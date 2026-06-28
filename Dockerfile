@@ -10,6 +10,10 @@ RUN cargo build --release --locked -p pharosd -p pharos-beacon \
     && strip target/release/pharosd target/release/pharos-beacon
 
 FROM debian:bookworm-slim
+# git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
 COPY --from=build /src/target/release/pharosd /usr/local/bin/pharosd
 COPY --from=build /src/target/release/pharos-beacon /usr/local/bin/pharos-beacon

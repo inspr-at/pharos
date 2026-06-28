@@ -1,13 +1,13 @@
 //! pharos-beacon — per-host agent (PHAROS-6 / PHAROS-15).
 //!
 //! Computes this host's Nix freshness (flake.lock age + commits behind nixcfg)
-//! and reports it to pharosd. v1 sends a single report then exits — deploy as a
-//! recurring service (systemd timer / Nix module) for continuous reporting
-//! (PHAROS-6/7). Token auth via Janus is PHAROS-8.
+//! and reports it to pharosd. With PHAROS_INTERVAL set it loops as a recurring
+//! service; otherwise it reports once and exits. Token auth via Janus is
+//! PHAROS-8; the native (musl) Nix-module deployment is PHAROS-6/7.
 //!
 //! Env: PHAROS_URL (pharosd base, default http://100.64.0.4:8088),
-//!      NIXCFG_DIR (flake checkout; auto-detected otherwise),
-//!      PHAROS_HOSTNAME / PHAROS_ROLE (overrides).
+//!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
+//!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides).
 
 use std::path::Path;
 use std::process::Command;
@@ -87,40 +87,52 @@ fn main() {
     let host = hostname();
     let is_nix = Path::new("/etc/NIXOS").exists();
     let dir = nixcfg_dir();
+    let role = std::env::var("PHAROS_ROLE").unwrap_or_else(|_| "server".into());
 
-    let freshness = if is_nix {
-        NixFreshness {
-            applicable: true,
-            flake_lock_age_days: dir.as_deref().and_then(flake_lock_age_days),
-            commits_behind: dir.as_deref().and_then(commits_behind),
-        }
-    } else {
-        NixFreshness::default()
-    };
+    // PHAROS_INTERVAL (secs) set => loop forever (recurring service);
+    // unset => report once and exit (one-shot / timer-driven).
+    let interval = std::env::var("PHAROS_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0);
+    let beat = interval.unwrap_or(60);
 
-    let report = HostReport {
-        name: host.clone(),
-        role: std::env::var("PHAROS_ROLE").unwrap_or_else(|_| "server".into()),
-        is_nix,
-        heartbeat_interval_secs: 60,
-        freshness,
-    };
-
-    let body = serde_json::to_string(&report).expect("serialize report");
-    match ureq::post(&endpoint)
-        .set("Content-Type", "application/json")
-        .send_string(&body)
-    {
-        Ok(resp) => {
-            println!(
-                "pharos-beacon: reported {host} -> {endpoint} (HTTP {})",
+    loop {
+        let freshness = if is_nix {
+            NixFreshness {
+                applicable: true,
+                flake_lock_age_days: dir.as_deref().and_then(flake_lock_age_days),
+                commits_behind: dir.as_deref().and_then(commits_behind),
+            }
+        } else {
+            NixFreshness::default()
+        };
+        let report = HostReport {
+            name: host.clone(),
+            role: role.clone(),
+            is_nix,
+            heartbeat_interval_secs: beat,
+            freshness,
+        };
+        let body = serde_json::to_string(&report).expect("serialize report");
+        match ureq::post(&endpoint)
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+        {
+            Ok(resp) => println!(
+                "pharos-beacon: reported {host} -> {endpoint} (HTTP {}) {body}",
                 resp.status()
-            );
-            println!("  {body}");
+            ),
+            Err(e) => {
+                eprintln!("pharos-beacon: report to {endpoint} failed: {e}");
+                if interval.is_none() {
+                    std::process::exit(1);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("pharos-beacon: report to {endpoint} failed: {e}");
-            std::process::exit(1);
+        match interval {
+            Some(s) => std::thread::sleep(std::time::Duration::from_secs(s)),
+            None => break,
         }
     }
 }
