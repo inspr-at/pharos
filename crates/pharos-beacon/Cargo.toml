@@ -1,0 +1,10 @@
+[package]
+name = "pharos-beacon"
+description = "Per-host Pharos agent: self-registers and reports status (incl. nix freshness)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pharos-core = { workspace = true }

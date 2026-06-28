@@ -1,0 +1,12 @@
+# Rust
+/target
+
+# devenv / direnv
+.devenv*
+devenv.local.nix
+.direnv
+
+# local env overrides
+.env*.local
+result
+result-*

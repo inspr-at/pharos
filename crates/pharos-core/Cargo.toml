@@ -1,0 +1,10 @@
+[package]
+name = "pharos-core"
+description = "Shared Pharos types (hosts, reports, nix-freshness, liveness) used by both pharosd and pharos-beacon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
