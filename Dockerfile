@@ -15,6 +15,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
+# /data owned by pharos so a named volume mounted here inherits writable
+# ownership (PHAROS_DB persistence — set PHAROS_DB=/data/pharos.json).
+RUN install -d -o pharos -g pharos /data
 COPY --from=build /src/target/release/pharosd /usr/local/bin/pharosd
 COPY --from=build /src/target/release/pharos-beacon /usr/local/bin/pharos-beacon
 USER pharos
