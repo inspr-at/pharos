@@ -1,9 +1,11 @@
 # syntax=docker/dockerfile:1
-# Multi-stage build. No native deps (no TLS/openssl/sqlite C), so slim works.
-# Ships BOTH binaries: pharosd (the server) + pharos-beacon (the agent, so it
-# can be extracted onto hosts: docker cp <ctr>:/usr/local/bin/pharos-beacon ...).
+# Multi-stage build. Ships BOTH binaries: pharosd (the server) + pharos-beacon
+# (the agent, so it can be extracted onto hosts: docker cp ...).
+# Full (non-slim) toolchain: pharosd's OIDC stack pulls ring (rustls), which
+# needs a C compiler. The runtime image stays slim — ring links statically and
+# rustls uses bundled roots, so no system OpenSSL at build or runtime.
 
-FROM rust:1-slim-bookworm AS build
+FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p pharosd -p pharos-beacon \

@@ -7,6 +7,7 @@
 //! accessible SVG status, the self-host lighthouse); the interactive Leptos UI
 //! is PHAROS-10.
 
+mod auth;
 mod icons;
 mod store;
 
@@ -14,15 +15,36 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{FromRef, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{liveness, Host, HostReport, Liveness};
 use serde_json::json;
 
+use crate::auth::{Auth, AuthState};
 use crate::store::Store;
+
+/// Combined app state. Handlers extract `Arc<Store>` or `AuthState` via `FromRef`.
+#[derive(Clone)]
+struct AppState {
+    store: Arc<Store>,
+    auth: AuthState,
+}
+
+impl FromRef<AppState> for Arc<Store> {
+    fn from_ref(s: &AppState) -> Self {
+        s.store.clone()
+    }
+}
+
+impl FromRef<AppState> for AuthState {
+    fn from_ref(s: &AppState) -> Self {
+        s.auth.clone()
+    }
+}
 
 const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><style>
 :root{--ink:#1b1f24;--muted:#6b7480;--accent:#1565c0}
@@ -184,14 +206,22 @@ async fn main() {
     let store = Arc::new(Store::new(
         std::env::var("PHAROS_DB").ok().map(PathBuf::from),
     ));
+    let auth = Auth::from_env().await;
+    let state = AppState { store, auth };
 
     let app = Router::new()
+        // Human routes — gated by OIDC when configured (open otherwise).
         .route("/", get(home))
+        .route("/hosts.json", get(hosts_json))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
+        // Open routes: beacon ingestion, health, version, and the auth flow.
         .route("/healthz", get(healthz))
         .route("/version", get(version))
-        .route("/hosts.json", get(hosts_json))
         .route("/report", post(report))
-        .with_state(store);
+        .route("/auth/login", get(auth::login))
+        .route("/auth/callback", get(auth::callback))
+        .route("/auth/logout", get(auth::logout))
+        .with_state(state);
 
     let addr = std::env::var("PHAROS_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(&addr)
