@@ -152,7 +152,7 @@ pub async fn login(State(auth): State<AuthState>) -> Response {
             CsrfToken::new_random,
             Nonce::new_random,
         )
-        .add_scope(Scope::new("openid".to_string()))
+        // openidconnect adds "openid" automatically.
         .add_scope(Scope::new("profile".to_string()))
         .add_scope(Scope::new("email".to_string()))
         .set_pkce_challenge(challenge)
@@ -204,7 +204,14 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
     let Some(id_token) = token.id_token() else {
         return (StatusCode::UNAUTHORIZED, "no id_token").into_response();
     };
-    let claims = match id_token.claims(&auth.client.id_token_verifier(), &pending.nonce) {
+    let verifier = auth
+        .client
+        .id_token_verifier()
+        // Zitadel adds the project id to the id_token audience alongside our
+        // client_id; accept the extra audience (client_id presence, signature,
+        // issuer, and nonce are still enforced).
+        .set_other_audience_verifier_fn(|_aud| true);
+    let claims = match id_token.claims(&verifier, &pending.nonce) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("id_token verification failed: {e}");
