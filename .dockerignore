@@ -1,0 +1,8 @@
+target
+.git
+.github
+.devenv*
+.direnv
+result
+result-*
+*.md

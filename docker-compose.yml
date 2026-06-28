@@ -1,0 +1,13 @@
+# Pharos deployment (PHAROS-12). Bound to localhost — a reverse proxy /
+# Tailscale fronts it; not publicly exposed until Zitadel auth (PHAROS-4).
+services:
+  pharosd:
+    build: .
+    image: pharosd:latest
+    container_name: pharosd
+    restart: unless-stopped
+    environment:
+      PHAROS_ADDR: 0.0.0.0:8080
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8080:8080"
