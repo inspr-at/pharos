@@ -74,14 +74,15 @@ pub enum Liveness {
 }
 
 impl Liveness {
-    /// Accessible status badge: `(css_color, glyph, word)` — colour is never
-    /// the only cue (PHAROS-10, point 3). Amber is used for `Stale`, not yellow.
-    pub fn badge(self) -> (&'static str, &'static str, &'static str) {
+    /// Accessible status badge: `(css_color, word)`. In the UI this is paired
+    /// with an SVG icon + the word (PHAROS-10, point 3) — colour is never the
+    /// only cue. Amber is used for `Stale`, not yellow.
+    pub fn badge(self) -> (&'static str, &'static str) {
         match self {
-            Liveness::Live => ("#2e7d32", "✓", "live"),
-            Liveness::Stale => ("#b26a00", "▲", "stale"),
-            Liveness::Down => ("#c62828", "／", "down"),
-            Liveness::AwaitingFirstHeartbeat => ("#9e9e9e", "•", "awaiting"),
+            Liveness::Live => ("#2e7d32", "live"),
+            Liveness::Stale => ("#b26a00", "stale"),
+            Liveness::Down => ("#c62828", "down"),
+            Liveness::AwaitingFirstHeartbeat => ("#9e9e9e", "awaiting"),
         }
     }
 }
