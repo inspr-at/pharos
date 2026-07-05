@@ -10,8 +10,10 @@
 
 mod auth;
 mod icons;
+mod manifests;
 mod store;
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,18 +26,21 @@ use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, Host, HostRegistration, HostRegistrationResponse, HostReport, Liveness, NixFreshness,
+    liveness, Host, HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
+    NixFreshness, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::auth::{Auth, AuthState};
+use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::store::Store;
 
 /// Combined app state. Handlers extract `Arc<Store>` or `AuthState` via `FromRef`.
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
+    manifests: Arc<ManifestRegistry>,
     auth: AuthState,
     beacon_auth: BeaconAuth,
 }
@@ -49,6 +54,12 @@ impl FromRef<AppState> for Arc<Store> {
 impl FromRef<AppState> for AuthState {
     fn from_ref(s: &AppState) -> Self {
         s.auth.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<ManifestRegistry> {
+    fn from_ref(s: &AppState) -> Self {
+        s.manifests.clone()
     }
 }
 
@@ -643,6 +654,77 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> 
     Json(json!({ "as_of": now, "hosts": hosts }))
 }
 
+async fn declared_hosts_json(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let now = now_unix();
+    let runtime_hosts = state.store.list();
+    Json(declared_hosts_payload(
+        state.manifests.manifests(),
+        state.manifests.load_errors(),
+        &runtime_hosts,
+        now,
+    ))
+}
+
+fn declared_hosts_payload(
+    manifests: &[HostManifest],
+    load_errors: &[ManifestLoadIssue],
+    runtime_hosts: &[Host],
+    now: i64,
+) -> serde_json::Value {
+    let runtime_by_name: BTreeMap<&str, &Host> = runtime_hosts
+        .iter()
+        .map(|host| (host.name.as_str(), host))
+        .collect();
+    let declared_hosts: Vec<_> = manifests
+        .iter()
+        .map(|manifest| {
+            let runtime = runtime_by_name
+                .get(manifest.host.name.as_str())
+                .copied()
+                .or_else(|| runtime_by_name.get(manifest.slug.as_str()).copied());
+            json!({
+                "name": &manifest.host.name,
+                "slug": &manifest.slug,
+                "declared": manifest,
+                "runtime": runtime_overlay(runtime, now),
+            })
+        })
+        .collect();
+
+    json!({
+        "schema": "inspr.pharos.declared-hosts.v1",
+        "manifest_schema": HOST_MANIFEST_SCHEMA,
+        "manifest_version": HOST_MANIFEST_VERSION,
+        "as_of": now,
+        "declared_hosts": declared_hosts,
+        "load_errors": load_errors,
+    })
+}
+
+fn runtime_overlay(host: Option<&Host>, now: i64) -> serde_json::Value {
+    let Some(host) = host else {
+        return json!({
+            "state": "pending",
+            "liveness": Liveness::AwaitingFirstHeartbeat,
+            "last_seen": null,
+            "heartbeat_log": [],
+            "heartbeat_interval_secs": null,
+            "freshness": null,
+            "freshness_tldr": null,
+        });
+    };
+    let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
+    json!({
+        "state": "observed",
+        "last_seen": host.last_seen,
+        "heartbeat_log": host.heartbeat_log,
+        "heartbeat_interval_secs": host.heartbeat_interval_secs,
+        "liveness": live,
+        "freshness": host.freshness,
+        "freshness_tldr": host.freshness.tldr(),
+    })
+}
+
 async fn home(State(store): State<Arc<Store>>) -> Html<String> {
     Html(render_home(&store.list(), &self_host(), now_unix()))
 }
@@ -1154,10 +1236,12 @@ async fn main() {
     let store = Arc::new(Store::new(
         std::env::var("PHAROS_DB").ok().map(PathBuf::from),
     ));
+    let manifests = Arc::new(ManifestRegistry::from_env());
     let auth = Auth::from_env().await;
     let beacon_auth = BeaconAuth::from_env();
     let state = AppState {
         store,
+        manifests,
         auth,
         beacon_auth,
     };
@@ -1168,7 +1252,8 @@ async fn main() {
         .route("/hosts.json", get(hosts_json))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
-        // version, and the auth flow.
+        // version, declared manifests, and the auth flow.
+        .route("/declared-hosts.json", get(declared_hosts_json))
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/register", post(register))
@@ -1296,5 +1381,88 @@ mod tests {
         assert!(lone.contains(r#"<aside class="lone-state""#));
         assert!(lone.contains("First host is on the map"));
         assert!(lone.contains(r#"data-live="awaiting_first_heartbeat""#));
+    }
+
+    #[test]
+    fn declared_hosts_payload_keeps_declared_and_runtime_state_separate() {
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": {
+                "name": "hsb8",
+                "access": {
+                    "lanHostname": "hsb8.lan",
+                    "lanIp": "192.168.1.100",
+                    "tailnet": "hsb8"
+                }
+            },
+            "wings": [{ "id": "ops", "name": "Ops" }],
+            "services": [
+                {
+                    "wing": "ops",
+                    "name": "pharos-beacon",
+                    "passive": true,
+                    "statusPolicy": { "source": "pharos-runtime" }
+                }
+            ],
+            "policy": {
+                "declaredOnly": true,
+                "runtimeStateOwner": "pharos",
+                "privilegedActions": { "mode": "none", "janusRequired": false }
+            }
+        }))
+        .expect("manifest parses");
+        let runtime = Host {
+            name: "hsb8".to_string(),
+            role: "NixOS Host".to_string(),
+            is_nix: true,
+            token_hash: Some("stored-token-hash".to_string()),
+            last_seen: Some(970),
+            heartbeat_log: vec![910, 970],
+            heartbeat_interval_secs: Some(60),
+            freshness: NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(0),
+                commits_behind: Some(1),
+            },
+        };
+
+        let payload = declared_hosts_payload(
+            std::slice::from_ref(&manifest),
+            &[],
+            std::slice::from_ref(&runtime),
+            1000,
+        );
+
+        assert_eq!(payload["schema"], "inspr.pharos.declared-hosts.v1");
+        assert_eq!(
+            payload["declared_hosts"][0]["declared"]["services"][0]["statusPolicy"]["source"],
+            "pharos-runtime"
+        );
+        assert_eq!(payload["declared_hosts"][0]["runtime"]["state"], "observed");
+        assert_eq!(payload["declared_hosts"][0]["runtime"]["liveness"], "live");
+        assert!(payload["declared_hosts"][0]["runtime"]["token_hash"].is_null());
+        assert!(!payload.to_string().contains("stored-token-hash"));
+    }
+
+    #[test]
+    fn declared_hosts_payload_marks_missing_runtime_as_pending() {
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "new-host",
+            "host": { "name": "new-host" },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+
+        let payload = declared_hosts_payload(std::slice::from_ref(&manifest), &[], &[], 1000);
+
+        assert_eq!(payload["declared_hosts"][0]["runtime"]["state"], "pending");
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["liveness"],
+            "awaiting_first_heartbeat"
+        );
     }
 }

@@ -38,6 +38,15 @@ cargo test --all
 cargo clippy --all-targets -- -D warnings
 ```
 
+`PHAROS_MANIFEST_PATHS` may point to one or more nixcfg-generated v1 host
+manifests, separated by `:` or `,`. pharosd serves them at
+`/declared-hosts.json` with runtime state overlaid separately from the declared
+manifest.
+
+```bash
+PHAROS_MANIFEST_PATHS=/etc/hostdash-config/hsb8.json cargo run -p pharosd
+```
+
 ## Beacon tokens
 
 `POST /register` is the local MVP token issuer. Set
