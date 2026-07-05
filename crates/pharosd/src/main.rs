@@ -8,6 +8,7 @@
 //! accessible SVG status, the self-host lighthouse); the interactive Leptos UI
 //! is PHAROS-10.
 
+mod agora;
 mod auth;
 mod icons;
 mod manifests;
@@ -1249,6 +1250,11 @@ async fn main() {
     let app = Router::new()
         // Human routes — gated by OIDC when configured (open otherwise).
         .route("/", get(home))
+        .route("/agora", get(agora::page))
+        .route(
+            "/agora/proposals/host-palette.json",
+            get(agora::palette_proposal),
+        )
         .route("/hosts.json", get(hosts_json))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
