@@ -79,7 +79,7 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .search input{width:100%;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px 0 32px;outline:none}
 .search input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(245px,1fr));gap:14px}
-.card{--state:var(--wait);position:relative;min-height:232px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
+.card{--state:var(--wait);position:relative;min-height:252px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
 .card:before{content:"";position:absolute;left:16px;right:16px;top:58px;height:1px;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent);pointer-events:none}
 [data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
 .card.light{border-color:rgba(214,155,49,.48);box-shadow:0 16px 34px rgba(150,103,28,.12)}
@@ -94,6 +94,10 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .status-pill{display:inline-flex;align-items:center;gap:6px;min-height:25px;max-width:150px;flex-shrink:0;padding:4px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--state) 24%,transparent);background:color-mix(in srgb,var(--state) 10%,white);color:var(--state);font-size:12px;white-space:nowrap}
 .status-pill .ico{width:14px;height:14px}.word{color:inherit;overflow:hidden;text-overflow:ellipsis}
 .state-icon{display:none}[data-live="live"] .state-icon.live,[data-live="stale"] .state-icon.stale,[data-live="down"] .state-icon.down,[data-live="awaiting_first_heartbeat"] .state-icon.awaiting{display:inline-block}
+.reason{--reason-color:var(--muted);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;gap:8px;min-height:22px;margin:-2px 0 10px;color:var(--muted);font-size:12px;line-height:1.25}
+.reason:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--reason-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--reason-color) 12%,transparent)}
+.reason.ok{--reason-color:var(--live)}.reason.warn{--reason-color:var(--stale)}.reason.down{--reason-color:var(--down)}.reason.wait{--reason-color:var(--wait)}.reason.self{--reason-color:var(--sun)}
+.reason span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fresh{min-height:52px;margin:4px 0 11px;font-size:13px;line-height:1.45;color:var(--ink)}
 .fresh-row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:10px;min-height:23px;border-bottom:1px solid rgba(214,226,234,.58)}
 .fresh-row:last-child{border-bottom:0}
@@ -134,11 +138,11 @@ main[data-view="list"] .list-wrap{display:block}
 .list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:8px 0 0 8px}
 .list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
-.list .host{min-width:210px}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}
+.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}
 [hidden]{display:none!important}
 .empty{margin-top:18px;padding:18px 20px;border:1px dashed #c5d7e0;border-radius:8px;background:rgba(255,255,255,.74);color:var(--muted)}
 .empty code{background:#edf6f7;padding:2px 7px;border-radius:6px;color:var(--ink)}
-@media (max-width:720px){main{padding:28px 16px 42px}.top{display:block}.asof{padding-top:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:760px}}
+@media (max-width:720px){main{padding:28px 16px 42px}.top{display:block}.asof{padding-top:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body>"#;
 
@@ -168,6 +172,34 @@ function freshHtml(f){
   const commits=freshValue(f.commits_behind,'0');
   if(age.klass==='warn')age.value=age.value+'d';
   return freshRow('Flake.lock age',age.value,age.klass)+freshRow('Commits behind',commits.value,commits.klass);
+}
+function freshnessAttention(f){
+  if(!f||f.applicable===false)return null;
+  const age=Number(f.flake_lock_age_days);
+  const commits=Number(f.commits_behind);
+  const hasAge=f.flake_lock_age_days!=null&&Number.isFinite(age);
+  const hasCommits=f.commits_behind!=null&&Number.isFinite(commits);
+  const ageWarn=hasAge&&age>0;
+  const commitsWarn=hasCommits&&commits>0;
+  if(ageWarn&&commitsWarn)return {label:'nix drift: '+age+'d · '+commits+' commits',level:'warn',rank:3};
+  if(ageWarn)return {label:'flake.lock '+age+'d',level:'warn',rank:3};
+  if(commitsWarn)return {label:commits+' commits behind',level:'warn',rank:3};
+  if(!hasAge||!hasCommits)return {label:'freshness unknown',level:'wait',rank:3};
+  return null;
+}
+function attentionFor(live,f){
+  if(live==='down')return {label:'silent heartbeat',level:'down',rank:0};
+  if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
+  if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
+  return freshnessAttention(f)||{label:'all clear',level:'ok',rank:4};
+}
+function selfAttention(){return {label:'control light',level:'self',rank:4}}
+function setReason(surface,reason){
+  const el=surface.querySelector('[data-reason]');
+  if(!el)return;
+  el.className='reason '+reason.level;
+  const text=el.querySelector('span');
+  if(text)text.textContent=reason.label;
 }
 function markHtml(beats){
   const kept=beats.slice(-MAX_BEATS);
@@ -329,11 +361,13 @@ async function refresh(){
       for(const card of surfaces){
         const live=card.dataset.self==='true'?'live':h.liveness;
         card.dataset.live=live;
-        card.dataset.sev=String(sevFor(live));
+        const attention=card.dataset.self==='true'?selfAttention():(h.attention||attentionFor(h.liveness,h.freshness));
+        card.dataset.sev=String(attention.rank ?? sevFor(live));
         card.dataset.last=h.last_seen ?? 0;
-        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')).toLowerCase();
+        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')).toLowerCase();
         const word=card.querySelector('[data-status-word]');
         if(word&&card.dataset.self!=='true')word.textContent=words[h.liveness]||h.liveness;
+        setReason(card,attention);
         const fresh=card.querySelector('[data-fresh]');
         if(fresh)fresh.innerHTML=freshHtml(h.freshness);
         setSeen(card,h.last_seen,now);
@@ -403,6 +437,7 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> 
         .map(|h| {
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
             let freshness_tldr = h.freshness.tldr();
+            let attention = attention_reason(live, &h.freshness);
             json!({
                 "name": h.name,
                 "role": h.role,
@@ -413,6 +448,11 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> 
                 "liveness": live,
                 "freshness": h.freshness,
                 "freshness_tldr": freshness_tldr,
+                "attention": {
+                    "label": attention.label,
+                    "level": attention.level,
+                    "rank": attention.rank,
+                },
             })
         })
         .collect();
@@ -469,21 +509,92 @@ fn freshness_markup(freshness: &NixFreshness) -> String {
     )
 }
 
+struct AttentionReason {
+    label: String,
+    level: &'static str,
+    rank: u8,
+}
+
+fn self_attention_reason() -> AttentionReason {
+    AttentionReason {
+        label: "control light".to_string(),
+        level: "self",
+        rank: 4,
+    }
+}
+
+fn freshness_attention_reason(freshness: &NixFreshness) -> Option<AttentionReason> {
+    if !freshness.applicable {
+        return None;
+    }
+
+    let age_warn = freshness.flake_lock_age_days.filter(|d| *d > 0);
+    let commits_warn = freshness.commits_behind.filter(|c| *c > 0);
+    let label = match (age_warn, commits_warn) {
+        (Some(days), Some(commits)) => format!("nix drift: {days}d · {commits} commits"),
+        (Some(days), None) => format!("flake.lock {days}d"),
+        (None, Some(commits)) => format!("{commits} commits behind"),
+        (None, None) => {
+            if freshness.flake_lock_age_days.is_none() || freshness.commits_behind.is_none() {
+                "freshness unknown".to_string()
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(AttentionReason {
+        label,
+        level: if age_warn.is_some() || commits_warn.is_some() {
+            "warn"
+        } else {
+            "wait"
+        },
+        rank: 3,
+    })
+}
+
+fn attention_reason(live: Liveness, freshness: &NixFreshness) -> AttentionReason {
+    match live {
+        Liveness::Down => AttentionReason {
+            label: "silent heartbeat".to_string(),
+            level: "down",
+            rank: 0,
+        },
+        Liveness::Stale => AttentionReason {
+            label: "stale heartbeat".to_string(),
+            level: "warn",
+            rank: 1,
+        },
+        Liveness::AwaitingFirstHeartbeat => AttentionReason {
+            label: "awaiting first beat".to_string(),
+            level: "wait",
+            rank: 2,
+        },
+        Liveness::Live => {
+            freshness_attention_reason(freshness).unwrap_or_else(|| AttentionReason {
+                label: "all clear".to_string(),
+                level: "ok",
+                rank: 4,
+            })
+        }
+    }
+}
+
+fn reason_markup(reason: &AttentionReason) -> String {
+    format!(
+        r#"<div class="reason {}" data-reason><span>{}</span></div>"#,
+        html_escape(reason.level),
+        html_escape(&reason.label)
+    )
+}
+
 fn live_key(live: Liveness) -> &'static str {
     match live {
         Liveness::Live => "live",
         Liveness::Stale => "stale",
         Liveness::Down => "down",
         Liveness::AwaitingFirstHeartbeat => "awaiting_first_heartbeat",
-    }
-}
-
-fn severity(live: Liveness) -> u8 {
-    match live {
-        Liveness::Down => 0,
-        Liveness::Stale => 1,
-        Liveness::AwaitingFirstHeartbeat => 2,
-        Liveness::Live => 3,
     }
 }
 
@@ -731,13 +842,9 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
     // self/lighthouse first, then by severity (needs-attention first), then name.
     sorted.sort_by_key(|h| {
         let is_self = u8::from(h.name != self_name);
-        let sev = match liveness(h.last_seen, h.heartbeat_interval_secs, now) {
-            Liveness::Down => 0u8,
-            Liveness::Stale => 1,
-            Liveness::AwaitingFirstHeartbeat => 2,
-            Liveness::Live => 3,
-        };
-        (is_self, sev, h.name.clone())
+        let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
+        let rank = attention_reason(live, &h.freshness).rank;
+        (is_self, rank, h.name.clone())
     });
 
     let mut cards = String::new();
@@ -758,15 +865,22 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
         let fresh = freshness_markup(&h.freshness);
+        let attention = if is_self {
+            self_attention_reason()
+        } else {
+            attention_reason(live, &h.freshness)
+        };
+        let reason = reason_markup(&attention);
         let search = html_escape(&format!(
-            "{} {} {}",
+            "{} {} {} {}",
             h.name.to_lowercase(),
             h.role.to_lowercase(),
-            fresh_tldr.to_lowercase()
+            fresh_tldr.to_lowercase(),
+            attention.label.to_lowercase()
         ));
         let sort_name = html_escape(&h.name.to_lowercase());
         let last_sort = h.last_seen.unwrap_or(0);
-        let sev = severity(live);
+        let sev = attention.rank;
         let seen = match h.last_seen {
             Some(t) => format!("last seen {} ago", duration_label(now - t)),
             None => "never seen".to_string(),
@@ -796,19 +910,19 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
             is_self,
         );
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header><div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
+            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td></tr>"#,
+            r#"<tr class="{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td></tr>"#,
             live_key = live_key(live),
             light_cls = light_cls.trim()
         ));
     }
 
     format!(
-        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section></main>{FOOT}",
+        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section></main>{FOOT}",
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar()
@@ -886,6 +1000,19 @@ mod tests {
                     commits_behind: Some(3),
                 },
             },
+            Host {
+                name: "poseidon".to_string(),
+                role: "NixOS Host".to_string(),
+                is_nix: true,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    flake_lock_age_days: Some(1),
+                    commits_behind: Some(3),
+                },
+            },
         ];
 
         let html = render_home(&hosts, "csb1", 1000);
@@ -896,6 +1023,9 @@ mod tests {
         assert!(html.contains(r#"data-host="csb1" data-live="live""#));
         assert!(html.contains(r#"data-self="true""#));
         assert!(html.contains("the light is lit"));
+        assert!(html.contains(r#"<th>Attention</th>"#));
+        assert!(html
+            .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
         assert!(html.contains("expected beat"));
         assert!(html.contains(r#"data-next>on cadence"#));
         assert!(html.contains(r#"data-beats="850,910,970""#));
@@ -908,6 +1038,10 @@ mod tests {
         assert!(html.contains("beat-current"));
         assert!(html.contains("beat-expected"));
         assert!(html.contains("beat-zones"));
+        assert!(html.contains("nix drift: 1d"));
+        assert!(html.contains("3 commits"));
+        assert!(html.contains(r#"data-search="poseidon nixos host flake.lock 1d old · 3 commits behind nixcfg nix drift: 1d · 3 commits""#));
+        assert!(html.contains(r#"data-host="poseidon" data-live="live" data-sev="3""#));
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
