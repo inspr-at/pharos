@@ -18,6 +18,10 @@ pub struct Host {
     pub name: String,
     pub role: String,
     pub is_nix: bool,
+    /// SHA-256 hash of the per-host beacon token. The raw token is returned
+    /// only at registration time and never rendered by the dashboard API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_hash: Option<String>,
     /// Server-received time of the last beacon report. `None` = never seen.
     pub last_seen: Option<UnixSeconds>,
     /// Recent server-received heartbeat times. These are real report events,
@@ -124,6 +128,23 @@ pub struct HostReport {
     pub freshness: NixFreshness,
 }
 
+/// What `inspr onboard` will send before installing `pharos-beacon` (PHAROS-7).
+/// The server creates/rotates the per-host token and starts the host in the
+/// grey "awaiting first heartbeat" state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostRegistration {
+    pub name: String,
+    pub role: String,
+    pub is_nix: bool,
+    pub heartbeat_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostRegistrationResponse {
+    pub name: String,
+    pub token: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +192,7 @@ mod tests {
         )
         .expect("deserialize old host json");
 
+        assert_eq!(host.token_hash, None);
         assert!(host.heartbeat_log.is_empty());
     }
 }

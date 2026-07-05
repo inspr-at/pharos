@@ -7,7 +7,8 @@
 //!
 //! Env: PHAROS_URL (pharosd base, default http://100.64.0.4:8088),
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
-//!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides).
+//!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
+//!      PHAROS_TOKEN (per-host bearer token from /register).
 
 use std::path::Path;
 use std::process::Command;
@@ -88,6 +89,9 @@ fn main() {
     let is_nix = Path::new("/etc/NIXOS").exists();
     let dir = nixcfg_dir();
     let role = std::env::var("PHAROS_ROLE").unwrap_or_else(|_| "server".into());
+    let token = std::env::var("PHAROS_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
     // PHAROS_INTERVAL (secs) set => loop forever (recurring service);
     // unset => report once and exit (one-shot / timer-driven).
@@ -115,10 +119,11 @@ fn main() {
             freshness,
         };
         let body = serde_json::to_string(&report).expect("serialize report");
-        match ureq::post(&endpoint)
-            .set("Content-Type", "application/json")
-            .send_string(&body)
-        {
+        let mut request = ureq::post(&endpoint).set("Content-Type", "application/json");
+        if let Some(token) = &token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        match request.send_string(&body) {
             Ok(resp) => println!(
                 "pharos-beacon: reported {host} -> {endpoint} (HTTP {}) {body}",
                 resp.status()

@@ -6,8 +6,8 @@ INSPR-native successor to FleetCom. Planning lives in PPM project **PHAROS**.
 ## MVP scope (v1)
 
 1. **Auth** — Zitadel OIDC login (PHAROS-4).
-2. **Onboarding / host registration** — `inspr onboard` registers a host and
-   deploys `pharos-beacon`, which self-registers on first report (PHAROS-6/7).
+2. **Onboarding / host registration** — `inspr onboard` registers a host,
+   receives a per-host beacon token, and deploys `pharos-beacon` (PHAROS-6/7/8).
 3. **Nix host freshness** — a human one-liner TL;DR per host of what it is
    "missing": `flake.lock 12d old · 3 commits behind nixcfg` (PHAROS-15).
 
@@ -38,7 +38,23 @@ cargo test --all
 cargo clippy --all-targets -- -D warnings
 ```
 
-> **Status: scaffold (PHAROS-2).** The dashboard at `/` is a static preview of
-> the intended design (rounded cards, accessible status, the dsc0 lighthouse)
-> over **sample data**. The real Leptos UI (PHAROS-10), SQLite store
-> (PHAROS-3/9), auth (PHAROS-4), and Janus tokens (PHAROS-8) are next.
+## Beacon tokens
+
+`POST /register` is the local MVP token issuer. Set
+`PHAROS_REGISTRATION_TOKEN`, then call it with `Authorization: Bearer ...`.
+The response returns the raw per-host token once; pharosd stores only its
+SHA-256 hash.
+
+```bash
+PHAROS_REGISTRATION_TOKEN=dev cargo run -p pharosd
+
+curl -sS -H 'Authorization: Bearer dev' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ares","role":"NixOS Host","is_nix":true,"heartbeat_interval_secs":60}' \
+  http://127.0.0.1:8080/register
+```
+
+`pharos-beacon` sends that token as `PHAROS_TOKEN`. `POST /report` requires a
+valid token for registered hosts. Set `PHAROS_REQUIRE_BEACON_TOKEN=1` to reject
+legacy unregistered reports; by default that becomes true when
+`PHAROS_REGISTRATION_TOKEN` is configured.

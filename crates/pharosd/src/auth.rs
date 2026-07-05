@@ -6,12 +6,13 @@
 //! without affecting the fleet until the env is wired in.
 //!
 //! Public client (PKCE, no client secret). The human routes (`/`, `/hosts.json`)
-//! are gated; the beacon `POST /report` + `/healthz` + `/version` stay open so
-//! agents keep reporting without a browser login.
+//! are gated; machine routes (`POST /register`, `POST /report`) use the
+//! PHAROS-8 beacon token flow instead of browser login, while `/healthz` and
+//! `/version` stay open.
 //!
 //! Sessions and in-flight logins are in-memory (single-instance pharosd). A
 //! restart drops them — the dashboard reloads from disk, the user just logs in
-//! again. Token-based machine auth is PHAROS-8.
+//! again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

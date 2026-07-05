@@ -1,8 +1,9 @@
 //! pharosd — the Pharos server.
 //!
-//! Routes: `/healthz`, `/version`, `POST /report` (beacon ingestion, PHAROS-9),
-//! `/hosts.json`, and the host dashboard at `/`. Hosts live in a small store
-//! (in-memory + optional JSON persistence; sqlx+SQLite is PHAROS-3). The
+//! Routes: `/healthz`, `/version`, `POST /register` (token issuance, PHAROS-8),
+//! `POST /report` (beacon ingestion, PHAROS-9), `/hosts.json`, and the host
+//! dashboard at `/`. Hosts live in a small store (in-memory + optional JSON
+//! persistence; sqlx+SQLite is PHAROS-3). The
 //! dashboard is a static server render previewing the design (rounded cards,
 //! accessible SVG status, the self-host lighthouse); the interactive Leptos UI
 //! is PHAROS-10.
@@ -11,18 +12,22 @@ mod auth;
 mod icons;
 mod store;
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRef, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use pharos_core::{liveness, Host, HostReport, Liveness, NixFreshness};
+use pharos_core::{
+    liveness, Host, HostRegistration, HostRegistrationResponse, HostReport, Liveness, NixFreshness,
+};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::auth::{Auth, AuthState};
 use crate::store::Store;
@@ -32,6 +37,7 @@ use crate::store::Store;
 struct AppState {
     store: Arc<Store>,
     auth: AuthState,
+    beacon_auth: BeaconAuth,
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -44,6 +50,44 @@ impl FromRef<AppState> for AuthState {
     fn from_ref(s: &AppState) -> Self {
         s.auth.clone()
     }
+}
+
+#[derive(Clone)]
+struct BeaconAuth {
+    registration_token: Option<String>,
+    require_report_token: bool,
+}
+
+impl BeaconAuth {
+    fn from_env() -> Self {
+        let registration_token = std::env::var("PHAROS_REGISTRATION_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let require_report_token = std::env::var("PHAROS_REQUIRE_BEACON_TOKEN")
+            .ok()
+            .and_then(|s| parse_bool(&s))
+            .unwrap_or(registration_token.is_some());
+        Self {
+            registration_token,
+            require_report_token,
+        }
+    }
+
+    fn registration_status(&self, headers: &HeaderMap) -> RegistrationAuth {
+        let Some(expected) = &self.registration_token else {
+            return RegistrationAuth::NotConfigured;
+        };
+        match bearer_token(headers) {
+            Some(actual) if constant_time_eq(actual, expected) => RegistrationAuth::Allowed,
+            _ => RegistrationAuth::Denied,
+        }
+    }
+}
+
+enum RegistrationAuth {
+    Allowed,
+    Denied,
+    NotConfigured,
 }
 
 const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><style>
@@ -140,9 +184,29 @@ main[data-view="list"] .list-wrap{display:block}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
 .list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}
 [hidden]{display:none!important}
-.empty{margin-top:18px;padding:18px 20px;border:1px dashed #c5d7e0;border-radius:8px;background:rgba(255,255,255,.74);color:var(--muted)}
-.empty code{background:#edf6f7;padding:2px 7px;border-radius:6px;color:var(--ink)}
+.empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
+.empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
+.empty-state:before,.lone-state:before{content:"";position:absolute;inset:auto -8% -30% -8%;height:50%;background:repeating-linear-gradient(178deg,rgba(31,127,181,.12) 0 1px,transparent 1px 28px);opacity:.72;pointer-events:none}
+.empty-copy{position:relative;max-width:440px}
+.empty-kicker,.lone-kicker{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--sun);font-weight:700}
+.empty-copy h2{margin:8px 0 9px;font-size:30px;line-height:1.12;letter-spacing:0}
+.empty-copy p,.lone-copy p{margin:0;color:var(--muted);font-size:14px}
+.onboard-command{margin-top:18px;display:inline-flex;align-items:center;gap:9px;max-width:100%;padding:10px 12px;border:1px solid rgba(210,226,234,.95);border-radius:7px;background:#fff;color:var(--ink);box-shadow:0 8px 20px rgba(45,75,95,.06);font:13px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:normal;word-break:break-word}
+.onboard-command .ico{color:var(--sea)}
+.empty-visual{position:relative;min-height:285px;display:grid;place-items:center;color:var(--sun)}
+.empty-sun{position:absolute;right:14%;top:8%;width:66px;height:66px;border-radius:50%;background:radial-gradient(circle,#fff 0 34%,rgba(214,155,49,.26) 36% 58%,transparent 60%);box-shadow:0 0 0 12px rgba(214,155,49,.06),0 0 42px rgba(214,155,49,.20)}
+.empty-line{position:absolute;left:7%;right:7%;top:57%;height:2px;border-radius:999px;background:linear-gradient(90deg,transparent,rgba(21,158,153,.42),rgba(214,155,49,.46),transparent)}
+.empty-line:after{content:"";position:absolute;left:0;top:50%;width:26%;height:3px;border-radius:999px;background:linear-gradient(90deg,transparent,var(--sea),transparent);animation:tide 3.2s linear infinite;transform:translateY(-50%)}
+.empty-lighthouse{position:relative;display:grid;place-items:center;width:150px;height:150px;border-radius:50%;background:radial-gradient(circle,rgba(214,155,49,.18),rgba(255,255,255,.66) 54%,transparent 70%);color:var(--sun)}
+.empty-lighthouse .ico{width:68px;height:68px}
+.empty-await{position:absolute;left:50%;bottom:16%;transform:translateX(-50%);font-size:11px;color:var(--muted);white-space:nowrap}
+.lone-state{margin-top:14px;padding:17px 18px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:16px}
+.lone-mark{position:relative;display:grid;place-items:center;width:46px;height:46px;border-radius:50%;border:1px solid rgba(214,155,49,.28);background:rgba(255,255,255,.74);color:var(--sun)}
+.lone-mark .ico{width:24px;height:24px}
+.lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
+.lone-state .onboard-command{position:relative;margin:0;font-size:12px}
 @media (max-width:720px){main{padding:28px 16px 42px}.top{display:block}.asof{padding-top:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
+@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body>"#;
 
@@ -414,6 +478,56 @@ fn self_host() -> String {
     std::env::var("PHAROS_SELF").unwrap_or_else(|_| "csb1".into())
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..len {
+        diff |=
+            usize::from(left.get(idx).copied().unwrap_or(0) ^ right.get(idx).copied().unwrap_or(0));
+    }
+    diff == 0
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(CHARS[(b >> 4) as usize] as char);
+        out.push(CHARS[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn token_hash(token: &str) -> String {
+    hex(&Sha256::digest(token.as_bytes()))
+}
+
+fn new_beacon_token() -> std::io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(format!("pharos_{}", hex(&bytes)))
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -423,10 +537,80 @@ async fn version() -> Json<serde_json::Value> {
 }
 
 /// Beacon ingestion (PHAROS-9): upsert the host, stamping server receive time.
-async fn report(State(store): State<Arc<Store>>, Json(rep): Json<HostReport>) -> StatusCode {
+async fn report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(rep): Json<HostReport>,
+) -> StatusCode {
+    let host_has_token = state.store.has_token(&rep.name);
+    if host_has_token || state.beacon_auth.require_report_token {
+        let Some(token) = bearer_token(&headers) else {
+            tracing::warn!(host = %rep.name, "report rejected: missing bearer token");
+            return StatusCode::UNAUTHORIZED;
+        };
+        let expected_hash = token_hash(token);
+        let valid = state
+            .store
+            .token_hash_for(&rep.name)
+            .is_some_and(|stored| constant_time_eq(&stored, &expected_hash));
+        if !valid {
+            tracing::warn!(host = %rep.name, "report rejected: invalid bearer token");
+            return StatusCode::UNAUTHORIZED;
+        }
+    } else {
+        tracing::warn!(
+            host = %rep.name,
+            "accepting legacy unauthenticated report; register a per-host token to enforce PHAROS-8"
+        );
+    }
     tracing::info!(host = %rep.name, "report received");
-    store.record(rep, now_unix());
+    state.store.record(rep, now_unix());
     StatusCode::NO_CONTENT
+}
+
+/// Local host registration for MVP onboarding (PHAROS-8/7). Protected by a
+/// deployment-local bootstrap token; the returned beacon token is shown once.
+async fn register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(registration): Json<HostRegistration>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.beacon_auth.registration_status(&headers) {
+        RegistrationAuth::Allowed => {}
+        RegistrationAuth::Denied => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "registration token invalid" })),
+            )
+        }
+        RegistrationAuth::NotConfigured => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "PHAROS_REGISTRATION_TOKEN not configured" })),
+            )
+        }
+    }
+
+    let token = match new_beacon_token() {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::error!("failed to generate beacon token: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "token generation failed" })),
+            );
+        }
+    };
+    let response = HostRegistrationResponse {
+        name: registration.name.clone(),
+        token: token.clone(),
+    };
+    let host = state.store.register(registration, token_hash(&token));
+    tracing::info!(host = %host.name, "beacon token issued");
+    (
+        StatusCode::CREATED,
+        Json(serde_json::to_value(response).expect("registration response serializes")),
+    )
 }
 
 async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> {
@@ -676,6 +860,29 @@ fn toolbar() -> String {
     )
 }
 
+fn onboard_command() -> String {
+    format!(
+        r#"<code class="onboard-command">{icon}<span>inspr onboard &lt;host&gt;</span></code>"#,
+        icon = icons::TERMINAL
+    )
+}
+
+fn empty_state() -> String {
+    format!(
+        r#"<section class="empty-state" aria-label="first run"><div class="empty-copy"><span class="empty-kicker">first light</span><h2>Waiting for the first host</h2><p>Register a host and Pharos will hold it in the grey awaiting state until the first real heartbeat arrives.</p>{command}</div><div class="empty-visual" aria-hidden="true"><span class="empty-sun"></span><span class="empty-line"></span><span class="empty-lighthouse">{lighthouse}</span><span class="empty-await">awaiting first heartbeat</span></div></section>"#,
+        command = onboard_command(),
+        lighthouse = icons::LIGHTHOUSE
+    )
+}
+
+fn lone_host_state() -> String {
+    format!(
+        r#"<aside class="lone-state" aria-label="lone host state"><span class="lone-mark">{lighthouse}</span><div class="lone-copy"><span class="lone-kicker">one light</span><strong>First host is on the map</strong><p>The fleet view is ready for the next onboarded machine.</p></div>{command}</aside>"#,
+        lighthouse = icons::LIGHTHOUSE,
+        command = onboard_command()
+    )
+}
+
 fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
     let mut recent = log.to_vec();
     if recent.is_empty() {
@@ -833,8 +1040,9 @@ fn heartbeat_card(
 fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
     if hosts.is_empty() {
         return format!(
-            "{HEAD}<main>{header}<div class=\"empty\">No hosts yet. Onboard one:<br><br><code>inspr onboard &lt;host&gt;</code></div></main>{FOOT}",
-            header = header(now)
+            "{HEAD}<main>{header}{empty}</main>{FOOT}",
+            header = header(now),
+            empty = empty_state()
         );
     }
 
@@ -921,8 +1129,14 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
         ));
     }
 
+    let lone = if hosts.len() == 1 {
+        lone_host_state()
+    } else {
+        String::new()
+    };
+
     format!(
-        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section></main>{FOOT}",
+        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar()
@@ -941,16 +1155,23 @@ async fn main() {
         std::env::var("PHAROS_DB").ok().map(PathBuf::from),
     ));
     let auth = Auth::from_env().await;
-    let state = AppState { store, auth };
+    let beacon_auth = BeaconAuth::from_env();
+    let state = AppState {
+        store,
+        auth,
+        beacon_auth,
+    };
 
     let app = Router::new()
         // Human routes — gated by OIDC when configured (open otherwise).
         .route("/", get(home))
         .route("/hosts.json", get(hosts_json))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
-        // Open routes: beacon ingestion, health, version, and the auth flow.
+        // Machine/public routes: beacon ingestion, local registration, health,
+        // version, and the auth flow.
         .route("/healthz", get(healthz))
         .route("/version", get(version))
+        .route("/register", post(register))
         .route("/report", post(report))
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
@@ -979,6 +1200,7 @@ mod tests {
                 name: "csb1".to_string(),
                 role: "Control Server".to_string(),
                 is_nix: true,
+                token_hash: None,
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
@@ -991,6 +1213,7 @@ mod tests {
                 name: "hades".to_string(),
                 role: "NixOS Host".to_string(),
                 is_nix: true,
+                token_hash: None,
                 last_seen: Some(879),
                 heartbeat_log: vec![760, 819, 879],
                 heartbeat_interval_secs: Some(60),
@@ -1004,6 +1227,7 @@ mod tests {
                 name: "poseidon".to_string(),
                 role: "NixOS Host".to_string(),
                 is_nix: true,
+                token_hash: None,
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
@@ -1045,5 +1269,32 @@ mod tests {
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
+    }
+
+    #[test]
+    fn render_home_has_deliberate_empty_and_lone_host_states() {
+        let empty = render_home(&[], "csb1", 1000);
+        assert!(empty.contains(r#"<section class="empty-state""#));
+        assert!(empty.contains("Waiting for the first host"));
+        assert!(empty.contains("inspr onboard &lt;host&gt;"));
+        assert!(empty.contains("awaiting first heartbeat"));
+
+        let host = Host {
+            name: "ares".to_string(),
+            role: "NixOS Host".to_string(),
+            is_nix: true,
+            token_hash: Some("hash".to_string()),
+            last_seen: None,
+            heartbeat_log: vec![],
+            heartbeat_interval_secs: Some(60),
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+        };
+        let lone = render_home(&[host], "csb1", 1000);
+        assert!(lone.contains(r#"<aside class="lone-state""#));
+        assert!(lone.contains("First host is on the map"));
+        assert!(lone.contains(r#"data-live="awaiting_first_heartbeat""#));
     }
 }

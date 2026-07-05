@@ -20,6 +20,9 @@ pub const LIST: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" strok
 /// Lucide `search` — search control.
 pub const SEARCH: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>"#;
 
+/// Lucide `terminal` — command snippet.
+pub const TERMINAL: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>"#;
+
 /// Lucide `circle-check` — live.
 const CIRCLE_CHECK: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>"#;
 

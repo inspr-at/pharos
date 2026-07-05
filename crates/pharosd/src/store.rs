@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use pharos_core::{Host, HostReport, UnixSeconds};
+use pharos_core::{Host, HostRegistration, HostReport, NixFreshness, UnixSeconds};
 
 const MAX_HEARTBEAT_LOG: usize = 24;
 
@@ -52,13 +52,61 @@ impl Store {
             .collect()
     }
 
+    /// Register or rotate a host token. Existing heartbeat/report data is kept
+    /// so manual rotation does not make a live host look new again.
+    pub fn register(&self, registration: HostRegistration, token_hash: String) -> Host {
+        let host = {
+            let mut map = self.hosts.write().expect("store lock");
+            let existing = map.get(&registration.name);
+            let host = Host {
+                name: registration.name.clone(),
+                role: registration.role,
+                is_nix: registration.is_nix,
+                token_hash: Some(token_hash),
+                last_seen: existing.and_then(|h| h.last_seen),
+                heartbeat_log: existing
+                    .map(|h| h.heartbeat_log.clone())
+                    .unwrap_or_default(),
+                heartbeat_interval_secs: Some(registration.heartbeat_interval_secs),
+                freshness: existing
+                    .map(|h| h.freshness.clone())
+                    .unwrap_or_else(|| NixFreshness {
+                        applicable: registration.is_nix,
+                        ..Default::default()
+                    }),
+            };
+            map.insert(registration.name, host.clone());
+            host
+        };
+        self.persist();
+        host
+    }
+
+    pub fn has_token(&self, host: &str) -> bool {
+        self.hosts
+            .read()
+            .expect("store lock")
+            .get(host)
+            .and_then(|h| h.token_hash.as_deref())
+            .is_some()
+    }
+
+    pub fn token_hash_for(&self, host: &str) -> Option<String> {
+        self.hosts
+            .read()
+            .expect("store lock")
+            .get(host)
+            .and_then(|h| h.token_hash.clone())
+    }
+
     /// Upsert from a beacon report. `now` is the **server** receive time — the
     /// agent never asserts its own liveness (PHAROS-9).
     pub fn record(&self, report: HostReport, now: UnixSeconds) {
         {
             let mut map = self.hosts.write().expect("store lock");
-            let mut heartbeat_log = map
-                .get(&report.name)
+            let existing = map.get(&report.name);
+            let token_hash = existing.and_then(|h| h.token_hash.clone());
+            let mut heartbeat_log = existing
                 .map(|h| h.heartbeat_log.clone())
                 .unwrap_or_default();
             if heartbeat_log.last().copied() != Some(now) {
@@ -71,6 +119,7 @@ impl Store {
                     name: report.name,
                     role: report.role,
                     is_nix: report.is_nix,
+                    token_hash,
                     last_seen: Some(now),
                     heartbeat_log,
                     heartbeat_interval_secs: Some(report.heartbeat_interval_secs),
@@ -140,5 +189,61 @@ mod tests {
         assert_eq!(host.heartbeat_log.len(), MAX_HEARTBEAT_LOG);
         assert_eq!(host.heartbeat_log.first(), Some(&7));
         assert_eq!(host.heartbeat_log.last(), Some(&30));
+    }
+
+    #[test]
+    fn register_preserves_report_history_and_sets_token_hash() {
+        let store = Store::new(None);
+        store.record(
+            HostReport {
+                name: "athena".to_string(),
+                role: "NixOS Host".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: 60,
+                freshness: NixFreshness {
+                    applicable: true,
+                    flake_lock_age_days: Some(1),
+                    commits_behind: Some(0),
+                },
+            },
+            120,
+        );
+
+        let host = store.register(
+            HostRegistration {
+                name: "athena".to_string(),
+                role: "Control Server".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: 30,
+            },
+            "hash".to_string(),
+        );
+
+        assert_eq!(host.token_hash.as_deref(), Some("hash"));
+        assert_eq!(host.last_seen, Some(120));
+        assert_eq!(host.heartbeat_log, vec![120]);
+        assert_eq!(host.heartbeat_interval_secs, Some(30));
+        assert_eq!(host.freshness.flake_lock_age_days, Some(1));
+        assert!(store.has_token("athena"));
+        assert_eq!(store.token_hash_for("athena").as_deref(), Some("hash"));
+
+        store.record(
+            HostReport {
+                name: "athena".to_string(),
+                role: "Control Server".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: 30,
+                freshness: NixFreshness {
+                    applicable: true,
+                    flake_lock_age_days: Some(0),
+                    commits_behind: Some(0),
+                },
+            },
+            150,
+        );
+
+        let updated = store.list().pop().expect("host remains recorded");
+        assert_eq!(updated.token_hash.as_deref(), Some("hash"));
+        assert_eq!(updated.last_seen, Some(150));
     }
 }
