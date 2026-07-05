@@ -66,10 +66,22 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .metric b{display:block;font-size:22px;line-height:1.1;font-weight:650;color:var(--ink)}
 .metric span{display:block;font-size:12px;color:var(--muted);margin-top:3px}
 .metric.live{border-color:rgba(37,132,95,.22)}.metric.stale{border-color:rgba(178,106,0,.24)}.metric.down{border-color:rgba(191,58,53,.24)}
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 18px;padding:9px;background:rgba(255,255,255,.72);border:1px solid rgba(210,226,234,.78);border-radius:8px;box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(8px)}
+.toolbar-left,.toolbar-right{display:flex;align-items:center;gap:10px;min-width:0}
+.seg{display:inline-flex;align-items:center;padding:3px;border:1px solid rgba(210,226,234,.86);border-radius:7px;background:rgba(244,250,251,.76)}
+.seg button{appearance:none;border:0;background:transparent;color:var(--muted);display:grid;place-items:center;width:30px;height:28px;border-radius:6px;cursor:pointer}
+.seg button[aria-pressed="true"]{background:#fff;color:var(--accent);box-shadow:0 1px 5px rgba(45,75,95,.12)}
+.seg .ico{width:16px;height:16px}
+.arrange{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;white-space:nowrap}
+.arrange select{appearance:none;border:0;background:transparent;color:var(--ink);font:inherit;font-weight:600;outline:none;padding-right:2px;cursor:pointer}
+.search{position:relative;min-width:210px;color:var(--muted)}
+.search .ico{position:absolute;left:10px;top:50%;width:15px;height:15px;transform:translateY(-50%)}
+.search input{width:100%;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px 0 32px;outline:none}
+.search input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(245px,1fr));gap:14px}
 .card{--state:var(--wait);position:relative;min-height:232px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
 .card:before{content:"";position:absolute;left:16px;right:16px;top:58px;height:1px;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent);pointer-events:none}
-.card[data-live="live"]{--state:var(--live)}.card[data-live="stale"]{--state:var(--stale)}.card[data-live="down"]{--state:var(--down)}.card[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
+[data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
 .card.light{border-color:rgba(214,155,49,.48);box-shadow:0 16px 34px rgba(150,103,28,.12)}
 .halo{position:absolute;inset:-84px -74px auto auto;width:190px;height:190px;background:radial-gradient(circle,rgba(214,155,49,.20),rgba(21,158,153,.08) 42%,transparent 70%);pointer-events:none}
 .lh{position:absolute;top:14px;right:14px;color:var(--sun)}
@@ -81,31 +93,42 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .role{font-size:12px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .status-pill{display:inline-flex;align-items:center;gap:6px;min-height:25px;max-width:150px;flex-shrink:0;padding:4px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--state) 24%,transparent);background:color-mix(in srgb,var(--state) 10%,white);color:var(--state);font-size:12px;white-space:nowrap}
 .status-pill .ico{width:14px;height:14px}.word{color:inherit;overflow:hidden;text-overflow:ellipsis}
-.state-icon{display:none}.card[data-live="live"] .state-icon.live,.card[data-live="stale"] .state-icon.stale,.card[data-live="down"] .state-icon.down,.card[data-live="awaiting_first_heartbeat"] .state-icon.awaiting{display:inline-block}
+.state-icon{display:none}[data-live="live"] .state-icon.live,[data-live="stale"] .state-icon.stale,[data-live="down"] .state-icon.down,[data-live="awaiting_first_heartbeat"] .state-icon.awaiting{display:inline-block}
 .fresh{min-height:38px;margin:4px 0 11px;font-size:13px;line-height:1.45;color:var(--ink)}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
-.beat{--beat-color:var(--state);--expect-alpha:.34;--target-alpha:.42;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
-.beat-stage{position:relative;height:38px;overflow:hidden}
-.beat-stage svg{display:block;width:100%;height:38px}
-.beat-floor{fill:none;stroke:#d8e6ed;stroke-width:2;stroke-linecap:round;stroke-dasharray:2 6}
-.beat-real{fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 0 4px color-mix(in srgb,currentColor 24%,transparent))}
-.beat[data-count="0"] .beat-real{opacity:0}
-.beat-expected{fill:none;stroke:#aebac3;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round;opacity:var(--expect-alpha);filter:drop-shadow(0 0 4px rgba(137,151,163,.18))}
-.beat-target{position:absolute;left:50%;top:5px;height:28px;border-left:1px solid rgba(137,151,163,.34);transform:translateX(-.5px);opacity:var(--target-alpha)}
-.beat-target:after{content:"";position:absolute;left:-4px;top:10px;width:7px;height:7px;border-radius:50%;border:1px solid #aebac3;background:rgba(255,255,255,.92);box-shadow:0 0 0 var(--target-ring) rgba(137,151,163,.12)}
-.beat-hit{position:absolute;left:50%;top:17px;width:7px;height:7px;border-radius:50%;background:currentColor;opacity:0;transform:translate(-50%,-50%) scale(.7)}
+.beat{--beat-color:var(--state);--expect-fill:0deg;--expect-alpha:.34;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
+.beat-stage{position:relative;height:36px;overflow:hidden}
+.beat-floor{position:absolute;left:0;right:0;top:18px;height:2px;border-radius:999px;background:linear-gradient(90deg,rgba(216,230,237,.42),rgba(174,186,195,.62),rgba(216,230,237,.42))}
+.beat-current{position:absolute;top:17px;left:-38%;width:38%;height:3px;border-radius:999px;background:linear-gradient(90deg,transparent,rgba(21,158,153,.32),rgba(214,155,49,.42),transparent);animation:tide 3.8s linear infinite;opacity:.72}
+.beat-marks{position:absolute;inset:0}
+.beat-mark{position:absolute;left:var(--mark-x);top:18px;width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 0 4px color-mix(in srgb,currentColor 10%,transparent);opacity:.78;transform:translate(-50%,-50%)}
+.beat[data-count="0"] .beat-mark{display:none}
+.beat-expected{position:absolute;left:50%;top:18px;width:18px;height:18px;border-radius:50%;border:1px solid #aebac3;background:conic-gradient(color-mix(in srgb,var(--beat-color) 72%,var(--sun)) var(--expect-fill),rgba(222,232,237,.9) 0),radial-gradient(circle,#fff 0 43%,transparent 45%);box-shadow:0 0 0 var(--target-ring) rgba(137,151,163,.12),0 0 16px rgba(214,155,49,.12);opacity:var(--expect-alpha);transform:translate(-50%,-50%)}
+.beat-expected:before,.beat-expected:after{content:"";position:absolute;left:50%;top:50%;width:28px;height:1px;background:#aebac3;opacity:.5;transform:translate(-50%,-50%)}
+.beat-expected:after{transform:translate(-50%,-50%) rotate(90deg)}
+.beat-hit{position:absolute;left:50%;top:18px;width:9px;height:9px;border-radius:50%;background:currentColor;opacity:0;transform:translate(-50%,-50%) scale(.7)}
 .beat[data-flash="true"] .beat-hit{animation:beat-hit .9s ease-out}
-.beat[data-flash="true"] .beat-real{stroke-dasharray:100;animation:draw-real .65s ease-out}
-.beat[data-beat="overdue"]{--beat-color:var(--down)}.beat[data-beat="overdue"] .beat-expected{stroke:var(--down);opacity:var(--late-alpha)}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="lit"]{--beat-color:var(--sun)}
+.beat[data-beat="overdue"]{--beat-color:var(--down)}.beat[data-beat="overdue"] .beat-expected{opacity:var(--late-alpha)}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="lit"]{--beat-color:var(--sun)}
 .beat-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:2px;font-size:11px;color:var(--muted)}
 .beat-meta strong{font-size:12px;color:var(--beat-color);font-weight:650}
 @keyframes beat-hit{0%{opacity:.9;transform:translate(-50%,-50%) scale(.55);box-shadow:0 0 0 0 color-mix(in srgb,currentColor 28%,transparent)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4);box-shadow:0 0 0 12px transparent}}
-@keyframes draw-real{from{stroke-dashoffset:100}to{stroke-dashoffset:0}}
+@keyframes tide{from{transform:translateX(0)}to{transform:translateX(365%)}}
+.list-wrap{display:none}
+main[data-view="list"] .grid{display:none}
+main[data-view="list"] .list-wrap{display:block}
+.list{width:100%;border-collapse:separate;border-spacing:0 8px}
+.list th{padding:0 12px 6px;text-align:left;color:var(--muted);font-size:11px;font-weight:600}
+.list td{padding:12px;background:rgba(255,255,255,.88);border-top:1px solid rgba(211,225,233,.86);border-bottom:1px solid rgba(211,225,233,.86);vertical-align:middle}
+.list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:8px 0 0 8px}
+.list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
+.list tr.light td{border-color:rgba(214,155,49,.34)}
+.list .host{min-width:210px}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .status-pill{max-width:120px}.list .beat{width:190px;margin:0}.list .beat-meta{display:none}
+[hidden]{display:none!important}
 .empty{margin-top:18px;padding:18px 20px;border:1px dashed #c5d7e0;border-radius:8px;background:rgba(255,255,255,.74);color:var(--muted)}
 .empty code{background:#edf6f7;padding:2px 7px;border-radius:6px;color:var(--ink)}
-@media (max-width:720px){main{padding:28px 16px 42px}.top{display:block}.asof{padding-top:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.grid{grid-template-columns:1fr}}
-@media (prefers-reduced-motion:reduce){.beat[data-flash="true"] .beat-hit,.beat[data-flash="true"] .beat-real{animation:none}}
+@media (max-width:720px){main{padding:28px 16px 42px}.top{display:block}.asof{padding-top:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:760px}}
+@media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body>"#;
 
 const FOOT: &str = r#"<script>
@@ -113,31 +136,26 @@ const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awa
 const MAX_BEATS=8;
 function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
-function cardFor(name){return Array.from(document.querySelectorAll('[data-host]')).find(card=>card.dataset.host===name)}
+function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(name+'='))?.split('=').slice(1).join('=')||''}
+function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
+function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host]')).filter(el=>el.dataset.host===name)}
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
-function historyPath(beats){
+function markHtml(beats){
   const kept=beats.slice(-MAX_BEATS);
   if(!kept.length)return '';
-  const start=8,end=90,base=23;
+  const start=5,end=45;
   const step=kept.length===1?0:(end-start)/(kept.length-1);
-  let d='M4 '+base;
-  kept.forEach((_,i)=>{
+  return kept.map((_,i)=>{
     const x=kept.length===1?end:start+i*step;
-    d+=' L '+Math.max(4,x-7).toFixed(1)+' '+base;
-    d+=' L '+(x-3).toFixed(1)+' '+base;
-    d+=' L '+(x-1.1).toFixed(1)+' 12';
-    d+=' L '+(x+2.4).toFixed(1)+' 31';
-    d+=' L '+(x+5.3).toFixed(1)+' 18';
-    d+=' L '+(x+8).toFixed(1)+' '+base;
-  });
-  return d+' L 98 '+base;
+    return '<span class="beat-mark" style="--mark-x:'+x.toFixed(1)+'%"></span>';
+  }).join('');
 }
 function setBeatHistory(beat,beats){
   const kept=Array.from(new Set(beats)).sort((a,b)=>a-b).slice(-MAX_BEATS);
   beat.dataset.beats=kept.join(',');
   beat.dataset.count=String(kept.length);
-  const line=beat.querySelector('.beat-real');
-  if(line)line.setAttribute('d',historyPath(kept));
+  const marks=beat.querySelector('.beat-marks');
+  if(marks)marks.innerHTML=markHtml(kept);
 }
 function flashBeat(beat){
   beat.dataset.flash='true';
@@ -160,7 +178,7 @@ function updateBeatClock(beat,now){
   const remaining=nextAt-now;
   const expect=Math.max(0,Math.min(1,1-(remaining/interval)));
   beat.style.setProperty('--expect-alpha',(.34+expect*.45).toFixed(3));
-  beat.style.setProperty('--target-alpha',(.42+expect*.38).toFixed(3));
+  beat.style.setProperty('--expect-fill',(expect*360).toFixed(1)+'deg');
   beat.style.setProperty('--target-ring',(3+expect*5).toFixed(1)+'px');
   if(remaining>=0){
     beat.style.setProperty('--late-alpha','.3');
@@ -168,7 +186,7 @@ function updateBeatClock(beat,now){
     if(next)next.textContent='in '+dur(remaining);
   }else{
     beat.style.setProperty('--expect-alpha','.79');
-    beat.style.setProperty('--target-alpha','.8');
+    beat.style.setProperty('--expect-fill','360deg');
     beat.style.setProperty('--target-ring','8px');
     beat.style.setProperty('--late-alpha',(.3+Math.min(1,(-remaining/interval))*.5).toFixed(3));
     beat.dataset.beat='overdue';
@@ -188,6 +206,59 @@ function setSeen(card,last,now){
   if(last==null){seen.textContent='never seen';return}
   seen.textContent='last seen '+dur(now-last)+' ago';
 }
+function sevFor(live){return live==='down'?0:live==='stale'?1:live==='awaiting_first_heartbeat'?2:3}
+function cmp(a,b,mode){
+  const self=Number(b.dataset.self==='true')-Number(a.dataset.self==='true');
+  if(self)return self;
+  if(mode==='name')return a.dataset.sortName.localeCompare(b.dataset.sortName);
+  if(mode==='last')return Number(b.dataset.last||0)-Number(a.dataset.last||0)||a.dataset.sortName.localeCompare(b.dataset.sortName);
+  return Number(a.dataset.sev)-Number(b.dataset.sev)||a.dataset.sortName.localeCompare(b.dataset.sortName);
+}
+function applySort(mode,write=true){
+  mode=['attention','name','last'].includes(mode)?mode:'attention';
+  const grid=document.querySelector('[data-grid]');
+  const body=document.querySelector('[data-list-body]');
+  if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
+  if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
+  const select=document.querySelector('[data-sort]');
+  if(select)select.value=mode;
+  if(write)setCookie('pharos_sort',mode);
+}
+function applyView(view,write=true){
+  view=view==='list'?'list':'grid';
+  const main=document.querySelector('main');
+  if(main)main.dataset.view=view;
+  document.querySelectorAll('[data-view-button]').forEach(btn=>btn.setAttribute('aria-pressed',String(btn.dataset.viewButton===view)));
+  if(write)setCookie('pharos_view',view);
+}
+function applyFilter(query,write=true){
+  const q=query.trim().toLowerCase();
+  document.querySelectorAll('[data-host]').forEach(el=>{el.hidden=q!==''&&!el.dataset.search.includes(q)});
+  const input=document.querySelector('[data-search]');
+  if(input&&input.value!==query)input.value=query;
+  if(write)setCookie('pharos_search',query);
+}
+function updateUrlState(){
+  const main=document.querySelector('main');
+  const sort=document.querySelector('[data-sort]')?.value||'attention';
+  const params=new URLSearchParams(location.search);
+  params.set('view',main?.dataset.view||'grid');
+  params.set('sort',sort);
+  const url=location.pathname+'?'+params.toString();
+  history.replaceState(null,'',url);
+}
+function initControls(){
+  const params=new URLSearchParams(location.search);
+  const view=params.get('view')||decodeURIComponent(cookie('pharos_view'))||'grid';
+  const sort=params.get('sort')||decodeURIComponent(cookie('pharos_sort'))||'attention';
+  const search=decodeURIComponent(cookie('pharos_search'));
+  applyView(view,false);
+  applySort(sort,false);
+  applyFilter(search,false);
+  document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
+  document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
+  document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
+}
 async function refresh(){
   try{
     const res=await fetch('/hosts.json',{headers:{Accept:'application/json'}});
@@ -197,32 +268,38 @@ async function refresh(){
     const asof=document.querySelector('[data-as-of]');
     if(asof)asof.textContent='as of '+clock(now);
     for(const h of data.hosts||[]){
-      const card=cardFor(h.name);
-      if(!card)continue;
-      if(card.dataset.self==='true')card.dataset.live='live';else card.dataset.live=h.liveness;
-      const word=card.querySelector('[data-status-word]');
-      if(word&&card.dataset.self!=='true')word.textContent=words[h.liveness]||h.liveness;
-      const fresh=card.querySelector('[data-fresh]');
-      if(fresh)fresh.textContent=h.freshness_tldr;
-      setSeen(card,h.last_seen,now);
-      const beat=card.querySelector('.beat');
-      if(beat){
-        const previous=Number(beat.dataset.last);
-        const last=h.last_seen == null ? NaN : Number(h.last_seen);
-        const interval=h.heartbeat_interval_secs || 60;
-        const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
-        const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
-        setBeatHistory(beat,beats);
-        if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous)flashBeat(beat);
-        beat.dataset.ready='true';
-        beat.dataset.last=Number.isFinite(last)?String(last):'';
-        beat.dataset.interval=interval;
-        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
+      const surfaces=hostSurfaces(h.name);
+      for(const card of surfaces){
+        const live=card.dataset.self==='true'?'live':h.liveness;
+        card.dataset.live=live;
+        card.dataset.sev=String(sevFor(live));
+        card.dataset.last=h.last_seen ?? 0;
+        const word=card.querySelector('[data-status-word]');
+        if(word&&card.dataset.self!=='true')word.textContent=words[h.liveness]||h.liveness;
+        const fresh=card.querySelector('[data-fresh]');
+        if(fresh)fresh.textContent=h.freshness_tldr;
+        setSeen(card,h.last_seen,now);
+        const beat=card.querySelector('.beat');
+        if(beat){
+          const previous=Number(beat.dataset.last);
+          const last=h.last_seen == null ? NaN : Number(h.last_seen);
+          const interval=h.heartbeat_interval_secs || 60;
+          const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
+          const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
+          setBeatHistory(beat,beats);
+          if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous)flashBeat(beat);
+          beat.dataset.ready='true';
+          beat.dataset.last=Number.isFinite(last)?String(last):'';
+          beat.dataset.interval=interval;
+          beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
+        }
       }
     }
+    applySort(document.querySelector('[data-sort]')?.value||'attention',false);
   }catch(_){}
 }
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.beats));beat.dataset.ready='true'});
+initControls();
 requestAnimationFrame(frame);
 setInterval(refresh,10000);
 setTimeout(refresh,3000);
@@ -300,6 +377,15 @@ fn live_key(live: Liveness) -> &'static str {
     }
 }
 
+fn severity(live: Liveness) -> u8 {
+    match live {
+        Liveness::Down => 0,
+        Liveness::Stale => 1,
+        Liveness::AwaitingFirstHeartbeat => 2,
+        Liveness::Live => 3,
+    }
+}
+
 fn icon_with_class(svg: &str, class: &str) -> String {
     svg.replacen("class=\"ico\"", &format!("class=\"ico {class}\""), 1)
 }
@@ -369,6 +455,15 @@ fn header(now: i64) -> String {
     )
 }
 
+fn toolbar() -> String {
+    format!(
+        r#"<section class="toolbar" aria-label="fleet controls"><div class="toolbar-left"><div class="seg" role="group" aria-label="view"><button type="button" data-view-button="grid" aria-pressed="true" title="Grid view">{grid}</button><button type="button" data-view-button="list" aria-pressed="false" title="List view">{list}</button></div><label class="arrange">Arrange by <select data-sort aria-label="arrange by"><option value="attention">Needs attention</option><option value="name">Name</option><option value="last">Last change</option></select></label></div><div class="toolbar-right"><label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="Search hosts..."></label></div></section>"#,
+        grid = icons::GRID,
+        list = icons::LIST,
+        search = icons::SEARCH
+    )
+}
+
 fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
     let mut recent = log.to_vec();
     if recent.is_empty() {
@@ -384,38 +479,30 @@ fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
     recent
 }
 
-fn heartbeat_history_path(log: &[i64]) -> String {
+fn heartbeat_marks(log: &[i64]) -> String {
     if log.is_empty() {
         return String::new();
     }
 
-    let start = 8.0;
-    let end = 90.0;
-    let base = 23.0;
+    let start = 5.0;
+    let end = 45.0;
     let step = if log.len() == 1 {
         0.0
     } else {
         (end - start) / (log.len() - 1) as f64
     };
-    let mut path = format!("M4 {base}");
+    let mut marks = String::new();
     for idx in 0..log.len() {
         let x = if log.len() == 1 {
             end
         } else {
             start + idx as f64 * step
         };
-        path.push_str(&format!(
-            " L {:.1} {base} L {:.1} {base} L {:.1} 12 L {:.1} 31 L {:.1} 18 L {:.1} {base}",
-            (x - 7.0).max(4.0),
-            x - 3.0,
-            x - 1.1,
-            x + 2.4,
-            x + 5.3,
-            x + 8.0
+        marks.push_str(&format!(
+            r#"<span class="beat-mark" style="--mark-x:{x:.1}%"></span>"#
         ));
     }
-    path.push_str(&format!(" L 98 {base}"));
-    path
+    marks
 }
 
 fn heartbeat_card(
@@ -434,7 +521,7 @@ fn heartbeat_card(
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let real_path = heartbeat_history_path(&recent);
+    let marks = heartbeat_marks(&recent);
     let (last_attr, next_at_attr, beat_state, next) = match last_seen {
         Some(last) => {
             let remaining = last + interval - now;
@@ -463,7 +550,7 @@ fn heartbeat_card(
     };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}"{self_attr}><div class="beat-stage"><svg viewBox="0 0 220 38" preserveAspectRatio="none" aria-hidden="true"><path class="beat-floor" d="M4 23H216"/><path class="beat-real" pathLength="100" d="{real_path}"/><path class="beat-expected" d="M101 23H107l3.5-10 4.5 20 4.5-13 5.5 3H137"/></svg><span class="beat-target"></span><span class="beat-hit"></span></div><div class="beat-meta"><span>next heartbeat</span><strong data-next>{next}</strong></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}"{self_attr}><div class="beat-stage"><span class="beat-floor"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-expected"></span><span class="beat-hit"></span></div><div class="beat-meta"><span>next heartbeat</span><strong data-next>{next}</strong></div></div>"#,
         count = recent.len()
     )
 }
@@ -490,6 +577,7 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
     });
 
     let mut cards = String::new();
+    let mut rows = String::new();
     for h in sorted {
         let is_self = h.name == self_name;
         let mut live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
@@ -505,6 +593,15 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
         let name = html_escape(&h.name);
         let role = html_escape(&h.role);
         let fresh = html_escape(&h.freshness.tldr());
+        let search = html_escape(&format!(
+            "{} {} {}",
+            h.name.to_lowercase(),
+            h.role.to_lowercase(),
+            h.freshness.tldr().to_lowercase()
+        ));
+        let sort_name = html_escape(&h.name.to_lowercase());
+        let last_sort = h.last_seen.unwrap_or(0);
+        let sev = severity(live);
         let seen = match h.last_seen {
             Some(t) => format!("last seen {} ago", duration_label(now - t)),
             None => "never seen".to_string(),
@@ -534,16 +631,22 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
             is_self,
         );
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header><div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
+            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header><div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
+        ));
+        rows.push_str(&format!(
+            r#"<tr class="{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td></tr>"#,
+            live_key = live_key(live),
+            light_cls = light_cls.trim()
         ));
     }
 
     format!(
-        "{HEAD}<main>{header}{summary}<div class=\"grid\">{cards}</div></main>{FOOT}",
+        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section></main>{FOOT}",
         header = header(now),
-        summary = summary_cards(hosts, self_name, now)
+        summary = summary_cards(hosts, self_name, now),
+        toolbar = toolbar()
     )
 }
 
@@ -623,13 +726,19 @@ mod tests {
 
         let html = render_home(&hosts, "csb1", 1000);
 
-        assert!(html.contains(r#"data-host="csb1" data-live="live" data-self="true""#));
+        assert!(html.contains(r#"<section class="toolbar""#));
+        assert!(html.contains(r#"data-view-button="list""#));
+        assert!(html.contains(r#"<table class="list">"#));
+        assert!(html.contains(r#"data-host="csb1" data-live="live""#));
+        assert!(html.contains(r#"data-self="true""#));
         assert!(html.contains("the light is lit"));
         assert!(html.contains("next heartbeat"));
         assert!(html.contains(r#"data-next>in 30s"#));
         assert!(html.contains(r#"data-beats="850,910,970""#));
+        assert!(html.contains("beat-current"));
         assert!(html.contains("beat-expected"));
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
+        assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
     }
 }
