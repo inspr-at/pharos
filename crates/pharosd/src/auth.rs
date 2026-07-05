@@ -21,11 +21,11 @@ use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
+use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
 use openidconnect::reqwest::async_http_client;
 use openidconnect::{
-    AuthorizationCode, ClientId, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope, TokenResponse,
+    AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, IssuerUrl, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
 
 const SESSION_COOKIE: &str = "pharos_session";
@@ -54,7 +54,10 @@ struct Session {
 }
 
 pub struct Auth {
-    client: CoreClient,
+    issuer: IssuerUrl,
+    client_id: ClientId,
+    redirect: RedirectUrl,
+    client: Mutex<CoreClient>,
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, Session>>,
 }
@@ -72,19 +75,55 @@ impl Auth {
         let redirect = std::env::var("PHAROS_OIDC_REDIRECT_URI").ok()?;
 
         let issuer_url = IssuerUrl::new(issuer.clone()).expect("PHAROS_OIDC_ISSUER is not a URL");
-        let metadata = CoreProviderMetadata::discover_async(issuer_url, async_http_client)
+        let client_id = ClientId::new(client_id);
+        let redirect = RedirectUrl::new(redirect).expect("PHAROS_OIDC_REDIRECT_URI is not a URL");
+        let client = discover_client(issuer_url.clone(), client_id.clone(), redirect.clone())
             .await
             .expect("OIDC discovery failed (issuer unreachable?)");
-        let client = CoreClient::from_provider_metadata(metadata, ClientId::new(client_id), None)
-            .set_redirect_uri(
-                RedirectUrl::new(redirect).expect("PHAROS_OIDC_REDIRECT_URI is not a URL"),
-            );
         tracing::info!("OIDC auth enabled (issuer {issuer})");
         Some(Arc::new(Auth {
-            client,
+            issuer: issuer_url,
+            client_id,
+            redirect,
+            client: Mutex::new(client),
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
         }))
+    }
+
+    fn client(&self) -> CoreClient {
+        self.client.lock().expect("client lock").clone()
+    }
+
+    /// Refresh OIDC discovery/JWKS metadata. Zitadel can rotate signing keys
+    /// while pharosd is running; retrying with a refreshed verifier avoids a
+    /// manual restart without weakening token validation.
+    async fn refresh_client(&self) -> Result<(), String> {
+        let client = discover_client(
+            self.issuer.clone(),
+            self.client_id.clone(),
+            self.redirect.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        *self.client.lock().expect("client lock") = client;
+        Ok(())
+    }
+
+    fn verify_id_token_subject(
+        &self,
+        client: &CoreClient,
+        id_token: &CoreIdToken,
+        nonce: &Nonce,
+    ) -> Result<String, ClaimsVerificationError> {
+        let verifier = client
+            .id_token_verifier()
+            // Zitadel adds the project id to the id_token audience alongside our
+            // client_id; accept the extra audience (client_id presence,
+            // signature, issuer, and nonce are still enforced).
+            .set_other_audience_verifier_fn(|_aud| true);
+        let claims = id_token.claims(&verifier, nonce)?;
+        Ok(claims.subject().as_str().to_string())
     }
 
     fn sweep(&self) {
@@ -109,6 +148,15 @@ impl Auth {
             .get(&sid)
             .is_some_and(|s| s.expires > now())
     }
+}
+
+async fn discover_client(
+    issuer: IssuerUrl,
+    client_id: ClientId,
+    redirect: RedirectUrl,
+) -> Result<CoreClient, Box<dyn std::error::Error + Send + Sync>> {
+    let metadata = CoreProviderMetadata::discover_async(issuer, async_http_client).await?;
+    Ok(CoreClient::from_provider_metadata(metadata, client_id, None).set_redirect_uri(redirect))
 }
 
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -145,8 +193,8 @@ pub async fn login(State(auth): State<AuthState>) -> Response {
     auth.sweep();
 
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let (url, csrf, nonce) = auth
-        .client
+    let client = auth.client();
+    let (url, csrf, nonce) = client
         .authorize_url(
             CoreAuthenticationFlow::AuthorizationCode,
             CsrfToken::new_random,
@@ -188,8 +236,8 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
         return (StatusCode::BAD_REQUEST, "unknown or expired login").into_response();
     };
 
-    let token = match auth
-        .client
+    let client = auth.client();
+    let token = match client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(pending.verifier)
         .request_async(async_http_client)
@@ -204,21 +252,45 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
     let Some(id_token) = token.id_token() else {
         return (StatusCode::UNAUTHORIZED, "no id_token").into_response();
     };
-    let verifier = auth
-        .client
-        .id_token_verifier()
-        // Zitadel adds the project id to the id_token audience alongside our
-        // client_id; accept the extra audience (client_id presence, signature,
-        // issuer, and nonce are still enforced).
-        .set_other_audience_verifier_fn(|_aud| true);
-    let claims = match id_token.claims(&verifier, &pending.nonce) {
-        Ok(c) => c,
+    let subject = match auth.verify_id_token_subject(&client, id_token, &pending.nonce) {
+        Ok(subject) => subject,
+        Err(ClaimsVerificationError::SignatureVerification(e)) => {
+            tracing::warn!(
+                "id_token signature verification failed; refreshing OIDC metadata and retrying: {e}"
+            );
+            if let Err(refresh_err) = auth.refresh_client().await {
+                tracing::warn!("OIDC metadata refresh failed: {refresh_err}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "login verification temporarily unavailable; please retry",
+                )
+                    .into_response();
+            }
+            let refreshed = auth.client();
+            match auth.verify_id_token_subject(&refreshed, id_token, &pending.nonce) {
+                Ok(subject) => {
+                    tracing::info!("id_token verified after OIDC metadata refresh");
+                    subject
+                }
+                Err(e) => {
+                    tracing::warn!("id_token verification failed after OIDC metadata refresh: {e}");
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "login verification failed; please retry",
+                    )
+                        .into_response();
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!("id_token verification failed: {e}");
-            return (StatusCode::UNAUTHORIZED, "id_token invalid").into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                "login verification failed; please retry",
+            )
+                .into_response();
         }
     };
-    let subject = claims.subject().as_str().to_string();
 
     let sid = CsrfToken::new_random().secret().clone();
     auth.sessions.lock().expect("sessions lock").insert(
