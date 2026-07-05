@@ -20,6 +20,10 @@ pub struct Host {
     pub is_nix: bool,
     /// Server-received time of the last beacon report. `None` = never seen.
     pub last_seen: Option<UnixSeconds>,
+    /// Recent server-received heartbeat times. These are real report events,
+    /// retained only so the dashboard can draw an honest pulse history.
+    #[serde(default)]
+    pub heartbeat_log: Vec<UnixSeconds>,
     /// Beacon's reported heartbeat cadence — drives the "expected next" pulse.
     pub heartbeat_interval_secs: Option<u64>,
     pub freshness: NixFreshness,
@@ -158,5 +162,15 @@ mod tests {
         assert_eq!(liveness(Some(1000), Some(60), 1000), Liveness::Live);
         assert_eq!(liveness(Some(1000), Some(60), 1000 + 121), Liveness::Stale);
         assert_eq!(liveness(Some(1000), Some(60), 1000 + 301), Liveness::Down);
+    }
+
+    #[test]
+    fn host_heartbeat_log_defaults_for_existing_json() {
+        let host: Host = serde_json::from_str(
+            r#"{"name":"hades","role":"NixOS Host","is_nix":true,"last_seen":1000,"heartbeat_interval_secs":60,"freshness":{"applicable":true,"flake_lock_age_days":null,"commits_behind":null}}"#,
+        )
+        .expect("deserialize old host json");
+
+        assert!(host.heartbeat_log.is_empty());
     }
 }

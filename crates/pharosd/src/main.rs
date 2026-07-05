@@ -85,50 +85,102 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .fresh{min-height:38px;margin:4px 0 11px;font-size:13px;line-height:1.45;color:var(--ink)}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
-.beat{--beat-pct:0;--beat-color:var(--state);margin-top:10px;color:var(--beat-color)}
-.beat-wave{position:relative;height:34px;overflow:hidden}
-.beat-wave svg{display:block;width:100%;height:34px}
-.beat-base{fill:none;stroke:#d8e6ed;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.beat-signal{fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:100;stroke-dashoffset:calc(100 - var(--beat-pct));filter:drop-shadow(0 0 4px color-mix(in srgb,currentColor 28%,transparent));transition:stroke-dashoffset .35s ease}
-.beat-dot{position:absolute;top:15px;left:calc(var(--beat-pct) * 1%);width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 0 5px color-mix(in srgb,currentColor 14%,transparent);transform:translateX(-3px);transition:left .35s ease}
-.beat[data-beat="overdue"]{--beat-color:var(--down)}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="lit"]{--beat-color:var(--sun)}
+.beat{--beat-color:var(--state);--expect-alpha:.34;--target-alpha:.42;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
+.beat-stage{position:relative;height:38px;overflow:hidden}
+.beat-stage svg{display:block;width:100%;height:38px}
+.beat-floor{fill:none;stroke:#d8e6ed;stroke-width:2;stroke-linecap:round;stroke-dasharray:2 6}
+.beat-real{fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 0 4px color-mix(in srgb,currentColor 24%,transparent))}
+.beat[data-count="0"] .beat-real{opacity:0}
+.beat-expected{fill:none;stroke:#aebac3;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round;opacity:var(--expect-alpha);filter:drop-shadow(0 0 4px rgba(137,151,163,.18))}
+.beat-target{position:absolute;left:50%;top:5px;height:28px;border-left:1px solid rgba(137,151,163,.34);transform:translateX(-.5px);opacity:var(--target-alpha)}
+.beat-target:after{content:"";position:absolute;left:-4px;top:10px;width:7px;height:7px;border-radius:50%;border:1px solid #aebac3;background:rgba(255,255,255,.92);box-shadow:0 0 0 var(--target-ring) rgba(137,151,163,.12)}
+.beat-hit{position:absolute;left:50%;top:17px;width:7px;height:7px;border-radius:50%;background:currentColor;opacity:0;transform:translate(-50%,-50%) scale(.7)}
+.beat[data-flash="true"] .beat-hit{animation:beat-hit .9s ease-out}
+.beat[data-flash="true"] .beat-real{stroke-dasharray:100;animation:draw-real .65s ease-out}
+.beat[data-beat="overdue"]{--beat-color:var(--down)}.beat[data-beat="overdue"] .beat-expected{stroke:var(--down);opacity:var(--late-alpha)}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="lit"]{--beat-color:var(--sun)}
 .beat-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:2px;font-size:11px;color:var(--muted)}
 .beat-meta strong{font-size:12px;color:var(--beat-color);font-weight:650}
+@keyframes beat-hit{0%{opacity:.9;transform:translate(-50%,-50%) scale(.55);box-shadow:0 0 0 0 color-mix(in srgb,currentColor 28%,transparent)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4);box-shadow:0 0 0 12px transparent}}
+@keyframes draw-real{from{stroke-dashoffset:100}to{stroke-dashoffset:0}}
 .empty{margin-top:18px;padding:18px 20px;border:1px dashed #c5d7e0;border-radius:8px;background:rgba(255,255,255,.74);color:var(--muted)}
 .empty code{background:#edf6f7;padding:2px 7px;border-radius:6px;color:var(--ink)}
 @media (max-width:720px){main{padding:28px 16px 42px}.top{display:block}.asof{padding-top:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.grid{grid-template-columns:1fr}}
-@media (prefers-reduced-motion:reduce){.beat-signal,.beat-dot{transition:none}}
+@media (prefers-reduced-motion:reduce){.beat[data-flash="true"] .beat-hit,.beat[data-flash="true"] .beat-real{animation:none}}
 </style></head><body>"#;
 
 const FOOT: &str = r#"<script>
 const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awaiting'};
-function dur(s){s=Math.max(0,Math.floor(s));return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
+const MAX_BEATS=8;
+function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 function cardFor(name){return Array.from(document.querySelectorAll('[data-host]')).find(card=>card.dataset.host===name)}
-function tick(){
-  const now=Math.floor(Date.now()/1000);
-  document.querySelectorAll('.beat').forEach(beat=>{
-    const last=Number(beat.dataset.last);
-    const interval=Math.max(1,Number(beat.dataset.interval)||60);
-    const next=beat.querySelector('[data-next]');
-    if(!Number.isFinite(last)||last<=0){
-      beat.style.setProperty('--beat-pct',0);
-      beat.dataset.beat='waiting';
-      if(next)next.textContent='waiting';
-      return;
-    }
-    const remaining=last+interval-now;
-    const elapsed=Math.max(0,Math.min(interval,now-last));
-    beat.style.setProperty('--beat-pct',String((elapsed/interval*100).toFixed(1)));
-    if(remaining>=0){
-      if(beat.dataset.self==='true')beat.dataset.beat='lit';else beat.dataset.beat='ok';
-      if(next)next.textContent='in '+dur(remaining);
-    }else{
-      beat.style.setProperty('--beat-pct',100);
-      beat.dataset.beat='overdue';
-      if(next)next.textContent='overdue '+dur(-remaining);
-    }
+function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
+function historyPath(beats){
+  const kept=beats.slice(-MAX_BEATS);
+  if(!kept.length)return '';
+  const start=8,end=90,base=23;
+  const step=kept.length===1?0:(end-start)/(kept.length-1);
+  let d='M4 '+base;
+  kept.forEach((_,i)=>{
+    const x=kept.length===1?end:start+i*step;
+    d+=' L '+Math.max(4,x-7).toFixed(1)+' '+base;
+    d+=' L '+(x-3).toFixed(1)+' '+base;
+    d+=' L '+(x-1.1).toFixed(1)+' 12';
+    d+=' L '+(x+2.4).toFixed(1)+' 31';
+    d+=' L '+(x+5.3).toFixed(1)+' 18';
+    d+=' L '+(x+8).toFixed(1)+' '+base;
   });
+  return d+' L 98 '+base;
+}
+function setBeatHistory(beat,beats){
+  const kept=Array.from(new Set(beats)).sort((a,b)=>a-b).slice(-MAX_BEATS);
+  beat.dataset.beats=kept.join(',');
+  beat.dataset.count=String(kept.length);
+  const line=beat.querySelector('.beat-real');
+  if(line)line.setAttribute('d',historyPath(kept));
+}
+function flashBeat(beat){
+  beat.dataset.flash='true';
+  window.setTimeout(()=>{delete beat.dataset.flash},950);
+}
+function updateBeatClock(beat,now){
+  const last=Number(beat.dataset.last);
+  const interval=Math.max(1,Number(beat.dataset.interval)||60);
+  const nextAt=Number(beat.dataset.nextAt)||last+interval;
+  const next=beat.querySelector('[data-next]');
+  if(!Number.isFinite(last)||last<=0){
+    beat.style.setProperty('--expect-alpha','.22');
+    beat.style.setProperty('--target-alpha','.3');
+    beat.style.setProperty('--target-ring','3px');
+    beat.style.setProperty('--late-alpha','.3');
+    beat.dataset.beat='waiting';
+    if(next)next.textContent='waiting';
+    return;
+  }
+  const remaining=nextAt-now;
+  const expect=Math.max(0,Math.min(1,1-(remaining/interval)));
+  beat.style.setProperty('--expect-alpha',(.34+expect*.45).toFixed(3));
+  beat.style.setProperty('--target-alpha',(.42+expect*.38).toFixed(3));
+  beat.style.setProperty('--target-ring',(3+expect*5).toFixed(1)+'px');
+  if(remaining>=0){
+    beat.style.setProperty('--late-alpha','.3');
+    beat.dataset.beat=beat.dataset.self==='true'?'lit':'tracking';
+    if(next)next.textContent='in '+dur(remaining);
+  }else{
+    beat.style.setProperty('--expect-alpha','.79');
+    beat.style.setProperty('--target-alpha','.8');
+    beat.style.setProperty('--target-ring','8px');
+    beat.style.setProperty('--late-alpha',(.3+Math.min(1,(-remaining/interval))*.5).toFixed(3));
+    beat.dataset.beat='overdue';
+    if(next)next.textContent='overdue '+dur(-remaining);
+  }
+}
+function frame(){
+  const now=Date.now()/1000;
+  document.querySelectorAll('.beat').forEach(beat=>{
+    updateBeatClock(beat,now);
+  });
+  requestAnimationFrame(frame);
 }
 function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
@@ -155,18 +207,28 @@ async function refresh(){
       setSeen(card,h.last_seen,now);
       const beat=card.querySelector('.beat');
       if(beat){
-        beat.dataset.last=h.last_seen ?? '';
-        beat.dataset.interval=h.heartbeat_interval_secs || 60;
+        const previous=Number(beat.dataset.last);
+        const last=h.last_seen == null ? NaN : Number(h.last_seen);
+        const interval=h.heartbeat_interval_secs || 60;
+        const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
+        const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
+        setBeatHistory(beat,beats);
+        if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous)flashBeat(beat);
+        beat.dataset.ready='true';
+        beat.dataset.last=Number.isFinite(last)?String(last):'';
+        beat.dataset.interval=interval;
+        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
       }
     }
-    tick();
   }catch(_){}
 }
-tick();
-setInterval(tick,1000);
-setInterval(refresh,30000);
+document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.beats));beat.dataset.ready='true'});
+requestAnimationFrame(frame);
+setInterval(refresh,10000);
 setTimeout(refresh,3000);
 </script></body></html>"#;
+
+const HEARTBEAT_UI_EVENTS: usize = 8;
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -207,6 +269,7 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> 
                 "role": h.role,
                 "is_nix": h.is_nix,
                 "last_seen": h.last_seen,
+                "heartbeat_log": h.heartbeat_log,
                 "heartbeat_interval_secs": h.heartbeat_interval_secs,
                 "liveness": live,
                 "freshness_tldr": h.freshness.tldr(),
@@ -306,8 +369,58 @@ fn header(now: i64) -> String {
     )
 }
 
+fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
+    let mut recent = log.to_vec();
+    if recent.is_empty() {
+        if let Some(last) = last_seen {
+            recent.push(last);
+        }
+    }
+    recent.sort_unstable();
+    recent.dedup();
+    if recent.len() > HEARTBEAT_UI_EVENTS {
+        recent.drain(0..recent.len() - HEARTBEAT_UI_EVENTS);
+    }
+    recent
+}
+
+fn heartbeat_history_path(log: &[i64]) -> String {
+    if log.is_empty() {
+        return String::new();
+    }
+
+    let start = 8.0;
+    let end = 90.0;
+    let base = 23.0;
+    let step = if log.len() == 1 {
+        0.0
+    } else {
+        (end - start) / (log.len() - 1) as f64
+    };
+    let mut path = format!("M4 {base}");
+    for idx in 0..log.len() {
+        let x = if log.len() == 1 {
+            end
+        } else {
+            start + idx as f64 * step
+        };
+        path.push_str(&format!(
+            " L {:.1} {base} L {:.1} {base} L {:.1} 12 L {:.1} 31 L {:.1} 18 L {:.1} {base}",
+            (x - 7.0).max(4.0),
+            x - 3.0,
+            x - 1.1,
+            x + 2.4,
+            x + 5.3,
+            x + 8.0
+        ));
+    }
+    path.push_str(&format!(" L 98 {base}"));
+    path
+}
+
 fn heartbeat_card(
     last_seen: Option<i64>,
+    heartbeat_log: &[i64],
     interval_secs: Option<u64>,
     now: i64,
     is_self: bool,
@@ -315,32 +428,43 @@ fn heartbeat_card(
     let interval = i64::try_from(interval_secs.unwrap_or(60))
         .unwrap_or(60)
         .max(1);
-    let (last_attr, pct, beat_state, next) = match last_seen {
+    let recent = recent_heartbeat_log(heartbeat_log, last_seen);
+    let beats_attr = recent
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let real_path = heartbeat_history_path(&recent);
+    let (last_attr, next_at_attr, beat_state, next) = match last_seen {
         Some(last) => {
-            let elapsed = (now - last).clamp(0, interval);
             let remaining = last + interval - now;
-            let pct = (elapsed as f64 / interval as f64) * 100.0;
             if remaining >= 0 {
                 (
                     last.to_string(),
-                    pct,
+                    (last + interval).to_string(),
                     if is_self { "lit" } else { "ok" },
                     format!("in {}", duration_label(remaining)),
                 )
             } else {
                 (
                     last.to_string(),
-                    100.0,
+                    (last + interval).to_string(),
                     "overdue",
                     format!("overdue {}", duration_label(-remaining)),
                 )
             }
         }
-        None => ("".to_string(), 0.0, "waiting", "waiting".to_string()),
+        None => (
+            "".to_string(),
+            "".to_string(),
+            "waiting",
+            "waiting".to_string(),
+        ),
     };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-last="{last_attr}" data-interval="{interval}"{self_attr} style="--beat-pct:{pct:.1}"><div class="beat-wave"><svg viewBox="0 0 220 34" preserveAspectRatio="none" aria-hidden="true"><path class="beat-base" pathLength="100" d="M1 21H31l6-13 8 25 7-17 7 5h35l5-9 7 18 8-17 5 8h101"/><path class="beat-signal" pathLength="100" d="M1 21H31l6-13 8 25 7-17 7 5h35l5-9 7 18 8-17 5 8h101"/></svg><span class="beat-dot"></span></div><div class="beat-meta"><span>next heartbeat</span><strong data-next>{next}</strong></div></div>"#
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}"{self_attr}><div class="beat-stage"><svg viewBox="0 0 220 38" preserveAspectRatio="none" aria-hidden="true"><path class="beat-floor" d="M4 23H216"/><path class="beat-real" pathLength="100" d="{real_path}"/><path class="beat-expected" d="M101 23H107l3.5-10 4.5 20 4.5-13 5.5 3H137"/></svg><span class="beat-target"></span><span class="beat-hit"></span></div><div class="beat-meta"><span>next heartbeat</span><strong data-next>{next}</strong></div></div>"#,
+        count = recent.len()
     )
 }
 
@@ -402,7 +526,13 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
         } else {
             status_icon_stack()
         };
-        let heartbeat = heartbeat_card(h.last_seen, h.heartbeat_interval_secs, now, is_self);
+        let heartbeat = heartbeat_card(
+            h.last_seen,
+            &h.heartbeat_log,
+            h.heartbeat_interval_secs,
+            now,
+            is_self,
+        );
         cards.push_str(&format!(
             r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header><div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
             live_key = live_key(live),
@@ -469,6 +599,7 @@ mod tests {
                 role: "Control Server".to_string(),
                 is_nix: true,
                 last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
                 freshness: NixFreshness {
                     applicable: true,
@@ -480,6 +611,7 @@ mod tests {
                 role: "NixOS Host".to_string(),
                 is_nix: true,
                 last_seen: Some(879),
+                heartbeat_log: vec![760, 819, 879],
                 heartbeat_interval_secs: Some(60),
                 freshness: NixFreshness {
                     applicable: true,
@@ -495,6 +627,8 @@ mod tests {
         assert!(html.contains("the light is lit"));
         assert!(html.contains("next heartbeat"));
         assert!(html.contains(r#"data-next>in 30s"#));
+        assert!(html.contains(r#"data-beats="850,910,970""#));
+        assert!(html.contains("beat-expected"));
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains("state-icon stale"));
     }
