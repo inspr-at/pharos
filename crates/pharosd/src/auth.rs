@@ -21,14 +21,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
+    CoreUserInfoClaims,
 };
 use openidconnect::reqwest::async_http_client;
 use openidconnect::{
-    AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, IssuerUrl, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AccessToken, AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, IssuerUrl, Nonce,
+    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    SubjectIdentifier, TokenResponse,
 };
 
 const SESSION_COOKIE: &str = "pharos_session";
@@ -56,7 +58,7 @@ pub struct AuthUser {
 }
 
 struct LoginIdentity {
-    subject: String,
+    subject: SubjectIdentifier,
     display_name: String,
 }
 
@@ -137,9 +139,9 @@ impl Auth {
             // signature, issuer, and nonce are still enforced).
             .set_other_audience_verifier_fn(|_aud| true);
         let claims = id_token.claims(&verifier, nonce)?;
-        let subject = claims.subject().as_str().to_string();
+        let subject = claims.subject().clone();
         Ok(LoginIdentity {
-            display_name: display_name_from_claims(claims, &subject),
+            display_name: display_name_from_claims(claims, subject.as_str()),
             subject,
         })
     }
@@ -205,6 +207,48 @@ fn display_name_from_claims(claims: &CoreIdTokenClaims, subject: &str) -> String
                 .and_then(|name| clean_display_name(name.as_str()))
         })
         .unwrap_or_else(|| subject.to_string())
+}
+
+fn display_name_from_user_info(claims: &CoreUserInfoClaims) -> Option<String> {
+    claims
+        .preferred_username()
+        .and_then(|name| clean_display_name(name.as_str()))
+        .or_else(|| {
+            claims
+                .email()
+                .and_then(|email| clean_display_name(email.as_str()))
+        })
+        .or_else(|| {
+            claims
+                .name()
+                .and_then(|name| name.get(None))
+                .and_then(|name| clean_display_name(name.as_str()))
+        })
+}
+
+async fn enrich_identity_from_user_info(
+    client: &CoreClient,
+    access_token: AccessToken,
+    identity: &mut LoginIdentity,
+) {
+    let request = match client.user_info(access_token, Some(identity.subject.clone())) {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::debug!("OIDC userinfo endpoint unavailable: {err}");
+            return;
+        }
+    };
+
+    match request.request_async(async_http_client).await {
+        Ok(user_info) => {
+            if let Some(display_name) = display_name_from_user_info(&user_info) {
+                identity.display_name = display_name;
+            }
+        }
+        Err(err) => {
+            tracing::warn!("OIDC userinfo request failed; using id_token claims: {err}");
+        }
+    }
 }
 
 async fn discover_client(
@@ -309,7 +353,7 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
     let Some(id_token) = token.id_token() else {
         return (StatusCode::UNAUTHORIZED, "no id_token").into_response();
     };
-    let identity = match auth.verify_id_token_identity(&client, id_token, &pending.nonce) {
+    let mut identity = match auth.verify_id_token_identity(&client, id_token, &pending.nonce) {
         Ok(identity) => identity,
         Err(ClaimsVerificationError::SignatureVerification(e)) => {
             tracing::warn!(
@@ -348,12 +392,13 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
                 .into_response();
         }
     };
+    enrich_identity_from_user_info(&client, token.access_token().to_owned(), &mut identity).await;
 
     let sid = CsrfToken::new_random().secret().clone();
     auth.sessions.lock().expect("sessions lock").insert(
         sid.clone(),
         Session {
-            subject: identity.subject,
+            subject: identity.subject.as_str().to_string(),
             display_name: identity.display_name,
             expires: now() + SESSION_TTL_SECS,
         },
@@ -383,7 +428,25 @@ pub async fn logout(State(auth): State<AuthState>, headers: HeaderMap) -> Respon
             .parse()
             .expect("cookie header"),
     );
-    (out, Redirect::temporary("/")).into_response()
+    (out, Redirect::temporary("/auth/logged-out")).into_response()
+}
+
+/// `GET /auth/logged-out` — neutral landing page after local Pharos logout.
+pub async fn logged_out() -> impl IntoResponse {
+    (
+        [
+            (
+                header::CACHE_CONTROL,
+                "no-store, no-cache, max-age=0, must-revalidate",
+            ),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+        ],
+        Html(
+            r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Logged out · Pharos</title><style>:root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#1f7fb5;--sun:#d69b31}*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}main{width:min(420px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}h1{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}p{margin:0 0 20px;color:var(--muted)}a{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 16px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}</style></head><body><main><h1>Logged out</h1><p>Your Pharos session has ended.</p><a href="/auth/login">Sign in</a></main></body></html>"#,
+        ),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -392,6 +455,11 @@ mod tests {
 
     fn claims(json: &str) -> CoreIdTokenClaims {
         serde_json::from_str(json).expect("valid id token claims")
+    }
+
+    fn user_info(json: &str) -> CoreUserInfoClaims {
+        CoreUserInfoClaims::from_json::<std::io::Error>(json.as_bytes(), None)
+            .expect("valid userinfo claims")
     }
 
     #[test]
@@ -432,6 +500,21 @@ mod tests {
         assert_eq!(
             display_name_from_claims(&claims, "opaque-subject"),
             "markus@example.invalid"
+        );
+    }
+
+    #[test]
+    fn display_name_reads_userinfo_claims() {
+        let user_info = user_info(
+            r#"{
+                "sub": "opaque-subject",
+                "preferred_username": "markus"
+            }"#,
+        );
+
+        assert_eq!(
+            display_name_from_user_info(&user_info),
+            Some("markus".to_string())
         );
     }
 }
