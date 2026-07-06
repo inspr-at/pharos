@@ -250,6 +250,7 @@ const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awa
 const MAX_BEATS=8;
 const EXPECT_X=64;
 const STALE_X=82;
+const HISTORY_STEP=EXPECT_X/(MAX_BEATS-1);
 function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
@@ -313,11 +314,14 @@ function setReason(surface,reason){
 function markHtml(beats,interval){
   const kept=beats.slice(-MAX_BEATS);
   if(!kept.length)return '';
-  const start=4,end=28;
-  const step=kept.length===1?0:(end-start)/(kept.length-1);
+  const cadence=Math.max(1,Number(interval)||60);
+  const latest=kept[kept.length-1];
+  const previous=kept.length>1?kept[kept.length-2]:null;
+  const newestX=previous==null?EXPECT_X:heartbeatX(Math.max(0,latest-previous),cadence);
   return kept.map((_,i)=>{
-    const x=kept.length===1?end:start+i*step;
-    const info=historyInfo(kept,i,interval);
+    const x=newestX-((latest-kept[i])/cadence)*HISTORY_STEP;
+    if(x<0)return '';
+    const info=historyInfo(kept,i,cadence);
     const title=info.label+' · '+info.detail;
     return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
@@ -560,6 +564,8 @@ setTimeout(refresh,3000);
 </script></body></html>"#;
 
 const HEARTBEAT_UI_EVENTS: usize = 8;
+const HEARTBEAT_EXPECT_X: f64 = 64.0;
+const HEARTBEAT_STALE_X: f64 = 82.0;
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -1180,20 +1186,20 @@ fn heartbeat_marks(log: &[i64], interval: i64) -> String {
         return String::new();
     }
 
-    let start = 4.0;
-    let end = 28.0;
-    let step = if log.len() == 1 {
-        0.0
+    let interval = interval.max(1);
+    let latest = log[log.len() - 1];
+    let newest_x = if log.len() > 1 {
+        heartbeat_x((latest - log[log.len() - 2]).max(0), interval)
     } else {
-        (end - start) / (log.len() - 1) as f64
+        HEARTBEAT_EXPECT_X
     };
+    let step = HEARTBEAT_EXPECT_X / (HEARTBEAT_UI_EVENTS.saturating_sub(1).max(1) as f64);
     let mut marks = String::new();
     for idx in 0..log.len() {
-        let x = if log.len() == 1 {
-            end
-        } else {
-            start + idx as f64 * step
-        };
+        let x = newest_x - (((latest - log[idx]).max(0) as f64 / interval as f64) * step);
+        if x < 0.0 {
+            continue;
+        }
         let (level, label, detail) = heartbeat_history(log, idx, interval);
         let title = format!("{label} · {detail}");
         marks.push_str(&format!(
@@ -1211,13 +1217,13 @@ fn heartbeat_x(age: i64, interval: i64) -> f64 {
     let age = age.max(0) as f64;
     let interval = interval.max(1) as f64;
     if age <= interval {
-        return (age / interval) * 64.0;
+        return (age / interval) * HEARTBEAT_EXPECT_X;
     }
     if age <= interval * 2.0 {
-        return 64.0 + ((age - interval) / interval) * 18.0;
+        return HEARTBEAT_EXPECT_X + ((age - interval) / interval) * 18.0;
     }
     if age <= interval * 5.0 {
-        return 82.0 + ((age - interval * 2.0) / (interval * 3.0)) * 18.0;
+        return HEARTBEAT_STALE_X + ((age - interval * 2.0) / (interval * 3.0)) * 18.0;
     }
     100.0
 }
@@ -1589,6 +1595,9 @@ mod tests {
         assert!(html.contains(r#"data-history-level="first""#));
         assert!(html.contains(r#"data-history-level="ok""#));
         assert!(html.contains(r#"data-history-label="on cadence""#));
+        assert!(html.contains(r#"--mark-x:45.7%""#));
+        assert!(html.contains(r#"--mark-x:54.9%""#));
+        assert!(html.contains(r#"--mark-x:64.0%""#));
         assert!(html.contains("Flake.lock age"));
         assert!(html.contains(r#"<strong class="warn">1d</strong>"#));
         assert!(html.contains("Commits behind"));
