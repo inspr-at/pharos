@@ -246,7 +246,6 @@ main[data-view="list"] .list-wrap{display:block}
 const FOOT: &str = r#"</div><script>
 const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awaiting'};
 const HISTORY_DOTS=12;
-const MAX_BEATS=HISTORY_DOTS+1;
 const EXPECT_X=64;
 const STALE_X=82;
 const HISTORY_STEP=EXPECT_X/HISTORY_DOTS;
@@ -261,6 +260,24 @@ function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value
 function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host]')).filter(el=>el.dataset.host===name)}
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
 function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
+function historyWindowMeta(samples,windowDef){
+  if(samples.length<2)return {start:0,latest:0,span:1,candidates:[]};
+  const latest=samples[samples.length-1];
+  const start=Math.max(latest-windowDef.secs,samples[0]);
+  const span=Math.max(1,latest-start);
+  const candidates=samples.map((stamp,index)=>({stamp,index})).filter(item=>item.index>0&&item.stamp>=start&&item.stamp<=latest);
+  return {start,latest,span,candidates};
+}
+function visibleHistory(samples,windowDef){
+  const meta=historyWindowMeta(samples,windowDef);
+  if(meta.candidates.length<=HISTORY_DOTS)return {...meta,visible:meta.candidates};
+  const buckets=Array(HISTORY_DOTS).fill(null);
+  for(const item of meta.candidates){
+    const bucket=Math.min(HISTORY_DOTS-1,Math.max(0,Math.floor(((item.stamp-meta.start)/meta.span)*HISTORY_DOTS)));
+    buckets[bucket]=item;
+  }
+  return {...meta,visible:buckets.filter(Boolean)};
+}
 function historyInfo(beats,index,interval){
   const stamp=beats[index];
   const previous=index>0?beats[index-1]:null;
@@ -313,17 +330,15 @@ function setReason(surface,reason){
   const text=el.querySelector('span');
   if(text)text.textContent=reason.label;
 }
-function markHtml(beats,interval){
-  const kept=beats.slice(-MAX_BEATS);
+function markHtml(beats,interval,windowDef=signalWindow){
+  const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
   if(kept.length<2)return '';
   const cadence=Math.max(1,Number(interval)||60);
-  const latest=kept[kept.length-1];
   const newestX=EXPECT_X-HISTORY_STEP;
-  return kept.map((stamp,i)=>{
-    if(i===0)return '';
-    const x=newestX-((latest-stamp)/cadence)*HISTORY_STEP;
-    if(x<0)return '';
-    const info=historyInfo(kept,i,cadence);
+  const view=visibleHistory(kept,windowDef);
+  return view.visible.map(item=>{
+    const x=((item.stamp-view.start)/view.span)*newestX;
+    const info=historyInfo(kept,item.index,cadence);
     const title=info.label+' · '+info.detail;
     return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
@@ -395,14 +410,18 @@ function bindHistoryHints(root=document){
 }
 function setBeatHistory(beat,beats,interval){
   const all=Array.from(new Set(beats)).sort((a,b)=>a-b);
-  const kept=all.slice(-MAX_BEATS);
+  const view=visibleHistory(all,signalWindow);
+  const kept=view.visible.map(item=>item.stamp);
   const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
   beat.dataset.signalBeats=all.join(',');
   beat.dataset.beats=kept.join(',');
-  beat.dataset.count=String(Math.max(0,kept.length-1));
+  beat.dataset.count=String(kept.length);
+  beat.dataset.historyWindow=signalWindow.label;
+  const windowLabel=beat.querySelector('[data-history-window-label]');
+  if(windowLabel)windowLabel.textContent=signalWindow.label;
   const marks=beat.querySelector('.beat-marks');
   if(marks){
-    marks.innerHTML=markHtml(kept,cadence);
+    marks.innerHTML=markHtml(all,cadence,signalWindow);
     bindHistoryHints(marks);
   }
 }
@@ -521,6 +540,7 @@ function applySignalWindow(key,write=true){
     const surface=beat.closest('[data-host]');
     const last=Number(beat.dataset.last);
     const interval=Math.max(1,Number(beat.dataset.interval)||60);
+    setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),interval);
     updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,Date.now()/1000,signalWindow));
   });
   if(write)setCookie('pharos_signal_window',signalWindow.key);
@@ -611,7 +631,6 @@ setTimeout(refresh,3000);
 </script></body></html>"#;
 
 const HEARTBEAT_HISTORY_DOTS: usize = 12;
-const HEARTBEAT_HISTORY_SAMPLES: usize = HEARTBEAT_HISTORY_DOTS + 1;
 const HEARTBEAT_EXPECT_X: f64 = 64.0;
 const HEARTBEAT_STALE_X: f64 = 82.0;
 const SIGNAL_DEFAULT_WINDOW_LABEL: &str = "10m";
@@ -1185,14 +1204,6 @@ fn lone_host_state() -> String {
     )
 }
 
-fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
-    let mut recent = heartbeat_samples(log, last_seen);
-    if recent.len() > HEARTBEAT_HISTORY_SAMPLES {
-        recent.drain(0..recent.len() - HEARTBEAT_HISTORY_SAMPLES);
-    }
-    recent
-}
-
 fn heartbeat_samples(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
     let mut samples = log.to_vec();
     if samples.is_empty() {
@@ -1287,11 +1298,69 @@ fn heartbeat_signal(
 fn signal_markup(signal: &HeartbeatSignal) -> String {
     let title = html_escape(&signal.title);
     format!(
-        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><button class="signal-window" type="button" data-signal-window title="{title}">{window}</button><span class="signal-orb" aria-hidden="true"></span></span>"#,
+        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window" type="button" data-signal-window title="{title}">{window}</button></span>"#,
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
         window = html_escape(signal.window),
     )
+}
+
+struct HeartbeatHistoryView {
+    start: i64,
+    span: i64,
+    visible: Vec<usize>,
+}
+
+fn heartbeat_history_view(log: &[i64], window_secs: i64) -> HeartbeatHistoryView {
+    if log.len() < 2 {
+        return HeartbeatHistoryView {
+            start: 0,
+            span: 1,
+            visible: Vec::new(),
+        };
+    }
+
+    let latest = log[log.len() - 1];
+    let start = log[0].max(latest - window_secs.max(1));
+    let span = (latest - start).max(1);
+    let candidates = log
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, stamp)| {
+            if idx > 0 && *stamp >= start && *stamp <= latest {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.len() <= HEARTBEAT_HISTORY_DOTS {
+        return HeartbeatHistoryView {
+            start,
+            span,
+            visible: candidates,
+        };
+    }
+
+    let mut buckets = vec![None; HEARTBEAT_HISTORY_DOTS];
+    for idx in candidates {
+        let raw_bucket = (((log[idx] - start) as f64 / span as f64) * HEARTBEAT_HISTORY_DOTS as f64)
+            .floor() as usize;
+        let bucket = raw_bucket.min(HEARTBEAT_HISTORY_DOTS - 1);
+        buckets[bucket] = Some(idx);
+    }
+
+    HeartbeatHistoryView {
+        start,
+        span,
+        visible: buckets.into_iter().flatten().collect(),
+    }
+}
+
+fn heartbeat_visible_log(log: &[i64], window_secs: i64) -> Vec<i64> {
+    let view = heartbeat_history_view(log, window_secs);
+    view.visible.into_iter().map(|idx| log[idx]).collect()
 }
 
 fn heartbeat_history(log: &[i64], idx: usize, interval: i64) -> (&'static str, String, String) {
@@ -1325,21 +1394,19 @@ fn heartbeat_history(log: &[i64], idx: usize, interval: i64) -> (&'static str, S
     )
 }
 
-fn heartbeat_marks(log: &[i64], interval: i64) -> String {
+fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> String {
     if log.len() < 2 {
         return String::new();
     }
 
     let interval = interval.max(1);
-    let latest = log[log.len() - 1];
     let step = HEARTBEAT_EXPECT_X / HEARTBEAT_HISTORY_DOTS.max(1) as f64;
     let newest_x = HEARTBEAT_EXPECT_X - step;
+    let view = heartbeat_history_view(log, window_secs);
     let mut marks = String::new();
-    for idx in 1..log.len() {
-        let x = newest_x - (((latest - log[idx]).max(0) as f64 / interval as f64) * step);
-        if x < 0.0 {
-            continue;
-        }
+    for idx in view.visible {
+        let x = (((log[idx] - view.start).max(0) as f64 / view.span as f64) * newest_x)
+            .clamp(0.0, newest_x);
         let (level, label, detail) = heartbeat_history(log, idx, interval);
         let title = format!("{label} · {detail}");
         marks.push_str(&format!(
@@ -1379,8 +1446,8 @@ fn heartbeat_card(
         .unwrap_or(60)
         .max(1);
     let all_beats = heartbeat_samples(heartbeat_log, last_seen);
-    let recent = recent_heartbeat_log(heartbeat_log, last_seen);
-    let beats_attr = recent
+    let visible_beats = heartbeat_visible_log(&all_beats, SIGNAL_DEFAULT_WINDOW_SECS);
+    let beats_attr = visible_beats
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
@@ -1390,7 +1457,7 @@ fn heartbeat_card(
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let marks = heartbeat_marks(&recent, interval);
+    let marks = heartbeat_marks(&all_beats, interval, SIGNAL_DEFAULT_WINDOW_SECS);
     let (last_attr, next_at_attr, beat_state, now_x, fill_color, expect_fill, target_ring) =
         match last_seen {
             Some(last) => {
@@ -1450,8 +1517,9 @@ fn heartbeat_card(
         };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div></div>"#,
-        count = recent.len().saturating_sub(1)
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span data-history-window-label>{history_window}</span><span>expected</span><span>late</span></span></div></div>"#,
+        count = visible_beats.len(),
+        history_window = html_escape(SIGNAL_DEFAULT_WINDOW_LABEL)
     )
 }
 
@@ -1721,16 +1789,21 @@ mod tests {
         assert!(!html.contains("expected beat"));
         assert!(html.contains(r#"class="signal" data-signal data-signal-level="good""#));
         assert!(html.contains(r#"<span data-signal-percent>100%</span>"#));
+        assert!(html.contains(
+            r#"<span data-signal-percent>100%</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window""#
+        ));
         assert!(html.contains(r#"<button class="signal-window" type="button" data-signal-window"#));
         assert!(html.contains(r#"data-signal-window-key="10m""#));
-        assert!(html.contains(r#"data-beats="850,910,970""#));
+        assert!(html.contains(r#"data-beats="910,970""#));
         assert!(html.contains(r#"data-signal-beats="850,910,970""#));
+        assert!(html.contains(r#"data-history-window="10m""#));
+        assert!(html.contains(r#"<span data-history-window-label>10m</span>"#));
         assert!(
             !html.contains(r#"<span class="beat-mark" tabindex="0" data-history-level="first""#)
         );
         assert!(html.contains(r#"data-history-level="ok""#));
         assert!(html.contains(r#"data-history-label="on cadence""#));
-        assert!(html.contains(r#"--mark-x:53.3%""#));
+        assert!(html.contains(r#"--mark-x:29.3%""#));
         assert!(html.contains(r#"--mark-x:58.7%""#));
         assert!(!html.contains(r#"--mark-x:64.0%""#));
         assert!(html.contains("Flake.lock age"));
@@ -1752,20 +1825,35 @@ mod tests {
 
     #[test]
     fn heartbeat_history_uses_outcome_slots_before_expected_marker() {
-        let marks = heartbeat_marks(&[100, 160, 220, 340], 60);
+        let marks = heartbeat_marks(&[100, 160, 220, 340], 60, SIGNAL_DEFAULT_WINDOW_SECS);
 
         assert!(!marks.contains(r#"data-history-level="first""#));
         assert!(marks.contains(r#"data-history-level="ok""#));
         assert!(marks.contains(r#"data-history-level="late""#));
-        assert!(marks.contains(r#"--mark-x:42.7%""#));
-        assert!(marks.contains(r#"--mark-x:48.0%""#));
+        assert!(marks.contains(r#"--mark-x:14.7%""#));
+        assert!(marks.contains(r#"--mark-x:29.3%""#));
         assert!(marks.contains(r#"--mark-x:58.7%""#));
         assert!(!marks.contains(r#"--mark-x:64.0%""#));
     }
 
     #[test]
     fn first_heartbeat_without_previous_sample_has_no_history_dot() {
-        assert!(heartbeat_marks(&[100], 60).is_empty());
+        assert!(heartbeat_marks(&[100], 60, SIGNAL_DEFAULT_WINDOW_SECS).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_history_window_changes_visible_samples() {
+        let log = (0..=20).map(|idx| idx * 60).collect::<Vec<_>>();
+
+        let ten_minutes = heartbeat_visible_log(&log, 10 * 60);
+        let hour = heartbeat_visible_log(&log, 60 * 60);
+
+        assert_eq!(ten_minutes.len(), 11);
+        assert_eq!(ten_minutes.first(), Some(&600));
+        assert_eq!(ten_minutes.last(), Some(&1200));
+        assert_eq!(hour.len(), HEARTBEAT_HISTORY_DOTS);
+        assert_ne!(hour, ten_minutes);
+        assert_eq!(hour.last(), Some(&1200));
     }
 
     #[test]
