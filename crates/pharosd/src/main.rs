@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{FromRef, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::Html;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
@@ -119,7 +119,7 @@ body:before{content:"";position:fixed;inset:0;z-index:-3;background:radial-gradi
 main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .ico{width:16px;height:16px;display:inline-block;vertical-align:middle;flex:0 0 auto}
 .top{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:22px;min-height:118px;margin:-10px 0 20px;padding:10px 0 18px;overflow:hidden}
-.top-art{position:absolute;left:0;right:0;top:-52px;height:270px;z-index:0;opacity:.84;pointer-events:none;--edge-fade-x:30%;--edge-fade-y:20%;-webkit-mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%);mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%)}
+.top-art{position:absolute;inset:0;z-index:0;opacity:.84;pointer-events:none;--edge-fade-x:30%;--edge-fade-y:20%;-webkit-mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%);mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%)}
 .top-art:before{content:"";position:absolute;inset:0;background:url('/assets/fleet-horizon.png') center center/100% auto no-repeat;-webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 var(--edge-fade-y),#000 calc(100% - var(--edge-fade-y)),transparent 100%);mask-image:linear-gradient(to bottom,transparent 0,#000 var(--edge-fade-y),#000 calc(100% - var(--edge-fade-y)),transparent 100%)}
 .top>:not(.top-art){position:relative;z-index:1}.top-art{z-index:0}.brand{display:flex;align-items:center;gap:12px;margin:0 0 4px}
 .brand h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:31px;line-height:1.05;font-weight:500;letter-spacing:0;color:#12304b}
@@ -809,8 +809,22 @@ fn runtime_overlay(host: Option<&Host>, now: i64) -> serde_json::Value {
     })
 }
 
-async fn home(State(state): State<AppState>) -> Html<String> {
-    Html(render_home(
+fn no_store_html(body: String) -> impl IntoResponse {
+    (
+        [
+            (
+                header::CACHE_CONTROL,
+                "no-store, no-cache, max-age=0, must-revalidate",
+            ),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+        ],
+        Html(body),
+    )
+}
+
+async fn home(State(state): State<AppState>) -> impl IntoResponse {
+    no_store_html(render_home(
         &state.store.list(),
         &self_host(),
         now_unix(),
