@@ -247,10 +247,11 @@ main[data-view="list"] .list-wrap{display:block}
 
 const FOOT: &str = r#"</div><script>
 const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awaiting'};
-const MAX_BEATS=8;
+const HISTORY_DOTS=8;
+const MAX_BEATS=HISTORY_DOTS+1;
 const EXPECT_X=64;
 const STALE_X=82;
-const HISTORY_STEP=EXPECT_X/(MAX_BEATS-1);
+const HISTORY_STEP=EXPECT_X/HISTORY_DOTS;
 function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
@@ -313,13 +314,13 @@ function setReason(surface,reason){
 }
 function markHtml(beats,interval){
   const kept=beats.slice(-MAX_BEATS);
-  if(!kept.length)return '';
+  if(kept.length<2)return '';
   const cadence=Math.max(1,Number(interval)||60);
   const latest=kept[kept.length-1];
-  const previous=kept.length>1?kept[kept.length-2]:null;
-  const newestX=previous==null?EXPECT_X:heartbeatX(Math.max(0,latest-previous),cadence);
-  return kept.map((_,i)=>{
-    const x=newestX-((latest-kept[i])/cadence)*HISTORY_STEP;
+  const newestX=EXPECT_X-HISTORY_STEP;
+  return kept.map((stamp,i)=>{
+    if(i===0)return '';
+    const x=newestX-((latest-stamp)/cadence)*HISTORY_STEP;
     if(x<0)return '';
     const info=historyInfo(kept,i,cadence);
     const title=info.label+' · '+info.detail;
@@ -356,7 +357,7 @@ function setBeatHistory(beat,beats,interval){
   const kept=Array.from(new Set(beats)).sort((a,b)=>a-b).slice(-MAX_BEATS);
   const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
   beat.dataset.beats=kept.join(',');
-  beat.dataset.count=String(kept.length);
+  beat.dataset.count=String(Math.max(0,kept.length-1));
   const marks=beat.querySelector('.beat-marks');
   if(marks){
     marks.innerHTML=markHtml(kept,cadence);
@@ -563,7 +564,8 @@ setInterval(refresh,10000);
 setTimeout(refresh,3000);
 </script></body></html>"#;
 
-const HEARTBEAT_UI_EVENTS: usize = 8;
+const HEARTBEAT_HISTORY_DOTS: usize = 8;
+const HEARTBEAT_HISTORY_SAMPLES: usize = HEARTBEAT_HISTORY_DOTS + 1;
 const HEARTBEAT_EXPECT_X: f64 = 64.0;
 const HEARTBEAT_STALE_X: f64 = 82.0;
 
@@ -1144,8 +1146,8 @@ fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
     }
     recent.sort_unstable();
     recent.dedup();
-    if recent.len() > HEARTBEAT_UI_EVENTS {
-        recent.drain(0..recent.len() - HEARTBEAT_UI_EVENTS);
+    if recent.len() > HEARTBEAT_HISTORY_SAMPLES {
+        recent.drain(0..recent.len() - HEARTBEAT_HISTORY_SAMPLES);
     }
     recent
 }
@@ -1182,20 +1184,16 @@ fn heartbeat_history(log: &[i64], idx: usize, interval: i64) -> (&'static str, S
 }
 
 fn heartbeat_marks(log: &[i64], interval: i64) -> String {
-    if log.is_empty() {
+    if log.len() < 2 {
         return String::new();
     }
 
     let interval = interval.max(1);
     let latest = log[log.len() - 1];
-    let newest_x = if log.len() > 1 {
-        heartbeat_x((latest - log[log.len() - 2]).max(0), interval)
-    } else {
-        HEARTBEAT_EXPECT_X
-    };
-    let step = HEARTBEAT_EXPECT_X / (HEARTBEAT_UI_EVENTS.saturating_sub(1).max(1) as f64);
+    let step = HEARTBEAT_EXPECT_X / HEARTBEAT_HISTORY_DOTS.max(1) as f64;
+    let newest_x = HEARTBEAT_EXPECT_X - step;
     let mut marks = String::new();
-    for idx in 0..log.len() {
+    for idx in 1..log.len() {
         let x = newest_x - (((latest - log[idx]).max(0) as f64 / interval as f64) * step);
         if x < 0.0 {
             continue;
@@ -1337,7 +1335,7 @@ fn heartbeat_card(
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
         r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div><div class="beat-meta"><span>expected beat</span><strong data-next data-next-state="{next_state}"><span data-next-label>{next}</span><span class="beat-expected" aria-hidden="true"></span></strong></div></div>"#,
-        count = recent.len()
+        count = recent.len().saturating_sub(1)
     )
 }
 
@@ -1592,12 +1590,14 @@ mod tests {
             r#"data-next data-next-state="cadence"><span data-next-label>on cadence</span><span class="beat-expected""#
         ));
         assert!(html.contains(r#"data-beats="850,910,970""#));
-        assert!(html.contains(r#"data-history-level="first""#));
+        assert!(
+            !html.contains(r#"<span class="beat-mark" tabindex="0" data-history-level="first""#)
+        );
         assert!(html.contains(r#"data-history-level="ok""#));
         assert!(html.contains(r#"data-history-label="on cadence""#));
-        assert!(html.contains(r#"--mark-x:45.7%""#));
-        assert!(html.contains(r#"--mark-x:54.9%""#));
-        assert!(html.contains(r#"--mark-x:64.0%""#));
+        assert!(html.contains(r#"--mark-x:48.0%""#));
+        assert!(html.contains(r#"--mark-x:56.0%""#));
+        assert!(!html.contains(r#"--mark-x:64.0%""#));
         assert!(html.contains("Flake.lock age"));
         assert!(html.contains(r#"<strong class="warn">1d</strong>"#));
         assert!(html.contains("Commits behind"));
@@ -1614,6 +1614,24 @@ mod tests {
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
+    }
+
+    #[test]
+    fn heartbeat_history_uses_outcome_slots_before_expected_marker() {
+        let marks = heartbeat_marks(&[100, 160, 220, 340], 60);
+
+        assert!(!marks.contains(r#"data-history-level="first""#));
+        assert!(marks.contains(r#"data-history-level="ok""#));
+        assert!(marks.contains(r#"data-history-level="late""#));
+        assert!(marks.contains(r#"--mark-x:32.0%""#));
+        assert!(marks.contains(r#"--mark-x:40.0%""#));
+        assert!(marks.contains(r#"--mark-x:56.0%""#));
+        assert!(!marks.contains(r#"--mark-x:64.0%""#));
+    }
+
+    #[test]
+    fn first_heartbeat_without_previous_sample_has_no_history_dot() {
+        assert!(heartbeat_marks(&[100], 60).is_empty());
     }
 
     #[test]
