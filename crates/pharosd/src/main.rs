@@ -104,7 +104,6 @@ enum RegistrationAuth {
 
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
 const SIDEBAR_LIGHTHOUSE_PNG: &[u8] = include_bytes!("../assets/sidebar-lighthouse.png");
-const TIMER_CIRCLE_PNG: &[u8] = include_bytes!("../assets/timer-circle.png");
 
 const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><style>
 :root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--card:#ffffff;--card-soft:rgba(255,255,255,.82);--accent:#1f7fb5;--sea:#159e99;--sun:#d69b31;--live:#25845f;--stale:#b26a00;--down:#bf3a35;--wait:#8997a3;--side:232px}
@@ -185,30 +184,28 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .settings-copy{min-width:0}.settings-copy strong{display:block;font-size:12px;line-height:1.1}.settings-copy span{display:none}
 .settings-swatch{width:16px;height:16px;border-radius:50%;border:1px solid rgba(0,0,0,.12);background:var(--host-color,var(--sun));box-shadow:inset 0 0 0 2px rgba(255,255,255,.54)}
 .beat{--beat-color:var(--state);--now-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
-.beat-stage{position:relative;height:50px;overflow:hidden}
+.beat-stage{position:relative;height:50px;overflow:visible}
 .beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
 .beat-fill{position:absolute;left:0;top:22px;width:var(--now-x);height:2px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.18),var(--fill-color));transition:background-color .2s ease}
-.beat-now{position:absolute;left:var(--now-x);top:23px;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle,#fff 0 29%,var(--fill-color) 32% 62%,transparent 64%);box-shadow:0 0 0 5px color-mix(in srgb,var(--fill-color) 12%,transparent),0 0 14px color-mix(in srgb,var(--fill-color) 26%,transparent);transform:translate(-50%,-50%)}
+.beat-now{position:absolute;left:var(--now-x);top:23px;z-index:8;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle,#fff 0 29%,var(--fill-color) 32% 62%,transparent 64%);box-shadow:0 0 0 5px color-mix(in srgb,var(--fill-color) 12%,transparent),0 0 14px color-mix(in srgb,var(--fill-color) 26%,transparent);transform:translate(-50%,-50%);pointer-events:none}
 .beat-current{position:absolute;top:22px;left:calc(var(--now-x) - 22%);width:22%;height:3px;border-radius:999px;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--fill-color) 34%,transparent),transparent);animation:tide 2.8s linear infinite;opacity:.8}
 .beat-marks{position:absolute;inset:0}
-.beat-mark{--mark-color:var(--sea);position:absolute;left:var(--mark-x);top:23px;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
+.beat-mark{--mark-color:var(--sea);position:absolute;left:var(--mark-x);top:23px;z-index:4;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
 .beat-mark[data-history-level="late"]{--mark-color:var(--sun)}.beat-mark[data-history-level="stale"]{--mark-color:var(--stale)}.beat-mark[data-history-level="down"]{--mark-color:var(--down)}.beat-mark[data-history-level="first"]{--mark-color:var(--wait)}
 .beat-mark:hover,.beat-mark:focus-visible{opacity:1;box-shadow:0 0 0 5px color-mix(in srgb,var(--mark-color) 18%,transparent),0 0 14px color-mix(in srgb,var(--mark-color) 24%,transparent);outline:0}
 .beat[data-count="0"] .beat-mark{display:none}
-.beat-expected{position:absolute;left:var(--expect-x);top:23px;width:18px;height:18px;border-radius:50%;border:1px solid #aebac3;background:conic-gradient(color-mix(in srgb,var(--beat-color) 72%,var(--sun)) var(--expect-fill),rgba(222,232,237,.9) 0),radial-gradient(circle,#fff 0 43%,transparent 45%);box-shadow:0 0 0 var(--target-ring) rgba(137,151,163,.12),0 0 16px rgba(214,155,49,.12);opacity:var(--expect-alpha);transform:translate(-50%,-50%)}
-.beat-expected:before,.beat-expected:after{content:"";position:absolute;left:50%;top:50%;width:28px;height:1px;background:#aebac3;opacity:.5;transform:translate(-50%,-50%)}
+.beat-expected{position:relative;display:inline-block;flex:0 0 14px;width:14px;height:14px;border-radius:50%;border:1px solid #aebac3;background:conic-gradient(color-mix(in srgb,var(--beat-color) 72%,var(--sun)) var(--expect-fill),rgba(222,232,237,.9) 0),radial-gradient(circle,#fff 0 43%,transparent 45%);box-shadow:0 0 0 var(--target-ring) rgba(137,151,163,.12),0 0 16px rgba(214,155,49,.12);opacity:var(--expect-alpha)}
+.beat-expected:before,.beat-expected:after{content:"";position:absolute;left:50%;top:50%;width:22px;height:1px;background:#aebac3;opacity:.5;transform:translate(-50%,-50%)}
 .beat-expected:after{transform:translate(-50%,-50%) rotate(90deg)}
 .beat-threshold{position:absolute;top:15px;bottom:15px;width:1px;background:rgba(137,151,163,.25)}
 .beat-threshold.expected{left:var(--expect-x)}.beat-threshold.stale{left:var(--stale-x)}
-.beat-hit{position:absolute;left:var(--hit-x,0%);top:23px;width:9px;height:9px;border-radius:50%;background:currentColor;opacity:0;transform:translate(-50%,-50%) scale(.7)}
+.beat-hit{position:absolute;left:var(--hit-x,0%);top:23px;z-index:9;width:9px;height:9px;border-radius:50%;background:currentColor;opacity:0;transform:translate(-50%,-50%) scale(.7);pointer-events:none}
 .beat[data-flash="true"] .beat-hit{animation:beat-hit .9s ease-out}
 .beat-zones{position:absolute;left:0;right:0;bottom:0;color:var(--muted);font-size:10px}
 .beat-zones span{position:absolute;bottom:0;white-space:nowrap}.beat-zones span:first-child{left:0}.beat-zones span:nth-child(2){left:var(--expect-x);transform:translateX(-50%)}.beat-zones span:nth-child(3){right:0;color:var(--stale)}
-.beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="late"] .beat-expected,.beat[data-beat="stale"] .beat-expected,.beat[data-beat="down"] .beat-expected{opacity:.86}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="tracking"] .beat-expected,.beat[data-beat="lit"] .beat-expected{opacity:0}.beat[data-beat="lit"]{--beat-color:var(--sun)}
+.beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="late"] .beat-expected,.beat[data-beat="stale"] .beat-expected,.beat[data-beat="down"] .beat-expected{opacity:.86}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="lit"]{--beat-color:var(--sun)}
 .beat-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:2px;font-size:11px;color:var(--muted)}
-.beat-meta strong{position:relative;z-index:0;display:inline-grid;place-items:center;min-width:62px;min-height:24px;padding:0 4px;font-size:12px;color:var(--beat-color);font-weight:650;text-align:center}
-.beat-meta strong:before{content:"";position:absolute;left:50%;top:50%;z-index:-1;width:58px;height:46px;background:url('/assets/timer-circle.png') center/contain no-repeat;opacity:0;transform:translate(-50%,-50%);pointer-events:none}
-.beat-meta strong[data-next-state="cadence"]:before{opacity:.58}
+.beat-meta strong{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;min-width:92px;min-height:24px;padding:0;font-size:12px;color:var(--beat-color);font-weight:650;text-align:right}
 @keyframes beat-hit{0%{opacity:.9;transform:translate(-50%,-50%) scale(.55);box-shadow:0 0 0 0 color-mix(in srgb,currentColor 28%,transparent)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4);box-shadow:0 0 0 12px transparent}}
 @keyframes tide{from{transform:translateX(-16%)}to{transform:translateX(42%)}}
 .list-wrap{display:none}
@@ -364,7 +361,9 @@ function setBeatHistory(beat,beats,interval){
 }
 function setNext(next,label,state=''){
   if(!next)return;
-  next.textContent=label;
+  const text=next.querySelector('[data-next-label]');
+  if(text)text.textContent=label;
+  else next.textContent=label;
   next.dataset.nextState=state;
 }
 function flashBeat(beat){
@@ -836,16 +835,6 @@ async fn sidebar_lighthouse_asset() -> impl axum::response::IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         SIDEBAR_LIGHTHOUSE_PNG,
-    )
-}
-
-async fn timer_circle_asset() -> impl axum::response::IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
-        TIMER_CIRCLE_PNG,
     )
 }
 
@@ -1327,7 +1316,7 @@ fn heartbeat_card(
     };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-expected"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div><div class="beat-meta"><span>expected beat</span><strong data-next data-next-state="{next_state}">{next}</strong></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div><div class="beat-meta"><span>expected beat</span><strong data-next data-next-state="{next_state}"><span data-next-label>{next}</span><span class="beat-expected" aria-hidden="true"></span></strong></div></div>"#,
         count = recent.len()
     )
 }
@@ -1495,7 +1484,6 @@ async fn main() {
             "/assets/sidebar-lighthouse.png",
             get(sidebar_lighthouse_asset),
         )
-        .route("/assets/timer-circle.png", get(timer_circle_asset))
         .route("/register", post(register))
         .route("/report", post(report))
         .route("/auth/login", get(auth::login))
@@ -1580,7 +1568,9 @@ mod tests {
         assert!(html
             .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
         assert!(html.contains("expected beat"));
-        assert!(html.contains(r#"data-next data-next-state="cadence">on cadence"#));
+        assert!(html.contains(
+            r#"data-next data-next-state="cadence"><span data-next-label>on cadence</span><span class="beat-expected""#
+        ));
         assert!(html.contains(r#"data-beats="850,910,970""#));
         assert!(html.contains(r#"data-history-level="first""#));
         assert!(html.contains(r#"data-history-level="ok""#));
