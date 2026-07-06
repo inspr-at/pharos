@@ -162,6 +162,12 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
+.settings-card{display:grid;grid-template-columns:34px minmax(0,1fr) 26px;align-items:center;gap:10px;margin:10px 0 8px;padding:10px;border:1px solid rgba(210,226,234,.94);border-left:4px solid var(--host-color,var(--sun));border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;box-shadow:0 8px 18px rgba(45,75,95,.06)}
+.settings-card:hover{border-color:rgba(31,127,181,.38);border-left-color:var(--host-color,var(--sun));box-shadow:0 10px 22px rgba(45,75,95,.10)}
+.settings-icon{display:grid;place-items:center;width:34px;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:rgba(244,250,251,.82);color:var(--accent)}
+.settings-icon .ico{width:17px;height:17px}
+.settings-copy{min-width:0}.settings-copy strong{display:block;font-size:14px;line-height:1.15}.settings-copy span{display:block;margin-top:2px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.settings-swatch{width:26px;height:26px;border-radius:7px;border:1px solid rgba(0,0,0,.12);background:var(--host-color,var(--sun));box-shadow:inset 0 0 0 2px rgba(255,255,255,.54)}
 .beat{--beat-color:var(--state);--now-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
 .beat-stage{position:relative;height:50px;overflow:hidden}
 .beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
@@ -194,7 +200,7 @@ main[data-view="list"] .list-wrap{display:block}
 .list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:8px 0 0 8px}
 .list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
-.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}
+.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}.list .settings-card{display:inline-flex;min-height:32px;margin:0;padding:6px 10px;border-left-width:3px}.list .settings-icon{width:24px;height:24px}.list .settings-copy span,.list .settings-swatch{display:none}.list .settings-copy strong{font-size:12px}
 [hidden]{display:none!important}
 .empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
@@ -726,8 +732,13 @@ fn runtime_overlay(host: Option<&Host>, now: i64) -> serde_json::Value {
     })
 }
 
-async fn home(State(store): State<Arc<Store>>) -> Html<String> {
-    Html(render_home(&store.list(), &self_host(), now_unix()))
+async fn home(State(state): State<AppState>) -> Html<String> {
+    Html(render_home(
+        &state.store.list(),
+        &self_host(),
+        now_unix(),
+        state.manifests.manifests(),
+    ))
 }
 
 fn html_escape(s: &str) -> String {
@@ -736,6 +747,36 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn url_query_escape(s: &str) -> String {
+    let mut encoded = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn manifest_palette_color(manifests: &[HostManifest]) -> BTreeMap<String, String> {
+    let mut by_host = BTreeMap::new();
+    for manifest in manifests {
+        let Some(color) = manifest.palette.as_ref().and_then(|palette| {
+            palette
+                .accent
+                .clone()
+                .or_else(|| palette.gradient.get("primary").cloned())
+        }) else {
+            continue;
+        };
+        by_host.insert(manifest.host.name.clone(), color.clone());
+        by_host.insert(manifest.slug.clone(), color);
+    }
+    by_host
 }
 
 fn freshness_row(label: &str, value: &str, class: &str) -> String {
@@ -1120,7 +1161,7 @@ fn heartbeat_card(
     )
 }
 
-fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
+fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManifest]) -> String {
     if hosts.is_empty() {
         return format!(
             "{HEAD}<main>{header}{empty}</main>{FOOT}",
@@ -1129,6 +1170,7 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
         );
     }
 
+    let palette_colors = manifest_palette_color(manifests);
     let mut sorted: Vec<&Host> = hosts.iter().collect();
     // self/lighthouse first, then by severity (needs-attention first), then name.
     sorted.sort_by_key(|h| {
@@ -1186,6 +1228,17 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
         } else {
             String::new()
         };
+        let settings_href = html_escape(&format!("/agora?host={}", url_query_escape(&h.name)));
+        let settings_color = html_escape(
+            palette_colors
+                .get(&h.name)
+                .map(String::as_str)
+                .unwrap_or("#d69b31"),
+        );
+        let settings_action = format!(
+            r#"<a class="settings-card" href="{settings_href}" title="Open settings for {name}" style="--host-color:{settings_color}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>Settings</strong><span>Color and access</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
+            icon = icons::SLIDERS
+        );
         // pharosd cannot honestly heartbeat itself; the host gets the lighthouse cue.
         let status_word = if is_self { "the light is lit" } else { word };
         let status_icon = if is_self {
@@ -1201,12 +1254,12 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
             is_self,
         );
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
+            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header>{settings_action}{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td></tr>"#,
+            r#"<tr class="{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
             live_key = live_key(live),
             light_cls = light_cls.trim()
         ));
@@ -1219,7 +1272,7 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64) -> String {
     };
 
     format!(
-        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
+        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar()
@@ -1330,7 +1383,7 @@ mod tests {
             },
         ];
 
-        let html = render_home(&hosts, "csb1", 1000);
+        let html = render_home(&hosts, "csb1", 1000, &[]);
 
         assert!(html.contains(r#"<section class="toolbar""#));
         assert!(html.contains(r#"data-view-button="list""#));
@@ -1339,6 +1392,10 @@ mod tests {
         assert!(html.contains(r#"data-self="true""#));
         assert!(html.contains("the light is lit"));
         assert!(html.contains(r#"<th>Attention</th>"#));
+        assert!(html.contains(r#"<th>Actions</th>"#));
+        assert!(html.contains(r#"href="/agora?host=poseidon""#));
+        assert!(html.contains("Settings"));
+        assert!(html.contains("Color and access"));
         assert!(html
             .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
         assert!(html.contains("expected beat"));
@@ -1364,7 +1421,7 @@ mod tests {
 
     #[test]
     fn render_home_has_deliberate_empty_and_lone_host_states() {
-        let empty = render_home(&[], "csb1", 1000);
+        let empty = render_home(&[], "csb1", 1000, &[]);
         assert!(empty.contains(r#"<section class="empty-state""#));
         assert!(empty.contains("Waiting for the first host"));
         assert!(empty.contains("inspr onboard &lt;host&gt;"));
@@ -1383,7 +1440,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let lone = render_home(&[host], "csb1", 1000);
+        let lone = render_home(&[host], "csb1", 1000, &[]);
         assert!(lone.contains(r#"<aside class="lone-state""#));
         assert!(lone.contains("First host is on the map"));
         assert!(lone.contains(r#"data-live="awaiting_first_heartbeat""#));
