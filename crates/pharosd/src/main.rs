@@ -104,6 +104,7 @@ enum RegistrationAuth {
 
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
 const SIDEBAR_LIGHTHOUSE_PNG: &[u8] = include_bytes!("../assets/sidebar-lighthouse.png");
+const TIMER_CIRCLE_PNG: &[u8] = include_bytes!("../assets/timer-circle.png");
 
 const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><style>
 :root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--card:#ffffff;--card-soft:rgba(255,255,255,.82);--accent:#1f7fb5;--sea:#159e99;--sun:#d69b31;--live:#25845f;--stale:#b26a00;--down:#bf3a35;--wait:#8997a3;--side:232px}
@@ -119,8 +120,9 @@ body:before{content:"";position:fixed;inset:0;z-index:-3;background:radial-gradi
 main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .ico{width:16px;height:16px;display:inline-block;vertical-align:middle;flex:0 0 auto}
 .top{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:22px;min-height:118px;margin:-10px 0 20px;padding:10px 0 18px;overflow:hidden}
-.top:before{content:"";position:absolute;left:0;right:0;top:-52px;height:270px;background:url('/assets/fleet-horizon.png') center center/100% auto no-repeat;opacity:.84;pointer-events:none;--edge-fade:30%;-webkit-mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade),#000 calc(100% - var(--edge-fade)),transparent 100%),linear-gradient(to bottom,transparent 0,#000 var(--edge-fade),#000 calc(100% - var(--edge-fade)),transparent 100%);-webkit-mask-composite:source-in;mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade),#000 calc(100% - var(--edge-fade)),transparent 100%),linear-gradient(to bottom,transparent 0,#000 var(--edge-fade),#000 calc(100% - var(--edge-fade)),transparent 100%);mask-composite:intersect}
-.top>*{position:relative;z-index:1}.brand{display:flex;align-items:center;gap:12px;margin:0 0 4px}
+.top-art{position:absolute;left:0;right:0;top:-52px;height:270px;z-index:0;opacity:.84;pointer-events:none;--edge-fade-x:30%;--edge-fade-y:20%;-webkit-mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%);mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%)}
+.top-art:before{content:"";position:absolute;inset:0;background:url('/assets/fleet-horizon.png') center center/100% auto no-repeat;-webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 var(--edge-fade-y),#000 calc(100% - var(--edge-fade-y)),transparent 100%);mask-image:linear-gradient(to bottom,transparent 0,#000 var(--edge-fade-y),#000 calc(100% - var(--edge-fade-y)),transparent 100%)}
+.top>:not(.top-art){position:relative;z-index:1}.top-art{z-index:0}.brand{display:flex;align-items:center;gap:12px;margin:0 0 4px}
 .brand h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:31px;line-height:1.05;font-weight:500;letter-spacing:0;color:#12304b}
 .fleet{display:flex;align-items:center;gap:10px;margin:8px 0 0;color:var(--muted);font-size:14px}
 .wave{width:44px;height:10px;color:var(--sea);opacity:.78}
@@ -189,7 +191,9 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .beat-now{position:absolute;left:var(--now-x);top:23px;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle,#fff 0 29%,var(--fill-color) 32% 62%,transparent 64%);box-shadow:0 0 0 5px color-mix(in srgb,var(--fill-color) 12%,transparent),0 0 14px color-mix(in srgb,var(--fill-color) 26%,transparent);transform:translate(-50%,-50%)}
 .beat-current{position:absolute;top:22px;left:calc(var(--now-x) - 22%);width:22%;height:3px;border-radius:999px;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--fill-color) 34%,transparent),transparent);animation:tide 2.8s linear infinite;opacity:.8}
 .beat-marks{position:absolute;inset:0}
-.beat-mark{position:absolute;left:var(--mark-x);top:23px;width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 0 4px color-mix(in srgb,currentColor 10%,transparent);opacity:.78;transform:translate(-50%,-50%)}
+.beat-mark{--mark-color:var(--sea);position:absolute;left:var(--mark-x);top:23px;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
+.beat-mark[data-history-level="late"]{--mark-color:var(--sun)}.beat-mark[data-history-level="stale"]{--mark-color:var(--stale)}.beat-mark[data-history-level="down"]{--mark-color:var(--down)}.beat-mark[data-history-level="first"]{--mark-color:var(--wait)}
+.beat-mark:hover,.beat-mark:focus-visible{opacity:1;box-shadow:0 0 0 5px color-mix(in srgb,var(--mark-color) 18%,transparent),0 0 14px color-mix(in srgb,var(--mark-color) 24%,transparent);outline:0}
 .beat[data-count="0"] .beat-mark{display:none}
 .beat-expected{position:absolute;left:var(--expect-x);top:23px;width:18px;height:18px;border-radius:50%;border:1px solid #aebac3;background:conic-gradient(color-mix(in srgb,var(--beat-color) 72%,var(--sun)) var(--expect-fill),rgba(222,232,237,.9) 0),radial-gradient(circle,#fff 0 43%,transparent 45%);box-shadow:0 0 0 var(--target-ring) rgba(137,151,163,.12),0 0 16px rgba(214,155,49,.12);opacity:var(--expect-alpha);transform:translate(-50%,-50%)}
 .beat-expected:before,.beat-expected:after{content:"";position:absolute;left:50%;top:50%;width:28px;height:1px;background:#aebac3;opacity:.5;transform:translate(-50%,-50%)}
@@ -200,9 +204,11 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .beat[data-flash="true"] .beat-hit{animation:beat-hit .9s ease-out}
 .beat-zones{position:absolute;left:0;right:0;bottom:0;color:var(--muted);font-size:10px}
 .beat-zones span{position:absolute;bottom:0;white-space:nowrap}.beat-zones span:first-child{left:0}.beat-zones span:nth-child(2){left:var(--expect-x);transform:translateX(-50%)}.beat-zones span:nth-child(3){right:0;color:var(--stale)}
-.beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="late"] .beat-expected,.beat[data-beat="stale"] .beat-expected,.beat[data-beat="down"] .beat-expected{opacity:.86}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="lit"]{--beat-color:var(--sun)}
+.beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="late"] .beat-expected,.beat[data-beat="stale"] .beat-expected,.beat[data-beat="down"] .beat-expected{opacity:.86}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="tracking"] .beat-expected,.beat[data-beat="lit"] .beat-expected{opacity:0}.beat[data-beat="lit"]{--beat-color:var(--sun)}
 .beat-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:2px;font-size:11px;color:var(--muted)}
-.beat-meta strong{font-size:12px;color:var(--beat-color);font-weight:650}
+.beat-meta strong{position:relative;z-index:0;display:inline-grid;place-items:center;min-width:62px;min-height:24px;padding:0 4px;font-size:12px;color:var(--beat-color);font-weight:650;text-align:center}
+.beat-meta strong:before{content:"";position:absolute;left:50%;top:50%;z-index:-1;width:58px;height:46px;background:url('/assets/timer-circle.png') center/contain no-repeat;opacity:0;transform:translate(-50%,-50%);pointer-events:none}
+.beat-meta strong[data-next-state="cadence"]:before{opacity:.58}
 @keyframes beat-hit{0%{opacity:.9;transform:translate(-50%,-50%) scale(.55);box-shadow:0 0 0 0 color-mix(in srgb,currentColor 28%,transparent)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4);box-shadow:0 0 0 12px transparent}}
 @keyframes tide{from{transform:translateX(-16%)}to{transform:translateX(42%)}}
 .list-wrap{display:none}
@@ -255,6 +261,16 @@ function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(na
 function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
 function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host]')).filter(el=>el.dataset.host===name)}
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
+function historyInfo(beats,index,interval){
+  const stamp=beats[index];
+  const previous=index>0?beats[index-1]:null;
+  if(previous==null)return {level:'first',label:'first heartbeat',detail:'at '+clock(stamp)};
+  const gap=Math.max(0,stamp-previous);
+  if(gap<=interval)return {level:'ok',label:'on cadence',detail:dur(gap)+' after previous · '+clock(stamp)};
+  if(gap<=interval*2)return {level:'late',label:'late heartbeat',detail:dur(gap)+' after previous · '+clock(stamp)};
+  if(gap<=interval*5)return {level:'stale',label:'stale gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
+  return {level:'down',label:'offline gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
+}
 function freshRow(label,value,klass){return '<div class="fresh-row"><span>'+esc(label)+'</span><strong class="'+klass+'">'+esc(value)+'</strong></div>'}
 function freshValue(v,zero){
   const n=Number(v);
@@ -297,22 +313,59 @@ function setReason(surface,reason){
   const text=el.querySelector('span');
   if(text)text.textContent=reason.label;
 }
-function markHtml(beats){
+function markHtml(beats,interval){
   const kept=beats.slice(-MAX_BEATS);
   if(!kept.length)return '';
   const start=4,end=28;
   const step=kept.length===1?0:(end-start)/(kept.length-1);
   return kept.map((_,i)=>{
     const x=kept.length===1?end:start+i*step;
-    return '<span class="beat-mark" style="--mark-x:'+x.toFixed(1)+'%"></span>';
+    const info=historyInfo(kept,i,interval);
+    const title=info.label+' · '+info.detail;
+    return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
 }
-function setBeatHistory(beat,beats){
+function setHistoryHint(mark,show){
+  const card=mark.closest('.card');
+  if(!card)return;
+  const seen=card.querySelector('[data-seen]');
+  const asof=card.querySelector('[data-card-asof]');
+  if(!seen||!asof)return;
+  if(show){
+    card.dataset.historyHint='true';
+    seen.textContent=mark.dataset.historyLabel||'historic heartbeat';
+    asof.textContent=mark.dataset.historyDetail||'';
+  }else{
+    delete card.dataset.historyHint;
+    seen.textContent=seen.dataset.defaultText||seen.textContent;
+    asof.textContent=asof.dataset.defaultText||asof.textContent;
+  }
+}
+function bindHistoryHints(root=document){
+  root.querySelectorAll('.beat-mark').forEach(mark=>{
+    if(mark.dataset.hintBound==='true')return;
+    mark.dataset.hintBound='true';
+    mark.addEventListener('mouseenter',()=>setHistoryHint(mark,true));
+    mark.addEventListener('mouseleave',()=>setHistoryHint(mark,false));
+    mark.addEventListener('focus',()=>setHistoryHint(mark,true));
+    mark.addEventListener('blur',()=>setHistoryHint(mark,false));
+  });
+}
+function setBeatHistory(beat,beats,interval){
   const kept=Array.from(new Set(beats)).sort((a,b)=>a-b).slice(-MAX_BEATS);
+  const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
   beat.dataset.beats=kept.join(',');
   beat.dataset.count=String(kept.length);
   const marks=beat.querySelector('.beat-marks');
-  if(marks)marks.innerHTML=markHtml(kept);
+  if(marks){
+    marks.innerHTML=markHtml(kept,cadence);
+    bindHistoryHints(marks);
+  }
+}
+function setNext(next,label,state=''){
+  if(!next)return;
+  next.textContent=label;
+  next.dataset.nextState=state;
 }
 function flashBeat(beat){
   beat.dataset.flash='true';
@@ -341,7 +394,7 @@ function updateBeatClock(beat,now){
     beat.style.setProperty('--target-ring','3px');
     beat.style.setProperty('--late-alpha','.3');
     beat.dataset.beat='waiting';
-    if(next)next.textContent='waiting';
+    setNext(next,'waiting');
     return;
   }
   const age=Math.max(0,now-last);
@@ -354,28 +407,29 @@ function updateBeatClock(beat,now){
   if(age<=interval){
     beat.style.setProperty('--fill-color',beat.dataset.self==='true'?'var(--sun)':'var(--sea)');
     beat.dataset.beat=beat.dataset.self==='true'?'lit':'tracking';
-    if(next)next.textContent=cadenceLabel(age,interval);
+    const label=cadenceLabel(age,interval);
+    setNext(next,label,label==='on cadence'?'cadence':'');
   }else if(age<=interval*2){
     beat.style.setProperty('--fill-color','var(--sun)');
     beat.style.setProperty('--expect-alpha','.79');
     beat.style.setProperty('--expect-fill','360deg');
     beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='late';
-    if(next)next.textContent='late';
+    setNext(next,'late');
   }else if(age<=interval*5){
     beat.style.setProperty('--fill-color','var(--stale)');
     beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
     beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='stale';
-    if(next)next.textContent='stale';
+    setNext(next,'stale');
   }else{
     beat.style.setProperty('--fill-color','var(--down)');
     beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
     beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='down';
-    if(next)next.textContent='silent';
+    setNext(next,'silent');
   }
 }
 function frame(){
@@ -388,8 +442,16 @@ function frame(){
 function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
   if(!seen)return;
-  if(last==null){seen.textContent='never seen';return}
-  seen.textContent='last seen '+dur(now-last)+' ago';
+  const text=last==null?'never seen':'last seen '+dur(now-last)+' ago';
+  seen.dataset.defaultText=text;
+  if(card.dataset.historyHint!=='true')seen.textContent=text;
+}
+function setCardAsOf(card,now){
+  const asof=card.querySelector('[data-card-asof]');
+  if(!asof)return;
+  const text='as of '+clock(now);
+  asof.dataset.defaultText=text;
+  if(card.dataset.historyHint!=='true')asof.textContent=text;
 }
 function sevFor(live){return live==='down'?0:live==='stale'?1:live==='awaiting_first_heartbeat'?2:3}
 function cmp(a,b,mode){
@@ -467,6 +529,7 @@ async function refresh(){
         const fresh=card.querySelector('[data-fresh]');
         if(fresh)fresh.innerHTML=freshHtml(h.freshness);
         setSeen(card,h.last_seen,now);
+        setCardAsOf(card,now);
         const beat=card.querySelector('.beat');
         if(beat){
           const previous=Number(beat.dataset.last);
@@ -474,14 +537,14 @@ async function refresh(){
           const interval=h.heartbeat_interval_secs || 60;
           const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
           const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
-          setBeatHistory(beat,beats);
+          beat.dataset.interval=interval;
+          setBeatHistory(beat,beats,interval);
           if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
             beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
             flashBeat(beat);
           }
           beat.dataset.ready='true';
           beat.dataset.last=Number.isFinite(last)?String(last):'';
-          beat.dataset.interval=interval;
           beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
         }
       }
@@ -489,7 +552,8 @@ async function refresh(){
     applySort(document.querySelector('[data-sort]')?.value||'attention',false);
   }catch(_){}
 }
-document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.beats));beat.dataset.ready='true'});
+document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
+document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
 initControls();
 requestAnimationFrame(frame);
 setInterval(refresh,10000);
@@ -775,6 +839,16 @@ async fn sidebar_lighthouse_asset() -> impl axum::response::IntoResponse {
     )
 }
 
+async fn timer_circle_asset() -> impl axum::response::IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        TIMER_CIRCLE_PNG,
+    )
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1015,7 +1089,7 @@ fn sidebar() -> String {
 
 fn header(now: i64) -> String {
     format!(
-        r#"<div class="top"><div><div class="brand"><h1>Fleet</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">All hosts at a glance</p></div><div class="asof" data-as-of>as of {as_of}</div></div>"#,
+        r#"<div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Fleet</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">All hosts at a glance</p></div><div class="asof" data-as-of>as of {as_of}</div></div>"#,
         as_of = clock_label(now)
     )
 }
@@ -1067,7 +1141,38 @@ fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
     recent
 }
 
-fn heartbeat_marks(log: &[i64]) -> String {
+fn heartbeat_history(log: &[i64], idx: usize, interval: i64) -> (&'static str, String, String) {
+    let stamp = log[idx];
+    let Some(previous) = idx.checked_sub(1).and_then(|previous| log.get(previous)) else {
+        return (
+            "first",
+            "first heartbeat".to_string(),
+            format!("at {}", clock_label(stamp)),
+        );
+    };
+    let gap = (stamp - previous).max(0);
+    let interval = interval.max(1);
+    let (level, label) = if gap <= interval {
+        ("ok", "on cadence")
+    } else if gap <= interval * 2 {
+        ("late", "late heartbeat")
+    } else if gap <= interval * 5 {
+        ("stale", "stale gap recovered")
+    } else {
+        ("down", "offline gap recovered")
+    };
+    (
+        level,
+        label.to_string(),
+        format!(
+            "{} after previous · {}",
+            duration_label(gap),
+            clock_label(stamp)
+        ),
+    )
+}
+
+fn heartbeat_marks(log: &[i64], interval: i64) -> String {
     if log.is_empty() {
         return String::new();
     }
@@ -1086,8 +1191,14 @@ fn heartbeat_marks(log: &[i64]) -> String {
         } else {
             start + idx as f64 * step
         };
+        let (level, label, detail) = heartbeat_history(log, idx, interval);
+        let title = format!("{label} · {detail}");
         marks.push_str(&format!(
-            r#"<span class="beat-mark" style="--mark-x:{x:.1}%"></span>"#
+            r#"<span class="beat-mark" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
+            level = html_escape(level),
+            label = html_escape(&label),
+            detail = html_escape(&detail),
+            title = html_escape(&title)
         ));
     }
     marks
@@ -1136,72 +1247,87 @@ fn heartbeat_card(
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let marks = heartbeat_marks(&recent);
-    let (last_attr, next_at_attr, beat_state, next, now_x, fill_color, expect_fill, target_ring) =
-        match last_seen {
-            Some(last) => {
-                let age = (now - last).max(0);
-                let progress = (age as f64 / interval as f64).clamp(0.0, 1.0);
-                if age <= interval {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        if is_self { "lit" } else { "tracking" },
-                        heartbeat_cadence_label(age, interval).to_string(),
-                        heartbeat_x(age, interval),
-                        if is_self { "var(--sun)" } else { "var(--sea)" },
-                        progress * 360.0,
-                        3.0 + progress * 5.0,
-                    )
-                } else if age <= interval * 2 {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "late",
-                        "late".to_string(),
-                        heartbeat_x(age, interval),
-                        "var(--sun)",
-                        360.0,
-                        8.0,
-                    )
-                } else if age <= interval * 5 {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "stale",
-                        "stale".to_string(),
-                        heartbeat_x(age, interval),
-                        "var(--stale)",
-                        360.0,
-                        8.0,
-                    )
-                } else {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "down",
-                        "silent".to_string(),
-                        100.0,
-                        "var(--down)",
-                        360.0,
-                        8.0,
-                    )
-                }
+    let marks = heartbeat_marks(&recent, interval);
+    let (
+        last_attr,
+        next_at_attr,
+        beat_state,
+        next,
+        next_state,
+        now_x,
+        fill_color,
+        expect_fill,
+        target_ring,
+    ) = match last_seen {
+        Some(last) => {
+            let age = (now - last).max(0);
+            let progress = (age as f64 / interval as f64).clamp(0.0, 1.0);
+            if age <= interval {
+                let next = heartbeat_cadence_label(age, interval);
+                (
+                    last.to_string(),
+                    (last + interval).to_string(),
+                    if is_self { "lit" } else { "tracking" },
+                    next.to_string(),
+                    if next == "on cadence" { "cadence" } else { "" },
+                    heartbeat_x(age, interval),
+                    if is_self { "var(--sun)" } else { "var(--sea)" },
+                    progress * 360.0,
+                    3.0 + progress * 5.0,
+                )
+            } else if age <= interval * 2 {
+                (
+                    last.to_string(),
+                    (last + interval).to_string(),
+                    "late",
+                    "late".to_string(),
+                    "",
+                    heartbeat_x(age, interval),
+                    "var(--sun)",
+                    360.0,
+                    8.0,
+                )
+            } else if age <= interval * 5 {
+                (
+                    last.to_string(),
+                    (last + interval).to_string(),
+                    "stale",
+                    "stale".to_string(),
+                    "",
+                    heartbeat_x(age, interval),
+                    "var(--stale)",
+                    360.0,
+                    8.0,
+                )
+            } else {
+                (
+                    last.to_string(),
+                    (last + interval).to_string(),
+                    "down",
+                    "silent".to_string(),
+                    "",
+                    100.0,
+                    "var(--down)",
+                    360.0,
+                    8.0,
+                )
             }
-            None => (
-                "".to_string(),
-                "".to_string(),
-                "waiting",
-                "waiting".to_string(),
-                0.0,
-                "var(--wait)",
-                0.0,
-                3.0,
-            ),
-        };
+        }
+        None => (
+            "".to_string(),
+            "".to_string(),
+            "waiting",
+            "waiting".to_string(),
+            "",
+            0.0,
+            "var(--wait)",
+            0.0,
+            3.0,
+        ),
+    };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-expected"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div><div class="beat-meta"><span>expected beat</span><strong data-next>{next}</strong></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-expected"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div><div class="beat-meta"><span>expected beat</span><strong data-next data-next-state="{next_state}">{next}</strong></div></div>"#,
         count = recent.len()
     )
 }
@@ -1302,7 +1428,7 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
             is_self,
         );
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header>{settings_action}{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span>as of {as_of}</span></div>{heartbeat}</article>"#,
+            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header>{settings_action}{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}</article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
@@ -1369,6 +1495,7 @@ async fn main() {
             "/assets/sidebar-lighthouse.png",
             get(sidebar_lighthouse_asset),
         )
+        .route("/assets/timer-circle.png", get(timer_circle_asset))
         .route("/register", post(register))
         .route("/report", post(report))
         .route("/auth/login", get(auth::login))
@@ -1453,8 +1580,11 @@ mod tests {
         assert!(html
             .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
         assert!(html.contains("expected beat"));
-        assert!(html.contains(r#"data-next>on cadence"#));
+        assert!(html.contains(r#"data-next data-next-state="cadence">on cadence"#));
         assert!(html.contains(r#"data-beats="850,910,970""#));
+        assert!(html.contains(r#"data-history-level="first""#));
+        assert!(html.contains(r#"data-history-level="ok""#));
+        assert!(html.contains(r#"data-history-label="on cadence""#));
         assert!(html.contains("Flake.lock age"));
         assert!(html.contains(r#"<strong class="warn">1d</strong>"#));
         assert!(html.contains("Commits behind"));
