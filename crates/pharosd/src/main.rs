@@ -151,13 +151,15 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 [data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
 .card.light{border-color:rgba(214,155,49,.48);box-shadow:0 16px 34px rgba(150,103,28,.12)}
 .halo{position:absolute;inset:-84px -74px auto auto;width:190px;height:190px;background:radial-gradient(circle,rgba(214,155,49,.20),rgba(21,158,153,.08) 42%,transparent 70%);pointer-events:none}
-.lh{position:absolute;top:14px;right:14px;color:var(--sun)}
-.lh .ico{width:22px;height:22px}
-.card-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
+.card-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
 .host{display:flex;align-items:center;gap:9px;min-width:0}
-.nix{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(102,121,139,.18);border-radius:50%;color:var(--accent);background:rgba(241,248,250,.72)}
+.nix{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(102,121,139,.18);border-radius:50%;color:var(--accent);background:rgba(241,248,250,.72);transition:border-color .2s ease,box-shadow .2s ease}
+.card.has-settings .nix,.list tr.has-settings .nix{border-width:2px;border-color:var(--host-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color) 13%,transparent),0 0 17px color-mix(in srgb,var(--host-color) 18%,transparent);background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--host-color) 8%,#f5fbfc))}
 .name{font-weight:650;font-size:16px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .role{font-size:12px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.signal{--signal-color:var(--wait);display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;min-width:52px;min-height:24px;color:var(--signal-color);font-size:13px;font-weight:720;white-space:nowrap;text-align:right}
+.signal[data-signal-level="good"]{--signal-color:var(--live)}.signal[data-signal-level="warn"]{--signal-color:var(--stale)}.signal[data-signal-level="down"]{--signal-color:var(--down)}.signal[data-signal-level="wait"]{--signal-color:var(--wait)}
+.signal-orb{width:12px;height:12px;border-radius:50%;background:radial-gradient(circle,#fff 0 28%,var(--signal-color) 33% 63%,transparent 66%);box-shadow:0 0 0 4px color-mix(in srgb,var(--signal-color) 12%,transparent),0 0 12px color-mix(in srgb,var(--signal-color) 18%,transparent);opacity:.92}
 .status-pill{display:inline-flex;align-items:center;gap:6px;min-height:25px;max-width:150px;flex-shrink:0;padding:4px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--state) 24%,transparent);background:color-mix(in srgb,var(--state) 10%,white);color:var(--state);font-size:12px;white-space:nowrap}
 .status-pill .ico{width:14px;height:14px}.word{color:inherit;overflow:hidden;text-overflow:ellipsis}
 .state-icon{display:none}[data-live="live"] .state-icon.live,[data-live="stale"] .state-icon.stale,[data-live="down"] .state-icon.down,[data-live="awaiting_first_heartbeat"] .state-icon.awaiting{display:inline-block}
@@ -173,16 +175,15 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
-.settings-card{display:inline-grid;grid-template-columns:22px minmax(0,auto) 16px;align-items:center;gap:8px;align-self:flex-start;max-width:100%;min-height:31px;margin:-2px 0 10px 39px;padding:4px 8px;border:1px solid rgba(210,226,234,.94);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(248,252,253,.88));color:var(--ink);text-decoration:none;box-shadow:0 7px 16px rgba(45,75,95,.055)}
-.settings-card:hover{border-color:rgba(31,127,181,.34);box-shadow:0 9px 20px rgba(45,75,95,.09);transform:translateY(-1px)}
-.settings-card.unavailable{--host-color:#aebac3;background:rgba(251,253,254,.82);color:var(--muted);box-shadow:none}
-.settings-card.unavailable:hover{border-color:rgba(137,151,163,.34);box-shadow:0 8px 18px rgba(45,75,95,.05)}
+.card-tools{display:flex;align-items:center;justify-content:flex-start;min-height:25px;margin-top:5px}
+.settings-card{display:inline-grid;place-items:center;width:25px;height:25px;margin:0;border:0;border-radius:50%;background:transparent;color:var(--accent);text-decoration:none;box-shadow:none}
+.settings-card:hover{background:rgba(223,241,249,.78);box-shadow:0 7px 16px rgba(45,75,95,.08);transform:translateY(-1px)}
+.settings-card.unavailable{--host-color:#aebac3;color:var(--muted);opacity:.72;box-shadow:none}
+.settings-card.unavailable:hover{background:rgba(241,247,250,.92);box-shadow:0 7px 16px rgba(45,75,95,.05);opacity:1}
 .settings-card.unavailable .settings-icon{color:var(--muted)}
-.settings-card.unavailable .settings-swatch{background:repeating-linear-gradient(135deg,#eef4f6 0 6px,#fff 6px 12px)}
-.settings-icon{display:grid;place-items:center;width:22px;height:22px;border:1px solid rgba(210,226,234,.92);border-radius:50%;background:rgba(244,250,251,.82);color:var(--accent)}
+.settings-icon{display:grid;place-items:center;width:25px;height:25px;border:1px solid rgba(210,226,234,.76);border-radius:50%;background:rgba(255,255,255,.58);color:inherit}
 .settings-icon .ico{width:13px;height:13px}
-.settings-copy{min-width:0}.settings-copy strong{display:block;font-size:12px;line-height:1.1}.settings-copy span{display:none}
-.settings-swatch{width:16px;height:16px;border-radius:50%;border:1px solid rgba(0,0,0,.12);background:var(--host-color,var(--sun));box-shadow:inset 0 0 0 2px rgba(255,255,255,.54)}
+.settings-copy,.settings-swatch{display:none}
 .beat{--beat-color:var(--state);--now-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
 .beat-stage{position:relative;height:50px;overflow:visible}
 .beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
@@ -194,18 +195,13 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .beat-mark[data-history-level="late"]{--mark-color:var(--sun)}.beat-mark[data-history-level="stale"]{--mark-color:var(--stale)}.beat-mark[data-history-level="down"]{--mark-color:var(--down)}.beat-mark[data-history-level="first"]{--mark-color:var(--wait)}
 .beat-mark:hover,.beat-mark:focus-visible{opacity:1;box-shadow:0 0 0 5px color-mix(in srgb,var(--mark-color) 18%,transparent),0 0 14px color-mix(in srgb,var(--mark-color) 24%,transparent);outline:0}
 .beat[data-count="0"] .beat-mark{display:none}
-.beat-expected{position:relative;display:inline-block;flex:0 0 14px;width:14px;height:14px;border-radius:50%;border:1px solid #aebac3;background:conic-gradient(color-mix(in srgb,var(--beat-color) 72%,var(--sun)) var(--expect-fill),rgba(222,232,237,.9) 0),radial-gradient(circle,#fff 0 43%,transparent 45%);box-shadow:0 0 0 var(--target-ring) rgba(137,151,163,.12),0 0 16px rgba(214,155,49,.12);opacity:var(--expect-alpha)}
-.beat-expected:before,.beat-expected:after{content:"";position:absolute;left:50%;top:50%;width:22px;height:1px;background:#aebac3;opacity:.5;transform:translate(-50%,-50%)}
-.beat-expected:after{transform:translate(-50%,-50%) rotate(90deg)}
 .beat-threshold{position:absolute;top:15px;bottom:15px;width:1px;background:rgba(137,151,163,.25)}
 .beat-threshold.expected{left:var(--expect-x)}.beat-threshold.stale{left:var(--stale-x)}
 .beat-hit{position:absolute;left:var(--hit-x,0%);top:23px;z-index:9;width:9px;height:9px;border-radius:50%;background:currentColor;opacity:0;transform:translate(-50%,-50%) scale(.7);pointer-events:none}
 .beat[data-flash="true"] .beat-hit{animation:beat-hit .9s ease-out}
 .beat-zones{position:absolute;left:0;right:0;bottom:0;color:var(--muted);font-size:10px}
 .beat-zones span{position:absolute;bottom:0;white-space:nowrap}.beat-zones span:first-child{left:0}.beat-zones span:nth-child(2){left:var(--expect-x);transform:translateX(-50%)}.beat-zones span:nth-child(3){right:0;color:var(--stale)}
-.beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="late"] .beat-expected,.beat[data-beat="stale"] .beat-expected,.beat[data-beat="down"] .beat-expected{opacity:.86}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="waiting"] .beat-expected{opacity:.22}.beat[data-beat="lit"]{--beat-color:var(--sun)}
-.beat-meta{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:2px;font-size:11px;color:var(--muted)}
-.beat-meta strong{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;min-width:92px;min-height:24px;padding:0;font-size:12px;color:var(--beat-color);font-weight:650;text-align:right}
+.beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="lit"]{--beat-color:var(--sun)}
 @keyframes beat-hit{0%{opacity:.9;transform:translate(-50%,-50%) scale(.55);box-shadow:0 0 0 0 color-mix(in srgb,currentColor 28%,transparent)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4);box-shadow:0 0 0 12px transparent}}
 @keyframes tide{from{transform:translateX(-16%)}to{transform:translateX(42%)}}
 .list-wrap{display:none}
@@ -217,7 +213,7 @@ main[data-view="list"] .list-wrap{display:block}
 .list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:8px 0 0 8px}
 .list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
-.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}.list .settings-card{display:inline-flex;min-height:30px;margin:0;padding:5px 9px}.list .settings-icon{width:22px;height:22px}.list .settings-copy span,.list .settings-swatch{display:none}.list .settings-copy strong{font-size:12px}
+.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .card-tools{margin:0}.list .settings-card{margin:0}.list .settings-icon{width:25px;height:25px}
 [hidden]{display:none!important}
 .empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
@@ -327,6 +323,42 @@ function markHtml(beats,interval){
     return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
 }
+function signalInfo(beats,last,interval,now){
+  const cadence=Math.max(1,Number(interval)||60);
+  const samples=Array.from(new Set(beats.concat(Number.isFinite(last)&&last>0?[last]:[]))).filter(Number.isFinite).filter(n=>n>0).sort((a,b)=>a-b);
+  if(!samples.length)return {text:'new',level:'wait',title:'Recent signal: waiting for first heartbeat'};
+  let remaining=HISTORY_DOTS;
+  let expected=0;
+  let received=0;
+  const latest=samples[samples.length-1];
+  const currentMissed=Math.max(0,Math.floor((now-latest)/cadence));
+  let take=Math.min(currentMissed,remaining);
+  expected+=take;
+  remaining-=take;
+  for(let i=samples.length-1;i>0&&remaining>0;i--){
+    const gap=Math.max(0,samples[i]-samples[i-1]);
+    const slots=Math.max(1,Math.ceil(gap/cadence));
+    take=Math.min(slots,remaining);
+    if(take>0){
+      expected+=take;
+      received+=1;
+      remaining-=take;
+    }
+  }
+  if(expected===0)return {text:'new',level:'wait',title:'Recent signal: not enough heartbeat history yet'};
+  const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
+  const level=percent>=95?'good':percent>=75?'warn':'down';
+  return {text:percent+'%',level,title:'Recent signal: '+received+' of '+expected+' expected heartbeats received'};
+}
+function updateSignal(surface,info){
+  const signal=surface?.querySelector('[data-signal]');
+  if(!signal)return;
+  signal.dataset.signalLevel=info.level;
+  signal.title=info.title;
+  signal.setAttribute('aria-label',info.title);
+  const text=signal.querySelector('[data-signal-percent]');
+  if(text)text.textContent=info.text;
+}
 function setHistoryHint(mark,show){
   const card=mark.closest('.card');
   if(!card)return;
@@ -364,13 +396,6 @@ function setBeatHistory(beat,beats,interval){
     bindHistoryHints(marks);
   }
 }
-function setNext(next,label,state=''){
-  if(!next)return;
-  const text=next.querySelector('[data-next-label]');
-  if(text)text.textContent=label;
-  else next.textContent=label;
-  next.dataset.nextState=state;
-}
 function flashBeat(beat){
   beat.dataset.flash='true';
   window.setTimeout(()=>{delete beat.dataset.flash},950);
@@ -381,15 +406,10 @@ function heartbeatX(age,interval){
   if(age<=interval*5)return STALE_X+((age-interval*2)/(interval*3))*(100-STALE_X);
   return 100;
 }
-function cadenceLabel(age,interval){
-  if(age<interval*.66)return 'on cadence';
-  if(age<interval*.92)return 'approaching';
-  return 'due now';
-}
 function updateBeatClock(beat,now){
   const last=Number(beat.dataset.last);
   const interval=Math.max(1,Number(beat.dataset.interval)||60);
-  const next=beat.querySelector('[data-next]');
+  const surface=beat.closest('[data-host]');
   if(!Number.isFinite(last)||last<=0){
     beat.style.setProperty('--expect-alpha','.22');
     beat.style.setProperty('--now-x','0%');
@@ -398,7 +418,7 @@ function updateBeatClock(beat,now){
     beat.style.setProperty('--target-ring','3px');
     beat.style.setProperty('--late-alpha','.3');
     beat.dataset.beat='waiting';
-    setNext(next,'waiting');
+    updateSignal(surface,signalInfo([],last,interval,now));
     return;
   }
   const age=Math.max(0,now-last);
@@ -411,30 +431,26 @@ function updateBeatClock(beat,now){
   if(age<=interval){
     beat.style.setProperty('--fill-color',beat.dataset.self==='true'?'var(--sun)':'var(--sea)');
     beat.dataset.beat=beat.dataset.self==='true'?'lit':'tracking';
-    const label=cadenceLabel(age,interval);
-    setNext(next,label,label==='on cadence'?'cadence':'');
   }else if(age<=interval*2){
     beat.style.setProperty('--fill-color','var(--sun)');
     beat.style.setProperty('--expect-alpha','.79');
     beat.style.setProperty('--expect-fill','360deg');
     beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='late';
-    setNext(next,'late');
   }else if(age<=interval*5){
     beat.style.setProperty('--fill-color','var(--stale)');
     beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
     beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='stale';
-    setNext(next,'stale');
   }else{
     beat.style.setProperty('--fill-color','var(--down)');
     beat.style.setProperty('--expect-alpha','.86');
     beat.style.setProperty('--expect-fill','360deg');
     beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='down';
-    setNext(next,'silent');
   }
+  updateSignal(surface,signalInfo(parseBeats(beat.dataset.beats),last,interval,now));
 }
 function frame(){
   const now=Date.now()/1000;
@@ -543,6 +559,7 @@ async function refresh(){
           const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
           beat.dataset.interval=interval;
           setBeatHistory(beat,beats,interval);
+          updateSignal(card,signalInfo(beats,last,interval,now));
           if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
             beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
             flashBeat(beat);
@@ -1138,18 +1155,100 @@ fn lone_host_state() -> String {
 }
 
 fn recent_heartbeat_log(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
-    let mut recent = log.to_vec();
-    if recent.is_empty() {
-        if let Some(last) = last_seen {
-            recent.push(last);
-        }
-    }
-    recent.sort_unstable();
-    recent.dedup();
+    let mut recent = heartbeat_samples(log, last_seen);
     if recent.len() > HEARTBEAT_HISTORY_SAMPLES {
         recent.drain(0..recent.len() - HEARTBEAT_HISTORY_SAMPLES);
     }
     recent
+}
+
+fn heartbeat_samples(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
+    let mut samples = log.to_vec();
+    if samples.is_empty() {
+        if let Some(last) = last_seen {
+            samples.push(last);
+        }
+    }
+    samples.sort_unstable();
+    samples.dedup();
+    samples
+}
+
+struct HeartbeatSignal {
+    text: String,
+    level: &'static str,
+    title: String,
+}
+
+fn heartbeat_signal(
+    log: &[i64],
+    last_seen: Option<i64>,
+    interval: i64,
+    now: i64,
+) -> HeartbeatSignal {
+    let samples = heartbeat_samples(log, last_seen);
+    let Some(latest) = samples.last().copied() else {
+        return HeartbeatSignal {
+            text: "new".to_string(),
+            level: "wait",
+            title: "Recent signal: waiting for first heartbeat".to_string(),
+        };
+    };
+
+    let interval = interval.max(1);
+    let mut remaining = HEARTBEAT_HISTORY_DOTS;
+    let mut expected = 0usize;
+    let mut received = 0usize;
+
+    let current_missed = ((now - latest).max(0) / interval) as usize;
+    let mut take = current_missed.min(remaining);
+    expected += take;
+    remaining -= take;
+
+    for idx in (1..samples.len()).rev() {
+        if remaining == 0 {
+            break;
+        }
+        let gap = (samples[idx] - samples[idx - 1]).max(0);
+        let slots = ((gap + interval - 1) / interval).max(1) as usize;
+        take = slots.min(remaining);
+        if take > 0 {
+            expected += take;
+            received += 1;
+            remaining -= take;
+        }
+    }
+
+    if expected == 0 {
+        return HeartbeatSignal {
+            text: "new".to_string(),
+            level: "wait",
+            title: "Recent signal: not enough heartbeat history yet".to_string(),
+        };
+    }
+
+    let percent = (((received * 100) + (expected / 2)) / expected).min(100);
+    let level = if percent >= 95 {
+        "good"
+    } else if percent >= 75 {
+        "warn"
+    } else {
+        "down"
+    };
+    HeartbeatSignal {
+        text: format!("{percent}%"),
+        level,
+        title: format!("Recent signal: {received} of {expected} expected heartbeats received"),
+    }
+}
+
+fn signal_markup(signal: &HeartbeatSignal) -> String {
+    let title = html_escape(&signal.title);
+    format!(
+        r#"<span class="signal" data-signal data-signal-level="{level}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span></span>"#,
+        level = html_escape(signal.level),
+        text = html_escape(&signal.text),
+    )
 }
 
 fn heartbeat_history(log: &[i64], idx: usize, interval: i64) -> (&'static str, String, String) {
@@ -1226,18 +1325,6 @@ fn heartbeat_x(age: i64, interval: i64) -> f64 {
     100.0
 }
 
-fn heartbeat_cadence_label(age: i64, interval: i64) -> &'static str {
-    let age = age.max(0) as f64;
-    let interval = interval.max(1) as f64;
-    if age < interval * 0.66 {
-        "on cadence"
-    } else if age < interval * 0.92 {
-        "approaching"
-    } else {
-        "due now"
-    }
-}
-
 fn heartbeat_card(
     last_seen: Option<i64>,
     heartbeat_log: &[i64],
@@ -1255,86 +1342,66 @@ fn heartbeat_card(
         .collect::<Vec<_>>()
         .join(",");
     let marks = heartbeat_marks(&recent, interval);
-    let (
-        last_attr,
-        next_at_attr,
-        beat_state,
-        next,
-        next_state,
-        now_x,
-        fill_color,
-        expect_fill,
-        target_ring,
-    ) = match last_seen {
-        Some(last) => {
-            let age = (now - last).max(0);
-            let progress = (age as f64 / interval as f64).clamp(0.0, 1.0);
-            if age <= interval {
-                let next = heartbeat_cadence_label(age, interval);
-                (
-                    last.to_string(),
-                    (last + interval).to_string(),
-                    if is_self { "lit" } else { "tracking" },
-                    next.to_string(),
-                    if next == "on cadence" { "cadence" } else { "" },
-                    heartbeat_x(age, interval),
-                    if is_self { "var(--sun)" } else { "var(--sea)" },
-                    progress * 360.0,
-                    3.0 + progress * 5.0,
-                )
-            } else if age <= interval * 2 {
-                (
-                    last.to_string(),
-                    (last + interval).to_string(),
-                    "late",
-                    "late".to_string(),
-                    "",
-                    heartbeat_x(age, interval),
-                    "var(--sun)",
-                    360.0,
-                    8.0,
-                )
-            } else if age <= interval * 5 {
-                (
-                    last.to_string(),
-                    (last + interval).to_string(),
-                    "stale",
-                    "stale".to_string(),
-                    "",
-                    heartbeat_x(age, interval),
-                    "var(--stale)",
-                    360.0,
-                    8.0,
-                )
-            } else {
-                (
-                    last.to_string(),
-                    (last + interval).to_string(),
-                    "down",
-                    "silent".to_string(),
-                    "",
-                    100.0,
-                    "var(--down)",
-                    360.0,
-                    8.0,
-                )
+    let (last_attr, next_at_attr, beat_state, now_x, fill_color, expect_fill, target_ring) =
+        match last_seen {
+            Some(last) => {
+                let age = (now - last).max(0);
+                let progress = (age as f64 / interval as f64).clamp(0.0, 1.0);
+                if age <= interval {
+                    (
+                        last.to_string(),
+                        (last + interval).to_string(),
+                        if is_self { "lit" } else { "tracking" },
+                        heartbeat_x(age, interval),
+                        if is_self { "var(--sun)" } else { "var(--sea)" },
+                        progress * 360.0,
+                        3.0 + progress * 5.0,
+                    )
+                } else if age <= interval * 2 {
+                    (
+                        last.to_string(),
+                        (last + interval).to_string(),
+                        "late",
+                        heartbeat_x(age, interval),
+                        "var(--sun)",
+                        360.0,
+                        8.0,
+                    )
+                } else if age <= interval * 5 {
+                    (
+                        last.to_string(),
+                        (last + interval).to_string(),
+                        "stale",
+                        heartbeat_x(age, interval),
+                        "var(--stale)",
+                        360.0,
+                        8.0,
+                    )
+                } else {
+                    (
+                        last.to_string(),
+                        (last + interval).to_string(),
+                        "down",
+                        100.0,
+                        "var(--down)",
+                        360.0,
+                        8.0,
+                    )
+                }
             }
-        }
-        None => (
-            "".to_string(),
-            "".to_string(),
-            "waiting",
-            "waiting".to_string(),
-            "",
-            0.0,
-            "var(--wait)",
-            0.0,
-            3.0,
-        ),
-    };
+            None => (
+                "".to_string(),
+                "".to_string(),
+                "waiting",
+                0.0,
+                "var(--wait)",
+                0.0,
+                3.0,
+            ),
+        };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div><div class="beat-meta"><span>expected beat</span><strong data-next data-next-state="{next_state}"><span data-next-label>{next}</span><span class="beat-expected" aria-hidden="true"></span></strong></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div></div>"#,
         count = recent.len().saturating_sub(1)
     )
 }
@@ -1400,23 +1467,29 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
         let light_cls = if is_self { " light" } else { "" };
         let self_attr = if is_self { r#" data-self="true""# } else { "" };
         let beam = if is_self {
-            format!(
-                "<div class=\"halo\"></div><span class=\"lh\">{}</span>",
-                icons::LIGHTHOUSE
-            )
+            "<div class=\"halo\"></div>".to_string()
         } else {
             String::new()
         };
         let settings_href = html_escape(&format!("/agora?host={}", url_query_escape(&h.name)));
-        let settings_action = if let Some(settings_color) = palette_colors.get(&h.name) {
-            let settings_color = html_escape(settings_color);
+        let settings_color = palette_colors.get(&h.name).map(|color| html_escape(color));
+        let settings_cls = if settings_color.is_some() {
+            " has-settings"
+        } else {
+            ""
+        };
+        let host_color_style = settings_color
+            .as_ref()
+            .map(|color| format!(r#" style="--host-color:{color}""#))
+            .unwrap_or_default();
+        let settings_action = if settings_color.is_some() {
             format!(
-                r#"<a class="settings-card" href="{settings_href}" title="Open settings for {name}" style="--host-color:{settings_color}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>Settings</strong><span>Color and access</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
+                r#"<a class="settings-card" href="{settings_href}" title="Open settings for {name}" aria-label="Open settings for {name}"><span class="settings-icon">{icon}</span></a>"#,
                 icon = icons::SLIDERS
             )
         } else {
             format!(
-                r#"<a class="settings-card unavailable" href="{settings_href}" title="Settings are not set up for {name}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>No settings yet</strong><span>Not set up yet</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
+                r#"<a class="settings-card unavailable" href="{settings_href}" title="Settings are not set up for {name}" aria-label="Settings are not set up for {name}"><span class="settings-icon">{icon}</span></a>"#,
                 icon = icons::SLIDERS
             )
         };
@@ -1434,15 +1507,24 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
             now,
             is_self,
         );
+        let interval = i64::try_from(h.heartbeat_interval_secs.unwrap_or(60))
+            .unwrap_or(60)
+            .max(1);
+        let signal = signal_markup(&heartbeat_signal(
+            &h.heartbeat_log,
+            h.last_seen,
+            interval,
+            now,
+        ));
+        let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></header>{settings_action}{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}</article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div>{signal}</header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{settings_action}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{light_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
             live_key = live_key(live),
-            light_cls = light_cls.trim()
         ));
     }
 
@@ -1581,14 +1663,13 @@ mod tests {
         assert!(html.contains(r#"<th>Attention</th>"#));
         assert!(html.contains(r#"<th>Actions</th>"#));
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
-        assert!(html.contains("No settings yet"));
-        assert!(html.contains("Not set up yet"));
+        assert!(!html.contains("No settings yet"));
+        assert!(!html.contains("Not set up yet"));
         assert!(html
             .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
-        assert!(html.contains("expected beat"));
-        assert!(html.contains(
-            r#"data-next data-next-state="cadence"><span data-next-label>on cadence</span><span class="beat-expected""#
-        ));
+        assert!(!html.contains("expected beat"));
+        assert!(html.contains(r#"class="signal" data-signal data-signal-level="good""#));
+        assert!(html.contains(r#"<span data-signal-percent>100%</span>"#));
         assert!(html.contains(r#"data-beats="850,910,970""#));
         assert!(
             !html.contains(r#"<span class="beat-mark" tabindex="0" data-history-level="first""#)
@@ -1605,7 +1686,6 @@ mod tests {
         assert!(html.contains("beat-fill"));
         assert!(html.contains("beat-now"));
         assert!(html.contains("beat-current"));
-        assert!(html.contains("beat-expected"));
         assert!(html.contains("beat-zones"));
         assert!(html.contains("nix drift: 1d"));
         assert!(html.contains("3 commits"));
@@ -1632,6 +1712,31 @@ mod tests {
     #[test]
     fn first_heartbeat_without_previous_sample_has_no_history_dot() {
         assert!(heartbeat_marks(&[100], 60).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_signal_scores_expected_intervals_not_dots() {
+        let steady = heartbeat_signal(
+            &[100, 160, 220, 280, 340, 400, 460, 520, 580],
+            Some(580),
+            60,
+            588,
+        );
+        assert_eq!(steady.text, "100%");
+        assert_eq!(steady.level, "good");
+
+        let overdue = heartbeat_signal(
+            &[100, 160, 220, 280, 340, 400, 460, 520, 580],
+            Some(580),
+            60,
+            645,
+        );
+        assert_eq!(overdue.text, "88%");
+        assert_eq!(overdue.level, "warn");
+
+        let recovered_gap = heartbeat_signal(&[100, 160, 220, 460], Some(460), 60, 468);
+        assert_eq!(recovered_gap.text, "50%");
+        assert_eq!(recovered_gap.level, "down");
     }
 
     #[test]
@@ -1666,10 +1771,11 @@ mod tests {
         let html = render_home(&[host], "csb1", 1000, &[manifest]);
 
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
-        assert!(html.contains("Settings"));
-        assert!(html.contains("Color and access"));
+        assert!(html.contains(r#"class="card has-settings""#));
+        assert!(html.contains(r#"aria-label="Open settings for poseidon""#));
         assert!(html.contains(r#"style="--host-color:#48b8a8""#));
-        assert!(!html.contains("Settings unavailable"));
+        assert!(!html.contains("Color and access"));
+        assert!(!html.contains(r#"class="settings-swatch""#));
     }
 
     #[test]
