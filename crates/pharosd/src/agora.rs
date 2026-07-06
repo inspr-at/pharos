@@ -30,8 +30,8 @@ h1{margin:0;font-size:25px;line-height:1.12;font-weight:700;letter-spacing:0}.su
 .layout{display:grid;grid-template-columns:minmax(220px,270px) minmax(0,1fr);gap:14px;align-items:start}
 .rail,.workspace{border:1px solid var(--line);border-radius:8px;background:var(--panel);box-shadow:var(--shadow)}
 .rail{padding:10px;position:sticky;top:14px}.rail-title{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 7px 10px;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.rail-count{color:var(--ink);font-weight:700}
-.host-button{width:100%;display:grid;grid-template-columns:10px minmax(0,1fr) auto;align-items:center;gap:10px;min-height:58px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--ink);text-align:left;padding:9px;cursor:pointer}
-.host-button[aria-pressed="true"]{background:var(--soft);border-color:var(--line);box-shadow:inset 3px 0 0 var(--host-color,var(--accent))}.host-dot{width:10px;height:10px;border-radius:50%;background:var(--host-color,var(--accent));box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color,var(--accent)) 13%,transparent)}.host-name{display:block;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.host-role{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.host-live{font-size:11px;color:var(--muted);white-space:nowrap}
+.host-button{width:100%;display:grid;grid-template-columns:10px minmax(0,1fr) auto;align-items:center;gap:10px;min-height:58px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--ink);text-align:left;text-decoration:none;padding:9px;cursor:pointer}
+.host-button[aria-pressed="true"],.host-button[aria-current="true"]{background:var(--soft);border-color:var(--line);box-shadow:inset 3px 0 0 var(--host-color,var(--accent))}.host-button.missing{--host-color:var(--amber);cursor:default;background:#fffaf3}.host-dot{width:10px;height:10px;border-radius:50%;background:var(--host-color,var(--accent));box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color,var(--accent)) 13%,transparent)}.host-name{display:block;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.host-role{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.host-live{font-size:11px;color:var(--muted);white-space:nowrap}
 .workspace{min-width:0;overflow:hidden}.workspace-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--line);background:#fbfdfe}.host-title{margin:2px 0 0;font-size:26px;font-weight:740}.kicker{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;font-weight:700}.state-stack{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.state-pill{display:inline-flex;align-items:center;gap:7px;min-height:30px;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--green);padding:5px 10px;font-size:12px;font-weight:700;white-space:nowrap}.state-pill[data-live="down"]{color:var(--red)}.state-pill[data-live="stale"]{color:var(--amber)}.state-pill[data-live="awaiting_first_heartbeat"]{color:var(--muted)}.state-pill.neutral{color:var(--muted)}
 .tabs{display:flex;gap:4px;padding:10px 14px;border-bottom:1px solid var(--line);background:#fff}.tab{border:0;background:transparent;color:var(--muted);min-height:32px;border-radius:7px;padding:6px 11px;cursor:pointer;font-weight:650}.tab[aria-selected="true"]{background:var(--soft);color:var(--accent);box-shadow:inset 0 0 0 1px var(--line)}
 .content{display:grid;grid-template-columns:minmax(0,1fr) minmax(330px,.72fr);gap:0;min-height:620px}.editor{min-width:0;padding:20px;border-right:1px solid var(--line)}.proposal{min-width:0;padding:20px;background:#fbfdfe}.proposal-inner{position:sticky;top:16px}
@@ -41,7 +41,7 @@ h1{margin:0;font-size:25px;line-height:1.12;font-weight:700;letter-spacing:0}.su
 .preview{display:grid;grid-template-rows:auto 1fr;gap:10px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:13px}.preview-label{color:var(--muted);font-size:12px}.preview-pane{border-radius:7px;border:1px solid var(--line);background:linear-gradient(135deg,var(--preview-color,#999),#f7fbfc 62%);min-height:122px;display:flex;align-items:flex-end;justify-content:space-between;gap:10px;padding:13px;color:#fff;overflow:hidden}.preview-pane strong{font-size:18px;text-shadow:0 1px 8px rgba(0,0,0,.18)}.preview-pill{border:1px solid rgba(255,255,255,.58);border-radius:999px;padding:4px 8px;font-size:11px;background:rgba(255,255,255,.18);backdrop-filter:blur(6px)}
 .meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.kv{border:1px solid var(--line);border-radius:8px;background:#fff;padding:11px}.kv span{display:block;color:var(--muted);font-size:12px}.kv strong{display:block;margin-top:4px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .proposal h2{margin:0 0 12px;font-size:17px}.change-summary{display:grid;gap:9px;margin-bottom:12px}.safe-line{display:flex;align-items:center;gap:9px;min-height:42px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px;color:var(--ink);font-weight:700}.safe-dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(37,132,95,.12)}.safe-line span:last-child{color:var(--muted);font-weight:650}.status-strip{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.status{border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px}.status span{display:block;color:var(--muted);font-size:12px}.status strong{display:block;margin-top:3px;font-size:13px}.status.ok strong{color:var(--green)}.technical{border:1px solid var(--line);border-radius:8px;background:#fff;padding:0;overflow:hidden}.technical summary{cursor:pointer;list-style:none;padding:12px 13px;font-weight:700}.technical summary::-webkit-details-marker{display:none}.technical .meta-grid{padding:0 12px 12px}.technical pre{border-radius:0;border-left:0;border-right:0;border-bottom:0}
-pre{min-height:300px;max-height:440px;overflow:auto;margin:0;border:1px solid var(--line);border-radius:8px;background:var(--code);color:#dce9ef;padding:13px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}.notice,.empty{padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--muted);margin-bottom:14px}.empty{padding:38px;margin:0}
+pre{min-height:300px;max-height:440px;overflow:auto;margin:0;border:1px solid var(--line);border-radius:8px;background:var(--code);color:#dce9ef;padding:13px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}.notice,.empty{padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--muted);margin-bottom:14px}.empty{padding:38px;margin:0}.unavailable-state{display:grid;align-content:start;justify-items:start;gap:12px;min-height:430px;padding:28px}.unavailable-state h2{margin:0;font-size:20px;line-height:1.2}.unavailable-state p{margin:0;max-width:560px;color:var(--muted)}.unavailable-state .action{display:inline-flex;align-items:center;margin-top:4px}
 @media (max-width:980px){.layout,.content,.controls{grid-template-columns:1fr}.rail{position:static}.editor{border-right:0;border-bottom:1px solid var(--line)}.proposal-inner{position:static}.matrix,.meta-grid,.status-strip{grid-template-columns:1fr}.cell{border-right:0;border-bottom:1px solid var(--line)}.cell:last-child{border-bottom:0}}
 @media (max-width:640px){.shell{padding:20px 14px 32px}.topbar,.workspace-head{display:block}.nav{justify-content:flex-start;margin-top:12px}.state-stack{justify-content:flex-start;margin-top:12px}.form{grid-template-columns:70px minmax(0,1fr)}}
 </style></head><body>"#;
@@ -176,28 +176,22 @@ fn render_page(
         );
     }
 
-    let selected_index = requested_host
-        .and_then(|requested| {
-            hosts
-                .iter()
-                .position(|host| host.name == requested || host.slug == requested)
-        })
-        .unwrap_or(0);
-    let selected_host = &hosts[selected_index];
-    let notice = match requested_host {
-        Some(requested)
-            if !hosts
-                .iter()
-                .any(|host| host.name == requested || host.slug == requested) =>
-        {
-            format!(
-                r#"<div class="notice">No declared Agora settings for {requested}; showing {selected}.</div>"#,
-                requested = html_escape(requested),
-                selected = html_escape(&selected_host.name)
-            )
+    let requested_host = requested_host
+        .map(str::trim)
+        .filter(|requested| !requested.is_empty());
+    let selected_index = requested_host.and_then(|requested| {
+        hosts
+            .iter()
+            .position(|host| host.name == requested || host.slug == requested)
+    });
+    if let Some(requested) = requested_host {
+        if selected_index.is_none() {
+            return render_unavailable_page(&hosts, requested);
         }
-        _ => String::new(),
-    };
+    }
+
+    let selected_index = selected_index.unwrap_or(0);
+    let selected_host = &hosts[selected_index];
     let host_buttons = hosts
         .iter()
         .enumerate()
@@ -215,7 +209,7 @@ fn render_page(
     let hosts_json = serde_json::to_string(&hosts).expect("host view JSON serializes");
 
     format!(
-        r#"{AGORA_HEAD}<main class="shell"><header class="topbar"><div><nav class="crumbs" aria-label="breadcrumb"><a href="/">Pharos</a><span>/</span><span data-breadcrumb-host>{name}</span><span>/</span><span>Settings</span></nav><div class="brand"><span class="mark">{mark}</span><div><h1>Host settings</h1><p class="subtitle">per-host controls</p></div></div></div><nav class="nav"><a href="/">Fleet</a></nav></header>{notice}<section class="layout"><aside class="rail"><div class="rail-title"><span>Hosts</span><span class="rail-count">{host_count}</span></div>{host_buttons}</aside><section class="workspace"><header class="workspace-head"><div><span class="kicker" data-host-slug>{slug}</span><div class="host-title"><span data-host-name>{name}</span> settings</div><p class="subtitle" data-host-role>{role}</p></div><div class="state-stack"><span class="state-pill" data-runtime-pill data-live="{live_key}">Live state: {live}</span><span class="state-pill neutral" data-runtime-state>Settings state: {runtime_state}</span></div></header><div class="tabs" role="tablist"><button class="tab" type="button" aria-selected="true">Color</button><button class="tab" type="button" aria-selected="false" disabled>Services</button><button class="tab" type="button" aria-selected="false" disabled>Access</button></div><div class="content"><section class="editor"><div class="section-title"><h2>Host color</h2><span data-palette-name>{palette_name}</span></div><div class="matrix" aria-label="color comparison"><div class="cell"><span>Current</span><strong class="swatch-line"><i class="swatch" data-declared-swatch style="--swatch:{declared}"></i><span data-declared>{declared}</span></strong></div><div class="cell"><span>New</span><strong class="swatch-line"><i class="swatch" data-proposed-swatch style="--swatch:{declared}"></i><span data-proposed>{declared}</span></strong></div><div class="cell"><span>Live</span><strong class="swatch-line"><i class="swatch" data-runtime-swatch style="--swatch:{runtime}"></i><span data-runtime>{runtime}</span></strong></div></div><div class="controls"><div class="form"><div class="control"><label for="accent-color">Color</label><input class="color" id="accent-color" data-color type="color" value="{declared}"></div><div class="control"><label for="accent-hex">Color code</label><input class="hex" id="accent-hex" data-hex maxlength="7" spellcheck="false" value="{declared}"></div><button class="action primary" type="button" data-review>Review color change</button></div><div class="preview"><span class="preview-label">Preview</span><div class="preview-pane" data-preview style="--preview-color:{declared}"><strong data-preview-name>{name}</strong><span class="preview-pill" data-preview-accent>{declared}</span></div></div></div></section><aside class="proposal"><div class="proposal-inner"><h2>Next step</h2><div class="change-summary"><div class="safe-line"><span class="safe-dot"></span><strong>Safe change</strong><span>No direct deploy from Pharos</span></div></div><details class="technical" data-technical><summary>Technical review</summary><div class="meta-grid"><div class="kv"><span>nixcfg target</span><strong data-target-path>{target_path}</strong></div><div class="kv"><span>Attribute</span><strong data-target-attribute>{target_attribute}</strong></div><div class="kv"><span>Services</span><strong data-services>{services}</strong></div><div class="kv"><span>Freshness</span><strong data-freshness>{freshness}</strong></div><div class="kv"><span>Janus mode</span><strong data-janus-mode>{janus_mode}</strong></div><div class="kv"><span>Deploy</span><strong>Pharos disabled</strong></div></div><div class="status-strip"><div class="status ok"><span>Janus</span><strong data-janus>Janus: not required</strong></div><div class="status"><span>Deploy</span><strong>disabled in Pharos</strong></div></div><pre data-patch>No color change reviewed yet.</pre></details></div></aside></div></section></section></main><script>
+        r#"{AGORA_HEAD}<main class="shell"><header class="topbar"><div><nav class="crumbs" aria-label="breadcrumb"><a href="/">Pharos</a><span>/</span><span data-breadcrumb-host>{name}</span><span>/</span><span>Settings</span></nav><div class="brand"><span class="mark">{mark}</span><div><h1>Host settings</h1><p class="subtitle">per-host controls</p></div></div></div><nav class="nav"><a href="/">Fleet</a></nav></header><section class="layout"><aside class="rail"><div class="rail-title"><span>Hosts</span><span class="rail-count">{host_count}</span></div>{host_buttons}</aside><section class="workspace"><header class="workspace-head"><div><span class="kicker" data-host-slug>{slug}</span><div class="host-title"><span data-host-name>{name}</span> settings</div><p class="subtitle" data-host-role>{role}</p></div><div class="state-stack"><span class="state-pill" data-runtime-pill data-live="{live_key}">Live state: {live}</span><span class="state-pill neutral" data-runtime-state>Settings state: {runtime_state}</span></div></header><div class="tabs" role="tablist"><button class="tab" type="button" aria-selected="true">Color</button><button class="tab" type="button" aria-selected="false" disabled>Services</button><button class="tab" type="button" aria-selected="false" disabled>Access</button></div><div class="content"><section class="editor"><div class="section-title"><h2>Host color</h2><span data-palette-name>{palette_name}</span></div><div class="matrix" aria-label="color comparison"><div class="cell"><span>Current</span><strong class="swatch-line"><i class="swatch" data-declared-swatch style="--swatch:{declared}"></i><span data-declared>{declared}</span></strong></div><div class="cell"><span>New</span><strong class="swatch-line"><i class="swatch" data-proposed-swatch style="--swatch:{declared}"></i><span data-proposed>{declared}</span></strong></div><div class="cell"><span>Live</span><strong class="swatch-line"><i class="swatch" data-runtime-swatch style="--swatch:{runtime}"></i><span data-runtime>{runtime}</span></strong></div></div><div class="controls"><div class="form"><div class="control"><label for="accent-color">Color</label><input class="color" id="accent-color" data-color type="color" value="{declared}"></div><div class="control"><label for="accent-hex">Color code</label><input class="hex" id="accent-hex" data-hex maxlength="7" spellcheck="false" value="{declared}"></div><button class="action primary" type="button" data-review>Review color change</button></div><div class="preview"><span class="preview-label">Preview</span><div class="preview-pane" data-preview style="--preview-color:{declared}"><strong data-preview-name>{name}</strong><span class="preview-pill" data-preview-accent>{declared}</span></div></div></div></section><aside class="proposal"><div class="proposal-inner"><h2>Next step</h2><div class="change-summary"><div class="safe-line"><span class="safe-dot"></span><strong>Safe change</strong><span>No direct deploy from Pharos</span></div></div><details class="technical" data-technical><summary>Technical review</summary><div class="meta-grid"><div class="kv"><span>nixcfg target</span><strong data-target-path>{target_path}</strong></div><div class="kv"><span>Attribute</span><strong data-target-attribute>{target_attribute}</strong></div><div class="kv"><span>Services</span><strong data-services>{services}</strong></div><div class="kv"><span>Freshness</span><strong data-freshness>{freshness}</strong></div><div class="kv"><span>Janus mode</span><strong data-janus-mode>{janus_mode}</strong></div><div class="kv"><span>Deploy</span><strong>Pharos disabled</strong></div></div><div class="status-strip"><div class="status ok"><span>Janus</span><strong data-janus>Janus: not required</strong></div><div class="status"><span>Deploy</span><strong>disabled in Pharos</strong></div></div><pre data-patch>No color change reviewed yet.</pre></details></div></aside></div></section></section></main><script>
 const HOSTS={hosts_json};
 let selected={selected_index};
 const $=sel=>document.querySelector(sel);
@@ -232,7 +226,6 @@ $('[data-hex]').addEventListener('input',e=>sync(e.target.value));
 $('[data-review]').addEventListener('click',async()=>{{const h=host();const accent=$('[data-hex]').value;const patch=$('[data-patch]');const tech=$('[data-technical]');if(tech)tech.open=true;patch.textContent='Preparing technical review...';try{{const res=await fetch('/agora/proposals/host-palette.json?host='+encodeURIComponent(h.name)+'&accent='+encodeURIComponent(accent),{{headers:{{Accept:'application/json'}}}});const data=await res.json();if(!res.ok){{patch.textContent=data.error||'review failed';return}}patch.textContent=data.patch.value;}}catch(_){{patch.textContent='review failed'}}}});
 </script>{AGORA_FOOT}"#,
         mark = crate::icons::LIGHTHOUSE,
-        notice = notice,
         host_count = hosts.len(),
         selected_index = selected_index,
         slug = html_escape(&selected_host.slug),
@@ -249,6 +242,34 @@ $('[data-review]').addEventListener('click',async()=>{{const h=host();const acce
         services = selected_host.services_count,
         freshness = html_escape(&selected_host.freshness_tldr),
         janus_mode = html_escape(&selected_host.janus_mode),
+    )
+}
+
+fn render_unavailable_page(hosts: &[AgoraHostView], requested_host: &str) -> String {
+    let requested = html_escape(requested_host);
+    let missing_button = format!(
+        r#"<div class="host-button missing" aria-current="true"><span class="host-dot"></span><span><span class="host-name">{requested}</span><span class="host-role">visible in fleet</span></span><span class="host-live">not set up</span></div>"#
+    );
+    let host_links = hosts
+        .iter()
+        .map(|host| {
+            format!(
+                r#"<a class="host-button" href="/agora?host={href}" style="--host-color:{accent}"><span class="host-dot"></span><span><span class="host-name">{name}</span><span class="host-role">{role}</span></span><span class="host-live">editable</span></a>"#,
+                href = html_escape(&crate::url_query_escape(&host.name)),
+                accent = html_escape(&host.declared_accent),
+                name = html_escape(&host.name),
+                role = html_escape(&host.role)
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        r#"{AGORA_HEAD}<main class="shell"><header class="topbar"><div><nav class="crumbs" aria-label="breadcrumb"><a href="/">Pharos</a><span>/</span><span>{requested}</span><span>/</span><span>Settings</span></nav><div class="brand"><span class="mark">{mark}</span><div><h1>Host settings</h1><p class="subtitle">per-host controls</p></div></div></div><nav class="nav"><a href="/">Fleet</a></nav></header><section class="layout"><aside class="rail"><div class="rail-title"><span>Editable hosts</span><span class="rail-count">{host_count}</span></div>{missing_button}{host_links}</aside><section class="workspace"><header class="workspace-head"><div><span class="kicker">not set up</span><div class="host-title">{requested} settings</div><p class="subtitle">This host is visible in the fleet, but has no editable settings yet.</p></div><div class="state-stack"><span class="state-pill neutral">Settings unavailable</span></div></header><div class="unavailable-state"><h2>No settings are declared for this host yet</h2><p>Pharos will not show or edit another host's values here. Add this host to the declared settings registry first, then the color and access controls can appear for {requested}.</p><a class="action primary" href="/">Back to Fleet</a></div></section></section></main>{AGORA_FOOT}"#,
+        mark = crate::icons::LIGHTHOUSE,
+        host_count = hosts.len(),
+        requested = requested,
+        missing_button = missing_button,
+        host_links = host_links,
     )
 }
 
@@ -552,6 +573,20 @@ mod tests {
         assert!(html.contains(r#"data-host-index="1" aria-pressed="true""#));
         assert!(html.contains("let selected=1;"));
         assert!(html.contains(r#"data-breadcrumb-host>hsb8"#));
+        assert!(!html.contains("No declared Agora settings"));
+    }
+
+    #[test]
+    fn agora_page_does_not_fallback_for_unknown_requested_host() {
+        let html = render_page(&[manifest()], &[], Some("csb0"));
+
+        assert!(html.contains("csb0 settings"));
+        assert!(html.contains("Settings unavailable"));
+        assert!(html.contains("No settings are declared for this host yet"));
+        assert!(html.contains("Pharos will not show or edit another host's values here"));
+        assert!(html.contains(r#"class="host-button missing" aria-current="true""#));
+        assert!(!html.contains(r#"data-host-name>hsb8"#));
+        assert!(!html.contains("Review color change"));
         assert!(!html.contains("No declared Agora settings"));
     }
 

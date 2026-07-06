@@ -164,6 +164,10 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .meta strong{font-weight:600;color:var(--ink)}
 .settings-card{display:grid;grid-template-columns:34px minmax(0,1fr) 26px;align-items:center;gap:10px;margin:10px 0 8px;padding:10px;border:1px solid rgba(210,226,234,.94);border-left:4px solid var(--host-color,var(--sun));border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;box-shadow:0 8px 18px rgba(45,75,95,.06)}
 .settings-card:hover{border-color:rgba(31,127,181,.38);border-left-color:var(--host-color,var(--sun));box-shadow:0 10px 22px rgba(45,75,95,.10)}
+.settings-card.unavailable{--host-color:#aebac3;background:#fbfdfe;color:var(--muted);box-shadow:none}
+.settings-card.unavailable:hover{border-color:rgba(137,151,163,.34);box-shadow:0 8px 18px rgba(45,75,95,.05)}
+.settings-card.unavailable .settings-icon{color:var(--muted)}
+.settings-card.unavailable .settings-swatch{background:repeating-linear-gradient(135deg,#eef4f6 0 6px,#fff 6px 12px)}
 .settings-icon{display:grid;place-items:center;width:34px;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:rgba(244,250,251,.82);color:var(--accent)}
 .settings-icon .ico{width:17px;height:17px}
 .settings-copy{min-width:0}.settings-copy strong{display:block;font-size:14px;line-height:1.15}.settings-copy span{display:block;margin-top:2px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1229,16 +1233,18 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
             String::new()
         };
         let settings_href = html_escape(&format!("/agora?host={}", url_query_escape(&h.name)));
-        let settings_color = html_escape(
-            palette_colors
-                .get(&h.name)
-                .map(String::as_str)
-                .unwrap_or("#d69b31"),
-        );
-        let settings_action = format!(
-            r#"<a class="settings-card" href="{settings_href}" title="Open settings for {name}" style="--host-color:{settings_color}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>Settings</strong><span>Color and access</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
-            icon = icons::SLIDERS
-        );
+        let settings_action = if let Some(settings_color) = palette_colors.get(&h.name) {
+            let settings_color = html_escape(settings_color);
+            format!(
+                r#"<a class="settings-card" href="{settings_href}" title="Open settings for {name}" style="--host-color:{settings_color}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>Settings</strong><span>Color and access</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
+                icon = icons::SLIDERS
+            )
+        } else {
+            format!(
+                r#"<a class="settings-card unavailable" href="{settings_href}" title="Settings are not set up for {name}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>Settings unavailable</strong><span>Not set up yet</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
+                icon = icons::SLIDERS
+            )
+        };
         // pharosd cannot honestly heartbeat itself; the host gets the lighthouse cue.
         let status_word = if is_self { "the light is lit" } else { word };
         let status_icon = if is_self {
@@ -1394,8 +1400,8 @@ mod tests {
         assert!(html.contains(r#"<th>Attention</th>"#));
         assert!(html.contains(r#"<th>Actions</th>"#));
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
-        assert!(html.contains("Settings"));
-        assert!(html.contains("Color and access"));
+        assert!(html.contains("Settings unavailable"));
+        assert!(html.contains("Not set up yet"));
         assert!(html
             .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
         assert!(html.contains("expected beat"));
@@ -1417,6 +1423,44 @@ mod tests {
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
+    }
+
+    #[test]
+    fn render_home_marks_declared_host_settings_as_available() {
+        let host = Host {
+            name: "poseidon".to_string(),
+            role: "NixOS Host".to_string(),
+            is_nix: true,
+            token_hash: None,
+            last_seen: Some(970),
+            heartbeat_log: vec![850, 910, 970],
+            heartbeat_interval_secs: Some(60),
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+        };
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "poseidon",
+            "host": { "name": "poseidon" },
+            "palette": {
+                "name": "custom-poseidon",
+                "accent": "#48b8a8",
+                "gradient": { "primary": "#48b8a8" }
+            },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+
+        let html = render_home(&[host], "csb1", 1000, &[manifest]);
+
+        assert!(html.contains(r#"href="/agora?host=poseidon""#));
+        assert!(html.contains("Settings"));
+        assert!(html.contains("Color and access"));
+        assert!(html.contains(r#"style="--host-color:#48b8a8""#));
+        assert!(!html.contains("Settings unavailable"));
     }
 
     #[test]
