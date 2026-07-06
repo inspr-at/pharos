@@ -102,27 +102,37 @@ enum RegistrationAuth {
     NotConfigured,
 }
 
+const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
+const SIDEBAR_LIGHTHOUSE_PNG: &[u8] = include_bytes!("../assets/sidebar-lighthouse.png");
+
 const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><style>
-:root{--ink:#19324a;--muted:#66798b;--line:#dfe9ef;--card:#ffffff;--card-soft:rgba(255,255,255,.82);--accent:#1f7fb5;--sea:#159e99;--sun:#d69b31;--live:#25845f;--stale:#b26a00;--down:#bf3a35;--wait:#8997a3}
+:root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--card:#ffffff;--card-soft:rgba(255,255,255,.82);--accent:#1f7fb5;--sea:#159e99;--sun:#d69b31;--live:#25845f;--stale:#b26a00;--down:#bf3a35;--wait:#8997a3;--side:232px}
 *{box-sizing:border-box}
-body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f6fbfc 48%,#edf6f7 100%);min-height:100vh;overflow-x:hidden}
-body:before{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(circle at 78% 9%,rgba(214,155,49,.18),transparent 13rem),radial-gradient(circle at 14% 20%,rgba(21,158,153,.10),transparent 18rem),linear-gradient(180deg,rgba(255,255,255,.92),rgba(239,249,250,.82));pointer-events:none}
-body:after{content:"";position:fixed;left:0;right:0;bottom:0;height:34vh;z-index:-1;background:linear-gradient(180deg,transparent,rgba(255,255,255,.64)),repeating-linear-gradient(178deg,rgba(31,127,181,.10) 0 1px,transparent 1px 38px);opacity:.9;pointer-events:none}
-main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
+body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%);min-height:100vh;overflow-x:hidden}
+body:before{content:"";position:fixed;inset:0;z-index:-3;background:radial-gradient(circle at 86% 5%,rgba(214,155,49,.16),transparent 12rem),radial-gradient(circle at 18% 28%,rgba(21,158,153,.08),transparent 18rem),linear-gradient(180deg,rgba(255,255,255,.94),rgba(239,249,250,.82));pointer-events:none}
+.app-shell{min-height:100vh;display:grid;grid-template-columns:var(--side) minmax(0,1fr)}
+.sidebar{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:24px;padding:30px 18px 18px;border-right:1px solid rgba(211,225,233,.78);background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(247,252,253,.82));box-shadow:12px 0 38px rgba(45,75,95,.05);overflow:hidden}
+.sidebar:before{content:"";position:absolute;left:0;right:0;bottom:0;height:52%;background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.82) 74%),url('/assets/sidebar-lighthouse.png') left bottom/118% auto no-repeat;opacity:.9;pointer-events:none}
+.side-brand,.side-nav,.side-foot{position:relative;z-index:1}.side-brand{display:flex;align-items:center;gap:13px;padding:0 12px}.side-mark{display:grid;place-items:center;width:36px;height:50px;color:var(--sun)}.side-mark .ico{width:31px;height:31px}.side-logo{font-family:Georgia,"Times New Roman",serif;font-size:22px;letter-spacing:.18em;color:#14304b;text-transform:uppercase}
+.side-nav{display:grid;gap:7px}.side-link{display:grid;grid-template-columns:23px minmax(0,1fr) auto;align-items:center;gap:11px;min-height:46px;padding:0 13px;border-radius:7px;color:#294761;text-decoration:none;font-weight:520}.side-link[aria-current="page"]{background:rgba(223,241,249,.76);color:#0f4f80}.side-link .ico{width:18px;height:18px}.side-badge{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:#ffe7bb;color:#9a5b00;font-size:12px;font-weight:700}
+.side-foot{margin-top:auto;display:flex;align-items:center;justify-content:space-between;padding:10px 13px;color:#294761;font-size:13px}.side-user{display:flex;align-items:center;gap:9px}.side-user:before{content:"";width:24px;height:24px;border-radius:50%;border:1px solid rgba(214,155,49,.38);background:radial-gradient(circle,#fff 0 33%,rgba(214,155,49,.18) 36%,transparent 68%)}
+main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .ico{width:16px;height:16px;display:inline-block;vertical-align:middle;flex:0 0 auto}
-.top{display:flex;align-items:flex-start;justify-content:space-between;gap:22px;margin-bottom:22px}
-.brand{display:flex;align-items:center;gap:10px;margin:0 0 2px}
-.brand .ico{width:26px;height:26px;color:var(--sun)}
-.brand h1{margin:0;font-size:24px;font-weight:650;letter-spacing:0}
-.fleet{display:flex;align-items:center;gap:10px;margin:4px 0 0;color:var(--muted);font-size:13px}
-.wave{width:44px;height:10px;color:var(--sea)}
-.asof{font-size:12px;color:var(--muted);white-space:nowrap;padding-top:9px}
+.top{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:22px;min-height:118px;margin:-10px 0 20px;padding:10px 0 18px;overflow:hidden}
+.top:before{content:"";position:absolute;inset:-24px -28px auto 24%;height:170px;background:linear-gradient(90deg,rgba(255,255,255,.92),rgba(255,255,255,.54) 28%,rgba(255,255,255,.05)),url('/assets/fleet-horizon.png') right top/auto 170px no-repeat;opacity:.96;pointer-events:none}
+.top>*{position:relative;z-index:1}.brand{display:flex;align-items:center;gap:12px;margin:0 0 4px}
+.brand h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:31px;line-height:1.05;font-weight:500;letter-spacing:0;color:#12304b}
+.fleet{display:flex;align-items:center;gap:10px;margin:8px 0 0;color:var(--muted);font-size:14px}
+.wave{width:44px;height:10px;color:var(--sea);opacity:.78}
+.asof{font-size:12px;color:var(--muted);white-space:nowrap;padding-top:22px}
 .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
-.metric{min-width:0;background:var(--card-soft);border:1px solid rgba(210,226,234,.78);border-radius:8px;padding:12px 13px;box-shadow:0 12px 30px rgba(54,88,108,.06);backdrop-filter:blur(8px)}
-.metric b{display:block;font-size:22px;line-height:1.1;font-weight:650;color:var(--ink)}
-.metric span{display:block;font-size:12px;color:var(--muted);margin-top:3px}
+.metric{position:relative;min-width:0;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;background:rgba(255,255,255,.82);border:1px solid rgba(210,226,234,.78);border-radius:8px;padding:14px 16px;box-shadow:0 12px 30px rgba(54,88,108,.06);backdrop-filter:blur(10px)}
+.metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color,var(--wait)) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color,var(--wait)) 20%,transparent)}
+.metric b{display:block;font-family:Georgia,"Times New Roman",serif;font-size:29px;line-height:1;font-weight:500;color:var(--ink)}
+.metric span{display:block;font-size:12px;color:var(--muted);margin-top:2px}
+.metric.live{--metric-color:var(--sea)}.metric.stale{--metric-color:var(--sun)}.metric.down{--metric-color:var(--down)}
 .metric.live{border-color:rgba(37,132,95,.22)}.metric.stale{border-color:rgba(178,106,0,.24)}.metric.down{border-color:rgba(191,58,53,.24)}
-.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 18px;padding:9px;background:rgba(255,255,255,.72);border:1px solid rgba(210,226,234,.78);border-radius:8px;box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(8px)}
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 18px;padding:9px;background:rgba(255,255,255,.72);border:1px solid rgba(210,226,234,.78);border-radius:8px;box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(10px)}
 .toolbar-left,.toolbar-right{display:flex;align-items:center;gap:10px;min-width:0}
 .seg{display:inline-flex;align-items:center;padding:3px;border:1px solid rgba(210,226,234,.86);border-radius:7px;background:rgba(244,250,251,.76)}
 .seg button{appearance:none;border:0;background:transparent;color:var(--muted);display:grid;place-items:center;width:30px;height:28px;border-radius:6px;cursor:pointer}
@@ -134,8 +144,8 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .search .ico{position:absolute;left:10px;top:50%;width:15px;height:15px;transform:translateY(-50%)}
 .search input{width:100%;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px 0 32px;outline:none}
 .search input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(245px,1fr));gap:14px}
-.card{--state:var(--wait);position:relative;min-height:252px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:18px}
+.card{--state:var(--wait);position:relative;min-height:264px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
 .card:before{content:"";position:absolute;left:16px;right:16px;top:58px;height:1px;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent);pointer-events:none}
 [data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
 .card.light{border-color:rgba(214,155,49,.48);box-shadow:0 16px 34px rgba(150,103,28,.12)}
@@ -162,16 +172,16 @@ main{width:min(1080px,100%);margin:0 auto;padding:42px 24px 56px}
 .fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
-.settings-card{display:grid;grid-template-columns:34px minmax(0,1fr) 26px;align-items:center;gap:10px;margin:10px 0 8px;padding:10px;border:1px solid rgba(210,226,234,.94);border-left:4px solid var(--host-color,var(--sun));border-radius:8px;background:#fff;color:var(--ink);text-decoration:none;box-shadow:0 8px 18px rgba(45,75,95,.06)}
-.settings-card:hover{border-color:rgba(31,127,181,.38);border-left-color:var(--host-color,var(--sun));box-shadow:0 10px 22px rgba(45,75,95,.10)}
-.settings-card.unavailable{--host-color:#aebac3;background:#fbfdfe;color:var(--muted);box-shadow:none}
+.settings-card{display:inline-grid;grid-template-columns:22px minmax(0,auto) 16px;align-items:center;gap:8px;align-self:flex-start;max-width:100%;min-height:31px;margin:-2px 0 10px 39px;padding:4px 8px;border:1px solid rgba(210,226,234,.94);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(248,252,253,.88));color:var(--ink);text-decoration:none;box-shadow:0 7px 16px rgba(45,75,95,.055)}
+.settings-card:hover{border-color:rgba(31,127,181,.34);box-shadow:0 9px 20px rgba(45,75,95,.09);transform:translateY(-1px)}
+.settings-card.unavailable{--host-color:#aebac3;background:rgba(251,253,254,.82);color:var(--muted);box-shadow:none}
 .settings-card.unavailable:hover{border-color:rgba(137,151,163,.34);box-shadow:0 8px 18px rgba(45,75,95,.05)}
 .settings-card.unavailable .settings-icon{color:var(--muted)}
 .settings-card.unavailable .settings-swatch{background:repeating-linear-gradient(135deg,#eef4f6 0 6px,#fff 6px 12px)}
-.settings-icon{display:grid;place-items:center;width:34px;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:rgba(244,250,251,.82);color:var(--accent)}
-.settings-icon .ico{width:17px;height:17px}
-.settings-copy{min-width:0}.settings-copy strong{display:block;font-size:14px;line-height:1.15}.settings-copy span{display:block;margin-top:2px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.settings-swatch{width:26px;height:26px;border-radius:7px;border:1px solid rgba(0,0,0,.12);background:var(--host-color,var(--sun));box-shadow:inset 0 0 0 2px rgba(255,255,255,.54)}
+.settings-icon{display:grid;place-items:center;width:22px;height:22px;border:1px solid rgba(210,226,234,.92);border-radius:50%;background:rgba(244,250,251,.82);color:var(--accent)}
+.settings-icon .ico{width:13px;height:13px}
+.settings-copy{min-width:0}.settings-copy strong{display:block;font-size:12px;line-height:1.1}.settings-copy span{display:none}
+.settings-swatch{width:16px;height:16px;border-radius:50%;border:1px solid rgba(0,0,0,.12);background:var(--host-color,var(--sun));box-shadow:inset 0 0 0 2px rgba(255,255,255,.54)}
 .beat{--beat-color:var(--state);--now-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
 .beat-stage{position:relative;height:50px;overflow:hidden}
 .beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
@@ -204,7 +214,7 @@ main[data-view="list"] .list-wrap{display:block}
 .list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:8px 0 0 8px}
 .list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
-.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}.list .settings-card{display:inline-flex;min-height:32px;margin:0;padding:6px 10px;border-left-width:3px}.list .settings-icon{width:24px;height:24px}.list .settings-copy span,.list .settings-swatch{display:none}.list .settings-copy strong{font-size:12px}
+.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .beat-meta{display:none}.list .settings-card{display:inline-flex;min-height:30px;margin:0;padding:5px 9px}.list .settings-icon{width:22px;height:22px}.list .settings-copy span,.list .settings-swatch{display:none}.list .settings-copy strong{font-size:12px}
 [hidden]{display:none!important}
 .empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
@@ -227,12 +237,12 @@ main[data-view="list"] .list-wrap{display:block}
 .lone-mark .ico{width:24px;height:24px}
 .lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
 .lone-state .onboard-command{position:relative;margin:0;font-size:12px}
-@media (max-width:720px){main{padding:28px 16px 42px}.top{display:block}.asof{padding-top:6px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
+@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
-</style></head><body>"#;
+</style></head><body><div class="app-shell">"#;
 
-const FOOT: &str = r#"<script>
+const FOOT: &str = r#"</div><script>
 const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awaiting'};
 const MAX_BEATS=8;
 const EXPECT_X=64;
@@ -745,6 +755,26 @@ async fn home(State(state): State<AppState>) -> Html<String> {
     ))
 }
 
+async fn fleet_horizon_asset() -> impl axum::response::IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        FLEET_HORIZON_PNG,
+    )
+}
+
+async fn sidebar_lighthouse_asset() -> impl axum::response::IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        SIDEBAR_LIGHTHOUSE_PNG,
+    )
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -971,10 +1001,21 @@ fn summary_cards(hosts: &[Host], self_name: &str, now: i64) -> String {
     )
 }
 
+fn sidebar() -> String {
+    format!(
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/" aria-current="page">{fleet}<span>Fleet</span></a><a class="side-link" href="/">{map}<span>Map</span></a><a class="side-link" href="/">{alerts}<span>Alerts</span></a><a class="side-link" href="/">{activity}<span>Activity</span></a><a class="side-link" href="/agora">{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user">mba</span><span aria-hidden="true">v</span></div></aside>"##,
+        lighthouse = icons::LIGHTHOUSE,
+        fleet = icons::GRID,
+        map = icons::SERVER,
+        alerts = icons::status_svg(Liveness::Stale),
+        activity = icons::LIST,
+        settings = icons::SLIDERS
+    )
+}
+
 fn header(now: i64) -> String {
     format!(
-        r#"<div class="top"><div><div class="brand">{lh}<h1>Pharos</h1></div><p class="fleet">host fleet <svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></p></div><div class="asof" data-as-of>as of {as_of}</div></div>"#,
-        lh = icons::LIGHTHOUSE,
+        r#"<div class="top"><div><div class="brand"><h1>Fleet</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">All hosts at a glance</p></div><div class="asof" data-as-of>as of {as_of}</div></div>"#,
         as_of = clock_label(now)
     )
 }
@@ -1168,7 +1209,8 @@ fn heartbeat_card(
 fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManifest]) -> String {
     if hosts.is_empty() {
         return format!(
-            "{HEAD}<main>{header}{empty}</main>{FOOT}",
+            "{HEAD}{sidebar}<main>{header}{empty}</main>{FOOT}",
+            sidebar = sidebar(),
             header = header(now),
             empty = empty_state()
         );
@@ -1241,7 +1283,7 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
             )
         } else {
             format!(
-                r#"<a class="settings-card unavailable" href="{settings_href}" title="Settings are not set up for {name}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>Settings unavailable</strong><span>Not set up yet</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
+                r#"<a class="settings-card unavailable" href="{settings_href}" title="Settings are not set up for {name}"><span class="settings-icon">{icon}</span><span class="settings-copy"><strong>No settings yet</strong><span>Not set up yet</span></span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
                 icon = icons::SLIDERS
             )
         };
@@ -1278,7 +1320,8 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
     };
 
     format!(
-        "{HEAD}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
+        sidebar = sidebar(),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar()
@@ -1321,6 +1364,11 @@ async fn main() {
         .route("/declared-hosts.json", get(declared_hosts_json))
         .route("/healthz", get(healthz))
         .route("/version", get(version))
+        .route("/assets/fleet-horizon.png", get(fleet_horizon_asset))
+        .route(
+            "/assets/sidebar-lighthouse.png",
+            get(sidebar_lighthouse_asset),
+        )
         .route("/register", post(register))
         .route("/report", post(report))
         .route("/auth/login", get(auth::login))
@@ -1400,7 +1448,7 @@ mod tests {
         assert!(html.contains(r#"<th>Attention</th>"#));
         assert!(html.contains(r#"<th>Actions</th>"#));
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
-        assert!(html.contains("Settings unavailable"));
+        assert!(html.contains("No settings yet"));
         assert!(html.contains("Not set up yet"));
         assert!(html
             .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
