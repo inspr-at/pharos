@@ -22,7 +22,9 @@ use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
+use openidconnect::core::{
+    CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
+};
 use openidconnect::reqwest::async_http_client;
 use openidconnect::{
     AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, IssuerUrl, Nonce,
@@ -48,9 +50,20 @@ struct Pending {
     created: i64,
 }
 
+#[derive(Clone)]
+pub struct AuthUser {
+    pub display_name: String,
+}
+
+struct LoginIdentity {
+    subject: String,
+    display_name: String,
+}
+
 struct Session {
     #[allow(dead_code)]
     subject: String,
+    display_name: String,
     expires: i64,
 }
 
@@ -111,12 +124,12 @@ impl Auth {
         Ok(())
     }
 
-    fn verify_id_token_subject(
+    fn verify_id_token_identity(
         &self,
         client: &CoreClient,
         id_token: &CoreIdToken,
         nonce: &Nonce,
-    ) -> Result<String, ClaimsVerificationError> {
+    ) -> Result<LoginIdentity, ClaimsVerificationError> {
         let verifier = client
             .id_token_verifier()
             // Zitadel adds the project id to the id_token audience alongside our
@@ -124,7 +137,11 @@ impl Auth {
             // signature, issuer, and nonce are still enforced).
             .set_other_audience_verifier_fn(|_aud| true);
         let claims = id_token.claims(&verifier, nonce)?;
-        Ok(claims.subject().as_str().to_string())
+        let subject = claims.subject().as_str().to_string();
+        Ok(LoginIdentity {
+            display_name: display_name_from_claims(claims, &subject),
+            subject,
+        })
     }
 
     fn sweep(&self) {
@@ -149,6 +166,45 @@ impl Auth {
             .get(&sid)
             .is_some_and(|s| s.expires > now())
     }
+
+    pub fn current_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
+        let sid = cookie(headers, SESSION_COOKIE)?;
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .get(&sid)
+            .filter(|s| s.expires > now())
+            .map(|s| AuthUser {
+                display_name: s.display_name.clone(),
+            })
+    }
+}
+
+fn clean_display_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn display_name_from_claims(claims: &CoreIdTokenClaims, subject: &str) -> String {
+    claims
+        .preferred_username()
+        .and_then(|name| clean_display_name(name.as_str()))
+        .or_else(|| {
+            claims
+                .email()
+                .and_then(|email| clean_display_name(email.as_str()))
+        })
+        .or_else(|| {
+            claims
+                .name()
+                .and_then(|name| name.get(None))
+                .and_then(|name| clean_display_name(name.as_str()))
+        })
+        .unwrap_or_else(|| subject.to_string())
 }
 
 async fn discover_client(
@@ -253,8 +309,8 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
     let Some(id_token) = token.id_token() else {
         return (StatusCode::UNAUTHORIZED, "no id_token").into_response();
     };
-    let subject = match auth.verify_id_token_subject(&client, id_token, &pending.nonce) {
-        Ok(subject) => subject,
+    let identity = match auth.verify_id_token_identity(&client, id_token, &pending.nonce) {
+        Ok(identity) => identity,
         Err(ClaimsVerificationError::SignatureVerification(e)) => {
             tracing::warn!(
                 "id_token signature verification failed; refreshing OIDC metadata and retrying: {e}"
@@ -268,10 +324,10 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
                     .into_response();
             }
             let refreshed = auth.client();
-            match auth.verify_id_token_subject(&refreshed, id_token, &pending.nonce) {
-                Ok(subject) => {
+            match auth.verify_id_token_identity(&refreshed, id_token, &pending.nonce) {
+                Ok(identity) => {
                     tracing::info!("id_token verified after OIDC metadata refresh");
-                    subject
+                    identity
                 }
                 Err(e) => {
                     tracing::warn!("id_token verification failed after OIDC metadata refresh: {e}");
@@ -297,7 +353,8 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
     auth.sessions.lock().expect("sessions lock").insert(
         sid.clone(),
         Session {
-            subject,
+            subject: identity.subject,
+            display_name: identity.display_name,
             expires: now() + SESSION_TTL_SECS,
         },
     );
@@ -327,4 +384,54 @@ pub async fn logout(State(auth): State<AuthState>, headers: HeaderMap) -> Respon
             .expect("cookie header"),
     );
     (out, Redirect::temporary("/")).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims(json: &str) -> CoreIdTokenClaims {
+        serde_json::from_str(json).expect("valid id token claims")
+    }
+
+    #[test]
+    fn display_name_prefers_zitadel_username_claim() {
+        let claims = claims(
+            r#"{
+                "iss": "https://auth.inspr.at",
+                "sub": "opaque-subject",
+                "aud": "pharos",
+                "exp": 4102444800,
+                "iat": 1700000000,
+                "preferred_username": "markus",
+                "email": "markus@example.invalid",
+                "name": "Markus Barta"
+            }"#,
+        );
+
+        assert_eq!(
+            display_name_from_claims(&claims, "opaque-subject"),
+            "markus"
+        );
+    }
+
+    #[test]
+    fn display_name_falls_back_without_username_claim() {
+        let claims = claims(
+            r#"{
+                "iss": "https://auth.inspr.at",
+                "sub": "opaque-subject",
+                "aud": "pharos",
+                "exp": 4102444800,
+                "iat": 1700000000,
+                "email": "markus@example.invalid",
+                "name": "Markus Barta"
+            }"#,
+        );
+
+        assert_eq!(
+            display_name_from_claims(&claims, "opaque-subject"),
+            "markus@example.invalid"
+        );
+    }
 }

@@ -115,7 +115,7 @@ body:before{content:"";position:fixed;inset:0;z-index:-3;background:radial-gradi
 .sidebar:before{content:"";position:absolute;left:-18%;right:-20%;bottom:-10%;height:66%;background:url('/assets/sidebar-lighthouse.png') left bottom/118% auto no-repeat;opacity:.78;pointer-events:none;-webkit-mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%);mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%)}
 .side-brand,.side-nav,.side-foot{position:relative;z-index:1}.side-brand{display:flex;align-items:center;gap:13px;padding:0 12px}.side-mark{display:grid;place-items:center;width:36px;height:50px;color:var(--sun)}.side-mark .ico{width:31px;height:31px}.side-logo{font-family:Georgia,"Times New Roman",serif;font-size:22px;letter-spacing:.18em;color:#14304b;text-transform:uppercase}
 .side-nav{display:grid;gap:7px}.side-link{display:grid;grid-template-columns:23px minmax(0,1fr) auto;align-items:center;gap:11px;min-height:46px;padding:0 13px;border-radius:7px;color:#294761;text-decoration:none;font-weight:520}.side-link[aria-current="page"]{background:rgba(223,241,249,.76);color:#0f4f80}.side-link .ico{width:18px;height:18px}.side-badge{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:#ffe7bb;color:#9a5b00;font-size:12px;font-weight:700}
-.side-foot{margin-top:auto;display:flex;align-items:center;justify-content:space-between;padding:10px 13px;color:#294761;font-size:13px}.side-user{display:flex;align-items:center;gap:9px}.side-user:before{content:"";width:24px;height:24px;border-radius:50%;border:1px solid rgba(214,155,49,.38);background:radial-gradient(circle,#fff 0 33%,rgba(214,155,49,.18) 36%,transparent 68%)}
+.side-foot{margin-top:auto;display:flex;align-items:center;justify-content:space-between;gap:9px;padding:10px 13px;color:#294761;font-size:13px}.side-user{min-width:0;display:flex;align-items:center;gap:9px;font-weight:540}.side-user:before{content:"";flex:0 0 auto;width:24px;height:24px;border-radius:50%;border:1px solid rgba(214,155,49,.38);background:radial-gradient(circle,#fff 0 33%,rgba(214,155,49,.18) 36%,transparent 68%)}.side-user span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.side-logout{display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border-radius:50%;color:#4c6780;text-decoration:none}.side-logout:hover{background:rgba(223,241,249,.78);color:#0f4f80}.side-logout .ico{width:16px;height:16px}
 main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .ico{width:16px;height:16px;display:inline-block;vertical-align:middle;flex:0 0 auto}
 .top{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:22px;min-height:118px;margin:-10px 0 20px;padding:10px 0 18px;overflow:hidden}
@@ -898,12 +898,15 @@ fn no_store_html(body: String) -> impl IntoResponse {
     )
 }
 
-async fn home(State(state): State<AppState>) -> impl IntoResponse {
+async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_label = sidebar_user_label(&state.auth, &headers);
     no_store_html(render_home(
         &state.store.list(),
         &self_host(),
         now_unix(),
         state.manifests.manifests(),
+        &user_label,
+        state.auth.is_some(),
     ))
 }
 
@@ -1153,15 +1156,39 @@ fn summary_cards(hosts: &[Host], self_name: &str, now: i64) -> String {
     )
 }
 
-fn sidebar() -> String {
+fn sidebar_user_label(auth: &AuthState, headers: &HeaderMap) -> String {
+    auth.as_ref()
+        .and_then(|auth| auth.current_user(headers))
+        .map(|user| user.display_name)
+        .unwrap_or_else(|| {
+            if auth.is_some() {
+                "signed in".to_string()
+            } else {
+                "local access".to_string()
+            }
+        })
+}
+
+fn sidebar(user_label: &str, logout_enabled: bool) -> String {
+    let logout = if logout_enabled {
+        format!(
+            r#"<a class="side-logout" href="/auth/logout" title="Log out of Pharos" aria-label="Log out of Pharos">{}</a>"#,
+            icons::LOG_OUT
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/" aria-current="page">{fleet}<span>Fleet</span></a><a class="side-link" href="/">{map}<span>Map</span></a><a class="side-link" href="/">{alerts}<span>Alerts</span></a><a class="side-link" href="/">{activity}<span>Activity</span></a><a class="side-link" href="/agora">{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user">mba</span><span aria-hidden="true">v</span></div></aside>"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/" aria-current="page">{fleet}<span>Fleet</span></a><a class="side-link" href="/">{map}<span>Map</span></a><a class="side-link" href="/">{alerts}<span>Alerts</span></a><a class="side-link" href="/">{activity}<span>Activity</span></a><a class="side-link" href="/agora">{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
         alerts = icons::status_svg(Liveness::Stale),
         activity = icons::LIST,
-        settings = icons::SLIDERS
+        settings = icons::SLIDERS,
+        user_label = html_escape(user_label),
+        user_title = html_escape(user_label),
+        logout = logout
     )
 }
 
@@ -1523,11 +1550,18 @@ fn heartbeat_card(
     )
 }
 
-fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManifest]) -> String {
+fn render_home(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    user_label: &str,
+    logout_enabled: bool,
+) -> String {
     if hosts.is_empty() {
         return format!(
             "{HEAD}{sidebar}<main>{header}{empty}</main>{FOOT}",
-            sidebar = sidebar(),
+            sidebar = sidebar(user_label, logout_enabled),
             header = header(now),
             empty = empty_state()
         );
@@ -1655,7 +1689,7 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
 
     format!(
         "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
-        sidebar = sidebar(),
+        sidebar = sidebar(user_label, logout_enabled),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar()
@@ -1771,11 +1805,17 @@ mod tests {
             },
         ];
 
-        let html = render_home(&hosts, "csb1", 1000, &[]);
+        let html = render_home(&hosts, "csb1", 1000, &[], "markus", true);
 
         assert!(html.contains(r#"<section class="toolbar""#));
         assert!(html.contains(r#"data-view-button="list""#));
         assert!(html.contains(r#"<table class="list">"#));
+        assert!(
+            html.contains(r#"<span class="side-user" title="markus"><span>markus</span></span>"#)
+        );
+        assert!(html.contains(r#"href="/auth/logout""#));
+        assert!(html.contains(r#"aria-label="Log out of Pharos""#));
+        assert!(!html.contains(">mba<"));
         assert!(html.contains(r#"data-host="csb1" data-live="live""#));
         assert!(html.contains(r#"data-self="true""#));
         assert!(html.contains("the light is lit"));
@@ -1932,7 +1972,7 @@ mod tests {
         }))
         .expect("manifest parses");
 
-        let html = render_home(&[host], "csb1", 1000, &[manifest]);
+        let html = render_home(&[host], "csb1", 1000, &[manifest], "markus", true);
 
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(html.contains(r#"class="card has-settings""#));
@@ -1948,7 +1988,7 @@ mod tests {
 
     #[test]
     fn render_home_has_deliberate_empty_and_lone_host_states() {
-        let empty = render_home(&[], "csb1", 1000, &[]);
+        let empty = render_home(&[], "csb1", 1000, &[], "local access", false);
         assert!(empty.contains(r#"<section class="empty-state""#));
         assert!(empty.contains("Waiting for the first host"));
         assert!(empty.contains("inspr onboard &lt;host&gt;"));
@@ -1967,7 +2007,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let lone = render_home(&[host], "csb1", 1000, &[]);
+        let lone = render_home(&[host], "csb1", 1000, &[], "local access", false);
         assert!(lone.contains(r#"<aside class="lone-state""#));
         assert!(lone.contains("First host is on the map"));
         assert!(lone.contains(r#"data-live="awaiting_first_heartbeat""#));
