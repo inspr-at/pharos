@@ -159,6 +159,8 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .role{font-size:12px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .signal{--signal-color:var(--wait);display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:52px;min-height:24px;color:var(--signal-color);font-size:13px;font-weight:720;white-space:nowrap;text-align:center}
 .signal[data-signal-level="good"]{--signal-color:var(--live)}.signal[data-signal-level="warn"]{--signal-color:var(--stale)}.signal[data-signal-level="down"]{--signal-color:var(--down)}.signal[data-signal-level="wait"]{--signal-color:var(--wait)}
+.signal-window{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11px;font-weight:700;padding:0 1px;cursor:pointer}
+.signal-window:hover{color:var(--ink);text-decoration:underline;text-underline-offset:2px}.signal-window:focus-visible{outline:2px solid color-mix(in srgb,var(--signal-color) 34%,transparent);outline-offset:2px;border-radius:4px}
 .signal-orb{width:12px;height:12px;border-radius:50%;background:radial-gradient(circle,#fff 0 28%,var(--signal-color) 33% 63%,transparent 66%);box-shadow:0 0 0 4px color-mix(in srgb,var(--signal-color) 12%,transparent),0 0 12px color-mix(in srgb,var(--signal-color) 18%,transparent);opacity:.92}
 .status-pill{display:inline-flex;align-items:center;gap:6px;min-height:25px;max-width:150px;flex-shrink:0;padding:4px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--state) 24%,transparent);background:color-mix(in srgb,var(--state) 10%,white);color:var(--state);font-size:12px;white-space:nowrap}
 .status-pill .ico{width:14px;height:14px}.word{color:inherit;overflow:hidden;text-overflow:ellipsis}
@@ -243,11 +245,13 @@ main[data-view="list"] .list-wrap{display:block}
 
 const FOOT: &str = r#"</div><script>
 const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awaiting'};
-const HISTORY_DOTS=8;
+const HISTORY_DOTS=12;
 const MAX_BEATS=HISTORY_DOTS+1;
 const EXPECT_X=64;
 const STALE_X=82;
 const HISTORY_STEP=EXPECT_X/HISTORY_DOTS;
+const SIGNAL_WINDOWS=[{key:'10m',label:'10m',secs:10*60},{key:'1h',label:'1h',secs:60*60},{key:'24h',label:'24h',secs:24*60*60}];
+let signalWindow=SIGNAL_WINDOWS[0];
 function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
@@ -256,6 +260,7 @@ function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(na
 function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
 function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host]')).filter(el=>el.dataset.host===name)}
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
+function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
 function historyInfo(beats,index,interval){
   const stamp=beats[index];
   const previous=index>0?beats[index-1]:null;
@@ -323,41 +328,44 @@ function markHtml(beats,interval){
     return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
 }
-function signalInfo(beats,last,interval,now){
+function signalInfo(beats,last,interval,now,windowDef=signalWindow){
   const cadence=Math.max(1,Number(interval)||60);
   const samples=Array.from(new Set(beats.concat(Number.isFinite(last)&&last>0?[last]:[]))).filter(Number.isFinite).filter(n=>n>0).sort((a,b)=>a-b);
-  if(!samples.length)return {text:'new',level:'wait',title:'Recent signal: waiting for first heartbeat'};
-  let remaining=HISTORY_DOTS;
-  let expected=0;
-  let received=0;
-  const latest=samples[samples.length-1];
-  const currentMissed=Math.max(0,Math.floor((now-latest)/cadence));
-  let take=Math.min(currentMissed,remaining);
-  expected+=take;
-  remaining-=take;
-  for(let i=samples.length-1;i>0&&remaining>0;i--){
-    const gap=Math.max(0,samples[i]-samples[i-1]);
-    const slots=Math.max(1,Math.ceil(gap/cadence));
-    take=Math.min(slots,remaining);
-    if(take>0){
-      expected+=take;
-      received+=1;
-      remaining-=take;
-    }
+  if(!samples.length)return {text:'new',level:'wait',window:windowDef.label,title:'Signal over '+windowDef.label+': waiting for first heartbeat'};
+  const requestedStart=now-windowDef.secs;
+  const retainedStart=Math.max(requestedStart,samples[0]);
+  const span=Math.max(cadence,Math.min(windowDef.secs,now-retainedStart));
+  const expected=Math.max(1,Math.ceil(span/cadence));
+  const received=samples.filter(stamp=>stamp>=retainedStart&&stamp<=now).length;
+  let longestGap=Math.max(0,Math.min(now-samples[samples.length-1],span));
+  let previous=retainedStart;
+  for(const stamp of samples){
+    if(stamp<retainedStart||stamp>now)continue;
+    longestGap=Math.max(longestGap,stamp-previous);
+    previous=stamp;
   }
-  if(expected===0)return {text:'new',level:'wait',title:'Recent signal: not enough heartbeat history yet'};
+  longestGap=Math.max(longestGap,now-previous);
   const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
   const level=percent>=95?'good':percent>=75?'warn':'down';
-  return {text:percent+'%',level,title:'Recent signal: '+received+' of '+expected+' expected heartbeats received'};
+  const coverage=retainedStart>requestedStart?' · retained '+dur(span):'';
+  return {text:percent+'%',level,window:windowDef.label,title:'Signal over '+windowDef.label+': '+received+' of '+expected+' expected heartbeats received · longest gap '+dur(longestGap)+coverage};
 }
 function updateSignal(surface,info){
   const signal=surface?.querySelector('[data-signal]');
   if(!signal)return;
   signal.dataset.signalLevel=info.level;
+  signal.dataset.signalWindowKey=info.window;
   signal.title=info.title;
   signal.setAttribute('aria-label',info.title);
   const text=signal.querySelector('[data-signal-percent]');
   if(text)text.textContent=info.text;
+  const windowLabel=signal.querySelector('[data-signal-window]');
+  if(windowLabel){
+    const next=SIGNAL_WINDOWS[(SIGNAL_WINDOWS.findIndex(w=>w.label===info.window)+1)%SIGNAL_WINDOWS.length]||SIGNAL_WINDOWS[0];
+    windowLabel.textContent=info.window;
+    windowLabel.title=info.title+'; click for '+next.label;
+    windowLabel.setAttribute('aria-label',info.title+'; click for '+next.label);
+  }
 }
 function setHistoryHint(mark,show){
   const card=mark.closest('.card');
@@ -386,8 +394,10 @@ function bindHistoryHints(root=document){
   });
 }
 function setBeatHistory(beat,beats,interval){
-  const kept=Array.from(new Set(beats)).sort((a,b)=>a-b).slice(-MAX_BEATS);
+  const all=Array.from(new Set(beats)).sort((a,b)=>a-b);
+  const kept=all.slice(-MAX_BEATS);
   const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
+  beat.dataset.signalBeats=all.join(',');
   beat.dataset.beats=kept.join(',');
   beat.dataset.count=String(Math.max(0,kept.length-1));
   const marks=beat.querySelector('.beat-marks');
@@ -418,7 +428,7 @@ function updateBeatClock(beat,now){
     beat.style.setProperty('--target-ring','3px');
     beat.style.setProperty('--late-alpha','.3');
     beat.dataset.beat='waiting';
-    updateSignal(surface,signalInfo([],last,interval,now));
+    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats),last,interval,now));
     return;
   }
   const age=Math.max(0,now-last);
@@ -450,7 +460,7 @@ function updateBeatClock(beat,now){
     beat.style.setProperty('--target-ring','8px');
     beat.dataset.beat='down';
   }
-  updateSignal(surface,signalInfo(parseBeats(beat.dataset.beats),last,interval,now));
+  updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now));
 }
 function frame(){
   const now=Date.now()/1000;
@@ -505,12 +515,28 @@ function applyFilter(query,write=true){
   if(input&&input.value!==query)input.value=query;
   if(write)setCookie('pharos_search',query);
 }
+function applySignalWindow(key,write=true){
+  signalWindow=signalWindowByKey(key);
+  document.querySelectorAll('.beat').forEach(beat=>{
+    const surface=beat.closest('[data-host]');
+    const last=Number(beat.dataset.last);
+    const interval=Math.max(1,Number(beat.dataset.interval)||60);
+    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,Date.now()/1000,signalWindow));
+  });
+  if(write)setCookie('pharos_signal_window',signalWindow.key);
+}
+function cycleSignalWindow(){
+  const idx=SIGNAL_WINDOWS.findIndex(w=>w.key===signalWindow.key);
+  applySignalWindow(SIGNAL_WINDOWS[(idx+1)%SIGNAL_WINDOWS.length].key);
+  updateUrlState();
+}
 function updateUrlState(){
   const main=document.querySelector('main');
   const sort=document.querySelector('[data-sort]')?.value||'attention';
   const params=new URLSearchParams(location.search);
   params.set('view',main?.dataset.view||'grid');
   params.set('sort',sort);
+  params.set('signal',signalWindow.key);
   const url=location.pathname+'?'+params.toString();
   history.replaceState(null,'',url);
 }
@@ -519,12 +545,15 @@ function initControls(){
   const view=params.get('view')||decodeURIComponent(cookie('pharos_view'))||'grid';
   const sort=params.get('sort')||decodeURIComponent(cookie('pharos_sort'))||'attention';
   const search=decodeURIComponent(cookie('pharos_search'));
+  const selectedSignalWindow=params.get('signal')||decodeURIComponent(cookie('pharos_signal_window'))||SIGNAL_WINDOWS[0].key;
   applyView(view,false);
   applySort(sort,false);
   applyFilter(search,false);
+  applySignalWindow(selectedSignalWindow,false);
   document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
   document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
   document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
+  document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
 }
 async function refresh(){
   try{
@@ -574,17 +603,19 @@ async function refresh(){
   }catch(_){}
 }
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
-document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
+document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
 initControls();
 requestAnimationFrame(frame);
 setInterval(refresh,10000);
 setTimeout(refresh,3000);
 </script></body></html>"#;
 
-const HEARTBEAT_HISTORY_DOTS: usize = 8;
+const HEARTBEAT_HISTORY_DOTS: usize = 12;
 const HEARTBEAT_HISTORY_SAMPLES: usize = HEARTBEAT_HISTORY_DOTS + 1;
 const HEARTBEAT_EXPECT_X: f64 = 64.0;
 const HEARTBEAT_STALE_X: f64 = 82.0;
+const SIGNAL_DEFAULT_WINDOW_LABEL: &str = "10m";
+const SIGNAL_DEFAULT_WINDOW_SECS: i64 = 10 * 60;
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -1177,6 +1208,7 @@ fn heartbeat_samples(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
 struct HeartbeatSignal {
     text: String,
     level: &'static str,
+    window: &'static str,
     title: String,
 }
 
@@ -1185,47 +1217,48 @@ fn heartbeat_signal(
     last_seen: Option<i64>,
     interval: i64,
     now: i64,
+    window_label: &'static str,
+    window_secs: i64,
 ) -> HeartbeatSignal {
     let samples = heartbeat_samples(log, last_seen);
-    let Some(latest) = samples.last().copied() else {
+    if samples.is_empty() {
         return HeartbeatSignal {
             text: "new".to_string(),
             level: "wait",
-            title: "Recent signal: waiting for first heartbeat".to_string(),
+            window: window_label,
+            title: format!("Signal over {window_label}: waiting for first heartbeat"),
         };
     };
 
     let interval = interval.max(1);
-    let mut remaining = HEARTBEAT_HISTORY_DOTS;
-    let mut expected = 0usize;
-    let mut received = 0usize;
-
-    let current_missed = ((now - latest).max(0) / interval) as usize;
-    let mut take = current_missed.min(remaining);
-    expected += take;
-    remaining -= take;
-
-    for idx in (1..samples.len()).rev() {
-        if remaining == 0 {
-            break;
-        }
-        let gap = (samples[idx] - samples[idx - 1]).max(0);
-        let slots = ((gap + interval - 1) / interval).max(1) as usize;
-        take = slots.min(remaining);
-        if take > 0 {
-            expected += take;
-            received += 1;
-            remaining -= take;
-        }
+    let window_secs = window_secs.max(interval);
+    let requested_start = now - window_secs;
+    let retained_start = samples
+        .first()
+        .copied()
+        .map(|oldest| oldest.max(requested_start))
+        .unwrap_or(requested_start);
+    let span = (now - retained_start).max(interval).min(window_secs);
+    let expected = ((span + interval - 1) / interval).max(1) as usize;
+    let received = samples
+        .iter()
+        .filter(|stamp| **stamp >= retained_start && **stamp <= now)
+        .count();
+    let mut previous = retained_start;
+    let mut longest_gap = samples
+        .last()
+        .copied()
+        .map(|latest| (now - latest).max(0).min(span))
+        .unwrap_or(span);
+    for stamp in samples
+        .iter()
+        .copied()
+        .filter(|stamp| *stamp >= retained_start && *stamp <= now)
+    {
+        longest_gap = longest_gap.max(stamp - previous);
+        previous = stamp;
     }
-
-    if expected == 0 {
-        return HeartbeatSignal {
-            text: "new".to_string(),
-            level: "wait",
-            title: "Recent signal: not enough heartbeat history yet".to_string(),
-        };
-    }
+    longest_gap = longest_gap.max(now - previous);
 
     let percent = (((received * 100) + (expected / 2)) / expected).min(100);
     let level = if percent >= 95 {
@@ -1238,16 +1271,26 @@ fn heartbeat_signal(
     HeartbeatSignal {
         text: format!("{percent}%"),
         level,
-        title: format!("Recent signal: {received} of {expected} expected heartbeats received"),
+        window: window_label,
+        title: format!(
+            "Signal over {window_label}: {received} of {expected} expected heartbeats received · longest gap {}{}",
+            duration_label(longest_gap),
+            if retained_start > requested_start {
+                format!(" · retained {}", duration_label(span))
+            } else {
+                String::new()
+            }
+        ),
     }
 }
 
 fn signal_markup(signal: &HeartbeatSignal) -> String {
     let title = html_escape(&signal.title);
     format!(
-        r#"<span class="signal" data-signal data-signal-level="{level}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span></span>"#,
+        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><button class="signal-window" type="button" data-signal-window title="{title}">{window}</button><span class="signal-orb" aria-hidden="true"></span></span>"#,
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
+        window = html_escape(signal.window),
     )
 }
 
@@ -1335,8 +1378,14 @@ fn heartbeat_card(
     let interval = i64::try_from(interval_secs.unwrap_or(60))
         .unwrap_or(60)
         .max(1);
+    let all_beats = heartbeat_samples(heartbeat_log, last_seen);
     let recent = recent_heartbeat_log(heartbeat_log, last_seen);
     let beats_attr = recent
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let signal_beats_attr = all_beats
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
@@ -1401,7 +1450,7 @@ fn heartbeat_card(
         };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span>last</span><span>expected</span><span>late</span></span></div></div>"#,
         count = recent.len().saturating_sub(1)
     )
 }
@@ -1515,6 +1564,8 @@ fn render_home(hosts: &[Host], self_name: &str, now: i64, manifests: &[HostManif
             h.last_seen,
             interval,
             now,
+            SIGNAL_DEFAULT_WINDOW_LABEL,
+            SIGNAL_DEFAULT_WINDOW_SECS,
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
@@ -1670,14 +1721,17 @@ mod tests {
         assert!(!html.contains("expected beat"));
         assert!(html.contains(r#"class="signal" data-signal data-signal-level="good""#));
         assert!(html.contains(r#"<span data-signal-percent>100%</span>"#));
+        assert!(html.contains(r#"<button class="signal-window" type="button" data-signal-window"#));
+        assert!(html.contains(r#"data-signal-window-key="10m""#));
         assert!(html.contains(r#"data-beats="850,910,970""#));
+        assert!(html.contains(r#"data-signal-beats="850,910,970""#));
         assert!(
             !html.contains(r#"<span class="beat-mark" tabindex="0" data-history-level="first""#)
         );
         assert!(html.contains(r#"data-history-level="ok""#));
         assert!(html.contains(r#"data-history-label="on cadence""#));
-        assert!(html.contains(r#"--mark-x:48.0%""#));
-        assert!(html.contains(r#"--mark-x:56.0%""#));
+        assert!(html.contains(r#"--mark-x:53.3%""#));
+        assert!(html.contains(r#"--mark-x:58.7%""#));
         assert!(!html.contains(r#"--mark-x:64.0%""#));
         assert!(html.contains("Flake.lock age"));
         assert!(html.contains(r#"<strong class="warn">1d</strong>"#));
@@ -1703,9 +1757,9 @@ mod tests {
         assert!(!marks.contains(r#"data-history-level="first""#));
         assert!(marks.contains(r#"data-history-level="ok""#));
         assert!(marks.contains(r#"data-history-level="late""#));
-        assert!(marks.contains(r#"--mark-x:32.0%""#));
-        assert!(marks.contains(r#"--mark-x:40.0%""#));
-        assert!(marks.contains(r#"--mark-x:56.0%""#));
+        assert!(marks.contains(r#"--mark-x:42.7%""#));
+        assert!(marks.contains(r#"--mark-x:48.0%""#));
+        assert!(marks.contains(r#"--mark-x:58.7%""#));
         assert!(!marks.contains(r#"--mark-x:64.0%""#));
     }
 
@@ -1721,22 +1775,44 @@ mod tests {
             Some(580),
             60,
             588,
+            SIGNAL_DEFAULT_WINDOW_LABEL,
+            SIGNAL_DEFAULT_WINDOW_SECS,
         );
         assert_eq!(steady.text, "100%");
         assert_eq!(steady.level, "good");
+        assert_eq!(steady.window, "10m");
 
         let overdue = heartbeat_signal(
             &[100, 160, 220, 280, 340, 400, 460, 520, 580],
             Some(580),
             60,
             645,
+            SIGNAL_DEFAULT_WINDOW_LABEL,
+            SIGNAL_DEFAULT_WINDOW_SECS,
         );
-        assert_eq!(overdue.text, "88%");
+        assert_eq!(overdue.text, "90%");
         assert_eq!(overdue.level, "warn");
 
-        let recovered_gap = heartbeat_signal(&[100, 160, 220, 460], Some(460), 60, 468);
-        assert_eq!(recovered_gap.text, "50%");
+        let recovered_gap = heartbeat_signal(
+            &[100, 160, 220, 460],
+            Some(460),
+            60,
+            468,
+            SIGNAL_DEFAULT_WINDOW_LABEL,
+            SIGNAL_DEFAULT_WINDOW_SECS,
+        );
+        assert_eq!(recovered_gap.text, "57%");
         assert_eq!(recovered_gap.level, "down");
+    }
+
+    #[test]
+    fn heartbeat_signal_can_score_longer_windows() {
+        let sparse = heartbeat_signal(&[0, 60, 120, 3600], Some(3600), 60, 3600, "1h", 3600);
+
+        assert_eq!(sparse.text, "7%");
+        assert_eq!(sparse.level, "down");
+        assert_eq!(sparse.window, "1h");
+        assert!(sparse.title.contains("longest gap"));
     }
 
     #[test]

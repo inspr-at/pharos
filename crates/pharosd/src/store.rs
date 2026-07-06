@@ -8,7 +8,8 @@ use std::sync::RwLock;
 
 use pharos_core::{Host, HostRegistration, HostReport, NixFreshness, UnixSeconds};
 
-const MAX_HEARTBEAT_LOG: usize = 24;
+const HEARTBEAT_RETENTION_SECS: UnixSeconds = 24 * 3600;
+const MAX_HEARTBEAT_LOG: usize = 3_000;
 
 pub struct Store {
     /// `None` = in-memory only (ephemeral). `Some(path)` = persist to JSON.
@@ -31,7 +32,7 @@ impl Store {
                                 h.heartbeat_log.push(last_seen);
                             }
                         }
-                        trim_heartbeat_log(&mut h.heartbeat_log);
+                        trim_heartbeat_log(&mut h.heartbeat_log, current_unix());
                         (h.name.clone(), h)
                     })
                     .collect()
@@ -112,7 +113,7 @@ impl Store {
             if heartbeat_log.last().copied() != Some(now) {
                 heartbeat_log.push(now);
             }
-            trim_heartbeat_log(&mut heartbeat_log);
+            trim_heartbeat_log(&mut heartbeat_log, now);
             map.insert(
                 report.name.clone(),
                 Host {
@@ -151,9 +152,18 @@ impl Store {
     }
 }
 
-fn trim_heartbeat_log(log: &mut Vec<UnixSeconds>) {
+fn current_unix() -> UnixSeconds {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn trim_heartbeat_log(log: &mut Vec<UnixSeconds>, now: UnixSeconds) {
     log.sort_unstable();
     log.dedup();
+    let cutoff = now.saturating_sub(HEARTBEAT_RETENTION_SECS);
+    log.retain(|stamp| *stamp >= cutoff);
     if log.len() > MAX_HEARTBEAT_LOG {
         log.drain(0..log.len() - MAX_HEARTBEAT_LOG);
     }
@@ -168,7 +178,7 @@ mod tests {
     fn record_retains_recent_real_heartbeat_events() {
         let store = Store::new(None);
 
-        for now in 1..=30 {
+        for now in 1..=(MAX_HEARTBEAT_LOG + 6) as UnixSeconds {
             store.record(
                 HostReport {
                     name: "poseidon".to_string(),
@@ -185,10 +195,26 @@ mod tests {
         }
 
         let host = store.list().pop().expect("host recorded");
-        assert_eq!(host.last_seen, Some(30));
+        assert_eq!(host.last_seen, Some((MAX_HEARTBEAT_LOG + 6) as UnixSeconds));
         assert_eq!(host.heartbeat_log.len(), MAX_HEARTBEAT_LOG);
         assert_eq!(host.heartbeat_log.first(), Some(&7));
-        assert_eq!(host.heartbeat_log.last(), Some(&30));
+        assert_eq!(
+            host.heartbeat_log.last(),
+            Some(&((MAX_HEARTBEAT_LOG + 6) as UnixSeconds))
+        );
+    }
+
+    #[test]
+    fn heartbeat_log_retains_roughly_twenty_four_hours() {
+        let mut log = vec![1, 3600, 86_399, 86_400, 86_401];
+
+        trim_heartbeat_log(&mut log, 86_401);
+
+        assert_eq!(log, vec![1, 3600, 86_399, 86_400, 86_401]);
+
+        trim_heartbeat_log(&mut log, 172_801);
+
+        assert_eq!(log, vec![86_401]);
     }
 
     #[test]
