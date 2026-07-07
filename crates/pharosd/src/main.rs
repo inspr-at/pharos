@@ -1319,11 +1319,14 @@ fn server_probe_observation(
 }
 
 fn should_server_probe(service: &ManifestService) -> bool {
-    service.status_policy.source == ManifestStatusSource::PharosRuntime
-        || service
-            .probe
-            .as_ref()
-            .is_some_and(explicit_server_probe_policy)
+    explicit_server_probe_policy_opt(service.probe.as_ref())
+        || (service.status_policy.source == ManifestStatusSource::PharosRuntime
+            && !service.passive
+            && server_probe_url(service).is_some())
+}
+
+fn explicit_server_probe_policy_opt(policy: Option<&ManifestProbePolicy>) -> bool {
+    policy.is_some_and(explicit_server_probe_policy)
 }
 
 fn explicit_server_probe_policy(policy: &ManifestProbePolicy) -> bool {
@@ -2569,6 +2572,15 @@ mod tests {
         }))
         .expect("service parses");
         assert!(should_server_probe(&named_service));
+
+        let passive_runtime_service: ManifestService = serde_json::from_value(json!({
+            "wing": "ops",
+            "name": "Beacon observation",
+            "passive": true,
+            "statusPolicy": { "source": "pharos-runtime" }
+        }))
+        .expect("service parses");
+        assert!(!should_server_probe(&passive_runtime_service));
     }
 
     #[test]
