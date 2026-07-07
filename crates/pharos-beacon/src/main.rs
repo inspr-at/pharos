@@ -11,7 +11,7 @@
 //!      PHAROS_TOKEN (per-host bearer token from /register).
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
@@ -73,6 +73,8 @@ fn flake_lock_age_days(dir: &str) -> Option<u32> {
 fn commits_behind(dir: &str) -> Option<u32> {
     let _ = Command::new("git")
         .args(["-C", dir, "fetch", "--quiet"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     let out = Command::new("git")
         .args(["-C", dir, "rev-list", "--count", "HEAD..@{u}"])
