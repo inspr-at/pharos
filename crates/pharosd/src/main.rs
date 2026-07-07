@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRef, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -36,6 +36,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 use url::Url;
 
@@ -254,7 +255,41 @@ main[data-view="list"] .list-wrap{display:block}
 .lone-mark .ico{width:24px;height:24px}
 .lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
 .lone-state .onboard-command{position:relative;margin:0;font-size:12px}
-.map-main{width:min(1380px,100%)}.map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}.map-panel,.site-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.84);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}.map-panel{position:relative;min-height:560px}.fleet-map{height:clamp(520px,calc(100vh - 220px),760px);min-height:520px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}.map-fallback{display:none;position:absolute;inset:0;place-items:center;padding:28px;text-align:center;color:var(--muted);background:rgba(255,255,255,.82);z-index:2}.map-fallback strong{display:block;color:var(--ink);font-size:18px}.site-panel{padding:16px;display:flex;flex-direction:column;gap:14px}.site-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;letter-spacing:0}.site-panel p{margin:0;color:var(--muted);font-size:12px}.site-list{display:grid;gap:9px;overflow:auto;padding-right:2px}.site-item{display:grid;gap:8px;padding:11px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.74)}.site-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.site-head strong{font-size:13px}.site-count{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:22px;border-radius:999px;background:rgba(223,241,249,.78);color:#0f4f80;font-size:12px;font-weight:700}.site-hosts{display:flex;flex-wrap:wrap;gap:6px}.site-host{display:inline-flex;align-items:center;gap:5px;min-height:22px;padding:3px 7px;border:1px solid color-mix(in srgb,var(--host-state) 22%,transparent);border-radius:999px;background:color-mix(in srgb,var(--host-state) 8%,white);color:var(--ink);font-size:12px;text-decoration:none}.site-host:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--host-state)}.map-note{margin-top:auto;padding-top:8px;border-top:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:11px}.leaflet-container{font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}.leaflet-control-zoom a{color:var(--ink)!important}.leaflet-popup-content-wrapper{border-radius:8px;box-shadow:0 16px 32px rgba(45,75,95,.18)}.leaflet-popup-content{min-width:190px;margin:12px}.map-popup{display:grid;gap:6px}.map-popup strong{font-size:15px}.map-popup span{color:var(--muted);font-size:12px}.map-popup a{color:var(--accent);font-weight:650;text-decoration:none}.map-popup a:hover{text-decoration:underline;text-underline-offset:2px}.pharos-pin{--pin-color:var(--wait);position:relative;display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid var(--pin-color);box-shadow:0 0 0 5px color-mix(in srgb,var(--pin-color) 13%,transparent),0 10px 20px rgba(45,75,95,.16)}.pharos-pin:after{content:"";width:8px;height:8px;border-radius:50%;background:var(--pin-color)}.pharos-pin.live{--pin-color:var(--live)}.pharos-pin.stale{--pin-color:var(--stale)}.pharos-pin.down{--pin-color:var(--down)}.pharos-pin.awaiting_first_heartbeat{--pin-color:var(--wait)}.marker-cluster-small,.marker-cluster-medium,.marker-cluster-large{background:rgba(31,127,181,.16)!important}.marker-cluster div{background:rgba(255,255,255,.94)!important;color:var(--ink)!important;border:2px solid rgba(31,127,181,.38);font-weight:750;box-shadow:0 0 0 5px rgba(31,127,181,.10),0 12px 24px rgba(45,75,95,.16)}
+.map-main{width:min(1380px,100%)}
+.map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
+.map-panel,.site-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.84);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
+.map-panel{position:relative;min-height:560px}
+.fleet-map{height:clamp(520px,calc(100vh - 220px),760px);min-height:520px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}
+.map-fallback{display:none;position:absolute;inset:0;place-items:center;padding:28px;text-align:center;color:var(--muted);background:rgba(255,255,255,.82);z-index:2}
+.map-fallback strong{display:block;color:var(--ink);font-size:18px}
+.site-panel{padding:16px;display:flex;flex-direction:column;gap:14px}
+.site-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;letter-spacing:0}
+.site-panel p{margin:0;color:var(--muted);font-size:12px}
+.site-list{display:grid;gap:9px;overflow:auto;padding-right:2px}
+.site-item{display:grid;gap:8px;padding:11px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.74)}
+.site-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.site-head strong{font-size:13px}
+.site-count{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:22px;border-radius:999px;background:rgba(223,241,249,.78);color:#0f4f80;font-size:12px;font-weight:700}
+.site-hosts{display:flex;flex-wrap:wrap;gap:6px}
+.site-host{--host-state:var(--wait);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;column-gap:6px;min-height:30px;padding:4px 8px;border:1px solid color-mix(in srgb,var(--host-state) 22%,transparent);border-radius:999px;background:color-mix(in srgb,var(--host-state) 8%,white);color:var(--ink);font-size:12px;text-decoration:none}
+.site-host:before{content:"";grid-row:1/3;width:7px;height:7px;border-radius:50%;background:var(--host-state);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-state) 12%,transparent)}
+.site-host-name{line-height:1.1;font-weight:650;white-space:nowrap}
+.site-host-ping{line-height:1.1;font-size:10px;color:var(--muted)}
+.site-host-ping[data-probe-level="good"]{color:var(--live)}.site-host-ping[data-probe-level="warn"]{color:var(--stale)}.site-host-ping[data-probe-level="down"]{color:var(--down)}
+.map-note{margin-top:auto;padding-top:8px;border-top:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:11px}
+.leaflet-container{font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
+.leaflet-control-zoom a{color:var(--ink)!important}
+.map-label-layer{position:absolute;inset:0;z-index:650;pointer-events:none;overflow:hidden}
+.map-leaders{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.map-leaders line{stroke:#7a8c9c;stroke-width:1.2;stroke-dasharray:2 4;opacity:.52;vector-effect:non-scaling-stroke}
+.map-anchor{--node-color:var(--wait);position:absolute;width:12px;height:12px;border-radius:50%;background:radial-gradient(circle,#fff 0 27%,var(--node-color) 33% 68%,transparent 70%);box-shadow:0 0 0 5px color-mix(in srgb,var(--node-color) 11%,transparent),0 6px 12px rgba(45,75,95,.14);transform:translate(-50%,-50%);pointer-events:none}
+.map-anchor.live,.map-node.live{--node-color:var(--live)}.map-anchor.stale,.map-node.stale{--node-color:var(--stale)}.map-anchor.down,.map-node.down{--node-color:var(--down)}.map-anchor.awaiting_first_heartbeat,.map-node.awaiting_first_heartbeat{--node-color:var(--wait)}
+.map-node{--node-color:var(--wait);position:absolute;display:grid;grid-template-columns:9px minmax(0,1fr);column-gap:7px;align-items:start;min-width:82px;max-width:136px;padding:6px 8px 6px 7px;border:1px solid color-mix(in srgb,var(--node-color) 30%,rgba(210,226,234,.92));border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 10px 22px rgba(45,75,95,.14),0 0 0 4px color-mix(in srgb,var(--node-color) 7%,transparent);-webkit-backdrop-filter:blur(8px) saturate(1.05);backdrop-filter:blur(8px) saturate(1.05);color:var(--ink);text-decoration:none;pointer-events:auto}
+.map-node:hover{box-shadow:0 14px 28px rgba(45,75,95,.18),0 0 0 5px color-mix(in srgb,var(--node-color) 12%,transparent);transform:translateY(-1px)}
+.map-status-dot{grid-row:1/3;width:9px;height:9px;margin-top:4px;border-radius:50%;background:var(--node-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--node-color) 13%,transparent)}
+.map-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;font-weight:760;color:#17304a}
+.map-ping{font-size:10px;line-height:1.15;color:var(--muted);white-space:nowrap}
+.map-ping[data-probe-level="good"]{color:var(--live)}.map-ping[data-probe-level="warn"]{color:var(--stale)}.map-ping[data-probe-level="down"]{color:var(--down)}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}}
 @media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.fleet-map{height:62vh;min-height:420px}}
@@ -1130,11 +1165,14 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
 
 async fn map_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
+    let hosts = state.store.list();
+    let probes = map_connectivity_probes(&hosts, state.manifests.manifests()).await;
     no_store_html(render_map(
-        &state.store.list(),
+        &hosts,
         &self_host(),
         now_unix(),
         state.manifests.manifests(),
+        &probes,
         &user_label,
         state.auth.is_some(),
     ))
@@ -1910,6 +1948,20 @@ struct SiteLocation {
     lon: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MapProbeTarget {
+    host: String,
+    port: u16,
+    kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MapProbe {
+    label: String,
+    level: &'static str,
+    title: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MapHost {
     name: String,
@@ -1922,6 +1974,9 @@ struct MapHost {
     region: &'static str,
     lat: f64,
     lon: f64,
+    probe_label: String,
+    probe_level: &'static str,
+    probe_title: String,
     settings_href: String,
 }
 
@@ -1955,12 +2010,12 @@ fn site_location(site: &str) -> SiteLocation {
             lat: 48.13,
             lon: 15.18,
         },
-        "dsc" | "dsc0" => SiteLocation {
-            id: "dsc",
+        "dsc" | "dsc0" | "dsc-us" | "hillsboro-or" => SiteLocation {
+            id: "dsc-us",
             label: "DSC",
-            region: "Germany",
-            lat: 51.1657,
-            lon: 10.4515,
+            region: "Hillsboro, OR, US",
+            lat: 45.5229,
+            lon: -122.9898,
         },
         _ => SiteLocation {
             id: "unknown",
@@ -1978,7 +2033,7 @@ fn fallback_site_for_host(host: &str) -> &'static str {
         "hsb0" | "hsb1" | "gpc0" => "home-at",
         "hsb8" => "ww87",
         "hsb9" => "parents-in-law",
-        "dsc0" => "dsc",
+        "dsc0" => "dsc-us",
         _ => "unknown",
     }
 }
@@ -1999,11 +2054,162 @@ fn manifest_site_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &str> {
     sites
 }
 
+fn manifest_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &HostManifest> {
+    let mut by_host = BTreeMap::new();
+    for manifest in manifests {
+        by_host.insert(manifest.host.name.as_str(), manifest);
+        by_host.insert(manifest.slug.as_str(), manifest);
+    }
+    by_host
+}
+
+fn split_probe_host_port(raw: &str, default_port: u16) -> Option<(String, u16)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(url) = Url::parse(trimmed) {
+        let host = url.host_str()?.trim().to_string();
+        if host.is_empty() {
+            return None;
+        }
+        return Some((host, url.port_or_known_default().unwrap_or(default_port)));
+    }
+    let target = trimmed
+        .trim_start_matches("//")
+        .split('/')
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if target.is_empty() {
+        return None;
+    }
+    if let Some((host, port)) = target.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                return Some((host.to_string(), port));
+            }
+        }
+    }
+    Some((target.to_string(), default_port))
+}
+
+fn map_probe_target(host: &Host, manifests: &[HostManifest]) -> MapProbeTarget {
+    let manifests = manifest_by_host(manifests);
+    if let Some(manifest) = manifests.get(host.name.as_str()) {
+        if let Some(tailnet) = manifest.host.tailnet_hostname() {
+            if let Some((host, port)) = split_probe_host_port(tailnet, 2222) {
+                return MapProbeTarget {
+                    host,
+                    port,
+                    kind: "tailnet ssh",
+                };
+            }
+        }
+        if let Some(lan) = manifest.host.lan_hostname() {
+            if let Some((host, port)) = split_probe_host_port(lan, 2222) {
+                return MapProbeTarget {
+                    host,
+                    port,
+                    kind: "lan ssh",
+                };
+            }
+        }
+        if let Some(ip) = manifest.host.lan_ip() {
+            if let Some((host, port)) = split_probe_host_port(ip, 2222) {
+                return MapProbeTarget {
+                    host,
+                    port,
+                    kind: "lan ssh",
+                };
+            }
+        }
+    }
+    MapProbeTarget {
+        host: format!("{}.ts.barta.cm", host.name),
+        port: 2222,
+        kind: "tailnet ssh",
+    }
+}
+
+fn default_map_probe() -> MapProbe {
+    MapProbe {
+        label: "checking".to_string(),
+        level: "wait",
+        title: "Pharos reachability check is pending".to_string(),
+    }
+}
+
+async fn map_connectivity_probe(target: MapProbeTarget) -> MapProbe {
+    let started = Instant::now();
+    match timeout(
+        SERVER_PROBE_TIMEOUT,
+        TcpStream::connect((target.host.as_str(), target.port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            let elapsed_ms = started.elapsed().as_millis().max(1);
+            MapProbe {
+                label: format!("{elapsed_ms} ms"),
+                level: "good",
+                title: format!(
+                    "Pharos {kind} check to {host}:{port} reachable in {elapsed_ms} ms",
+                    kind = target.kind,
+                    host = target.host,
+                    port = target.port
+                ),
+            }
+        }
+        Ok(Err(_)) => MapProbe {
+            label: "no route".to_string(),
+            level: "down",
+            title: format!(
+                "Pharos {kind} check to {host}:{port} failed",
+                kind = target.kind,
+                host = target.host,
+                port = target.port
+            ),
+        },
+        Err(_) => MapProbe {
+            label: "timeout".to_string(),
+            level: "warn",
+            title: format!(
+                "Pharos {kind} check to {host}:{port} timed out after {} ms",
+                SERVER_PROBE_TIMEOUT.as_millis(),
+                kind = target.kind,
+                host = target.host,
+                port = target.port
+            ),
+        },
+    }
+}
+
+async fn map_connectivity_probes(
+    hosts: &[Host],
+    manifests: &[HostManifest],
+) -> BTreeMap<String, MapProbe> {
+    let mut jobs = JoinSet::new();
+    for host in hosts {
+        let name = host.name.clone();
+        let target = map_probe_target(host, manifests);
+        jobs.spawn(async move { (name, map_connectivity_probe(target).await) });
+    }
+    let mut probes = BTreeMap::new();
+    while let Some(result) = jobs.join_next().await {
+        if let Ok((name, probe)) = result {
+            probes.insert(name, probe);
+        }
+    }
+    probes
+}
+
 fn map_hosts(
     hosts: &[Host],
     self_name: &str,
     now: i64,
     manifests: &[HostManifest],
+    probes: &BTreeMap<String, MapProbe>,
 ) -> Vec<MapHost> {
     let sites = manifest_site_by_host(manifests);
     let mut mapped = hosts
@@ -2024,6 +2230,10 @@ fn map_hosts(
                 .copied()
                 .unwrap_or_else(|| fallback_site_for_host(&host.name));
             let site = site_location(site);
+            let probe = probes
+                .get(&host.name)
+                .cloned()
+                .unwrap_or_else(default_map_probe);
             MapHost {
                 name: host.name.clone(),
                 role: host.role.clone(),
@@ -2035,6 +2245,9 @@ fn map_hosts(
                 region: site.region,
                 lat: site.lat,
                 lon: site.lon,
+                probe_label: probe.label,
+                probe_level: probe.level,
+                probe_title: probe.title,
                 settings_href: format!("/agora?host={}", url_query_escape(&host.name)),
             }
         })
@@ -2066,11 +2279,14 @@ fn map_site_list(hosts: &[MapHost]) -> String {
                         other => other,
                     };
                     format!(
-                        r#"<a class="site-host" href="{href}" style="--host-state:var(--{state_var})" title="{name}: {attention}">{name}</a>"#,
+                        r#"<a class="site-host" href="{href}" style="--host-state:var(--{state_var})" title="{name}: {attention}; {probe_title}"><span class="site-host-name">{name}</span><span class="site-host-ping" data-probe-level="{probe_level}">{probe_label}</span></a>"#,
                         href = html_escape(&host.settings_href),
                         state_var = html_escape(state_var),
                         name = html_escape(&host.name),
-                        attention = html_escape(&host.attention)
+                        attention = html_escape(&host.attention),
+                        probe_title = html_escape(&host.probe_title),
+                        probe_level = html_escape(host.probe_level),
+                        probe_label = html_escape(&host.probe_label)
                     )
                 })
                 .collect::<String>();
@@ -2089,10 +2305,11 @@ fn render_map(
     self_name: &str,
     now: i64,
     manifests: &[HostManifest],
+    probes: &BTreeMap<String, MapProbe>,
     user_label: &str,
     logout_enabled: bool,
 ) -> String {
-    let mapped = map_hosts(hosts, self_name, now, manifests);
+    let mapped = map_hosts(hosts, self_name, now, manifests, probes);
     let hosts_json = serde_json::to_string(&mapped).expect("map hosts serialize");
     let site_list = map_site_list(&mapped);
     let location_count = mapped
@@ -2100,37 +2317,130 @@ fn render_map(
         .map(|host| host.site_id)
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    let leaflet_assets = r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"><link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">"#;
+    let leaflet_assets =
+        r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">"#;
     let head = head_with_extra(leaflet_assets);
-    let map_script = format!(
-        r#"<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script><script>
-const MAP_HOSTS={hosts_json};
-function escapeHtml(value){{return String(value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]))}}
-function markerIcon(host){{return L.divIcon({{className:'pharos-marker',html:'<span class="pharos-pin '+escapeHtml(host.live)+'"></span>',iconSize:[24,24],iconAnchor:[12,12],popupAnchor:[0,-14]}})}}
-function popup(host){{return '<div class="map-popup"><strong>'+escapeHtml(host.name)+'</strong><span>'+escapeHtml(host.role)+'</span><span>'+escapeHtml(host.site_label)+' · '+escapeHtml(host.region)+'</span><span>'+escapeHtml(host.status)+' · '+escapeHtml(host.attention)+'</span><a href="'+escapeHtml(host.settings_href)+'">Settings</a></div>'}}
-function initMap(){{
+    let map_script = r#"<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="https://unpkg.com/d3@7.9.0/dist/d3.min.js"></script><script>
+const MAP_HOSTS=__MAP_HOSTS__;
+function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
+function nodeHtml(host){return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-ping" data-probe-level="'+escapeHtml(host.probe_level)+'">'+escapeHtml(host.probe_label)+'</span>'}
+function groupOffsets(hosts){
+  const groups=new Map();
+  hosts.forEach(host=>{
+    const key=Number(host.lat).toFixed(4)+','+Number(host.lon).toFixed(4);
+    if(!groups.has(key))groups.set(key,[]);
+    groups.get(key).push(host.name);
+  });
+  return groups;
+}
+function seedOffset(index,count){
+  if(count<=1)return {x:34,y:-28};
+  const angle=(-Math.PI/2)+(index/count)*Math.PI*2;
+  const radius=42+Math.min(count,6)*6;
+  return {x:Math.cos(angle)*radius,y:Math.sin(angle)*radius};
+}
+function clamp(value,min,max){return Math.max(min,Math.min(max,value))}
+function forceBounds(nodes,width,height){
+  return function(){
+    for(const d of nodes){
+      d.x=clamp(d.x,d.w/2+8,width-d.w/2-8);
+      d.y=clamp(d.y,d.h/2+8,height-d.h/2-8);
+    }
+  }
+}
+function buildLabels(map,el){
+  const layer=document.createElement('div');
+  layer.className='map-label-layer';
+  const leaders=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  leaders.classList.add('map-leaders');
+  layer.appendChild(leaders);
+  el.appendChild(layer);
+  const groups=groupOffsets(MAP_HOSTS);
+  const seen=new Map();
+  const nodes=MAP_HOSTS.map((host,idx)=>{
+    const key=Number(host.lat).toFixed(4)+','+Number(host.lon).toFixed(4);
+    const groupIndex=seen.get(key)||0;
+    seen.set(key,groupIndex+1);
+    const anchor=document.createElement('span');
+    anchor.className='map-anchor '+escapeHtml(host.live);
+    const link=document.createElement('a');
+    link.className='map-node '+escapeHtml(host.live);
+    link.href=host.settings_href;
+    link.innerHTML=nodeHtml(host);
+    link.title=host.name+': '+host.status+'; '+host.probe_title;
+    link.setAttribute('aria-label',host.name+', '+host.status+', '+host.probe_label);
+    const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+    leaders.appendChild(line);
+    layer.appendChild(anchor);
+    layer.appendChild(link);
+    return {host,idx,anchor,link,line,groupIndex,groupCount:(groups.get(key)||[]).length,w:100,h:38,r:58,x:0,y:0,ax:0,ay:0};
+  });
+  function layout(){
+    const width=el.clientWidth||800;
+    const height=el.clientHeight||520;
+    leaders.setAttribute('viewBox','0 0 '+width+' '+height);
+    nodes.forEach(node=>{
+      const point=map.latLngToContainerPoint([node.host.lat,node.host.lon]);
+      const offset=seedOffset(node.groupIndex,node.groupCount);
+      node.ax=point.x;
+      node.ay=point.y;
+      node.anchor.style.left=point.x+'px';
+      node.anchor.style.top=point.y+'px';
+      node.link.style.transform='translate(-1000px,-1000px)';
+      const rect=node.link.getBoundingClientRect();
+      node.w=rect.width||110;
+      node.h=rect.height||40;
+      node.r=Math.sqrt(node.w*node.w+node.h*node.h)/2+10;
+      node.x=clamp(point.x+offset.x,node.w/2+8,width-node.w/2-8);
+      node.y=clamp(point.y+offset.y,node.h/2+8,height-node.h/2-8);
+    });
+    if(window.d3&&d3.forceSimulation){
+      const simulation=d3.forceSimulation(nodes)
+        .force('x',d3.forceX(d=>d.ax+seedOffset(d.groupIndex,d.groupCount).x).strength(.18))
+        .force('y',d3.forceY(d=>d.ay+seedOffset(d.groupIndex,d.groupCount).y).strength(.18))
+        .force('collide',d3.forceCollide(d=>d.r).strength(1))
+        .force('bounds',forceBounds(nodes,width,height))
+        .stop();
+      for(let i=0;i<90;i++)simulation.tick();
+    }
+    nodes.forEach(node=>{
+      node.x=clamp(node.x,node.w/2+8,width-node.w/2-8);
+      node.y=clamp(node.y,node.h/2+8,height-node.h/2-8);
+      const left=node.x-node.w/2;
+      const top=node.y-node.h/2;
+      node.link.style.transform='translate('+left.toFixed(1)+'px,'+top.toFixed(1)+'px)';
+      const distance=Math.hypot(node.x-node.ax,node.y-node.ay);
+      node.line.setAttribute('x1',node.ax);
+      node.line.setAttribute('y1',node.ay);
+      node.line.setAttribute('x2',node.x);
+      node.line.setAttribute('y2',node.y);
+      node.line.style.opacity=distance>22?'.55':'0';
+    });
+  }
+  map.on('moveend zoomend resize viewreset',layout);
+  window.addEventListener('resize',()=>requestAnimationFrame(layout));
+  requestAnimationFrame(layout);
+}
+function initMap(){
   const el=document.getElementById('fleet-map');
-  if(!el||!window.L||!L.markerClusterGroup){{document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}}
-  const map=L.map(el,{{worldCopyJump:true,scrollWheelZoom:false,zoomControl:false}});
-  L.control.zoom({{position:'topright'}}).addTo(map);
-  L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}}).addTo(map);
-  const cluster=L.markerClusterGroup({{showCoverageOnHover:false,spiderfyOnMaxZoom:true,removeOutsideVisibleBounds:true,maxClusterRadius:42,spiderLegPolylineOptions:{{weight:1.5,color:'#64778a',opacity:.55}}}});
-  const bounds=[];
-  MAP_HOSTS.forEach(host=>{{const marker=L.marker([host.lat,host.lon],{{title:host.name,icon:markerIcon(host)}}).bindPopup(popup(host));cluster.addLayer(marker);bounds.push([host.lat,host.lon])}});
-  map.addLayer(cluster);
-  if(bounds.length===1){{map.setView(bounds[0],5)}}else if(bounds.length){{map.fitBounds(bounds,{{padding:[42,42],maxZoom:6}})}}else{{map.setView([20,0],2)}}
-}}
+  if(!el||!window.L){document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}
+  const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:false,zoomControl:false});
+  L.control.zoom({position:'topright'}).addTo(map);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+  const bounds=MAP_HOSTS.map(host=>[host.lat,host.lon]);
+  if(bounds.length===1){map.setView(bounds[0],5)}else if(bounds.length){map.fitBounds(bounds,{padding:[64,64],maxZoom:5})}else{map.setView([20,0],2)}
+  buildLabels(map,el);
+}
 initMap();
 </script>"#
-    );
+        .replace("__MAP_HOSTS__", &hosts_json);
     format!(
-        r#"{head}{sidebar}<main class="map-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div><section class="summary" aria-label="map summary"><div class="metric live"><b>{host_count}</b><span>Hosts</span></div><div class="metric stale"><b>{location_count}</b><span>Locations</span></div><div class="metric"><b>{cluster_count}</b><span>Clusters</span></div><div class="metric"><b>0</b><span>Overlap</span></div></section><section class="map-layout"><div class="map-panel"><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">Overlapping hosts are clustered and spiderfied by Leaflet.markercluster.</div></aside></section></main>{map_script}{FOOT}"#,
+        r#"{head}{sidebar}<main class="map-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div><section class="summary" aria-label="map summary"><div class="metric live"><b>{host_count}</b><span>Hosts</span></div><div class="metric stale"><b>{location_count}</b><span>Locations</span></div><div class="metric"><b>{host_count}</b><span>Labels</span></div><div class="metric"><b>0</b><span>Clusters</span></div></section><section class="map-layout"><div class="map-panel"><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">All servers stay visible; labels are separated by D3 force layout with leader lines.</div></aside></section></main>{map_script}{FOOT}"#,
         head = head,
         sidebar = sidebar(user_label, logout_enabled, "map"),
         as_of = clock_label(now),
         host_count = mapped.len(),
         location_count = location_count,
-        cluster_count = mapped.len().saturating_sub(location_count),
     )
 }
 
@@ -2696,7 +3006,7 @@ mod tests {
     }
 
     #[test]
-    fn render_map_uses_clustered_site_level_locations() {
+    fn render_map_uses_visible_labels_and_site_level_locations() {
         let hosts = vec![
             Host {
                 name: "csb1".to_string(),
@@ -2735,6 +3045,18 @@ mod tests {
                 service_observations: vec![],
             },
             Host {
+                name: "dsc0".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness::default(),
+                service_observations: vec![],
+            },
+            Host {
                 name: "new-host".to_string(),
                 role: "new server".to_string(),
                 is_nix: true,
@@ -2755,25 +3077,76 @@ mod tests {
             "policy": { "declaredOnly": true }
         }))
         .expect("manifest parses");
+        let probes = BTreeMap::from([
+            (
+                "csb1".to_string(),
+                MapProbe {
+                    label: "4 ms".to_string(),
+                    level: "good",
+                    title: "Pharos tailnet ssh check reachable in 4 ms".to_string(),
+                },
+            ),
+            (
+                "csb0".to_string(),
+                MapProbe {
+                    label: "8 ms".to_string(),
+                    level: "good",
+                    title: "Pharos tailnet ssh check reachable in 8 ms".to_string(),
+                },
+            ),
+            (
+                "hsb8".to_string(),
+                MapProbe {
+                    label: "24 ms".to_string(),
+                    level: "good",
+                    title: "Pharos tailnet ssh check reachable in 24 ms".to_string(),
+                },
+            ),
+            (
+                "dsc0".to_string(),
+                MapProbe {
+                    label: "139 ms".to_string(),
+                    level: "good",
+                    title: "Pharos tailnet ssh check reachable in 139 ms".to_string(),
+                },
+            ),
+            (
+                "new-host".to_string(),
+                MapProbe {
+                    label: "timeout".to_string(),
+                    level: "warn",
+                    title: "Pharos tailnet ssh check timed out".to_string(),
+                },
+            ),
+        ]);
 
-        let html = render_map(&hosts, "csb1", 1000, &[manifest], "markus", true);
+        let html = render_map(&hosts, "csb1", 1000, &[manifest], &probes, "markus", true);
 
         let leaflet_css = html.find("leaflet@1.9.4/dist/leaflet.css").unwrap();
         let body = html.find("</head><body>").unwrap();
         assert!(leaflet_css < body);
         assert!(html.contains(r#"href="/map" aria-current="page""#));
-        assert!(html.contains("leaflet.markercluster@1.5.3"));
-        assert!(html.contains("L.markerClusterGroup"));
-        assert!(html.contains("spiderfyOnMaxZoom:true"));
-        assert!(html.contains("maxClusterRadius:42"));
+        assert!(html.contains("d3@7.9.0"));
+        assert!(html.contains("d3.forceSimulation"));
+        assert!(html.contains("d3.forceCollide"));
+        assert!(html.contains("buildLabels(map,el)"));
+        assert!(!html.contains("markercluster"));
+        assert!(!html.contains("L.markerClusterGroup"));
         assert!(html.contains(r#""site_id":"cloud-de""#));
         assert!(html.contains(r#""site_id":"ww87""#));
+        assert!(html.contains(r#""site_id":"dsc-us""#));
         assert!(html.contains(r#""site_id":"unknown""#));
+        assert!(html.contains(r#""lon":-122.9898"#));
+        assert!(html.contains("Hillsboro, OR, US"));
+        assert!(html.contains(r#""probe_label":"24 ms""#));
+        assert!(html.contains(r#"data-probe-level="good">24 ms"#));
+        assert!(html.contains(r#"data-probe-level="warn">timeout"#));
         assert!(html.contains("Parents&#39; home"));
-        assert!(html.contains(r#"<b>1</b><span>Clusters</span>"#));
+        assert!(html.contains(r#"<b>5</b><span>Labels</span>"#));
+        assert!(html.contains(r#"<b>0</b><span>Clusters</span>"#));
         assert!(html.contains(r#"style="--host-state:var(--wait)""#));
         assert!(html.contains("Approximate site-level coordinates."));
-        assert!(html.contains("Overlapping hosts are clustered and spiderfied"));
+        assert!(html.contains("All servers stay visible"));
     }
 
     #[test]
