@@ -254,8 +254,10 @@ main[data-view="list"] .list-wrap{display:block}
 .lone-mark .ico{width:24px;height:24px}
 .lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
 .lone-state .onboard-command{position:relative;margin:0;font-size:12px}
+.map-main{width:min(1380px,100%)}.map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}.map-panel,.site-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.84);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}.map-panel{position:relative;min-height:560px}.fleet-map{height:clamp(520px,calc(100vh - 220px),760px);min-height:520px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}.map-fallback{display:none;position:absolute;inset:0;place-items:center;padding:28px;text-align:center;color:var(--muted);background:rgba(255,255,255,.82);z-index:2}.map-fallback strong{display:block;color:var(--ink);font-size:18px}.site-panel{padding:16px;display:flex;flex-direction:column;gap:14px}.site-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;letter-spacing:0}.site-panel p{margin:0;color:var(--muted);font-size:12px}.site-list{display:grid;gap:9px;overflow:auto;padding-right:2px}.site-item{display:grid;gap:8px;padding:11px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.74)}.site-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.site-head strong{font-size:13px}.site-count{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:22px;border-radius:999px;background:rgba(223,241,249,.78);color:#0f4f80;font-size:12px;font-weight:700}.site-hosts{display:flex;flex-wrap:wrap;gap:6px}.site-host{display:inline-flex;align-items:center;gap:5px;min-height:22px;padding:3px 7px;border:1px solid color-mix(in srgb,var(--host-state) 22%,transparent);border-radius:999px;background:color-mix(in srgb,var(--host-state) 8%,white);color:var(--ink);font-size:12px;text-decoration:none}.site-host:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--host-state)}.map-note{margin-top:auto;padding-top:8px;border-top:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:11px}.leaflet-container{font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}.leaflet-control-zoom a{color:var(--ink)!important}.leaflet-popup-content-wrapper{border-radius:8px;box-shadow:0 16px 32px rgba(45,75,95,.18)}.leaflet-popup-content{min-width:190px;margin:12px}.map-popup{display:grid;gap:6px}.map-popup strong{font-size:15px}.map-popup span{color:var(--muted);font-size:12px}.map-popup a{color:var(--accent);font-weight:650;text-decoration:none}.map-popup a:hover{text-decoration:underline;text-underline-offset:2px}.pharos-pin{--pin-color:var(--wait);position:relative;display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:rgba(255,255,255,.92);border:2px solid var(--pin-color);box-shadow:0 0 0 5px color-mix(in srgb,var(--pin-color) 13%,transparent),0 10px 20px rgba(45,75,95,.16)}.pharos-pin:after{content:"";width:8px;height:8px;border-radius:50%;background:var(--pin-color)}.pharos-pin.live{--pin-color:var(--live)}.pharos-pin.stale{--pin-color:var(--stale)}.pharos-pin.down{--pin-color:var(--down)}.pharos-pin.awaiting_first_heartbeat{--pin-color:var(--wait)}.marker-cluster-small,.marker-cluster-medium,.marker-cluster-large{background:rgba(31,127,181,.16)!important}.marker-cluster div{background:rgba(255,255,255,.94)!important;color:var(--ink)!important;border:2px solid rgba(31,127,181,.38);font-weight:750;box-shadow:0 0 0 5px rgba(31,127,181,.10),0 12px 24px rgba(45,75,95,.16)}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
-@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}}
+@media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}}
+@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.fleet-map{height:62vh;min-height:420px}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -1126,6 +1128,18 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
     ))
 }
 
+async fn map_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    no_store_html(render_map(
+        &state.store.list(),
+        &self_host(),
+        now_unix(),
+        state.manifests.manifests(),
+        &user_label,
+        state.auth.is_some(),
+    ))
+}
+
 async fn fleet_horizon_asset() -> impl axum::response::IntoResponse {
     (
         [
@@ -1702,7 +1716,7 @@ fn sidebar_user_label(auth: &AuthState, headers: &HeaderMap) -> String {
         })
 }
 
-fn sidebar(user_label: &str, logout_enabled: bool) -> String {
+fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
     let logout = if logout_enabled {
         format!(
             r#"<a class="side-logout" href="/auth/logout" title="Log out of Pharos" aria-label="Log out of Pharos">{}</a>"#,
@@ -1711,14 +1725,32 @@ fn sidebar(user_label: &str, logout_enabled: bool) -> String {
     } else {
         String::new()
     };
+    let fleet_current = if active == "fleet" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
+    let map_current = if active == "map" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
+    let settings_current = if active == "settings" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/" aria-current="page">{fleet}<span>Fleet</span></a><a class="side-link" href="/">{map}<span>Map</span></a><a class="side-link" href="/">{alerts}<span>Alerts</span></a><a class="side-link" href="/">{activity}<span>Activity</span></a><a class="side-link" href="/agora">{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/">{alerts}<span>Alerts</span></a><a class="side-link" href="/">{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
         alerts = icons::status_svg(Liveness::Stale),
         activity = icons::LIST,
         settings = icons::SLIDERS,
+        fleet_current = fleet_current,
+        map_current = map_current,
+        settings_current = settings_current,
         user_label = html_escape(user_label),
         user_title = html_escape(user_label),
         logout = logout
@@ -1862,6 +1894,243 @@ fn signal_markup(signal: &HeartbeatSignal) -> String {
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
         window = html_escape(signal.window),
+    )
+}
+
+fn head_with_extra(extra: &str) -> String {
+    HEAD.replacen("</style></head>", &format!("</style>{extra}</head>"), 1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SiteLocation {
+    id: &'static str,
+    label: &'static str,
+    region: &'static str,
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MapHost {
+    name: String,
+    role: String,
+    live: &'static str,
+    status: &'static str,
+    attention: String,
+    site_id: &'static str,
+    site_label: &'static str,
+    region: &'static str,
+    lat: f64,
+    lon: f64,
+    settings_href: String,
+}
+
+fn site_location(site: &str) -> SiteLocation {
+    match site {
+        "cloud" | "cloud-de" => SiteLocation {
+            id: "cloud-de",
+            label: "Cloud",
+            region: "Germany",
+            lat: 50.1109,
+            lon: 8.6821,
+        },
+        "home" | "home-at" => SiteLocation {
+            id: "home-at",
+            label: "Home",
+            region: "Austria",
+            lat: 48.2082,
+            lon: 16.3738,
+        },
+        "ww87" | "parents-home" => SiteLocation {
+            id: "ww87",
+            label: "Parents' home",
+            region: "Austria",
+            lat: 48.32,
+            lon: 15.92,
+        },
+        "parents-in-law" => SiteLocation {
+            id: "parents-in-law",
+            label: "Parents-in-law",
+            region: "Austria",
+            lat: 48.13,
+            lon: 15.18,
+        },
+        "dsc" | "dsc0" => SiteLocation {
+            id: "dsc",
+            label: "DSC",
+            region: "Germany",
+            lat: 51.1657,
+            lon: 10.4515,
+        },
+        _ => SiteLocation {
+            id: "unknown",
+            label: "Unknown site",
+            region: "Not declared",
+            lat: 46.8,
+            lon: 8.2,
+        },
+    }
+}
+
+fn fallback_site_for_host(host: &str) -> &'static str {
+    match host {
+        "csb0" | "csb1" => "cloud-de",
+        "hsb0" | "hsb1" | "gpc0" => "home-at",
+        "hsb8" => "ww87",
+        "hsb9" => "parents-in-law",
+        "dsc0" => "dsc",
+        _ => "unknown",
+    }
+}
+
+fn manifest_site_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &str> {
+    let mut sites = BTreeMap::new();
+    for manifest in manifests {
+        if let Some(site) = manifest
+            .host
+            .site
+            .as_deref()
+            .filter(|site| !site.trim().is_empty())
+        {
+            sites.insert(manifest.host.name.as_str(), site);
+            sites.insert(manifest.slug.as_str(), site);
+        }
+    }
+    sites
+}
+
+fn map_hosts(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+) -> Vec<MapHost> {
+    let sites = manifest_site_by_host(manifests);
+    let mut mapped = hosts
+        .iter()
+        .map(|host| {
+            let mut live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
+            if host.name == self_name {
+                live = Liveness::Live;
+            }
+            let (_color, status) = live.badge();
+            let attention = if host.name == self_name {
+                self_attention_reason()
+            } else {
+                attention_reason(live, &host.freshness, &host.service_observations)
+            };
+            let site = sites
+                .get(host.name.as_str())
+                .copied()
+                .unwrap_or_else(|| fallback_site_for_host(&host.name));
+            let site = site_location(site);
+            MapHost {
+                name: host.name.clone(),
+                role: host.role.clone(),
+                live: live_key(live),
+                status,
+                attention: attention.label,
+                site_id: site.id,
+                site_label: site.label,
+                region: site.region,
+                lat: site.lat,
+                lon: site.lon,
+                settings_href: format!("/agora?host={}", url_query_escape(&host.name)),
+            }
+        })
+        .collect::<Vec<_>>();
+    mapped.sort_by(|a, b| {
+        a.site_label
+            .cmp(b.site_label)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    mapped
+}
+
+fn map_site_list(hosts: &[MapHost]) -> String {
+    let mut by_site: BTreeMap<&str, Vec<&MapHost>> = BTreeMap::new();
+    for host in hosts {
+        by_site.entry(host.site_id).or_default().push(host);
+    }
+    by_site
+        .into_values()
+        .map(|hosts| {
+            let Some(first) = hosts.first() else {
+                return String::new();
+            };
+            let host_links = hosts
+                .iter()
+                .map(|host| {
+                    let state_var = match host.live {
+                        "awaiting_first_heartbeat" => "wait",
+                        other => other,
+                    };
+                    format!(
+                        r#"<a class="site-host" href="{href}" style="--host-state:var(--{state_var})" title="{name}: {attention}">{name}</a>"#,
+                        href = html_escape(&host.settings_href),
+                        state_var = html_escape(state_var),
+                        name = html_escape(&host.name),
+                        attention = html_escape(&host.attention)
+                    )
+                })
+                .collect::<String>();
+            format!(
+                r#"<section class="site-item"><div class="site-head"><div><strong>{site}</strong><p>{region}</p></div><span class="site-count">{count}</span></div><div class="site-hosts">{host_links}</div></section>"#,
+                site = html_escape(first.site_label),
+                region = html_escape(first.region),
+                count = hosts.len()
+            )
+        })
+        .collect()
+}
+
+fn render_map(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    user_label: &str,
+    logout_enabled: bool,
+) -> String {
+    let mapped = map_hosts(hosts, self_name, now, manifests);
+    let hosts_json = serde_json::to_string(&mapped).expect("map hosts serialize");
+    let site_list = map_site_list(&mapped);
+    let location_count = mapped
+        .iter()
+        .map(|host| host.site_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let leaflet_assets = r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"><link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">"#;
+    let head = head_with_extra(leaflet_assets);
+    let map_script = format!(
+        r#"<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script><script>
+const MAP_HOSTS={hosts_json};
+function escapeHtml(value){{return String(value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]))}}
+function markerIcon(host){{return L.divIcon({{className:'pharos-marker',html:'<span class="pharos-pin '+escapeHtml(host.live)+'"></span>',iconSize:[24,24],iconAnchor:[12,12],popupAnchor:[0,-14]}})}}
+function popup(host){{return '<div class="map-popup"><strong>'+escapeHtml(host.name)+'</strong><span>'+escapeHtml(host.role)+'</span><span>'+escapeHtml(host.site_label)+' · '+escapeHtml(host.region)+'</span><span>'+escapeHtml(host.status)+' · '+escapeHtml(host.attention)+'</span><a href="'+escapeHtml(host.settings_href)+'">Settings</a></div>'}}
+function initMap(){{
+  const el=document.getElementById('fleet-map');
+  if(!el||!window.L||!L.markerClusterGroup){{document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}}
+  const map=L.map(el,{{worldCopyJump:true,scrollWheelZoom:false,zoomControl:false}});
+  L.control.zoom({{position:'topright'}}).addTo(map);
+  L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}}).addTo(map);
+  const cluster=L.markerClusterGroup({{showCoverageOnHover:false,spiderfyOnMaxZoom:true,removeOutsideVisibleBounds:true,maxClusterRadius:42,spiderLegPolylineOptions:{{weight:1.5,color:'#64778a',opacity:.55}}}});
+  const bounds=[];
+  MAP_HOSTS.forEach(host=>{{const marker=L.marker([host.lat,host.lon],{{title:host.name,icon:markerIcon(host)}}).bindPopup(popup(host));cluster.addLayer(marker);bounds.push([host.lat,host.lon])}});
+  map.addLayer(cluster);
+  if(bounds.length===1){{map.setView(bounds[0],5)}}else if(bounds.length){{map.fitBounds(bounds,{{padding:[42,42],maxZoom:6}})}}else{{map.setView([20,0],2)}}
+}}
+initMap();
+</script>"#
+    );
+    format!(
+        r#"{head}{sidebar}<main class="map-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div><section class="summary" aria-label="map summary"><div class="metric live"><b>{host_count}</b><span>Hosts</span></div><div class="metric stale"><b>{location_count}</b><span>Locations</span></div><div class="metric"><b>{cluster_count}</b><span>Clusters</span></div><div class="metric"><b>0</b><span>Overlap</span></div></section><section class="map-layout"><div class="map-panel"><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">Overlapping hosts are clustered and spiderfied by Leaflet.markercluster.</div></aside></section></main>{map_script}{FOOT}"#,
+        head = head,
+        sidebar = sidebar(user_label, logout_enabled, "map"),
+        as_of = clock_label(now),
+        host_count = mapped.len(),
+        location_count = location_count,
+        cluster_count = mapped.len().saturating_sub(location_count),
     )
 }
 
@@ -2094,7 +2363,7 @@ fn render_home(
     if hosts.is_empty() {
         return format!(
             "{HEAD}{sidebar}<main>{header}{empty}</main>{FOOT}",
-            sidebar = sidebar(user_label, logout_enabled),
+            sidebar = sidebar(user_label, logout_enabled, "fleet"),
             header = header(now),
             empty = empty_state()
         );
@@ -2226,7 +2495,7 @@ fn render_home(
 
     format!(
         "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
-        sidebar = sidebar(user_label, logout_enabled),
+        sidebar = sidebar(user_label, logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar()
@@ -2257,6 +2526,7 @@ async fn main() {
     let app = Router::new()
         // Human routes — gated by OIDC when configured (open otherwise).
         .route("/", get(home))
+        .route("/map", get(map_page))
         .route("/agora", get(agora::page))
         .route(
             "/agora/proposals/host-palette.json",
@@ -2361,6 +2631,8 @@ mod tests {
         assert!(
             html.contains(r#"<span class="side-user" title="markus"><span>markus</span></span>"#)
         );
+        assert!(html.contains(r#"href="/" aria-current="page""#));
+        assert!(html.contains(r#"href="/map""#));
         assert!(html.contains(r#"href="/auth/logout""#));
         assert!(html.contains(r#"aria-label="Log out of Pharos""#));
         assert!(!html.contains(">mba<"));
@@ -2421,6 +2693,87 @@ mod tests {
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
+    }
+
+    #[test]
+    fn render_map_uses_clustered_site_level_locations() {
+        let hosts = vec![
+            Host {
+                name: "csb1".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness::default(),
+                service_observations: vec![],
+            },
+            Host {
+                name: "csb0".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness::default(),
+                service_observations: vec![],
+            },
+            Host {
+                name: "hsb8".to_string(),
+                role: "parents' home".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness::default(),
+                service_observations: vec![],
+            },
+            Host {
+                name: "new-host".to_string(),
+                role: "new server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: None,
+                heartbeat_log: vec![],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness::default(),
+                service_observations: vec![],
+            },
+        ];
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": { "name": "hsb8", "site": "ww87" },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+
+        let html = render_map(&hosts, "csb1", 1000, &[manifest], "markus", true);
+
+        let leaflet_css = html.find("leaflet@1.9.4/dist/leaflet.css").unwrap();
+        let body = html.find("</head><body>").unwrap();
+        assert!(leaflet_css < body);
+        assert!(html.contains(r#"href="/map" aria-current="page""#));
+        assert!(html.contains("leaflet.markercluster@1.5.3"));
+        assert!(html.contains("L.markerClusterGroup"));
+        assert!(html.contains("spiderfyOnMaxZoom:true"));
+        assert!(html.contains("maxClusterRadius:42"));
+        assert!(html.contains(r#""site_id":"cloud-de""#));
+        assert!(html.contains(r#""site_id":"ww87""#));
+        assert!(html.contains(r#""site_id":"unknown""#));
+        assert!(html.contains("Parents&#39; home"));
+        assert!(html.contains(r#"<b>1</b><span>Clusters</span>"#));
+        assert!(html.contains(r#"style="--host-state:var(--wait)""#));
+        assert!(html.contains("Approximate site-level coordinates."));
+        assert!(html.contains("Overlapping hosts are clustered and spiderfied"));
     }
 
     #[test]
