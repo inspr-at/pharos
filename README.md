@@ -15,25 +15,44 @@ Everything else (per-host authz, command channel, alerting, drag, …) is
 explicitly deferred. See PPM PHAROS-1 and the `guideline/pharos-architecture`
 + `guideline/pharos-ui` knowledge entries.
 
-## Stack (ADR-001 / ADR-002, in PHAROS-2)
+## Current shipped shape
 
-Rust, aligned with the Janus workspace. axum + sqlx/SQLite backend; **Leptos**
-UI (shares `pharos-core` types end-to-end); tokens via Janus crates.
+Rust, aligned with the Janus workspace, but the live v1 is deliberately smaller
+than the long-term ADR target:
+
+- `pharosd`: axum server with an in-memory store and optional JSON persistence
+  (`PHAROS_DB`). sqlx/SQLite remains a PHAROS-3 durability decision, not the
+  current deployed store.
+- UI: server-rendered HTML plus a small vanilla-JS bridge over stable JSON APIs.
+  Leptos remains the ADR direction if the dashboard grows beyond this thin
+  surface; it is not required for the accepted July 2026 v1 dashboard.
+- Auth: Zitadel OIDC for human routes when OIDC env is configured. Local/dev is
+  open when those env vars are absent. Pharos-side operator authorization is
+  tracked separately in PPM.
+- Machine auth: local MVP bearer tokens via `/register` + `PHAROS_TOKEN`.
+  Janus Forge/Warden migration remains later.
+
+## Planned direction (ADR-001 / ADR-002, in PHAROS-2)
+
+Keep the Rust workspace and shared `pharos-core` contracts. Move storage to
+SQLite only if JSON persistence stops being enough for the fleet. Move the UI to
+Leptos only if the operator surface grows enough to justify a frontend build.
+Move token issuance/rotation to Janus once the local MVP token flow is proven.
 
 ## Workspace
 
 | Crate | What |
 | --- | --- |
 | `pharos-core` | shared types (host, report, nix-freshness TL;DR, liveness) — used by server **and** agent so the schema can't drift |
-| `pharosd` | the server: host registry, JSON API, dashboard |
-| `pharos-beacon` | per-host agent (self-register + report) |
+| `pharosd` | the server: host registry, JSON persistence, JSON APIs, dashboard, Agora |
+| `pharos-beacon` | per-host agent (Nix freshness + heartbeat report) |
 
 ## Develop
 
 Toolchain comes from `devenv` (no global rustup) — `direnv allow`, then:
 
 ```bash
-cargo run -p pharosd      # http://127.0.0.1:8080  (/, /healthz, /version, /hosts.json)
+cargo run -p pharosd      # http://127.0.0.1:8080  (/, /healthz, /version, /hosts.json, /agora)
 cargo test --all
 cargo clippy --all-targets -- -D warnings
 ```
@@ -41,7 +60,7 @@ cargo clippy --all-targets -- -D warnings
 `PHAROS_MANIFEST_PATHS` may point to one or more nixcfg-generated v1 host
 manifests, separated by `:` or `,`. pharosd serves them at
 `/declared-hosts.json` with runtime state overlaid separately from the declared
-manifest.
+manifest. Agora uses the same manifest data for per-host settings proposals.
 
 ```bash
 PHAROS_MANIFEST_PATHS=/etc/hostdash-config/hsb8.json cargo run -p pharosd
@@ -67,3 +86,16 @@ curl -sS -H 'Authorization: Bearer dev' \
 valid token for registered hosts. Set `PHAROS_REQUIRE_BEACON_TOKEN=1` to reject
 legacy unregistered reports; by default that becomes true when
 `PHAROS_REGISTRATION_TOKEN` is configured.
+
+Production is still rolling toward strict token-only report ingestion. Do not
+enable strict mode until every deployed beacon has a per-host `PHAROS_TOKEN` and
+the persisted host state has token hashes for those hosts.
+
+## Route boundaries
+
+- Human routes: `/`, `/hosts.json`, `/agora`, and Agora proposal APIs are gated
+  by OIDC when auth is configured.
+- Public/machine routes: `/healthz`, `/version`, `/assets/*`, `/auth/*`,
+  `/declared-hosts.json`, `/register`, and `/report`.
+- `/declared-hosts.json` is declaration plus runtime overlay; the manifest stays
+  declarative and Pharos does not write runtime state back into it.
