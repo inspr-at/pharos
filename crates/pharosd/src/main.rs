@@ -706,6 +706,7 @@ let refreshTimer=null;
 let refreshPromise=null;
 let refreshAbort=null;
 let refreshStartedAt=0;
+let refreshGeneration=0;
 function clearRefreshTimer(){
   if(refreshTimer!=null){
     clearTimeout(refreshTimer);
@@ -723,14 +724,16 @@ async function refresh(reason='manual'){
   clearRefreshTimer();
   if(refreshPromise)return refreshPromise;
   const controller=new AbortController();
+  const generation=++refreshGeneration;
   refreshAbort=controller;
   refreshStartedAt=Date.now();
   const timeout=setTimeout(()=>controller.abort(),FETCH_TIMEOUT_MS);
   refreshPromise=(async()=>{
   try{
-    const res=await fetch('/hosts.json',{headers:{Accept:'application/json'},cache:'no-store',signal:controller.signal});
+    const res=await fetch('/hosts.json?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin',signal:controller.signal});
     if(!res.ok)return;
     const data=await res.json();
+    if(generation!==refreshGeneration)return;
     const now=Number(data.as_of)||Math.floor(Date.now()/1000);
     const asof=document.querySelector('[data-as-of]');
     if(asof)asof.textContent='as of '+clock(now);
@@ -774,9 +777,11 @@ async function refresh(reason='manual'){
   }catch(_){}
   finally{
     clearTimeout(timeout);
-    if(refreshAbort===controller)refreshAbort=null;
-    refreshPromise=null;
-    scheduleRefresh();
+    if(generation===refreshGeneration){
+      if(refreshAbort===controller)refreshAbort=null;
+      refreshPromise=null;
+      scheduleRefresh();
+    }
   }
   })();
   return refreshPromise;
@@ -787,10 +792,10 @@ function resumeRefresh(reason){
     return;
   }
   if(refreshPromise&&refreshAbort&&Date.now()-refreshStartedAt>FETCH_TIMEOUT_MS){
-    const pending=refreshPromise;
     refreshAbort.abort();
-    pending.finally(()=>refresh(reason));
-    return;
+    refreshGeneration++;
+    refreshAbort=null;
+    refreshPromise=null;
   }
   refresh(reason);
 }
@@ -2360,6 +2365,11 @@ mod tests {
         assert!(html.contains(r#"aria-label="Log out of Pharos""#));
         assert!(!html.contains(">mba<"));
         assert!(html.contains("cache:'no-store'"));
+        assert!(html.contains("'/hosts.json?refresh='+Date.now()"));
+        assert!(html.contains("credentials:'same-origin'"));
+        assert!(html.contains("let refreshGeneration=0;"));
+        assert!(html.contains("generation!==refreshGeneration"));
+        assert!(html.contains("refreshGeneration++;"));
         assert!(html.contains("document.addEventListener('visibilitychange'"));
         assert!(html.contains("window.addEventListener('focus'"));
         assert!(html.contains("window.addEventListener('pageshow'"));
