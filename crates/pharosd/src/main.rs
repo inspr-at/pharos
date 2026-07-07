@@ -160,6 +160,7 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .card.light{border-color:rgba(214,155,49,.48);box-shadow:0 16px 34px rgba(150,103,28,.12)}
 .halo{position:absolute;inset:-84px -74px auto auto;width:190px;height:190px;background:radial-gradient(circle,rgba(214,155,49,.20),rgba(21,158,153,.08) 42%,transparent 70%);pointer-events:none}
 .card-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
+.card-actions{display:flex;align-items:center;gap:5px;flex:0 0 auto}
 .host{display:flex;align-items:center;gap:9px;min-width:0}
 .nix{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(102,121,139,.18);border-radius:50%;color:var(--accent);background:rgba(241,248,250,.72);transition:border-color .2s ease,box-shadow .2s ease}
 .card.has-settings .nix,.list tr.has-settings .nix{border-width:2px;border-color:var(--host-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color) 13%,transparent),0 0 17px color-mix(in srgb,var(--host-color) 18%,transparent);background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--host-color) 8%,#f5fbfc))}
@@ -186,6 +187,13 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
 .card-tools{display:flex;align-items:center;justify-content:center;min-height:25px;margin-top:5px}
+.drag-handle{appearance:none;display:none;place-items:center;width:25px;height:25px;margin:0;border:0;border-radius:50%;background:transparent;color:var(--muted);cursor:grab}
+main[data-arrange="freeform"] .drag-handle{display:grid}
+.drag-handle:hover,.drag-handle:focus-visible{background:rgba(223,241,249,.78);color:var(--accent);box-shadow:0 7px 16px rgba(45,75,95,.08);outline:0}
+.drag-handle:active{cursor:grabbing}
+.drag-handle .ico{width:13px;height:13px}
+.card[data-dragging="true"]{z-index:20;transform:scale(1.015);box-shadow:0 20px 44px rgba(45,75,95,.18);cursor:grabbing}
+.grid[data-freeform-dragging="true"] .card:not([data-dragging]){transition:transform .12s ease,box-shadow .12s ease}
 .settings-card{display:inline-grid;place-items:center;width:25px;height:25px;margin:0;border:0;border-radius:50%;background:transparent;color:var(--accent);text-decoration:none;box-shadow:none}
 .settings-card:hover{background:rgba(223,241,249,.78);box-shadow:0 7px 16px rgba(45,75,95,.08);transform:translateY(-1px)}
 .settings-card.unavailable{--host-color:#aebac3;color:var(--muted);opacity:.72;box-shadow:none}
@@ -518,12 +526,59 @@ function cmp(a,b,mode){
   if(mode==='last')return Number(b.dataset.last||0)-Number(a.dataset.last||0)||a.dataset.sortName.localeCompare(b.dataset.sortName);
   return Number(a.dataset.sev)-Number(b.dataset.sev)||a.dataset.sortName.localeCompare(b.dataset.sortName);
 }
-function applySort(mode,write=true){
-  mode=['attention','name','last'].includes(mode)?mode:'attention';
+const FREEFORM_ORDER_KEY='pharos_freeform_order_v1';
+function readFreeformOrder(){
+  try{
+    const parsed=JSON.parse(window.localStorage.getItem(FREEFORM_ORDER_KEY)||'[]');
+    return Array.isArray(parsed)?parsed.filter(v=>typeof v==='string'&&v):[];
+  }catch(_){return []}
+}
+function writeFreeformOrder(){
+  const grid=document.querySelector('[data-grid]');
+  if(!grid)return;
+  try{
+    const order=Array.from(grid.querySelectorAll('.card')).map(el=>el.dataset.host).filter(Boolean);
+    window.localStorage.setItem(FREEFORM_ORDER_KEY,JSON.stringify(order));
+  }catch(_){}
+}
+function clearFreeformOrder(){
+  try{window.localStorage.removeItem(FREEFORM_ORDER_KEY)}catch(_){}
+}
+function sortByFreeformOrder(items,order){
+  const index=new Map(order.map((name,idx)=>[name,idx]));
+  return items.sort((a,b)=>{
+    const ai=index.has(a.dataset.host)?index.get(a.dataset.host):Number.MAX_SAFE_INTEGER;
+    const bi=index.has(b.dataset.host)?index.get(b.dataset.host):Number.MAX_SAFE_INTEGER;
+    return ai-bi||a.dataset.sortName.localeCompare(b.dataset.sortName);
+  });
+}
+function applyFreeformOrder(){
   const grid=document.querySelector('[data-grid]');
   const body=document.querySelector('[data-list-body]');
-  if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
-  if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
+  const order=readFreeformOrder();
+  if(!order.length){
+    writeFreeformOrder();
+    return;
+  }
+  if(grid)sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order).forEach(el=>grid.appendChild(el));
+  if(body)sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order).forEach(el=>body.appendChild(el));
+}
+function setArrangeMode(mode){
+  const main=document.querySelector('main');
+  if(main)main.dataset.arrange=mode;
+}
+function applySort(mode,write=true){
+  mode=['attention','name','last','freeform'].includes(mode)?mode:'attention';
+  const grid=document.querySelector('[data-grid]');
+  const body=document.querySelector('[data-list-body]');
+  setArrangeMode(mode);
+  if(mode==='freeform'){
+    applyFreeformOrder();
+  }else{
+    if(write)clearFreeformOrder();
+    if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
+    if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
+  }
   const select=document.querySelector('[data-sort]');
   if(select)select.value=mode;
   if(write)setCookie('pharos_sort',mode);
@@ -558,6 +613,66 @@ function cycleSignalWindow(){
   applySignalWindow(SIGNAL_WINDOWS[(idx+1)%SIGNAL_WINDOWS.length].key);
   updateUrlState();
 }
+function freeformTarget(grid,x,y){
+  let best=null;
+  let bestDistance=Infinity;
+  let bestAfter=false;
+  grid.querySelectorAll('.card:not([data-dragging]):not([hidden])').forEach(card=>{
+    const box=card.getBoundingClientRect();
+    const cx=box.left+box.width/2;
+    const cy=box.top+box.height/2;
+    const distance=Math.hypot(x-cx,(y-cy)*1.35);
+    if(distance<bestDistance){
+      best=card;
+      bestDistance=distance;
+      bestAfter=y>cy||Math.abs(y-cy)<box.height*.42&&x>cx;
+    }
+  });
+  return {card:best,after:bestAfter};
+}
+function bindFreeformDrag(){
+  const grid=document.querySelector('[data-grid]');
+  if(!grid||grid.dataset.freeformBound==='true')return;
+  grid.dataset.freeformBound='true';
+  let drag=null;
+  function finish(){
+    if(!drag)return;
+    delete drag.card.dataset.dragging;
+    drag.card.style.zIndex='';
+    delete grid.dataset.freeformDragging;
+    writeFreeformOrder();
+    applyFreeformOrder();
+    drag=null;
+  }
+  grid.addEventListener('pointerdown',event=>{
+    const handle=event.target.closest('[data-drag-handle]');
+    if(!handle||!grid.contains(handle))return;
+    if(document.querySelector('main')?.dataset.arrange!=='freeform')return;
+    if(event.button!==0)return;
+    const card=handle.closest('.card');
+    if(!card)return;
+    event.preventDefault();
+    handle.setPointerCapture?.(event.pointerId);
+    drag={card,pointerId:event.pointerId};
+    card.dataset.dragging='true';
+    card.style.zIndex='20';
+    grid.dataset.freeformDragging='true';
+  });
+  grid.addEventListener('pointermove',event=>{
+    if(!drag||event.pointerId!==drag.pointerId)return;
+    event.preventDefault();
+    const target=freeformTarget(grid,event.clientX,event.clientY);
+    if(!target.card){
+      grid.appendChild(drag.card);
+      return;
+    }
+    const before=target.after?target.card.nextSibling:target.card;
+    if(before!==drag.card)grid.insertBefore(drag.card,before);
+  });
+  grid.addEventListener('pointerup',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
+  grid.addEventListener('pointercancel',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
+  window.addEventListener('blur',finish);
+}
 function updateUrlState(){
   const main=document.querySelector('main');
   const sort=document.querySelector('[data-sort]')?.value||'attention';
@@ -582,6 +697,7 @@ function initControls(){
   document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
   document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
+  bindFreeformDrag();
 }
 const REFRESH_MS=10000;
 const HIDDEN_REFRESH_MS=60000;
@@ -1615,7 +1731,7 @@ fn header(now: i64) -> String {
 
 fn toolbar() -> String {
     format!(
-        r#"<section class="toolbar" aria-label="fleet controls"><div class="toolbar-left"><div class="seg" role="group" aria-label="view"><button type="button" data-view-button="grid" aria-pressed="true" title="Grid view">{grid}</button><button type="button" data-view-button="list" aria-pressed="false" title="List view">{list}</button></div><label class="arrange">Arrange by <select data-sort aria-label="arrange by"><option value="attention">Needs attention</option><option value="name">Name</option><option value="last">Last change</option></select></label></div><div class="toolbar-right"><label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="Search hosts..."></label></div></section>"#,
+        r#"<section class="toolbar" aria-label="fleet controls"><div class="toolbar-left"><div class="seg" role="group" aria-label="view"><button type="button" data-view-button="grid" aria-pressed="true" title="Grid view">{grid}</button><button type="button" data-view-button="list" aria-pressed="false" title="List view">{list}</button></div><label class="arrange">Arrange by <select data-sort aria-label="arrange by"><option value="attention">Needs attention</option><option value="name">Name</option><option value="last">Last change</option><option value="freeform">Freeform</option></select></label></div><div class="toolbar-right"><label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="Search hosts..."></label></div></section>"#,
         grid = icons::GRID,
         list = icons::LIST,
         search = icons::SEARCH
@@ -2058,6 +2174,10 @@ fn render_home(
                 icon = icons::SLIDERS
             )
         };
+        let drag_action = format!(
+            r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
+            icon = icons::GRIP
+        );
         // pharosd cannot honestly heartbeat itself; the host gets the lighthouse cue.
         let status_word = if is_self { "the light is lit" } else { word };
         let status_icon = if is_self {
@@ -2085,7 +2205,7 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div>{settings_action}</header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
@@ -2230,6 +2350,10 @@ mod tests {
 
         assert!(html.contains(r#"<section class="toolbar""#));
         assert!(html.contains(r#"data-view-button="list""#));
+        assert!(html.contains(r#"<option value="freeform">Freeform</option>"#));
+        assert!(html.contains("pharos_freeform_order_v1"));
+        assert!(html.contains("bindFreeformDrag();"));
+        assert!(html.contains(r#"data-drag-handle title="Move poseidon""#));
         assert!(html.contains(r#"<table class="list">"#));
         assert!(
             html.contains(r#"<span class="side-user" title="markus"><span>markus</span></span>"#)
@@ -2410,9 +2534,7 @@ mod tests {
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(html.contains(r#"class="card has-settings""#));
         assert!(html.contains(r#"aria-label="Open settings for poseidon""#));
-        assert!(
-            html.contains(r#"</div></div><a class="settings-card" href="/agora?host=poseidon""#)
-        );
+        assert!(html.contains(r#"<div class="card-actions"><button class="drag-handle" type="button" data-drag-handle title="Move poseidon" aria-label="Move poseidon""#));
         assert!(html.contains(r#"<div class="card-tools"><span class="signal" data-signal"#));
         assert!(html.contains(r#"style="--host-color:#48b8a8""#));
         assert!(!html.contains("Color and access"));
