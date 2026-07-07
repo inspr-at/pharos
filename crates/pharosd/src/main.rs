@@ -271,25 +271,32 @@ main[data-view="list"] .list-wrap{display:block}
 .site-head strong{font-size:13px}
 .site-count{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:22px;border-radius:999px;background:rgba(223,241,249,.78);color:#0f4f80;font-size:12px;font-weight:700}
 .site-hosts{display:flex;flex-wrap:wrap;gap:6px}
-.site-host{--host-state:var(--wait);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;column-gap:6px;min-height:30px;padding:4px 8px;border:1px solid color-mix(in srgb,var(--host-state) 22%,transparent);border-radius:999px;background:color-mix(in srgb,var(--host-state) 8%,white);color:var(--ink);font-size:12px;text-decoration:none}
-.site-host:before{content:"";grid-row:1/3;width:7px;height:7px;border-radius:50%;background:var(--host-state);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-state) 12%,transparent)}
+.site-host{--host-state:var(--wait);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;column-gap:6px;min-height:42px;padding:5px 8px;border:1px solid color-mix(in srgb,var(--host-state) 22%,transparent);border-radius:8px;background:color-mix(in srgb,var(--host-state) 8%,white);color:var(--ink);font-size:12px;text-decoration:none}
+.site-host:before{content:"";grid-row:1/4;width:7px;height:7px;border-radius:50%;background:var(--host-state);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-state) 12%,transparent)}
 .site-host-name{line-height:1.1;font-weight:650;white-space:nowrap}
-.site-host-ping{line-height:1.1;font-size:10px;color:var(--muted)}
-.site-host-ping[data-probe-level="good"]{color:var(--live)}.site-host-ping[data-probe-level="warn"]{color:var(--stale)}.site-host-ping[data-probe-level="down"]{color:var(--down)}
+.site-host-signals{display:flex;flex-wrap:wrap;gap:5px;margin-top:2px}
+.site-host-ping{line-height:1.1;font-size:10px;color:var(--muted);white-space:nowrap}
+.site-host-ping[data-probe-level="good"]{color:var(--live)}.site-host-ping[data-probe-level="warn"]{color:var(--stale)}.site-host-ping[data-probe-level="down"]{color:var(--down)}.site-host-ping[data-policy="blocked"]{color:var(--muted)}
 .map-note{margin-top:auto;padding-top:8px;border-top:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:11px}
 .leaflet-container{font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
 .leaflet-control-zoom a{color:var(--ink)!important}
 .map-label-layer{position:absolute;inset:0;z-index:650;pointer-events:none;overflow:hidden}
+.map-links{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.map-link{fill:none;stroke:rgba(21,158,153,.36);stroke-width:1.15;opacity:.72;vector-effect:non-scaling-stroke}
+.map-link[data-inbound-level="warn"]{stroke:rgba(214,155,49,.38)}.map-link[data-inbound-level="down"]{stroke:rgba(191,58,53,.30);stroke-dasharray:4 7}.map-link[data-outbound-policy="blocked"]{stroke:rgba(137,151,163,.34);stroke-dasharray:3 6;opacity:.42}
+.map-packet{r:3;opacity:.78}.map-packet.inbound{fill:var(--sea)}.map-packet.outbound{fill:var(--accent)}.map-packet[data-level="warn"]{fill:var(--sun)}.map-packet[data-level="down"]{fill:var(--down)}.map-packet[data-policy="blocked"]{fill:var(--wait);opacity:.38}
 .map-leaders{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
 .map-leaders line{stroke:#7a8c9c;stroke-width:1.2;stroke-dasharray:2 4;opacity:.52;vector-effect:non-scaling-stroke}
 .map-anchor{--node-color:var(--wait);position:absolute;width:12px;height:12px;border-radius:50%;background:radial-gradient(circle,#fff 0 27%,var(--node-color) 33% 68%,transparent 70%);box-shadow:0 0 0 5px color-mix(in srgb,var(--node-color) 11%,transparent),0 6px 12px rgba(45,75,95,.14);transform:translate(-50%,-50%);pointer-events:none}
 .map-anchor.live,.map-node.live{--node-color:var(--live)}.map-anchor.stale,.map-node.stale{--node-color:var(--stale)}.map-anchor.down,.map-node.down{--node-color:var(--down)}.map-anchor.awaiting_first_heartbeat,.map-node.awaiting_first_heartbeat{--node-color:var(--wait)}
-.map-node{--node-color:var(--wait);position:absolute;display:grid;grid-template-columns:9px minmax(0,1fr);column-gap:7px;align-items:start;min-width:82px;max-width:136px;padding:6px 8px 6px 7px;border:1px solid color-mix(in srgb,var(--node-color) 30%,rgba(210,226,234,.92));border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 10px 22px rgba(45,75,95,.14),0 0 0 4px color-mix(in srgb,var(--node-color) 7%,transparent);-webkit-backdrop-filter:blur(8px) saturate(1.05);backdrop-filter:blur(8px) saturate(1.05);color:var(--ink);text-decoration:none;pointer-events:auto}
+.map-node{--node-color:var(--wait);position:absolute;display:grid;grid-template-columns:9px minmax(0,1fr);column-gap:7px;align-items:start;min-width:106px;max-width:154px;padding:6px 8px 7px 7px;border:1px solid color-mix(in srgb,var(--node-color) 30%,rgba(210,226,234,.92));border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 10px 22px rgba(45,75,95,.14),0 0 0 4px color-mix(in srgb,var(--node-color) 7%,transparent);-webkit-backdrop-filter:blur(8px) saturate(1.05);backdrop-filter:blur(8px) saturate(1.05);color:var(--ink);text-decoration:none;pointer-events:auto}
 .map-node:hover{box-shadow:0 14px 28px rgba(45,75,95,.18),0 0 0 5px color-mix(in srgb,var(--node-color) 12%,transparent);transform:translateY(-1px)}
-.map-status-dot{grid-row:1/3;width:9px;height:9px;margin-top:4px;border-radius:50%;background:var(--node-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--node-color) 13%,transparent)}
+.map-status-dot{grid-row:1/4;width:9px;height:9px;margin-top:4px;border-radius:50%;background:var(--node-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--node-color) 13%,transparent)}
 .map-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;font-weight:760;color:#17304a}
-.map-ping{font-size:10px;line-height:1.15;color:var(--muted);white-space:nowrap}
-.map-ping[data-probe-level="good"]{color:var(--live)}.map-ping[data-probe-level="warn"]{color:var(--stale)}.map-ping[data-probe-level="down"]{color:var(--down)}
+.map-signals{grid-column:2;display:grid;gap:2px;margin-top:2px}
+.map-ping{display:flex;align-items:center;gap:4px;font-size:10px;line-height:1.15;color:var(--muted);white-space:nowrap}
+.map-ping:before{content:attr(data-dir);width:17px;color:var(--muted);font-weight:700;text-transform:uppercase;font-size:8px;letter-spacing:.03em}
+.map-ping[data-probe-level="good"]{color:var(--live)}.map-ping[data-probe-level="warn"]{color:var(--stale)}.map-ping[data-probe-level="down"]{color:var(--down)}.map-ping[data-policy="blocked"]{color:var(--muted)}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}}
 @media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.fleet-map{height:62vh;min-height:420px}}
@@ -1950,16 +1957,18 @@ struct SiteLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MapProbeTarget {
-    host: String,
-    port: u16,
+    endpoint: Option<(String, u16)>,
     kind: &'static str,
+    policy: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct MapProbe {
+struct MapSignal {
     label: String,
     level: &'static str,
     title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1974,9 +1983,14 @@ struct MapHost {
     region: &'static str,
     lat: f64,
     lon: f64,
-    probe_label: String,
-    probe_level: &'static str,
-    probe_title: String,
+    is_pharos: bool,
+    inbound_label: String,
+    inbound_level: &'static str,
+    inbound_title: String,
+    outbound_label: String,
+    outbound_level: &'static str,
+    outbound_title: String,
+    outbound_policy: &'static str,
     settings_href: String,
 }
 
@@ -2094,93 +2108,153 @@ fn split_probe_host_port(raw: &str, default_port: u16) -> Option<(String, u16)> 
     Some((target.to_string(), default_port))
 }
 
+fn normalize_outbound_policy(policy: &str) -> Option<&'static str> {
+    match policy.trim().to_ascii_lowercase().as_str() {
+        "expected" | "reachable" | "allow" | "allowed" | "required" => Some("expected"),
+        "blocked" | "deny" | "denied" | "intentional-block" | "intentional_block" => {
+            Some("blocked")
+        }
+        "unknown" | "probe" | "best-effort" | "best_effort" => Some("unknown"),
+        _ => None,
+    }
+}
+
+fn manifest_outbound_policy(host: &str, manifests: &[HostManifest]) -> Option<&'static str> {
+    let manifests = manifest_by_host(manifests);
+    let manifest = manifests.get(host)?;
+    [
+        "pharosOutbound",
+        "pharosOutboundPolicy",
+        "pharosConnectivity",
+    ]
+    .into_iter()
+    .find_map(|key| manifest.host.access.get(key))
+    .and_then(|value| normalize_outbound_policy(value))
+}
+
+fn outbound_policy_for_host(host: &Host, manifests: &[HostManifest]) -> &'static str {
+    manifest_outbound_policy(&host.name, manifests).unwrap_or("unknown")
+}
+
 fn map_probe_target(host: &Host, manifests: &[HostManifest]) -> MapProbeTarget {
+    let policy = outbound_policy_for_host(host, manifests);
+    if policy == "blocked" {
+        return MapProbeTarget {
+            endpoint: None,
+            kind: "tailnet ssh",
+            policy,
+        };
+    }
     let manifests = manifest_by_host(manifests);
     if let Some(manifest) = manifests.get(host.name.as_str()) {
         if let Some(tailnet) = manifest.host.tailnet_hostname() {
             if let Some((host, port)) = split_probe_host_port(tailnet, 2222) {
                 return MapProbeTarget {
-                    host,
-                    port,
+                    endpoint: Some((host, port)),
                     kind: "tailnet ssh",
+                    policy,
                 };
             }
         }
         if let Some(lan) = manifest.host.lan_hostname() {
             if let Some((host, port)) = split_probe_host_port(lan, 2222) {
                 return MapProbeTarget {
-                    host,
-                    port,
+                    endpoint: Some((host, port)),
                     kind: "lan ssh",
+                    policy,
                 };
             }
         }
         if let Some(ip) = manifest.host.lan_ip() {
             if let Some((host, port)) = split_probe_host_port(ip, 2222) {
                 return MapProbeTarget {
-                    host,
-                    port,
+                    endpoint: Some((host, port)),
                     kind: "lan ssh",
+                    policy,
                 };
             }
         }
     }
     MapProbeTarget {
-        host: format!("{}.ts.barta.cm", host.name),
-        port: 2222,
+        endpoint: Some((format!("{}.ts.barta.cm", host.name), 2222)),
         kind: "tailnet ssh",
+        policy,
     }
 }
 
-fn default_map_probe() -> MapProbe {
-    MapProbe {
+fn default_map_signal() -> MapSignal {
+    MapSignal {
         label: "checking".to_string(),
         level: "wait",
         title: "Pharos reachability check is pending".to_string(),
+        policy: None,
     }
 }
 
-async fn map_connectivity_probe(target: MapProbeTarget) -> MapProbe {
+async fn map_connectivity_probe(target: MapProbeTarget) -> MapSignal {
+    let Some((host, port)) = target.endpoint else {
+        return MapSignal {
+            label: if target.policy == "blocked" {
+                "blocked".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            level: "wait",
+            title: if target.policy == "blocked" {
+                "Outbound access from Pharos is blocked by policy".to_string()
+            } else {
+                "No outbound probe endpoint declared".to_string()
+            },
+            policy: Some(target.policy),
+        };
+    };
     let started = Instant::now();
     match timeout(
         SERVER_PROBE_TIMEOUT,
-        TcpStream::connect((target.host.as_str(), target.port)),
+        TcpStream::connect((host.as_str(), port)),
     )
     .await
     {
         Ok(Ok(_)) => {
             let elapsed_ms = started.elapsed().as_millis().max(1);
-            MapProbe {
+            MapSignal {
                 label: format!("{elapsed_ms} ms"),
                 level: "good",
                 title: format!(
                     "Pharos {kind} check to {host}:{port} reachable in {elapsed_ms} ms",
                     kind = target.kind,
-                    host = target.host,
-                    port = target.port
+                    host = host,
+                    port = port
                 ),
+                policy: Some(target.policy),
             }
         }
-        Ok(Err(_)) => MapProbe {
+        Ok(Err(_)) => MapSignal {
             label: "no route".to_string(),
-            level: "down",
+            level: if target.policy == "expected" {
+                "down"
+            } else {
+                "warn"
+            },
             title: format!(
                 "Pharos {kind} check to {host}:{port} failed",
                 kind = target.kind,
-                host = target.host,
-                port = target.port
+                host = host,
+                port = port
             ),
+            policy: Some(target.policy),
         },
-        Err(_) => MapProbe {
+        Err(_) => MapSignal {
             label: "timeout".to_string(),
             level: "warn",
             title: format!(
                 "Pharos {kind} check to {host}:{port} timed out after {} ms",
                 SERVER_PROBE_TIMEOUT.as_millis(),
                 kind = target.kind,
-                host = target.host,
-                port = target.port
+                host = host,
+                port = port
             ),
+            policy: Some(target.policy),
         },
     }
 }
@@ -2188,7 +2262,7 @@ async fn map_connectivity_probe(target: MapProbeTarget) -> MapProbe {
 async fn map_connectivity_probes(
     hosts: &[Host],
     manifests: &[HostManifest],
-) -> BTreeMap<String, MapProbe> {
+) -> BTreeMap<String, MapSignal> {
     let mut jobs = JoinSet::new();
     for host in hosts {
         let name = host.name.clone();
@@ -2204,19 +2278,57 @@ async fn map_connectivity_probes(
     probes
 }
 
+fn map_inbound_signal(host: &Host, is_pharos: bool, now: i64) -> MapSignal {
+    if is_pharos {
+        return MapSignal {
+            label: "local".to_string(),
+            level: "good",
+            title: "Pharos is the local control host".to_string(),
+            policy: None,
+        };
+    }
+    let Some(last_seen) = host.last_seen else {
+        return MapSignal {
+            label: "waiting".to_string(),
+            level: "wait",
+            title: "No heartbeat from this host has reached Pharos yet".to_string(),
+            policy: None,
+        };
+    };
+    let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
+    let level = match live {
+        Liveness::Live => "good",
+        Liveness::Stale => "warn",
+        Liveness::Down => "down",
+        Liveness::AwaitingFirstHeartbeat => "wait",
+    };
+    let age = (now - last_seen).max(0);
+    MapSignal {
+        label: duration_label(age),
+        level,
+        title: format!(
+            "Last heartbeat from {} reached Pharos {} ago",
+            host.name,
+            duration_label(age)
+        ),
+        policy: None,
+    }
+}
+
 fn map_hosts(
     hosts: &[Host],
     self_name: &str,
     now: i64,
     manifests: &[HostManifest],
-    probes: &BTreeMap<String, MapProbe>,
+    probes: &BTreeMap<String, MapSignal>,
 ) -> Vec<MapHost> {
     let sites = manifest_site_by_host(manifests);
     let mut mapped = hosts
         .iter()
         .map(|host| {
+            let is_pharos = host.name == self_name;
             let mut live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-            if host.name == self_name {
+            if is_pharos {
                 live = Liveness::Live;
             }
             let (_color, status) = live.badge();
@@ -2230,10 +2342,11 @@ fn map_hosts(
                 .copied()
                 .unwrap_or_else(|| fallback_site_for_host(&host.name));
             let site = site_location(site);
-            let probe = probes
+            let inbound = map_inbound_signal(host, is_pharos, now);
+            let outbound = probes
                 .get(&host.name)
                 .cloned()
-                .unwrap_or_else(default_map_probe);
+                .unwrap_or_else(default_map_signal);
             MapHost {
                 name: host.name.clone(),
                 role: host.role.clone(),
@@ -2245,9 +2358,14 @@ fn map_hosts(
                 region: site.region,
                 lat: site.lat,
                 lon: site.lon,
-                probe_label: probe.label,
-                probe_level: probe.level,
-                probe_title: probe.title,
+                is_pharos,
+                inbound_label: inbound.label,
+                inbound_level: inbound.level,
+                inbound_title: inbound.title,
+                outbound_label: outbound.label,
+                outbound_level: outbound.level,
+                outbound_title: outbound.title,
+                outbound_policy: outbound.policy.unwrap_or("unknown"),
                 settings_href: format!("/agora?host={}", url_query_escape(&host.name)),
             }
         })
@@ -2279,14 +2397,18 @@ fn map_site_list(hosts: &[MapHost]) -> String {
                         other => other,
                     };
                     format!(
-                        r#"<a class="site-host" href="{href}" style="--host-state:var(--{state_var})" title="{name}: {attention}; {probe_title}"><span class="site-host-name">{name}</span><span class="site-host-ping" data-probe-level="{probe_level}">{probe_label}</span></a>"#,
+                        r#"<a class="site-host" href="{href}" style="--host-state:var(--{state_var})" title="{name}: {attention}; {inbound_title}; {outbound_title}"><span class="site-host-name">{name}</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="{inbound_level}">in {inbound_label}</span><span class="site-host-ping" data-probe-level="{outbound_level}" data-policy="{outbound_policy}">out {outbound_label}</span></span></a>"#,
                         href = html_escape(&host.settings_href),
                         state_var = html_escape(state_var),
                         name = html_escape(&host.name),
                         attention = html_escape(&host.attention),
-                        probe_title = html_escape(&host.probe_title),
-                        probe_level = html_escape(host.probe_level),
-                        probe_label = html_escape(&host.probe_label)
+                        inbound_title = html_escape(&host.inbound_title),
+                        outbound_title = html_escape(&host.outbound_title),
+                        inbound_level = html_escape(host.inbound_level),
+                        outbound_level = html_escape(host.outbound_level),
+                        outbound_policy = html_escape(host.outbound_policy),
+                        inbound_label = html_escape(&host.inbound_label),
+                        outbound_label = html_escape(&host.outbound_label)
                     )
                 })
                 .collect::<String>();
@@ -2305,7 +2427,7 @@ fn render_map(
     self_name: &str,
     now: i64,
     manifests: &[HostManifest],
-    probes: &BTreeMap<String, MapProbe>,
+    probes: &BTreeMap<String, MapSignal>,
     user_label: &str,
     logout_enabled: bool,
 ) -> String {
@@ -2323,7 +2445,7 @@ fn render_map(
     let map_script = r#"<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="https://unpkg.com/d3@7.9.0/dist/d3.min.js"></script><script>
 const MAP_HOSTS=__MAP_HOSTS__;
 function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
-function nodeHtml(host){return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-ping" data-probe-level="'+escapeHtml(host.probe_level)+'">'+escapeHtml(host.probe_label)+'</span>'}
+function nodeHtml(host){return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-signals"><span class="map-ping" data-dir="in" data-probe-level="'+escapeHtml(host.inbound_level)+'">'+escapeHtml(host.inbound_label)+'</span><span class="map-ping" data-dir="out" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">'+escapeHtml(host.outbound_label)+'</span></span>'}
 function groupOffsets(hosts){
   const groups=new Map();
   hosts.forEach(host=>{
@@ -2348,11 +2470,46 @@ function forceBounds(nodes,width,height){
     }
   }
 }
+function svgEl(name){return document.createElementNS('http://www.w3.org/2000/svg',name)}
+function curvePath(a,b){
+  const dx=b.ax-a.ax;
+  const dy=b.ay-a.ay;
+  const mx=(a.ax+b.ax)/2;
+  const my=(a.ay+b.ay)/2;
+  const len=Math.max(1,Math.hypot(dx,dy));
+  const bend=Math.min(70,Math.max(18,len*.12));
+  const cx=mx+(-dy/len)*bend;
+  const cy=my+(dx/len)*bend;
+  return 'M '+a.ax.toFixed(1)+' '+a.ay.toFixed(1)+' Q '+cx.toFixed(1)+' '+cy.toFixed(1)+' '+b.ax.toFixed(1)+' '+b.ay.toFixed(1);
+}
+function addPacket(path,id,dir,level,policy,reverse){
+  const circle=svgEl('circle');
+  circle.setAttribute('r','3');
+  circle.classList.add('map-packet',dir);
+  circle.dataset.level=level;
+  circle.dataset.policy=policy||'unknown';
+  const motion=svgEl('animateMotion');
+  motion.setAttribute('dur',dir==='inbound'?'3.6s':'2.8s');
+  motion.setAttribute('repeatCount','indefinite');
+  motion.setAttribute('calcMode','linear');
+  if(reverse){
+    motion.setAttribute('keyPoints','1;0');
+    motion.setAttribute('keyTimes','0;1');
+  }
+  const mpath=svgEl('mpath');
+  mpath.setAttribute('href','#'+id);
+  motion.appendChild(mpath);
+  circle.appendChild(motion);
+  path.parentNode.appendChild(circle);
+}
 function buildLabels(map,el){
   const layer=document.createElement('div');
   layer.className='map-label-layer';
-  const leaders=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  const links=svgEl('svg');
+  links.classList.add('map-links');
+  const leaders=svgEl('svg');
   leaders.classList.add('map-leaders');
+  layer.appendChild(links);
   layer.appendChild(leaders);
   el.appendChild(layer);
   const groups=groupOffsets(MAP_HOSTS);
@@ -2367,17 +2524,34 @@ function buildLabels(map,el){
     link.className='map-node '+escapeHtml(host.live);
     link.href=host.settings_href;
     link.innerHTML=nodeHtml(host);
-    link.title=host.name+': '+host.status+'; '+host.probe_title;
-    link.setAttribute('aria-label',host.name+', '+host.status+', '+host.probe_label);
-    const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+    link.title=host.name+': '+host.status+'; '+host.inbound_title+'; '+host.outbound_title;
+    link.setAttribute('aria-label',host.name+', '+host.status+', inbound '+host.inbound_label+', outbound '+host.outbound_label);
+    const line=svgEl('line');
     leaders.appendChild(line);
     layer.appendChild(anchor);
     layer.appendChild(link);
     return {host,idx,anchor,link,line,groupIndex,groupCount:(groups.get(key)||[]).length,w:100,h:38,r:58,x:0,y:0,ax:0,ay:0};
   });
+  const pharosNode=nodes.find(node=>node.host.is_pharos)||nodes[0];
+  const linksByHost=nodes.filter(node=>node!==pharosNode).map((node,idx)=>{
+    const path=svgEl('path');
+    const id='map-link-'+idx;
+    path.id=id;
+    path.classList.add('map-link');
+    path.dataset.inboundLevel=node.host.inbound_level;
+    path.dataset.outboundLevel=node.host.outbound_level;
+    path.dataset.outboundPolicy=node.host.outbound_policy;
+    links.appendChild(path);
+    if(node.host.inbound_level!=='wait')addPacket(path,id,'inbound',node.host.inbound_level,node.host.outbound_policy,true);
+    if(node.host.outbound_level==='good')addPacket(path,id,'outbound',node.host.outbound_level,node.host.outbound_policy,false);
+    return {node,path};
+  });
+  let scheduled=false;
   function layout(){
+    scheduled=false;
     const width=el.clientWidth||800;
     const height=el.clientHeight||520;
+    links.setAttribute('viewBox','0 0 '+width+' '+height);
     leaders.setAttribute('viewBox','0 0 '+width+' '+height);
     nodes.forEach(node=>{
       const point=map.latLngToContainerPoint([node.host.lat,node.host.lon]);
@@ -2389,7 +2563,7 @@ function buildLabels(map,el){
       node.link.style.transform='translate(-1000px,-1000px)';
       const rect=node.link.getBoundingClientRect();
       node.w=rect.width||110;
-      node.h=rect.height||40;
+      node.h=rect.height||54;
       node.r=Math.sqrt(node.w*node.w+node.h*node.h)/2+10;
       node.x=clamp(point.x+offset.x,node.w/2+8,width-node.w/2-8);
       node.y=clamp(point.y+offset.y,node.h/2+8,height-node.h/2-8);
@@ -2416,17 +2590,27 @@ function buildLabels(map,el){
       node.line.setAttribute('y2',node.y);
       node.line.style.opacity=distance>22?'.55':'0';
     });
+    if(pharosNode){
+      linksByHost.forEach(link=>{
+        link.path.setAttribute('d',curvePath(pharosNode,link.node));
+      });
+    }
   }
-  map.on('moveend zoomend resize viewreset',layout);
-  window.addEventListener('resize',()=>requestAnimationFrame(layout));
-  requestAnimationFrame(layout);
+  function scheduleLayout(){
+    if(scheduled)return;
+    scheduled=true;
+    requestAnimationFrame(layout);
+  }
+  map.on('move zoom moveend zoomend resize viewreset',scheduleLayout);
+  window.addEventListener('resize',scheduleLayout);
+  scheduleLayout();
 }
 function initMap(){
   const el=document.getElementById('fleet-map');
   if(!el||!window.L){document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}
   const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:false,zoomControl:false});
   L.control.zoom({position:'topright'}).addTo(map);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:20,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'}).addTo(map);
   const bounds=MAP_HOSTS.map(host=>[host.lat,host.lon]);
   if(bounds.length===1){map.setView(bounds[0],5)}else if(bounds.length){map.fitBounds(bounds,{padding:[64,64],maxZoom:5})}else{map.setView([20,0],2)}
   buildLabels(map,el);
@@ -3080,42 +3264,47 @@ mod tests {
         let probes = BTreeMap::from([
             (
                 "csb1".to_string(),
-                MapProbe {
+                MapSignal {
                     label: "4 ms".to_string(),
                     level: "good",
                     title: "Pharos tailnet ssh check reachable in 4 ms".to_string(),
+                    policy: Some("expected"),
                 },
             ),
             (
                 "csb0".to_string(),
-                MapProbe {
+                MapSignal {
                     label: "8 ms".to_string(),
                     level: "good",
                     title: "Pharos tailnet ssh check reachable in 8 ms".to_string(),
+                    policy: Some("expected"),
                 },
             ),
             (
                 "hsb8".to_string(),
-                MapProbe {
-                    label: "24 ms".to_string(),
-                    level: "good",
-                    title: "Pharos tailnet ssh check reachable in 24 ms".to_string(),
+                MapSignal {
+                    label: "blocked".to_string(),
+                    level: "wait",
+                    title: "Outbound access from Pharos is blocked by policy".to_string(),
+                    policy: Some("blocked"),
                 },
             ),
             (
                 "dsc0".to_string(),
-                MapProbe {
+                MapSignal {
                     label: "139 ms".to_string(),
                     level: "good",
                     title: "Pharos tailnet ssh check reachable in 139 ms".to_string(),
+                    policy: Some("expected"),
                 },
             ),
             (
                 "new-host".to_string(),
-                MapProbe {
+                MapSignal {
                     label: "timeout".to_string(),
                     level: "warn",
                     title: "Pharos tailnet ssh check timed out".to_string(),
+                    policy: Some("unknown"),
                 },
             ),
         ]);
@@ -3130,6 +3319,12 @@ mod tests {
         assert!(html.contains("d3.forceSimulation"));
         assert!(html.contains("d3.forceCollide"));
         assert!(html.contains("buildLabels(map,el)"));
+        assert!(html.contains("basemaps.cartocdn.com/light_all"));
+        assert!(html.contains("map.on('move zoom moveend zoomend resize viewreset'"));
+        assert!(html.contains("classList.add('map-links')"));
+        assert!(html.contains("animateMotion"));
+        assert!(html.contains("data-dir=\"in\""));
+        assert!(html.contains("data-dir=\"out\""));
         assert!(!html.contains("markercluster"));
         assert!(!html.contains("L.markerClusterGroup"));
         assert!(html.contains(r#""site_id":"cloud-de""#));
@@ -3138,9 +3333,11 @@ mod tests {
         assert!(html.contains(r#""site_id":"unknown""#));
         assert!(html.contains(r#""lon":-122.9898"#));
         assert!(html.contains("Hillsboro, OR, US"));
-        assert!(html.contains(r#""probe_label":"24 ms""#));
-        assert!(html.contains(r#"data-probe-level="good">24 ms"#));
-        assert!(html.contains(r#"data-probe-level="warn">timeout"#));
+        assert!(html.contains(r#""inbound_label":"30s""#));
+        assert!(html.contains(r#""outbound_label":"blocked""#));
+        assert!(html.contains(r#""outbound_policy":"blocked""#));
+        assert!(html.contains(r#"data-probe-level="wait" data-policy="blocked">out blocked"#));
+        assert!(html.contains(r#"data-probe-level="warn" data-policy="unknown">out timeout"#));
         assert!(html.contains("Parents&#39; home"));
         assert!(html.contains(r#"<b>5</b><span>Labels</span>"#));
         assert!(html.contains(r#"<b>0</b><span>Clusters</span>"#));
