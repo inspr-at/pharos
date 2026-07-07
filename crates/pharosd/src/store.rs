@@ -63,6 +63,9 @@ impl Store {
                 name: registration.name.clone(),
                 role: registration.role,
                 is_nix: registration.is_nix,
+                report_version: existing
+                    .map(|h| h.report_version)
+                    .unwrap_or(pharos_core::HOST_REPORT_VERSION),
                 token_hash: Some(token_hash),
                 last_seen: existing.and_then(|h| h.last_seen),
                 heartbeat_log: existing
@@ -75,6 +78,9 @@ impl Store {
                         applicable: registration.is_nix,
                         ..Default::default()
                     }),
+                service_observations: existing
+                    .map(|h| h.service_observations.clone())
+                    .unwrap_or_default(),
             };
             map.insert(registration.name, host.clone());
             host
@@ -120,11 +126,13 @@ impl Store {
                     name: report.name,
                     role: report.role,
                     is_nix: report.is_nix,
+                    report_version: report.version,
                     token_hash,
                     last_seen: Some(now),
                     heartbeat_log,
                     heartbeat_interval_secs: Some(report.heartbeat_interval_secs),
                     freshness: report.freshness,
+                    service_observations: report.service_observations,
                 },
             );
         }
@@ -172,7 +180,7 @@ fn trim_heartbeat_log(log: &mut Vec<UnixSeconds>, now: UnixSeconds) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pharos_core::NixFreshness;
+    use pharos_core::{NixFreshness, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION};
 
     #[test]
     fn record_retains_recent_real_heartbeat_events() {
@@ -181,6 +189,8 @@ mod tests {
         for now in 1..=(MAX_HEARTBEAT_LOG + 6) as UnixSeconds {
             store.record(
                 HostReport {
+                    schema: HOST_REPORT_SCHEMA.to_string(),
+                    version: HOST_REPORT_VERSION,
                     name: "poseidon".to_string(),
                     role: "NixOS Host".to_string(),
                     is_nix: true,
@@ -189,6 +199,7 @@ mod tests {
                         applicable: true,
                         ..Default::default()
                     },
+                    service_observations: vec![],
                 },
                 now,
             );
@@ -222,6 +233,8 @@ mod tests {
         let store = Store::new(None);
         store.record(
             HostReport {
+                schema: HOST_REPORT_SCHEMA.to_string(),
+                version: HOST_REPORT_VERSION,
                 name: "athena".to_string(),
                 role: "NixOS Host".to_string(),
                 is_nix: true,
@@ -231,6 +244,13 @@ mod tests {
                     flake_lock_age_days: Some(1),
                     commits_behind: Some(0),
                 },
+                service_observations: vec![pharos_core::ServiceObservation::nix_freshness(
+                    &NixFreshness {
+                        applicable: true,
+                        flake_lock_age_days: Some(1),
+                        commits_behind: Some(0),
+                    },
+                )],
             },
             120,
         );
@@ -255,6 +275,8 @@ mod tests {
 
         store.record(
             HostReport {
+                schema: HOST_REPORT_SCHEMA.to_string(),
+                version: HOST_REPORT_VERSION,
                 name: "athena".to_string(),
                 role: "Control Server".to_string(),
                 is_nix: true,
@@ -264,6 +286,7 @@ mod tests {
                     flake_lock_age_days: Some(0),
                     commits_behind: Some(0),
                 },
+                service_observations: vec![],
             },
             150,
         );

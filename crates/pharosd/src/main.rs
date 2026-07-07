@@ -28,7 +28,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
     liveness, Host, HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
-    NixFreshness, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    NixFreshness, ServiceObservation, ServiceObservationState, HOST_MANIFEST_SCHEMA,
+    HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -712,6 +713,15 @@ async fn report(
     headers: HeaderMap,
     Json(rep): Json<HostReport>,
 ) -> StatusCode {
+    if rep.schema != HOST_REPORT_SCHEMA || rep.version != HOST_REPORT_VERSION {
+        tracing::warn!(
+            host = %rep.name,
+            schema = %rep.schema,
+            version = rep.version,
+            "report rejected: unsupported report contract"
+        );
+        return StatusCode::BAD_REQUEST;
+    }
     let host_has_token = state.store.has_token(&rep.name);
     if host_has_token || state.beacon_auth.require_report_token {
         let Some(token) = bearer_token(&headers) else {
@@ -791,17 +801,20 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> 
         .map(|h| {
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
             let freshness_tldr = h.freshness.tldr();
-            let attention = attention_reason(live, &h.freshness);
+            let attention = attention_reason(live, &h.freshness, &h.service_observations);
             json!({
                 "name": h.name,
                 "role": h.role,
                 "is_nix": h.is_nix,
+                "report_version": h.report_version,
                 "last_seen": h.last_seen,
                 "heartbeat_log": h.heartbeat_log,
                 "heartbeat_interval_secs": h.heartbeat_interval_secs,
                 "liveness": live,
                 "freshness": h.freshness,
                 "freshness_tldr": freshness_tldr,
+                "service_observations": h.service_observations,
+                "service_observations_summary": service_observations_summary(&h.service_observations),
                 "attention": {
                     "label": attention.label,
                     "level": attention.level,
@@ -870,17 +883,22 @@ fn runtime_overlay(host: Option<&Host>, now: i64) -> serde_json::Value {
             "heartbeat_interval_secs": null,
             "freshness": null,
             "freshness_tldr": null,
+            "service_observations": [],
+            "service_observations_summary": service_observations_summary(&[]),
         });
     };
     let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
     json!({
         "state": "observed",
+        "report_version": host.report_version,
         "last_seen": host.last_seen,
         "heartbeat_log": host.heartbeat_log,
         "heartbeat_interval_secs": host.heartbeat_interval_secs,
         "liveness": live,
         "freshness": host.freshness,
         "freshness_tldr": host.freshness.tldr(),
+        "service_observations": host.service_observations,
+        "service_observations_summary": service_observations_summary(&host.service_observations),
     })
 }
 
@@ -1051,7 +1069,93 @@ fn freshness_attention_reason(freshness: &NixFreshness) -> Option<AttentionReaso
     })
 }
 
-fn attention_reason(live: Liveness, freshness: &NixFreshness) -> AttentionReason {
+fn service_observation_attention_reason(
+    observations: &[ServiceObservation],
+) -> Option<AttentionReason> {
+    if observations.is_empty() {
+        return None;
+    }
+
+    let warnings = observations
+        .iter()
+        .filter(|obs| obs.state == ServiceObservationState::Warning)
+        .count();
+    if warnings > 0 {
+        return Some(AttentionReason {
+            label: format!(
+                "{warnings} service warning{}",
+                if warnings == 1 { "" } else { "s" }
+            ),
+            level: "warn",
+            rank: 3,
+        });
+    }
+
+    let stale = observations
+        .iter()
+        .filter(|obs| obs.state == ServiceObservationState::Stale)
+        .count();
+    if stale > 0 {
+        return Some(AttentionReason {
+            label: format!("{stale} service stale{}", if stale == 1 { "" } else { "s" }),
+            level: "warn",
+            rank: 3,
+        });
+    }
+
+    let unknown = observations
+        .iter()
+        .filter(|obs| obs.state == ServiceObservationState::Unknown)
+        .count();
+    if unknown > 0 {
+        return Some(AttentionReason {
+            label: format!("{unknown} service unknown"),
+            level: "wait",
+            rank: 3,
+        });
+    }
+
+    None
+}
+
+fn service_observations_summary(observations: &[ServiceObservation]) -> serde_json::Value {
+    let mut healthy = 0;
+    let mut warning = 0;
+    let mut stale = 0;
+    let mut unknown = 0;
+    for observation in observations {
+        match observation.state {
+            ServiceObservationState::Healthy => healthy += 1,
+            ServiceObservationState::Warning => warning += 1,
+            ServiceObservationState::Stale => stale += 1,
+            ServiceObservationState::Unknown => unknown += 1,
+        }
+    }
+    let label = if observations.is_empty() {
+        "not observed".to_string()
+    } else if warning > 0 {
+        format!("{warning} warning{}", if warning == 1 { "" } else { "s" })
+    } else if stale > 0 {
+        format!("{stale} stale")
+    } else if unknown > 0 {
+        format!("{unknown} unknown")
+    } else {
+        "healthy".to_string()
+    };
+    json!({
+        "label": label,
+        "healthy": healthy,
+        "warning": warning,
+        "stale": stale,
+        "unknown": unknown,
+    })
+}
+
+fn attention_reason(
+    live: Liveness,
+    freshness: &NixFreshness,
+    observations: &[ServiceObservation],
+) -> AttentionReason {
     match live {
         Liveness::Down => AttentionReason {
             label: "silent heartbeat".to_string(),
@@ -1068,13 +1172,13 @@ fn attention_reason(live: Liveness, freshness: &NixFreshness) -> AttentionReason
             level: "wait",
             rank: 2,
         },
-        Liveness::Live => {
-            freshness_attention_reason(freshness).unwrap_or_else(|| AttentionReason {
+        Liveness::Live => freshness_attention_reason(freshness)
+            .or_else(|| service_observation_attention_reason(observations))
+            .unwrap_or_else(|| AttentionReason {
                 label: "all clear".to_string(),
                 level: "ok",
                 rank: 4,
-            })
-        }
+            }),
     }
 }
 
@@ -1573,7 +1677,7 @@ fn render_home(
     sorted.sort_by_key(|h| {
         let is_self = u8::from(h.name != self_name);
         let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        let rank = attention_reason(live, &h.freshness).rank;
+        let rank = attention_reason(live, &h.freshness, &h.service_observations).rank;
         (is_self, rank, h.name.clone())
     });
 
@@ -1598,7 +1702,7 @@ fn render_home(
         let attention = if is_self {
             self_attention_reason()
         } else {
-            attention_reason(live, &h.freshness)
+            attention_reason(live, &h.freshness, &h.service_observations)
         };
         let reason = reason_markup(&attention);
         let search = html_escape(&format!(
@@ -1767,6 +1871,7 @@ mod tests {
                 name: "csb1".to_string(),
                 role: "Control Server".to_string(),
                 is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
                 token_hash: None,
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
@@ -1775,11 +1880,13 @@ mod tests {
                     applicable: true,
                     ..Default::default()
                 },
+                service_observations: vec![],
             },
             Host {
                 name: "hades".to_string(),
                 role: "NixOS Host".to_string(),
                 is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
                 token_hash: None,
                 last_seen: Some(879),
                 heartbeat_log: vec![760, 819, 879],
@@ -1789,11 +1896,13 @@ mod tests {
                     flake_lock_age_days: Some(1),
                     commits_behind: Some(3),
                 },
+                service_observations: vec![],
             },
             Host {
                 name: "poseidon".to_string(),
                 role: "NixOS Host".to_string(),
                 is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
                 token_hash: None,
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
@@ -1803,6 +1912,7 @@ mod tests {
                     flake_lock_age_days: Some(1),
                     commits_behind: Some(3),
                 },
+                service_observations: vec![],
             },
         ];
 
@@ -1950,6 +2060,7 @@ mod tests {
             name: "poseidon".to_string(),
             role: "NixOS Host".to_string(),
             is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
             token_hash: None,
             last_seen: Some(970),
             heartbeat_log: vec![850, 910, 970],
@@ -1958,6 +2069,7 @@ mod tests {
                 applicable: true,
                 ..Default::default()
             },
+            service_observations: vec![],
         };
         let manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -1999,6 +2111,7 @@ mod tests {
             name: "ares".to_string(),
             role: "NixOS Host".to_string(),
             is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
             token_hash: Some("hash".to_string()),
             last_seen: None,
             heartbeat_log: vec![],
@@ -2007,6 +2120,7 @@ mod tests {
                 applicable: true,
                 ..Default::default()
             },
+            service_observations: vec![],
         };
         let lone = render_home(&[host], "csb1", 1000, &[], "local access", false);
         assert!(lone.contains(r#"<aside class="lone-state""#));
@@ -2048,6 +2162,7 @@ mod tests {
             name: "hsb8".to_string(),
             role: "NixOS Host".to_string(),
             is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
             token_hash: Some("stored-token-hash".to_string()),
             last_seen: Some(970),
             heartbeat_log: vec![910, 970],
@@ -2057,6 +2172,11 @@ mod tests {
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(1),
             },
+            service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(0),
+                commits_behind: Some(1),
+            })],
         };
 
         let payload = declared_hosts_payload(

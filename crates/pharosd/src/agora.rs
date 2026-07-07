@@ -526,6 +526,7 @@ mod tests {
             name: "hsb8".to_string(),
             role: "parents' home".to_string(),
             is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
             token_hash: Some("stored-token-hash".to_string()),
             last_seen: Some(crate::now_unix()),
             heartbeat_log: vec![],
@@ -535,6 +536,7 @@ mod tests {
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(0),
             },
+            service_observations: vec![],
         };
 
         let html = render_page(&[manifest()], &[runtime], None);

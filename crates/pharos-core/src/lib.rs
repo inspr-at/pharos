@@ -20,6 +20,9 @@ pub struct Host {
     pub name: String,
     pub role: String,
     pub is_nix: bool,
+    /// Latest report contract version observed from the beacon.
+    #[serde(default = "default_host_report_version")]
+    pub report_version: u16,
     /// SHA-256 hash of the per-host beacon token. The raw token is returned
     /// only at registration time and never rendered by the dashboard API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +36,10 @@ pub struct Host {
     /// Beacon's reported heartbeat cadence — drives the "expected next" pulse.
     pub heartbeat_interval_secs: Option<u64>,
     pub freshness: NixFreshness,
+    /// Non-secret service facts from the latest beacon report. Runtime only;
+    /// declared service intent stays in the manifest.
+    #[serde(default)]
+    pub service_observations: Vec<ServiceObservation>,
 }
 
 /// Nix freshness for a host (PHAROS-15): what it is "missing".
@@ -119,15 +126,89 @@ pub fn liveness(
     }
 }
 
+pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v1";
+pub const HOST_REPORT_VERSION: u16 = 1;
+
+fn default_host_report_schema() -> String {
+    HOST_REPORT_SCHEMA.to_string()
+}
+
+fn default_host_report_version() -> u16 {
+    HOST_REPORT_VERSION
+}
+
 /// What a `pharos-beacon` sends to `pharosd` (PHAROS-9 ingestion). The server
 /// adds the receive timestamp; the agent never sends its own liveness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostReport {
+    #[serde(default = "default_host_report_schema")]
+    pub schema: String,
+    #[serde(default = "default_host_report_version")]
+    pub version: u16,
     pub name: String,
     pub role: String,
     pub is_nix: bool,
     pub heartbeat_interval_secs: u64,
     pub freshness: NixFreshness,
+    #[serde(default)]
+    pub service_observations: Vec<ServiceObservation>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceObservationState {
+    Healthy,
+    Warning,
+    Stale,
+    Unknown,
+}
+
+impl ServiceObservationState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Warning => "warning",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Non-secret runtime observation about a service or host subsystem.
+/// Keep this intentionally coarse: stable id, human label, state, and summary.
+/// Do not include process lists, env vars, URLs with credentials, or raw probe
+/// payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceObservation {
+    pub id: String,
+    pub label: String,
+    pub state: ServiceObservationState,
+    pub summary: String,
+}
+
+impl ServiceObservation {
+    pub fn nix_freshness(freshness: &NixFreshness) -> Self {
+        let (state, summary) = if !freshness.applicable {
+            (ServiceObservationState::Unknown, "nix: n/a".to_string())
+        } else if freshness.flake_lock_age_days.is_none() || freshness.commits_behind.is_none() {
+            (
+                ServiceObservationState::Unknown,
+                "freshness partially observed".to_string(),
+            )
+        } else if freshness.flake_lock_age_days.unwrap_or(0) > 0
+            || freshness.commits_behind.unwrap_or(0) > 0
+        {
+            (ServiceObservationState::Warning, freshness.tldr())
+        } else {
+            (ServiceObservationState::Healthy, "up to date".to_string())
+        };
+        Self {
+            id: "nix-freshness".to_string(),
+            label: "Nix freshness".to_string(),
+            state,
+            summary,
+        }
+    }
 }
 
 /// What `inspr onboard` will send before installing `pharos-beacon` (PHAROS-7).
@@ -563,7 +644,28 @@ mod tests {
         .expect("deserialize old host json");
 
         assert_eq!(host.token_hash, None);
+        assert_eq!(host.report_version, HOST_REPORT_VERSION);
         assert!(host.heartbeat_log.is_empty());
+        assert!(host.service_observations.is_empty());
+    }
+
+    #[test]
+    fn nix_freshness_observation_is_coarse_and_non_secret() {
+        let warning = ServiceObservation::nix_freshness(&NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(2),
+            commits_behind: Some(0),
+        });
+        assert_eq!(warning.id, "nix-freshness");
+        assert_eq!(warning.state, ServiceObservationState::Warning);
+        assert_eq!(warning.summary, "flake.lock 2d old");
+
+        let healthy = ServiceObservation::nix_freshness(&NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+        });
+        assert_eq!(healthy.state, ServiceObservationState::Healthy);
     }
 
     #[test]

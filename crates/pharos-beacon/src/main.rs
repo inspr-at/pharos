@@ -14,7 +14,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pharos_core::{HostReport, NixFreshness};
+use pharos_core::{
+    HostReport, NixFreshness, ServiceObservation, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+};
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -134,12 +136,16 @@ fn main() {
         } else {
             NixFreshness::default()
         };
+        let service_observations = vec![ServiceObservation::nix_freshness(&freshness)];
         let report = HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
             name: host.clone(),
             role: role.clone(),
             is_nix,
             heartbeat_interval_secs: beat,
             freshness,
+            service_observations,
         };
         let body = serde_json::to_string(&report).expect("serialize report");
         let mut request = ureq::post(&endpoint).set("Content-Type", "application/json");
