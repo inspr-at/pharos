@@ -82,6 +82,29 @@ fn commits_behind(dir: &str) -> Option<u32> {
     String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
+fn freshness_log_summary(freshness: &NixFreshness) -> String {
+    if !freshness.applicable {
+        return "nix=n/a".to_string();
+    }
+
+    let age = freshness
+        .flake_lock_age_days
+        .map(|days| format!("{days}d"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let behind = freshness
+        .commits_behind
+        .map(|commits| commits.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("flake_lock_age={age}; commits_behind={behind}")
+}
+
+fn success_log_line(host: &str, endpoint: &str, status: u16, freshness: &NixFreshness) -> String {
+    format!(
+        "pharos-beacon: reported {host} -> {endpoint} (HTTP {status}; {})",
+        freshness_log_summary(freshness)
+    )
+}
+
 fn main() {
     let base = std::env::var("PHAROS_URL").unwrap_or_else(|_| "http://100.64.0.4:8088".into());
     let endpoint = format!("{}/report", base.trim_end_matches('/'));
@@ -125,8 +148,8 @@ fn main() {
         }
         match request.send_string(&body) {
             Ok(resp) => println!(
-                "pharos-beacon: reported {host} -> {endpoint} (HTTP {}) {body}",
-                resp.status()
+                "{}",
+                success_log_line(&host, &endpoint, resp.status(), &report.freshness)
             ),
             Err(e) => {
                 eprintln!("pharos-beacon: report to {endpoint} failed: {e}");
@@ -139,5 +162,46 @@ fn main() {
             Some(s) => std::thread::sleep(std::time::Duration::from_secs(s)),
             None => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn success_log_line_keeps_operational_context_without_report_body() {
+        let line = success_log_line(
+            "hsb8",
+            "http://pharos.example/report",
+            204,
+            &NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(1),
+                commits_behind: Some(0),
+            },
+        );
+
+        assert!(line.contains("hsb8"));
+        assert!(line.contains("http://pharos.example/report"));
+        assert!(line.contains("HTTP 204"));
+        assert!(line.contains("flake_lock_age=1d"));
+        assert!(line.contains("commits_behind=0"));
+        assert!(!line.contains("\"name\""));
+        assert!(!line.contains("heartbeat_interval_secs"));
+        assert!(!line.contains("freshness"));
+    }
+
+    #[test]
+    fn success_log_line_handles_non_nix_hosts() {
+        let line = success_log_line(
+            "hermes",
+            "http://pharos.example/report",
+            204,
+            &NixFreshness::default(),
+        );
+
+        assert!(line.contains("nix=n/a"));
+        assert!(!line.contains("\"applicable\""));
     }
 }
