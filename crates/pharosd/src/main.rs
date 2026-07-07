@@ -21,22 +21,22 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRef, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, Host,
-    HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
+    liveness, Host, HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
     ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
-    ServiceObservationState, liveness,
+    ServiceObservationState, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA,
+    HOST_REPORT_VERSION,
 };
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use url::Url;
 
 use crate::auth::{Auth, AuthState};
@@ -2376,11 +2376,8 @@ mod tests {
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains("No settings yet"));
         assert!(!html.contains("Not set up yet"));
-        assert!(
-            html.contains(
-                r#"<div class="reason self" data-reason><span>control light</span></div>"#
-            )
-        );
+        assert!(html
+            .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
         assert!(!html.contains("expected beat"));
         assert!(html.contains(r#"class="signal" data-signal data-signal-level="good""#));
         assert!(html.contains(r#"<span data-signal-percent>100%</span>"#));
@@ -2700,11 +2697,9 @@ mod tests {
             payload["declared_hosts"][0]["runtime"]["server_probes_summary"]["label"],
             "server reachable"
         );
-        assert!(
-            payload["declared_hosts"][0]["declared"]["services"][0]
-                .get("server_probes")
-                .is_none()
-        );
+        assert!(payload["declared_hosts"][0]["declared"]["services"][0]
+            .get("server_probes")
+            .is_none());
     }
 
     #[test]

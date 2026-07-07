@@ -180,7 +180,7 @@ fn trim_heartbeat_log(log: &mut Vec<UnixSeconds>, now: UnixSeconds) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pharos_core::{HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, NixFreshness};
+    use pharos_core::{NixFreshness, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION};
 
     #[test]
     fn record_retains_recent_real_heartbeat_events() {
