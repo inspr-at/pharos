@@ -4,6 +4,7 @@
   # wasm target get added when the Leptos UI lands (PHAROS-10).
   packages = with pkgs; [
     cargo
+    cargo-deny
     rustc
     clippy
     rustfmt

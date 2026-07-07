@@ -18,4 +18,4 @@ sha2 = "0.10"
 # OIDC (Authorization Code + PKCE) against Zitadel (PHAROS-4). Default features
 # pull reqwest + rustls (ring), so no system OpenSSL — but ring needs a C
 # compiler, hence the non-slim build stage in the Dockerfile.
-openidconnect = "3"
+openidconnect = "4"

@@ -1,0 +1,39 @@
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "Pharos is an OIDC relying party and uses openidconnect/rsa only for public-key ID-token signature verification; it does not perform RSA private-key operations where the Marvin timing side channel applies." },
+]
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "allow"
+highlight = "simplest-path"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = [
+  { crate = "base64@0.21.7", reason = "reqwest/oauth2 still carries base64 0.21 while pharos-beacon's ureq carries base64 0.22; accepted until either stack converges." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

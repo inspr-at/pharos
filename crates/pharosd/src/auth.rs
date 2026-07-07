@@ -26,16 +26,25 @@ use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
     CoreUserInfoClaims,
 };
-use openidconnect::reqwest::async_http_client;
+use openidconnect::reqwest;
 use openidconnect::{
-    AccessToken, AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, IssuerUrl, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
-    SubjectIdentifier, TokenResponse,
+    AccessToken, AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, SubjectIdentifier, TokenResponse,
 };
 
 const SESSION_COOKIE: &str = "pharos_session";
 const SESSION_TTL_SECS: i64 = 8 * 3600;
 const FLOW_TTL_SECS: i64 = 600;
+
+type OidcClient = CoreClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -73,7 +82,8 @@ pub struct Auth {
     issuer: IssuerUrl,
     client_id: ClientId,
     redirect: RedirectUrl,
-    client: Mutex<CoreClient>,
+    http_client: reqwest::Client,
+    client: Mutex<OidcClient>,
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, Session>>,
 }
@@ -93,21 +103,33 @@ impl Auth {
         let issuer_url = IssuerUrl::new(issuer.clone()).expect("PHAROS_OIDC_ISSUER is not a URL");
         let client_id = ClientId::new(client_id);
         let redirect = RedirectUrl::new(redirect).expect("PHAROS_OIDC_REDIRECT_URI is not a URL");
-        let client = discover_client(issuer_url.clone(), client_id.clone(), redirect.clone())
-            .await
-            .expect("OIDC discovery failed (issuer unreachable?)");
+        let http_client = reqwest::ClientBuilder::new()
+            // OIDC 4 requires a stateful client; redirects must stay disabled
+            // to avoid SSRF through provider-controlled endpoints.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("OIDC HTTP client builds");
+        let client = discover_client(
+            issuer_url.clone(),
+            client_id.clone(),
+            redirect.clone(),
+            &http_client,
+        )
+        .await
+        .expect("OIDC discovery failed (issuer unreachable?)");
         tracing::info!("OIDC auth enabled (issuer {issuer})");
         Some(Arc::new(Auth {
             issuer: issuer_url,
             client_id,
             redirect,
+            http_client,
             client: Mutex::new(client),
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
         }))
     }
 
-    fn client(&self) -> CoreClient {
+    fn client(&self) -> OidcClient {
         self.client.lock().expect("client lock").clone()
     }
 
@@ -119,6 +141,7 @@ impl Auth {
             self.issuer.clone(),
             self.client_id.clone(),
             self.redirect.clone(),
+            &self.http_client,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -128,7 +151,7 @@ impl Auth {
 
     fn verify_id_token_identity(
         &self,
-        client: &CoreClient,
+        client: &OidcClient,
         id_token: &CoreIdToken,
         nonce: &Nonce,
     ) -> Result<LoginIdentity, ClaimsVerificationError> {
@@ -227,7 +250,8 @@ fn display_name_from_user_info(claims: &CoreUserInfoClaims) -> Option<String> {
 }
 
 async fn enrich_identity_from_user_info(
-    client: &CoreClient,
+    client: &OidcClient,
+    http_client: &reqwest::Client,
     access_token: AccessToken,
     identity: &mut LoginIdentity,
 ) {
@@ -239,7 +263,7 @@ async fn enrich_identity_from_user_info(
         }
     };
 
-    match request.request_async(async_http_client).await {
+    match request.request_async(http_client).await {
         Ok(user_info) => {
             if let Some(display_name) = display_name_from_user_info(&user_info) {
                 identity.display_name = display_name;
@@ -255,8 +279,9 @@ async fn discover_client(
     issuer: IssuerUrl,
     client_id: ClientId,
     redirect: RedirectUrl,
-) -> Result<CoreClient, Box<dyn std::error::Error + Send + Sync>> {
-    let metadata = CoreProviderMetadata::discover_async(issuer, async_http_client).await?;
+    http_client: &reqwest::Client,
+) -> Result<OidcClient, Box<dyn std::error::Error + Send + Sync>> {
+    let metadata = CoreProviderMetadata::discover_async(issuer, http_client).await?;
     Ok(CoreClient::from_provider_metadata(metadata, client_id, None).set_redirect_uri(redirect))
 }
 
@@ -338,10 +363,20 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
     };
 
     let client = auth.client();
-    let token = match client
-        .exchange_code(AuthorizationCode::new(code))
+    let token_request = match client.exchange_code(AuthorizationCode::new(code)) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::warn!("OIDC token endpoint unavailable: {e}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "login temporarily unavailable; please retry",
+            )
+                .into_response();
+        }
+    };
+    let token = match token_request
         .set_pkce_verifier(pending.verifier)
-        .request_async(async_http_client)
+        .request_async(&auth.http_client)
         .await
     {
         Ok(t) => t,
@@ -392,7 +427,13 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
                 .into_response();
         }
     };
-    enrich_identity_from_user_info(&client, token.access_token().to_owned(), &mut identity).await;
+    enrich_identity_from_user_info(
+        &client,
+        &auth.http_client,
+        token.access_token().to_owned(),
+        &mut identity,
+    )
+    .await;
 
     let sid = CsrfToken::new_random().secret().clone();
     auth.sessions.lock().expect("sessions lock").insert(
