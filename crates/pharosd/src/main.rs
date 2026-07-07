@@ -896,12 +896,7 @@ async fn report(
         );
         return StatusCode::BAD_REQUEST;
     }
-    let host_has_token = state.store.has_token(&rep.name);
-    if host_has_token || state.beacon_auth.require_report_token {
-        let Some(token) = bearer_token(&headers) else {
-            tracing::warn!(host = %rep.name, "report rejected: missing bearer token");
-            return StatusCode::UNAUTHORIZED;
-        };
+    if let Some(token) = bearer_token(&headers) {
         let expected_hash = token_hash(token);
         let valid = state
             .store
@@ -911,10 +906,13 @@ async fn report(
             tracing::warn!(host = %rep.name, "report rejected: invalid bearer token");
             return StatusCode::UNAUTHORIZED;
         }
+    } else if state.beacon_auth.require_report_token {
+        tracing::warn!(host = %rep.name, "report rejected: missing bearer token");
+        return StatusCode::UNAUTHORIZED;
     } else {
         tracing::warn!(
             host = %rep.name,
-            "accepting legacy unauthenticated report; register a per-host token to enforce PHAROS-8"
+            "accepting legacy unauthenticated report; migrate this host to PHAROS_TOKEN before enabling strict report auth"
         );
     }
     tracing::info!(host = %rep.name, "report received");
@@ -2777,6 +2775,133 @@ mod tests {
             sanitized_probe_target(&url),
             "https://example.test:8443/path"
         );
+    }
+
+    fn report_test_state(require_report_token: bool) -> AppState {
+        AppState {
+            store: Arc::new(Store::new(None)),
+            manifests: Arc::new(ManifestRegistry::default()),
+            auth: None,
+            beacon_auth: BeaconAuth {
+                registration_token: None,
+                require_report_token,
+            },
+        }
+    }
+
+    fn test_report(host: &str) -> HostReport {
+        HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
+            name: host.to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            heartbeat_interval_secs: 60,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            service_observations: vec![],
+        }
+    }
+
+    fn register_test_token(state: &AppState, host: &str, token: &str) {
+        state.store.register(
+            HostRegistration {
+                name: host.to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: 60,
+            },
+            token_hash(token),
+        );
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}"))
+                .expect("valid bearer header"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn report_accepts_registered_host_without_token_when_strict_disabled() {
+        let state = report_test_state(false);
+        register_test_token(&state, "ares", "valid-token");
+
+        let status = report(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state
+            .store
+            .list()
+            .into_iter()
+            .find(|host| host.name == "ares")
+            .and_then(|host| host.last_seen)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn report_accepts_valid_token_when_strict_disabled() {
+        let state = report_test_state(false);
+        register_test_token(&state, "ares", "valid-token");
+
+        let status = report(
+            State(state),
+            bearer_headers("valid-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn report_rejects_invalid_token_even_when_strict_disabled() {
+        let state = report_test_state(false);
+        register_test_token(&state, "ares", "valid-token");
+
+        let status = report(
+            State(state),
+            bearer_headers("wrong-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn report_rejects_missing_token_when_strict_enabled() {
+        let state = report_test_state(true);
+        register_test_token(&state, "ares", "valid-token");
+
+        let status = report(State(state), HeaderMap::new(), Json(test_report("ares"))).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn report_accepts_valid_token_when_strict_enabled() {
+        let state = report_test_state(true);
+        register_test_token(&state, "ares", "valid-token");
+
+        let status = report(
+            State(state),
+            bearer_headers("valid-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

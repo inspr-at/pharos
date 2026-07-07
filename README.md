@@ -146,10 +146,13 @@ curl -sS -H 'Authorization: Bearer dev' \
 ```
 
 `pharos-beacon` sends that token as `PHAROS_TOKEN`, or reads it from
-`PHAROS_TOKEN_FILE` when configured. `POST /report` requires a valid token for
-registered hosts. Set `PHAROS_REQUIRE_BEACON_TOKEN=1` to reject legacy
-unregistered reports; by default that becomes true when
-`PHAROS_REGISTRATION_TOKEN` is configured.
+`PHAROS_TOKEN_FILE` when configured. When
+`PHAROS_REQUIRE_BEACON_TOKEN=0`, `/report` accepts legacy reports without a
+bearer token even if the host already has a stored token hash, while still
+rejecting an explicitly wrong bearer token. Set
+`PHAROS_REQUIRE_BEACON_TOKEN=1` to reject reports that do not present a valid
+per-host token; by default that becomes true when `PHAROS_REGISTRATION_TOKEN`
+is configured.
 
 Production is still rolling toward strict token-only report ingestion. Do not
 enable strict mode until every deployed beacon has a per-host `PHAROS_TOKEN` and
