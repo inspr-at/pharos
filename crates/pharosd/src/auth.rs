@@ -36,6 +36,7 @@ use openidconnect::{
 const SESSION_COOKIE: &str = "pharos_session";
 const SESSION_TTL_SECS: i64 = 8 * 3600;
 const FLOW_TTL_SECS: i64 = 600;
+const ALLOWED_OPERATORS_ENV: &str = "PHAROS_ALLOWED_OPERATORS";
 
 type OidcClient = CoreClient<
     EndpointSet,
@@ -69,6 +70,7 @@ pub struct AuthUser {
 struct LoginIdentity {
     subject: SubjectIdentifier,
     display_name: String,
+    identifiers: Vec<String>,
 }
 
 struct Session {
@@ -84,6 +86,7 @@ pub struct Auth {
     redirect: RedirectUrl,
     http_client: reqwest::Client,
     client: Mutex<OidcClient>,
+    operator_policy: OperatorPolicy,
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, Session>>,
 }
@@ -109,6 +112,7 @@ impl Auth {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("OIDC HTTP client builds");
+        let operator_policy = OperatorPolicy::from_env();
         let client = discover_client(
             issuer_url.clone(),
             client_id.clone(),
@@ -118,12 +122,20 @@ impl Auth {
         .await
         .expect("OIDC discovery failed (issuer unreachable?)");
         tracing::info!("OIDC auth enabled (issuer {issuer})");
+        if operator_policy.is_enforced() {
+            tracing::info!("Pharos operator authorization enabled");
+        } else {
+            tracing::warn!(
+                "{ALLOWED_OPERATORS_ENV} is not configured; all authenticated OIDC users are allowed"
+            );
+        }
         Some(Arc::new(Auth {
             issuer: issuer_url,
             client_id,
             redirect,
             http_client,
             client: Mutex::new(client),
+            operator_policy,
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
         }))
@@ -163,10 +175,20 @@ impl Auth {
             .set_other_audience_verifier_fn(|_aud| true);
         let claims = id_token.claims(&verifier, nonce)?;
         let subject = claims.subject().clone();
-        Ok(LoginIdentity {
+        let mut identity = LoginIdentity {
             display_name: display_name_from_claims(claims, subject.as_str()),
             subject,
-        })
+            identifiers: Vec::new(),
+        };
+        let subject_identifier = identity.subject.as_str().to_string();
+        identity.add_identifier(&subject_identifier);
+        if let Some(username) = claims.preferred_username() {
+            identity.add_identifier(username.as_str());
+        }
+        if let Some(email) = claims.email() {
+            identity.add_identifier(email.as_str());
+        }
+        Ok(identity)
     }
 
     fn sweep(&self) {
@@ -203,6 +225,59 @@ impl Auth {
                 display_name: s.display_name.clone(),
             })
     }
+}
+
+#[derive(Clone)]
+struct OperatorPolicy {
+    allowed: Vec<String>,
+}
+
+impl OperatorPolicy {
+    fn from_env() -> Self {
+        Self::from_raw(std::env::var(ALLOWED_OPERATORS_ENV).ok().as_deref())
+    }
+
+    fn from_raw(raw: Option<&str>) -> Self {
+        let allowed = raw
+            .into_iter()
+            .flat_map(|value| value.split([',', ' ', '\n', '\t']))
+            .filter_map(normalize_identifier)
+            .fold(Vec::new(), |mut acc, item| {
+                if !acc.contains(&item) {
+                    acc.push(item);
+                }
+                acc
+            });
+        Self { allowed }
+    }
+
+    fn is_enforced(&self) -> bool {
+        !self.allowed.is_empty()
+    }
+
+    fn allows(&self, identity: &LoginIdentity) -> bool {
+        !self.is_enforced()
+            || identity
+                .identifiers
+                .iter()
+                .any(|identifier| self.allowed.contains(identifier))
+    }
+}
+
+impl LoginIdentity {
+    fn add_identifier(&mut self, value: &str) {
+        let Some(value) = normalize_identifier(value) else {
+            return;
+        };
+        if !self.identifiers.contains(&value) {
+            self.identifiers.push(value);
+        }
+    }
+}
+
+fn normalize_identifier(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
 }
 
 fn clean_display_name(value: &str) -> Option<String> {
@@ -249,6 +324,16 @@ fn display_name_from_user_info(claims: &CoreUserInfoClaims) -> Option<String> {
         })
 }
 
+fn add_user_info_identifiers(claims: &CoreUserInfoClaims, identity: &mut LoginIdentity) {
+    identity.add_identifier(claims.subject().as_str());
+    if let Some(username) = claims.preferred_username() {
+        identity.add_identifier(username.as_str());
+    }
+    if let Some(email) = claims.email() {
+        identity.add_identifier(email.as_str());
+    }
+}
+
 async fn enrich_identity_from_user_info(
     client: &OidcClient,
     http_client: &reqwest::Client,
@@ -265,6 +350,7 @@ async fn enrich_identity_from_user_info(
 
     match request.request_async(http_client).await {
         Ok(user_info) => {
+            add_user_info_identifiers(&user_info, identity);
             if let Some(display_name) = display_name_from_user_info(&user_info) {
                 identity.display_name = display_name;
             }
@@ -434,6 +520,10 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
         &mut identity,
     )
     .await;
+    if !auth.operator_policy.allows(&identity) {
+        tracing::warn!("OIDC login denied by Pharos operator policy");
+        return forbidden().into_response();
+    }
 
     let sid = CsrfToken::new_random().secret().clone();
     auth.sessions.lock().expect("sessions lock").insert(
@@ -453,6 +543,24 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
             .expect("cookie header"),
     );
     (headers, Redirect::temporary("/")).into_response()
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (
+                header::CACHE_CONTROL,
+                "no-store, no-cache, max-age=0, must-revalidate",
+            ),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+        ],
+        Html(
+            r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Access denied · Pharos</title><style>:root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#1f7fb5}*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}main{width:min(420px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}h1{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}p{margin:0 0 20px;color:var(--muted)}a{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 16px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}</style></head><body><main><h1>Access denied</h1><p>Your login succeeded, but this Pharos instance has not granted you operator access.</p><a href="/auth/logout">Sign out</a></main></body></html>"#,
+        ),
+    )
+        .into_response()
 }
 
 /// `GET /auth/logout` — drop the session and clear the cookie.
@@ -557,5 +665,65 @@ mod tests {
             display_name_from_user_info(&user_info),
             Some("markus".to_string())
         );
+    }
+
+    #[test]
+    fn operator_policy_allows_when_not_configured() {
+        let identity = LoginIdentity {
+            subject: SubjectIdentifier::new("subject-1".to_string()),
+            display_name: "markus".to_string(),
+            identifiers: vec!["subject-1".to_string()],
+        };
+
+        assert!(OperatorPolicy::from_raw(None).allows(&identity));
+    }
+
+    #[test]
+    fn operator_policy_allows_configured_username_or_email() {
+        let mut identity = LoginIdentity {
+            subject: SubjectIdentifier::new("subject-1".to_string()),
+            display_name: "markus".to_string(),
+            identifiers: Vec::new(),
+        };
+        identity.add_identifier("subject-1");
+        identity.add_identifier("Markus");
+        identity.add_identifier("markus@example.invalid");
+
+        assert!(OperatorPolicy::from_raw(Some("markus")).allows(&identity));
+        assert!(OperatorPolicy::from_raw(Some("other, markus@example.invalid")).allows(&identity));
+    }
+
+    #[test]
+    fn operator_policy_denies_unknown_operator() {
+        let mut identity = LoginIdentity {
+            subject: SubjectIdentifier::new("subject-1".to_string()),
+            display_name: "markus".to_string(),
+            identifiers: Vec::new(),
+        };
+        identity.add_identifier("subject-1");
+        identity.add_identifier("markus");
+
+        assert!(!OperatorPolicy::from_raw(Some("athena")).allows(&identity));
+    }
+
+    #[test]
+    fn userinfo_extends_operator_identifiers() {
+        let mut identity = LoginIdentity {
+            subject: SubjectIdentifier::new("opaque-subject".to_string()),
+            display_name: "opaque-subject".to_string(),
+            identifiers: vec!["opaque-subject".to_string()],
+        };
+        let user_info = user_info(
+            r#"{
+                "sub": "opaque-subject",
+                "preferred_username": "markus",
+                "email": "markus@example.invalid"
+            }"#,
+        );
+
+        add_user_info_identifiers(&user_info, &mut identity);
+
+        assert!(OperatorPolicy::from_raw(Some("markus")).allows(&identity));
+        assert!(OperatorPolicy::from_raw(Some("markus@example.invalid")).allows(&identity));
     }
 }

@@ -27,8 +27,8 @@ than the long-term ADR target:
   Leptos remains the ADR direction if the dashboard grows beyond this thin
   surface; it is not required for the accepted July 2026 v1 dashboard.
 - Auth: Zitadel OIDC for human routes when OIDC env is configured. Local/dev is
-  open when those env vars are absent. Pharos-side operator authorization is
-  tracked separately in PPM.
+  open when those env vars are absent. `PHAROS_ALLOWED_OPERATORS` can then
+  restrict authenticated users to explicit Pharos operators.
 - Machine auth: local MVP bearer tokens via `/register` + `PHAROS_TOKEN`.
   Janus Forge/Warden migration remains later.
 
@@ -91,10 +91,24 @@ Production is still rolling toward strict token-only report ingestion. Do not
 enable strict mode until every deployed beacon has a per-host `PHAROS_TOKEN` and
 the persisted host state has token hashes for those hosts.
 
+## Operator authorization
+
+When OIDC is enabled, set `PHAROS_ALLOWED_OPERATORS` to a comma- or
+space-separated allowlist. Entries match normalized OIDC subject,
+`preferred_username`, or email claims collected from the ID token/UserInfo.
+
+```bash
+PHAROS_ALLOWED_OPERATORS=markus cargo run -p pharosd
+```
+
+If OIDC is configured and the allowlist is absent, Pharos keeps compatibility
+mode and allows all authenticated users. Production should set the allowlist
+explicitly before adding broader operator access or sensitive controls.
+
 ## Route boundaries
 
 - Human routes: `/`, `/hosts.json`, `/agora`, and Agora proposal APIs are gated
-  by OIDC when auth is configured.
+  by OIDC and the Pharos operator policy when auth is configured.
 - Public/machine routes: `/healthz`, `/version`, `/assets/*`, `/auth/*`,
   `/declared-hosts.json`, `/register`, and `/report`.
 - `/declared-hosts.json` is declaration plus runtime overlay; the manifest stays
