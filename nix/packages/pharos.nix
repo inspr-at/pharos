@@ -1,0 +1,32 @@
+{
+  lib,
+  rustPlatform,
+  src ? lib.cleanSource ../..,
+  binaryName,
+  cargoPackage ? binaryName,
+}:
+
+rustPlatform.buildRustPackage {
+  pname = binaryName;
+  version = "0.0.1";
+
+  inherit src;
+
+  cargoLock.lockFile = src + "/Cargo.lock";
+  cargoBuildFlags = [
+    "-p"
+    cargoPackage
+  ];
+  cargoTestFlags = [
+    "-p"
+    cargoPackage
+  ];
+
+  meta = {
+    description = "Pharos fleet management binary: ${binaryName}";
+    homepage = "https://github.com/markus-barta/pharos";
+    license = lib.licenses.mit;
+    mainProgram = binaryName;
+    maintainers = [ ];
+  };
+}

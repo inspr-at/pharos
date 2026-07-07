@@ -83,6 +83,35 @@ The optional `pharos-beacon` profile reports to the local `pharosd` service.
 For strict-token local tests, register a host and provide `PHAROS_TOKEN` from an
 untracked local environment; never commit token values.
 
+### Native NixOS beacon
+
+The flake exports a package and NixOS module for replacing the interim Docker
+beacon with a native systemd service:
+
+```nix
+{
+  inputs.pharos.url = "github:markus-barta/pharos";
+  inputs.pharos.inputs.nixpkgs.follows = "nixpkgs";
+}
+```
+
+```nix
+{
+  imports = [ inputs.pharos.nixosModules.pharos-beacon ];
+
+  services.pharos-beacon = {
+    enable = true;
+    tokenEnvironmentFile = "/run/agenix/pharos-beacon-env";
+    nixcfgDir = "/home/mba/Code/nixcfg";
+  };
+}
+```
+
+`tokenEnvironmentFile` must contain `PHAROS_TOKEN=...` and should be produced by
+agenix or another runtime secret source. During the temporary PHAROS-37 rollout,
+`allowLegacyReports = true` can run the service without a token, but that should
+not be used for final production enforcement.
+
 ## Beacon tokens
 
 `POST /register` is the local MVP token issuer. Set
