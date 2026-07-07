@@ -25,6 +25,8 @@ jobs:
         run: cargo install cargo-deny --version 0.19.9 --locked
       - name: dependency audit
         run: cargo deny check
+      - name: shell syntax
+        run: bash -n scripts/install-pharos-beacon-systemd.sh
       - name: build
         run: cargo build --all --locked
       - name: test

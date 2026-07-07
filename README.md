@@ -112,6 +112,23 @@ agenix or another runtime secret source. During the temporary PHAROS-37 rollout,
 `allowLegacyReports = true` can run the service without a token, but that should
 not be used for final production enforcement.
 
+### Portable non-Nix beacon
+
+Non-Nix Linux hosts can install the beacon as a native systemd service without
+Docker:
+
+```bash
+sudo ./scripts/install-pharos-beacon-systemd.sh \
+  --binary ./pharos-beacon \
+  --token-env /etc/pharos/pharos-beacon.env \
+  --host ares
+```
+
+The installer also accepts `--binary-url` for a prebuilt binary. It never creates
+or prints token values; the env file must already exist and contain
+`PHAROS_TOKEN=...`, unless `--allow-legacy` is passed for the temporary PHAROS-37
+rollout window.
+
 ## Beacon tokens
 
 `POST /register` is the local MVP token issuer. Set
