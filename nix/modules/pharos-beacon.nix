@@ -22,6 +22,9 @@ let
   // lib.optionalAttrs (cfg.nixcfgDir != null) {
     NIXCFG_DIR = cfg.nixcfgDir;
   }
+  // lib.optionalAttrs (cfg.tokenFile != null) {
+    PHAROS_TOKEN_FILE = cfg.tokenFile;
+  }
   // cfg.extraEnvironment;
 in
 {
@@ -77,6 +80,17 @@ in
       '';
     };
 
+    tokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/run/agenix/pharos-beacon-token";
+      description = ''
+        Runtime file containing only the raw beacon token. Prefer this for
+        agenix-backed deployments when possible. Do not place raw token values
+        in Nix.
+      '';
+    };
+
     allowLegacyReports = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -108,10 +122,11 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.tokenEnvironmentFile != null || cfg.allowLegacyReports;
+        assertion = cfg.tokenEnvironmentFile != null || cfg.tokenFile != null || cfg.allowLegacyReports;
         message = ''
-          services.pharos-beacon requires tokenEnvironmentFile unless
-          allowLegacyReports = true is set explicitly for the PHAROS-37 rollout.
+          services.pharos-beacon requires tokenFile or tokenEnvironmentFile
+          unless allowLegacyReports = true is set explicitly for the PHAROS-37
+          rollout.
         '';
       }
     ];

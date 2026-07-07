@@ -38,6 +38,23 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+fn bearer_token() -> Option<String> {
+    std::env::var("PHAROS_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let path = std::env::var("PHAROS_TOKEN_FILE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())?;
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
 /// Locate a flake checkout (one containing flake.lock).
 fn nixcfg_dir() -> Option<String> {
     if let Ok(d) = std::env::var("NIXCFG_DIR") {
@@ -116,9 +133,7 @@ fn main() {
     let is_nix = Path::new("/etc/NIXOS").exists();
     let dir = nixcfg_dir();
     let role = std::env::var("PHAROS_ROLE").unwrap_or_else(|_| "server".into());
-    let token = std::env::var("PHAROS_TOKEN")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let token = bearer_token();
 
     // PHAROS_INTERVAL (secs) set => loop forever (recurring service);
     // unset => report once and exit (one-shot / timer-driven).
@@ -211,5 +226,21 @@ mod tests {
 
         assert!(line.contains("nix=n/a"));
         assert!(!line.contains("\"applicable\""));
+    }
+
+    #[test]
+    fn bearer_token_prefers_env_over_file_and_trims() {
+        let temp = std::env::temp_dir().join(format!("pharos-token-test-{}", std::process::id()));
+        std::fs::write(&temp, "file-token\n").expect("write token fixture");
+        std::env::set_var("PHAROS_TOKEN", " env-token ");
+        std::env::set_var("PHAROS_TOKEN_FILE", &temp);
+
+        assert_eq!(bearer_token(), Some("env-token".to_string()));
+
+        std::env::remove_var("PHAROS_TOKEN");
+        assert_eq!(bearer_token(), Some("file-token".to_string()));
+
+        std::env::remove_var("PHAROS_TOKEN_FILE");
+        let _ = std::fs::remove_file(temp);
     }
 }

@@ -101,16 +101,17 @@ beacon with a native systemd service:
 
   services.pharos-beacon = {
     enable = true;
-    tokenEnvironmentFile = "/run/agenix/pharos-beacon-env";
+    tokenFile = "/run/agenix/pharos-beacon-token";
     nixcfgDir = "/home/mba/Code/nixcfg";
   };
 }
 ```
 
-`tokenEnvironmentFile` must contain `PHAROS_TOKEN=...` and should be produced by
-agenix or another runtime secret source. During the temporary PHAROS-37 rollout,
-`allowLegacyReports = true` can run the service without a token, but that should
-not be used for final production enforcement.
+`tokenFile` should be produced by agenix or another runtime secret source and
+contain only the raw token. `tokenEnvironmentFile` is still supported when an env
+file with `PHAROS_TOKEN=...` is more practical. During the temporary PHAROS-37
+rollout, `allowLegacyReports = true` can run the service without a token, but
+that should not be used for final production enforcement.
 
 ### Portable non-Nix beacon
 
@@ -120,14 +121,13 @@ Docker:
 ```bash
 sudo ./scripts/install-pharos-beacon-systemd.sh \
   --binary ./pharos-beacon \
-  --token-env /etc/pharos/pharos-beacon.env \
+  --token-file /etc/pharos/pharos-beacon.token \
   --host ares
 ```
 
 The installer also accepts `--binary-url` for a prebuilt binary. It never creates
-or prints token values; the env file must already exist and contain
-`PHAROS_TOKEN=...`, unless `--allow-legacy` is passed for the temporary PHAROS-37
-rollout window.
+or prints token values; the token file or env file must already exist unless
+`--allow-legacy` is passed for the temporary PHAROS-37 rollout window.
 
 ## Beacon tokens
 
@@ -145,9 +145,10 @@ curl -sS -H 'Authorization: Bearer dev' \
   http://127.0.0.1:8080/register
 ```
 
-`pharos-beacon` sends that token as `PHAROS_TOKEN`. `POST /report` requires a
-valid token for registered hosts. Set `PHAROS_REQUIRE_BEACON_TOKEN=1` to reject
-legacy unregistered reports; by default that becomes true when
+`pharos-beacon` sends that token as `PHAROS_TOKEN`, or reads it from
+`PHAROS_TOKEN_FILE` when configured. `POST /report` requires a valid token for
+registered hosts. Set `PHAROS_REQUIRE_BEACON_TOKEN=1` to reject legacy
+unregistered reports; by default that becomes true when
 `PHAROS_REGISTRATION_TOKEN` is configured.
 
 Production is still rolling toward strict token-only report ingestion. Do not

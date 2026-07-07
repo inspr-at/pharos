@@ -3,16 +3,17 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install-pharos-beacon-systemd.sh --binary PATH|--binary-url URL --token-env PATH [options]
+Usage: install-pharos-beacon-systemd.sh --binary PATH|--binary-url URL --token-env PATH|--token-file PATH [options]
 
 Installs pharos-beacon as a native systemd service on non-Nix Linux hosts.
-The token env file must already exist and contain PHAROS_TOKEN=... unless
---allow-legacy is set for the temporary PHAROS-37 rollout window.
+The token env/file must already exist unless --allow-legacy is set for the
+temporary PHAROS-37 rollout window.
 
 Options:
   --binary PATH          Local pharos-beacon binary to install.
   --binary-url URL       Download pharos-beacon binary from URL.
   --token-env PATH       Runtime env file containing PHAROS_TOKEN=...
+  --token-file PATH      Runtime file containing only the raw token.
   --allow-legacy         Allow install without token env file.
   --pharos-url URL       pharosd base URL (default: http://100.64.0.4:8088).
   --host NAME            Reported host name (default: hostname -s).
@@ -50,6 +51,7 @@ systemd_quote() {
 binary=""
 binary_url=""
 token_env=""
+token_file=""
 allow_legacy=0
 pharos_url="${PHAROS_URL:-http://100.64.0.4:8088}"
 host="${PHAROS_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
@@ -85,6 +87,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --token-env=*)
       token_env="${1#--token-env=}"
+      shift
+      ;;
+    --token-file)
+      token_file="${2:-}"
+      shift 2
+      ;;
+    --token-file=*)
+      token_file="${1#--token-file=}"
       shift
       ;;
     --allow-legacy)
@@ -172,6 +182,8 @@ done
 [[ "$service_user" =~ ^[A-Za-z_][A-Za-z0-9_-]*[$]?$ ]] || die "--user contains unsupported characters"
 [[ "$prefix" = /* ]] || die "--prefix must be absolute"
 [[ -z "$token_env" || "$token_env" = /* ]] || die "--token-env must be absolute"
+[[ -z "$token_file" || "$token_file" = /* ]] || die "--token-file must be absolute"
+[[ -z "$token_env" || -z "$token_file" ]] || die "set only one of --token-env or --token-file"
 [[ -z "$nixcfg_dir" || "$nixcfg_dir" = /* ]] || die "--nixcfg-dir must be absolute"
 
 validate_no_newline "PHAROS_URL" "$pharos_url"
@@ -182,8 +194,11 @@ validate_no_newline "NIXCFG_DIR" "$nixcfg_dir"
 if [[ -n "$token_env" && ! -r "$token_env" ]]; then
   die "token env file is not readable: $token_env"
 fi
-if [[ -z "$token_env" && "$allow_legacy" -ne 1 ]]; then
-  die "set --token-env or explicitly pass --allow-legacy"
+if [[ -n "$token_file" && ! -r "$token_file" ]]; then
+  die "token file is not readable: $token_file"
+fi
+if [[ -z "$token_env" && -z "$token_file" && "$allow_legacy" -ne 1 ]]; then
+  die "set --token-env, --token-file, or explicitly pass --allow-legacy"
 fi
 if [[ -n "$binary" && ! -x "$binary" ]]; then
   die "binary is not executable: $binary"
@@ -214,6 +229,9 @@ EOF
   fi
   if [[ -n "$token_env" ]]; then
     echo "EnvironmentFile=$token_env"
+  fi
+  if [[ -n "$token_file" ]]; then
+    echo "Environment=PHAROS_TOKEN_FILE=$(systemd_quote "$token_file")"
   fi
   cat <<EOF
 ExecStart=$install_path
