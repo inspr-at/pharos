@@ -1,13 +1,53 @@
-# Pharos deployment (PHAROS-12). Bound to localhost — a reverse proxy /
-# Tailscale fronts it; not publicly exposed until Zitadel auth (PHAROS-4).
+# Local-only Pharos topology for development smoke tests.
+#
+# Production compose is owned by nixcfg (hosts/csb1/docker/docker-compose.yml)
+# and uses GHCR images, Traefik, Zitadel OIDC, operator allowlists, tailnet
+# ports, manifests, backups, and eventually strict beacon tokens. Do not copy
+# this file to production.
+#
+# Secrets are intentionally not committed here. If you need to test strict
+# token behavior locally, export PHAROS_REGISTRATION_TOKEN / PHAROS_TOKEN in
+# your shell or use an untracked local env file.
+
+name: pharos-local
+
 services:
   pharosd:
     build: .
-    image: pharosd:latest
-    container_name: pharosd
+    image: pharosd:local
+    container_name: pharosd-local
     restart: unless-stopped
     environment:
       PHAROS_ADDR: 0.0.0.0:8080
       RUST_LOG: info
+      PHAROS_DB: /data/pharos.json
+      # Optional: mount a local manifest directory and set, for example:
+      # PHAROS_MANIFEST_PATHS: /manifests/hsb8.json
+      # OIDC/operator policy is intentionally off in local compose.
     ports:
       - "127.0.0.1:8080:8080"
+    volumes:
+      - pharos_data:/data
+      # Optional local manifest fixture mount:
+      # - ./manifests:/manifests:ro
+
+  pharos-beacon:
+    build: .
+    image: pharosd:local
+    container_name: pharos-beacon-local
+    profiles: ["beacon"]
+    restart: unless-stopped
+    depends_on:
+      - pharosd
+    entrypoint: ["/usr/local/bin/pharos-beacon"]
+    environment:
+      PHAROS_URL: http://pharosd:8080
+      PHAROS_INTERVAL: 60
+      PHAROS_HOSTNAME: ${PHAROS_HOSTNAME:-local-dev}
+      PHAROS_ROLE: ${PHAROS_ROLE:-local}
+      # Optional for strict-token local tests; leave unset for legacy-mode
+      # local smoke tests.
+      PHAROS_TOKEN: ${PHAROS_TOKEN:-}
+
+volumes:
+  pharos_data: {}

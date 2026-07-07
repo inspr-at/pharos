@@ -66,6 +66,23 @@ manifest. Agora uses the same manifest data for per-host settings proposals.
 PHAROS_MANIFEST_PATHS=/etc/hostdash-config/hsb8.json cargo run -p pharosd
 ```
 
+### Local Docker Compose
+
+`docker-compose.yml` is a local smoke topology, not the production deployment.
+It builds `pharosd:local`, persists `/data/pharos.json` in a local Docker
+volume, binds only `127.0.0.1:8080`, and keeps OIDC/operator policy off unless
+you export the relevant env vars yourself. Production compose remains in
+`nixcfg` under `hosts/csb1/docker/docker-compose.yml`.
+
+```bash
+docker compose up --build pharosd
+docker compose --profile beacon up --build
+```
+
+The optional `pharos-beacon` profile reports to the local `pharosd` service.
+For strict-token local tests, register a host and provide `PHAROS_TOKEN` from an
+untracked local environment; never commit token values.
+
 ## Beacon tokens
 
 `POST /register` is the local MVP token issuer. Set
