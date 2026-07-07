@@ -28,15 +28,22 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
     liveness, Host, HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
-    NixFreshness, ServiceObservation, ServiceObservationState, HOST_MANIFEST_SCHEMA,
-    HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
+    ServiceObservationState, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA,
+    HOST_REPORT_VERSION,
 };
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
+use url::Url;
 
 use crate::auth::{Auth, AuthState};
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::store::Store;
+
+const SERVER_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 
 /// Combined app state. Handlers extract `Arc<Store>` or `AuthState` via `FromRef`.
 #[derive(Clone)]
@@ -829,10 +836,12 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> 
 async fn declared_hosts_json(State(state): State<AppState>) -> Json<serde_json::Value> {
     let now = now_unix();
     let runtime_hosts = state.store.list();
+    let server_probes = server_probe_overlays(state.manifests.manifests(), now).await;
     Json(declared_hosts_payload(
         state.manifests.manifests(),
         state.manifests.load_errors(),
         &runtime_hosts,
+        &server_probes,
         now,
     ))
 }
@@ -841,6 +850,7 @@ fn declared_hosts_payload(
     manifests: &[HostManifest],
     load_errors: &[ManifestLoadIssue],
     runtime_hosts: &[Host],
+    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
     now: i64,
 ) -> serde_json::Value {
     let runtime_by_name: BTreeMap<&str, &Host> = runtime_hosts
@@ -854,11 +864,16 @@ fn declared_hosts_payload(
                 .get(manifest.host.name.as_str())
                 .copied()
                 .or_else(|| runtime_by_name.get(manifest.slug.as_str()).copied());
+            let probes = server_probes
+                .get(manifest.host.name.as_str())
+                .or_else(|| server_probes.get(manifest.slug.as_str()))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             json!({
                 "name": &manifest.host.name,
                 "slug": &manifest.slug,
                 "declared": manifest,
-                "runtime": runtime_overlay(runtime, now),
+                "runtime": runtime_overlay(runtime, probes, now),
             })
         })
         .collect();
@@ -873,7 +888,11 @@ fn declared_hosts_payload(
     })
 }
 
-fn runtime_overlay(host: Option<&Host>, now: i64) -> serde_json::Value {
+fn runtime_overlay(
+    host: Option<&Host>,
+    server_probes: &[ServerProbeObservation],
+    now: i64,
+) -> serde_json::Value {
     let Some(host) = host else {
         return json!({
             "state": "pending",
@@ -885,6 +904,8 @@ fn runtime_overlay(host: Option<&Host>, now: i64) -> serde_json::Value {
             "freshness_tldr": null,
             "service_observations": [],
             "service_observations_summary": service_observations_summary(&[]),
+            "server_probes": server_probes,
+            "server_probes_summary": server_probe_summary(server_probes),
         });
     };
     let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
@@ -899,6 +920,8 @@ fn runtime_overlay(host: Option<&Host>, now: i64) -> serde_json::Value {
         "freshness_tldr": host.freshness.tldr(),
         "service_observations": host.service_observations,
         "service_observations_summary": service_observations_summary(&host.service_observations),
+        "server_probes": server_probes,
+        "server_probes_summary": server_probe_summary(server_probes),
     })
 }
 
@@ -1149,6 +1172,234 @@ fn service_observations_summary(observations: &[ServiceObservation]) -> serde_js
         "stale": stale,
         "unknown": unknown,
     })
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ServerProbeObservation {
+    id: String,
+    service: String,
+    source: &'static str,
+    policy: &'static str,
+    kind: &'static str,
+    target: Option<String>,
+    state: ServiceObservationState,
+    server_reachable: Option<bool>,
+    client_reachable: Option<bool>,
+    summary: String,
+    checked_at: i64,
+}
+
+async fn server_probe_overlays(
+    manifests: &[HostManifest],
+    now: i64,
+) -> BTreeMap<String, Vec<ServerProbeObservation>> {
+    let mut overlays = BTreeMap::new();
+    for manifest in manifests {
+        let mut observations = Vec::new();
+        for service in &manifest.services {
+            if should_server_probe(service) {
+                observations.push(server_probe_service(service, now).await);
+            }
+        }
+        if !observations.is_empty() {
+            overlays.insert(manifest.host.name.clone(), observations);
+        }
+    }
+    overlays
+}
+
+async fn server_probe_service(service: &ManifestService, now: i64) -> ServerProbeObservation {
+    let Some(raw_url) = server_probe_url(service) else {
+        return server_probe_observation(
+            service,
+            None,
+            ServiceObservationState::Unknown,
+            None,
+            "no server-probe URL declared".to_string(),
+            now,
+        );
+    };
+
+    let url = match Url::parse(&raw_url) {
+        Ok(url) => url,
+        Err(_) => {
+            return server_probe_observation(
+                service,
+                Some(raw_url),
+                ServiceObservationState::Unknown,
+                None,
+                "server-probe URL is invalid".to_string(),
+                now,
+            );
+        }
+    };
+    let target = sanitized_probe_target(&url);
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return server_probe_observation(
+            service,
+            Some(target),
+            ServiceObservationState::Unknown,
+            None,
+            "server probe supports http/https targets only".to_string(),
+            now,
+        );
+    }
+
+    let Some(host) = url.host_str() else {
+        return server_probe_observation(
+            service,
+            Some(target),
+            ServiceObservationState::Unknown,
+            None,
+            "server-probe URL has no host".to_string(),
+            now,
+        );
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return server_probe_observation(
+            service,
+            Some(target),
+            ServiceObservationState::Unknown,
+            None,
+            "server-probe URL has no port".to_string(),
+            now,
+        );
+    };
+
+    match timeout(SERVER_PROBE_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(Ok(_)) => server_probe_observation(
+            service,
+            Some(target),
+            ServiceObservationState::Healthy,
+            Some(true),
+            format!("server can reach {host}:{port}"),
+            now,
+        ),
+        Ok(Err(_)) => server_probe_observation(
+            service,
+            Some(target),
+            ServiceObservationState::Warning,
+            Some(false),
+            format!("server cannot reach {host}:{port}"),
+            now,
+        ),
+        Err(_) => server_probe_observation(
+            service,
+            Some(target),
+            ServiceObservationState::Warning,
+            Some(false),
+            format!("server probe timed out for {host}:{port}"),
+            now,
+        ),
+    }
+}
+
+fn server_probe_observation(
+    service: &ManifestService,
+    target: Option<String>,
+    state: ServiceObservationState,
+    server_reachable: Option<bool>,
+    summary: String,
+    checked_at: i64,
+) -> ServerProbeObservation {
+    ServerProbeObservation {
+        id: service_probe_id(service),
+        service: service.name.clone(),
+        source: "server",
+        policy: "pharos-runtime",
+        kind: "tcp-connect",
+        target,
+        state,
+        server_reachable,
+        client_reachable: None,
+        summary,
+        checked_at,
+    }
+}
+
+fn should_server_probe(service: &ManifestService) -> bool {
+    service.status_policy.source == ManifestStatusSource::PharosRuntime
+        || service
+            .probe
+            .as_ref()
+            .is_some_and(explicit_server_probe_policy)
+}
+
+fn explicit_server_probe_policy(policy: &ManifestProbePolicy) -> bool {
+    match policy {
+        ManifestProbePolicy::Named(name) => matches!(
+            name.trim().to_ascii_lowercase().as_str(),
+            "server" | "server-probe" | "pharos" | "pharos-runtime"
+        ),
+        ManifestProbePolicy::Enabled(_) => false,
+    }
+}
+
+fn server_probe_url(service: &ManifestService) -> Option<String> {
+    ["tailnet", "lanHostname", "lanIp"]
+        .into_iter()
+        .find_map(|key| service.urls.get(key).filter(|url| !url.is_empty()).cloned())
+        .or_else(|| service.url.as_ref().filter(|url| !url.is_empty()).cloned())
+}
+
+fn sanitized_probe_target(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("unknown");
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    format!("{}://{host}{port}{path}", url.scheme())
+}
+
+fn server_probe_summary(observations: &[ServerProbeObservation]) -> serde_json::Value {
+    let mut healthy = 0;
+    let mut warning = 0;
+    let mut stale = 0;
+    let mut unknown = 0;
+    for observation in observations {
+        match observation.state {
+            ServiceObservationState::Healthy => healthy += 1,
+            ServiceObservationState::Warning => warning += 1,
+            ServiceObservationState::Stale => stale += 1,
+            ServiceObservationState::Unknown => unknown += 1,
+        }
+    }
+    let label = if observations.is_empty() {
+        "not probed".to_string()
+    } else if warning > 0 {
+        format!("{warning} unreachable")
+    } else if stale > 0 {
+        format!("{stale} stale")
+    } else if unknown > 0 {
+        format!("{unknown} unknown")
+    } else {
+        "server reachable".to_string()
+    };
+    json!({
+        "label": label,
+        "healthy": healthy,
+        "warning": warning,
+        "stale": stale,
+        "unknown": unknown,
+    })
+}
+
+fn service_probe_id(service: &ManifestService) -> String {
+    let mut id = String::new();
+    for ch in service.name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch);
+        } else if !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    id.trim_matches('-').to_string()
 }
 
 fn attention_reason(
@@ -2183,6 +2434,7 @@ mod tests {
             std::slice::from_ref(&manifest),
             &[],
             std::slice::from_ref(&runtime),
+            &BTreeMap::new(),
             1000,
         );
 
@@ -2194,7 +2446,72 @@ mod tests {
         assert_eq!(payload["declared_hosts"][0]["runtime"]["state"], "observed");
         assert_eq!(payload["declared_hosts"][0]["runtime"]["liveness"], "live");
         assert!(payload["declared_hosts"][0]["runtime"]["token_hash"].is_null());
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["server_probes_summary"]["label"],
+            "not probed"
+        );
         assert!(!payload.to_string().contains("stored-token-hash"));
+    }
+
+    #[test]
+    fn declared_hosts_payload_adds_server_probe_runtime_overlay() {
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": { "name": "hsb8" },
+            "wings": [{ "id": "ops", "name": "Ops" }],
+            "services": [
+                {
+                    "wing": "ops",
+                    "name": "Home Assistant",
+                    "url": "http://hsb8.lan:8123/",
+                    "statusPolicy": { "source": "pharos-runtime" }
+                }
+            ],
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+        let mut probes = BTreeMap::new();
+        probes.insert(
+            "hsb8".to_string(),
+            vec![ServerProbeObservation {
+                id: "home-assistant".to_string(),
+                service: "Home Assistant".to_string(),
+                source: "server",
+                policy: "pharos-runtime",
+                kind: "tcp-connect",
+                target: Some("http://hsb8.lan:8123/".to_string()),
+                state: ServiceObservationState::Healthy,
+                server_reachable: Some(true),
+                client_reachable: None,
+                summary: "server can reach hsb8.lan:8123".to_string(),
+                checked_at: 1000,
+            }],
+        );
+
+        let payload =
+            declared_hosts_payload(std::slice::from_ref(&manifest), &[], &[], &probes, 1000);
+
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["server_probes"][0]["state"],
+            "healthy"
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["server_probes"][0]["server_reachable"],
+            true
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["server_probes"][0]["client_reachable"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["server_probes_summary"]["label"],
+            "server reachable"
+        );
+        assert!(payload["declared_hosts"][0]["declared"]["services"][0]
+            .get("server_probes")
+            .is_none());
     }
 
     #[test]
@@ -2208,12 +2525,82 @@ mod tests {
         }))
         .expect("manifest parses");
 
-        let payload = declared_hosts_payload(std::slice::from_ref(&manifest), &[], &[], 1000);
+        let payload = declared_hosts_payload(
+            std::slice::from_ref(&manifest),
+            &[],
+            &[],
+            &BTreeMap::new(),
+            1000,
+        );
 
         assert_eq!(payload["declared_hosts"][0]["runtime"]["state"], "pending");
         assert_eq!(
             payload["declared_hosts"][0]["runtime"]["liveness"],
             "awaiting_first_heartbeat"
         );
+    }
+
+    #[test]
+    fn server_probe_policy_is_explicitly_declared() {
+        let hostdash_service: ManifestService = serde_json::from_value(json!({
+            "wing": "ops",
+            "name": "Client probe",
+            "url": "http://example.test/",
+            "probe": true,
+            "statusPolicy": { "source": "hostdash-probe" }
+        }))
+        .expect("service parses");
+        assert!(!should_server_probe(&hostdash_service));
+
+        let pharos_service: ManifestService = serde_json::from_value(json!({
+            "wing": "ops",
+            "name": "Server probe",
+            "url": "http://example.test/",
+            "statusPolicy": { "source": "pharos-runtime" }
+        }))
+        .expect("service parses");
+        assert!(should_server_probe(&pharos_service));
+
+        let named_service: ManifestService = serde_json::from_value(json!({
+            "wing": "ops",
+            "name": "Named server probe",
+            "url": "http://example.test/",
+            "probe": "server"
+        }))
+        .expect("service parses");
+        assert!(should_server_probe(&named_service));
+    }
+
+    #[test]
+    fn sanitized_probe_target_drops_userinfo_query_and_fragment() {
+        let url = Url::parse("https://user:secret@example.test:8443/path?token=secret#frag")
+            .expect("valid URL");
+
+        assert_eq!(
+            sanitized_probe_target(&url),
+            "https://example.test:8443/path"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_probe_service_reports_reachable_tcp_target() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let service: ManifestService = serde_json::from_value(json!({
+            "wing": "ops",
+            "name": "Local Test",
+            "url": format!("http://{addr}/"),
+            "statusPolicy": { "source": "pharos-runtime" }
+        }))
+        .expect("service parses");
+
+        let observation = server_probe_service(&service, 1000).await;
+
+        assert_eq!(observation.state, ServiceObservationState::Healthy);
+        assert_eq!(observation.server_reachable, Some(true));
+        assert_eq!(observation.client_reachable, None);
+        assert_eq!(observation.kind, "tcp-connect");
     }
 }
