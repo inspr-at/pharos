@@ -5,15 +5,15 @@
 
 use std::collections::BTreeMap;
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
-use axum::Json;
-use pharos_core::{liveness, Host, HostManifest, Liveness, ManifestPalette};
+use pharos_core::{Host, HostManifest, Liveness, ManifestPalette, liveness};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{html_escape, AppState};
+use crate::{AppState, html_escape};
 
 const AGORA_HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Host settings · Pharos</title><style>
 :root{--ink:#172c3d;--muted:#647687;--line:#dce6ec;--soft:#f5f8fa;--panel:#fff;--accent:#1f7fb5;--teal:#159e99;--amber:#c98224;--green:#25845f;--red:#bf3a35;--code:#0f1720;--shadow:0 18px 42px rgba(45,75,95,.07)}
@@ -441,8 +441,8 @@ fn live_key(live: Liveness) -> &'static str {
 mod tests {
     use super::*;
     use pharos_core::{
-        Host, ManifestHost, ManifestPalette, ManifestPolicy, NixFreshness, PrivilegedActionMode,
-        PrivilegedActions, RuntimeStateOwner, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+        HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, Host, ManifestHost, ManifestPalette,
+        ManifestPolicy, NixFreshness, PrivilegedActionMode, PrivilegedActions, RuntimeStateOwner,
     };
 
     fn manifest() -> HostManifest {
@@ -506,18 +506,24 @@ mod tests {
         );
         assert!(!proposal.janus.required);
         assert!(!proposal.safety.applies_change);
-        assert!(proposal
-            .patch
-            .value
-            .contains("-        primary = \"#e09051\";"));
-        assert!(proposal
-            .patch
-            .value
-            .contains("+        primary = \"#48b8a8\";"));
-        assert!(proposal
-            .patch
-            .value
-            .contains("+        frame = \"#48b8a8\";"));
+        assert!(
+            proposal
+                .patch
+                .value
+                .contains("-        primary = \"#e09051\";")
+        );
+        assert!(
+            proposal
+                .patch
+                .value
+                .contains("+        primary = \"#48b8a8\";")
+        );
+        assert!(
+            proposal
+                .patch
+                .value
+                .contains("+        frame = \"#48b8a8\";")
+        );
     }
 
     #[test]

@@ -21,22 +21,22 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRef, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, Host, HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
+    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, Host,
+    HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
     ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
-    ServiceObservationState, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA,
-    HOST_REPORT_VERSION,
+    ServiceObservationState, liveness,
 };
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use url::Url;
 
 use crate::auth::{Auth, AuthState};
@@ -583,9 +583,36 @@ function initControls(){
   document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
 }
-async function refresh(){
+const REFRESH_MS=10000;
+const HIDDEN_REFRESH_MS=60000;
+const FETCH_TIMEOUT_MS=9000;
+let refreshTimer=null;
+let refreshPromise=null;
+let refreshAbort=null;
+let refreshStartedAt=0;
+function clearRefreshTimer(){
+  if(refreshTimer!=null){
+    clearTimeout(refreshTimer);
+    refreshTimer=null;
+  }
+}
+function nextRefreshDelay(){
+  return document.hidden?HIDDEN_REFRESH_MS:REFRESH_MS;
+}
+function scheduleRefresh(delay=nextRefreshDelay()){
+  clearRefreshTimer();
+  refreshTimer=setTimeout(()=>refresh('timer'),delay);
+}
+async function refresh(reason='manual'){
+  clearRefreshTimer();
+  if(refreshPromise)return refreshPromise;
+  const controller=new AbortController();
+  refreshAbort=controller;
+  refreshStartedAt=Date.now();
+  const timeout=setTimeout(()=>controller.abort(),FETCH_TIMEOUT_MS);
+  refreshPromise=(async()=>{
   try{
-    const res=await fetch('/hosts.json',{headers:{Accept:'application/json'}});
+    const res=await fetch('/hosts.json',{headers:{Accept:'application/json'},cache:'no-store',signal:controller.signal});
     if(!res.ok)return;
     const data=await res.json();
     const now=Number(data.as_of)||Math.floor(Date.now()/1000);
@@ -629,13 +656,37 @@ async function refresh(){
     }
     applySort(document.querySelector('[data-sort]')?.value||'attention',false);
   }catch(_){}
+  finally{
+    clearTimeout(timeout);
+    if(refreshAbort===controller)refreshAbort=null;
+    refreshPromise=null;
+    scheduleRefresh();
+  }
+  })();
+  return refreshPromise;
 }
+function resumeRefresh(reason){
+  if(document.hidden){
+    scheduleRefresh(HIDDEN_REFRESH_MS);
+    return;
+  }
+  if(refreshPromise&&refreshAbort&&Date.now()-refreshStartedAt>FETCH_TIMEOUT_MS){
+    const pending=refreshPromise;
+    refreshAbort.abort();
+    pending.finally(()=>refresh(reason));
+    return;
+  }
+  refresh(reason);
+}
+document.addEventListener('visibilitychange',()=>resumeRefresh('visible'));
+window.addEventListener('focus',()=>resumeRefresh('focus'));
+window.addEventListener('pageshow',()=>resumeRefresh('pageshow'));
+window.addEventListener('online',()=>resumeRefresh('online'));
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
 initControls();
 requestAnimationFrame(frame);
-setInterval(refresh,10000);
-setTimeout(refresh,3000);
+scheduleRefresh(3000);
 </script></body></html>"#;
 
 const HEARTBEAT_HISTORY_DOTS: usize = 12;
@@ -768,13 +819,13 @@ async fn register(
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "registration token invalid" })),
-            )
+            );
         }
         RegistrationAuth::NotConfigured => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "PHAROS_REGISTRATION_TOKEN not configured" })),
-            )
+            );
         }
     }
 
@@ -800,7 +851,7 @@ async fn register(
     )
 }
 
-async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> {
+async fn hosts_json(State(store): State<Arc<Store>>) -> impl IntoResponse {
     let now = now_unix();
     let hosts: Vec<_> = store
         .list()
@@ -830,14 +881,14 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> Json<serde_json::Value> 
             })
         })
         .collect();
-    Json(json!({ "as_of": now, "hosts": hosts }))
+    no_store_json(json!({ "as_of": now, "hosts": hosts }))
 }
 
-async fn declared_hosts_json(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn declared_hosts_json(State(state): State<AppState>) -> impl IntoResponse {
     let now = now_unix();
     let runtime_hosts = state.store.list();
     let server_probes = server_probe_overlays(state.manifests.manifests(), now).await;
-    Json(declared_hosts_payload(
+    no_store_json(declared_hosts_payload(
         state.manifests.manifests(),
         state.manifests.load_errors(),
         &runtime_hosts,
@@ -925,18 +976,23 @@ fn runtime_overlay(
     })
 }
 
+fn no_store_headers() -> [(header::HeaderName, &'static str); 3] {
+    [
+        (
+            header::CACHE_CONTROL,
+            "no-store, no-cache, max-age=0, must-revalidate",
+        ),
+        (header::PRAGMA, "no-cache"),
+        (header::EXPIRES, "0"),
+    ]
+}
+
 fn no_store_html(body: String) -> impl IntoResponse {
-    (
-        [
-            (
-                header::CACHE_CONTROL,
-                "no-store, no-cache, max-age=0, must-revalidate",
-            ),
-            (header::PRAGMA, "no-cache"),
-            (header::EXPIRES, "0"),
-        ],
-        Html(body),
-    )
+    (no_store_headers(), Html(body))
+}
+
+fn no_store_json(value: serde_json::Value) -> impl IntoResponse {
+    (no_store_headers(), Json(value))
 }
 
 async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -2181,6 +2237,13 @@ mod tests {
         assert!(html.contains(r#"href="/auth/logout""#));
         assert!(html.contains(r#"aria-label="Log out of Pharos""#));
         assert!(!html.contains(">mba<"));
+        assert!(html.contains("cache:'no-store'"));
+        assert!(html.contains("document.addEventListener('visibilitychange'"));
+        assert!(html.contains("window.addEventListener('focus'"));
+        assert!(html.contains("window.addEventListener('pageshow'"));
+        assert!(html.contains("window.addEventListener('online'"));
+        assert!(html.contains("scheduleRefresh(3000);"));
+        assert!(!html.contains("setInterval(refresh,10000)"));
         assert!(html.contains(r#"data-host="csb1" data-live="live""#));
         assert!(html.contains(r#"data-self="true""#));
         assert!(html.contains("the light is lit"));
@@ -2189,8 +2252,11 @@ mod tests {
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains("No settings yet"));
         assert!(!html.contains("Not set up yet"));
-        assert!(html
-            .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
+        assert!(
+            html.contains(
+                r#"<div class="reason self" data-reason><span>control light</span></div>"#
+            )
+        );
         assert!(!html.contains("expected beat"));
         assert!(html.contains(r#"class="signal" data-signal data-signal-level="good""#));
         assert!(html.contains(r#"<span data-signal-percent>100%</span>"#));
@@ -2512,9 +2578,11 @@ mod tests {
             payload["declared_hosts"][0]["runtime"]["server_probes_summary"]["label"],
             "server reachable"
         );
-        assert!(payload["declared_hosts"][0]["declared"]["services"][0]
-            .get("server_probes")
-            .is_none());
+        assert!(
+            payload["declared_hosts"][0]["declared"]["services"][0]
+                .get("server_probes")
+                .is_none()
+        );
     }
 
     #[test]
