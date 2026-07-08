@@ -3405,11 +3405,13 @@ fn render_activity_row(event: &ActivityEvent) -> String {
         title = html_escape(&event.title),
         detail = html_escape(&event.detail),
         source = html_escape(event.source),
-        host_search = html_escape(&format!(
-            "{} {} {} {} {}",
-            event.host, event.kind, event.title, event.detail, event.source
+        host_search = html_escape(
+            &format!(
+                "{} {} {} {} {}",
+                event.host, event.kind, event.title, event.detail, event.source
+            )
+            .to_lowercase(),
         )
-        .to_lowercase())
     )
 }
 
@@ -4526,7 +4528,9 @@ mod tests {
         assert!(html.contains("Install or start pharos-beacon"));
         assert!(html.contains("Operations posture"));
         assert!(html.contains(r#"class="ops-action" href="/map">View on map</a>"#));
-        assert!(html.contains(r#"<button class="ops-metric critical" type="button" data-ops-filter="critical""#));
+        assert!(html.contains(
+            r#"<button class="ops-metric critical" type="button" data-ops-filter="critical""#
+        ));
         assert!(html.contains(r#"data-ops-filter="warning""#));
         assert!(html.contains(r#"placeholder="Search hosts...""#));
         assert!(html.contains(r#"data-host-search="athena server hermes server"#));
