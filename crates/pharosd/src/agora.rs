@@ -24,16 +24,30 @@ const LOCATION_TARGET_PATH: &str = "modules/uzumaki/hosts/host-settings.nix";
 
 const AGORA_CSS: &str = r#"<style>
 .settings-main{width:min(1180px,100%)}
-.settings-bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 18px;padding:11px;background:rgba(255,255,255,.72);border:1px solid rgba(210,226,234,.78);border-radius:8px;box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(10px)}
-.host-picker{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
-.host-picker label{color:var(--muted);font-size:12px;font-weight:650}
-.host-select-wrap{position:relative;min-width:220px;max-width:360px;flex:1}
-.host-select{width:100%;height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:650;padding:0 34px 0 12px;outline:none;appearance:none}
-.host-select-wrap:after{content:"";position:absolute;right:13px;top:50%;width:7px;height:7px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:translateY(-65%) rotate(45deg);pointer-events:none}
-.host-context{display:flex;align-items:center;gap:8px;min-width:0;color:var(--muted);font-size:12px}
-.host-status-dot{width:9px;height:9px;border-radius:50%;background:var(--state);box-shadow:0 0 0 4px color-mix(in srgb,var(--state) 13%,transparent)}
-.settings-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
-.settings-link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 13px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);text-decoration:none;font-weight:650}
+.settings-ia{display:flex;align-items:center;gap:9px;margin:0 0 18px;padding:7px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.68);box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(10px)}
+.settings-tab{display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 13px;border:1px solid transparent;border-radius:7px;color:var(--muted);font-weight:720;font-size:13px;text-decoration:none}
+.settings-tab[aria-current="page"]{border-color:rgba(210,226,234,.92);background:#fff;color:#0f4f80;box-shadow:0 7px 16px rgba(45,75,95,.05)}
+.settings-workspace{display:grid;grid-template-columns:minmax(320px,390px) minmax(0,1fr);gap:18px;align-items:start}
+.settings-host-table{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
+.settings-host-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:18px 18px 12px;border-bottom:1px solid rgba(214,226,234,.72)}
+.settings-host-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:23px;font-weight:500;color:#12304b;letter-spacing:0}
+.settings-host-head span{display:grid;place-items:center;min-width:28px;height:28px;border-radius:999px;background:#e8f6fb;color:#0f4f80;font-size:13px;font-weight:760}
+.settings-search{padding:12px 14px;border-bottom:1px solid rgba(214,226,234,.72)}
+.settings-search input{width:100%;height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:620;padding:0 12px;outline:none}
+.settings-search input::placeholder{color:#7c8fa3}
+.settings-host-list{display:grid;padding:8px}
+.settings-host-row{display:grid;grid-template-columns:11px minmax(0,1fr) 34px auto;align-items:center;gap:10px;min-height:58px;padding:8px 9px;border:1px solid transparent;border-radius:8px;color:var(--ink);text-decoration:none}
+.settings-host-row[hidden]{display:none}
+.settings-host-row:hover{background:rgba(247,252,253,.86);border-color:rgba(210,226,234,.74)}
+.settings-host-row[aria-current="true"]{background:linear-gradient(90deg,color-mix(in srgb,var(--row-color) 10%,#fff),rgba(255,255,255,.92));border-color:color-mix(in srgb,var(--row-color) 42%,rgba(210,226,234,.86));box-shadow:inset 3px 0 0 var(--row-color)}
+.settings-host-state{width:9px;height:9px;border-radius:50%;background:var(--row-state);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-state) 13%,transparent)}
+.settings-host-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:760}
+.settings-host-role{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px;margin-top:2px}
+.settings-host-color{width:25px;height:25px;border:3px solid var(--row-color);border-radius:50%;background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--row-color) 10%,#f5fbfc));box-shadow:0 0 0 5px color-mix(in srgb,var(--row-color) 12%,transparent),0 0 16px color-mix(in srgb,var(--row-color) 16%,transparent)}
+.settings-host-ready{padding:4px 8px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:760;white-space:nowrap}
+.settings-host-row[data-ready="true"] .settings-host-ready{color:var(--live)}
+.settings-empty-hosts{display:none;padding:14px 18px;color:var(--muted);font-size:13px}
+.settings-detail{min-width:0}
 .settings-panel{overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .settings-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:22px 24px;border-bottom:1px solid rgba(214,226,234,.72)}
 .settings-kicker{display:block;margin-bottom:5px;color:var(--sun);font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:720}
@@ -105,7 +119,8 @@ const AGORA_CSS: &str = r#"<style>
 .location-preview strong{display:block;color:var(--ink);font-size:15px}
 .location-preview span{display:block;margin-top:3px;color:var(--muted);font-size:12px}
 .location-action-row{display:flex;justify-content:flex-end;margin-top:16px}
-@media (max-width:900px){.settings-bar{align-items:stretch;flex-direction:column}.settings-actions{justify-content:flex-start}.color-layout,.color-controls{grid-template-columns:1fr}.color-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}.preview-zone{padding:20px}.setup-banner{align-items:flex-start;flex-direction:column}}
+@media (max-width:980px){.settings-workspace{grid-template-columns:1fr}.settings-host-table{order:1}.settings-detail{order:2}}
+@media (max-width:900px){.color-layout,.color-controls{grid-template-columns:1fr}.color-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}.preview-zone{padding:20px}.setup-banner{align-items:flex-start;flex-direction:column}}
 @media (max-width:900px){.location-layout,.location-mode-row,.location-fields{grid-template-columns:1fr}.location-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}}
 @media (max-width:640px){.advanced-meta{grid-template-columns:1fr}}
 </style>"#;
@@ -336,12 +351,12 @@ fn render_page(
 
     if hosts.is_empty() {
         return format!(
-            r#"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host settings</p></div><div class="asof">as of {as_of}</div></div><section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#
+            r#"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host preferences</p></div><div class="asof">as of {as_of}</div></div><section class="settings-ia" aria-label="settings sections"><span class="settings-tab" aria-current="page">Host colors</span></section><section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#
         );
     }
 
     let selected = &hosts[selected_index];
-    let options = host_options(&hosts, selected_index);
+    let host_table = render_host_table(&hosts, selected_index);
     let content = if selected.settings_ready {
         render_ready_content(selected)
     } else {
@@ -349,9 +364,19 @@ fn render_page(
     };
 
     format!(
-        r##"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host settings</p></div><div class="asof">as of {as_of}</div></div><section class="settings-bar" aria-label="host settings selector"><div class="host-picker"><label for="host-select">Host</label><span class="host-select-wrap"><select id="host-select" class="host-select" data-host-select>{options}</select></span><span class="host-context" style="--state:{state_color}"><span class="host-status-dot"></span><span>{role}</span></span></div><div class="settings-actions"><a class="settings-link" href="/">Fleet</a></div></section>{content}</main><script>
-const hostSelect=document.querySelector('[data-host-select]');
-hostSelect?.addEventListener('change',event=>{{location.href='/agora?host='+encodeURIComponent(event.target.value)}});
+        r##"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host preferences</p></div><div class="asof">as of {as_of}</div></div><section class="settings-ia" aria-label="settings sections"><span class="settings-tab" aria-current="page">Host colors</span></section><section class="settings-workspace">{host_table}<div class="settings-detail">{content}</div></section></main><script>
+const settingsSearch=document.querySelector('[data-settings-search]');
+settingsSearch?.addEventListener('input',()=>{{
+  const q=settingsSearch.value.trim().toLowerCase();
+  let visible=0;
+  document.querySelectorAll('[data-settings-host]').forEach(row=>{{
+    const match=!q || (row.dataset.search||'').includes(q);
+    row.hidden=!match;
+    if(match)visible+=1;
+  }});
+  const empty=document.querySelector('[data-settings-empty]');
+  if(empty)empty.style.display=visible?'none':'block';
+}});
 const root=document.querySelector('[data-color-root]');
 if(root){{
   const color=root.querySelector('[data-color]');
@@ -391,68 +416,20 @@ if(root){{
     }}
   }});
 }}
-const locationRoot=document.querySelector('[data-location-root]');
-if(locationRoot){{
-  const mode=locationRoot.querySelector('[data-location-mode]');
-  const output=locationRoot.querySelector('[data-location-output]');
-  const advanced=locationRoot.querySelector('[data-location-advanced]');
-  const fields=locationRoot.querySelector('[data-location-fields]');
-  const copy=locationRoot.querySelector('[data-location-copy]');
-  function modeNeedsCoordinates(value){{return value==='declared-override'||value==='declared-fallback'}}
-  function refreshLocationFields(){{
-    const value=mode?.value||'auto';
-    if(fields)fields.hidden=!modeNeedsCoordinates(value);
-    if(copy){{
-      copy.textContent=value==='hidden'
-        ? 'Do not expose coordinates for this host.'
-        : value==='declared-override'
-          ? 'Always use the coordinates below, even when runtime detection reports something else.'
-          : value==='declared-fallback'
-            ? 'Use runtime detection first; use these coordinates only as the fallback.'
-            : 'Use runtime detection when available, then declared site metadata.';
-    }}
-  }}
-  mode?.addEventListener('change',refreshLocationFields);
-  refreshLocationFields();
-  locationRoot.querySelector('[data-location-review]')?.addEventListener('click',async()=>{{
-    if(!output)return;
-    if(advanced)advanced.open=true;
-    output.textContent='Preparing review...';
-    const params=new URLSearchParams();
-    const selectedMode=mode?.value||'auto';
-    params.set('host',locationRoot.dataset.host);
-    params.set('mode',selectedMode);
-    if(modeNeedsCoordinates(selectedMode)){{
-      locationRoot.querySelectorAll('[data-location-param]').forEach(input=>{{
-        if(input.value.trim())params.set(input.dataset.locationParam,input.value.trim());
-      }});
-    }}
-    try{{
-      const res=await fetch('/agora/proposals/host-location.json?'+params.toString(),{{headers:{{Accept:'application/json'}}}});
-      const data=await res.json();
-      output.textContent=res.ok?data.patch.value:(data.error||'review failed');
-    }}catch(_){{output.textContent='review failed'}}
-  }});
-}}
 </script></div></body></html>"##,
-        role = html_escape(&selected.role),
-        state_color = html_escape(&selected.state_color),
+        host_table = host_table,
         accent = html_escape(&selected.declared_accent)
     )
 }
 
 fn render_ready_content(host: &AgoraHostView) -> String {
-    format!(
-        "{}{}",
-        render_color_panel(
-            host,
-            None,
-            "Review color change",
-            r#"<span class="review-note">Pharos only prepares a review. Applying it still happens in nixcfg.</span>"#,
-            "No color change reviewed yet.",
-            true,
-        ),
-        render_location_panel(host)
+    render_color_panel(
+        host,
+        None,
+        "Review color change",
+        r#"<span class="review-note">Pharos only prepares a review. Applying it still happens in nixcfg.</span>"#,
+        "No color change reviewed yet.",
+        true,
     )
 }
 
@@ -469,6 +446,51 @@ fn render_setup_content(host: &AgoraHostView) -> String {
         r#"<span class="review-note">This prepares the declarative setup path; Pharos does not deploy it directly.</span>"#,
         &plan,
         false,
+    )
+}
+
+fn render_host_table(hosts: &[AgoraHostView], selected_index: usize) -> String {
+    let rows = hosts
+        .iter()
+        .enumerate()
+        .map(|(idx, host)| render_host_row(host, idx == selected_index))
+        .collect::<String>();
+    format!(
+        r#"<section class="settings-host-table" aria-label="host color settings"><header class="settings-host-head"><div><h2>Host colors</h2></div><span>{count}</span></header><div class="settings-search"><input data-settings-search type="search" placeholder="Search hosts..." aria-label="Search hosts"></div><div class="settings-host-list">{rows}</div><div class="settings-empty-hosts" data-settings-empty>No matching hosts.</div></section>"#,
+        count = hosts.len(),
+        rows = rows,
+    )
+}
+
+fn render_host_row(host: &AgoraHostView, selected: bool) -> String {
+    let href = format!("/agora?host={}", query_escape(&host.name));
+    let current = if selected {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    let ready = if host.settings_ready { "true" } else { "false" };
+    let status = if host.settings_ready {
+        "Ready"
+    } else {
+        "Setup"
+    };
+    let search = format!(
+        "{} {} {} {}",
+        host.name, host.slug, host.role, host.liveness
+    )
+    .to_ascii_lowercase();
+    format!(
+        r#"<a class="settings-host-row" href="{href}" data-settings-host data-ready="{ready}" data-search="{search}" style="--row-color:{accent};--row-state:{state}"{current}><span class="settings-host-state" aria-hidden="true"></span><span><span class="settings-host-name">{name}</span><span class="settings-host-role">{role}</span></span><span class="settings-host-color" aria-hidden="true"></span><span class="settings-host-ready">{status}</span></a>"#,
+        href = html_escape(&href),
+        ready = ready,
+        search = html_escape(&search),
+        accent = html_escape(&host.declared_accent),
+        state = html_escape(&host.state_color),
+        current = current,
+        name = html_escape(&host.name),
+        role = html_escape(&host.role),
+        status = status,
     )
 }
 
@@ -498,16 +520,16 @@ fn render_color_panel(
         )
     };
     format!(
-        r##"<section class="settings-panel" data-color-root data-host="{host_name}" data-ready="{ready}" style="--picked-color:{accent}"><header class="settings-panel-head"><div><span class="settings-kicker">{slug}</span><h2>Choose color</h2><p>{copy}</p></div><span class="settings-state" data-ready="{ready}">{state}</span></header><div class="color-layout"><section class="color-editor">{banner}<div class="color-controls"><div class="color-well-wrap"><input class="color-well" data-color type="color" value="{accent}" aria-label="Host color"><span class="color-well-label">{accent_upper}</span></div><div class="color-fields"><div class="field"><label for="accent-hex">Color code</label><input class="hex-input" id="accent-hex" data-hex maxlength="7" spellcheck="false" value="{accent_upper}"></div><div class="preset-row" aria-label="preset colors">{presets}</div>{action}</div></div></section><aside class="preview-zone"><article class="preview-card" aria-label="host card preview"><div class="preview-host"><span class="preview-badge">{badge}</span><div><div class="preview-name">{host_name}</div><div class="preview-role">{role}</div></div></div><div class="preview-line"></div><div class="preview-reason"><span>{reason}</span></div><div class="preview-meta"><div><span>Flake.lock age</span><strong>{freshness}</strong></div><div><span>Settings</span><strong>{settings}</strong></div></div></article></aside></div><section class="advanced"><details data-advanced><summary>Advanced review</summary><div class="advanced-body">{review_note}<div class="advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre>{setup_template}</div></details></section></section>"##,
+        r##"<section class="settings-panel" data-color-root data-host="{host_name}" data-ready="{ready}" style="--picked-color:{accent}"><header class="settings-panel-head"><div><span class="settings-kicker">{slug}</span><h2>{host_name}</h2><p>{copy}</p></div><span class="settings-state" data-ready="{ready}">{state}</span></header><div class="color-layout"><section class="color-editor">{banner}<div class="color-controls"><div class="color-well-wrap"><input class="color-well" data-color type="color" value="{accent}" aria-label="Host color"><span class="color-well-label">{accent_upper}</span></div><div class="color-fields"><div class="field"><label for="accent-hex">Color code</label><input class="hex-input" id="accent-hex" data-hex maxlength="7" spellcheck="false" value="{accent_upper}"></div><div class="preset-row" aria-label="preset colors">{presets}</div>{action}</div></div></section><aside class="preview-zone"><article class="preview-card" aria-label="host card preview"><div class="preview-host"><span class="preview-badge">{badge}</span><div><div class="preview-name">{host_name}</div><div class="preview-role">{role}</div></div></div><div class="preview-line"></div><div class="preview-reason"><span>{reason}</span></div><div class="preview-meta"><div><span>Flake.lock age</span><strong>{freshness}</strong></div><div><span>Settings</span><strong>{settings}</strong></div></div></article></aside></div><section class="advanced"><details data-advanced><summary>Advanced review</summary><div class="advanced-body">{review_note}<div class="advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre>{setup_template}</div></details></section></section>"##,
         host_name = html_escape(&host.name),
         slug = html_escape(&host.slug),
         role = html_escape(&host.role),
         accent = html_escape(&host.declared_accent),
         accent_upper = html_escape(&host.declared_accent.to_ascii_uppercase()),
         copy = if ready {
-            "Pick the color used for this host across Pharos."
+            "Change the color used for this host across Pharos."
         } else {
-            "Pick the first color, then prepare this host for normal settings."
+            "Choose the first color and prepare this host."
         },
         state = if ready { "Ready" } else { "Needs setup" },
         banner = banner.unwrap_or(""),
@@ -527,69 +549,6 @@ fn render_color_panel(
         },
         setup_template = setup_template,
     )
-}
-
-fn render_location_panel(host: &AgoraHostView) -> String {
-    let mode = location_mode_key(host.location_mode);
-    let mode_label = location_mode_label(host.location_mode);
-    let declared_copy = if host.location_latitude.is_empty() || host.location_longitude.is_empty() {
-        "No declared coordinates"
-    } else {
-        "Declared coordinates ready"
-    };
-    let fields_hidden = if matches!(
-        host.location_mode,
-        ManifestLocationMode::DeclaredOverride | ManifestLocationMode::DeclaredFallback
-    ) {
-        ""
-    } else {
-        " hidden"
-    };
-    format!(
-        r##"<section class="settings-panel location-panel" data-location-root data-host="{host_name}" style="--picked-color:{accent}"><header class="settings-panel-head"><div><span class="settings-kicker">{slug}</span><h2>Host location</h2><p>Choose how Pharos places this host on the map.</p></div><span class="settings-state" data-ready="true">{mode_label}</span></header><div class="location-layout"><section class="location-editor"><div class="location-mode-row"><div class="field"><label for="location-mode">Location mode</label><select id="location-mode" class="plain-select" data-location-mode><option value="auto"{auto_selected}>Use detected</option><option value="declared-fallback"{fallback_selected}>Manual fallback</option><option value="declared-override"{override_selected}>Always manual</option><option value="hidden"{hidden_selected}>Hide location</option></select></div><p class="location-mode-copy" data-location-copy></p></div><div class="location-fields" data-location-fields{fields_hidden}><div class="field"><label for="location-label">Label</label><input id="location-label" class="location-input" data-location-param="label" value="{location_label}" placeholder="Parents' home"></div><div class="field"><label for="location-latitude">Latitude</label><input id="location-latitude" class="location-input" data-location-param="latitude" inputmode="decimal" value="{latitude}" placeholder="48.2082"></div><div class="field"><label for="location-longitude">Longitude</label><input id="location-longitude" class="location-input" data-location-param="longitude" inputmode="decimal" value="{longitude}" placeholder="16.3738"></div></div><div class="location-action-row"><button class="primary-action" type="button" data-location-review>Review location change</button></div></section><aside class="preview-zone"><div class="location-preview" aria-label="host location preview"><span class="location-pin" aria-hidden="true"></span><div><strong>{declared_copy}</strong><span>{preview_text}</span></div></div></aside></div><section class="advanced"><details data-location-advanced><summary>Advanced review</summary><div class="advanced-body"><span class="review-note">Pharos prepares a nixcfg review only. It does not mutate the host or deploy.</span><div class="advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-location-output>No location change reviewed yet.</pre></div></details></section></section>"##,
-        host_name = html_escape(&host.name),
-        slug = html_escape(&host.slug),
-        accent = html_escape(&host.declared_accent),
-        mode_label = html_escape(mode_label),
-        auto_selected = selected_attr(mode == "auto"),
-        fallback_selected = selected_attr(mode == "declared-fallback"),
-        override_selected = selected_attr(mode == "declared-override"),
-        hidden_selected = selected_attr(mode == "hidden"),
-        fields_hidden = fields_hidden,
-        location_label = html_escape(&host.location_label),
-        latitude = html_escape(&host.location_latitude),
-        longitude = html_escape(&host.location_longitude),
-        declared_copy = declared_copy,
-        preview_text = html_escape(&location_preview_text(host)),
-        target_path = html_escape(&host.location_target_path),
-        target_attribute = html_escape(&host.location_target_attribute),
-    )
-}
-
-fn host_options(hosts: &[AgoraHostView], selected_index: usize) -> String {
-    hosts
-        .iter()
-        .enumerate()
-        .map(|(idx, host)| {
-            let selected = if idx == selected_index {
-                " selected"
-            } else {
-                ""
-            };
-            let suffix = if host.settings_ready {
-                ""
-            } else {
-                " - needs setup"
-            };
-            format!(
-                r#"<option value="{value}"{selected}>{name} - {role}{suffix}</option>"#,
-                value = html_escape(&host.name),
-                name = html_escape(&host.name),
-                role = html_escape(&host.role),
-                suffix = suffix
-            )
-        })
-        .collect()
 }
 
 fn preset_buttons(current: &str) -> String {
@@ -784,14 +743,6 @@ fn palette_accent(palette: &ManifestPalette) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
-fn selected_attr(selected: bool) -> &'static str {
-    if selected {
-        " selected"
-    } else {
-        ""
-    }
-}
-
 fn format_coordinate(value: f64) -> String {
     let mut text = format!("{value:.6}");
     while text.contains('.') && text.ends_with('0') {
@@ -803,34 +754,24 @@ fn format_coordinate(value: f64) -> String {
     text
 }
 
+fn query_escape(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 fn location_mode_key(mode: ManifestLocationMode) -> &'static str {
     match mode {
         ManifestLocationMode::Auto => "auto",
         ManifestLocationMode::DeclaredOverride => "declared-override",
         ManifestLocationMode::DeclaredFallback => "declared-fallback",
         ManifestLocationMode::Hidden => "hidden",
-    }
-}
-
-fn location_mode_label(mode: ManifestLocationMode) -> &'static str {
-    match mode {
-        ManifestLocationMode::Auto => "Use detected",
-        ManifestLocationMode::DeclaredOverride => "Always manual",
-        ManifestLocationMode::DeclaredFallback => "Manual fallback",
-        ManifestLocationMode::Hidden => "Hidden",
-    }
-}
-
-fn location_preview_text(host: &AgoraHostView) -> String {
-    match host.location_mode {
-        ManifestLocationMode::Auto => "Runtime detection can update the map placement.".to_string(),
-        ManifestLocationMode::DeclaredOverride => {
-            format!("{} is pinned to the declared map position.", host.name)
-        }
-        ManifestLocationMode::DeclaredFallback => {
-            "Runtime detection wins; declared coordinates are the fallback.".to_string()
-        }
-        ManifestLocationMode::Hidden => "Pharos will not expose host coordinates.".to_string(),
     }
 }
 
@@ -1265,17 +1206,21 @@ mod tests {
         assert!(html.contains(r#"<aside class="sidebar" aria-label="primary navigation""#));
         assert!(html.contains(r#"href="/agora" aria-current="page""#));
         assert!(html.contains("<h1>Settings</h1>"));
-        assert!(html.contains("Host settings"));
-        assert!(html.contains("Choose color"));
+        assert!(html.contains("Host preferences"));
+        assert!(html.contains("settings-workspace"));
+        assert!(html.contains("settings-host-table"));
+        assert!(html.contains("Host colors"));
+        assert!(html.contains(r#"placeholder="Search hosts...""#));
+        assert!(html.contains(r#"data-settings-host"#));
         assert!(html.contains("Review color change"));
-        assert!(html.contains("Host location"));
-        assert!(html.contains("Use detected"));
-        assert!(html.contains("Manual fallback"));
-        assert!(html.contains("Review location change"));
         assert!(html.contains("Advanced review"));
         assert!(html.contains("preview-card"));
         assert!(html.contains("palettes.custom-hsb8.gradient.primary"));
-        assert!(html.contains("hosts.hsb8.location"));
+        assert!(!html.contains("Host location"));
+        assert!(!html.contains("Review location change"));
+        assert!(!html.contains("Use detected"));
+        assert!(!html.contains("Manual fallback"));
+        assert!(!html.contains("host-select"));
         assert!(!html.contains(r#"class="rail""#));
         assert!(!html.contains("Services</button>"));
         assert!(!html.contains("Access</button>"));
@@ -1298,7 +1243,8 @@ mod tests {
 
         let html = render_page(&[other, manifest()], &[], Some("hsb8"), "markus", true);
 
-        assert!(html.contains(r#"<option value="hsb8" selected>hsb8 - parents&#39; home</option>"#));
+        assert!(html.contains(r#"href="/agora?host=hsb8""#));
+        assert!(html.contains(r#"aria-current="true"><span class="settings-host-state""#));
         assert!(html.contains(r#"data-host="hsb8""#));
         assert!(html.contains("#E09051"));
     }
@@ -1311,11 +1257,10 @@ mod tests {
         assert!(html.contains("Color settings are not prepared yet"));
         assert!(html.contains("Prepare color settings"));
         assert!(html.contains("Prepare color settings for csb0"));
-        assert!(
-            html.contains(r#"<option value="csb0" selected>csb0 - server - needs setup</option>"#)
-        );
+        assert!(html.contains(r#"href="/agora?host=csb0""#));
+        assert!(html.contains(r#"data-ready="false""#));
+        assert!(html.contains(r#"<span class="settings-host-ready">Setup</span>"#));
         assert!(html.contains(r#"data-host="csb0""#));
-        assert!(!html.contains(r#"data-host="hsb8""#));
         assert!(!html.contains("Settings unavailable"));
     }
 
@@ -1325,9 +1270,9 @@ mod tests {
 
         assert!(html.contains("Color settings are not prepared yet"));
         assert!(html.contains("Prepare color settings for csb0"));
-        assert!(
-            html.contains(r#"<option value="csb0" selected>csb0 - host - needs setup</option>"#)
-        );
+        assert!(html.contains(r#"href="/agora?host=csb0""#));
+        assert!(html.contains(r#"<span class="settings-host-name">csb0</span>"#));
+        assert!(html.contains(r#"<span class="settings-host-role">host</span>"#));
         assert!(!html.contains("Pharos will not show or edit another host"));
     }
 
