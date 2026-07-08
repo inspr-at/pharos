@@ -123,9 +123,10 @@ struct AlertNotifier {
 
 impl AlertNotifier {
     fn from_env() -> Self {
-        let webhook_url = std::env::var("PHAROS_ALERT_WEBHOOK_URL")
-            .ok()
-            .and_then(|value| non_empty_env_value(&value));
+        let webhook_url = alert_webhook_url(
+            std::env::var("PHAROS_ALERT_WEBHOOK_URL").ok(),
+            std::env::var("WATCHTOWER_NOTIFICATION_URL").ok(),
+        );
         let check_interval = std::env::var("PHAROS_ALERT_CHECK_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -284,6 +285,13 @@ fn non_empty_env_value(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn alert_webhook_url(pharos_url: Option<String>, watchtower_url: Option<String>) -> Option<String> {
+    pharos_url
+        .as_deref()
+        .and_then(non_empty_env_value)
+        .or_else(|| watchtower_url.as_deref().and_then(non_empty_env_value))
 }
 
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
@@ -5456,6 +5464,29 @@ mod tests {
         assert_eq!(alerts[0].age_seconds, 400);
         assert_eq!(alerts[0].heartbeat_interval_secs, 60);
         assert!(alerts[0].summary.contains("has not reported"));
+    }
+
+    #[test]
+    fn alert_webhook_prefers_pharos_specific_url() {
+        let selected = alert_webhook_url(
+            Some(" https://pharos-alert.example/hook ".to_string()),
+            Some("https://watchtower.example/hook".to_string()),
+        );
+
+        assert_eq!(
+            selected.as_deref(),
+            Some("https://pharos-alert.example/hook")
+        );
+    }
+
+    #[test]
+    fn alert_webhook_reuses_watchtower_url_when_pharos_url_is_blank() {
+        let selected = alert_webhook_url(
+            Some("   ".to_string()),
+            Some(" https://watchtower.example/hook ".to_string()),
+        );
+
+        assert_eq!(selected.as_deref(), Some("https://watchtower.example/hook"));
     }
 
     #[test]
