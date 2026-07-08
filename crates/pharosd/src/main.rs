@@ -506,13 +506,12 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .card{--state:var(--wait);position:relative;min-height:264px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
 .card:before{content:"";position:absolute;left:16px;right:16px;top:58px;height:1px;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent);pointer-events:none}
 [data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
-.card.light{border-color:rgba(214,155,49,.48);box-shadow:0 16px 34px rgba(150,103,28,.12)}
-.halo{position:absolute;inset:-84px -74px auto auto;width:190px;height:190px;background:radial-gradient(circle,rgba(214,155,49,.20),rgba(21,158,153,.08) 42%,transparent 70%);pointer-events:none}
-.card-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
-.card-actions{display:flex;align-items:center;gap:5px;flex:0 0 auto}
+.card.light{border-color:rgba(214,155,49,.28);box-shadow:0 14px 32px rgba(45,75,95,.08),inset 0 0 0 1px rgba(214,155,49,.08)}
+.pharos-mark{position:absolute;right:10px;top:7px;z-index:0;display:grid;place-items:center;width:58px;height:58px;color:rgba(214,155,49,.14);pointer-events:none}
+.pharos-mark .ico{width:50px;height:50px;stroke-width:1.35}
+.card-head{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.card-actions{position:relative;z-index:2;display:flex;align-items:center;gap:5px;flex:0 0 auto}
 .host{display:flex;align-items:center;gap:9px;min-width:0}
-.card-head .host{align-items:flex-start}
-.card-head .nix{margin-top:1px}
 .nix{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(102,121,139,.18);border-radius:50%;color:var(--accent);background:rgba(241,248,250,.72);transition:border-color .2s ease,box-shadow .2s ease}
 .card.has-settings .nix,.list tr.has-settings .nix{border-width:2px;border-color:var(--host-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color) 13%,transparent),0 0 17px color-mix(in srgb,var(--host-color) 18%,transparent);background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--host-color) 8%,#f5fbfc))}
 .name{font-weight:650;font-size:16px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -806,7 +805,6 @@ function attentionFor(live,f){
   if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
   return freshnessAttention(f)||{label:'all clear',level:'ok',rank:4};
 }
-function selfAttention(){return {label:'control light',level:'self',rank:4}}
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
   if(!el)return;
@@ -988,8 +986,6 @@ function setCardAsOf(card,now){
 }
 function sevFor(live){return live==='down'?0:live==='stale'?1:live==='awaiting_first_heartbeat'?2:3}
 function cmp(a,b,mode){
-  const self=Number(b.dataset.self==='true')-Number(a.dataset.self==='true');
-  if(self)return self;
   if(mode==='name')return a.dataset.sortName.localeCompare(b.dataset.sortName);
   if(mode==='last')return Number(b.dataset.last||0)-Number(a.dataset.last||0)||a.dataset.sortName.localeCompare(b.dataset.sortName);
   return Number(a.dataset.sev)-Number(b.dataset.sev)||a.dataset.sortName.localeCompare(b.dataset.sortName);
@@ -1246,14 +1242,14 @@ async function refresh(reason='manual'){
     for(const h of data.hosts||[]){
       const surfaces=hostSurfaces(h.name);
       for(const card of surfaces){
-        const live=card.dataset.self==='true'?'live':h.liveness;
+        const live=h.liveness;
         card.dataset.live=live;
-        const attention=card.dataset.self==='true'?selfAttention():(h.attention||attentionFor(h.liveness,h.freshness));
+        const attention=h.attention||attentionFor(h.liveness,h.freshness);
         card.dataset.sev=String(attention.rank ?? sevFor(live));
         card.dataset.last=h.last_seen ?? 0;
         card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')).toLowerCase();
         const word=card.querySelector('[data-status-word]');
-        if(word&&card.dataset.self!=='true')word.textContent=words[h.liveness]||h.liveness;
+        if(word)word.textContent=words[h.liveness]||h.liveness;
         setReason(card,attention);
         const fresh=card.querySelector('[data-fresh]');
         if(fresh)fresh.innerHTML=freshHtml(h.freshness);
@@ -1813,7 +1809,7 @@ struct AttentionReason {
 
 fn self_attention_reason() -> AttentionReason {
     AttentionReason {
-        label: "control light".to_string(),
+        label: "Pharos host".to_string(),
         level: "self",
         rank: 4,
     }
@@ -2249,17 +2245,13 @@ fn clock_label(timestamp: i64) -> String {
     )
 }
 
-fn summary_cards(hosts: &[Host], self_name: &str, now: i64) -> String {
+fn summary_cards(hosts: &[Host], _self_name: &str, now: i64) -> String {
     let total = hosts.len();
     let mut live = 0;
     let mut stale = 0;
     let mut down = 0;
     for h in hosts {
-        let live_state = if h.name == self_name {
-            Liveness::Live
-        } else {
-            liveness(h.last_seen, h.heartbeat_interval_secs, now)
-        };
+        let live_state = liveness(h.last_seen, h.heartbeat_interval_secs, now);
         match live_state {
             Liveness::Live => live += 1,
             Liveness::Stale => stale += 1,
@@ -3351,7 +3343,7 @@ fn probe_alert(host: &str, role: &str, probe: &ServerProbeObservation) -> Option
 
 fn alert_items(
     hosts: &[Host],
-    self_name: &str,
+    _self_name: &str,
     now: i64,
     manifests: &[HostManifest],
     load_errors: &[ManifestLoadIssue],
@@ -3414,12 +3406,7 @@ fn alert_items(
     }
 
     for host in hosts {
-        let is_self = host.name == self_name;
-        let live = if is_self {
-            Liveness::Live
-        } else {
-            liveness(host.last_seen, host.heartbeat_interval_secs, now)
-        };
+        let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
         match live {
             Liveness::Down => alerts.push(AlertItem {
                 level: "critical",
@@ -3729,7 +3716,7 @@ document.querySelectorAll('[data-ops-page]').forEach(root=>{
 
 fn activity_events(
     hosts: &[Host],
-    self_name: &str,
+    _self_name: &str,
     now: i64,
     manifests: &[HostManifest],
     load_errors: &[ManifestLoadIssue],
@@ -3762,12 +3749,7 @@ fn activity_events(
     }
 
     for host in hosts {
-        let is_self = host.name == self_name;
-        let live = if is_self {
-            Liveness::Live
-        } else {
-            liveness(host.last_seen, host.heartbeat_interval_secs, now)
-        };
+        let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
         match live {
             Liveness::Down => events.push(ActivityEvent::new(
                 now,
@@ -3804,13 +3786,9 @@ fn activity_events(
             events.push(ActivityEvent::new(
                 *stamp,
                 host.name.clone(),
-                if is_self { "recovery" } else { "info" },
+                "info",
                 "heartbeat",
-                if is_self {
-                    "Control light observed"
-                } else {
-                    "Heartbeat received"
-                },
+                "Heartbeat received",
                 format!("{} checked in at {}", host.name, clock_label(*stamp)),
                 "heartbeat",
             ));
@@ -4577,22 +4555,17 @@ fn render_home(
 
     let palette_colors = manifest_palette_color(manifests);
     let mut sorted: Vec<&Host> = hosts.iter().collect();
-    // self/lighthouse first, then by severity (needs-attention first), then name.
     sorted.sort_by_key(|h| {
-        let is_self = u8::from(h.name != self_name);
         let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
         let rank = attention_reason(live, &h.freshness, &h.service_observations).rank;
-        (is_self, rank, h.name.clone())
+        (rank, h.name.clone())
     });
 
     let mut cards = String::new();
     let mut rows = String::new();
     for h in sorted {
         let is_self = h.name == self_name;
-        let mut live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        if is_self {
-            live = Liveness::Live;
-        }
+        let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
         let (_color, word) = live.badge();
         let nix_icon = if h.is_nix {
             icons::SNOWFLAKE
@@ -4603,11 +4576,7 @@ fn render_home(
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
         let fresh = freshness_markup(&h.freshness);
-        let attention = if is_self {
-            self_attention_reason()
-        } else {
-            attention_reason(live, &h.freshness, &h.service_observations)
-        };
+        let attention = attention_reason(live, &h.freshness, &h.service_observations);
         let reason = reason_markup(&attention);
         let search = html_escape(&format!(
             "{} {} {} {}",
@@ -4626,7 +4595,10 @@ fn render_home(
         let light_cls = if is_self { " light" } else { "" };
         let self_attr = if is_self { r#" data-self="true""# } else { "" };
         let beam = if is_self {
-            "<div class=\"halo\"></div>".to_string()
+            format!(
+                r#"<span class="pharos-mark" aria-hidden="true">{}</span>"#,
+                icons::LIGHTHOUSE
+            )
         } else {
             String::new()
         };
@@ -4656,13 +4628,8 @@ fn render_home(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
         );
-        // pharosd cannot honestly heartbeat itself; the host gets the lighthouse cue.
-        let status_word = if is_self { "the light is lit" } else { word };
-        let status_icon = if is_self {
-            icons::LIGHTHOUSE.to_string()
-        } else {
-            status_icon_stack()
-        };
+        let status_word = word;
+        let status_icon = status_icon_stack();
         let heartbeat = heartbeat_card(
             h.last_seen,
             &h.heartbeat_log,
@@ -4886,14 +4853,14 @@ mod tests {
         assert!(!html.contains("setInterval(refresh,10000)"));
         assert!(html.contains(r#"data-host="csb1" data-live="live""#));
         assert!(html.contains(r#"data-self="true""#));
-        assert!(html.contains("the light is lit"));
+        assert!(html.contains(r#"class="pharos-mark""#));
+        assert!(!html.contains("the light is lit"));
         assert!(html.contains(r#"<th>Attention</th>"#));
         assert!(html.contains(r#"<th>Actions</th>"#));
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains("No settings yet"));
         assert!(!html.contains("Not set up yet"));
-        assert!(html
-            .contains(r#"<div class="reason self" data-reason><span>control light</span></div>"#));
+        assert!(!html.contains("control light"));
         assert!(!html.contains("expected beat"));
         assert!(html.contains(r#"class="signal" data-signal data-signal-level="good""#));
         assert!(html.contains(r#"<span data-signal-percent>100%</span>"#));
@@ -5200,7 +5167,7 @@ mod tests {
         assert!(html.contains(r#"href="/activity" aria-current="page""#));
         assert!(html.contains(r#"<h1>Activity</h1>"#));
         assert!(html.contains("Operational timeline"));
-        assert!(html.contains("Control light observed"));
+        assert!(!html.contains("Control light observed"));
         assert!(html.contains("Heartbeat received"));
         assert!(html.contains("Heartbeat lateness detected"));
         assert!(html.contains("Freshness drift detected"));
@@ -5218,6 +5185,45 @@ mod tests {
         assert!(html.contains("const filterOk=active==='all'"));
         assert!(html.contains("Activity is derived from current retained Pharos state."));
         assert!(!html.contains("not-rendered-token-hash"));
+    }
+
+    #[test]
+    fn render_home_sorts_self_host_like_any_other_host() {
+        fn host(name: &str) -> Host {
+            Host {
+                name: name.to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(990),
+                heartbeat_log: vec![930, 990],
+                heartbeat_interval_secs: Some(60),
+                location: None,
+                freshness: NixFreshness {
+                    applicable: false,
+                    ..Default::default()
+                },
+                service_observations: vec![],
+            }
+        }
+
+        let html = render_home(
+            &[host("csb1"), host("csb0")],
+            "csb1",
+            1000,
+            &[],
+            "markus",
+            true,
+        );
+        let csb0 = html.find(r#"data-host="csb0""#).expect("csb0 rendered");
+        let csb1 = html.find(r#"data-host="csb1""#).expect("csb1 rendered");
+
+        assert!(csb0 < csb1, "self host must not be pinned ahead of csb0");
+        assert!(html.contains(r#"<span class="pharos-mark" aria-hidden="true">"#));
+        assert!(!html.contains("control light"));
+        assert!(!html.contains("the light is lit"));
+        assert!(!html.contains("dataset.self==='true')-Number"));
     }
 
     #[test]
