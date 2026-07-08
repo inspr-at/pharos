@@ -589,6 +589,12 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:18px}
 .card{--state:var(--wait);position:relative;min-height:264px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
 .card:before{content:"";position:absolute;left:16px;right:16px;top:58px;height:1px;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent);pointer-events:none}
+.onboard-tile{appearance:none;position:relative;min-height:264px;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px;border:1px dashed rgba(214,155,49,.48);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.82),rgba(240,250,250,.74));box-shadow:0 14px 32px rgba(45,75,95,.05),inset 0 0 0 1px rgba(255,255,255,.52);color:var(--ink);text-align:left;cursor:pointer;overflow:hidden}
+.onboard-tile:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 72% 22%,rgba(214,155,49,.12),transparent 34%),linear-gradient(160deg,transparent 48%,rgba(21,158,153,.08));pointer-events:none}
+.onboard-tile>*{position:relative;z-index:1}.onboard-tile:hover,.onboard-tile:focus-visible{border-style:solid;border-color:rgba(214,155,49,.64);box-shadow:0 18px 38px rgba(45,75,95,.09),0 0 0 4px rgba(214,155,49,.08);outline:0;transform:translateY(-1px)}
+.onboard-mark{display:grid;place-items:center;width:42px;height:42px;border:1px solid rgba(214,155,49,.30);border-radius:50%;background:rgba(255,255,255,.78);color:var(--sun);box-shadow:0 0 0 8px rgba(214,155,49,.06)}.onboard-mark .ico{width:20px;height:20px}
+.onboard-copy strong{display:block;margin:0 0 4px;font-size:18px;line-height:1.15;color:var(--ink)}.onboard-copy span{display:block;color:var(--muted);font-size:13px}
+.onboard-foot{display:flex;align-items:center;gap:8px;color:#0f4f80;font-size:12px;font-weight:760}.onboard-foot:after{content:"";width:24px;height:1px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.60),transparent)}
 [data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
 .card.light{border-color:rgba(214,155,49,.28);box-shadow:0 14px 32px rgba(45,75,95,.08),inset 0 0 0 1px rgba(214,155,49,.08)}
 .pharos-mark{position:absolute;right:10px;top:7px;z-index:0;display:grid;place-items:center;width:58px;height:58px;color:rgba(214,155,49,.14);pointer-events:none}
@@ -666,6 +672,9 @@ main[data-view="list"] .list-wrap{display:block}
 .list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
 .list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .card-tools{margin:0}.list .settings-card{margin:0}.list .settings-icon{width:25px;height:25px}
+.list tr.onboard-row td{border:1px dashed rgba(214,155,49,.42);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.86),rgba(240,250,250,.72));box-shadow:0 10px 24px rgba(45,75,95,.05)}
+.onboard-row button{appearance:none;width:100%;display:flex;align-items:center;gap:12px;border:0;background:transparent;color:var(--ink);font:inherit;text-align:left;cursor:pointer}.onboard-row button:hover strong,.onboard-row button:focus-visible strong{color:#0f4f80}.onboard-row button:focus-visible{outline:0}
+.onboard-row .onboard-mark{width:32px;height:32px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.onboard-row .onboard-mark .ico{width:16px;height:16px}.onboard-row strong{display:block;font-size:13px}.onboard-row span:last-child{display:block;color:var(--muted);font-size:12px}
 .ops-main{width:min(1280px,100%)}
 .ops-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
 .ops-metric{--metric-color:var(--wait);appearance:none;width:100%;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;min-height:78px;padding:14px 16px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.82);box-shadow:0 12px 30px rgba(54,88,108,.06);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);text-align:left;cursor:pointer}
@@ -726,8 +735,6 @@ main[data-view="list"] .list-wrap{display:block}
 .empty-kicker,.lone-kicker{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--sun);font-weight:700}
 .empty-copy h2{margin:8px 0 9px;font-size:30px;line-height:1.12;letter-spacing:0}
 .empty-copy p,.lone-copy p{margin:0;color:var(--muted);font-size:14px}
-.onboard-command{margin-top:18px;display:inline-flex;align-items:center;gap:9px;max-width:100%;padding:10px 12px;border:1px solid rgba(210,226,234,.95);border-radius:7px;background:#fff;color:var(--ink);box-shadow:0 8px 20px rgba(45,75,95,.06);font:13px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:normal;word-break:break-word}
-.onboard-command .ico{color:var(--sea)}
 .empty-visual{position:relative;min-height:285px;display:grid;place-items:center;color:var(--sun)}
 .empty-sun{position:absolute;right:14%;top:8%;width:66px;height:66px;border-radius:50%;background:radial-gradient(circle,#fff 0 34%,rgba(214,155,49,.26) 36% 58%,transparent 60%);box-shadow:0 0 0 12px rgba(214,155,49,.06),0 0 42px rgba(214,155,49,.20)}
 .empty-line{position:absolute;left:7%;right:7%;top:57%;height:2px;border-radius:999px;background:linear-gradient(90deg,transparent,rgba(21,158,153,.42),rgba(214,155,49,.46),transparent)}
@@ -739,7 +746,15 @@ main[data-view="list"] .list-wrap{display:block}
 .lone-mark{position:relative;display:grid;place-items:center;width:46px;height:46px;border-radius:50%;border:1px solid rgba(214,155,49,.28);background:rgba(255,255,255,.74);color:var(--sun)}
 .lone-mark .ico{width:24px;height:24px}
 .lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
-.lone-state .onboard-command{position:relative;margin:0;font-size:12px}
+.onboard-primary{appearance:none;position:relative;display:inline-flex;align-items:center;justify-content:center;gap:9px;min-height:38px;margin-top:18px;padding:0 14px;border:1px solid rgba(103,177,196,.42);border-radius:7px;background:rgba(223,241,249,.74);color:#0f4f80;text-decoration:none;font:inherit;font-size:13px;font-weight:760;box-shadow:0 8px 20px rgba(45,75,95,.07);cursor:pointer}.onboard-primary:hover,.onboard-primary:focus-visible{background:rgba(207,235,244,.92);box-shadow:0 10px 24px rgba(45,75,95,.10);outline:0}.onboard-primary .ico{width:15px;height:15px}
+.lone-state .onboard-primary{margin:0}
+.assistant-overlay{position:fixed;inset:0;z-index:5000;display:grid;place-items:center;padding:24px;background:rgba(20,43,63,.20);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.assistant-sheet{width:min(560px,100%);border:1px solid rgba(210,226,234,.92);border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(247,252,253,.94));box-shadow:0 28px 70px rgba(31,61,82,.22);overflow:hidden}
+.assistant-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 22px 16px;border-bottom:1px solid rgba(214,226,234,.72)}.assistant-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;color:#12304b}.assistant-head p{margin:5px 0 0;color:var(--muted);font-size:13px}
+.assistant-close{appearance:none;display:grid;place-items:center;min-width:34px;height:34px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-close:hover,.assistant-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}
+.assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}.assistant-note{min-height:36px;margin:0;padding:10px 12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--muted);font-size:12px}
+body[data-assistant-open="true"]{overflow:hidden}
+@media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}}
 .map-main{width:min(1380px,100%)}
 .map-main[data-map-view="maximized"]{width:100%}
 .map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
@@ -826,7 +841,7 @@ main[data-view="list"] .list-wrap{display:block}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
 @media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
+@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-primary{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -1122,16 +1137,23 @@ function sortByFreeformOrder(items,order){
     return ai-bi||a.dataset.sortName.localeCompare(b.dataset.sortName);
   });
 }
+function keepOnboardAffordanceLast(){
+  const grid=document.querySelector('[data-grid]');
+  const tile=document.querySelector('[data-onboard-tile]');
+  if(grid&&tile)grid.appendChild(tile);
+}
 function applyFreeformOrder(){
   const grid=document.querySelector('[data-grid]');
   const body=document.querySelector('[data-list-body]');
   const order=readFreeformOrder();
   if(!order.length){
     writeFreeformOrder();
+    keepOnboardAffordanceLast();
     return;
   }
   if(grid)sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order).forEach(el=>grid.appendChild(el));
   if(body)sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order).forEach(el=>body.appendChild(el));
+  keepOnboardAffordanceLast();
 }
 function setArrangeMode(mode){
   const main=document.querySelector('main');
@@ -1149,6 +1171,7 @@ function applySort(mode,write=true){
     if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
     if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
   }
+  keepOnboardAffordanceLast();
   const select=document.querySelector('[data-sort]');
   if(select)select.value=mode;
   if(write)setCookie('pharos_sort',mode);
@@ -1277,6 +1300,25 @@ function bindFreeformDrag(){
   grid.addEventListener('pointercancel',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
   window.addEventListener('blur',finish);
 }
+function setAssistantOpen(open){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  overlay.hidden=!open;
+  document.body.dataset.assistantOpen=open?'true':'false';
+  if(open)overlay.querySelector('[data-assistant-close]')?.focus();
+}
+function initSetupAssistant(){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  document.querySelectorAll('[data-onboard-open]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(true)));
+  overlay.querySelectorAll('[data-assistant-close]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(false)));
+  overlay.addEventListener('click',event=>{if(event.target===overlay)setAssistantOpen(false)});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!overlay.hidden)setAssistantOpen(false)});
+  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>{
+    const note=overlay.querySelector('[data-assistant-note]');
+    if(note)note.textContent='No changes made. This setup path is queued for the next implementation slice.';
+  }));
+}
 function updateUrlState(){
   const main=document.querySelector('main');
   const sort=document.querySelector('[data-sort]')?.value||'attention';
@@ -1306,6 +1348,7 @@ function initControls(){
   document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
   bindFreeformDrag();
+  initSetupAssistant();
 }
 const REFRESH_MS=10000;
 const HIDDEN_REFRESH_MS=60000;
@@ -1976,6 +2019,7 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
         state.manifests.manifests(),
         &user_label,
         state.auth.is_some(),
+        true,
     ))
 }
 
@@ -2721,26 +2765,59 @@ fn map_toolbar() -> String {
     )
 }
 
-fn onboard_command() -> String {
+fn onboard_primary(label: &str) -> String {
     format!(
-        r#"<code class="onboard-command">{icon}<span>inspr onboard &lt;host&gt;</span></code>"#,
-        icon = icons::TERMINAL
+        r#"<button class="onboard-primary" type="button" data-onboard-open>{icon}<span>{label}</span></button>"#,
+        icon = icons::PLUS,
+        label = html_escape(label)
     )
 }
 
-fn empty_state() -> String {
+fn onboard_tile() -> String {
     format!(
-        r#"<section class="empty-state" aria-label="first run"><div class="empty-copy"><span class="empty-kicker">first light</span><h2>Waiting for the first host</h2><p>Register a host and Pharos will hold it in the grey awaiting state until the first real heartbeat arrives.</p>{command}</div><div class="empty-visual" aria-hidden="true"><span class="empty-sun"></span><span class="empty-line"></span><span class="empty-lighthouse">{lighthouse}</span><span class="empty-await">awaiting first heartbeat</span></div></section>"#,
-        command = onboard_command(),
+        r#"<button class="onboard-tile" type="button" data-onboard-open data-onboard-tile aria-label="Add server"><span class="onboard-mark">{icon}</span><span class="onboard-copy"><strong>Add server</strong><span>Provision or onboard</span></span><span class="onboard-foot">Open setup assistant</span></button>"#,
+        icon = icons::PLUS
+    )
+}
+
+fn onboard_row() -> String {
+    format!(
+        r#"<tr class="onboard-row" data-sev="9" data-sort-name="zzzz-onboard" data-last="0"><td colspan="7"><button type="button" data-onboard-open aria-label="Add server"><span class="onboard-mark">{icon}</span><span><strong>Add server</strong><span>Provision a new host or onboard an existing one.</span></span></button></td></tr>"#,
+        icon = icons::PLUS
+    )
+}
+
+fn setup_assistant() -> String {
+    format!(
+        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><p class="assistant-note" data-assistant-note>This is the chooser shell. The concrete setup paths come next.</p></div></div></section>"#,
+        plus = icons::PLUS,
+        server = icons::SERVER
+    )
+}
+
+fn empty_state(can_onboard: bool) -> String {
+    let action = if can_onboard {
+        onboard_primary("Add first server")
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<section class="empty-state" aria-label="first run"><div class="empty-copy"><span class="empty-kicker">first light</span><h2>Waiting for the first host</h2><p>Register a host and Pharos will hold it in the grey awaiting state until the first real heartbeat arrives.</p>{action}</div><div class="empty-visual" aria-hidden="true"><span class="empty-sun"></span><span class="empty-line"></span><span class="empty-lighthouse">{lighthouse}</span><span class="empty-await">awaiting first heartbeat</span></div></section>"#,
+        action = action,
         lighthouse = icons::LIGHTHOUSE
     )
 }
 
-fn lone_host_state() -> String {
+fn lone_host_state(can_onboard: bool) -> String {
+    let action = if can_onboard {
+        onboard_primary("Add server")
+    } else {
+        String::new()
+    };
     format!(
-        r#"<aside class="lone-state" aria-label="lone host state"><span class="lone-mark">{lighthouse}</span><div class="lone-copy"><span class="lone-kicker">one light</span><strong>First host is on the map</strong><p>The fleet view is ready for the next onboarded machine.</p></div>{command}</aside>"#,
+        r#"<aside class="lone-state" aria-label="lone host state"><span class="lone-mark">{lighthouse}</span><div class="lone-copy"><span class="lone-kicker">one light</span><strong>First host is on the map</strong><p>The fleet view is ready for the next onboarded machine.</p></div>{action}</aside>"#,
         lighthouse = icons::LIGHTHOUSE,
-        command = onboard_command()
+        action = action
     )
 }
 
@@ -5036,13 +5113,20 @@ fn render_home(
     manifests: &[HostManifest],
     user_label: &str,
     logout_enabled: bool,
+    can_onboard: bool,
 ) -> String {
     if hosts.is_empty() {
+        let assistant = if can_onboard {
+            setup_assistant()
+        } else {
+            String::new()
+        };
         return format!(
-            "{HEAD}{sidebar}<main>{header}{empty}</main>{FOOT}",
+            "{HEAD}{sidebar}<main>{header}{empty}</main>{assistant}{FOOT}",
             sidebar = sidebar(user_label, logout_enabled, "fleet"),
             header = header(now),
-            empty = empty_state()
+            empty = empty_state(can_onboard),
+            assistant = assistant
         );
     }
 
@@ -5154,17 +5238,27 @@ fn render_home(
     }
 
     let lone = if hosts.len() == 1 {
-        lone_host_state()
+        lone_host_state(can_onboard)
+    } else {
+        String::new()
+    };
+    if can_onboard {
+        cards.push_str(&onboard_tile());
+        rows.push_str(&onboard_row());
+    }
+    let assistant = if can_onboard {
+        setup_assistant()
     } else {
         String::new()
     };
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{FOOT}",
         sidebar = sidebar(user_label, logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
-        toolbar = toolbar()
+        toolbar = toolbar(),
+        assistant = assistant
     )
 }
 
@@ -5318,7 +5412,7 @@ mod tests {
             },
         ];
 
-        let html = render_home(&hosts, "csb1", 1000, &[], "markus", true);
+        let html = render_home(&hosts, "csb1", 1000, &[], "markus", true, true);
 
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains(r#"<section class="toolbar""#));
@@ -5719,6 +5813,7 @@ mod tests {
             1000,
             &[],
             "markus",
+            true,
             true,
         );
         let csb0 = html.find(r#"data-host="csb0""#).expect("csb0 rendered");
@@ -6392,7 +6487,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         }))
         .expect("manifest parses");
 
-        let html = render_home(&[host], "csb1", 1000, &[manifest], "markus", true);
+        let html = render_home(&[host], "csb1", 1000, &[manifest], "markus", true, true);
 
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(html.contains(r#"class="card has-settings""#));
@@ -6406,10 +6501,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn render_home_has_deliberate_empty_and_lone_host_states() {
-        let empty = render_home(&[], "csb1", 1000, &[], "local access", false);
+        let empty = render_home(&[], "csb1", 1000, &[], "local access", false, true);
         assert!(empty.contains(r#"<section class="empty-state""#));
         assert!(empty.contains("Waiting for the first host"));
-        assert!(empty.contains("inspr onboard &lt;host&gt;"));
+        assert!(empty.contains("Add first server"));
+        assert!(empty.contains("Add a server"));
         assert!(empty.contains("awaiting first heartbeat"));
 
         let host = Host {
@@ -6429,10 +6525,40 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             },
             service_observations: vec![],
         };
-        let lone = render_home(&[host], "csb1", 1000, &[], "local access", false);
+        let lone = render_home(&[host], "csb1", 1000, &[], "local access", false, true);
         assert!(lone.contains(r#"<aside class="lone-state""#));
         assert!(lone.contains("First host is on the map"));
+        assert!(lone.contains(r#"data-onboard-tile"#));
+        assert!(lone.contains(r#"<tr class="onboard-row""#));
         assert!(lone.contains(r#"data-live="awaiting_first_heartbeat""#));
+    }
+
+    #[test]
+    fn render_home_hides_onboarding_when_not_allowed() {
+        let host = Host {
+            name: "ares".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(940),
+            heartbeat_log: vec![880, 940],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            service_observations: vec![],
+        };
+
+        let html = render_home(&[host], "csb1", 1000, &[], "reader", true, false);
+
+        assert!(!html.contains(r#"<button class="onboard-tile""#));
+        assert!(!html.contains("Add server"));
+        assert!(!html.contains(r#"<section class="assistant-overlay""#));
+        assert!(!html.contains(r#"<tr class="onboard-row""#));
     }
 
     #[test]
