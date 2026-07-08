@@ -134,7 +134,7 @@ or prints token values; the token file or env file must already exist unless
 `POST /register` is the local MVP token issuer. Set
 `PHAROS_REGISTRATION_TOKEN`, then call it with `Authorization: Bearer ...`.
 The response returns the raw per-host token once; pharosd stores only its
-SHA-256 hash.
+SHA-256 hash. Keep this path for development and migration only.
 
 ```bash
 PHAROS_REGISTRATION_TOKEN=dev cargo run -p pharosd
@@ -146,17 +146,37 @@ curl -sS -H 'Authorization: Bearer dev' \
 ```
 
 `pharos-beacon` sends that token as `PHAROS_TOKEN`, or reads it from
-`PHAROS_TOKEN_FILE` when configured. When
+`PHAROS_TOKEN_FILE` when configured. For Janus-managed issuance, set
+`PHAROS_BEACON_TOKEN_MODE=janus` and provide
+`PHAROS_BEACON_TOKEN_HASH_FILE` pointing at a private Janus/Forge-produced JSON
+file. That file contains host names and SHA-256 token hashes only; pharosd never
+needs the raw beacon token. `dual` mode accepts both the local persisted hashes
+and the Janus hash file during migration. In `janus` mode, local `/register` is
+disabled unless `PHAROS_ALLOW_LOCAL_REGISTER=1` is set explicitly.
+
+The hash file contract is:
+
+```json
+{
+  "schema": "inspr.pharos.beacon-token-hashes.v1",
+  "hosts": [
+    { "name": "ares", "token_sha256": "<64 lowercase hex chars>" }
+  ]
+}
+```
+
+When
 `PHAROS_REQUIRE_BEACON_TOKEN=0`, `/report` accepts legacy reports without a
 bearer token even if the host already has a stored token hash, while still
 rejecting an explicitly wrong bearer token. Set
 `PHAROS_REQUIRE_BEACON_TOKEN=1` to reject reports that do not present a valid
 per-host token; by default that becomes true when `PHAROS_REGISTRATION_TOKEN`
-is configured.
+is configured or a Janus hash file is configured.
 
 Production is still rolling toward strict token-only report ingestion. Do not
 enable strict mode until every deployed beacon has a per-host `PHAROS_TOKEN` and
-the persisted host state has token hashes for those hosts.
+pharosd has either persisted local hashes or a Janus-managed hash file for those
+hosts.
 
 ## Operator authorization
 

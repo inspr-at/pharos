@@ -17,7 +17,7 @@ mod store;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +33,7 @@ use pharos_core::{
     ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
     ServiceObservationState, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
@@ -80,24 +80,51 @@ impl FromRef<AppState> for Arc<ManifestRegistry> {
 struct BeaconAuth {
     registration_token: Option<String>,
     require_report_token: bool,
+    report_token_mode: BeaconTokenMode,
+    janus_token_hash_file: Option<PathBuf>,
+    local_register_enabled: bool,
 }
 
 impl BeaconAuth {
     fn from_env() -> Self {
-        let registration_token = std::env::var("PHAROS_REGISTRATION_TOKEN")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+        let registration_token = env_nonempty("PHAROS_REGISTRATION_TOKEN");
+        let janus_token_hash_file = env_nonempty("PHAROS_BEACON_TOKEN_HASH_FILE")
+            .or_else(|| env_nonempty("PHAROS_JANUS_BEACON_TOKEN_HASH_FILE"))
+            .map(PathBuf::from);
+        let report_token_mode = env_nonempty("PHAROS_BEACON_TOKEN_MODE")
+            .and_then(|s| parse_beacon_token_mode(&s))
+            .unwrap_or_else(|| {
+                if janus_token_hash_file.is_some() {
+                    BeaconTokenMode::Dual
+                } else {
+                    BeaconTokenMode::Local
+                }
+            });
         let require_report_token = std::env::var("PHAROS_REQUIRE_BEACON_TOKEN")
             .ok()
             .and_then(|s| parse_bool(&s))
-            .unwrap_or(registration_token.is_some());
+            .unwrap_or(
+                registration_token.is_some()
+                    || janus_token_hash_file.is_some()
+                    || report_token_mode == BeaconTokenMode::Janus,
+            );
+        let local_register_enabled = std::env::var("PHAROS_ALLOW_LOCAL_REGISTER")
+            .ok()
+            .and_then(|s| parse_bool(&s))
+            .unwrap_or(report_token_mode != BeaconTokenMode::Janus);
         Self {
             registration_token,
             require_report_token,
+            report_token_mode,
+            janus_token_hash_file,
+            local_register_enabled,
         }
     }
 
     fn registration_status(&self, headers: &HeaderMap) -> RegistrationAuth {
+        if !self.local_register_enabled {
+            return RegistrationAuth::Disabled;
+        }
         let Some(expected) = &self.registration_token else {
             return RegistrationAuth::NotConfigured;
         };
@@ -106,12 +133,69 @@ impl BeaconAuth {
             _ => RegistrationAuth::Denied,
         }
     }
+
+    fn report_token_status(&self, store: &Store, host: &str, token: &str) -> ReportTokenAuth {
+        let expected_hash = token_hash(token);
+        match self.report_token_mode {
+            BeaconTokenMode::Local => {
+                if local_token_matches(store, host, &expected_hash) {
+                    ReportTokenAuth::Allowed
+                } else {
+                    ReportTokenAuth::Denied
+                }
+            }
+            BeaconTokenMode::Dual => {
+                if local_token_matches(store, host, &expected_hash) {
+                    return ReportTokenAuth::Allowed;
+                }
+                match self.janus_token_matches(host, &expected_hash) {
+                    Ok(true) => ReportTokenAuth::Allowed,
+                    Ok(false) => ReportTokenAuth::Denied,
+                    Err(err) => ReportTokenAuth::Unavailable(err),
+                }
+            }
+            BeaconTokenMode::Janus => match self.janus_token_matches(host, &expected_hash) {
+                Ok(true) => ReportTokenAuth::Allowed,
+                Ok(false) => ReportTokenAuth::Denied,
+                Err(err) => ReportTokenAuth::Unavailable(err),
+            },
+        }
+    }
+
+    fn janus_token_matches(
+        &self,
+        host: &str,
+        expected_hash: &str,
+    ) -> Result<bool, JanusTokenHashError> {
+        let path = self
+            .janus_token_hash_file
+            .as_deref()
+            .ok_or(JanusTokenHashError::NotConfigured)?;
+        let hashes = load_janus_token_hashes(path)?;
+        Ok(hashes
+            .get(host)
+            .is_some_and(|stored| constant_time_eq(stored, expected_hash)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeaconTokenMode {
+    Local,
+    Dual,
+    Janus,
 }
 
 enum RegistrationAuth {
     Allowed,
     Denied,
+    Disabled,
     NotConfigured,
+}
+
+enum ReportTokenAuth {
+    Allowed,
+    Denied,
+    Unavailable(JanusTokenHashError),
 }
 
 #[derive(Clone)]
@@ -1353,10 +1437,26 @@ fn self_host() -> String {
     std::env::var("PHAROS_SELF").unwrap_or_else(|_| "csb1".into())
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_beacon_token_mode(value: &str) -> Option<BeaconTokenMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "local" | "mvp" => Some(BeaconTokenMode::Local),
+        "dual" | "migration" => Some(BeaconTokenMode::Dual),
+        "janus" | "forge" | "warden" => Some(BeaconTokenMode::Janus),
         _ => None,
     }
 }
@@ -1397,10 +1497,102 @@ fn token_hash(token: &str) -> String {
     hex(&Sha256::digest(token.as_bytes()))
 }
 
+fn local_token_matches(store: &Store, host: &str, expected_hash: &str) -> bool {
+    store
+        .token_hash_for(host)
+        .is_some_and(|stored| constant_time_eq(&stored, expected_hash))
+}
+
 fn new_beacon_token() -> std::io::Result<String> {
     let mut bytes = [0_u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(format!("pharos_{}", hex(&bytes)))
+}
+
+const JANUS_BEACON_TOKEN_HASH_SCHEMA: &str = "inspr.pharos.beacon-token-hashes.v1";
+
+#[derive(Debug, Deserialize)]
+struct JanusTokenHashFile {
+    #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
+    hosts: Vec<JanusTokenHashHost>,
+    #[serde(default)]
+    tokens: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JanusTokenHashHost {
+    name: String,
+    #[serde(alias = "tokenHash", alias = "token_hash", alias = "sha256")]
+    token_sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum JanusTokenHashError {
+    NotConfigured,
+    Read,
+    Parse,
+    UnsupportedSchema,
+    EmptyHost,
+    InvalidHash,
+    DuplicateHost,
+}
+
+impl std::fmt::Display for JanusTokenHashError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConfigured => write!(f, "janus token hash file is not configured"),
+            Self::Read => write!(f, "janus token hash file could not be read"),
+            Self::Parse => write!(f, "janus token hash file could not be parsed"),
+            Self::UnsupportedSchema => write!(f, "janus token hash file schema is unsupported"),
+            Self::EmptyHost => write!(f, "janus token hash file contains an empty host"),
+            Self::InvalidHash => write!(f, "janus token hash file contains an invalid hash"),
+            Self::DuplicateHost => write!(f, "janus token hash file contains a duplicate host"),
+        }
+    }
+}
+
+fn load_janus_token_hashes(path: &Path) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
+    let contents = fs::read_to_string(path).map_err(|_| JanusTokenHashError::Read)?;
+    parse_janus_token_hashes(&contents)
+}
+
+fn parse_janus_token_hashes(
+    contents: &str,
+) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
+    let payload: JanusTokenHashFile =
+        serde_json::from_str(contents).map_err(|_| JanusTokenHashError::Parse)?;
+    if let Some(schema) = payload.schema.as_deref() {
+        if schema != JANUS_BEACON_TOKEN_HASH_SCHEMA {
+            return Err(JanusTokenHashError::UnsupportedSchema);
+        }
+    }
+
+    let mut hashes = BTreeMap::new();
+    for (host, hash) in payload.tokens.into_iter().chain(
+        payload
+            .hosts
+            .into_iter()
+            .map(|host| (host.name, host.token_sha256)),
+    ) {
+        let host = host.trim().to_string();
+        let hash = hash.trim().to_ascii_lowercase();
+        if host.is_empty() {
+            return Err(JanusTokenHashError::EmptyHost);
+        }
+        if !is_sha256_hex(&hash) {
+            return Err(JanusTokenHashError::InvalidHash);
+        }
+        if hashes.insert(host.clone(), hash).is_some() {
+            return Err(JanusTokenHashError::DuplicateHost);
+        }
+    }
+    Ok(hashes)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 async fn healthz() -> &'static str {
@@ -1428,14 +1620,23 @@ async fn report(
         return StatusCode::BAD_REQUEST;
     }
     if let Some(token) = bearer_token(&headers) {
-        let expected_hash = token_hash(token);
-        let valid = state
-            .store
-            .token_hash_for(&rep.name)
-            .is_some_and(|stored| constant_time_eq(&stored, &expected_hash));
-        if !valid {
-            tracing::warn!(host = %rep.name, "report rejected: invalid bearer token");
-            return StatusCode::UNAUTHORIZED;
+        match state
+            .beacon_auth
+            .report_token_status(&state.store, &rep.name, token)
+        {
+            ReportTokenAuth::Allowed => {}
+            ReportTokenAuth::Denied => {
+                tracing::warn!(host = %rep.name, "report rejected: invalid bearer token");
+                return StatusCode::UNAUTHORIZED;
+            }
+            ReportTokenAuth::Unavailable(err) => {
+                tracing::error!(
+                    host = %rep.name,
+                    error = %err,
+                    "report rejected: beacon token verifier unavailable"
+                );
+                return StatusCode::SERVICE_UNAVAILABLE;
+            }
         }
     } else if state.beacon_auth.require_report_token {
         tracing::warn!(host = %rep.name, "report rejected: missing bearer token");
@@ -1460,6 +1661,14 @@ async fn register(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.beacon_auth.registration_status(&headers) {
         RegistrationAuth::Allowed => {}
+        RegistrationAuth::Disabled => {
+            return (
+                StatusCode::GONE,
+                Json(json!({
+                    "error": "local registration disabled; use Janus-managed beacon token issuance"
+                })),
+            );
+        }
         RegistrationAuth::Denied => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -6278,15 +6487,45 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     fn report_test_state(require_report_token: bool) -> AppState {
+        report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token,
+            report_token_mode: BeaconTokenMode::Local,
+            janus_token_hash_file: None,
+            local_register_enabled: true,
+        })
+    }
+
+    fn report_test_state_with_auth(beacon_auth: BeaconAuth) -> AppState {
         AppState {
             store: Arc::new(Store::new(None)),
             manifests: Arc::new(ManifestRegistry::default()),
             auth: None,
-            beacon_auth: BeaconAuth {
-                registration_token: None,
-                require_report_token,
-            },
+            beacon_auth,
         }
+    }
+
+    fn janus_hash_file(host: &str, token: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pharos-janus-token-hashes-{}-{}.json",
+            std::process::id(),
+            nanos
+        ));
+        let payload = json!({
+            "schema": JANUS_BEACON_TOKEN_HASH_SCHEMA,
+            "hosts": [
+                {
+                    "name": host,
+                    "token_sha256": token_hash(token)
+                }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string(&payload).unwrap()).expect("write hash file");
+        path
     }
 
     fn test_report(host: &str) -> HostReport {
@@ -6403,6 +6642,144 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
 
         assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn report_accepts_janus_hash_file_token_without_local_registration() {
+        let path = janus_hash_file("ares", "janus-token");
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_token_hash_file: Some(path.clone()),
+            local_register_enabled: false,
+        });
+
+        let status = report(
+            State(state.clone()),
+            bearer_headers("janus-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!state.store.has_token("ares"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn report_rejects_local_token_when_janus_mode_is_enabled() {
+        let path = janus_hash_file("ares", "janus-token");
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_token_hash_file: Some(path.clone()),
+            local_register_enabled: false,
+        });
+        register_test_token(&state, "ares", "local-token");
+
+        let status = report(
+            State(state),
+            bearer_headers("local-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn report_accepts_local_or_janus_token_in_dual_mode() {
+        let path = janus_hash_file("ares", "janus-token");
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Dual,
+            janus_token_hash_file: Some(path.clone()),
+            local_register_enabled: true,
+        });
+        register_test_token(&state, "athena", "local-token");
+
+        let janus_status = report(
+            State(state.clone()),
+            bearer_headers("janus-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+        let local_status = report(
+            State(state),
+            bearer_headers("local-token"),
+            Json(test_report("athena")),
+        )
+        .await;
+
+        assert_eq!(janus_status, StatusCode::NO_CONTENT);
+        assert_eq!(local_status, StatusCode::NO_CONTENT);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn report_fails_closed_when_janus_hash_file_is_unavailable() {
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_token_hash_file: Some(PathBuf::from("/no/such/pharos-token-hashes.json")),
+            local_register_enabled: false,
+        });
+
+        let status = report(
+            State(state),
+            bearer_headers("janus-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn local_register_is_disabled_by_default_in_janus_mode() {
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: Some("bootstrap".to_string()),
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_token_hash_file: Some(PathBuf::from("/run/janus/pharos-token-hashes.json")),
+            local_register_enabled: false,
+        });
+
+        let (status, Json(payload)) = register(
+            State(state),
+            bearer_headers("bootstrap"),
+            Json(HostRegistration {
+                name: "ares".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: 60,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            payload["error"],
+            "local registration disabled; use Janus-managed beacon token issuance"
+        );
+    }
+
+    #[test]
+    fn janus_token_hash_contract_rejects_secret_shaped_or_invalid_hashes() {
+        let err = parse_janus_token_hashes(
+            r#"{
+                "schema": "inspr.pharos.beacon-token-hashes.v1",
+                "tokens": { "ares": "pharos_not_a_hash" }
+            }"#,
+        )
+        .expect_err("invalid hash is rejected");
+
+        assert_eq!(err, JanusTokenHashError::InvalidHash);
     }
 
     #[tokio::test]
