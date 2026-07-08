@@ -81,20 +81,18 @@ struct BeaconAuth {
     registration_token: Option<String>,
     require_report_token: bool,
     report_token_mode: BeaconTokenMode,
-    janus_token_hash_file: Option<PathBuf>,
+    janus_token_hash_sources: Vec<JanusTokenHashSource>,
     local_register_enabled: bool,
 }
 
 impl BeaconAuth {
     fn from_env() -> Self {
         let registration_token = env_nonempty("PHAROS_REGISTRATION_TOKEN");
-        let janus_token_hash_file = env_nonempty("PHAROS_BEACON_TOKEN_HASH_FILE")
-            .or_else(|| env_nonempty("PHAROS_JANUS_BEACON_TOKEN_HASH_FILE"))
-            .map(PathBuf::from);
+        let janus_token_hash_sources = janus_token_hash_sources_from_env();
         let report_token_mode = env_nonempty("PHAROS_BEACON_TOKEN_MODE")
             .and_then(|s| parse_beacon_token_mode(&s))
-            .unwrap_or_else(|| {
-                if janus_token_hash_file.is_some() {
+            .unwrap_or({
+                if !janus_token_hash_sources.is_empty() {
                     BeaconTokenMode::Dual
                 } else {
                     BeaconTokenMode::Local
@@ -105,7 +103,7 @@ impl BeaconAuth {
             .and_then(|s| parse_bool(&s))
             .unwrap_or(
                 registration_token.is_some()
-                    || janus_token_hash_file.is_some()
+                    || !janus_token_hash_sources.is_empty()
                     || report_token_mode == BeaconTokenMode::Janus,
             );
         let local_register_enabled = std::env::var("PHAROS_ALLOW_LOCAL_REGISTER")
@@ -116,7 +114,7 @@ impl BeaconAuth {
             registration_token,
             require_report_token,
             report_token_mode,
-            janus_token_hash_file,
+            janus_token_hash_sources,
             local_register_enabled,
         }
     }
@@ -167,15 +165,17 @@ impl BeaconAuth {
         host: &str,
         expected_hash: &str,
     ) -> Result<bool, JanusTokenHashError> {
-        let path = self
-            .janus_token_hash_file
-            .as_deref()
-            .ok_or(JanusTokenHashError::NotConfigured)?;
-        let hashes = load_janus_token_hashes(path)?;
+        let hashes = load_janus_token_hashes(&self.janus_token_hash_sources)?;
         Ok(hashes
             .get(host)
             .is_some_and(|stored| constant_time_eq(stored, expected_hash)))
     }
+}
+
+#[derive(Clone)]
+enum JanusTokenHashSource {
+    File(PathBuf),
+    Dir(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1461,6 +1461,43 @@ fn parse_beacon_token_mode(value: &str) -> Option<BeaconTokenMode> {
     }
 }
 
+fn janus_token_hash_sources_from_env() -> Vec<JanusTokenHashSource> {
+    let mut sources = Vec::new();
+    if let Some(value) = env_nonempty("PHAROS_BEACON_TOKEN_HASH_FILES") {
+        sources.extend(
+            parse_path_list(&value)
+                .into_iter()
+                .map(JanusTokenHashSource::File),
+        );
+    }
+    for name in [
+        "PHAROS_BEACON_TOKEN_HASH_FILE",
+        "PHAROS_JANUS_BEACON_TOKEN_HASH_FILE",
+    ] {
+        if let Some(path) = env_nonempty(name) {
+            sources.push(JanusTokenHashSource::File(PathBuf::from(path)));
+        }
+    }
+    if let Some(path) = env_nonempty("PHAROS_BEACON_TOKEN_HASH_DIR") {
+        sources.push(JanusTokenHashSource::Dir(PathBuf::from(path)));
+    }
+    sources
+}
+
+fn parse_path_list(value: &str) -> Vec<PathBuf> {
+    value
+        .split(',')
+        .filter_map(|path| {
+            let path = path.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            }
+        })
+        .collect()
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -1543,7 +1580,7 @@ impl std::fmt::Display for JanusTokenHashError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotConfigured => write!(f, "janus token hash file is not configured"),
-            Self::Read => write!(f, "janus token hash file could not be read"),
+            Self::Read => write!(f, "janus token hash source could not be read"),
             Self::Parse => write!(f, "janus token hash file could not be parsed"),
             Self::UnsupportedSchema => write!(f, "janus token hash file schema is unsupported"),
             Self::EmptyHost => write!(f, "janus token hash file contains an empty host"),
@@ -1553,7 +1590,73 @@ impl std::fmt::Display for JanusTokenHashError {
     }
 }
 
-fn load_janus_token_hashes(path: &Path) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
+fn load_janus_token_hashes(
+    sources: &[JanusTokenHashSource],
+) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
+    if sources.is_empty() {
+        return Err(JanusTokenHashError::NotConfigured);
+    }
+    let mut hashes = BTreeMap::new();
+    for source in sources {
+        match source {
+            JanusTokenHashSource::File(path) => {
+                merge_janus_token_hashes(&mut hashes, load_janus_token_hash_file(path)?)?;
+            }
+            JanusTokenHashSource::Dir(path) => {
+                for path in janus_token_hash_dir_files(path)? {
+                    merge_janus_token_hashes(&mut hashes, load_janus_token_hash_file(&path)?)?;
+                }
+            }
+        }
+    }
+    if hashes.is_empty() {
+        return Err(JanusTokenHashError::NotConfigured);
+    }
+    Ok(hashes)
+}
+
+fn janus_token_hash_dir_files(path: &Path) -> Result<Vec<PathBuf>, JanusTokenHashError> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path).map_err(|_| JanusTokenHashError::Read)? {
+        let entry = entry.map_err(|_| JanusTokenHashError::Read)?;
+        let metadata = entry.metadata().map_err(|_| JanusTokenHashError::Read)?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(JanusTokenHashError::Read);
+        };
+        if file_name.starts_with('.') {
+            continue;
+        }
+        let is_json = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        if is_json {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn merge_janus_token_hashes(
+    target: &mut BTreeMap<String, String>,
+    next: BTreeMap<String, String>,
+) -> Result<(), JanusTokenHashError> {
+    for (host, hash) in next {
+        if target.insert(host.clone(), hash).is_some() {
+            return Err(JanusTokenHashError::DuplicateHost);
+        }
+    }
+    Ok(())
+}
+
+fn load_janus_token_hash_file(
+    path: &Path,
+) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
     let contents = fs::read_to_string(path).map_err(|_| JanusTokenHashError::Read)?;
     parse_janus_token_hashes(&contents)
 }
@@ -6491,7 +6594,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: None,
             require_report_token,
             report_token_mode: BeaconTokenMode::Local,
-            janus_token_hash_file: None,
+            janus_token_hash_sources: vec![],
             local_register_enabled: true,
         })
     }
@@ -6526,6 +6629,34 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         });
         std::fs::write(&path, serde_json::to_string(&payload).unwrap()).expect("write hash file");
         path
+    }
+
+    fn janus_hash_dir(entries: &[(&str, &str)]) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-janus-token-hash-dir-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir(&dir).expect("create hash dir");
+        for (host, token) in entries {
+            let path = dir.join(format!("{host}.json"));
+            let payload = json!({
+                "schema": JANUS_BEACON_TOKEN_HASH_SCHEMA,
+                "hosts": [
+                    {
+                        "name": host,
+                        "token_sha256": token_hash(token)
+                    }
+                ]
+            });
+            std::fs::write(&path, serde_json::to_string(&payload).unwrap())
+                .expect("write hash file");
+        }
+        dir
     }
 
     fn test_report(host: &str) -> HostReport {
@@ -6651,7 +6782,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_file: Some(path.clone()),
+            janus_token_hash_sources: vec![JanusTokenHashSource::File(path.clone())],
             local_register_enabled: false,
         });
 
@@ -6674,7 +6805,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_file: Some(path.clone()),
+            janus_token_hash_sources: vec![JanusTokenHashSource::File(path.clone())],
             local_register_enabled: false,
         });
         register_test_token(&state, "ares", "local-token");
@@ -6697,7 +6828,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Dual,
-            janus_token_hash_file: Some(path.clone()),
+            janus_token_hash_sources: vec![JanusTokenHashSource::File(path.clone())],
             local_register_enabled: true,
         });
         register_test_token(&state, "athena", "local-token");
@@ -6721,12 +6852,67 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn report_accepts_janus_hash_sidecar_directory() {
+        let dir = janus_hash_dir(&[("ares", "ares-token"), ("athena", "athena-token")]);
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_token_hash_sources: vec![JanusTokenHashSource::Dir(dir.clone())],
+            local_register_enabled: false,
+        });
+
+        let ares_status = report(
+            State(state.clone()),
+            bearer_headers("ares-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+        let athena_status = report(
+            State(state),
+            bearer_headers("athena-token"),
+            Json(test_report("athena")),
+        )
+        .await;
+
+        assert_eq!(ares_status, StatusCode::NO_CONTENT);
+        assert_eq!(athena_status, StatusCode::NO_CONTENT);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn report_ignores_janus_hash_sidecar_directory_temp_files() {
+        let dir = janus_hash_dir(&[("ares", "ares-token")]);
+        std::fs::write(dir.join(".ares.json.123.tmp"), "not-json").expect("write temp sidecar");
+        std::fs::write(dir.join("README.txt"), "not-json").expect("write ignored text file");
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_token_hash_sources: vec![JanusTokenHashSource::Dir(dir.clone())],
+            local_register_enabled: false,
+        });
+
+        let status = report(
+            State(state),
+            bearer_headers("ares-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn report_fails_closed_when_janus_hash_file_is_unavailable() {
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_file: Some(PathBuf::from("/no/such/pharos-token-hashes.json")),
+            janus_token_hash_sources: vec![JanusTokenHashSource::File(PathBuf::from(
+                "/no/such/pharos-token-hashes.json",
+            ))],
             local_register_enabled: false,
         });
 
@@ -6746,7 +6932,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: Some("bootstrap".to_string()),
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_file: Some(PathBuf::from("/run/janus/pharos-token-hashes.json")),
+            janus_token_hash_sources: vec![JanusTokenHashSource::File(PathBuf::from(
+                "/run/janus/pharos-token-hashes.json",
+            ))],
             local_register_enabled: false,
         });
 

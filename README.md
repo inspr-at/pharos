@@ -149,10 +149,13 @@ curl -sS -H 'Authorization: Bearer dev' \
 `PHAROS_TOKEN_FILE` when configured. For Janus-managed issuance, set
 `PHAROS_BEACON_TOKEN_MODE=janus` and provide
 `PHAROS_BEACON_TOKEN_HASH_FILE` pointing at a private Janus/Forge-produced JSON
-file. That file contains host names and SHA-256 token hashes only; pharosd never
-needs the raw beacon token. `dual` mode accepts both the local persisted hashes
-and the Janus hash file during migration. In `janus` mode, local `/register` is
-disabled unless `PHAROS_ALLOW_LOCAL_REGISTER=1` is set explicitly.
+file. For per-host sidecars, use `PHAROS_BEACON_TOKEN_HASH_FILES` as a
+comma-separated list or `PHAROS_BEACON_TOKEN_HASH_DIR` to read every non-hidden
+`.json` regular file in a private directory. Those files contain host names and
+SHA-256 token hashes only; pharosd never needs the raw beacon token. `dual` mode
+accepts both the local persisted hashes and Janus hash files during migration.
+In `janus` mode, local `/register` is disabled unless
+`PHAROS_ALLOW_LOCAL_REGISTER=1` is set explicitly.
 
 The hash file contract is:
 
