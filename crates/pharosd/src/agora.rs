@@ -701,6 +701,7 @@ mod tests {
                 fqdn: Some("hsb8.lan".to_string()),
                 ip: Some("192.168.1.100".to_string()),
                 site: None,
+                location: None,
                 title: None,
                 heading: None,
                 eyebrow: None,
@@ -741,6 +742,7 @@ mod tests {
             last_seen: Some(crate::now_unix()),
             heartbeat_log: vec![],
             heartbeat_interval_secs: Some(60),
+            location: None,
             freshness: NixFreshness {
                 applicable: true,
                 flake_lock_age_days: Some(0),

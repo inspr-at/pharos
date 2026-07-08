@@ -72,6 +72,7 @@ impl Store {
                     .map(|h| h.heartbeat_log.clone())
                     .unwrap_or_default(),
                 heartbeat_interval_secs: Some(registration.heartbeat_interval_secs),
+                location: existing.and_then(|h| h.location.clone()),
                 freshness: existing
                     .map(|h| h.freshness.clone())
                     .unwrap_or_else(|| NixFreshness {
@@ -131,6 +132,7 @@ impl Store {
                     last_seen: Some(now),
                     heartbeat_log,
                     heartbeat_interval_secs: Some(report.heartbeat_interval_secs),
+                    location: report.location,
                     freshness: report.freshness,
                     service_observations: report.service_observations,
                 },
@@ -200,6 +202,7 @@ mod tests {
                         ..Default::default()
                     },
                     service_observations: vec![],
+                    location: None,
                 },
                 now,
             );
@@ -251,6 +254,7 @@ mod tests {
                         commits_behind: Some(0),
                     },
                 )],
+                location: None,
             },
             120,
         );
@@ -287,6 +291,7 @@ mod tests {
                     commits_behind: Some(0),
                 },
                 service_observations: vec![],
+                location: None,
             },
             150,
         );

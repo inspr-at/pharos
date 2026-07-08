@@ -27,10 +27,10 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, Host, HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
-    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
-    ServiceObservationState, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, HOST_REPORT_SCHEMA,
-    HOST_REPORT_VERSION,
+    liveness, Host, HostLocation, HostLocationSource, HostManifest, HostRegistration,
+    HostRegistrationResponse, HostReport, Liveness, ManifestProbePolicy, ManifestService,
+    ManifestStatusSource, NixFreshness, ServiceObservation, ServiceObservationState,
+    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -1054,12 +1054,13 @@ async fn report(
     headers: HeaderMap,
     Json(rep): Json<HostReport>,
 ) -> StatusCode {
-    if rep.schema != HOST_REPORT_SCHEMA || rep.version != HOST_REPORT_VERSION {
+    if let Err(error) = rep.validate_contract() {
         tracing::warn!(
             host = %rep.name,
             schema = %rep.schema,
             version = rep.version,
-            "report rejected: unsupported report contract"
+            error = %error,
+            "report rejected: invalid report contract"
         );
         return StatusCode::BAD_REQUEST;
     }
@@ -1132,15 +1133,22 @@ async fn register(
     )
 }
 
-async fn hosts_json(State(store): State<Arc<Store>>) -> impl IntoResponse {
+async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
     let now = now_unix();
-    let hosts: Vec<_> = store
-        .list()
+    let runtime_hosts = state.store.list();
+    let manifests = manifest_by_host(state.manifests.manifests());
+    let hosts: Vec<_> = runtime_hosts
         .into_iter()
         .map(|h| {
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
             let freshness_tldr = h.freshness.tldr();
             let attention = attention_reason(live, &h.freshness, &h.service_observations);
+            let location = resolve_host_location(
+                Some(&h),
+                manifests.get(h.name.as_str()).copied(),
+                &h.name,
+                now,
+            );
             json!({
                 "name": h.name,
                 "role": h.role,
@@ -1150,6 +1158,7 @@ async fn hosts_json(State(store): State<Arc<Store>>) -> impl IntoResponse {
                 "heartbeat_log": h.heartbeat_log,
                 "heartbeat_interval_secs": h.heartbeat_interval_secs,
                 "liveness": live,
+                "location": location_payload(&location),
                 "freshness": h.freshness,
                 "freshness_tldr": freshness_tldr,
                 "service_observations": h.service_observations,
@@ -1205,7 +1214,7 @@ fn declared_hosts_payload(
                 "name": &manifest.host.name,
                 "slug": &manifest.slug,
                 "declared": manifest,
-                "runtime": runtime_overlay(runtime, probes, now),
+                "runtime": runtime_overlay(runtime, manifest, probes, now),
             })
         })
         .collect();
@@ -1222,9 +1231,11 @@ fn declared_hosts_payload(
 
 fn runtime_overlay(
     host: Option<&Host>,
+    manifest: &HostManifest,
     server_probes: &[ServerProbeObservation],
     now: i64,
 ) -> serde_json::Value {
+    let location = resolve_host_location(host, Some(manifest), &manifest.host.name, now);
     let Some(host) = host else {
         return json!({
             "state": "pending",
@@ -1232,6 +1243,7 @@ fn runtime_overlay(
             "last_seen": null,
             "heartbeat_log": [],
             "heartbeat_interval_secs": null,
+            "location": location_payload(&location),
             "freshness": null,
             "freshness_tldr": null,
             "service_observations": [],
@@ -1248,6 +1260,7 @@ fn runtime_overlay(
         "heartbeat_log": host.heartbeat_log,
         "heartbeat_interval_secs": host.heartbeat_interval_secs,
         "liveness": live,
+        "location": location_payload(&location),
         "freshness": host.freshness,
         "freshness_tldr": host.freshness.tldr(),
         "service_observations": host.service_observations,
@@ -2151,13 +2164,86 @@ fn head_with_extra(extra: &str) -> String {
     HEAD.replacen("</style></head>", &format!("</style>{extra}</head>"), 1)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+const LOCATION_STALE_AFTER_SECS: i64 = 24 * 3600;
+
+#[derive(Debug, Clone, PartialEq)]
 struct SiteLocation {
-    id: &'static str,
-    label: &'static str,
-    region: &'static str,
+    id: String,
+    label: String,
+    region: String,
     lat: f64,
     lon: f64,
+    source: HostLocationSource,
+    state: &'static str,
+    stale: bool,
+    manual_override: bool,
+    observed_at: Option<i64>,
+    accuracy_meters: Option<f64>,
+    precision_meters: Option<f64>,
+}
+
+impl SiteLocation {
+    fn from_site(site: &str, source: HostLocationSource) -> Self {
+        let (id, label, region, lat, lon) = match site {
+            "cloud" | "cloud-de" => ("cloud-de", "Cloud", "Germany", 50.1109, 8.6821),
+            "home" | "home-at" => ("home-at", "Home", "Austria", 48.2082, 16.3738),
+            "ww87" | "parents-home" => ("ww87", "Parents' home", "Austria", 48.32, 15.92),
+            "parents-in-law" => ("parents-in-law", "Parents-in-law", "Austria", 48.13, 15.18),
+            "dsc" | "dsc0" | "dsc-us" | "hillsboro-or" => {
+                ("dsc-us", "DSC", "Hillsboro, OR, US", 45.5229, -122.9898)
+            }
+            _ => ("unknown", "Unknown site", "Not declared", 46.8, 8.2),
+        };
+        Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            region: region.to_string(),
+            lat,
+            lon,
+            source,
+            state: if id == "unknown" { "unknown" } else { "known" },
+            stale: false,
+            manual_override: false,
+            observed_at: None,
+            accuracy_meters: None,
+            precision_meters: None,
+        }
+    }
+
+    fn from_host_location(
+        location: &HostLocation,
+        fallback_label: impl Into<String>,
+        fallback_region: impl Into<String>,
+        state: &'static str,
+        now: i64,
+    ) -> Self {
+        let stale = location_stale(location, now);
+        let label = location
+            .label
+            .clone()
+            .unwrap_or_else(|| fallback_label.into());
+        let region = fallback_region.into();
+        let id = format!(
+            "{}:{:.4},{:.4}",
+            location_source_key(location.source),
+            location.latitude,
+            location.longitude
+        );
+        Self {
+            id,
+            label,
+            region,
+            lat: location.latitude,
+            lon: location.longitude,
+            source: location.source,
+            state: if stale { "stale" } else { state },
+            stale,
+            manual_override: location.manual_override,
+            observed_at: location.observed_at,
+            accuracy_meters: location.accuracy_meters,
+            precision_meters: location.precision_meters,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2184,11 +2270,16 @@ struct MapHost {
     status: &'static str,
     attention: String,
     search: String,
-    site_id: &'static str,
-    site_label: &'static str,
-    region: &'static str,
+    site_id: String,
+    site_label: String,
+    region: String,
     lat: f64,
     lon: f64,
+    location_source: &'static str,
+    location_state: &'static str,
+    location_stale: bool,
+    location_manual_override: bool,
+    location: serde_json::Value,
     is_pharos: bool,
     inbound_label: String,
     inbound_level: &'static str,
@@ -2201,50 +2292,112 @@ struct MapHost {
 }
 
 fn site_location(site: &str) -> SiteLocation {
-    match site {
-        "cloud" | "cloud-de" => SiteLocation {
-            id: "cloud-de",
-            label: "Cloud",
-            region: "Germany",
-            lat: 50.1109,
-            lon: 8.6821,
-        },
-        "home" | "home-at" => SiteLocation {
-            id: "home-at",
-            label: "Home",
-            region: "Austria",
-            lat: 48.2082,
-            lon: 16.3738,
-        },
-        "ww87" | "parents-home" => SiteLocation {
-            id: "ww87",
-            label: "Parents' home",
-            region: "Austria",
-            lat: 48.32,
-            lon: 15.92,
-        },
-        "parents-in-law" => SiteLocation {
-            id: "parents-in-law",
-            label: "Parents-in-law",
-            region: "Austria",
-            lat: 48.13,
-            lon: 15.18,
-        },
-        "dsc" | "dsc0" | "dsc-us" | "hillsboro-or" => SiteLocation {
-            id: "dsc-us",
-            label: "DSC",
-            region: "Hillsboro, OR, US",
-            lat: 45.5229,
-            lon: -122.9898,
-        },
-        _ => SiteLocation {
-            id: "unknown",
-            label: "Unknown site",
-            region: "Not declared",
-            lat: 46.8,
-            lon: 8.2,
-        },
+    SiteLocation::from_site(site, HostLocationSource::Provider)
+}
+
+fn fallback_site_location(host: &str) -> SiteLocation {
+    SiteLocation::from_site(fallback_site_for_host(host), HostLocationSource::Fallback)
+}
+
+fn location_source_key(source: HostLocationSource) -> &'static str {
+    match source {
+        HostLocationSource::Wifi => "wifi",
+        HostLocationSource::Ip => "ip",
+        HostLocationSource::Provider => "provider",
+        HostLocationSource::Declared => "declared",
+        HostLocationSource::Fallback => "fallback",
+        HostLocationSource::Unknown => "unknown",
     }
+}
+
+fn location_stale(location: &HostLocation, now: i64) -> bool {
+    if location.stale {
+        return true;
+    }
+    location
+        .observed_at
+        .is_some_and(|observed| now.saturating_sub(observed) > LOCATION_STALE_AFTER_SECS)
+}
+
+fn location_payload(location: &SiteLocation) -> serde_json::Value {
+    json!({
+        "latitude": location.lat,
+        "longitude": location.lon,
+        "source": location_source_key(location.source),
+        "state": location.state,
+        "stale": location.stale,
+        "manual_override": location.manual_override,
+        "observed_at": location.observed_at,
+        "accuracy_meters": location.accuracy_meters,
+        "precision_meters": location.precision_meters,
+        "label": location.label,
+        "region": location.region,
+        "site_id": location.id,
+    })
+}
+
+fn resolve_host_location(
+    host: Option<&Host>,
+    manifest: Option<&HostManifest>,
+    host_name: &str,
+    now: i64,
+) -> SiteLocation {
+    let provider = manifest
+        .and_then(|manifest| {
+            manifest
+                .host
+                .site
+                .as_deref()
+                .filter(|site| !site.trim().is_empty())
+        })
+        .map(site_location);
+
+    if let Some(location) = manifest
+        .and_then(|manifest| manifest.host.location.as_ref())
+        .filter(|location| location.manual_override)
+    {
+        let fallback = provider
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| fallback_site_location(host_name));
+        return SiteLocation::from_host_location(
+            location,
+            fallback.label,
+            fallback.region,
+            "declared",
+            now,
+        );
+    }
+
+    if let Some(location) = host.and_then(|host| host.location.as_ref()) {
+        let fallback = provider
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| fallback_site_location(host_name));
+        return SiteLocation::from_host_location(
+            location,
+            fallback.label,
+            fallback.region,
+            "observed",
+            now,
+        );
+    }
+
+    if let Some(location) = manifest.and_then(|manifest| manifest.host.location.as_ref()) {
+        let fallback = provider
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| fallback_site_location(host_name));
+        return SiteLocation::from_host_location(
+            location,
+            fallback.label,
+            fallback.region,
+            "declared",
+            now,
+        );
+    }
+
+    provider.unwrap_or_else(|| fallback_site_location(host_name))
 }
 
 fn fallback_site_for_host(host: &str) -> &'static str {
@@ -2256,22 +2409,6 @@ fn fallback_site_for_host(host: &str) -> &'static str {
         "dsc0" => "dsc-us",
         _ => "unknown",
     }
-}
-
-fn manifest_site_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &str> {
-    let mut sites = BTreeMap::new();
-    for manifest in manifests {
-        if let Some(site) = manifest
-            .host
-            .site
-            .as_deref()
-            .filter(|site| !site.trim().is_empty())
-        {
-            sites.insert(manifest.host.name.as_str(), site);
-            sites.insert(manifest.slug.as_str(), site);
-        }
-    }
-    sites
 }
 
 fn manifest_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &HostManifest> {
@@ -2528,7 +2665,7 @@ fn map_hosts(
     manifests: &[HostManifest],
     probes: &BTreeMap<String, MapSignal>,
 ) -> Vec<MapHost> {
-    let sites = manifest_site_by_host(manifests);
+    let manifests = manifest_by_host(manifests);
     let mut mapped = hosts
         .iter()
         .map(|host| {
@@ -2543,27 +2680,30 @@ fn map_hosts(
             } else {
                 attention_reason(live, &host.freshness, &host.service_observations)
             };
-            let site = sites
-                .get(host.name.as_str())
-                .copied()
-                .unwrap_or_else(|| fallback_site_for_host(&host.name));
-            let site = site_location(site);
+            let site = resolve_host_location(
+                Some(host),
+                manifests.get(host.name.as_str()).copied(),
+                &host.name,
+                now,
+            );
             let inbound = map_inbound_signal(host, is_pharos, now);
             let outbound = probes
                 .get(&host.name)
                 .cloned()
                 .unwrap_or_else(default_map_signal);
             let search = format!(
-                "{} {} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {}",
                 host.name,
                 host.role,
                 status,
                 attention.label,
                 site.label,
                 site.region,
+                location_source_key(site.source),
                 outbound.label
             )
             .to_lowercase();
+            let location = location_payload(&site);
             MapHost {
                 name: host.name.clone(),
                 role: host.role.clone(),
@@ -2576,6 +2716,11 @@ fn map_hosts(
                 region: site.region,
                 lat: site.lat,
                 lon: site.lon,
+                location_source: location_source_key(site.source),
+                location_state: site.state,
+                location_stale: site.stale,
+                location_manual_override: site.manual_override,
+                location,
                 is_pharos,
                 inbound_label: inbound.label,
                 inbound_level: inbound.level,
@@ -2590,7 +2735,7 @@ fn map_hosts(
         .collect::<Vec<_>>();
     mapped.sort_by(|a, b| {
         a.site_label
-            .cmp(b.site_label)
+            .cmp(&b.site_label)
             .then_with(|| a.name.cmp(&b.name))
     });
     mapped
@@ -2599,7 +2744,7 @@ fn map_hosts(
 fn map_site_list(hosts: &[MapHost]) -> String {
     let mut by_site: BTreeMap<&str, Vec<&MapHost>> = BTreeMap::new();
     for host in hosts {
-        by_site.entry(host.site_id).or_default().push(host);
+        by_site.entry(host.site_id.as_str()).or_default().push(host);
     }
     by_site
         .into_values()
@@ -2634,8 +2779,8 @@ fn map_site_list(hosts: &[MapHost]) -> String {
                 .collect::<String>();
             format!(
                 r#"<section class="site-item"><div class="site-head"><div><strong>{site}</strong><p>{region}</p></div><span class="site-count">{count}</span></div><div class="site-hosts">{host_links}</div></section>"#,
-                site = html_escape(first.site_label),
-                region = html_escape(first.region),
+                site = html_escape(&first.site_label),
+                region = html_escape(&first.region),
                 count = hosts.len()
             )
         })
@@ -4275,6 +4420,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     ..Default::default()
@@ -4290,6 +4436,7 @@ mod tests {
                 last_seen: Some(879),
                 heartbeat_log: vec![760, 819, 879],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     flake_lock_age_days: Some(1),
@@ -4306,6 +4453,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     flake_lock_age_days: Some(1),
@@ -4404,6 +4552,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     ..Default::default()
@@ -4419,6 +4568,7 @@ mod tests {
                 last_seen: Some(500),
                 heartbeat_log: vec![380, 440, 500],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     ..Default::default()
@@ -4434,6 +4584,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     flake_lock_age_days: Some(2),
@@ -4462,6 +4613,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     flake_lock_age_days: Some(2),
@@ -4553,6 +4705,7 @@ mod tests {
                 last_seen: Some(1000),
                 heartbeat_log: vec![880, 940, 1000],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     flake_lock_age_days: Some(0),
@@ -4569,6 +4722,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     flake_lock_age_days: Some(4),
@@ -4603,6 +4757,7 @@ mod tests {
                 last_seen: Some(760),
                 heartbeat_log: vec![640, 700, 760],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness {
                     applicable: true,
                     ..Default::default()
@@ -4686,6 +4841,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
             },
@@ -4698,6 +4854,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
             },
@@ -4710,6 +4867,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
             },
@@ -4722,6 +4880,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
             },
@@ -4734,6 +4893,7 @@ mod tests {
                 last_seen: None,
                 heartbeat_log: vec![],
                 heartbeat_interval_secs: Some(60),
+                location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
             },
@@ -4844,6 +5004,10 @@ mod tests {
         assert!(html.contains(r#""site_id":"dsc-us""#));
         assert!(html.contains(r#""site_id":"unknown""#));
         assert!(html.contains(r#""lon":-122.9898"#));
+        assert!(html.contains(r#""location_source":"provider""#));
+        assert!(html.contains(r#""location_source":"fallback""#));
+        assert!(html.contains(r#""source":"provider""#));
+        assert!(html.contains(r#""source":"fallback""#));
         assert!(html.contains("Hillsboro, OR, US"));
         assert!(html.contains(r#""inbound_label":"30s""#));
         assert!(html.contains(r#""outbound_label":"blocked""#));
@@ -4860,6 +5024,162 @@ mod tests {
         assert!(html.contains(r#"style="--host-state:var(--wait)""#));
         assert!(html.contains("Approximate site-level coordinates."));
         assert!(html.contains("All servers stay visible"));
+    }
+
+    #[test]
+    fn host_location_resolution_defines_precedence_and_stale_state() {
+        fn location(
+            latitude: f64,
+            longitude: f64,
+            source: HostLocationSource,
+            observed_at: Option<i64>,
+            manual_override: bool,
+            label: &str,
+        ) -> HostLocation {
+            HostLocation {
+                latitude,
+                longitude,
+                source,
+                accuracy_meters: Some(1000.0),
+                precision_meters: None,
+                observed_at,
+                stale: false,
+                manual_override,
+                label: Some(label.to_string()),
+            }
+        }
+
+        let mut host = Host {
+            name: "dsc0".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(1000),
+            heartbeat_log: vec![940, 1000],
+            heartbeat_interval_secs: Some(60),
+            location: Some(location(
+                50.1109,
+                8.6821,
+                HostLocationSource::Wifi,
+                Some(995),
+                false,
+                "Runtime wifi",
+            )),
+            freshness: NixFreshness::default(),
+            service_observations: vec![],
+        };
+        let mut manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "dsc0",
+            "host": {
+                "name": "dsc0",
+                "site": "dsc-us",
+                "location": {
+                    "latitude": 45.5229,
+                    "longitude": -122.9898,
+                    "source": "declared",
+                    "manual_override": true,
+                    "label": "Declared DSC"
+                }
+            },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+
+        let declared = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(declared.source, HostLocationSource::Declared);
+        assert_eq!(declared.label, "Declared DSC");
+        assert!(declared.manual_override);
+
+        manifest.host.location.as_mut().unwrap().manual_override = false;
+        let runtime = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(runtime.source, HostLocationSource::Wifi);
+        assert_eq!(runtime.label, "Runtime wifi");
+        assert_eq!(runtime.state, "observed");
+
+        host.location.as_mut().unwrap().observed_at = Some(1000 - LOCATION_STALE_AFTER_SECS - 1);
+        let stale = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(stale.source, HostLocationSource::Wifi);
+        assert_eq!(stale.state, "stale");
+        assert!(stale.stale);
+
+        host.location = None;
+        manifest.host.location = None;
+        let provider = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(provider.source, HostLocationSource::Provider);
+        assert_eq!(provider.id, "dsc-us");
+
+        manifest.host.site = None;
+        let fallback = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(fallback.source, HostLocationSource::Fallback);
+        assert_eq!(fallback.id, "dsc-us");
+
+        let unknown = resolve_host_location(None, None, "new-host", 1000);
+        assert_eq!(unknown.source, HostLocationSource::Fallback);
+        assert_eq!(unknown.state, "unknown");
+        assert_eq!(unknown.id, "unknown");
+    }
+
+    #[test]
+    fn declared_hosts_payload_exposes_sanitized_location_overlay() {
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "athena",
+            "host": {
+                "name": "athena",
+                "site": "home-at"
+            },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+        let runtime = Host {
+            name: "athena".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: Some("not-rendered-token-hash".to_string()),
+            last_seen: Some(970),
+            heartbeat_log: vec![910, 970],
+            heartbeat_interval_secs: Some(60),
+            location: Some(HostLocation {
+                latitude: 48.2082,
+                longitude: 16.3738,
+                source: HostLocationSource::Wifi,
+                accuracy_meters: Some(1500.0),
+                precision_meters: None,
+                observed_at: Some(970),
+                stale: false,
+                manual_override: false,
+                label: Some("Vienna area".to_string()),
+            }),
+            freshness: NixFreshness::default(),
+            service_observations: vec![],
+        };
+
+        let payload = declared_hosts_payload(
+            std::slice::from_ref(&manifest),
+            &[],
+            std::slice::from_ref(&runtime),
+            &BTreeMap::new(),
+            1000,
+        );
+
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["location"]["source"],
+            "wifi"
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["location"]["label"],
+            "Vienna area"
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["location"]["manual_override"],
+            false
+        );
+        assert!(payload.to_string().contains("not-rendered-token-hash") == false);
     }
 
     #[test]
@@ -4953,6 +5273,7 @@ mod tests {
             last_seen: Some(970),
             heartbeat_log: vec![850, 910, 970],
             heartbeat_interval_secs: Some(60),
+            location: None,
             freshness: NixFreshness {
                 applicable: true,
                 ..Default::default()
@@ -5002,6 +5323,7 @@ mod tests {
             last_seen: None,
             heartbeat_log: vec![],
             heartbeat_interval_secs: Some(60),
+            location: None,
             freshness: NixFreshness {
                 applicable: true,
                 ..Default::default()
@@ -5053,6 +5375,7 @@ mod tests {
             last_seen: Some(970),
             heartbeat_log: vec![910, 970],
             heartbeat_interval_secs: Some(60),
+            location: None,
             freshness: NixFreshness {
                 applicable: true,
                 flake_lock_age_days: Some(0),
@@ -5240,8 +5563,8 @@ mod tests {
 
     fn test_report(host: &str) -> HostReport {
         HostReport {
-            schema: HOST_REPORT_SCHEMA.to_string(),
-            version: HOST_REPORT_VERSION,
+            schema: pharos_core::HOST_REPORT_SCHEMA.to_string(),
+            version: pharos_core::HOST_REPORT_VERSION,
             name: host.to_string(),
             role: "server".to_string(),
             is_nix: true,
@@ -5251,6 +5574,7 @@ mod tests {
                 ..Default::default()
             },
             service_observations: vec![],
+            location: None,
         }
     }
 

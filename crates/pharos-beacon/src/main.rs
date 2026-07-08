@@ -163,6 +163,7 @@ fn main() {
             heartbeat_interval_secs: beat,
             freshness,
             service_observations,
+            location: None,
         };
         let body = serde_json::to_string(&report).expect("serialize report");
         let mut request = ureq::post(&endpoint).set("Content-Type", "application/json");

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub type UnixSeconds = i64;
 
 /// A managed host as seen by the dashboard.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Host {
     pub name: String,
     pub role: String,
@@ -35,6 +35,10 @@ pub struct Host {
     pub heartbeat_log: Vec<UnixSeconds>,
     /// Beacon's reported heartbeat cadence — drives the "expected next" pulse.
     pub heartbeat_interval_secs: Option<u64>,
+    /// Optional runtime-reported approximate host location. This is an
+    /// observation overlay, not declared config intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<HostLocation>,
     pub freshness: NixFreshness,
     /// Non-secret service facts from the latest beacon report. Runtime only;
     /// declared service intent stays in the manifest.
@@ -76,6 +80,60 @@ impl NixFreshness {
         } else {
             parts.join(" · ")
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostLocationSource {
+    Wifi,
+    Ip,
+    Provider,
+    Declared,
+    Fallback,
+    Unknown,
+}
+
+/// Approximate host location. It deliberately carries source and quality, not
+/// raw Wi-Fi scan data, provider payloads, or private address evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub source: HostLocationSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accuracy_meters: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision_meters: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<UnixSeconds>,
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub manual_override: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl HostLocation {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if !self.latitude.is_finite() || !(-90.0..=90.0).contains(&self.latitude) {
+            return Err(format!("latitude {} is outside -90..90", self.latitude));
+        }
+        if !self.longitude.is_finite() || !(-180.0..=180.0).contains(&self.longitude) {
+            return Err(format!("longitude {} is outside -180..180", self.longitude));
+        }
+        if let Some(accuracy) = self.accuracy_meters {
+            if !accuracy.is_finite() || accuracy < 0.0 {
+                return Err(format!("accuracy_meters {accuracy} must be non-negative"));
+            }
+        }
+        if let Some(precision) = self.precision_meters {
+            if !precision.is_finite() || precision < 0.0 {
+                return Err(format!("precision_meters {precision} must be non-negative"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -139,7 +197,7 @@ fn default_host_report_version() -> u16 {
 
 /// What a `pharos-beacon` sends to `pharosd` (PHAROS-9 ingestion). The server
 /// adds the receive timestamp; the agent never sends its own liveness.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HostReport {
     #[serde(default = "default_host_report_schema")]
     pub schema: String,
@@ -152,6 +210,41 @@ pub struct HostReport {
     pub freshness: NixFreshness,
     #[serde(default)]
     pub service_observations: Vec<ServiceObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<HostLocation>,
+}
+
+impl HostReport {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.schema != HOST_REPORT_SCHEMA {
+            return Err(format!(
+                "unsupported report schema {:?}; expected {:?}",
+                self.schema, HOST_REPORT_SCHEMA
+            ));
+        }
+        if self.version != HOST_REPORT_VERSION {
+            return Err(format!(
+                "unsupported report version {}; expected {}",
+                self.version, HOST_REPORT_VERSION
+            ));
+        }
+        if let Some(location) = &self.location {
+            location.validate_contract()?;
+            if location.manual_override {
+                return Err("runtime report location cannot be a manual override".to_string());
+            }
+            if matches!(
+                location.source,
+                HostLocationSource::Declared | HostLocationSource::Fallback
+            ) {
+                return Err(
+                    "runtime report location source must be wifi, ip, provider, or unknown"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,6 +372,16 @@ impl HostManifest {
         if self.host.name.trim().is_empty() {
             return Err(ManifestContractError::EmptyHostName);
         }
+        if let Some(location) = &self.host.location {
+            location
+                .validate_contract()
+                .map_err(ManifestContractError::InvalidHostLocation)?;
+            if location.source != HostLocationSource::Declared {
+                return Err(ManifestContractError::InvalidHostLocation(
+                    "declared host location source must be declared".to_string(),
+                ));
+            }
+        }
         if !self.policy.declared_only {
             return Err(ManifestContractError::ManifestEmbedsRuntimeState);
         }
@@ -302,7 +405,7 @@ impl HostManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManifestHost {
     pub name: String,
     #[serde(default)]
@@ -315,6 +418,8 @@ pub struct ManifestHost {
     pub ip: Option<String>,
     #[serde(default)]
     pub site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<HostLocation>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -552,6 +657,7 @@ pub enum ManifestContractError {
     UnsupportedVersion { expected: u16, actual: u16 },
     EmptySlug,
     EmptyHostName,
+    InvalidHostLocation(String),
     ManifestEmbedsRuntimeState,
     UndefinedWing { service: String, wing: String },
     JanusRequiredWithoutJanus,
@@ -574,6 +680,7 @@ impl std::fmt::Display for ManifestContractError {
             }
             Self::EmptySlug => write!(f, "manifest slug is empty"),
             Self::EmptyHostName => write!(f, "manifest host.name is empty"),
+            Self::InvalidHostLocation(error) => write!(f, "invalid host location: {error}"),
             Self::ManifestEmbedsRuntimeState => {
                 write!(f, "manifest policy.declaredOnly must be true")
             }
@@ -646,7 +753,52 @@ mod tests {
         assert_eq!(host.token_hash, None);
         assert_eq!(host.report_version, HOST_REPORT_VERSION);
         assert!(host.heartbeat_log.is_empty());
+        assert!(host.location.is_none());
         assert!(host.service_observations.is_empty());
+    }
+
+    #[test]
+    fn host_report_location_is_optional_and_runtime_only() {
+        let legacy: HostReport = serde_json::from_str(
+            r#"{"schema":"inspr.pharos.host-report.v1","version":1,"name":"hsb8","role":"server","is_nix":true,"heartbeat_interval_secs":60,"freshness":{"applicable":true}}"#,
+        )
+        .expect("deserialize legacy report");
+        assert!(legacy.location.is_none());
+        legacy.validate_contract().expect("legacy report valid");
+
+        let runtime = HostReport {
+            location: Some(HostLocation {
+                latitude: 48.2082,
+                longitude: 16.3738,
+                source: HostLocationSource::Wifi,
+                accuracy_meters: Some(1200.0),
+                precision_meters: None,
+                observed_at: Some(1_700_000_000),
+                stale: false,
+                manual_override: false,
+                label: Some("Vienna area".to_string()),
+            }),
+            ..legacy.clone()
+        };
+        runtime
+            .validate_contract()
+            .expect("runtime location source is valid");
+
+        let declared_runtime = HostReport {
+            location: Some(HostLocation {
+                latitude: 48.2082,
+                longitude: 16.3738,
+                source: HostLocationSource::Declared,
+                accuracy_meters: None,
+                precision_meters: None,
+                observed_at: None,
+                stale: false,
+                manual_override: true,
+                label: None,
+            }),
+            ..legacy
+        };
+        assert!(declared_runtime.validate_contract().is_err());
     }
 
     #[test]
@@ -682,6 +834,14 @@ mod tests {
                 "os": "NixOS",
                 "fqdn": "hsb8.lan",
                 "ip": "192.168.1.100",
+                "location": {
+                    "latitude": 48.32,
+                    "longitude": 15.92,
+                    "source": "declared",
+                    "accuracy_meters": 5000,
+                    "manual_override": true,
+                    "label": "Parents' home"
+                },
                 "access": {
                     "lanHostname": "hsb8.lan",
                     "lanIp": "192.168.1.100",
@@ -729,6 +889,22 @@ mod tests {
         .expect("manifest json parses");
 
         manifest.validate_contract().expect("manifest is valid");
+        assert_eq!(
+            manifest
+                .host
+                .location
+                .as_ref()
+                .map(|location| location.source),
+            Some(HostLocationSource::Declared)
+        );
+        assert_eq!(
+            manifest
+                .host
+                .location
+                .as_ref()
+                .and_then(|location| location.label.as_deref()),
+            Some("Parents' home")
+        );
         assert_eq!(manifest.host.lan_hostname(), Some("hsb8.lan"));
         assert_eq!(manifest.host.lan_ip(), Some("192.168.1.100"));
         assert_eq!(manifest.host.tailnet_hostname(), Some("hsb8"));
@@ -768,5 +944,25 @@ mod tests {
             manifest.validate_contract(),
             Err(ManifestContractError::ManifestEmbedsRuntimeState)
         );
+
+        let invalid_location: HostManifest = serde_json::from_value(serde_json::json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": {
+                "name": "hsb8",
+                "location": {
+                    "latitude": 91.0,
+                    "longitude": 15.92,
+                    "source": "declared"
+                }
+            },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest json parses");
+        assert!(matches!(
+            invalid_location.validate_contract(),
+            Err(ManifestContractError::InvalidHostLocation(_))
+        ));
     }
 }
