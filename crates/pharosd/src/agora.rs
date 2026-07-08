@@ -1,12 +1,12 @@
-//! Agora operator surface for declared host settings.
+//! Host color settings surface.
 //!
-//! This is intentionally proposal-only: Pharos can explain the declarative
-//! nixcfg change, but it must not write nixcfg or mutate a host from here.
+//! This stays proposal-only: Pharos can explain the declarative nixcfg change,
+//! but it must not write nixcfg or mutate a host from here.
 
 use std::collections::BTreeMap;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::Json;
 use pharos_core::{liveness, Host, HostManifest, Liveness, ManifestPalette};
@@ -15,38 +15,82 @@ use serde_json::json;
 
 use crate::{html_escape, AppState};
 
-const AGORA_HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Host settings · Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
-:root{--ink:#172c3d;--muted:#647687;--line:#dce6ec;--soft:#f5f8fa;--panel:#fff;--accent:#1f7fb5;--teal:#159e99;--amber:#c98224;--green:#25845f;--red:#bf3a35;--code:#0f1720;--shadow:0 18px 42px rgba(45,75,95,.07)}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;background:linear-gradient(180deg,#fbfdfe 0%,#f4f9fb 58%,#edf6f7 100%);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;overflow-x:hidden}
-button,input{font:inherit}
-a{color:inherit}
-.shell{width:min(1320px,100%);margin:0 auto;padding:26px 22px 42px}
-.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}
-.crumbs{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;margin-bottom:8px}.crumbs a{text-decoration:none;color:var(--accent);font-weight:650}.crumbs span{white-space:nowrap}
-.brand{display:flex;align-items:center;gap:11px;min-width:0}.mark{display:grid;place-items:center;width:36px;height:36px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--amber);box-shadow:0 8px 18px rgba(45,75,95,.05)}.mark .ico{width:20px;height:20px}
-h1{margin:0;font-size:25px;line-height:1.12;font-weight:700;letter-spacing:0}.subtitle{margin:3px 0 0;color:var(--muted);font-size:12px}
-.nav{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.nav a,.action{min-height:36px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);text-decoration:none;padding:8px 12px;cursor:pointer;font-weight:650}.action.primary{background:var(--ink);border-color:var(--ink);color:#fff}.action:disabled{cursor:not-allowed;opacity:.62}
-.layout{display:grid;grid-template-columns:minmax(220px,270px) minmax(0,1fr);gap:14px;align-items:start}
-.rail,.workspace{border:1px solid var(--line);border-radius:8px;background:var(--panel);box-shadow:var(--shadow)}
-.rail{padding:10px;position:sticky;top:14px}.rail-title{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 7px 10px;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.rail-count{color:var(--ink);font-weight:700}
-.host-button{width:100%;display:grid;grid-template-columns:10px minmax(0,1fr) auto;align-items:center;gap:10px;min-height:58px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--ink);text-align:left;text-decoration:none;padding:9px;cursor:pointer}
-.host-button[aria-pressed="true"],.host-button[aria-current="true"]{background:var(--soft);border-color:var(--line);box-shadow:inset 3px 0 0 var(--host-color,var(--accent))}.host-button.missing{--host-color:var(--amber);cursor:default;background:#fffaf3}.host-dot{width:10px;height:10px;border-radius:50%;background:var(--host-color,var(--accent));box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color,var(--accent)) 13%,transparent)}.host-name{display:block;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.host-role{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.host-live{font-size:11px;color:var(--muted);white-space:nowrap}
-.workspace{min-width:0;overflow:hidden}.workspace-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid var(--line);background:#fbfdfe}.host-title{margin:2px 0 0;font-size:26px;font-weight:740}.kicker{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;font-weight:700}.state-stack{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.state-pill{display:inline-flex;align-items:center;gap:7px;min-height:30px;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--green);padding:5px 10px;font-size:12px;font-weight:700;white-space:nowrap}.state-pill[data-live="down"]{color:var(--red)}.state-pill[data-live="stale"]{color:var(--amber)}.state-pill[data-live="awaiting_first_heartbeat"]{color:var(--muted)}.state-pill.neutral{color:var(--muted)}
-.tabs{display:flex;gap:4px;padding:10px 14px;border-bottom:1px solid var(--line);background:#fff}.tab{border:0;background:transparent;color:var(--muted);min-height:32px;border-radius:7px;padding:6px 11px;cursor:pointer;font-weight:650}.tab[aria-selected="true"]{background:var(--soft);color:var(--accent);box-shadow:inset 0 0 0 1px var(--line)}
-.content{display:grid;grid-template-columns:minmax(0,1fr) minmax(330px,.72fr);gap:0;min-height:620px}.editor{min-width:0;padding:20px;border-right:1px solid var(--line)}.proposal{min-width:0;padding:20px;background:#fbfdfe}.proposal-inner{position:sticky;top:16px}
-.section-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 12px}.section-title h2{margin:0;font-size:16px}.section-title span{color:var(--muted);font-size:12px}
-.matrix{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fff;margin-bottom:14px}.cell{min-width:0;padding:13px;border-right:1px solid var(--line)}.cell:last-child{border-right:0}.cell span{display:block;color:var(--muted);font-size:12px}.cell strong{display:block;margin-top:6px;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.swatch-line{display:flex;align-items:center;gap:8px;min-width:0}.swatch{width:23px;height:23px;border-radius:6px;border:1px solid rgba(0,0,0,.12);background:var(--swatch,#999);flex:0 0 auto}
-.controls{display:grid;grid-template-columns:minmax(0,1fr) minmax(200px,.45fr);gap:14px;align-items:stretch;margin-bottom:14px}.form{display:grid;grid-template-columns:70px minmax(120px,1fr);gap:10px;align-content:start;border:1px solid var(--line);border-radius:8px;background:#fff;padding:13px}.control label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}.color{width:64px;height:38px;padding:2px;border:1px solid var(--line);border-radius:7px;background:#fff}.hex{height:38px;width:100%;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);padding:0 10px;text-transform:uppercase}.form .action{grid-column:1/-1;width:100%;margin-top:2px}
-.preview{display:grid;grid-template-rows:auto 1fr;gap:10px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:13px}.preview-label{color:var(--muted);font-size:12px}.preview-pane{border-radius:7px;border:1px solid var(--line);background:linear-gradient(135deg,var(--preview-color,#999),#f7fbfc 62%);min-height:122px;display:flex;align-items:flex-end;justify-content:space-between;gap:10px;padding:13px;color:#fff;overflow:hidden}.preview-pane strong{font-size:18px;text-shadow:0 1px 8px rgba(0,0,0,.18)}.preview-pill{border:1px solid rgba(255,255,255,.58);border-radius:999px;padding:4px 8px;font-size:11px;background:rgba(255,255,255,.18);backdrop-filter:blur(6px)}
-.meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.kv{border:1px solid var(--line);border-radius:8px;background:#fff;padding:11px}.kv span{display:block;color:var(--muted);font-size:12px}.kv strong{display:block;margin-top:4px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.proposal h2{margin:0 0 12px;font-size:17px}.change-summary{display:grid;gap:9px;margin-bottom:12px}.safe-line{display:flex;align-items:center;gap:9px;min-height:42px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px;color:var(--ink);font-weight:700}.safe-dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(37,132,95,.12)}.safe-line span:last-child{color:var(--muted);font-weight:650}.status-strip{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.status{border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px}.status span{display:block;color:var(--muted);font-size:12px}.status strong{display:block;margin-top:3px;font-size:13px}.status.ok strong{color:var(--green)}.technical{border:1px solid var(--line);border-radius:8px;background:#fff;padding:0;overflow:hidden}.technical summary{cursor:pointer;list-style:none;padding:12px 13px;font-weight:700}.technical summary::-webkit-details-marker{display:none}.technical .meta-grid{padding:0 12px 12px}.technical pre{border-radius:0;border-left:0;border-right:0;border-bottom:0}
-pre{min-height:300px;max-height:440px;overflow:auto;margin:0;border:1px solid var(--line);border-radius:8px;background:var(--code);color:#dce9ef;padding:13px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}.notice,.empty{padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--muted);margin-bottom:14px}.empty{padding:38px;margin:0}.unavailable-state{display:grid;align-content:start;justify-items:start;gap:12px;min-height:430px;padding:28px}.unavailable-state h2{margin:0;font-size:20px;line-height:1.2}.unavailable-state p{margin:0;max-width:560px;color:var(--muted)}.unavailable-state .action{display:inline-flex;align-items:center;margin-top:4px}
-@media (max-width:980px){.layout,.content,.controls{grid-template-columns:1fr}.rail{position:static}.editor{border-right:0;border-bottom:1px solid var(--line)}.proposal-inner{position:static}.matrix,.meta-grid,.status-strip{grid-template-columns:1fr}.cell{border-right:0;border-bottom:1px solid var(--line)}.cell:last-child{border-bottom:0}}
-@media (max-width:640px){.shell{padding:20px 14px 32px}.topbar,.workspace-head{display:block}.nav{justify-content:flex-start;margin-top:12px}.state-stack{justify-content:flex-start;margin-top:12px}.form{grid-template-columns:70px minmax(0,1fr)}}
-</style></head><body>"#;
+const DEFAULT_ACCENT: &str = "#1f7fb5";
+const TARGET_PATH: &str = "modules/uzumaki/theme/theme-palettes.nix";
 
-const AGORA_FOOT: &str = r#"</body></html>"#;
+const AGORA_CSS: &str = r#"<style>
+.settings-main{width:min(1180px,100%)}
+.settings-bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 18px;padding:11px;background:rgba(255,255,255,.72);border:1px solid rgba(210,226,234,.78);border-radius:8px;box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(10px)}
+.host-picker{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
+.host-picker label{color:var(--muted);font-size:12px;font-weight:650}
+.host-select-wrap{position:relative;min-width:220px;max-width:360px;flex:1}
+.host-select{width:100%;height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:650;padding:0 34px 0 12px;outline:none;appearance:none}
+.host-select-wrap:after{content:"";position:absolute;right:13px;top:50%;width:7px;height:7px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:translateY(-65%) rotate(45deg);pointer-events:none}
+.host-context{display:flex;align-items:center;gap:8px;min-width:0;color:var(--muted);font-size:12px}
+.host-status-dot{width:9px;height:9px;border-radius:50%;background:var(--state);box-shadow:0 0 0 4px color-mix(in srgb,var(--state) 13%,transparent)}
+.settings-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+.settings-link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 13px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);text-decoration:none;font-weight:650}
+.settings-panel{overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 16px 38px rgba(54,88,108,.08)}
+.settings-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:22px 24px;border-bottom:1px solid rgba(214,226,234,.72)}
+.settings-kicker{display:block;margin-bottom:5px;color:var(--sun);font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:720}
+.settings-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;letter-spacing:0;color:#12304b}
+.settings-panel p{margin:5px 0 0;color:var(--muted);font-size:13px}
+.settings-state{display:flex;align-items:center;gap:8px;min-height:30px;border:1px solid rgba(210,226,234,.92);border-radius:999px;background:#fff;padding:5px 10px;color:var(--muted);font-size:12px;font-weight:700;white-space:nowrap}
+.settings-state[data-ready="true"]{color:var(--live)}
+.color-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:0}
+.color-editor{padding:24px;border-right:1px solid rgba(214,226,234,.72)}
+.preview-zone{padding:24px;background:linear-gradient(180deg,rgba(247,252,253,.72),rgba(255,255,255,.78))}
+.setup-banner{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 18px;padding:12px 14px;border:1px solid rgba(214,155,49,.28);border-radius:8px;background:linear-gradient(90deg,rgba(255,247,232,.88),rgba(255,255,255,.72));color:var(--ink)}
+.setup-banner strong{display:block;font-size:13px}
+.setup-banner span{display:block;color:var(--muted);font-size:12px}
+.color-controls{display:grid;grid-template-columns:126px minmax(0,1fr);gap:18px;align-items:start}
+.color-well-wrap{display:grid;justify-items:center;gap:10px}
+.color-well{width:112px;height:112px;border-radius:50%;border:0;background:var(--picked-color);box-shadow:0 0 0 9px color-mix(in srgb,var(--picked-color) 14%,transparent),0 16px 34px color-mix(in srgb,var(--picked-color) 22%,transparent);cursor:pointer}
+.color-well::-webkit-color-swatch-wrapper{padding:0}.color-well::-webkit-color-swatch{border:0;border-radius:50%}
+.color-well-label{color:var(--muted);font-size:12px}
+.color-fields{display:grid;gap:14px;align-content:start}
+.field label{display:block;margin-bottom:6px;color:var(--muted);font-size:12px;font-weight:650}
+.hex-input{width:100%;height:40px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:700;padding:0 12px;text-transform:uppercase;outline:none}
+.preset-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.preset{width:28px;height:28px;border:1px solid rgba(210,226,234,.92);border-radius:50%;background:var(--preset-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--preset-color) 10%,transparent);cursor:pointer}
+.preset:hover,.preset:focus-visible{outline:0;box-shadow:0 0 0 5px color-mix(in srgb,var(--preset-color) 18%,transparent),0 7px 16px rgba(45,75,95,.08)}
+.primary-action{min-height:42px;border:1px solid #17304a;border-radius:7px;background:#17304a;color:#fff;font:inherit;font-weight:720;cursor:pointer;padding:0 16px}
+.primary-action:hover{background:#10273d}
+.primary-action:disabled{opacity:.58;cursor:not-allowed}
+.preview-card{position:relative;min-height:248px;display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.86);border-radius:8px;background:rgba(255,255,255,.92);box-shadow:0 14px 32px rgba(45,75,95,.08);padding:16px;overflow:hidden}
+.preview-card:before{content:"";position:absolute;inset:-84px -74px auto auto;width:190px;height:190px;background:radial-gradient(circle,color-mix(in srgb,var(--picked-color) 22%,transparent),rgba(21,158,153,.08) 42%,transparent 70%);pointer-events:none}
+.preview-host{position:relative;display:flex;align-items:flex-start;gap:10px}
+.preview-badge{display:grid;place-items:center;width:34px;height:34px;border:3px solid var(--picked-color);border-radius:50%;color:var(--accent);background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--picked-color) 8%,#f5fbfc));box-shadow:0 0 0 6px color-mix(in srgb,var(--picked-color) 14%,transparent),0 0 20px color-mix(in srgb,var(--picked-color) 20%,transparent)}
+.preview-badge .ico{width:17px;height:17px}
+.preview-name{font-weight:760;font-size:17px;line-height:1.2;color:var(--ink)}
+.preview-role{margin-top:2px;color:var(--muted);font-size:12px}
+.preview-line{height:1px;margin:18px 0;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent)}
+.preview-reason{display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;gap:8px;color:var(--muted);font-size:12px}
+.preview-reason:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--picked-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--picked-color) 12%,transparent)}
+.preview-meta{margin-top:auto;display:grid;gap:9px;color:var(--muted);font-size:12px}
+.preview-meta div{display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid rgba(214,226,234,.58);padding-bottom:6px}
+.preview-meta div:last-child{border-bottom:0;padding-bottom:0}
+.preview-meta strong{color:var(--ink)}
+.advanced{border-top:1px solid rgba(214,226,234,.72);background:rgba(255,255,255,.82)}
+.advanced details{padding:0}
+.advanced summary{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:48px;padding:0 24px;cursor:pointer;font-weight:720;color:var(--ink);list-style:none}
+.advanced summary::-webkit-details-marker{display:none}
+.advanced summary:after{content:"";width:8px;height:8px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:rotate(45deg)}
+.advanced details[open] summary:after{transform:rotate(225deg)}
+.advanced-body{display:grid;gap:12px;padding:0 24px 22px}
+.review-note{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}
+.review-note:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.12)}
+.advanced-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.advanced-meta div{min-width:0;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:#fff;padding:9px 10px}
+.advanced-meta span{display:block;color:var(--muted);font-size:11px;font-weight:650}
+.advanced-meta strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-size:12px}
+.review-output{min-height:180px;max-height:360px;overflow:auto;margin:0;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:#10202d;color:#dce9ef;padding:13px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.empty-settings{padding:34px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 16px 38px rgba(54,88,108,.08)}
+.empty-settings h2{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500}
+.empty-settings p{margin:0;color:var(--muted)}
+@media (max-width:900px){.settings-bar{align-items:stretch;flex-direction:column}.settings-actions{justify-content:flex-start}.color-layout,.color-controls{grid-template-columns:1fr}.color-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}.preview-zone{padding:20px}.setup-banner{align-items:flex-start;flex-direction:column}}
+@media (max-width:640px){.advanced-meta{grid-template-columns:1fr}}
+</style>"#;
 
 #[derive(Debug, Clone, Serialize)]
 struct AgoraHostView {
@@ -57,7 +101,8 @@ struct AgoraHostView {
     declared_accent: String,
     runtime_accent: String,
     liveness: String,
-    runtime_state: String,
+    state_color: String,
+    settings_ready: bool,
     freshness_tldr: String,
     services_count: usize,
     target_path: String,
@@ -127,12 +172,16 @@ struct ProposalPatch {
 
 pub(crate) async fn page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<AgoraPageQuery>,
 ) -> Html<String> {
+    let user_label = crate::sidebar_user_label(&state.auth, &headers);
     Html(render_page(
         state.manifests.manifests(),
         &state.store.list(),
         query.host.as_deref(),
+        &user_label,
+        state.auth.is_some(),
     ))
 }
 
@@ -167,109 +216,228 @@ fn render_page(
     manifests: &[HostManifest],
     runtime_hosts: &[Host],
     requested_host: Option<&str>,
+    user_label: &str,
+    logout_enabled: bool,
 ) -> String {
-    let hosts = host_views(manifests, runtime_hosts);
-    if hosts.is_empty() {
-        return format!(
-            "{AGORA_HEAD}<main class=\"shell\"><header class=\"topbar\"><div><nav class=\"crumbs\" aria-label=\"breadcrumb\"><a href=\"/\">Pharos</a><span>/</span><span>Settings</span></nav><div class=\"brand\"><span class=\"mark\">{mark}</span><div><h1>Host settings</h1><p class=\"subtitle\">per-host controls</p></div></div></div><nav class=\"nav\"><a href=\"/\">Fleet</a></nav></header><section class=\"empty\">No declared host manifests loaded.</section></main>{AGORA_FOOT}",
-            mark = crate::icons::LIGHTHOUSE
-        );
-    }
-
+    let mut hosts = host_views(manifests, runtime_hosts);
     let requested_host = requested_host
         .map(str::trim)
         .filter(|requested| !requested.is_empty());
+
     let selected_index = requested_host.and_then(|requested| {
         hosts
             .iter()
             .position(|host| host.name == requested || host.slug == requested)
     });
-    if let Some(requested) = requested_host {
-        if selected_index.is_none() {
-            return render_unavailable_page(&hosts, requested);
+
+    let selected_index = match (selected_index, requested_host) {
+        (Some(index), _) => index,
+        (None, Some(requested)) => {
+            hosts.push(setup_host_view(requested, "host", None, None));
+            hosts.len() - 1
         }
+        (None, None) => 0,
+    };
+
+    let head = crate::head_with_extra(AGORA_CSS);
+    let sidebar = crate::sidebar(user_label, logout_enabled, "settings");
+    let as_of = crate::clock_label(crate::now_unix());
+
+    if hosts.is_empty() {
+        return format!(
+            r#"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host color</p></div><div class="asof">as of {as_of}</div></div><section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its color settings will appear here.</p></section></main></div></body></html>"#
+        );
     }
 
-    let selected_index = selected_index.unwrap_or(0);
-    let selected_host = &hosts[selected_index];
-    let host_buttons = hosts
-        .iter()
-        .enumerate()
-        .map(|(idx, host)| {
-            format!(
-                r#"<button class="host-button" type="button" data-host-index="{idx}" aria-pressed="{pressed}" style="--host-color:{accent}"><span class="host-dot"></span><span><span class="host-name">{name}</span><span class="host-role">{role}</span></span><span class="host-live">{live}</span></button>"#,
-                pressed = idx == selected_index,
-                accent = html_escape(&host.declared_accent),
-                name = html_escape(&host.name),
-                role = html_escape(&host.role),
-                live = html_escape(&host.liveness)
-            )
-        })
-        .collect::<String>();
-    let hosts_json = serde_json::to_string(&hosts).expect("host view JSON serializes");
+    let selected = &hosts[selected_index];
+    let options = host_options(&hosts, selected_index);
+    let content = if selected.settings_ready {
+        render_ready_content(selected)
+    } else {
+        render_setup_content(selected)
+    };
 
     format!(
-        r#"{AGORA_HEAD}<main class="shell"><header class="topbar"><div><nav class="crumbs" aria-label="breadcrumb"><a href="/">Pharos</a><span>/</span><span data-breadcrumb-host>{name}</span><span>/</span><span>Settings</span></nav><div class="brand"><span class="mark">{mark}</span><div><h1>Host settings</h1><p class="subtitle">per-host controls</p></div></div></div><nav class="nav"><a href="/">Fleet</a></nav></header><section class="layout"><aside class="rail"><div class="rail-title"><span>Hosts</span><span class="rail-count">{host_count}</span></div>{host_buttons}</aside><section class="workspace"><header class="workspace-head"><div><span class="kicker" data-host-slug>{slug}</span><div class="host-title"><span data-host-name>{name}</span> settings</div><p class="subtitle" data-host-role>{role}</p></div><div class="state-stack"><span class="state-pill" data-runtime-pill data-live="{live_key}">Live state: {live}</span><span class="state-pill neutral" data-runtime-state>Settings state: {runtime_state}</span></div></header><div class="tabs" role="tablist"><button class="tab" type="button" aria-selected="true">Color</button><button class="tab" type="button" aria-selected="false" disabled>Services</button><button class="tab" type="button" aria-selected="false" disabled>Access</button></div><div class="content"><section class="editor"><div class="section-title"><h2>Host color</h2><span data-palette-name>{palette_name}</span></div><div class="matrix" aria-label="color comparison"><div class="cell"><span>Current</span><strong class="swatch-line"><i class="swatch" data-declared-swatch style="--swatch:{declared}"></i><span data-declared>{declared}</span></strong></div><div class="cell"><span>New</span><strong class="swatch-line"><i class="swatch" data-proposed-swatch style="--swatch:{declared}"></i><span data-proposed>{declared}</span></strong></div><div class="cell"><span>Live</span><strong class="swatch-line"><i class="swatch" data-runtime-swatch style="--swatch:{runtime}"></i><span data-runtime>{runtime}</span></strong></div></div><div class="controls"><div class="form"><div class="control"><label for="accent-color">Color</label><input class="color" id="accent-color" data-color type="color" value="{declared}"></div><div class="control"><label for="accent-hex">Color code</label><input class="hex" id="accent-hex" data-hex maxlength="7" spellcheck="false" value="{declared}"></div><button class="action primary" type="button" data-review>Review color change</button></div><div class="preview"><span class="preview-label">Preview</span><div class="preview-pane" data-preview style="--preview-color:{declared}"><strong data-preview-name>{name}</strong><span class="preview-pill" data-preview-accent>{declared}</span></div></div></div></section><aside class="proposal"><div class="proposal-inner"><h2>Next step</h2><div class="change-summary"><div class="safe-line"><span class="safe-dot"></span><strong>Safe change</strong><span>No direct deploy from Pharos</span></div></div><details class="technical" data-technical><summary>Technical review</summary><div class="meta-grid"><div class="kv"><span>nixcfg target</span><strong data-target-path>{target_path}</strong></div><div class="kv"><span>Attribute</span><strong data-target-attribute>{target_attribute}</strong></div><div class="kv"><span>Services</span><strong data-services>{services}</strong></div><div class="kv"><span>Freshness</span><strong data-freshness>{freshness}</strong></div><div class="kv"><span>Janus mode</span><strong data-janus-mode>{janus_mode}</strong></div><div class="kv"><span>Deploy</span><strong>Pharos disabled</strong></div></div><div class="status-strip"><div class="status ok"><span>Janus</span><strong data-janus>Janus: not required</strong></div><div class="status"><span>Deploy</span><strong>disabled in Pharos</strong></div></div><pre data-patch>No color change reviewed yet.</pre></details></div></aside></div></section></section></main><script>
-const HOSTS={hosts_json};
-let selected={selected_index};
-const $=sel=>document.querySelector(sel);
-function esc(v){{return String(v ?? '')}}
-function host(){{return HOSTS[selected]}}
-function setSwatch(sel,color){{const el=$(sel);if(el)el.style.setProperty('--swatch',color)}}
-function setPreview(color){{const preview=$('[data-preview]');if(preview)preview.style.setProperty('--preview-color',color);$('[data-preview-accent]').textContent=color.toUpperCase()}}
-function validHex(v){{return /^#[0-9a-fA-F]{{6}}$/.test(v)}}
-function renderHost(writeUrl=false){{const h=host();document.querySelectorAll('[data-host-index]').forEach((btn,idx)=>btn.setAttribute('aria-pressed',String(idx===selected)));$('[data-breadcrumb-host]').textContent=h.name;$('[data-host-slug]').textContent=h.slug;$('[data-host-name]').textContent=h.name;$('[data-host-role]').textContent=h.role;$('[data-preview-name]').textContent=h.name;$('[data-palette-name]').textContent=h.palette_name;const pill=$('[data-runtime-pill]');pill.dataset.live=h.liveness;pill.textContent='Live state: '+h.liveness;$('[data-runtime-state]').textContent='Settings state: '+h.runtime_state;$('[data-declared]').textContent=h.declared_accent;$('[data-proposed]').textContent=h.declared_accent;$('[data-runtime]').textContent=h.runtime_accent;$('[data-color]').value=h.declared_accent;$('[data-hex]').value=h.declared_accent.toUpperCase();setSwatch('[data-declared-swatch]',h.declared_accent);setSwatch('[data-proposed-swatch]',h.declared_accent);setSwatch('[data-runtime-swatch]',h.runtime_accent);setPreview(h.declared_accent);$('[data-target-path]').textContent=h.target_path;$('[data-target-attribute]').textContent=h.target_attribute;$('[data-services]').textContent=String(h.services_count);$('[data-freshness]').textContent=h.freshness_tldr;$('[data-janus]').textContent=h.janus_required?'Janus: required':'Janus: not required';$('[data-janus-mode]').textContent=h.janus_mode;$('[data-patch]').textContent='No color change reviewed yet.';const tech=$('[data-technical]');if(tech)tech.open=false;if(writeUrl){{const url=new URL(location.href);url.searchParams.set('host',h.name);history.replaceState(null,'',url)}}}}
-function sync(value){{let v=value.trim();if(!v.startsWith('#'))v='#'+v;v=v.slice(0,7);$('[data-hex]').value=v.toUpperCase();if(validHex(v)){{$('[data-color]').value=v;$('[data-proposed]').textContent=v.toUpperCase();setSwatch('[data-proposed-swatch]',v);setPreview(v)}}}}
-document.querySelectorAll('[data-host-index]').forEach(btn=>btn.addEventListener('click',()=>{{selected=Number(btn.dataset.hostIndex)||0;renderHost(true)}}));
-$('[data-color]').addEventListener('input',e=>sync(e.target.value));
-$('[data-hex]').addEventListener('input',e=>sync(e.target.value));
-$('[data-review]').addEventListener('click',async()=>{{const h=host();const accent=$('[data-hex]').value;const patch=$('[data-patch]');const tech=$('[data-technical]');if(tech)tech.open=true;patch.textContent='Preparing technical review...';try{{const res=await fetch('/agora/proposals/host-palette.json?host='+encodeURIComponent(h.name)+'&accent='+encodeURIComponent(accent),{{headers:{{Accept:'application/json'}}}});const data=await res.json();if(!res.ok){{patch.textContent=data.error||'review failed';return}}patch.textContent=data.patch.value;}}catch(_){{patch.textContent='review failed'}}}});
-</script>{AGORA_FOOT}"#,
-        mark = crate::icons::LIGHTHOUSE,
-        host_count = hosts.len(),
-        selected_index = selected_index,
-        slug = html_escape(&selected_host.slug),
-        name = html_escape(&selected_host.name),
-        role = html_escape(&selected_host.role),
-        palette_name = html_escape(&selected_host.palette_name),
-        live = html_escape(&selected_host.liveness),
-        live_key = html_escape(&selected_host.liveness),
-        runtime_state = html_escape(&selected_host.runtime_state),
-        declared = html_escape(&selected_host.declared_accent),
-        runtime = html_escape(&selected_host.runtime_accent),
-        target_path = html_escape(&selected_host.target_path),
-        target_attribute = html_escape(&selected_host.target_attribute),
-        services = selected_host.services_count,
-        freshness = html_escape(&selected_host.freshness_tldr),
-        janus_mode = html_escape(&selected_host.janus_mode),
+        r##"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host color</p></div><div class="asof">as of {as_of}</div></div><section class="settings-bar" aria-label="host settings selector"><div class="host-picker"><label for="host-select">Host</label><span class="host-select-wrap"><select id="host-select" class="host-select" data-host-select>{options}</select></span><span class="host-context" style="--state:{state_color}"><span class="host-status-dot"></span><span>{role}</span></span></div><div class="settings-actions"><a class="settings-link" href="/">Fleet</a></div></section>{content}</main><script>
+const hostSelect=document.querySelector('[data-host-select]');
+hostSelect?.addEventListener('change',event=>{{location.href='/agora?host='+encodeURIComponent(event.target.value)}});
+const root=document.querySelector('[data-color-root]');
+if(root){{
+  const color=root.querySelector('[data-color]');
+  const hex=root.querySelector('[data-hex]');
+  const output=root.querySelector('[data-review-output]');
+  const advanced=root.querySelector('[data-advanced]');
+  const setupPlan=root.querySelector('[data-setup-plan]');
+  function validHex(value){{return /^#[0-9a-fA-F]{{6}}$/.test(value)}}
+  function setPicked(value){{
+    let next=String(value||'').trim();
+    if(!next.startsWith('#'))next='#'+next;
+    next=next.slice(0,7);
+    if(hex)hex.value=next.toUpperCase();
+    if(validHex(next)){{
+      root.style.setProperty('--picked-color',next);
+      if(color)color.value=next;
+    }}
+  }}
+  color?.addEventListener('input',event=>setPicked(event.target.value));
+  hex?.addEventListener('input',event=>setPicked(event.target.value));
+  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>setPicked(button.dataset.preset)));
+  root.querySelector('[data-review]')?.addEventListener('click',async()=>{{
+    if(!output)return;
+    if(advanced)advanced.open=true;
+    output.textContent='Preparing review...';
+    try{{
+      const res=await fetch('/agora/proposals/host-palette.json?host='+encodeURIComponent(root.dataset.host)+'&accent='+encodeURIComponent(hex.value),{{headers:{{Accept:'application/json'}}}});
+      const data=await res.json();
+      output.textContent=res.ok?data.patch.value:(data.error||'review failed');
+    }}catch(_){{output.textContent='review failed'}}
+  }});
+  root.querySelector('[data-prepare]')?.addEventListener('click',()=>{{
+    if(advanced)advanced.open=true;
+    if(output){{
+      const plan=(setupPlan?.textContent||'').replaceAll('__ACCENT__',hex?.value||'{accent}');
+      output.textContent=plan;
+    }}
+  }});
+}}
+</script></div></body></html>"##,
+        role = html_escape(&selected.role),
+        state_color = html_escape(&selected.state_color),
+        accent = html_escape(&selected.declared_accent)
     )
 }
 
-fn render_unavailable_page(hosts: &[AgoraHostView], requested_host: &str) -> String {
-    let requested = html_escape(requested_host);
-    let missing_button = format!(
-        r#"<div class="host-button missing" aria-current="true"><span class="host-dot"></span><span><span class="host-name">{requested}</span><span class="host-role">visible in fleet</span></span><span class="host-live">not set up</span></div>"#
+fn render_ready_content(host: &AgoraHostView) -> String {
+    render_color_panel(
+        host,
+        None,
+        "Review color change",
+        r#"<span class="review-note">Pharos only prepares a review. Applying it still happens in nixcfg.</span>"#,
+        "No color change reviewed yet.",
+        true,
+    )
+}
+
+fn render_setup_content(host: &AgoraHostView) -> String {
+    let banner = format!(
+        r#"<div class="setup-banner"><div><strong>Color settings are not prepared yet</strong><span>{name} can be prepared first, then normal color reviews are available.</span></div><button class="primary-action" type="button" data-prepare>Prepare color settings</button></div>"#,
+        name = html_escape(&host.name)
     );
-    let host_links = hosts
+    let plan = setup_plan(host).replace(&host.declared_accent, "__ACCENT__");
+    render_color_panel(
+        host,
+        Some(&banner),
+        "Prepare color settings",
+        r#"<span class="review-note">This prepares the declarative setup path; Pharos does not deploy it directly.</span>"#,
+        &plan,
+        false,
+    )
+}
+
+fn render_color_panel(
+    host: &AgoraHostView,
+    banner: Option<&str>,
+    primary_label: &str,
+    review_note: &str,
+    review_output: &str,
+    ready: bool,
+) -> String {
+    let presets = preset_buttons(&host.declared_accent);
+    let action = if ready {
+        format!(
+            r#"<button class="primary-action" type="button" data-review>{}</button>"#,
+            html_escape(primary_label)
+        )
+    } else {
+        String::new()
+    };
+    let setup_template = if ready {
+        String::new()
+    } else {
+        format!(
+            r#"<template data-setup-plan>{}</template>"#,
+            html_escape(review_output)
+        )
+    };
+    format!(
+        r##"<section class="settings-panel" data-color-root data-host="{host_name}" data-ready="{ready}" style="--picked-color:{accent}"><header class="settings-panel-head"><div><span class="settings-kicker">{slug}</span><h2>Choose color</h2><p>{copy}</p></div><span class="settings-state" data-ready="{ready}">{state}</span></header><div class="color-layout"><section class="color-editor">{banner}<div class="color-controls"><div class="color-well-wrap"><input class="color-well" data-color type="color" value="{accent}" aria-label="Host color"><span class="color-well-label">{accent_upper}</span></div><div class="color-fields"><div class="field"><label for="accent-hex">Color code</label><input class="hex-input" id="accent-hex" data-hex maxlength="7" spellcheck="false" value="{accent_upper}"></div><div class="preset-row" aria-label="preset colors">{presets}</div>{action}</div></div></section><aside class="preview-zone"><article class="preview-card" aria-label="host card preview"><div class="preview-host"><span class="preview-badge">{badge}</span><div><div class="preview-name">{host_name}</div><div class="preview-role">{role}</div></div></div><div class="preview-line"></div><div class="preview-reason"><span>{reason}</span></div><div class="preview-meta"><div><span>Flake.lock age</span><strong>{freshness}</strong></div><div><span>Settings</span><strong>{settings}</strong></div></div></article></aside></div><section class="advanced"><details data-advanced><summary>Advanced review</summary><div class="advanced-body">{review_note}<div class="advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre>{setup_template}</div></details></section></section>"##,
+        host_name = html_escape(&host.name),
+        slug = html_escape(&host.slug),
+        role = html_escape(&host.role),
+        accent = html_escape(&host.declared_accent),
+        accent_upper = html_escape(&host.declared_accent.to_ascii_uppercase()),
+        copy = if ready {
+            "Pick the color used for this host across Pharos."
+        } else {
+            "Pick the first color, then prepare this host for normal settings."
+        },
+        state = if ready { "Ready" } else { "Needs setup" },
+        banner = banner.unwrap_or(""),
+        presets = presets,
+        action = action,
+        badge = crate::icons::SNOWFLAKE,
+        reason = if ready { "color ready" } else { "setup needed" },
+        freshness = html_escape(&host.freshness_tldr),
+        settings = if ready { "prepared" } else { "not prepared" },
+        target_path = html_escape(&host.target_path),
+        target_attribute = html_escape(&host.target_attribute),
+        review_note = review_note,
+        initial_output = if ready {
+            html_escape(review_output)
+        } else {
+            "No setup reviewed yet.".to_string()
+        },
+        setup_template = setup_template,
+    )
+}
+
+fn host_options(hosts: &[AgoraHostView], selected_index: usize) -> String {
+    hosts
         .iter()
-        .map(|host| {
+        .enumerate()
+        .map(|(idx, host)| {
+            let selected = if idx == selected_index { " selected" } else { "" };
+            let suffix = if host.settings_ready { "" } else { " - needs setup" };
             format!(
-                r#"<a class="host-button" href="/agora?host={href}" style="--host-color:{accent}"><span class="host-dot"></span><span><span class="host-name">{name}</span><span class="host-role">{role}</span></span><span class="host-live">editable</span></a>"#,
-                href = html_escape(&crate::url_query_escape(&host.name)),
-                accent = html_escape(&host.declared_accent),
+                r#"<option value="{value}"{selected}>{name} - {role}{suffix}</option>"#,
+                value = html_escape(&host.name),
                 name = html_escape(&host.name),
-                role = html_escape(&host.role)
+                role = html_escape(&host.role),
+                suffix = suffix
             )
         })
-        .collect::<String>();
+        .collect()
+}
 
+fn preset_buttons(current: &str) -> String {
+    let mut colors = vec![
+        current.to_string(),
+        "#48b8a8".to_string(),
+        "#1f7fb5".to_string(),
+        "#25845f".to_string(),
+        "#d69b31".to_string(),
+        "#b66d94".to_string(),
+    ];
+    colors.sort();
+    colors.dedup();
+    colors
+        .into_iter()
+        .take(6)
+        .map(|color| {
+            format!(
+                r#"<button class="preset" type="button" data-preset="{color}" title="{color}" aria-label="Use {color}" style="--preset-color:{color}"></button>"#,
+                color = html_escape(&color)
+            )
+        })
+        .collect()
+}
+
+fn setup_plan(host: &AgoraHostView) -> String {
     format!(
-        r#"{AGORA_HEAD}<main class="shell"><header class="topbar"><div><nav class="crumbs" aria-label="breadcrumb"><a href="/">Pharos</a><span>/</span><span>{requested}</span><span>/</span><span>Settings</span></nav><div class="brand"><span class="mark">{mark}</span><div><h1>Host settings</h1><p class="subtitle">per-host controls</p></div></div></div><nav class="nav"><a href="/">Fleet</a></nav></header><section class="layout"><aside class="rail"><div class="rail-title"><span>Editable hosts</span><span class="rail-count">{host_count}</span></div>{missing_button}{host_links}</aside><section class="workspace"><header class="workspace-head"><div><span class="kicker">not set up</span><div class="host-title">{requested} settings</div><p class="subtitle">This host is visible in the fleet, but has no editable settings yet.</p></div><div class="state-stack"><span class="state-pill neutral">Settings unavailable</span></div></header><div class="unavailable-state"><h2>No settings are declared for this host yet</h2><p>Pharos will not show or edit another host's values here. Add this host to the declared settings registry first, then the color and access controls can appear for {requested}.</p><a class="action primary" href="/">Back to Fleet</a></div></section></section></main>{AGORA_FOOT}"#,
-        mark = crate::icons::LIGHTHOUSE,
-        host_count = hosts.len(),
-        requested = requested,
-        missing_button = missing_button,
-        host_links = host_links,
+        "Prepare color settings for {name}\n\n1. Add {name} to the nixcfg host settings registry.\n2. Create palette {palette} with accent {accent}.\n3. Export the updated host manifest so Pharos can review future color changes.\n4. Run nixcfg QA, backup, deploy, and verify Pharos after the host reports again.",
+        name = host.name,
+        palette = host.palette_name,
+        accent = host.declared_accent
     )
 }
 
@@ -278,57 +446,115 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
         .iter()
         .map(|host| (host.name.as_str(), host))
         .collect();
-    let mut views: Vec<_> = manifests
-        .iter()
-        .filter_map(|manifest| {
-            let palette = manifest.palette.as_ref()?;
-            let declared_accent = palette_accent(palette)?;
-            let runtime = runtime_by_name
-                .get(manifest.host.name.as_str())
-                .copied()
-                .or_else(|| runtime_by_name.get(manifest.slug.as_str()).copied());
-            let live = runtime
-                .map(|host| {
-                    liveness(
-                        host.last_seen,
-                        host.heartbeat_interval_secs,
-                        crate::now_unix(),
-                    )
-                })
-                .unwrap_or(Liveness::AwaitingFirstHeartbeat);
-            let role = manifest
-                .host
-                .role
-                .clone()
-                .or_else(|| runtime.map(|host| host.role.clone()))
-                .unwrap_or_else(|| "declared host".to_string());
-            let freshness_tldr = runtime
-                .map(|host| host.freshness.tldr())
-                .unwrap_or_else(|| "not observed".to_string());
-            let target_attribute = format!("palettes.{}.gradient.primary", palette.name);
-            Some(AgoraHostView {
+    let mut views: BTreeMap<String, AgoraHostView> = BTreeMap::new();
+
+    for host in runtime_hosts {
+        views.insert(
+            host.name.clone(),
+            setup_host_view(
+                &host.name,
+                &host.role,
+                Some(liveness(
+                    host.last_seen,
+                    host.heartbeat_interval_secs,
+                    crate::now_unix(),
+                )),
+                Some(host.freshness.tldr()),
+            ),
+        );
+    }
+
+    for manifest in manifests {
+        let runtime = runtime_by_name
+            .get(manifest.host.name.as_str())
+            .copied()
+            .or_else(|| runtime_by_name.get(manifest.slug.as_str()).copied());
+        let live = runtime
+            .map(|host| {
+                liveness(
+                    host.last_seen,
+                    host.heartbeat_interval_secs,
+                    crate::now_unix(),
+                )
+            })
+            .unwrap_or(Liveness::AwaitingFirstHeartbeat);
+        let role = manifest
+            .host
+            .role
+            .clone()
+            .or_else(|| runtime.map(|host| host.role.clone()))
+            .unwrap_or_else(|| "host".to_string());
+        let freshness_tldr = runtime
+            .map(|host| host.freshness.tldr())
+            .unwrap_or_else(|| "not observed".to_string());
+        let palette = manifest.palette.as_ref();
+        let accent = palette.and_then(palette_accent);
+        let settings_ready = accent.is_some();
+        let declared_accent = accent.unwrap_or_else(|| DEFAULT_ACCENT.to_string());
+        let palette_name = palette
+            .map(|palette| palette.name.clone())
+            .unwrap_or_else(|| format!("custom-{}", manifest.slug));
+        views.insert(
+            manifest.host.name.clone(),
+            AgoraHostView {
                 name: manifest.host.name.clone(),
                 slug: manifest.slug.clone(),
                 role,
-                palette_name: palette.name.clone(),
+                palette_name: palette_name.clone(),
                 declared_accent: declared_accent.clone(),
                 runtime_accent: declared_accent,
                 liveness: live_key(live).to_string(),
-                runtime_state: runtime
-                    .map(|_| "observed".to_string())
-                    .unwrap_or_else(|| "pending".to_string()),
+                state_color: state_color(live).to_string(),
+                settings_ready,
                 freshness_tldr,
                 services_count: manifest.services.len(),
-                target_path: "modules/uzumaki/theme/theme-palettes.nix".to_string(),
-                target_attribute,
+                target_path: TARGET_PATH.to_string(),
+                target_attribute: format!("palettes.{palette_name}.gradient.primary"),
                 janus_required: manifest.policy.privileged_actions.janus_required,
                 janus_mode: format!("{:?}", manifest.policy.privileged_actions.mode)
                     .to_ascii_lowercase(),
-            })
+            },
+        );
+    }
+
+    views.into_values().collect()
+}
+
+fn setup_host_view(
+    name: &str,
+    role: &str,
+    live: Option<Liveness>,
+    freshness_tldr: Option<String>,
+) -> AgoraHostView {
+    let live = live.unwrap_or(Liveness::AwaitingFirstHeartbeat);
+    let slug = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
         })
-        .collect();
-    views.sort_by(|left, right| left.name.cmp(&right.name));
-    views
+        .collect::<String>();
+    let palette_name = format!("custom-{slug}");
+    AgoraHostView {
+        name: name.to_string(),
+        slug,
+        role: role.to_string(),
+        palette_name: palette_name.clone(),
+        declared_accent: DEFAULT_ACCENT.to_string(),
+        runtime_accent: DEFAULT_ACCENT.to_string(),
+        liveness: live_key(live).to_string(),
+        state_color: state_color(live).to_string(),
+        settings_ready: false,
+        freshness_tldr: freshness_tldr.unwrap_or_else(|| "not observed".to_string()),
+        services_count: 0,
+        target_path: TARGET_PATH.to_string(),
+        target_attribute: format!("palettes.{palette_name}.gradient.primary"),
+        janus_required: false,
+        janus_mode: "none".to_string(),
+    }
 }
 
 fn find_manifest<'a>(manifests: &'a [HostManifest], host: &str) -> Option<&'a HostManifest> {
@@ -367,9 +593,8 @@ fn build_palette_proposal(
         return Err("host palette has no declared accent");
     };
     let normalized = normalize_hex_color(proposed)?;
-    let target_path = "modules/uzumaki/theme/theme-palettes.nix";
     let attribute = format!("palettes.{}.gradient.primary", palette.name);
-    let patch = render_palette_patch(target_path, &current, &normalized, palette);
+    let patch = render_palette_patch(TARGET_PATH, &current, &normalized, palette);
     Ok(PaletteProposal {
         schema: "inspr.pharos.agora.palette-proposal.v1",
         status: if current == normalized {
@@ -386,7 +611,7 @@ fn build_palette_proposal(
         },
         target: ProposalTarget {
             repo: "nixcfg",
-            path: target_path,
+            path: TARGET_PATH,
             palette: palette.name.clone(),
             attribute,
         },
@@ -434,6 +659,15 @@ fn live_key(live: Liveness) -> &'static str {
         Liveness::Stale => "stale",
         Liveness::Down => "down",
         Liveness::AwaitingFirstHeartbeat => "awaiting_first_heartbeat",
+    }
+}
+
+fn state_color(live: Liveness) -> &'static str {
+    match live {
+        Liveness::Live => "var(--live)",
+        Liveness::Stale => "var(--stale)",
+        Liveness::Down => "var(--down)",
+        Liveness::AwaitingFirstHeartbeat => "var(--wait)",
     }
 }
 
@@ -489,6 +723,25 @@ mod tests {
         }
     }
 
+    fn runtime_host(name: &str) -> Host {
+        Host {
+            name: name.to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: Some("stored-token-hash".to_string()),
+            last_seen: Some(crate::now_unix()),
+            heartbeat_log: vec![],
+            heartbeat_interval_secs: Some(60),
+            freshness: NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(0),
+                commits_behind: Some(0),
+            },
+            service_observations: vec![],
+        }
+    }
+
     #[test]
     fn palette_proposal_generates_reviewable_nixcfg_patch() {
         let proposal = build_palette_proposal(&manifest(), "#48b8a8").expect("proposal");
@@ -496,10 +749,7 @@ mod tests {
         assert_eq!(proposal.schema, "inspr.pharos.agora.palette-proposal.v1");
         assert_eq!(proposal.status, "draft");
         assert_eq!(proposal.target.repo, "nixcfg");
-        assert_eq!(
-            proposal.target.path,
-            "modules/uzumaki/theme/theme-palettes.nix"
-        );
+        assert_eq!(proposal.target.path, TARGET_PATH);
         assert_eq!(
             proposal.target.attribute,
             "palettes.custom-hsb8.gradient.primary"
@@ -521,44 +771,28 @@ mod tests {
     }
 
     #[test]
-    fn agora_page_separates_declared_proposed_runtime_and_boundary() {
-        let runtime = Host {
-            name: "hsb8".to_string(),
-            role: "parents' home".to_string(),
-            is_nix: true,
-            report_version: pharos_core::HOST_REPORT_VERSION,
-            token_hash: Some("stored-token-hash".to_string()),
-            last_seen: Some(crate::now_unix()),
-            heartbeat_log: vec![],
-            heartbeat_interval_secs: Some(60),
-            freshness: NixFreshness {
-                applicable: true,
-                flake_lock_age_days: Some(0),
-                commits_behind: Some(0),
-            },
-            service_observations: vec![],
-        };
-
-        let html = render_page(&[manifest()], &[runtime], None);
+    fn settings_page_uses_shared_shell_and_simple_color_task() {
+        let runtime = runtime_host("hsb8");
+        let html = render_page(&[manifest()], &[runtime], None, "markus", true);
 
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
-        assert!(html.contains("Host settings"));
+        assert!(html.contains(r#"<aside class="sidebar" aria-label="primary navigation""#));
+        assert!(html.contains(r#"href="/agora" aria-current="page""#));
+        assert!(html.contains("<h1>Settings</h1>"));
         assert!(html.contains("Host color"));
-        assert!(html.contains("Current"));
-        assert!(html.contains("New"));
-        assert!(html.contains("Live"));
-        assert!(html.contains("Technical review"));
-        assert!(html.contains("Safe change"));
-        assert!(html.contains("Janus: not required"));
+        assert!(html.contains("Choose color"));
         assert!(html.contains("Review color change"));
-        assert!(html.contains("Preview"));
-        assert!(html.contains(r#"data-breadcrumb-host>hsb8"#));
+        assert!(html.contains("Advanced review"));
+        assert!(html.contains("preview-card"));
         assert!(html.contains("palettes.custom-hsb8.gradient.primary"));
+        assert!(!html.contains(r#"class="rail""#));
+        assert!(!html.contains("Services</button>"));
+        assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
     }
 
     #[test]
-    fn agora_page_selects_requested_host() {
+    fn settings_page_selects_requested_host() {
         let mut other = manifest();
         other.slug = "csb1".to_string();
         other.host.name = "csb1".to_string();
@@ -571,26 +805,35 @@ mod tests {
                 .insert("primary".to_string(), "#48b8a8".to_string());
         }
 
-        let html = render_page(&[other, manifest()], &[], Some("hsb8"));
+        let html = render_page(&[other, manifest()], &[], Some("hsb8"), "markus", true);
 
-        assert!(html.contains(r#"data-host-index="1" aria-pressed="true""#));
-        assert!(html.contains("let selected=1;"));
-        assert!(html.contains(r#"data-breadcrumb-host>hsb8"#));
-        assert!(!html.contains("No declared Agora settings"));
+        assert!(html.contains(r#"<option value="hsb8" selected>hsb8 - parents&#39; home</option>"#));
+        assert!(html.contains(r#"data-host="hsb8""#));
+        assert!(html.contains("#E09051"));
     }
 
     #[test]
-    fn agora_page_does_not_fallback_for_unknown_requested_host() {
-        let html = render_page(&[manifest()], &[], Some("csb0"));
+    fn runtime_host_without_declared_settings_gets_setup_flow() {
+        let runtime = runtime_host("csb0");
+        let html = render_page(&[manifest()], &[runtime], Some("csb0"), "markus", true);
 
-        assert!(html.contains("csb0 settings"));
-        assert!(html.contains("Settings unavailable"));
-        assert!(html.contains("No settings are declared for this host yet"));
-        assert!(html.contains("Pharos will not show or edit another host's values here"));
-        assert!(html.contains(r#"class="host-button missing" aria-current="true""#));
-        assert!(!html.contains(r#"data-host-name>hsb8"#));
-        assert!(!html.contains("Review color change"));
-        assert!(!html.contains("No declared Agora settings"));
+        assert!(html.contains("Color settings are not prepared yet"));
+        assert!(html.contains("Prepare color settings"));
+        assert!(html.contains("Prepare color settings for csb0"));
+        assert!(html.contains(r#"<option value="csb0" selected>csb0 - server - needs setup</option>"#));
+        assert!(html.contains(r#"data-host="csb0""#));
+        assert!(!html.contains(r#"data-host="hsb8""#));
+        assert!(!html.contains("Settings unavailable"));
+    }
+
+    #[test]
+    fn unknown_requested_host_gets_setup_placeholder() {
+        let html = render_page(&[manifest()], &[], Some("csb0"), "markus", true);
+
+        assert!(html.contains("Color settings are not prepared yet"));
+        assert!(html.contains("Prepare color settings for csb0"));
+        assert!(html.contains(r#"<option value="csb0" selected>csb0 - host - needs setup</option>"#));
+        assert!(!html.contains("Pharos will not show or edit another host"));
     }
 
     #[test]

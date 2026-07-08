@@ -3191,12 +3191,12 @@ fn render_home(
             .unwrap_or_default();
         let settings_action = if settings_color.is_some() {
             format!(
-                r#"<a class="settings-card" href="{settings_href}" title="Open settings for {name}" aria-label="Open settings for {name}"><span class="settings-icon">{icon}</span></a>"#,
+                r#"<a class="settings-card" href="{settings_href}" title="Open color settings for {name}" aria-label="Open color settings for {name}"><span class="settings-icon">{icon}</span></a>"#,
                 icon = icons::SLIDERS
             )
         } else {
             format!(
-                r#"<a class="settings-card unavailable" href="{settings_href}" title="Settings are not set up for {name}" aria-label="Settings are not set up for {name}"><span class="settings-icon">{icon}</span></a>"#,
+                r#"<a class="settings-card unavailable" href="{settings_href}" title="Prepare color settings for {name}" aria-label="Prepare color settings for {name}"><span class="settings-icon">{icon}</span></a>"#,
                 icon = icons::SLIDERS
             )
         };
@@ -3769,7 +3769,7 @@ mod tests {
 
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(html.contains(r#"class="card has-settings""#));
-        assert!(html.contains(r#"aria-label="Open settings for poseidon""#));
+        assert!(html.contains(r#"aria-label="Open color settings for poseidon""#));
         assert!(html.contains(r#"<div class="card-actions"><button class="drag-handle" type="button" data-drag-handle title="Move poseidon" aria-label="Move poseidon""#));
         assert!(html.contains(r#"<div class="card-tools"><span class="signal" data-signal"#));
         assert!(html.contains(r#"style="--host-color:#48b8a8""#));
