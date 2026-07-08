@@ -113,8 +113,9 @@ enum RegistrationAuth {
 
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
 const SIDEBAR_LIGHTHOUSE_PNG: &[u8] = include_bytes!("../assets/sidebar-lighthouse.png");
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="5" fill="#f7fbfc"/><path d="M10.5 5 12 2.5 13.5 5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="10" y="5" width="4" height="3" rx=".5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 8 8.6 20M14 8l1.4 12M9.2 13.5h5.6M7 20h10M6 22h12M16.6 6.4l2.4-1M7.4 6.4l-2.4-1" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
-const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><style>
+const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
 :root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--card:#ffffff;--card-soft:rgba(255,255,255,.82);--accent:#1f7fb5;--sea:#159e99;--sun:#d69b31;--live:#25845f;--stale:#b26a00;--down:#bf3a35;--wait:#8997a3;--side:232px}
 *{box-sizing:border-box}
 body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%);min-height:100vh;overflow-x:hidden}
@@ -1216,6 +1217,16 @@ async fn sidebar_lighthouse_asset() -> impl axum::response::IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         SIDEBAR_LIGHTHOUSE_PNG,
+    )
+}
+
+async fn favicon_svg() -> impl axum::response::IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_SVG,
     )
 }
 
@@ -3160,6 +3171,7 @@ async fn main() {
         .route("/declared-hosts.json", get(declared_hosts_json))
         .route("/healthz", get(healthz))
         .route("/version", get(version))
+        .route("/favicon.svg", get(favicon_svg))
         .route("/assets/fleet-horizon.png", get(fleet_horizon_asset))
         .route(
             "/assets/sidebar-lighthouse.png",
@@ -3187,6 +3199,23 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn favicon_serves_pharos_lighthouse_svg() {
+        let response = favicon_svg().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("favicon body");
+        let svg = std::str::from_utf8(&body).expect("favicon is utf8 svg");
+        assert!(svg.contains(r#"<svg xmlns="http://www.w3.org/2000/svg""#));
+        assert!(svg.contains(r##"stroke="#d69b31""##));
+        assert!(svg.contains(r#"M10.5 5 12 2.5 13.5 5"#));
+    }
 
     #[test]
     fn render_home_includes_lighthouse_and_heartbeat_markup() {
@@ -3242,6 +3271,7 @@ mod tests {
 
         let html = render_home(&hosts, "csb1", 1000, &[], "markus", true);
 
+        assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains(r#"<section class="toolbar""#));
         assert!(html.contains(r#"data-view-button="list""#));
         assert!(html.contains(r#"<option value="freeform">Freeform</option>"#));
@@ -3442,6 +3472,7 @@ mod tests {
         let body = html.find("</head><body>").unwrap();
         assert!(leaflet_css < body);
         assert!(html.contains(r#"href="/map" aria-current="page""#));
+        assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains("d3@7.9.0"));
         assert!(html.contains("d3.forceSimulation"));
         assert!(html.contains("d3.forceCollide"));

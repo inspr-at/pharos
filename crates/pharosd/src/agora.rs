@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::{html_escape, AppState};
 
-const AGORA_HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Host settings · Pharos</title><style>
+const AGORA_HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Host settings · Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
 :root{--ink:#172c3d;--muted:#647687;--line:#dce6ec;--soft:#f5f8fa;--panel:#fff;--accent:#1f7fb5;--teal:#159e99;--amber:#c98224;--green:#25845f;--red:#bf3a35;--code:#0f1720;--shadow:0 18px 42px rgba(45,75,95,.07)}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;background:linear-gradient(180deg,#fbfdfe 0%,#f4f9fb 58%,#edf6f7 100%);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;overflow-x:hidden}
@@ -541,6 +541,7 @@ mod tests {
 
         let html = render_page(&[manifest()], &[runtime], None);
 
+        assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains("Host settings"));
         assert!(html.contains("Host color"));
         assert!(html.contains("Current"));
