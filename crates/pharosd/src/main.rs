@@ -678,6 +678,22 @@ main[data-view="list"] .list-wrap{display:block}
 .map-panel:fullscreen .map-mode-controls,.map-panel:-webkit-full-screen .map-mode-controls{right:14px;top:14px}
 .map-fallback{display:none;position:absolute;inset:0;place-items:center;padding:28px;text-align:center;color:var(--muted);background:rgba(255,255,255,.82);z-index:2}
 .map-fallback strong{display:block;color:var(--ink);font-size:18px}
+.map-loading{position:absolute;inset:0;z-index:900;display:grid;place-items:center;padding:26px;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.82),rgba(239,249,250,.54))}
+.map-panel[data-loading="false"] .map-loading{display:none;opacity:0;visibility:hidden}
+.map-load-card{width:min(420px,calc(100% - 40px));padding:18px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 16px 38px rgba(54,88,108,.12);-webkit-backdrop-filter:blur(10px) saturate(1.06);backdrop-filter:blur(10px) saturate(1.06)}
+.map-load-card strong{display:block;margin-bottom:5px;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;color:var(--ink)}
+.map-load-card p{margin:0;color:var(--muted);font-size:12px}
+.map-load-rail{position:relative;height:6px;margin-top:14px;overflow:hidden;border-radius:999px;background:rgba(214,226,234,.68)}
+.map-load-rail:after{content:"";position:absolute;inset:0;width:38%;border-radius:999px;background:linear-gradient(90deg,transparent,rgba(21,158,153,.68),transparent);animation:mapShimmer 1.2s linear infinite}
+.fleet-map:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 22% 42%,rgba(21,158,153,.10),transparent 20%),radial-gradient(circle at 72% 38%,rgba(214,155,49,.10),transparent 18%),linear-gradient(135deg,#f7fbfc,#edf6f7);opacity:0;transition:opacity .18s ease}
+.map-panel[data-loading="true"] .fleet-map{position:relative}
+.map-panel[data-loading="true"] .fleet-map:before{opacity:1}
+.site-loading,.site-error{display:grid;gap:8px;padding:11px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.74)}
+.site-skel-line{height:11px;border-radius:999px;background:linear-gradient(90deg,rgba(222,234,240,.58),rgba(247,252,253,.96),rgba(222,234,240,.58));background-size:220% 100%;animation:siteShimmer 1.4s linear infinite}
+.site-skel-line.short{width:46%}.site-skel-line.medium{width:68%}.site-skel-line.long{width:86%}
+.site-error strong{font-size:13px;color:var(--ink)}.site-error span{color:var(--muted);font-size:12px}
+@keyframes mapShimmer{from{transform:translateX(-100%)}to{transform:translateX(265%)}}
+@keyframes siteShimmer{from{background-position:120% 0}to{background-position:-120% 0}}
 .site-panel{padding:16px;display:flex;flex-direction:column;gap:14px}
 .site-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;letter-spacing:0}
 .site-panel p{margin:0;color:var(--muted);font-size:12px}
@@ -1645,16 +1661,27 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
 async fn map_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let hosts = state.store.list();
-    let probes = map_connectivity_probes(&hosts, state.manifests.manifests()).await;
     no_store_html(render_map(
         &hosts,
         &self_host(),
         now_unix(),
-        state.manifests.manifests(),
-        &probes,
         &user_label,
         state.auth.is_some(),
     ))
+}
+
+async fn map_data_json(State(state): State<AppState>) -> impl IntoResponse {
+    let hosts = state.store.list();
+    let now = now_unix();
+    let probes = map_connectivity_probes(&hosts, state.manifests.manifests()).await;
+    let payload = map_data_payload(
+        &hosts,
+        &self_host(),
+        now,
+        state.manifests.manifests(),
+        &probes,
+    );
+    no_store_json(serde_json::to_value(payload).expect("map data serializes"))
 }
 
 async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -2650,6 +2677,13 @@ struct MapHost {
     settings_href: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct MapDataPayload {
+    schema: &'static str,
+    as_of: i64,
+    hosts: Vec<MapHost>,
+}
+
 fn site_location(site: &str) -> SiteLocation {
     SiteLocation::from_site(site, HostLocationSource::Provider)
 }
@@ -3118,50 +3152,18 @@ fn map_hosts(
     mapped
 }
 
-fn map_site_list(hosts: &[MapHost]) -> String {
-    let mut by_site: BTreeMap<&str, Vec<&MapHost>> = BTreeMap::new();
-    for host in hosts {
-        by_site.entry(host.site_id.as_str()).or_default().push(host);
+fn map_data_payload(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    probes: &BTreeMap<String, MapSignal>,
+) -> MapDataPayload {
+    MapDataPayload {
+        schema: "inspr.pharos.map-data.v1",
+        as_of: now,
+        hosts: map_hosts(hosts, self_name, now, manifests, probes),
     }
-    by_site
-        .into_values()
-        .map(|hosts| {
-            let Some(first) = hosts.first() else {
-                return String::new();
-            };
-            let host_links = hosts
-                .iter()
-                .map(|host| {
-                    let state_var = match host.live {
-                        "awaiting_first_heartbeat" => "wait",
-                        other => other,
-                    };
-                    format!(
-                        r#"<a class="site-host" href="{href}" data-host="{name}" data-live="{live}" data-search="{search}" style="--host-state:var(--{state_var})" title="{name}: {attention}; {inbound_title}; {outbound_title}"><span class="site-host-name">{name}</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="{inbound_level}">in {inbound_label}</span><span class="site-host-ping" data-probe-level="{outbound_level}" data-policy="{outbound_policy}">out {outbound_label}</span></span></a>"#,
-                        href = html_escape(&host.settings_href),
-                        state_var = html_escape(state_var),
-                        name = html_escape(&host.name),
-                        live = html_escape(host.live),
-                        search = html_escape(&host.search),
-                        attention = html_escape(&host.attention),
-                        inbound_title = html_escape(&host.inbound_title),
-                        outbound_title = html_escape(&host.outbound_title),
-                        inbound_level = html_escape(host.inbound_level),
-                        outbound_level = html_escape(host.outbound_level),
-                        outbound_policy = html_escape(host.outbound_policy),
-                        inbound_label = html_escape(&host.inbound_label),
-                        outbound_label = html_escape(&host.outbound_label)
-                    )
-                })
-                .collect::<String>();
-            format!(
-                r#"<section class="site-item"><div class="site-head"><div><strong>{site}</strong><p>{region}</p></div><span class="site-count">{count}</span></div><div class="site-hosts">{host_links}</div></section>"#,
-                site = html_escape(&first.site_label),
-                region = html_escape(&first.region),
-                count = hosts.len()
-            )
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -3961,22 +3963,102 @@ fn render_map(
     hosts: &[Host],
     self_name: &str,
     now: i64,
-    manifests: &[HostManifest],
-    probes: &BTreeMap<String, MapSignal>,
     user_label: &str,
     logout_enabled: bool,
 ) -> String {
-    let mapped = map_hosts(hosts, self_name, now, manifests, probes);
-    let hosts_json = serde_json::to_string(&mapped).expect("map hosts serialize");
-    let site_list = map_site_list(&mapped);
     let summary = summary_cards(hosts, self_name, now);
     let toolbar = map_toolbar();
-    let leaflet_assets =
-        r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">"#;
-    let head = head_with_extra(leaflet_assets);
-    let map_script = r#"<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="https://unpkg.com/d3@7.9.0/dist/d3.min.js"></script><script>
-const MAP_HOSTS=__MAP_HOSTS__;
+    let map_script = r#"<script>
+const MAP_DATA_URL='/map/data.json';
+const MAP_LEAFLET_CSS='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+const MAP_LEAFLET_JS='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+const MAP_D3_JS='https://unpkg.com/d3@7.9.0/dist/d3.min.js';
+let MAP_HOSTS=[];
+let applyMapFilterNow=null;
+let pendingMapFilter={q:'',live:'all'};
 function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
+function stateVar(live){return live==='awaiting_first_heartbeat'?'wait':live}
+function loadStylesheet(href){
+  if(document.querySelector('link[href="'+href+'"]'))return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    const tag=document.createElement('link');
+    tag.rel='stylesheet';
+    tag.href=href;
+    tag.onload=resolve;
+    tag.onerror=()=>reject(new Error('stylesheet failed'));
+    document.head.appendChild(tag);
+  });
+}
+function loadScript(src,ready){
+  if(ready&&ready())return Promise.resolve();
+  if(document.querySelector('script[src="'+src+'"]')){
+    return new Promise(resolve=>{
+      const check=()=>ready&&ready()?resolve():setTimeout(check,30);
+      check();
+    });
+  }
+  return new Promise((resolve,reject)=>{
+    const tag=document.createElement('script');
+    tag.src=src;
+    tag.async=true;
+    tag.onload=resolve;
+    tag.onerror=()=>reject(new Error('script failed'));
+    document.head.appendChild(tag);
+  });
+}
+async function loadMapAssets(){
+  await loadStylesheet(MAP_LEAFLET_CSS);
+  await loadScript(MAP_LEAFLET_JS,()=>Boolean(window.L));
+  await loadScript(MAP_D3_JS,()=>Boolean(window.d3));
+}
+async function loadMapData(){
+  const res=await fetch(MAP_DATA_URL+'?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin'});
+  if(!res.ok)throw new Error('map data failed');
+  const data=await res.json();
+  if(!data||!Array.isArray(data.hosts))throw new Error('map data malformed');
+  return data;
+}
+function setMapLoading(state,message){
+  const panel=document.getElementById('map-panel');
+  const sitePanel=document.querySelector('[data-site-panel]');
+  const note=document.querySelector('[data-map-note]');
+  const text=document.querySelector('[data-map-status-message]');
+  if(panel)panel.dataset.loading=state==='loading'?'true':'false';
+  if(panel)panel.dataset.mapState=state;
+  if(sitePanel)sitePanel.dataset.loading=state==='loading'?'true':'false';
+  if(note&&message)note.textContent=message;
+  if(text&&message)text.textContent=message;
+}
+function siteSkeleton(){
+  return '<div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div>';
+}
+function siteError(message){
+  return '<div class="site-error"><strong>Locations unavailable</strong><span>'+escapeHtml(message||'Map data could not be loaded. Try refreshing this view.')+'</span></div>';
+}
+function siteHostHtml(host){
+  const style='--host-state:var(--'+escapeHtml(stateVar(host.live))+')';
+  return '<a class="site-host" href="'+escapeHtml(host.settings_href)+'" data-host="'+escapeHtml(host.name)+'" data-live="'+escapeHtml(host.live)+'" data-search="'+escapeHtml(host.search||'')+'" style="'+style+'" title="'+escapeHtml(host.name+': '+host.attention+'; '+host.inbound_title+'; '+host.outbound_title)+'"><span class="site-host-name">'+escapeHtml(host.name)+'</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="'+escapeHtml(host.inbound_level)+'">in '+escapeHtml(host.inbound_label)+'</span><span class="site-host-ping" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">out '+escapeHtml(host.outbound_label)+'</span></span></a>';
+}
+function renderSiteList(hosts){
+  const target=document.querySelector('[data-site-list]');
+  if(!target)return;
+  if(!hosts.length){
+    target.innerHTML='<div class="site-error"><strong>No mapped hosts</strong><span>Pharos has no host locations to show yet.</span></div>';
+    return;
+  }
+  const bySite=new Map();
+  hosts.forEach(host=>{
+    const key=host.site_id||'unknown';
+    if(!bySite.has(key))bySite.set(key,[]);
+    bySite.get(key).push(host);
+  });
+  const sections=Array.from(bySite.values()).sort((a,b)=>String(a[0].site_label).localeCompare(String(b[0].site_label))).map(siteHosts=>{
+    siteHosts.sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+    const first=siteHosts[0];
+    return '<section class="site-item"><div class="site-head"><div><strong>'+escapeHtml(first.site_label)+'</strong><p>'+escapeHtml(first.region)+'</p></div><span class="site-count">'+siteHosts.length+'</span></div><div class="site-hosts">'+siteHosts.map(siteHostHtml).join('')+'</div></section>';
+  });
+  target.innerHTML=sections.join('');
+}
 function nodeHtml(host){return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-signals"><span class="map-ping" data-dir="in" data-probe-level="'+escapeHtml(host.inbound_level)+'">'+escapeHtml(host.inbound_label)+'</span><span class="map-ping" data-dir="out" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">'+escapeHtml(host.outbound_label)+'</span></span>'}
 function groupOffsets(hosts){
   const groups=new Map();
@@ -4154,12 +4236,17 @@ function buildLabels(map,el){
   }
   map.on('move zoom moveend zoomend resize viewreset',scheduleLayout);
   window.addEventListener('resize',scheduleLayout);
-  window.pharosMapApplyFilter=(q='',live='all')=>{
+  applyMapFilterNow=(q='',live='all')=>{
     nodes.forEach(node=>{
       node.visible=mapHostMatches(node.host,q,live);
     });
     scheduleLayout();
   };
+  window.pharosMapApplyFilter=(q='',live='all')=>{
+    pendingMapFilter={q,live};
+    applyMapFilterNow(q,live);
+  };
+  applyMapFilterNow(pendingMapFilter.q,pendingMapFilter.live);
   scheduleLayout();
   return scheduleLayout;
 }
@@ -4301,12 +4388,35 @@ function initMap(){
   map.on('moveend zoomend',()=>storeViewport(map));
   storeViewport(map);
 }
-initMap();
-</script>"#
-        .replace("__MAP_HOSTS__", &hosts_json);
+window.pharosMapApplyFilter=(q='',live='all')=>{
+  pendingMapFilter={q,live};
+  if(applyMapFilterNow)applyMapFilterNow(q,live);
+};
+async function bootMap(){
+  setMapLoading('loading','Loading server locations and reachability checks.');
+  const target=document.querySelector('[data-site-list]');
+  if(target)target.innerHTML=siteSkeleton();
+  try{
+    const [data]=await Promise.all([loadMapData(),loadMapAssets()]);
+    MAP_HOSTS=data.hosts;
+    renderSiteList(MAP_HOSTS);
+    initMap();
+    setMapLoading('ready','All servers stay visible; labels are separated by D3 force layout with leader lines.');
+    if(typeof applySurfaceFilters==='function')applySurfaceFilters(false);
+    else window.pharosMapApplyFilter(pendingMapFilter.q,pendingMapFilter.live);
+  }catch(error){
+    setMapLoading('error','Map data is temporarily unavailable. The rest of Pharos remains usable.');
+    const fallback=document.querySelector('[data-map-fallback]');
+    if(fallback)fallback.style.display='grid';
+    const target=document.querySelector('[data-site-list]');
+    if(target)target.innerHTML=siteError(error&&error.message);
+  }
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bootMap,{once:true});
+else bootMap();
+</script>"#;
     format!(
-        r#"{head}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">All servers stay visible; labels are separated by D3 force layout with leader lines.</div></aside></section></main>{map_script}{FOOT}"#,
-        head = head,
+        r#"{HEAD}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof" data-as-of>as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal" data-loading="true" data-map-state="loading"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-loading" data-map-loading><div class="map-load-card"><strong>Preparing map</strong><p data-map-status-message>Loading server locations and reachability checks.</p><span class="map-load-rail" aria-hidden="true"></span></div></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available when data can be loaded.</p></div></div></div><aside class="site-panel" aria-label="server locations" data-site-panel data-loading="true"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list" data-site-list><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div></div><div class="map-note" data-map-note>Loading server locations and reachability checks.</div></aside></section></main>{map_script}{FOOT}"#,
         sidebar = sidebar(user_label, logout_enabled, "map"),
         as_of = clock_label(now),
         summary = summary,
@@ -4702,6 +4812,7 @@ async fn main() {
         // Human routes — gated by OIDC when configured (open otherwise).
         .route("/", get(home))
         .route("/map", get(map_page))
+        .route("/map/data.json", get(map_data_json))
         .route("/alerts", get(alerts_page))
         .route("/activity", get(activity_page))
         .route("/agora", get(agora::page))
@@ -5351,16 +5462,30 @@ mod tests {
             ),
         ]);
 
-        let html = render_map(&hosts, "csb1", 1000, &[manifest], &probes, "markus", true);
+        let manifests = vec![manifest];
+        let html = render_map(&hosts, "csb1", 1000, "markus", true);
+        let payload = map_data_payload(&hosts, "csb1", 1000, &manifests, &probes);
+        let data_json = serde_json::to_string(&payload).expect("map payload serializes");
 
         let leaflet_css = html.find("leaflet@1.9.4/dist/leaflet.css").unwrap();
         let body = html.find("</head><body>").unwrap();
-        assert!(leaflet_css < body);
+        assert!(leaflet_css > body);
         assert!(html.contains(r#"href="/map" aria-current="page""#));
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
+        assert!(html.contains("const MAP_DATA_URL='/map/data.json'"));
+        assert!(html.contains("fetch(MAP_DATA_URL+'?refresh='"));
+        assert!(html.contains("loadMapAssets()"));
+        assert!(html.contains("data-map-loading"));
+        assert!(html.contains("data-map-state=\"loading\""));
+        assert!(html.contains("Preparing map"));
+        assert!(html.contains("site-skel-line"));
+        assert!(html.contains("Loading server locations and reachability checks."));
+        assert!(html.contains("let MAP_HOSTS=[]"));
+        assert!(!html.contains("const MAP_HOSTS=["));
         assert!(html.contains("d3@7.9.0"));
         assert!(html.contains("d3.forceSimulation"));
         assert!(html.contains("d3.forceCollide"));
+        assert!(html.contains("renderSiteList(MAP_HOSTS)"));
         assert!(html.contains("buildLabels(map,el)"));
         assert!(html.contains("basemaps.cartocdn.com/light_all"));
         assert!(html.contains("map.on('move zoom moveend zoomend resize viewreset'"));
@@ -5396,31 +5521,38 @@ mod tests {
         assert!(html.contains("data-dir=\"out\""));
         assert!(!html.contains("markercluster"));
         assert!(!html.contains("L.markerClusterGroup"));
-        assert!(html.contains(r#""site_id":"cloud-de""#));
-        assert!(html.contains(r#""site_id":"ww87""#));
-        assert!(html.contains(r#""site_id":"dsc-us""#));
-        assert!(html.contains(r#""site_id":"unknown""#));
-        assert!(html.contains(r#""lon":-122.9898"#));
-        assert!(html.contains(r#""location_source":"provider""#));
-        assert!(html.contains(r#""location_source":"fallback""#));
-        assert!(html.contains(r#""source":"provider""#));
-        assert!(html.contains(r#""source":"fallback""#));
-        assert!(html.contains("Hillsboro, OR, US"));
-        assert!(html.contains(r#""inbound_label":"30s""#));
-        assert!(html.contains(r#""outbound_label":"blocked""#));
-        assert!(html.contains(r#""outbound_policy":"blocked""#));
-        assert!(html.contains(r#""search":"csb1 server live"#));
-        assert!(html.contains(r#"data-probe-level="wait" data-policy="blocked">out blocked"#));
-        assert!(html.contains(r#"data-probe-level="warn" data-policy="unknown">out timeout"#));
-        assert!(html.contains(
-            r#"data-host="hsb8" data-live="live" data-search="hsb8 parents&#39; home live"#
-        ));
-        assert!(html.contains("Parents&#39; home"));
+        assert!(!html.contains(r#""site_id":"cloud-de""#));
+        assert!(!html.contains(r#""lon":-122.9898"#));
+        assert!(html.contains(r#"data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">out "#));
+        assert!(html.contains(r#"data-host="'+escapeHtml(host.name)+'" data-live="'+escapeHtml(host.live)+'" data-search="'+escapeHtml(host.search||'')+'" "#));
         assert!(html.contains(r#"<b>5</b><span>All hosts</span>"#));
         assert!(html.contains(r#"<b>4</b><span>Live</span>"#));
-        assert!(html.contains(r#"style="--host-state:var(--wait)""#));
         assert!(html.contains("Approximate site-level coordinates."));
         assert!(html.contains("All servers stay visible"));
+
+        assert!(data_json.contains(r#""schema":"inspr.pharos.map-data.v1""#));
+        assert!(data_json.contains(r#""site_id":"cloud-de""#));
+        assert!(data_json.contains(r#""site_id":"ww87""#));
+        assert!(data_json.contains(r#""site_id":"dsc-us""#));
+        assert!(data_json.contains(r#""site_id":"unknown""#));
+        assert!(data_json.contains(r#""lon":-122.9898"#));
+        assert!(data_json.contains(r#""location_source":"provider""#));
+        assert!(data_json.contains(r#""location_source":"fallback""#));
+        assert!(data_json.contains(r#""source":"provider""#));
+        assert!(data_json.contains(r#""source":"fallback""#));
+        assert!(data_json.contains("Hillsboro, OR, US"));
+        assert!(data_json.contains(r#""inbound_label":"30s""#));
+        assert!(data_json.contains(r#""outbound_label":"blocked""#));
+        assert!(data_json.contains(r#""outbound_policy":"blocked""#));
+        assert!(data_json.contains(r#""search":"csb1 server live"#));
+        assert!(payload.hosts.iter().any(|host| host.name == "hsb8"
+            && host.live == "live"
+            && host.outbound_label == "blocked"
+            && host.outbound_policy == "blocked"));
+        assert!(payload.hosts.iter().any(|host| host.name == "new-host"
+            && host.live == "awaiting_first_heartbeat"
+            && host.outbound_label == "timeout"
+            && host.outbound_level == "warn"));
     }
 
     #[test]
