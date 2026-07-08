@@ -240,11 +240,14 @@ main[data-view="list"] .list-wrap{display:block}
 .list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .card-tools{margin:0}.list .settings-card{margin:0}.list .settings-icon{width:25px;height:25px}
 .ops-main{width:min(1280px,100%)}
 .ops-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
-.ops-metric{--metric-color:var(--wait);display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;min-height:78px;padding:14px 16px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.82);box-shadow:0 12px 30px rgba(54,88,108,.06);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.ops-metric{--metric-color:var(--wait);appearance:none;width:100%;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;min-height:78px;padding:14px 16px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.82);box-shadow:0 12px 30px rgba(54,88,108,.06);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);text-align:left;cursor:pointer}
 .ops-metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color) 20%,transparent)}
 .ops-metric b{display:block;font-family:Georgia,"Times New Roman",serif;font-size:28px;line-height:1;font-weight:500;color:var(--ink)}
 .ops-metric span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.ops-metric:hover,.ops-metric:focus-visible{border-color:color-mix(in srgb,var(--metric-color) 38%,rgba(210,226,234,.86));box-shadow:0 16px 34px rgba(54,88,108,.09),0 0 0 3px color-mix(in srgb,var(--metric-color) 9%,transparent);outline:0}
+.ops-metric[aria-pressed="true"]{border-color:color-mix(in srgb,var(--metric-color) 46%,rgba(210,226,234,.86));background:linear-gradient(135deg,rgba(255,255,255,.94),color-mix(in srgb,var(--metric-color) 8%,white));box-shadow:0 16px 34px rgba(54,88,108,.10),0 0 0 3px color-mix(in srgb,var(--metric-color) 12%,transparent)}
 .ops-metric.critical{--metric-color:var(--down);border-color:rgba(191,58,53,.24)}.ops-metric.warning{--metric-color:var(--stale);border-color:rgba(178,106,0,.24)}.ops-metric.watch{--metric-color:var(--sun);border-color:rgba(214,155,49,.24)}.ops-metric.clear,.ops-metric.info,.ops-metric.recovery{--metric-color:var(--live);border-color:rgba(37,132,95,.22)}
+.ops-toolbar{margin-bottom:18px}
 .ops-layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:18px;align-items:start}
 .ops-panel,.ops-side-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
 .ops-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:17px 18px;border-bottom:1px solid rgba(214,226,234,.72);background:rgba(251,253,254,.74)}
@@ -261,24 +264,32 @@ main[data-view="list"] .list-wrap{display:block}
 .alert-dot,.activity-dot{flex:0 0 auto;width:9px;height:9px;border-radius:50%;background:var(--row-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-color) 12%,transparent)}
 .alert-host strong,.activity-host strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
 .alert-host span:last-child,.activity-host span:last-child{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}
+.alert-status{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0}
+.alert-repeat{display:inline-flex;align-items:center;min-height:23px;padding:3px 8px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:720}
 .severity{display:inline-flex;align-items:center;justify-content:center;width:max-content;min-height:25px;padding:4px 9px;border:1px solid color-mix(in srgb,var(--row-color) 25%,transparent);border-radius:999px;background:color-mix(in srgb,var(--row-color) 9%,white);color:var(--row-color);font-size:11px;font-weight:760;text-transform:lowercase}
 .alert-issue strong,.activity-copy strong{display:block;color:var(--ink);font-size:13px}
 .alert-issue p,.activity-copy p{margin:2px 0 0;color:var(--muted);font-size:12px;line-height:1.35}
 .ops-source,.ops-time{color:var(--muted);font-size:12px}.ops-time{white-space:nowrap}
 .next-action{min-width:0;color:#0f4f80;font-size:12px;font-weight:720;line-height:1.35;overflow-wrap:anywhere}
 .ops-side-panel{display:grid;gap:14px;padding:16px}
-.posture-ring{--posture-color:var(--live);position:relative;display:grid;place-items:center;width:126px;height:126px;margin:2px auto 4px;border-radius:50%;background:conic-gradient(var(--posture-color) var(--posture-fill),rgba(214,226,234,.72) 0);box-shadow:0 0 0 10px color-mix(in srgb,var(--posture-color) 8%,transparent)}
+.posture-ring{--posture-color:var(--live);appearance:none;position:relative;display:grid;place-items:center;width:126px;height:126px;margin:2px auto 4px;border:0;border-radius:50%;background:conic-gradient(var(--posture-color) var(--posture-fill),rgba(214,226,234,.72) 0);box-shadow:0 0 0 10px color-mix(in srgb,var(--posture-color) 8%,transparent);cursor:pointer;text-align:center}
 .posture-ring:before{content:"";position:absolute;inset:18px;border-radius:50%;background:#fff;box-shadow:inset 0 0 0 1px rgba(210,226,234,.72)}
+.posture-ring:hover,.posture-ring:focus-visible{box-shadow:0 0 0 10px color-mix(in srgb,var(--posture-color) 11%,transparent),0 12px 28px rgba(45,75,95,.10);outline:0}
 .posture-ring strong{position:relative;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;color:var(--ink)}
 .posture-ring span{position:relative;color:var(--muted);font-size:11px}
 .posture-list,.activity-filters{display:flex;flex-wrap:wrap;gap:7px}
-.posture-chip,.activity-filter{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:5px 9px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:650}
+.posture-chip,.activity-filter{appearance:none;display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:5px 9px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:650;cursor:pointer}
 .posture-chip:before,.activity-filter:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--chip-color,var(--wait));box-shadow:0 0 0 3px color-mix(in srgb,var(--chip-color,var(--wait)) 10%,transparent)}
-.posture-chip.critical,.activity-filter.critical{--chip-color:var(--down)}.posture-chip.warning,.activity-filter.warning{--chip-color:var(--stale)}.posture-chip.watch,.activity-filter.watch{--chip-color:var(--sun)}.posture-chip.clear,.activity-filter.clear,.activity-filter.recovery{--chip-color:var(--live)}.activity-filter.info{--chip-color:var(--accent)}
-.activity-filter{cursor:pointer}.activity-filter[aria-pressed="true"]{color:#0f4f80;border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.76)}
+.posture-chip.critical,.activity-filter.critical{--chip-color:var(--down)}.posture-chip.warning,.activity-filter.warning{--chip-color:var(--stale)}.posture-chip.watch,.activity-filter.watch{--chip-color:var(--sun)}.posture-chip.clear,.activity-filter.clear,.activity-filter.recovery{--chip-color:var(--live)}.posture-chip.info,.activity-filter.info{--chip-color:var(--accent)}
+.posture-chip:hover,.posture-chip:focus-visible,.activity-filter:hover,.activity-filter:focus-visible{border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.58);outline:0}
+.posture-chip[aria-pressed="true"],.activity-filter[aria-pressed="true"]{color:#0f4f80;border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.76)}
+.ops-action{display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:8px 12px;border:1px solid rgba(103,177,196,.42);border-radius:7px;background:rgba(223,241,249,.72);color:#0f4f80;text-decoration:none;font-size:12px;font-weight:760;box-shadow:0 8px 20px rgba(45,75,95,.07)}
+.ops-action:hover,.ops-action:focus-visible{background:rgba(207,235,244,.92);box-shadow:0 10px 24px rgba(45,75,95,.10);outline:0}
 .ops-empty{padding:34px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .ops-empty h2{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500}.ops-empty p{margin:0;color:var(--muted)}
 .ops-note{padding:11px 13px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.78);color:var(--muted);font-size:12px}
+.ops-filter-empty{display:none;margin:0;padding:22px;border-top:1px solid rgba(214,226,234,.66);color:var(--muted);font-size:13px;background:rgba(255,255,255,.64)}
+.ops-filter-empty[data-visible="true"]{display:block}
 [hidden]{display:none!important}
 .empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
@@ -2645,6 +2656,19 @@ struct AlertItem {
 }
 
 #[derive(Debug, Clone)]
+struct AlertGroup {
+    level: &'static str,
+    hosts: Vec<(String, String)>,
+    issue: String,
+    detail: String,
+    source: &'static str,
+    seen: String,
+    next_action: String,
+    sort_time: i64,
+    count: usize,
+}
+
+#[derive(Debug, Clone)]
 struct ActivityEvent {
     timestamp: i64,
     host: String,
@@ -2743,6 +2767,10 @@ fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str, String, St
 }
 
 fn service_alert(host: &Host, observation: &ServiceObservation, now: i64) -> Option<AlertItem> {
+    if is_nix_freshness_observation(observation) {
+        return None;
+    }
+
     let (level, action) = match observation.state {
         ServiceObservationState::Healthy => return None,
         ServiceObservationState::Warning => ("warning", "Inspect the service on the host."),
@@ -2762,6 +2790,10 @@ fn service_alert(host: &Host, observation: &ServiceObservation, now: i64) -> Opt
         next_action: action.to_string(),
         sort_time: host.last_seen.unwrap_or(now),
     })
+}
+
+fn is_nix_freshness_observation(observation: &ServiceObservation) -> bool {
+    observation.id == "nix-freshness" || observation.label.eq_ignore_ascii_case("Nix freshness")
 }
 
 fn probe_alert(host: &str, role: &str, probe: &ServerProbeObservation) -> Option<AlertItem> {
@@ -2959,52 +2991,142 @@ fn alert_counts(alerts: &[AlertItem], hosts: &[Host]) -> (usize, usize, usize, u
     (critical, warning, watch, clear)
 }
 
+fn alert_groups(alerts: &[AlertItem]) -> Vec<AlertGroup> {
+    let mut groups: Vec<AlertGroup> = Vec::new();
+
+    for alert in alerts {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group.level == alert.level
+                && group.source == alert.source
+                && group.issue == alert.issue
+                && group.detail == alert.detail
+                && group.next_action == alert.next_action
+        }) {
+            group.count += 1;
+            if !group.hosts.iter().any(|(host, _)| host == &alert.host) {
+                group.hosts.push((alert.host.clone(), alert.role.clone()));
+            }
+            if alert.sort_time >= group.sort_time {
+                group.sort_time = alert.sort_time;
+                group.seen = alert.seen.clone();
+            }
+        } else {
+            groups.push(AlertGroup {
+                level: alert.level,
+                hosts: vec![(alert.host.clone(), alert.role.clone())],
+                issue: alert.issue.clone(),
+                detail: alert.detail.clone(),
+                source: alert.source,
+                seen: alert.seen.clone(),
+                next_action: alert.next_action.clone(),
+                sort_time: alert.sort_time,
+                count: 1,
+            });
+        }
+    }
+
+    for group in &mut groups {
+        group.hosts.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+    groups.sort_by(|left, right| {
+        level_rank(left.level)
+            .cmp(&level_rank(right.level))
+            .then_with(|| right.sort_time.cmp(&left.sort_time))
+            .then_with(|| left.issue.cmp(&right.issue))
+            .then_with(|| left.source.cmp(right.source))
+    });
+    groups
+}
+
 fn ops_summary_metrics(alerts: &[AlertItem], hosts: &[Host]) -> String {
     let (critical, warning, watch, clear) = alert_counts(alerts, hosts);
     format!(
-        r#"<section class="ops-summary" aria-label="alert summary"><div class="ops-metric critical"><b>{critical}</b><span>critical</span></div><div class="ops-metric warning"><b>{warning}</b><span>warning</span></div><div class="ops-metric watch"><b>{watch}</b><span>watch</span></div><div class="ops-metric clear"><b>{clear}</b><span>clear</span></div></section>"#
+        r#"<section class="ops-summary" aria-label="alert summary"><button class="ops-metric critical" type="button" data-ops-filter="critical" aria-pressed="false"><b>{critical}</b><span>critical</span></button><button class="ops-metric warning" type="button" data-ops-filter="warning" aria-pressed="false"><b>{warning}</b><span>warning</span></button><button class="ops-metric watch" type="button" data-ops-filter="watch" aria-pressed="false"><b>{watch}</b><span>watch</span></button><button class="ops-metric clear" type="button" data-ops-filter="clear" aria-pressed="false"><b>{clear}</b><span>clear</span></button></section>"#
     )
 }
 
-fn render_alert_row(alert: &AlertItem) -> String {
+fn alert_group_host_label(group: &AlertGroup) -> (String, String) {
+    if group.hosts.len() == 1 {
+        return group.hosts[0].clone();
+    }
+
+    let mut names = group
+        .hosts
+        .iter()
+        .take(3)
+        .map(|(host, _)| host.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if group.hosts.len() > 3 {
+        names.push_str(&format!(" +{} more", group.hosts.len() - 3));
+    }
+    (format!("{} hosts", group.hosts.len()), names)
+}
+
+fn alert_group_host_search(group: &AlertGroup) -> String {
+    let mut parts = Vec::new();
+    for (host, role) in &group.hosts {
+        parts.push(host.as_str());
+        parts.push(role.as_str());
+    }
+    parts.push(group.issue.as_str());
+    parts.push(group.detail.as_str());
+    parts.push(group.source);
+    parts.join(" ").to_lowercase()
+}
+
+fn render_alert_row(group: &AlertGroup) -> String {
+    let (host_label, host_detail) = alert_group_host_label(group);
+    let repeat = if group.count > 1 {
+        format!(
+            r#"<span class="alert-repeat">{count} alerts</span>"#,
+            count = group.count
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<article class="alert-row {level}" data-alert-level="{level}"><div class="alert-host"><span class="alert-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{role}</span></div></div><span class="severity">{level_label}</span><div class="alert-issue"><strong>{issue}</strong><p>{detail}</p></div><span class="ops-source">{source}</span><span class="ops-time">{seen}</span><span class="next-action">{next_action}</span></article>"#,
-        level = html_escape(alert.level),
-        level_label = level_label(alert.level),
-        host = html_escape(&alert.host),
-        role = html_escape(&alert.role),
-        issue = html_escape(&alert.issue),
-        detail = html_escape(&alert.detail),
-        source = html_escape(alert.source),
-        seen = html_escape(&alert.seen),
-        next_action = html_escape(&alert.next_action)
+        r#"<article class="alert-row {level}" data-ops-row data-ops-level="{level}" data-ops-kind="{source}" data-host-search="{host_search}"><div class="alert-host"><span class="alert-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{role}</span></div></div><div class="alert-status"><span class="severity">{level_label}</span>{repeat}</div><div class="alert-issue"><strong>{issue}</strong><p>{detail}</p></div><span class="ops-source">{source}</span><span class="ops-time">{seen}</span><span class="next-action">{next_action}</span></article>"#,
+        level = html_escape(group.level),
+        level_label = level_label(group.level),
+        repeat = repeat,
+        host = html_escape(&host_label),
+        role = html_escape(&host_detail),
+        issue = html_escape(&group.issue),
+        detail = html_escape(&group.detail),
+        source = html_escape(group.source),
+        seen = html_escape(&group.seen),
+        next_action = html_escape(&group.next_action),
+        host_search = html_escape(&alert_group_host_search(group))
     )
 }
 
-fn render_alert_rows(alerts: &[AlertItem]) -> String {
-    if alerts.is_empty() {
+fn render_alert_rows(groups: &[AlertGroup]) -> String {
+    if groups.is_empty() {
         return r#"<section class="ops-empty"><h2>All clear</h2><p>No host, freshness, service, probe, or manifest alert needs attention right now.</p></section>"#.to_string();
     }
-    alerts.iter().map(render_alert_row).collect()
+    groups.iter().map(render_alert_row).collect()
 }
 
 fn posture_panel(alerts: &[AlertItem], hosts: &[Host]) -> String {
     let (critical, warning, watch, clear) = alert_counts(alerts, hosts);
-    let total = hosts.len().max(1);
-    let clear_percent = ((clear * 100) / total).min(100);
-    let posture = if critical > 0 {
-        ("critical", "var(--down)")
+    let total_alerts = alerts.len().max(1);
+    let (posture_label, posture_color, posture_count, posture_filter) = if critical > 0 {
+        ("critical", "var(--down)", critical, "critical")
     } else if warning > 0 {
-        ("attention", "var(--stale)")
+        ("warning", "var(--stale)", warning, "warning")
     } else if watch > 0 {
-        ("watching", "var(--sun)")
+        ("watch", "var(--sun)", watch, "watch")
     } else {
-        ("clear", "var(--live)")
+        ("clear", "var(--live)", clear, "clear")
+    };
+    let posture_fill = if alerts.is_empty() {
+        100
+    } else {
+        ((posture_count * 100) / total_alerts).clamp(8, 100)
     };
     format!(
-        r#"<aside class="ops-side-panel" aria-label="operations posture"><div><h2>Operations posture</h2><p>Most important work first.</p></div><div class="posture-ring" style="--posture-fill:{clear_percent}%;--posture-color:{posture_color}"><div><strong>{clear}</strong><span>{posture_label}</span></div></div><div class="posture-list"><span class="posture-chip critical">critical {critical}</span><span class="posture-chip warning">warning {warning}</span><span class="posture-chip watch">watch {watch}</span><span class="posture-chip clear">clear {clear}</span></div><div class="ops-note">Alerts are ordered by severity, then by the freshest evidence. Focus critical rows before freshness housekeeping.</div><a class="settings-link" href="/map">View on map</a></aside>"#,
-        posture_color = posture.1,
-        posture_label = posture.0
+        r#"<aside class="ops-side-panel" aria-label="operations posture"><div><h2>Operations posture</h2><p>Most important work first.</p></div><button class="posture-ring" type="button" data-ops-filter="{posture_filter}" aria-pressed="false" style="--posture-fill:{posture_fill}%;--posture-color:{posture_color}"><div><strong>{posture_count}</strong><span>{posture_label}</span></div></button><div class="posture-list"><button class="posture-chip critical" type="button" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="posture-chip warning" type="button" data-ops-filter="warning" aria-pressed="false">warning {warning}</button><button class="posture-chip watch" type="button" data-ops-filter="watch" aria-pressed="false">watch {watch}</button><button class="posture-chip clear" type="button" data-ops-filter="clear" aria-pressed="false">clear {clear}</button><button class="posture-chip info" type="button" data-ops-filter="all" aria-pressed="true">show all</button></div><div class="ops-note">Repeated alerts are grouped. Use the host search and severity controls to focus the queue.</div><a class="ops-action" href="/map">View on map</a></aside>"#
     )
 }
 
@@ -3018,15 +3140,61 @@ fn render_alerts(
     shell: ShellContext<'_>,
 ) -> String {
     let alerts = alert_items(hosts, self_name, now, manifests, load_errors, server_probes);
-    let rows = render_alert_rows(&alerts);
+    let groups = alert_groups(&alerts);
+    let rows = render_alert_rows(&groups);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main">{header}{summary}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div></section>{posture}</section></main></div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "alerts"),
         header = page_header("Alerts", "Needs attention", now),
         summary = ops_summary_metrics(&alerts, hosts),
+        toolbar = ops_toolbar(),
         count = alerts.len(),
-        posture = posture_panel(&alerts, hosts)
+        posture = posture_panel(&alerts, hosts),
+        script = ops_script()
     )
+}
+
+fn ops_toolbar() -> String {
+    format!(
+        r#"<section class="toolbar ops-toolbar" aria-label="operations filters"><div class="toolbar-left"><button class="activity-filter info" type="button" data-ops-filter="all" aria-pressed="true">Show all</button></div><div class="toolbar-right">{search}</div></section>"#,
+        search = search_box("Search hosts...")
+    )
+}
+
+fn ops_script() -> &'static str {
+    r#"<script>
+document.querySelectorAll('[data-ops-page]').forEach(root=>{
+  const search=root.querySelector('[data-search]');
+  const rows=[...root.querySelectorAll('[data-ops-row]')];
+  const empty=root.querySelector('[data-ops-empty]');
+  let active='all';
+  function setFilter(filter){
+    active=filter||'all';
+    root.querySelectorAll('[data-ops-filter]').forEach(button=>{
+      button.setAttribute('aria-pressed',String((button.dataset.opsFilter||'all')===active));
+    });
+    apply();
+  }
+  function apply(){
+    const query=(search?.value||'').trim().toLowerCase();
+    let visible=0;
+    rows.forEach(row=>{
+      const filterOk=active==='all'||row.dataset.opsLevel===active||row.dataset.opsKind===active;
+      const haystack=(row.dataset.hostSearch||row.textContent||'').toLowerCase();
+      const searchOk=!query||haystack.includes(query);
+      const show=filterOk&&searchOk;
+      row.hidden=!show;
+      if(show)visible++;
+    });
+    if(empty)empty.dataset.visible=String(visible===0&&rows.length>0);
+  }
+  root.querySelectorAll('[data-ops-filter]').forEach(button=>{
+    button.addEventListener('click',()=>setFilter(button.dataset.opsFilter||'all'));
+  });
+  search?.addEventListener('input',apply);
+  setFilter('all');
+});
+</script>"#
 }
 
 fn activity_events(
@@ -3131,6 +3299,10 @@ fn activity_events(
         }
 
         for observation in &host.service_observations {
+            if is_nix_freshness_observation(observation) {
+                continue;
+            }
+
             if observation.state == ServiceObservationState::Healthy {
                 events.push(ActivityEvent::new(
                     host.last_seen.unwrap_or(now),
@@ -3198,7 +3370,7 @@ fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
     let freshness = activity_source_count(events, "freshness");
     let service = activity_source_count(events, "service");
     format!(
-        r#"<section class="ops-summary" aria-label="activity summary"><div class="ops-metric info"><b>{total}</b><span>all events</span></div><div class="ops-metric clear"><b>{heartbeat}</b><span>heartbeat</span></div><div class="ops-metric watch"><b>{freshness}</b><span>freshness</span></div><div class="ops-metric warning"><b>{service}</b><span>service</span></div></section>"#,
+        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button></section>"#,
         total = events.len()
     )
 }
@@ -3214,7 +3386,7 @@ fn activity_filter_bar(events: &[ActivityEvent]) -> String {
         .filter(|event| event.level == "warning")
         .count();
     format!(
-        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter info" type="button" data-activity-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
+        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
         total = events.len(),
         heartbeat = activity_source_count(events, "heartbeat"),
         freshness = activity_source_count(events, "freshness"),
@@ -3224,7 +3396,7 @@ fn activity_filter_bar(events: &[ActivityEvent]) -> String {
 
 fn render_activity_row(event: &ActivityEvent) -> String {
     format!(
-        r#"<article class="activity-row {level}" data-activity-kind="{kind}" data-activity-level="{level}"><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></article>"#,
+        r#"<article class="activity-row {level}" data-ops-row data-activity-kind="{kind}" data-activity-level="{level}" data-ops-kind="{kind}" data-ops-level="{level}" data-host-search="{host_search}"><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></article>"#,
         level = html_escape(event.level),
         kind = html_escape(event.kind),
         time = html_escape(&clock_label(event.timestamp)),
@@ -3232,7 +3404,12 @@ fn render_activity_row(event: &ActivityEvent) -> String {
         level_label = level_label(event.level),
         title = html_escape(&event.title),
         detail = html_escape(&event.detail),
-        source = html_escape(event.source)
+        source = html_escape(event.source),
+        host_search = html_escape(&format!(
+            "{} {} {} {} {}",
+            event.host, event.kind, event.title, event.detail, event.source
+        )
+        .to_lowercase())
     )
 }
 
@@ -3244,17 +3421,7 @@ fn activity_rows(events: &[ActivityEvent]) -> String {
 }
 
 fn activity_script() -> &'static str {
-    r#"<script>
-document.querySelectorAll('[data-activity-filter]').forEach(button=>{
-  button.addEventListener('click',()=>{
-    const filter=button.dataset.activityFilter||'all';
-    document.querySelectorAll('[data-activity-filter]').forEach(other=>other.setAttribute('aria-pressed',String(other===button)));
-    document.querySelectorAll('[data-activity-kind]').forEach(row=>{
-      row.hidden=!(filter==='all'||row.dataset.activityKind===filter||row.dataset.activityLevel===filter);
-    });
-  });
-});
-</script>"#
+    ops_script()
 }
 
 fn render_activity(
@@ -3269,10 +3436,11 @@ fn render_activity(
     let events = activity_events(hosts, self_name, now, manifests, load_errors, server_probes);
     let rows = activity_rows(&events);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main">{header}{summary}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
         header = page_header("Activity", "Operational timeline", now),
         summary = activity_summary_metrics(&events),
+        toolbar = ops_toolbar(),
         count = events.len(),
         filters = activity_filter_bar(&events),
         script = activity_script()
@@ -4269,12 +4437,19 @@ mod tests {
                     flake_lock_age_days: Some(2),
                     commits_behind: Some(3),
                 },
-                service_observations: vec![ServiceObservation {
-                    id: "nginx".to_string(),
-                    label: "nginx".to_string(),
-                    state: ServiceObservationState::Warning,
-                    summary: "response is slow".to_string(),
-                }],
+                service_observations: vec![
+                    ServiceObservation::nix_freshness(&NixFreshness {
+                        applicable: true,
+                        flake_lock_age_days: Some(2),
+                        commits_behind: Some(3),
+                    }),
+                    ServiceObservation {
+                        id: "nginx".to_string(),
+                        label: "nginx".to_string(),
+                        state: ServiceObservationState::Warning,
+                        summary: "response is slow".to_string(),
+                    },
+                ],
             },
             Host {
                 name: "hermes".to_string(),
@@ -4287,8 +4462,8 @@ mod tests {
                 heartbeat_interval_secs: Some(60),
                 freshness: NixFreshness {
                     applicable: true,
-                    flake_lock_age_days: Some(0),
-                    commits_behind: Some(0),
+                    flake_lock_age_days: Some(2),
+                    commits_behind: Some(3),
                 },
                 service_observations: vec![],
             },
@@ -4343,12 +4518,22 @@ mod tests {
         assert!(html.contains("No heartbeat received"));
         assert!(html.contains("Check host power, network, and pharos-beacon."));
         assert!(html.contains("3 commits behind nixcfg"));
+        assert!(html.contains(r#"<span class="alert-repeat">2 alerts</span>"#));
+        assert!(html.contains("athena, hermes"));
         assert!(html.contains("nginx: warning"));
+        assert!(!html.contains("Nix freshness: warning"));
         assert!(html.contains("Home Assistant probe warning"));
         assert!(html.contains("Install or start pharos-beacon"));
         assert!(html.contains("Operations posture"));
-        assert!(html.contains(r#"href="/map">View on map</a>"#));
-        assert!(html.contains(r#"<div class="ops-metric critical">"#));
+        assert!(html.contains(r#"class="ops-action" href="/map">View on map</a>"#));
+        assert!(html.contains(r#"<button class="ops-metric critical" type="button" data-ops-filter="critical""#));
+        assert!(html.contains(r#"data-ops-filter="warning""#));
+        assert!(html.contains(r#"placeholder="Search hosts...""#));
+        assert!(html.contains(r#"data-host-search="athena server hermes server"#));
+        assert!(html.contains(r#"class="posture-ring" type="button" data-ops-filter="critical""#));
+        assert!(html.contains(r#"<strong>2</strong><span>critical</span>"#));
+        assert!(html.contains("Repeated alerts are grouped."));
+        assert!(html.contains("const filterOk=active==='all'"));
         assert!(!html.contains("not-rendered-token-hash"));
     }
 
@@ -4386,6 +4571,11 @@ mod tests {
                     commits_behind: Some(1),
                 },
                 service_observations: vec![
+                    ServiceObservation::nix_freshness(&NixFreshness {
+                        applicable: true,
+                        flake_lock_age_days: Some(4),
+                        commits_behind: Some(1),
+                    }),
                     ServiceObservation {
                         id: "ssh".to_string(),
                         label: "ssh".to_string(),
@@ -4466,11 +4656,16 @@ mod tests {
         assert!(html.contains("Freshness drift detected"));
         assert!(html.contains("ssh is healthy"));
         assert!(html.contains("nginx warning"));
+        assert!(!html.contains("Nix freshness warning"));
         assert!(html.contains("ssh probe healthy"));
         assert!(html.contains("Declared host manifest loaded"));
         assert!(html.contains(r#"data-activity-filter="heartbeat""#));
+        assert!(html.contains(r#"data-ops-filter="heartbeat""#));
+        assert!(html.contains(r#"placeholder="Search hosts...""#));
+        assert!(html.contains(r#"data-host-search="athena freshness freshness drift detected"#));
+        assert!(html.contains(r#"<button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true""#));
         assert!(html.contains(r#"data-activity-filter="critical""#));
-        assert!(html.contains(r#"row.hidden=!(filter==='all'"#));
+        assert!(html.contains("const filterOk=active==='all'"));
         assert!(html.contains("Activity is derived from current retained Pharos state."));
         assert!(!html.contains("not-rendered-token-hash"));
     }
