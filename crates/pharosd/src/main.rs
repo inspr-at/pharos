@@ -189,6 +189,25 @@ impl AlertNotifier {
         let Some(url) = self.webhook_url.as_deref() else {
             return false;
         };
+        let Ok(parsed_url) = Url::parse(url) else {
+            tracing::warn!(host = %alert.host, "silent beacon alert target URL is invalid");
+            return false;
+        };
+        match parsed_url.scheme() {
+            "http" | "https" => self.send_http_alert(url, alert).await,
+            "telegram" => self.send_telegram_alert(&parsed_url, alert).await,
+            _ => {
+                tracing::warn!(
+                    host = %alert.host,
+                    scheme = %parsed_url.scheme(),
+                    "silent beacon alert target URL scheme is unsupported"
+                );
+                false
+            }
+        }
+    }
+
+    async fn send_http_alert(&self, url: &str, alert: &SilentBeaconAlert) -> bool {
         match self.client.post(url).json(alert).send().await {
             Ok(response) if response.status().is_success() => {
                 tracing::warn!(
@@ -214,6 +233,50 @@ impl AlertNotifier {
                 false
             }
         }
+    }
+
+    async fn send_telegram_alert(&self, url: &Url, alert: &SilentBeaconAlert) -> bool {
+        let Some(target) = TelegramAlertTarget::from_url(url) else {
+            tracing::warn!(host = %alert.host, "silent beacon Telegram alert target is invalid");
+            return false;
+        };
+        let endpoint = format!("https://api.telegram.org/bot{}/sendMessage", target.token);
+        let text = telegram_alert_text(alert);
+        let mut sent_all = true;
+
+        for chat_id in target.chats {
+            let payload = json!({
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": true,
+            });
+            match self.client.post(&endpoint).json(&payload).send().await {
+                Ok(response) if response.status().is_success() => {
+                    tracing::warn!(
+                        host = %alert.host,
+                        age_seconds = alert.age_seconds,
+                        "silent beacon Telegram alert notification sent"
+                    );
+                }
+                Ok(response) => {
+                    tracing::warn!(
+                        host = %alert.host,
+                        status = %response.status(),
+                        "silent beacon Telegram alert returned non-success"
+                    );
+                    sent_all = false;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        host = %alert.host,
+                        "silent beacon Telegram alert request failed"
+                    );
+                    sent_all = false;
+                }
+            }
+        }
+
+        sent_all
     }
 }
 
@@ -245,6 +308,57 @@ struct SilentBeaconAlert {
     as_of: i64,
     summary: String,
     next_action: &'static str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TelegramAlertTarget {
+    token: String,
+    chats: Vec<String>,
+}
+
+impl TelegramAlertTarget {
+    fn from_url(url: &Url) -> Option<Self> {
+        if url.scheme() != "telegram" {
+            return None;
+        }
+        let username = url.username();
+        if username.is_empty() {
+            return None;
+        }
+        let token = match url.password() {
+            Some(password) if !password.is_empty() => format!("{username}:{password}"),
+            _ => username.to_string(),
+        };
+        let chats = url
+            .query_pairs()
+            .find_map(|(key, value)| {
+                if key == "chats" || key == "channels" {
+                    Some(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|chat| !chat.is_empty())
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .filter(|chats| !chats.is_empty())?;
+
+        Some(Self { token, chats })
+    }
+}
+
+fn telegram_alert_text(alert: &SilentBeaconAlert) -> String {
+    format!(
+        "Pharos critical alert\nHost: {}\nProblem: {}\nAge: {}\nNext: {}",
+        alert.host,
+        alert.summary,
+        duration_label(alert.age_seconds),
+        alert.next_action
+    )
 }
 
 fn silent_beacon_alerts(hosts: &[Host], now: i64) -> Vec<SilentBeaconAlert> {
@@ -5561,6 +5675,39 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let _ = fs::remove_file(path);
 
         assert_eq!(selected.as_deref(), Some("https://watchtower.example/hook"));
+    }
+
+    #[test]
+    fn telegram_alert_target_parses_shoutrrr_url() {
+        let url =
+            Url::parse("telegram://123456:abcDEF@telegram?chats=-100111222333,444555").unwrap();
+        let target = TelegramAlertTarget::from_url(&url).expect("telegram target");
+
+        assert_eq!(target.token, "123456:abcDEF");
+        assert_eq!(target.chats, vec!["-100111222333", "444555"]);
+    }
+
+    #[test]
+    fn telegram_alert_text_is_plain_and_actionable() {
+        let alert = SilentBeaconAlert {
+            schema: "inspr.pharos.alert.v1",
+            level: "critical",
+            kind: "silent_heartbeat",
+            host: "gpc0".to_string(),
+            role: "server".to_string(),
+            last_seen: 100,
+            age_seconds: 360,
+            heartbeat_interval_secs: 60,
+            as_of: 460,
+            summary: "gpc0 has not reported for 6m 00s.".to_string(),
+            next_action: "Check host power, network, and pharos-beacon.",
+        };
+
+        let text = telegram_alert_text(&alert);
+
+        assert!(text.contains("Pharos critical alert"));
+        assert!(text.contains("Host: gpc0"));
+        assert!(text.contains("Check host power"));
     }
 
     #[test]
