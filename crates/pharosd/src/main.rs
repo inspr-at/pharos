@@ -3645,7 +3645,9 @@ mod tests {
         assert!(html.contains(r#""search":"csb1 server live"#));
         assert!(html.contains(r#"data-probe-level="wait" data-policy="blocked">out blocked"#));
         assert!(html.contains(r#"data-probe-level="warn" data-policy="unknown">out timeout"#));
-        assert!(html.contains(r#"data-host="hsb8" data-live="live" data-search="hsb8 parents&#39; home live"#));
+        assert!(html.contains(
+            r#"data-host="hsb8" data-live="live" data-search="hsb8 parents&#39; home live"#
+        ));
         assert!(html.contains("Parents&#39; home"));
         assert!(html.contains(r#"<b>5</b><span>All hosts</span>"#));
         assert!(html.contains(r#"<b>4</b><span>Live</span>"#));

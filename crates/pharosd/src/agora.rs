@@ -396,8 +396,16 @@ fn host_options(hosts: &[AgoraHostView], selected_index: usize) -> String {
         .iter()
         .enumerate()
         .map(|(idx, host)| {
-            let selected = if idx == selected_index { " selected" } else { "" };
-            let suffix = if host.settings_ready { "" } else { " - needs setup" };
+            let selected = if idx == selected_index {
+                " selected"
+            } else {
+                ""
+            };
+            let suffix = if host.settings_ready {
+                ""
+            } else {
+                " - needs setup"
+            };
             format!(
                 r#"<option value="{value}"{selected}>{name} - {role}{suffix}</option>"#,
                 value = html_escape(&host.name),
@@ -820,7 +828,9 @@ mod tests {
         assert!(html.contains("Color settings are not prepared yet"));
         assert!(html.contains("Prepare color settings"));
         assert!(html.contains("Prepare color settings for csb0"));
-        assert!(html.contains(r#"<option value="csb0" selected>csb0 - server - needs setup</option>"#));
+        assert!(
+            html.contains(r#"<option value="csb0" selected>csb0 - server - needs setup</option>"#)
+        );
         assert!(html.contains(r#"data-host="csb0""#));
         assert!(!html.contains(r#"data-host="hsb8""#));
         assert!(!html.contains("Settings unavailable"));
@@ -832,7 +842,9 @@ mod tests {
 
         assert!(html.contains("Color settings are not prepared yet"));
         assert!(html.contains("Prepare color settings for csb0"));
-        assert!(html.contains(r#"<option value="csb0" selected>csb0 - host - needs setup</option>"#));
+        assert!(
+            html.contains(r#"<option value="csb0" selected>csb0 - host - needs setup</option>"#)
+        );
         assert!(!html.contains("Pharos will not show or edit another host"));
     }
 
