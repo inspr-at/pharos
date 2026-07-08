@@ -256,10 +256,24 @@ main[data-view="list"] .list-wrap{display:block}
 .lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
 .lone-state .onboard-command{position:relative;margin:0;font-size:12px}
 .map-main{width:min(1380px,100%)}
+.map-main[data-map-view="maximized"]{width:100%}
 .map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
 .map-panel,.site-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.84);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
-.map-panel{position:relative;min-height:560px}
-.fleet-map{height:clamp(520px,calc(100vh - 220px),760px);min-height:520px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}
+.map-panel{position:relative;display:flex;min-height:560px}
+.fleet-map{flex:1 1 auto;height:auto;min-height:560px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}
+.map-layout[data-mode="maximized"]{grid-template-columns:minmax(0,1fr)}
+.map-layout[data-mode="maximized"] .site-panel{display:none}
+.map-layout[data-mode="maximized"] .map-panel{height:calc(100vh - 258px);min-height:640px}
+.map-panel:fullscreen{width:100vw;height:100vh;min-height:100vh;border:0;border-radius:0;background:#f7fbfc}
+.map-panel:fullscreen .fleet-map{min-height:100vh}
+.map-panel:-webkit-full-screen{width:100vw;height:100vh;min-height:100vh;border:0;border-radius:0;background:#f7fbfc}
+.map-panel:-webkit-full-screen .fleet-map{min-height:100vh}
+.map-mode-controls{position:absolute;right:12px;top:76px;z-index:1001;display:flex;align-items:center;gap:4px;padding:4px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 12px 28px rgba(45,75,95,.14);-webkit-backdrop-filter:blur(10px) saturate(1.06);backdrop-filter:blur(10px) saturate(1.06)}
+.map-mode-control{display:grid;place-items:center;width:34px;height:34px;border:1px solid transparent;border-radius:6px;background:transparent;color:#44637f;cursor:pointer}
+.map-mode-control:hover{border-color:rgba(173,205,220,.72);background:rgba(223,241,249,.56);color:#17304a}
+.map-mode-control[aria-pressed="true"]{border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.82);color:#187fb9;box-shadow:0 0 0 3px rgba(103,177,196,.10)}
+.map-mode-control .ico{width:17px;height:17px}
+.map-panel:fullscreen .map-mode-controls,.map-panel:-webkit-full-screen .map-mode-controls{right:14px;top:76px}
 .map-fallback{display:none;position:absolute;inset:0;place-items:center;padding:28px;text-align:center;color:var(--muted);background:rgba(255,255,255,.82);z-index:2}
 .map-fallback strong{display:block;color:var(--ink);font-size:18px}
 .site-panel{padding:16px;display:flex;flex-direction:column;gap:14px}
@@ -298,8 +312,8 @@ main[data-view="list"] .list-wrap{display:block}
 .map-ping:before{content:attr(data-dir);width:17px;color:var(--muted);font-weight:700;text-transform:uppercase;font-size:8px;letter-spacing:.03em}
 .map-ping[data-probe-level="good"]{color:var(--live)}.map-ping[data-probe-level="warn"]{color:var(--stale)}.map-ping[data-probe-level="down"]{color:var(--down)}.map-ping[data-policy="blocked"]{color:var(--muted)}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
-@media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}}
-@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.fleet-map{height:62vh;min-height:420px}}
+@media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
+@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:76px;right:10px}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -2604,6 +2618,74 @@ function buildLabels(map,el){
   map.on('move zoom moveend zoomend resize viewreset',scheduleLayout);
   window.addEventListener('resize',scheduleLayout);
   scheduleLayout();
+  return scheduleLayout;
+}
+function fullscreenElement(){return document.fullscreenElement||document.webkitFullscreenElement||null}
+function requestFullscreen(el){
+  if(el.requestFullscreen)return el.requestFullscreen();
+  if(el.webkitRequestFullscreen)return el.webkitRequestFullscreen();
+  return Promise.reject(new Error('Fullscreen is not supported'));
+}
+function exitFullscreen(){
+  if(document.exitFullscreen)return document.exitFullscreen();
+  if(document.webkitExitFullscreen)return document.webkitExitFullscreen();
+  return Promise.resolve();
+}
+function setupMapModes(map,el,relayout){
+  const panel=document.getElementById('map-panel');
+  const layout=document.querySelector('[data-map-layout]');
+  const main=document.querySelector('[data-map-view]');
+  const buttons=Array.from(document.querySelectorAll('[data-map-mode-button]'));
+  if(!panel||!layout||!main||!buttons.length)return;
+  let mode='standard';
+  let beforeFullscreen='standard';
+  function resizeSoon(){
+    const run=()=>{map.invalidateSize();relayout&&relayout()};
+    requestAnimationFrame(run);
+    window.setTimeout(run,90);
+    window.setTimeout(run,260);
+  }
+  function setPressed(next){
+    buttons.forEach(button=>{
+      const active=button.dataset.mapModeButton===next;
+      button.setAttribute('aria-pressed',active?'true':'false');
+    });
+  }
+  function commit(next){
+    mode=next;
+    panel.dataset.mode=next;
+    layout.dataset.mode=next==='fullscreen'?'maximized':next;
+    main.dataset.mapView=next==='standard'?'standard':'maximized';
+    setPressed(next);
+    resizeSoon();
+  }
+  function setMode(next){
+    if(next==='fullscreen'){
+      beforeFullscreen=mode==='fullscreen'?'standard':mode;
+      commit('fullscreen');
+      requestFullscreen(panel).catch(()=>commit('maximized'));
+      return;
+    }
+    if(fullscreenElement()===panel){
+      exitFullscreen().catch(()=>{});
+    }
+    commit(next);
+  }
+  buttons.forEach(button=>{
+    button.addEventListener('click',()=>setMode(button.dataset.mapModeButton||'standard'));
+  });
+  function onFullscreenChange(){
+    if(fullscreenElement()===panel){
+      commit('fullscreen');
+    }else if(mode==='fullscreen'){
+      commit(beforeFullscreen||'standard');
+    }else{
+      resizeSoon();
+    }
+  }
+  document.addEventListener('fullscreenchange',onFullscreenChange);
+  document.addEventListener('webkitfullscreenchange',onFullscreenChange);
+  commit('standard');
 }
 function initMap(){
   const el=document.getElementById('fleet-map');
@@ -2613,18 +2695,22 @@ function initMap(){
   L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:20,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'}).addTo(map);
   const bounds=MAP_HOSTS.map(host=>[host.lat,host.lon]);
   if(bounds.length===1){map.setView(bounds[0],5)}else if(bounds.length){map.fitBounds(bounds,{padding:[64,64],maxZoom:5})}else{map.setView([20,0],2)}
-  buildLabels(map,el);
+  const relayout=buildLabels(map,el);
+  setupMapModes(map,el,relayout);
 }
 initMap();
 </script>"#
         .replace("__MAP_HOSTS__", &hosts_json);
     format!(
-        r#"{head}{sidebar}<main class="map-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div><section class="summary" aria-label="map summary"><div class="metric live"><b>{host_count}</b><span>Hosts</span></div><div class="metric stale"><b>{location_count}</b><span>Locations</span></div><div class="metric"><b>{host_count}</b><span>Labels</span></div><div class="metric"><b>0</b><span>Clusters</span></div></section><section class="map-layout"><div class="map-panel"><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">All servers stay visible; labels are separated by D3 force layout with leader lines.</div></aside></section></main>{map_script}{FOOT}"#,
+        r#"{head}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div><section class="summary" aria-label="map summary"><div class="metric live"><b>{host_count}</b><span>Hosts</span></div><div class="metric stale"><b>{location_count}</b><span>Locations</span></div><div class="metric"><b>{host_count}</b><span>Labels</span></div><div class="metric"><b>0</b><span>Clusters</span></div></section><section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">All servers stay visible; labels are separated by D3 force layout with leader lines.</div></aside></section></main>{map_script}{FOOT}"#,
         head = head,
         sidebar = sidebar(user_label, logout_enabled, "map"),
         as_of = clock_label(now),
         host_count = mapped.len(),
         location_count = location_count,
+        standard_icon = icons::PANEL_RIGHT,
+        maximize_icon = icons::MAXIMIZE_2,
+        fullscreen_icon = icons::FULLSCREEN,
     )
 }
 
@@ -3323,6 +3409,15 @@ mod tests {
         assert!(html.contains("map.on('move zoom moveend zoomend resize viewreset'"));
         assert!(html.contains("classList.add('map-links')"));
         assert!(html.contains("animateMotion"));
+        assert!(html.contains(r#"data-map-view="standard""#));
+        assert!(html.contains(r#"data-map-layout data-mode="standard""#));
+        assert!(html.contains(r#"id="map-panel" class="map-panel""#));
+        assert!(html.contains(r#"data-map-mode-button="standard""#));
+        assert!(html.contains(r#"data-map-mode-button="maximized""#));
+        assert!(html.contains(r#"data-map-mode-button="fullscreen""#));
+        assert!(html.contains("requestFullscreen(panel)"));
+        assert!(html.contains("map.invalidateSize()"));
+        assert!(html.contains(".fleet-map{flex:1 1 auto;height:auto;min-height:560px"));
         assert!(html.contains("data-dir=\"in\""));
         assert!(html.contains("data-dir=\"out\""));
         assert!(!html.contains("markercluster"));
