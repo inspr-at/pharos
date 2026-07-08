@@ -752,7 +752,8 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-sheet{width:min(560px,100%);border:1px solid rgba(210,226,234,.92);border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(247,252,253,.94));box-shadow:0 28px 70px rgba(31,61,82,.22);overflow:hidden}
 .assistant-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 22px 16px;border-bottom:1px solid rgba(214,226,234,.72)}.assistant-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;color:#12304b}.assistant-head p{margin:5px 0 0;color:var(--muted);font-size:13px}
 .assistant-close{appearance:none;display:grid;place-items:center;min-width:34px;height:34px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-close:hover,.assistant-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}
-.assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}.assistant-note{min-height:36px;margin:0;padding:10px 12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--muted);font-size:12px}
+.assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
+.assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
 body[data-assistant-open="true"]{overflow:hidden}
 @media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}}
 .map-main{width:min(1380px,100%)}
@@ -1300,12 +1301,61 @@ function bindFreeformDrag(){
   grid.addEventListener('pointercancel',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
   window.addEventListener('blur',finish);
 }
-function setAssistantOpen(open){
+const ASSISTANT_SETUP_PARAM='setup';
+const ASSISTANT_PATH_PARAM='setup_path';
+function assistantPath(path){
+  return ['new','existing'].includes(path)?path:'';
+}
+function writeAssistantUrl(open,path=''){
+  const params=new URLSearchParams(location.search);
+  if(open){
+    params.set(ASSISTANT_SETUP_PARAM,'add-server');
+    const safePath=assistantPath(path);
+    if(safePath)params.set(ASSISTANT_PATH_PARAM,safePath);
+    else params.delete(ASSISTANT_PATH_PARAM);
+  }else{
+    params.delete(ASSISTANT_SETUP_PARAM);
+    params.delete(ASSISTANT_PATH_PARAM);
+  }
+  const query=params.toString();
+  history.replaceState(null,'',location.pathname+(query?'?'+query:''));
+}
+function setAssistantPath(path,write=true){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const safePath=assistantPath(path);
+  overlay.dataset.assistantSelectedPath=safePath;
+  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>{
+    btn.setAttribute('aria-pressed',String(btn.dataset.assistantPath===safePath));
+  });
+  const title=overlay.querySelector('[data-assistant-next-title]');
+  const copy=overlay.querySelector('[data-assistant-next-copy]');
+  if(safePath==='new'){
+    if(title)title.textContent='New server selected';
+    if(copy)copy.textContent='Next: choose a provider template. No resources have been created.';
+  }else if(safePath==='existing'){
+    if(title)title.textContent='Existing server selected';
+    if(copy)copy.textContent='Next: enter connection details. No tokens or host records have been created.';
+  }else{
+    if(title)title.textContent='Next step';
+    if(copy)copy.textContent='Choose a path to preview the next step. No changes have been started.';
+  }
+  if(write)writeAssistantUrl(!overlay.hidden,safePath);
+}
+function setAssistantOpen(open,write=true){
   const overlay=document.querySelector('[data-setup-assistant]');
   if(!overlay)return;
   overlay.hidden=!open;
   document.body.dataset.assistantOpen=open?'true':'false';
+  if(!open)setAssistantPath('',false);
+  if(write)writeAssistantUrl(open,open?(overlay.dataset.assistantSelectedPath||''):'');
   if(open)overlay.querySelector('[data-assistant-close]')?.focus();
+}
+function restoreAssistantFromUrl(){
+  const params=new URLSearchParams(location.search);
+  const open=params.get(ASSISTANT_SETUP_PARAM)==='add-server';
+  setAssistantOpen(open,false);
+  setAssistantPath(open?params.get(ASSISTANT_PATH_PARAM):'',false);
 }
 function initSetupAssistant(){
   const overlay=document.querySelector('[data-setup-assistant]');
@@ -1314,10 +1364,9 @@ function initSetupAssistant(){
   overlay.querySelectorAll('[data-assistant-close]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(false)));
   overlay.addEventListener('click',event=>{if(event.target===overlay)setAssistantOpen(false)});
   document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!overlay.hidden)setAssistantOpen(false)});
-  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>{
-    const note=overlay.querySelector('[data-assistant-note]');
-    if(note)note.textContent='No changes made. This setup path is queued for the next implementation slice.';
-  }));
+  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>setAssistantPath(btn.dataset.assistantPath)));
+  window.addEventListener('popstate',restoreAssistantFromUrl);
+  restoreAssistantFromUrl();
 }
 function updateUrlState(){
   const main=document.querySelector('main');
@@ -2789,7 +2838,7 @@ fn onboard_row() -> String {
 
 fn setup_assistant() -> String {
     format!(
-        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><p class="assistant-note" data-assistant-note>This is the chooser shell. The concrete setup paths come next.</p></div></div></section>"#,
+        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" disabled>Continue</button></div></div></div></section>"#,
         plus = icons::PLUS,
         server = icons::SERVER
     )
@@ -6506,6 +6555,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Waiting for the first host"));
         assert!(empty.contains("Add first server"));
         assert!(empty.contains("Add a server"));
+        assert!(empty.contains("setup_path"));
+        assert!(empty.contains(r#"data-assistant-next-title"#));
+        assert!(empty.contains(r#"aria-pressed="false""#));
         assert!(empty.contains("awaiting first heartbeat"));
 
         let host = Host {
