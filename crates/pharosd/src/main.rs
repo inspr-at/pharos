@@ -2710,16 +2710,10 @@ fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str, String, St
     None
 }
 
-fn service_alert(
-    host: &Host,
-    observation: &ServiceObservation,
-    now: i64,
-) -> Option<AlertItem> {
+fn service_alert(host: &Host, observation: &ServiceObservation, now: i64) -> Option<AlertItem> {
     let (level, action) = match observation.state {
         ServiceObservationState::Healthy => return None,
-        ServiceObservationState::Warning => {
-            ("warning", "Inspect the service on the host.")
-        }
+        ServiceObservationState::Warning => ("warning", "Inspect the service on the host."),
         ServiceObservationState::Stale => ("warning", "Verify the service is still reporting."),
         ServiceObservationState::Unknown => {
             ("watch", "Confirm whether this service should report state.")
@@ -2770,8 +2764,10 @@ fn alert_items(
     server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
 ) -> Vec<AlertItem> {
     let mut alerts = Vec::new();
-    let runtime_by_name: BTreeMap<&str, &Host> =
-        hosts.iter().map(|host| (host.name.as_str(), host)).collect();
+    let runtime_by_name: BTreeMap<&str, &Host> = hosts
+        .iter()
+        .map(|host| (host.name.as_str(), host))
+        .collect();
     let manifest_roles: BTreeMap<&str, &str> = manifests
         .iter()
         .map(|manifest| {
@@ -2811,11 +2807,13 @@ fn alert_items(
                     .clone()
                     .unwrap_or_else(|| "declared host".to_string()),
                 issue: "Declared host has not reported yet".to_string(),
-                detail: "The host exists in declared metadata, but no runtime heartbeat is present."
-                    .to_string(),
+                detail:
+                    "The host exists in declared metadata, but no runtime heartbeat is present."
+                        .to_string(),
                 source: "config",
                 seen: "never".to_string(),
-                next_action: "Install or start pharos-beacon, or remove stale metadata.".to_string(),
+                next_action: "Install or start pharos-beacon, or remove stale metadata."
+                    .to_string(),
                 sort_time: now,
             });
         }
