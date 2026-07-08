@@ -10,9 +10,10 @@
 //!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
 //!      PHAROS_TOKEN (per-host bearer token from /register).
 
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
     HostLocation, HostLocationSource, HostReport, NixFreshness, ServiceObservation,
@@ -125,6 +126,7 @@ enum LocationMode {
     Off,
     Env,
     IpApi,
+    Command,
 }
 
 impl LocationMode {
@@ -137,10 +139,13 @@ impl LocationMode {
         {
             Some("env") => Self::Env,
             Some("ip") | Some("ip-api") | Some("ipapi") | Some("geoip") => Self::IpApi,
+            Some("command") | Some("cmd") | Some("provider-command") => Self::Command,
             _ => Self::Off,
         }
     }
 }
+
+const LOCATION_COMMAND_TIMEOUT_MS: u64 = 2_000;
 
 fn env_value(key: &str) -> Option<String> {
     std::env::var(key)
@@ -170,6 +175,34 @@ fn parse_location_source(value: Option<String>, default: HostLocationSource) -> 
     }
 }
 
+fn parse_u64(value: Option<String>) -> Option<u64> {
+    value.and_then(|value| value.parse::<u64>().ok())
+}
+
+fn location_command_args_from_raw(raw: &str) -> Option<Vec<String>> {
+    serde_json::from_str::<Vec<String>>(raw).ok()
+}
+
+fn location_command_args() -> Vec<String> {
+    let Some(raw) = env_value("PHAROS_LOCATION_COMMAND_ARGS") else {
+        return Vec::new();
+    };
+    match location_command_args_from_raw(&raw) {
+        Some(args) => args,
+        None => {
+            eprintln!("pharos-beacon: location command args invalid");
+            Vec::new()
+        }
+    }
+}
+
+fn location_command_timeout() -> Duration {
+    let millis = parse_u64(env_value("PHAROS_LOCATION_COMMAND_TIMEOUT_MS"))
+        .filter(|millis| (100..=30_000).contains(millis))
+        .unwrap_or(LOCATION_COMMAND_TIMEOUT_MS);
+    Duration::from_millis(millis)
+}
+
 fn location_from_env(now: i64) -> Option<HostLocation> {
     let location = HostLocation {
         latitude: parse_f64(env_value("PHAROS_LOCATION_LATITUDE"))?,
@@ -188,6 +221,112 @@ fn location_from_env(now: i64) -> Option<HostLocation> {
     };
     location.validate_contract().ok()?;
     Some(location)
+}
+
+fn json_f64(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| value.get(*key)?.as_f64())
+        .filter(|value| value.is_finite())
+}
+
+fn json_optional_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64())
+        .filter(|value| value.is_finite())
+}
+
+fn location_from_command_json(raw: &str, now: i64) -> Option<HostLocation> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let source = parse_location_source(
+        value
+            .get("source")
+            .and_then(|source| source.as_str())
+            .map(str::to_string),
+        HostLocationSource::Provider,
+    );
+    let location = HostLocation {
+        latitude: json_f64(&value, &["latitude", "lat"])?,
+        longitude: json_f64(&value, &["longitude", "lon"])?,
+        source,
+        accuracy_meters: json_optional_f64(&value, "accuracy_meters"),
+        precision_meters: json_optional_f64(&value, "precision_meters").or(Some(25_000.0)),
+        observed_at: value
+            .get("observed_at")
+            .and_then(|observed_at| observed_at.as_i64())
+            .or(Some(now)),
+        stale: false,
+        manual_override: false,
+        label: value
+            .get("label")
+            .and_then(|label| label.as_str())
+            .map(str::to_string),
+    };
+    location.validate_contract().ok()?;
+    Some(location)
+}
+
+fn run_location_command(
+    command: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, &'static str> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "spawn")?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    pipe.read_to_string(&mut stdout).map_err(|_| "stdout")?;
+                }
+                return if status.success() {
+                    Ok(stdout)
+                } else {
+                    Err("exit")
+                };
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("timeout");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return Err("wait"),
+        }
+    }
+}
+
+fn location_from_command(now: i64) -> Option<HostLocation> {
+    let Some(command) = env_value("PHAROS_LOCATION_COMMAND") else {
+        eprintln!("pharos-beacon: location command not configured");
+        return None;
+    };
+    let raw = match run_location_command(
+        &command,
+        &location_command_args(),
+        location_command_timeout(),
+    ) {
+        Ok(raw) => raw,
+        Err(reason) => {
+            eprintln!("pharos-beacon: location command failed: {reason}");
+            return None;
+        }
+    };
+    match location_from_command_json(&raw, now) {
+        Some(location) => Some(location),
+        None => {
+            eprintln!("pharos-beacon: location command returned invalid location");
+            None
+        }
+    }
 }
 
 fn location_label_from_parts(
@@ -259,6 +398,7 @@ fn collect_location(now: i64) -> Option<HostLocation> {
         LocationMode::Off => None,
         LocationMode::Env => location_from_env(now),
         LocationMode::IpApi => location_from_ip_api(now),
+        LocationMode::Command => location_from_command(now),
     }
 }
 
@@ -424,6 +564,14 @@ mod tests {
             LocationMode::IpApi
         );
         assert_eq!(
+            LocationMode::from_env_value(Some("command".to_string())),
+            LocationMode::Command
+        );
+        assert_eq!(
+            LocationMode::from_env_value(Some("provider-command".to_string())),
+            LocationMode::Command
+        );
+        assert_eq!(
             LocationMode::from_env_value(Some("wifi".to_string())),
             LocationMode::Off
         );
@@ -491,6 +639,81 @@ mod tests {
         assert!(summary.contains("precision=50000m"));
         assert!(!summary.contains("52.52"));
         assert!(!summary.contains("13.405"));
+    }
+
+    #[test]
+    fn command_location_parses_sanitized_payload_only() {
+        let raw = r#"{
+            "latitude": 48.2082,
+            "longitude": 16.3738,
+            "source": "wifi",
+            "accuracy_meters": 900,
+            "precision_meters": 2500,
+            "observed_at": 1700000000,
+            "label": "Vienna area",
+            "bssid": "aa:bb:cc:dd:ee:ff",
+            "ssid": "private-network"
+        }"#;
+
+        let location = location_from_command_json(raw, 1_700_000_100).expect("command location");
+        let body = serde_json::to_string(&location).expect("location serializes");
+        let summary = location_log_summary(Some(&location));
+
+        assert_eq!(location.source, HostLocationSource::Wifi);
+        assert_eq!(location.accuracy_meters, Some(900.0));
+        assert_eq!(location.precision_meters, Some(2500.0));
+        assert_eq!(location.observed_at, Some(1_700_000_000));
+        assert_eq!(location.label.as_deref(), Some("Vienna area"));
+        assert!(!body.contains("aa:bb"));
+        assert!(!body.contains("private-network"));
+        assert!(summary.contains("location=wifi"));
+        assert!(!summary.contains("48.2082"));
+        assert!(!summary.contains("16.3738"));
+        assert!(!summary.contains("Vienna"));
+    }
+
+    #[test]
+    fn command_location_rejects_malformed_or_invalid_payload() {
+        assert!(location_from_command_json("not json", 1_700_000_000).is_none());
+        assert!(
+            location_from_command_json(r#"{"latitude":99,"longitude":16}"#, 1_700_000_000)
+                .is_none()
+        );
+        assert!(location_from_command_json(
+            r#"{"latitude":48.2,"longitude":"bad"}"#,
+            1_700_000_000
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn command_location_args_are_json_array_only() {
+        assert_eq!(
+            location_command_args_from_raw(r#"["--format","json"]"#),
+            Some(vec!["--format".to_string(), "json".to_string()])
+        );
+        assert!(location_command_args_from_raw("--format json").is_none());
+    }
+
+    #[test]
+    fn command_runner_reports_failure_without_leaking_output() {
+        let args = vec![
+            "-c".to_string(),
+            "printf 'BSSID=aa:bb:cc:dd:ee:ff'; exit 7".to_string(),
+        ];
+        let error =
+            run_location_command("/bin/sh", &args, Duration::from_secs(1)).expect_err("fails");
+        assert_eq!(error, "exit");
+        assert!(!error.contains("aa:bb"));
+        assert!(!error.contains("BSSID"));
+    }
+
+    #[test]
+    fn command_runner_times_out() {
+        let args = vec!["-c".to_string(), "sleep 1".to_string()];
+        let error =
+            run_location_command("/bin/sh", &args, Duration::from_millis(10)).expect_err("timeout");
+        assert_eq!(error, "timeout");
     }
 
     #[test]
