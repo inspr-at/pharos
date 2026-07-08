@@ -1133,6 +1133,7 @@ dependencies = [
  "axum",
  "openidconnect",
  "pharos-core",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

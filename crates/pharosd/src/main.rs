@@ -14,10 +14,10 @@ mod icons;
 mod manifests;
 mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRef, State};
@@ -37,7 +37,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, MissedTickBehavior};
 use url::Url;
 
 use crate::auth::{Auth, AuthState};
@@ -45,6 +45,8 @@ use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::store::Store;
 
 const SERVER_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+const ALERT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const ALERT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Combined app state. Handlers extract `Arc<Store>` or `AuthState` via `FromRef`.
 #[derive(Clone)]
@@ -109,6 +111,179 @@ enum RegistrationAuth {
     Allowed,
     Denied,
     NotConfigured,
+}
+
+#[derive(Clone)]
+struct AlertNotifier {
+    webhook_url: Option<String>,
+    client: reqwest::Client,
+    notified_down_hosts: Arc<Mutex<BTreeSet<String>>>,
+    check_interval: Duration,
+}
+
+impl AlertNotifier {
+    fn from_env() -> Self {
+        let webhook_url = std::env::var("PHAROS_ALERT_WEBHOOK_URL")
+            .ok()
+            .and_then(|value| non_empty_env_value(&value));
+        let check_interval = std::env::var("PHAROS_ALERT_CHECK_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds >= 5)
+            .map(Duration::from_secs)
+            .unwrap_or(ALERT_CHECK_INTERVAL);
+        let timeout = std::env::var("PHAROS_ALERT_WEBHOOK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds >= 1)
+            .map(Duration::from_secs)
+            .unwrap_or(ALERT_WEBHOOK_TIMEOUT);
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            webhook_url,
+            client,
+            notified_down_hosts: Arc::new(Mutex::new(BTreeSet::new())),
+            check_interval,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.webhook_url.is_some()
+    }
+
+    async fn check_store(&self, store: &Store, now: i64) {
+        let alerts = silent_beacon_alerts(&store.list(), now);
+        let down_hosts = alerts
+            .iter()
+            .map(|alert| alert.host.clone())
+            .collect::<BTreeSet<_>>();
+        let candidates = {
+            let mut notified = self
+                .notified_down_hosts
+                .lock()
+                .expect("alert notifier mutex poisoned");
+            notified.retain(|host| down_hosts.contains(host));
+            alerts
+                .into_iter()
+                .filter(|alert| !notified.contains(&alert.host))
+                .collect::<Vec<_>>()
+        };
+
+        for alert in candidates {
+            if self.send(&alert).await {
+                self.notified_down_hosts
+                    .lock()
+                    .expect("alert notifier mutex poisoned")
+                    .insert(alert.host.clone());
+            }
+        }
+    }
+
+    async fn send(&self, alert: &SilentBeaconAlert) -> bool {
+        let Some(url) = self.webhook_url.as_deref() else {
+            return false;
+        };
+        match self.client.post(url).json(alert).send().await {
+            Ok(response) if response.status().is_success() => {
+                tracing::warn!(
+                    host = %alert.host,
+                    age_seconds = alert.age_seconds,
+                    "silent beacon alert notification sent"
+                );
+                true
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    host = %alert.host,
+                    status = %response.status(),
+                    "silent beacon alert webhook returned non-success"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    host = %alert.host,
+                    "silent beacon alert webhook request failed"
+                );
+                false
+            }
+        }
+    }
+}
+
+fn spawn_alert_loop(state: AppState, notifier: AlertNotifier) {
+    if !notifier.enabled() {
+        tracing::info!("silent beacon alert webhook not configured; notifications disabled");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(notifier.check_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            notifier.check_store(&state.store, now_unix()).await;
+        }
+    });
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SilentBeaconAlert {
+    schema: &'static str,
+    level: &'static str,
+    kind: &'static str,
+    host: String,
+    role: String,
+    last_seen: i64,
+    age_seconds: i64,
+    heartbeat_interval_secs: u64,
+    as_of: i64,
+    summary: String,
+    next_action: &'static str,
+}
+
+fn silent_beacon_alerts(hosts: &[Host], now: i64) -> Vec<SilentBeaconAlert> {
+    let mut alerts = hosts
+        .iter()
+        .filter_map(|host| {
+            let last_seen = host.last_seen?;
+            if liveness(host.last_seen, host.heartbeat_interval_secs, now) != Liveness::Down {
+                return None;
+            }
+            let age_seconds = now.saturating_sub(last_seen);
+            let interval = host.heartbeat_interval_secs.unwrap_or(60);
+            Some(SilentBeaconAlert {
+                schema: "inspr.pharos.alert.v1",
+                level: "critical",
+                kind: "silent_heartbeat",
+                host: host.name.clone(),
+                role: host.role.clone(),
+                last_seen,
+                age_seconds,
+                heartbeat_interval_secs: interval,
+                as_of: now,
+                summary: format!(
+                    "{} has not reported to Pharos for {}.",
+                    host.name,
+                    duration_label(age_seconds)
+                ),
+                next_action: "Check host power, network, and pharos-beacon.",
+            })
+        })
+        .collect::<Vec<_>>();
+    alerts.sort_by(|left, right| left.host.cmp(&right.host));
+    alerts
+}
+
+fn non_empty_env_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
@@ -4377,12 +4552,14 @@ async fn main() {
     let manifests = Arc::new(ManifestRegistry::from_env());
     let auth = Auth::from_env().await;
     let beacon_auth = BeaconAuth::from_env();
+    let alert_notifier = AlertNotifier::from_env();
     let state = AppState {
         store,
         manifests,
         auth,
         beacon_auth,
     };
+    spawn_alert_loop(state.clone(), alert_notifier);
 
     let app = Router::new()
         // Human routes — gated by OIDC when configured (open otherwise).
@@ -5243,6 +5420,42 @@ mod tests {
             false
         );
         assert!(!payload.to_string().contains("not-rendered-token-hash"));
+    }
+
+    #[test]
+    fn silent_beacon_alerts_only_previous_hosts_that_are_down() {
+        fn host(name: &str, last_seen: Option<i64>) -> Host {
+            Host {
+                name: name.to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen,
+                heartbeat_log: last_seen.into_iter().collect(),
+                heartbeat_interval_secs: Some(60),
+                location: None,
+                freshness: NixFreshness::default(),
+                service_observations: vec![],
+            }
+        }
+
+        let alerts = silent_beacon_alerts(
+            &[
+                host("live", Some(950)),
+                host("stale", Some(800)),
+                host("down", Some(600)),
+                host("awaiting", None),
+            ],
+            1000,
+        );
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].host, "down");
+        assert_eq!(alerts[0].kind, "silent_heartbeat");
+        assert_eq!(alerts[0].age_seconds, 400);
+        assert_eq!(alerts[0].heartbeat_interval_secs, 60);
+        assert!(alerts[0].summary.contains("has not reported"));
     }
 
     #[test]
