@@ -709,6 +709,9 @@ main[data-view="list"] .list-wrap{display:block}
 .site-host-signals{display:flex;flex-wrap:wrap;gap:5px;margin-top:2px}
 .site-host-ping{line-height:1.1;font-size:10px;color:var(--muted);white-space:nowrap}
 .site-host-ping[data-probe-level="good"]{color:var(--live)}.site-host-ping[data-probe-level="warn"]{color:var(--stale)}.site-host-ping[data-probe-level="down"]{color:var(--down)}.site-host-ping[data-policy="blocked"]{color:var(--muted)}
+.site-host-source{display:inline-flex;align-items:center;gap:4px;margin-left:auto;padding:2px 6px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:rgba(255,255,255,.78);color:#546b80;font-size:10px;line-height:1.1;white-space:nowrap}
+.site-host-source:before{content:"";width:5px;height:5px;border-radius:50%;background:#8aa0b2;box-shadow:0 0 0 3px rgba(138,160,178,.10)}
+.site-host-source[data-location-source="declared"]:before{background:#2d87bf}.site-host-source[data-location-source="wifi"]:before,.site-host-source[data-location-source="ip"]:before{background:var(--live)}.site-host-source[data-location-source="provider"]:before{background:var(--sea)}.site-host-source[data-location-source="fallback"]:before{background:var(--sun)}
 .map-note{margin-top:auto;padding-top:8px;border-top:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:11px}
 .leaflet-container{height:100%;font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
 .leaflet-control-zoom a{color:var(--ink)!important}
@@ -729,10 +732,13 @@ main[data-view="list"] .list-wrap{display:block}
 .map-ping{display:flex;align-items:center;gap:4px;font-size:10px;line-height:1.15;color:var(--muted);white-space:nowrap}
 .map-ping:before{content:attr(data-dir);width:17px;color:var(--muted);font-weight:700;text-transform:uppercase;font-size:8px;letter-spacing:.03em}
 .map-ping[data-probe-level="good"]{color:var(--live)}.map-ping[data-probe-level="warn"]{color:var(--stale)}.map-ping[data-probe-level="down"]{color:var(--down)}.map-ping[data-policy="blocked"]{color:var(--muted)}
+.map-source{grid-column:2;justify-self:start;display:inline-flex;align-items:center;gap:4px;margin-top:4px;padding:2px 6px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:rgba(255,255,255,.76);color:#546b80;font-size:10px;line-height:1.1;white-space:nowrap}
+.map-source:before{content:"";width:5px;height:5px;border-radius:50%;background:#8aa0b2;box-shadow:0 0 0 3px rgba(138,160,178,.10)}
+.map-source[data-location-source="declared"]:before{background:#2d87bf}.map-source[data-location-source="wifi"]:before,.map-source[data-location-source="ip"]:before{background:var(--live)}.map-source[data-location-source="provider"]:before{background:var(--sea)}.map-source[data-location-source="fallback"]:before{background:var(--sun)}
 .map-panel[data-label-density="compact"] .map-node{grid-template-columns:8px max-content;align-items:center;min-width:0;max-width:132px;padding:5px 8px 5px 7px}
 .map-panel[data-label-density="compact"] .map-status-dot{grid-row:auto;margin-top:0;width:8px;height:8px}
 .map-panel[data-label-density="compact"] .map-name{font-size:12px}
-.map-panel[data-label-density="compact"] .map-signals{display:none}
+.map-panel[data-label-density="compact"] .map-signals,.map-panel[data-label-density="compact"] .map-source{display:none}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
 @media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -2703,6 +2709,16 @@ fn location_source_key(source: HostLocationSource) -> &'static str {
     }
 }
 
+fn location_source_label(source: HostLocationSource) -> &'static str {
+    match source {
+        HostLocationSource::Wifi | HostLocationSource::Ip => "auto",
+        HostLocationSource::Provider => "provider",
+        HostLocationSource::Declared => "declared",
+        HostLocationSource::Fallback => "fallback",
+        HostLocationSource::Unknown => "unknown",
+    }
+}
+
 fn location_stale(location: &HostLocation, now: i64) -> bool {
     if location.stale {
         return true;
@@ -3103,7 +3119,7 @@ fn map_hosts(
                 .cloned()
                 .unwrap_or_else(default_map_signal);
             let search = format!(
-                "{} {} {} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {} {}",
                 host.name,
                 host.role,
                 status,
@@ -3111,6 +3127,7 @@ fn map_hosts(
                 site.label,
                 site.region,
                 location_source_key(site.source),
+                location_source_label(site.source),
                 outbound.label
             )
             .to_lowercase();
@@ -3978,6 +3995,27 @@ let applyMapFilterNow=null;
 let pendingMapFilter={q:'',live:'all'};
 function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
 function stateVar(live){return live==='awaiting_first_heartbeat'?'wait':live}
+function locationSourceLabel(source){
+  switch(source){
+    case 'wifi':
+    case 'ip':
+      return 'auto';
+    case 'declared':
+      return 'declared';
+    case 'provider':
+      return 'provider';
+    case 'fallback':
+      return 'fallback';
+    default:
+      return 'unknown';
+  }
+}
+function locationSourceTitle(host){
+  const label=locationSourceLabel(host.location_source);
+  const stale=host.location_stale?'stale ':'';
+  const state=host.location_state&&host.location_state!=='observed'?' · '+host.location_state:'';
+  return stale+label+' location'+state;
+}
 function loadStylesheet(href){
   if(document.querySelector('link[href="'+href+'"]'))return Promise.resolve();
   return new Promise((resolve,reject)=>{
@@ -4037,7 +4075,9 @@ function siteError(message){
 }
 function siteHostHtml(host){
   const style='--host-state:var(--'+escapeHtml(stateVar(host.live))+')';
-  return '<a class="site-host" href="'+escapeHtml(host.settings_href)+'" data-host="'+escapeHtml(host.name)+'" data-live="'+escapeHtml(host.live)+'" data-search="'+escapeHtml(host.search||'')+'" style="'+style+'" title="'+escapeHtml(host.name+': '+host.attention+'; '+host.inbound_title+'; '+host.outbound_title)+'"><span class="site-host-name">'+escapeHtml(host.name)+'</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="'+escapeHtml(host.inbound_level)+'">in '+escapeHtml(host.inbound_label)+'</span><span class="site-host-ping" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">out '+escapeHtml(host.outbound_label)+'</span></span></a>';
+  const sourceLabel=locationSourceLabel(host.location_source);
+  const sourceTitle=locationSourceTitle(host);
+  return '<a class="site-host" href="'+escapeHtml(host.settings_href)+'" data-host="'+escapeHtml(host.name)+'" data-live="'+escapeHtml(host.live)+'" data-search="'+escapeHtml(host.search||'')+'" style="'+style+'" title="'+escapeHtml(host.name+': '+host.attention+'; '+sourceTitle+'; '+host.inbound_title+'; '+host.outbound_title)+'"><span class="site-host-name">'+escapeHtml(host.name)+'</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="'+escapeHtml(host.inbound_level)+'">in '+escapeHtml(host.inbound_label)+'</span><span class="site-host-ping" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">out '+escapeHtml(host.outbound_label)+'</span><span class="site-host-source" data-location-source="'+escapeHtml(host.location_source)+'" data-location-state="'+escapeHtml(host.location_state)+'" title="'+escapeHtml(sourceTitle)+'">'+escapeHtml(sourceLabel)+'</span></span></a>';
 }
 function renderSiteList(hosts){
   const target=document.querySelector('[data-site-list]');
@@ -4059,7 +4099,7 @@ function renderSiteList(hosts){
   });
   target.innerHTML=sections.join('');
 }
-function nodeHtml(host){return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-signals"><span class="map-ping" data-dir="in" data-probe-level="'+escapeHtml(host.inbound_level)+'">'+escapeHtml(host.inbound_label)+'</span><span class="map-ping" data-dir="out" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">'+escapeHtml(host.outbound_label)+'</span></span>'}
+function nodeHtml(host){const sourceLabel=locationSourceLabel(host.location_source);const sourceTitle=locationSourceTitle(host);return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-signals"><span class="map-ping" data-dir="in" data-probe-level="'+escapeHtml(host.inbound_level)+'">'+escapeHtml(host.inbound_label)+'</span><span class="map-ping" data-dir="out" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">'+escapeHtml(host.outbound_label)+'</span></span><span class="map-source" data-location-source="'+escapeHtml(host.location_source)+'" data-location-state="'+escapeHtml(host.location_state)+'" title="'+escapeHtml(sourceTitle)+'">'+escapeHtml(sourceLabel)+'</span>'}
 function groupOffsets(hosts){
   const groups=new Map();
   hosts.forEach(host=>{
@@ -4144,8 +4184,8 @@ function buildLabels(map,el){
     link.dataset.search=host.search||'';
     link.dataset.mapLayer='managed';
     link.innerHTML=nodeHtml(host);
-    link.title=host.name+': '+host.status+'; '+host.inbound_title+'; '+host.outbound_title;
-    link.setAttribute('aria-label',host.name+', '+host.status+', inbound '+host.inbound_label+', outbound '+host.outbound_label);
+    link.title=host.name+': '+host.status+'; '+locationSourceTitle(host)+'; '+host.inbound_title+'; '+host.outbound_title;
+    link.setAttribute('aria-label',host.name+', '+host.status+', '+locationSourceTitle(host)+', inbound '+host.inbound_label+', outbound '+host.outbound_label);
     const line=svgEl('line');
     leaders.appendChild(line);
     layer.appendChild(anchor);
@@ -5362,7 +5402,17 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
-                location: None,
+                location: Some(HostLocation {
+                    latitude: 50.1109,
+                    longitude: 8.6821,
+                    source: HostLocationSource::Wifi,
+                    accuracy_meters: Some(1000.0),
+                    precision_meters: Some(25_000.0),
+                    observed_at: Some(990),
+                    stale: false,
+                    manual_override: false,
+                    label: Some("Runtime wifi".to_string()),
+                }),
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
             },
@@ -5486,6 +5536,10 @@ mod tests {
         assert!(html.contains("d3.forceSimulation"));
         assert!(html.contains("d3.forceCollide"));
         assert!(html.contains("renderSiteList(MAP_HOSTS)"));
+        assert!(html.contains("function locationSourceLabel(source)"));
+        assert!(html.contains("class=\"site-host-source\""));
+        assert!(html.contains("class=\"map-source\""));
+        assert!(html.contains("data-location-source"));
         assert!(html.contains("buildLabels(map,el)"));
         assert!(html.contains("basemaps.cartocdn.com/light_all"));
         assert!(html.contains("map.on('move zoom moveend zoomend resize viewreset'"));
@@ -5532,13 +5586,16 @@ mod tests {
 
         assert!(data_json.contains(r#""schema":"inspr.pharos.map-data.v1""#));
         assert!(data_json.contains(r#""site_id":"cloud-de""#));
+        assert!(data_json.contains(r#""site_id":"wifi:50.1109,8.6821""#));
         assert!(data_json.contains(r#""site_id":"ww87""#));
         assert!(data_json.contains(r#""site_id":"dsc-us""#));
         assert!(data_json.contains(r#""site_id":"unknown""#));
         assert!(data_json.contains(r#""lon":-122.9898"#));
         assert!(data_json.contains(r#""location_source":"provider""#));
+        assert!(data_json.contains(r#""location_source":"wifi""#));
         assert!(data_json.contains(r#""location_source":"fallback""#));
         assert!(data_json.contains(r#""source":"provider""#));
+        assert!(data_json.contains(r#""source":"wifi""#));
         assert!(data_json.contains(r#""source":"fallback""#));
         assert!(data_json.contains("Hillsboro, OR, US"));
         assert!(data_json.contains(r#""inbound_label":"30s""#));
@@ -5549,10 +5606,15 @@ mod tests {
             && host.live == "live"
             && host.outbound_label == "blocked"
             && host.outbound_policy == "blocked"));
+        assert!(payload.hosts.iter().any(|host| host.name == "csb0"
+            && host.location_source == "wifi"
+            && host.location_state == "observed"
+            && host.search.contains("auto")));
         assert!(payload.hosts.iter().any(|host| host.name == "new-host"
             && host.live == "awaiting_first_heartbeat"
             && host.outbound_label == "timeout"
-            && host.outbound_level == "warn"));
+            && host.outbound_level == "warn"
+            && host.search.contains("fallback")));
     }
 
     #[test]
