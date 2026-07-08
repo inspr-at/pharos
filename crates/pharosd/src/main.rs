@@ -5179,7 +5179,7 @@ mod tests {
             payload["declared_hosts"][0]["runtime"]["location"]["manual_override"],
             false
         );
-        assert!(payload.to_string().contains("not-rendered-token-hash") == false);
+        assert!(!payload.to_string().contains("not-rendered-token-hash"));
     }
 
     #[test]
