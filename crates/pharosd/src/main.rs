@@ -15,6 +15,7 @@ mod manifests;
 mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -126,6 +127,7 @@ impl AlertNotifier {
         let webhook_url = alert_webhook_url(
             std::env::var("PHAROS_ALERT_WEBHOOK_URL").ok(),
             std::env::var("WATCHTOWER_NOTIFICATION_URL").ok(),
+            std::env::var("PHAROS_ALERT_WEBHOOK_ENV_FILE").ok(),
         );
         let check_interval = std::env::var("PHAROS_ALERT_CHECK_SECS")
             .ok()
@@ -287,11 +289,57 @@ fn non_empty_env_value(value: &str) -> Option<String> {
     }
 }
 
-fn alert_webhook_url(pharos_url: Option<String>, watchtower_url: Option<String>) -> Option<String> {
+fn alert_webhook_url(
+    pharos_url: Option<String>,
+    watchtower_url: Option<String>,
+    env_file: Option<String>,
+) -> Option<String> {
     pharos_url
         .as_deref()
         .and_then(non_empty_env_value)
         .or_else(|| watchtower_url.as_deref().and_then(non_empty_env_value))
+        .or_else(|| {
+            env_file
+                .as_deref()
+                .and_then(alert_webhook_url_from_env_file)
+        })
+}
+
+fn alert_webhook_url_from_env_file(path: &str) -> Option<String> {
+    let path = non_empty_env_value(path)?;
+    let contents = fs::read_to_string(path).ok()?;
+    env_file_value(&contents, "WATCHTOWER_NOTIFICATION_URL")
+        .as_deref()
+        .and_then(non_empty_env_value)
+}
+
+fn env_file_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let (name, value) = line.split_once('=')?;
+        if name.trim() != key {
+            return None;
+        }
+        Some(unquote_env_value(value.trim()).to_string())
+    })
+}
+
+fn unquote_env_value(value: &str) -> &str {
+    if value.len() < 2 {
+        return value;
+    }
+    let bytes = value.as_bytes();
+    let quoted = (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+        || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'');
+    if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
 }
 
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
@@ -5471,6 +5519,7 @@ mod tests {
         let selected = alert_webhook_url(
             Some(" https://pharos-alert.example/hook ".to_string()),
             Some("https://watchtower.example/hook".to_string()),
+            Some("/no/read/needed".to_string()),
         );
 
         assert_eq!(
@@ -5484,7 +5533,32 @@ mod tests {
         let selected = alert_webhook_url(
             Some("   ".to_string()),
             Some(" https://watchtower.example/hook ".to_string()),
+            Some("/no/read/needed".to_string()),
         );
+
+        assert_eq!(selected.as_deref(), Some("https://watchtower.example/hook"));
+    }
+
+    #[test]
+    fn alert_webhook_can_read_watchtower_url_from_env_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pharos-alert-env-{}-{}.env",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::write(
+            &path,
+            r#"
+# ignored
+WATCHTOWER_HTTP_API_TOKEN=not-selected
+export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
+"#,
+        )
+        .expect("write test env file");
+
+        let selected = alert_webhook_url(None, None, Some(path.display().to_string()));
+        let _ = fs::remove_file(path);
 
         assert_eq!(selected.as_deref(), Some("https://watchtower.example/hook"));
     }
