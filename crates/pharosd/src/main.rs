@@ -238,6 +238,47 @@ main[data-view="list"] .list-wrap{display:block}
 .list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
 .list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .card-tools{margin:0}.list .settings-card{margin:0}.list .settings-icon{width:25px;height:25px}
+.ops-main{width:min(1280px,100%)}
+.ops-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
+.ops-metric{--metric-color:var(--wait);display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;min-height:78px;padding:14px 16px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.82);box-shadow:0 12px 30px rgba(54,88,108,.06);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.ops-metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color) 20%,transparent)}
+.ops-metric b{display:block;font-family:Georgia,"Times New Roman",serif;font-size:28px;line-height:1;font-weight:500;color:var(--ink)}
+.ops-metric span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.ops-metric.critical{--metric-color:var(--down);border-color:rgba(191,58,53,.24)}.ops-metric.warning{--metric-color:var(--stale);border-color:rgba(178,106,0,.24)}.ops-metric.watch{--metric-color:var(--sun);border-color:rgba(214,155,49,.24)}.ops-metric.clear,.ops-metric.info,.ops-metric.recovery{--metric-color:var(--live);border-color:rgba(37,132,95,.22)}
+.ops-layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:18px;align-items:start}
+.ops-panel,.ops-side-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
+.ops-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:17px 18px;border-bottom:1px solid rgba(214,226,234,.72);background:rgba(251,253,254,.74)}
+.ops-panel-head h2,.ops-side-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;letter-spacing:0;color:#12304b}
+.ops-panel-head p,.ops-side-panel p{margin:3px 0 0;color:var(--muted);font-size:12px}
+.ops-count{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:27px;border-radius:999px;background:rgba(223,241,249,.78);color:#0f4f80;font-size:12px;font-weight:760}
+.alert-list,.activity-list{display:grid}
+.alert-row,.activity-row{--row-color:var(--wait);position:relative;display:grid;gap:12px;align-items:center;min-width:0;border-bottom:1px solid rgba(214,226,234,.66);background:rgba(255,255,255,.72);color:var(--ink)}
+.alert-row:last-child,.activity-row:last-child{border-bottom:0}
+.alert-row{grid-template-columns:minmax(116px,.58fr) auto minmax(180px,1.25fr) minmax(66px,.36fr) minmax(74px,.42fr) minmax(124px,.7fr);gap:10px;padding:13px 16px}
+.activity-row{grid-template-columns:86px minmax(110px,.55fr) 92px minmax(260px,1.5fr) 94px;align-items:start;padding:14px 16px}
+.alert-row.critical,.activity-row.critical{--row-color:var(--down)}.alert-row.warning,.activity-row.warning{--row-color:var(--stale)}.alert-row.watch,.activity-row.watch{--row-color:var(--sun)}.alert-row.clear,.activity-row.clear,.activity-row.recovery{--row-color:var(--live)}.activity-row.info{--row-color:var(--accent)}
+.alert-host,.activity-host{display:flex;align-items:center;gap:9px;min-width:0}
+.alert-dot,.activity-dot{flex:0 0 auto;width:9px;height:9px;border-radius:50%;background:var(--row-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-color) 12%,transparent)}
+.alert-host strong,.activity-host strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.alert-host span:last-child,.activity-host span:last-child{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}
+.severity{display:inline-flex;align-items:center;justify-content:center;width:max-content;min-height:25px;padding:4px 9px;border:1px solid color-mix(in srgb,var(--row-color) 25%,transparent);border-radius:999px;background:color-mix(in srgb,var(--row-color) 9%,white);color:var(--row-color);font-size:11px;font-weight:760;text-transform:lowercase}
+.alert-issue strong,.activity-copy strong{display:block;color:var(--ink);font-size:13px}
+.alert-issue p,.activity-copy p{margin:2px 0 0;color:var(--muted);font-size:12px;line-height:1.35}
+.ops-source,.ops-time{color:var(--muted);font-size:12px}.ops-time{white-space:nowrap}
+.next-action{min-width:0;color:#0f4f80;font-size:12px;font-weight:720;line-height:1.35;overflow-wrap:anywhere}
+.ops-side-panel{display:grid;gap:14px;padding:16px}
+.posture-ring{--posture-color:var(--live);position:relative;display:grid;place-items:center;width:126px;height:126px;margin:2px auto 4px;border-radius:50%;background:conic-gradient(var(--posture-color) var(--posture-fill),rgba(214,226,234,.72) 0);box-shadow:0 0 0 10px color-mix(in srgb,var(--posture-color) 8%,transparent)}
+.posture-ring:before{content:"";position:absolute;inset:18px;border-radius:50%;background:#fff;box-shadow:inset 0 0 0 1px rgba(210,226,234,.72)}
+.posture-ring strong{position:relative;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;color:var(--ink)}
+.posture-ring span{position:relative;color:var(--muted);font-size:11px}
+.posture-list,.activity-filters{display:flex;flex-wrap:wrap;gap:7px}
+.posture-chip,.activity-filter{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:5px 9px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:650}
+.posture-chip:before,.activity-filter:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--chip-color,var(--wait));box-shadow:0 0 0 3px color-mix(in srgb,var(--chip-color,var(--wait)) 10%,transparent)}
+.posture-chip.critical,.activity-filter.critical{--chip-color:var(--down)}.posture-chip.warning,.activity-filter.warning{--chip-color:var(--stale)}.posture-chip.watch,.activity-filter.watch{--chip-color:var(--sun)}.posture-chip.clear,.activity-filter.clear,.activity-filter.recovery{--chip-color:var(--live)}.activity-filter.info{--chip-color:var(--accent)}
+.activity-filter{cursor:pointer}.activity-filter[aria-pressed="true"]{color:#0f4f80;border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.76)}
+.ops-empty{padding:34px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
+.ops-empty h2{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500}.ops-empty p{margin:0;color:var(--muted)}
+.ops-note{padding:11px 13px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.78);color:var(--muted);font-size:12px}
 [hidden]{display:none!important}
 .empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
@@ -323,7 +364,8 @@ main[data-view="list"] .list-wrap{display:block}
 .map-panel[data-label-density="compact"] .map-signals{display:none}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
-@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}}
+@media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -1250,6 +1292,40 @@ async fn map_page(State(state): State<AppState>, headers: HeaderMap) -> impl Int
     ))
 }
 
+async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    let hosts = state.store.list();
+    let now = now_unix();
+    let probes = server_probe_overlays(state.manifests.manifests(), now).await;
+    no_store_html(render_alerts(
+        &hosts,
+        &self_host(),
+        now,
+        state.manifests.manifests(),
+        state.manifests.load_errors(),
+        &probes,
+        &user_label,
+        state.auth.is_some(),
+    ))
+}
+
+async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    let hosts = state.store.list();
+    let now = now_unix();
+    let probes = server_probe_overlays(state.manifests.manifests(), now).await;
+    no_store_html(render_activity(
+        &hosts,
+        &self_host(),
+        now,
+        state.manifests.manifests(),
+        state.manifests.load_errors(),
+        &probes,
+        &user_label,
+        state.auth.is_some(),
+    ))
+}
+
 async fn fleet_horizon_asset() -> impl axum::response::IntoResponse {
     (
         [
@@ -1855,13 +1931,23 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
     } else {
         ""
     };
+    let alerts_current = if active == "alerts" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
+    let activity_current = if active == "activity" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
     let settings_current = if active == "settings" {
         r#" aria-current="page""#
     } else {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/">{alerts}<span>Alerts</span></a><a class="side-link" href="/">{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
@@ -1870,6 +1956,8 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         settings = icons::SLIDERS,
         fleet_current = fleet_current,
         map_current = map_current,
+        alerts_current = alerts_current,
+        activity_current = activity_current,
         settings_current = settings_current,
         user_label = html_escape(user_label),
         user_title = html_escape(user_label),
@@ -1877,11 +1965,17 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
     )
 }
 
-fn header(now: i64) -> String {
+fn page_header(title: &str, subtitle: &str, now: i64) -> String {
     format!(
-        r#"<div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Fleet</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">All hosts at a glance</p></div><div class="asof" data-as-of>as of {as_of}</div></div>"#,
+        r#"<div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof" data-as-of>as of {as_of}</div></div>"#,
+        title = html_escape(title),
+        subtitle = html_escape(subtitle),
         as_of = clock_label(now)
     )
+}
+
+fn header(now: i64) -> String {
+    page_header("Fleet", "All hosts at a glance", now)
 }
 
 fn search_box(placeholder: &str) -> String {
@@ -2525,6 +2619,667 @@ fn map_site_list(hosts: &[MapHost]) -> String {
             )
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct AlertItem {
+    level: &'static str,
+    host: String,
+    role: String,
+    issue: String,
+    detail: String,
+    source: &'static str,
+    seen: String,
+    next_action: String,
+    sort_time: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ActivityEvent {
+    timestamp: i64,
+    host: String,
+    level: &'static str,
+    kind: &'static str,
+    title: String,
+    detail: String,
+    source: &'static str,
+}
+
+fn level_rank(level: &str) -> usize {
+    match level {
+        "critical" => 0,
+        "warning" => 1,
+        "watch" => 2,
+        "recovery" => 3,
+        "info" => 4,
+        "clear" => 5,
+        _ => 6,
+    }
+}
+
+fn level_label(level: &str) -> &'static str {
+    match level {
+        "critical" => "critical",
+        "warning" => "warning",
+        "watch" => "watch",
+        "recovery" => "recovery",
+        "info" => "info",
+        "clear" => "clear",
+        _ => "info",
+    }
+}
+
+fn seen_label(last_seen: Option<i64>, now: i64) -> String {
+    match last_seen {
+        Some(seen) => format!("{} ago", duration_label(now - seen)),
+        None => "never".to_string(),
+    }
+}
+
+fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str, String, String)> {
+    if !freshness.applicable {
+        return None;
+    }
+
+    let age = freshness.flake_lock_age_days;
+    let commits = freshness.commits_behind;
+    if age.is_none() || commits.is_none() {
+        return Some((
+            "watch",
+            "Freshness is only partially observed".to_string(),
+            "Confirm the beacon can read nixcfg freshness.".to_string(),
+        ));
+    }
+
+    let days = age.unwrap_or(0);
+    let behind = commits.unwrap_or(0);
+    if behind > 0 || days >= 30 {
+        return Some((
+            "warning",
+            freshness.tldr(),
+            "Review nixcfg, then update or deploy when safe.".to_string(),
+        ));
+    }
+    if days > 0 {
+        return Some((
+            "watch",
+            freshness.tldr(),
+            "Consider a normal flake update during the next maintenance window.".to_string(),
+        ));
+    }
+    None
+}
+
+fn service_alert(
+    host: &Host,
+    observation: &ServiceObservation,
+    now: i64,
+) -> Option<AlertItem> {
+    let (level, action) = match observation.state {
+        ServiceObservationState::Healthy => return None,
+        ServiceObservationState::Warning => {
+            ("warning", "Inspect the service on the host.")
+        }
+        ServiceObservationState::Stale => ("warning", "Verify the service is still reporting."),
+        ServiceObservationState::Unknown => {
+            ("watch", "Confirm whether this service should report state.")
+        }
+    };
+    Some(AlertItem {
+        level,
+        host: host.name.clone(),
+        role: host.role.clone(),
+        issue: format!("{}: {}", observation.label, observation.state.label()),
+        detail: observation.summary.clone(),
+        source: "service",
+        seen: seen_label(host.last_seen, now),
+        next_action: action.to_string(),
+        sort_time: host.last_seen.unwrap_or(now),
+    })
+}
+
+fn probe_alert(host: &str, role: &str, probe: &ServerProbeObservation) -> Option<AlertItem> {
+    let (level, action) = match probe.state {
+        ServiceObservationState::Healthy => return None,
+        ServiceObservationState::Warning => (
+            "warning",
+            "Check the service route, firewall, or probe target.",
+        ),
+        ServiceObservationState::Stale => ("warning", "Re-check the service probe path."),
+        ServiceObservationState::Unknown => ("watch", "Complete the service probe declaration."),
+    };
+    Some(AlertItem {
+        level,
+        host: host.to_string(),
+        role: role.to_string(),
+        issue: format!("{} probe {}", probe.service, probe.state.label()),
+        detail: probe.summary.clone(),
+        source: "probe",
+        seen: format!("as of {}", clock_label(probe.checked_at)),
+        next_action: action.to_string(),
+        sort_time: probe.checked_at,
+    })
+}
+
+fn alert_items(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    load_errors: &[ManifestLoadIssue],
+    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
+) -> Vec<AlertItem> {
+    let mut alerts = Vec::new();
+    let runtime_by_name: BTreeMap<&str, &Host> =
+        hosts.iter().map(|host| (host.name.as_str(), host)).collect();
+    let manifest_roles: BTreeMap<&str, &str> = manifests
+        .iter()
+        .map(|manifest| {
+            (
+                manifest.host.name.as_str(),
+                manifest.host.role.as_deref().unwrap_or("declared host"),
+            )
+        })
+        .collect();
+
+    for issue in load_errors {
+        alerts.push(AlertItem {
+            level: "critical",
+            host: "Pharos".to_string(),
+            role: "manifest loader".to_string(),
+            issue: "Declared host manifest failed to load".to_string(),
+            detail: format!("{} - {}", issue.path, issue.error),
+            source: "config",
+            seen: format!("as of {}", clock_label(now)),
+            next_action: "Fix the manifest and restart or reload Pharos.".to_string(),
+            sort_time: now,
+        });
+    }
+
+    for manifest in manifests {
+        let runtime = runtime_by_name
+            .get(manifest.host.name.as_str())
+            .copied()
+            .or_else(|| runtime_by_name.get(manifest.slug.as_str()).copied());
+        if runtime.is_none() {
+            alerts.push(AlertItem {
+                level: "watch",
+                host: manifest.host.name.clone(),
+                role: manifest
+                    .host
+                    .role
+                    .clone()
+                    .unwrap_or_else(|| "declared host".to_string()),
+                issue: "Declared host has not reported yet".to_string(),
+                detail: "The host exists in declared metadata, but no runtime heartbeat is present."
+                    .to_string(),
+                source: "config",
+                seen: "never".to_string(),
+                next_action: "Install or start pharos-beacon, or remove stale metadata.".to_string(),
+                sort_time: now,
+            });
+        }
+    }
+
+    for host in hosts {
+        let is_self = host.name == self_name;
+        let live = if is_self {
+            Liveness::Live
+        } else {
+            liveness(host.last_seen, host.heartbeat_interval_secs, now)
+        };
+        match live {
+            Liveness::Down => alerts.push(AlertItem {
+                level: "critical",
+                host: host.name.clone(),
+                role: host.role.clone(),
+                issue: "No heartbeat received".to_string(),
+                detail: "Pharos has not received a report within the allowed heartbeat window."
+                    .to_string(),
+                source: "heartbeat",
+                seen: seen_label(host.last_seen, now),
+                next_action: "Check host power, network, and pharos-beacon.".to_string(),
+                sort_time: host.last_seen.unwrap_or(now),
+            }),
+            Liveness::Stale => alerts.push(AlertItem {
+                level: "warning",
+                host: host.name.clone(),
+                role: host.role.clone(),
+                issue: "Heartbeat is late".to_string(),
+                detail: "The host checked in later than its normal cadence.".to_string(),
+                source: "heartbeat",
+                seen: seen_label(host.last_seen, now),
+                next_action: "Verify pharos-beacon and recent host load.".to_string(),
+                sort_time: host.last_seen.unwrap_or(now),
+            }),
+            Liveness::AwaitingFirstHeartbeat => alerts.push(AlertItem {
+                level: "watch",
+                host: host.name.clone(),
+                role: host.role.clone(),
+                issue: "Waiting for first heartbeat".to_string(),
+                detail: "The host is registered but has not sent a first report.".to_string(),
+                source: "heartbeat",
+                seen: "never".to_string(),
+                next_action: "Finish onboarding or confirm the host should exist.".to_string(),
+                sort_time: now,
+            }),
+            Liveness::Live => {}
+        }
+
+        if let Some((level, issue, action)) = freshness_alert(&host.freshness) {
+            alerts.push(AlertItem {
+                level,
+                host: host.name.clone(),
+                role: host.role.clone(),
+                issue,
+                detail: "Nix freshness differs from the preferred declared state.".to_string(),
+                source: "freshness",
+                seen: seen_label(host.last_seen, now),
+                next_action: action,
+                sort_time: host.last_seen.unwrap_or(now),
+            });
+        }
+
+        for observation in &host.service_observations {
+            if let Some(alert) = service_alert(host, observation, now) {
+                alerts.push(alert);
+            }
+        }
+    }
+
+    for (host, probes) in server_probes {
+        let role = runtime_by_name
+            .get(host.as_str())
+            .map(|host| host.role.as_str())
+            .or_else(|| manifest_roles.get(host.as_str()).copied())
+            .unwrap_or("declared service");
+        for probe in probes {
+            if let Some(alert) = probe_alert(host, role, probe) {
+                alerts.push(alert);
+            }
+        }
+    }
+
+    alerts.sort_by(|left, right| {
+        level_rank(left.level)
+            .cmp(&level_rank(right.level))
+            .then_with(|| right.sort_time.cmp(&left.sort_time))
+            .then_with(|| left.host.cmp(&right.host))
+            .then_with(|| left.source.cmp(right.source))
+    });
+    alerts
+}
+
+fn alert_counts(alerts: &[AlertItem], hosts: &[Host]) -> (usize, usize, usize, usize) {
+    let critical = alerts
+        .iter()
+        .filter(|alert| alert.level == "critical")
+        .count();
+    let warning = alerts
+        .iter()
+        .filter(|alert| alert.level == "warning")
+        .count();
+    let watch = alerts.iter().filter(|alert| alert.level == "watch").count();
+    let affected: std::collections::BTreeSet<&str> = alerts
+        .iter()
+        .filter(|alert| alert.host != "Pharos")
+        .map(|alert| alert.host.as_str())
+        .collect();
+    let clear = hosts.len().saturating_sub(affected.len());
+    (critical, warning, watch, clear)
+}
+
+fn ops_summary_metrics(alerts: &[AlertItem], hosts: &[Host]) -> String {
+    let (critical, warning, watch, clear) = alert_counts(alerts, hosts);
+    format!(
+        r#"<section class="ops-summary" aria-label="alert summary"><div class="ops-metric critical"><b>{critical}</b><span>critical</span></div><div class="ops-metric warning"><b>{warning}</b><span>warning</span></div><div class="ops-metric watch"><b>{watch}</b><span>watch</span></div><div class="ops-metric clear"><b>{clear}</b><span>clear</span></div></section>"#
+    )
+}
+
+fn render_alert_row(alert: &AlertItem) -> String {
+    format!(
+        r#"<article class="alert-row {level}" data-alert-level="{level}"><div class="alert-host"><span class="alert-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{role}</span></div></div><span class="severity">{level_label}</span><div class="alert-issue"><strong>{issue}</strong><p>{detail}</p></div><span class="ops-source">{source}</span><span class="ops-time">{seen}</span><span class="next-action">{next_action}</span></article>"#,
+        level = html_escape(alert.level),
+        level_label = level_label(alert.level),
+        host = html_escape(&alert.host),
+        role = html_escape(&alert.role),
+        issue = html_escape(&alert.issue),
+        detail = html_escape(&alert.detail),
+        source = html_escape(alert.source),
+        seen = html_escape(&alert.seen),
+        next_action = html_escape(&alert.next_action)
+    )
+}
+
+fn render_alert_rows(alerts: &[AlertItem]) -> String {
+    if alerts.is_empty() {
+        return r#"<section class="ops-empty"><h2>All clear</h2><p>No host, freshness, service, probe, or manifest alert needs attention right now.</p></section>"#.to_string();
+    }
+    alerts.iter().map(render_alert_row).collect()
+}
+
+fn posture_panel(alerts: &[AlertItem], hosts: &[Host]) -> String {
+    let (critical, warning, watch, clear) = alert_counts(alerts, hosts);
+    let total = hosts.len().max(1);
+    let clear_percent = ((clear * 100) / total).min(100);
+    let posture = if critical > 0 {
+        ("critical", "var(--down)")
+    } else if warning > 0 {
+        ("attention", "var(--stale)")
+    } else if watch > 0 {
+        ("watching", "var(--sun)")
+    } else {
+        ("clear", "var(--live)")
+    };
+    format!(
+        r#"<aside class="ops-side-panel" aria-label="operations posture"><div><h2>Operations posture</h2><p>Most important work first.</p></div><div class="posture-ring" style="--posture-fill:{clear_percent}%;--posture-color:{posture_color}"><div><strong>{clear}</strong><span>{posture_label}</span></div></div><div class="posture-list"><span class="posture-chip critical">critical {critical}</span><span class="posture-chip warning">warning {warning}</span><span class="posture-chip watch">watch {watch}</span><span class="posture-chip clear">clear {clear}</span></div><div class="ops-note">Alerts are ordered by severity, then by the freshest evidence. Focus critical rows before freshness housekeeping.</div><a class="settings-link" href="/map">View on map</a></aside>"#,
+        posture_color = posture.1,
+        posture_label = posture.0
+    )
+}
+
+fn render_alerts(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    load_errors: &[ManifestLoadIssue],
+    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
+    user_label: &str,
+    logout_enabled: bool,
+) -> String {
+    let alerts = alert_items(hosts, self_name, now, manifests, load_errors, server_probes);
+    let rows = render_alert_rows(&alerts);
+    format!(
+        r#"{HEAD}{sidebar}<main class="ops-main">{header}{summary}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div></section>{posture}</section></main></div></body></html>"#,
+        sidebar = sidebar(user_label, logout_enabled, "alerts"),
+        header = page_header("Alerts", "Needs attention", now),
+        summary = ops_summary_metrics(&alerts, hosts),
+        count = alerts.len(),
+        posture = posture_panel(&alerts, hosts)
+    )
+}
+
+fn add_activity_event(
+    events: &mut Vec<ActivityEvent>,
+    timestamp: i64,
+    host: impl Into<String>,
+    level: &'static str,
+    kind: &'static str,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    source: &'static str,
+) {
+    events.push(ActivityEvent {
+        timestamp,
+        host: host.into(),
+        level,
+        kind,
+        title: title.into(),
+        detail: detail.into(),
+        source,
+    });
+}
+
+fn activity_events(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    load_errors: &[ManifestLoadIssue],
+    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
+) -> Vec<ActivityEvent> {
+    let mut events = Vec::new();
+
+    for issue in load_errors {
+        add_activity_event(
+            &mut events,
+            now,
+            "Pharos",
+            "critical",
+            "config",
+            "Manifest load failed",
+            format!("{} - {}", issue.path, issue.error),
+            "config",
+        );
+    }
+
+    for manifest in manifests {
+        add_activity_event(
+            &mut events,
+            now,
+            manifest.host.name.clone(),
+            "info",
+            "config",
+            "Declared host manifest loaded",
+            format!("{} declared services", manifest.services.len()),
+            "config",
+        );
+    }
+
+    for host in hosts {
+        let is_self = host.name == self_name;
+        let live = if is_self {
+            Liveness::Live
+        } else {
+            liveness(host.last_seen, host.heartbeat_interval_secs, now)
+        };
+        match live {
+            Liveness::Down => add_activity_event(
+                &mut events,
+                now,
+                host.name.clone(),
+                "critical",
+                "heartbeat",
+                "No heartbeat received",
+                format!("Last report was {}", seen_label(host.last_seen, now)),
+                "heartbeat",
+            ),
+            Liveness::Stale => add_activity_event(
+                &mut events,
+                now,
+                host.name.clone(),
+                "warning",
+                "heartbeat",
+                "Heartbeat lateness detected",
+                format!("Last report was {}", seen_label(host.last_seen, now)),
+                "heartbeat",
+            ),
+            Liveness::AwaitingFirstHeartbeat => add_activity_event(
+                &mut events,
+                now,
+                host.name.clone(),
+                "watch",
+                "heartbeat",
+                "Awaiting first heartbeat",
+                "Host exists but has not reported yet.",
+                "heartbeat",
+            ),
+            Liveness::Live => {}
+        }
+
+        let samples = heartbeat_samples(&host.heartbeat_log, host.last_seen);
+        for stamp in samples.iter().rev().take(4) {
+            add_activity_event(
+                &mut events,
+                *stamp,
+                host.name.clone(),
+                if is_self { "recovery" } else { "info" },
+                "heartbeat",
+                if is_self {
+                    "Control light observed"
+                } else {
+                    "Heartbeat received"
+                },
+                format!("{} checked in at {}", host.name, clock_label(*stamp)),
+                "heartbeat",
+            );
+        }
+
+        if let Some((level, issue, _action)) = freshness_alert(&host.freshness) {
+            add_activity_event(
+                &mut events,
+                host.last_seen.unwrap_or(now),
+                host.name.clone(),
+                level,
+                "freshness",
+                "Freshness drift detected",
+                issue,
+                "freshness",
+            );
+        }
+
+        for observation in &host.service_observations {
+            if observation.state == ServiceObservationState::Healthy {
+                add_activity_event(
+                    &mut events,
+                    host.last_seen.unwrap_or(now),
+                    host.name.clone(),
+                    "info",
+                    "service",
+                    format!("{} is healthy", observation.label),
+                    observation.summary.clone(),
+                    "service",
+                );
+            } else {
+                let level = match observation.state {
+                    ServiceObservationState::Warning | ServiceObservationState::Stale => "warning",
+                    ServiceObservationState::Unknown => "watch",
+                    ServiceObservationState::Healthy => "info",
+                };
+                add_activity_event(
+                    &mut events,
+                    host.last_seen.unwrap_or(now),
+                    host.name.clone(),
+                    level,
+                    "service",
+                    format!("{} {}", observation.label, observation.state.label()),
+                    observation.summary.clone(),
+                    "service",
+                );
+            }
+        }
+    }
+
+    for (host, probes) in server_probes {
+        for probe in probes {
+            let level = match probe.state {
+                ServiceObservationState::Healthy => "info",
+                ServiceObservationState::Warning | ServiceObservationState::Stale => "warning",
+                ServiceObservationState::Unknown => "watch",
+            };
+            add_activity_event(
+                &mut events,
+                probe.checked_at,
+                host.clone(),
+                level,
+                "service",
+                format!("{} probe {}", probe.service, probe.state.label()),
+                probe.summary.clone(),
+                "probe",
+            );
+        }
+    }
+
+    events.sort_by(|left, right| {
+        right
+            .timestamp
+            .cmp(&left.timestamp)
+            .then_with(|| level_rank(left.level).cmp(&level_rank(right.level)))
+            .then_with(|| left.host.cmp(&right.host))
+    });
+    events
+}
+
+fn activity_source_count(events: &[ActivityEvent], kind: &str) -> usize {
+    events.iter().filter(|event| event.kind == kind).count()
+}
+
+fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
+    let heartbeat = activity_source_count(events, "heartbeat");
+    let freshness = activity_source_count(events, "freshness");
+    let service = activity_source_count(events, "service");
+    format!(
+        r#"<section class="ops-summary" aria-label="activity summary"><div class="ops-metric info"><b>{total}</b><span>all events</span></div><div class="ops-metric clear"><b>{heartbeat}</b><span>heartbeat</span></div><div class="ops-metric watch"><b>{freshness}</b><span>freshness</span></div><div class="ops-metric warning"><b>{service}</b><span>service</span></div></section>"#,
+        total = events.len()
+    )
+}
+
+fn activity_filter_bar(events: &[ActivityEvent]) -> String {
+    let config = activity_source_count(events, "config");
+    let critical = events
+        .iter()
+        .filter(|event| event.level == "critical")
+        .count();
+    let warning = events
+        .iter()
+        .filter(|event| event.level == "warning")
+        .count();
+    format!(
+        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter info" type="button" data-activity-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
+        total = events.len(),
+        heartbeat = activity_source_count(events, "heartbeat"),
+        freshness = activity_source_count(events, "freshness"),
+        service = activity_source_count(events, "service"),
+    )
+}
+
+fn render_activity_row(event: &ActivityEvent) -> String {
+    format!(
+        r#"<article class="activity-row {level}" data-activity-kind="{kind}" data-activity-level="{level}"><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></article>"#,
+        level = html_escape(event.level),
+        kind = html_escape(event.kind),
+        time = html_escape(&clock_label(event.timestamp)),
+        host = html_escape(&event.host),
+        level_label = level_label(event.level),
+        title = html_escape(&event.title),
+        detail = html_escape(&event.detail),
+        source = html_escape(event.source)
+    )
+}
+
+fn activity_rows(events: &[ActivityEvent]) -> String {
+    if events.is_empty() {
+        return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, freshness changes, service observations, and config events here.</p></section>"#.to_string();
+    }
+    events.iter().take(80).map(render_activity_row).collect()
+}
+
+fn activity_script() -> &'static str {
+    r#"<script>
+document.querySelectorAll('[data-activity-filter]').forEach(button=>{
+  button.addEventListener('click',()=>{
+    const filter=button.dataset.activityFilter||'all';
+    document.querySelectorAll('[data-activity-filter]').forEach(other=>other.setAttribute('aria-pressed',String(other===button)));
+    document.querySelectorAll('[data-activity-kind]').forEach(row=>{
+      row.hidden=!(filter==='all'||row.dataset.activityKind===filter||row.dataset.activityLevel===filter);
+    });
+  });
+});
+</script>"#
+}
+
+fn render_activity(
+    hosts: &[Host],
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    load_errors: &[ManifestLoadIssue],
+    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
+    user_label: &str,
+    logout_enabled: bool,
+) -> String {
+    let events = activity_events(hosts, self_name, now, manifests, load_errors, server_probes);
+    let rows = activity_rows(&events);
+    format!(
+        r#"{HEAD}{sidebar}<main class="ops-main">{header}{summary}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
+        sidebar = sidebar(user_label, logout_enabled, "activity"),
+        header = page_header("Activity", "Operational timeline", now),
+        summary = activity_summary_metrics(&events),
+        count = events.len(),
+        filters = activity_filter_bar(&events),
+        script = activity_script()
+    )
 }
 
 fn render_map(
@@ -3281,6 +4036,8 @@ async fn main() {
         // Human routes — gated by OIDC when configured (open otherwise).
         .route("/", get(home))
         .route("/map", get(map_page))
+        .route("/alerts", get(alerts_page))
+        .route("/activity", get(activity_page))
         .route("/agora", get(agora::page))
         .route(
             "/agora/proposals/host-palette.json",
@@ -3466,6 +4223,255 @@ mod tests {
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
+    }
+
+    #[test]
+    fn render_alerts_derives_actionable_attention_queue() {
+        let hosts = vec![
+            Host {
+                name: "csb1".to_string(),
+                role: "control".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    ..Default::default()
+                },
+                service_observations: vec![],
+            },
+            Host {
+                name: "poseidon".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: Some("not-rendered-token-hash".to_string()),
+                last_seen: Some(500),
+                heartbeat_log: vec![380, 440, 500],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    ..Default::default()
+                },
+                service_observations: vec![],
+            },
+            Host {
+                name: "athena".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    flake_lock_age_days: Some(2),
+                    commits_behind: Some(3),
+                },
+                service_observations: vec![ServiceObservation {
+                    id: "nginx".to_string(),
+                    label: "nginx".to_string(),
+                    state: ServiceObservationState::Warning,
+                    summary: "response is slow".to_string(),
+                }],
+            },
+            Host {
+                name: "hermes".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    flake_lock_age_days: Some(0),
+                    commits_behind: Some(0),
+                },
+                service_observations: vec![],
+            },
+        ];
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": { "name": "hsb8", "role": "parents home" },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+        let load_error = ManifestLoadIssue {
+            path: "/etc/pharos/hosts/broken.json".to_string(),
+            error: "failed to parse manifest JSON".to_string(),
+        };
+        let mut probes = BTreeMap::new();
+        probes.insert(
+            "hsb8".to_string(),
+            vec![ServerProbeObservation {
+                id: "home-assistant".to_string(),
+                service: "Home Assistant".to_string(),
+                source: "server",
+                policy: "pharos-runtime",
+                kind: "tcp-connect",
+                target: Some("http://hsb8.lan:8123/".to_string()),
+                state: ServiceObservationState::Warning,
+                server_reachable: Some(false),
+                client_reachable: None,
+                summary: "server probe timed out".to_string(),
+                checked_at: 995,
+            }],
+        );
+
+        let html = render_alerts(
+            &hosts,
+            "csb1",
+            1000,
+            &[manifest],
+            &[load_error],
+            &probes,
+            "markus",
+            true,
+        );
+
+        assert!(html.contains(r#"href="/alerts" aria-current="page""#));
+        assert!(html.contains(r#"<h1>Alerts</h1>"#));
+        assert!(html.contains("Needs attention"));
+        assert!(html.contains("Declared host manifest failed to load"));
+        assert!(html.contains("No heartbeat received"));
+        assert!(html.contains("Check host power, network, and pharos-beacon."));
+        assert!(html.contains("3 commits behind nixcfg"));
+        assert!(html.contains("nginx: warning"));
+        assert!(html.contains("Home Assistant probe warning"));
+        assert!(html.contains("Install or start pharos-beacon"));
+        assert!(html.contains("Operations posture"));
+        assert!(html.contains(r#"href="/map">View on map</a>"#));
+        assert!(html.contains(r#"<div class="ops-metric critical">"#));
+        assert!(!html.contains("not-rendered-token-hash"));
+    }
+
+    #[test]
+    fn render_activity_derives_operational_timeline() {
+        let hosts = vec![
+            Host {
+                name: "csb1".to_string(),
+                role: "control".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(1000),
+                heartbeat_log: vec![880, 940, 1000],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    flake_lock_age_days: Some(0),
+                    commits_behind: Some(0),
+                },
+                service_observations: vec![],
+            },
+            Host {
+                name: "athena".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: Some("not-rendered-token-hash".to_string()),
+                last_seen: Some(970),
+                heartbeat_log: vec![850, 910, 970],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    flake_lock_age_days: Some(4),
+                    commits_behind: Some(1),
+                },
+                service_observations: vec![
+                    ServiceObservation {
+                        id: "ssh".to_string(),
+                        label: "ssh".to_string(),
+                        state: ServiceObservationState::Healthy,
+                        summary: "accepting connections".to_string(),
+                    },
+                    ServiceObservation {
+                        id: "nginx".to_string(),
+                        label: "nginx".to_string(),
+                        state: ServiceObservationState::Warning,
+                        summary: "response is slow".to_string(),
+                    },
+                ],
+            },
+            Host {
+                name: "hades".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                report_version: pharos_core::HOST_REPORT_VERSION,
+                token_hash: None,
+                last_seen: Some(760),
+                heartbeat_log: vec![640, 700, 760],
+                heartbeat_interval_secs: Some(60),
+                freshness: NixFreshness {
+                    applicable: true,
+                    ..Default::default()
+                },
+                service_observations: vec![],
+            },
+        ];
+        let manifest: HostManifest = serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "athena",
+            "host": { "name": "athena", "role": "server" },
+            "wings": [{ "id": "ops", "name": "Ops" }],
+            "services": [{ "wing": "ops", "name": "ssh" }],
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest parses");
+        let mut probes = BTreeMap::new();
+        probes.insert(
+            "athena".to_string(),
+            vec![ServerProbeObservation {
+                id: "ssh".to_string(),
+                service: "ssh".to_string(),
+                source: "server",
+                policy: "pharos-runtime",
+                kind: "tcp-connect",
+                target: Some("tcp://athena:22".to_string()),
+                state: ServiceObservationState::Healthy,
+                server_reachable: Some(true),
+                client_reachable: None,
+                summary: "server can reach ssh".to_string(),
+                checked_at: 990,
+            }],
+        );
+
+        let html = render_activity(
+            &hosts,
+            "csb1",
+            1000,
+            &[manifest],
+            &[],
+            &probes,
+            "markus",
+            true,
+        );
+
+        assert!(html.contains(r#"href="/activity" aria-current="page""#));
+        assert!(html.contains(r#"<h1>Activity</h1>"#));
+        assert!(html.contains("Operational timeline"));
+        assert!(html.contains("Control light observed"));
+        assert!(html.contains("Heartbeat received"));
+        assert!(html.contains("Heartbeat lateness detected"));
+        assert!(html.contains("Freshness drift detected"));
+        assert!(html.contains("ssh is healthy"));
+        assert!(html.contains("nginx warning"));
+        assert!(html.contains("ssh probe healthy"));
+        assert!(html.contains("Declared host manifest loaded"));
+        assert!(html.contains(r#"data-activity-filter="heartbeat""#));
+        assert!(html.contains(r#"data-activity-filter="critical""#));
+        assert!(html.contains(r#"row.hidden=!(filter==='all'"#));
+        assert!(html.contains("Activity is derived from current retained Pharos state."));
+        assert!(!html.contains("not-rendered-token-hash"));
     }
 
     #[test]
