@@ -2631,6 +2631,40 @@ function exitFullscreen(){
   if(document.webkitExitFullscreen)return document.webkitExitFullscreen();
   return Promise.resolve();
 }
+const MAP_VIEWPORT_STORAGE='pharos.map.viewport.v1';
+const MAP_MODE_STORAGE='pharos.map.mode.v1';
+function storageGet(key){try{return window.localStorage.getItem(key)}catch(_){return null}}
+function storageSet(key,value){try{window.localStorage.setItem(key,value)}catch(_){}}
+function storedMapMode(){
+  const value=storageGet(MAP_MODE_STORAGE);
+  return value==='maximized'?'maximized':'standard';
+}
+function storeMapMode(mode){
+  storageSet(MAP_MODE_STORAGE,mode==='standard'?'standard':'maximized');
+}
+function storedViewport(){
+  try{
+    const raw=storageGet(MAP_VIEWPORT_STORAGE);
+    if(!raw)return null;
+    const parsed=JSON.parse(raw);
+    const lat=Number(parsed.lat);
+    const lon=Number(parsed.lon);
+    const zoom=Number(parsed.zoom);
+    if(!Number.isFinite(lat)||!Number.isFinite(lon)||!Number.isFinite(zoom))return null;
+    if(lat<-90||lat>90||lon<-180||lon>180||zoom<0||zoom>20)return null;
+    return {lat,lon,zoom};
+  }catch(_){
+    return null;
+  }
+}
+function storeViewport(map){
+  const center=map.getCenter();
+  storageSet(MAP_VIEWPORT_STORAGE,JSON.stringify({
+    lat:Number(center.lat.toFixed(5)),
+    lon:Number(center.lng.toFixed(5)),
+    zoom:map.getZoom()
+  }));
+}
 function setupMapModes(map,el,relayout){
   const panel=document.getElementById('map-panel');
   const layout=document.querySelector('[data-map-layout]');
@@ -2657,6 +2691,7 @@ function setupMapModes(map,el,relayout){
     layout.dataset.mode=next==='fullscreen'?'maximized':next;
     main.dataset.mapView=next==='standard'?'standard':'maximized';
     setPressed(next);
+    storeMapMode(next);
     resizeSoon();
   }
   function setMode(next){
@@ -2685,18 +2720,24 @@ function setupMapModes(map,el,relayout){
   }
   document.addEventListener('fullscreenchange',onFullscreenChange);
   document.addEventListener('webkitfullscreenchange',onFullscreenChange);
-  commit('standard');
+  commit(storedMapMode());
 }
 function initMap(){
   const el=document.getElementById('fleet-map');
   if(!el||!window.L){document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}
-  const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:false,zoomControl:false});
-  L.control.zoom({position:'topright'}).addTo(map);
+  const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:true,zoomControl:false});
+  L.control.zoom({position:'topleft'}).addTo(map);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:20,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'}).addTo(map);
   const bounds=MAP_HOSTS.map(host=>[host.lat,host.lon]);
-  if(bounds.length===1){map.setView(bounds[0],5)}else if(bounds.length){map.fitBounds(bounds,{padding:[64,64],maxZoom:5})}else{map.setView([20,0],2)}
+  const saved=storedViewport();
+  if(saved){map.setView([saved.lat,saved.lon],saved.zoom)}
+  else if(bounds.length===1){map.setView(bounds[0],5)}
+  else if(bounds.length){map.fitBounds(bounds,{padding:[64,64],maxZoom:5})}
+  else{map.setView([20,0],2)}
   const relayout=buildLabels(map,el);
   setupMapModes(map,el,relayout);
+  map.on('moveend zoomend',()=>storeViewport(map));
+  storeViewport(map);
 }
 initMap();
 </script>"#
@@ -3409,6 +3450,13 @@ mod tests {
         assert!(html.contains("map.on('move zoom moveend zoomend resize viewreset'"));
         assert!(html.contains("classList.add('map-links')"));
         assert!(html.contains("animateMotion"));
+        assert!(html.contains("const MAP_VIEWPORT_STORAGE='pharos.map.viewport.v1'"));
+        assert!(html.contains("const MAP_MODE_STORAGE='pharos.map.mode.v1'"));
+        assert!(html.contains("storedViewport()"));
+        assert!(html.contains("storeViewport(map)"));
+        assert!(html.contains("map.on('moveend zoomend',()=>storeViewport(map))"));
+        assert!(html.contains("scrollWheelZoom:true"));
+        assert!(html.contains("L.control.zoom({position:'topleft'})"));
         assert!(html.contains(r#"data-map-view="standard""#));
         assert!(html.contains(r#"data-map-layout data-mode="standard""#));
         assert!(html.contains(r#"id="map-panel" class="map-panel""#));
