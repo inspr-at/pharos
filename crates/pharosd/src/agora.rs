@@ -9,7 +9,10 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::Json;
-use pharos_core::{liveness, Host, HostManifest, Liveness, ManifestPalette};
+use pharos_core::{
+    liveness, Host, HostLocation, HostLocationSource, HostManifest, Liveness, ManifestLocationMode,
+    ManifestPalette,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -17,6 +20,7 @@ use crate::{html_escape, AppState};
 
 const DEFAULT_ACCENT: &str = "#1f7fb5";
 const TARGET_PATH: &str = "modules/uzumaki/theme/theme-palettes.nix";
+const LOCATION_TARGET_PATH: &str = "modules/uzumaki/hosts/host-settings.nix";
 
 const AGORA_CSS: &str = r#"<style>
 .settings-main{width:min(1180px,100%)}
@@ -88,7 +92,21 @@ const AGORA_CSS: &str = r#"<style>
 .empty-settings{padding:34px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .empty-settings h2{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500}
 .empty-settings p{margin:0;color:var(--muted)}
+.location-panel{margin-top:18px}
+.location-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:0}
+.location-editor{padding:24px;border-right:1px solid rgba(214,226,234,.72)}
+.location-mode-row{display:grid;grid-template-columns:210px minmax(0,1fr);gap:16px;align-items:end}
+.location-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:16px}
+.plain-select{width:100%;height:40px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:700;padding:0 12px;outline:none}
+.location-input{width:100%;height:40px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:650;padding:0 12px;outline:none}
+.location-mode-copy{color:var(--muted);font-size:13px;line-height:1.45}
+.location-preview{display:grid;align-content:start;gap:14px;min-height:190px}
+.location-pin{width:64px;height:64px;border:3px solid color-mix(in srgb,var(--picked-color) 78%,#fff);border-radius:50%;background:radial-gradient(circle at 42% 38%,#fff 0 18%,color-mix(in srgb,var(--picked-color) 22%,#eef9fa) 20% 100%);box-shadow:0 0 0 8px color-mix(in srgb,var(--picked-color) 12%,transparent),0 18px 34px color-mix(in srgb,var(--picked-color) 16%,transparent)}
+.location-preview strong{display:block;color:var(--ink);font-size:15px}
+.location-preview span{display:block;margin-top:3px;color:var(--muted);font-size:12px}
+.location-action-row{display:flex;justify-content:flex-end;margin-top:16px}
 @media (max-width:900px){.settings-bar{align-items:stretch;flex-direction:column}.settings-actions{justify-content:flex-start}.color-layout,.color-controls{grid-template-columns:1fr}.color-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}.preview-zone{padding:20px}.setup-banner{align-items:flex-start;flex-direction:column}}
+@media (max-width:900px){.location-layout,.location-mode-row,.location-fields{grid-template-columns:1fr}.location-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}}
 @media (max-width:640px){.advanced-meta{grid-template-columns:1fr}}
 </style>"#;
 
@@ -109,6 +127,12 @@ struct AgoraHostView {
     target_attribute: String,
     janus_required: bool,
     janus_mode: String,
+    location_mode: ManifestLocationMode,
+    location_label: String,
+    location_latitude: String,
+    location_longitude: String,
+    location_target_path: String,
+    location_target_attribute: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -122,6 +146,15 @@ pub(crate) struct PaletteProposalQuery {
     accent: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct LocationProposalQuery {
+    host: String,
+    mode: String,
+    label: Option<String>,
+    latitude: Option<String>,
+    longitude: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PaletteProposal {
     schema: &'static str,
@@ -133,6 +166,33 @@ struct PaletteProposal {
     janus: ProposalJanus,
     safety: ProposalSafety,
     patch: ProposalPatch,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LocationProposal {
+    schema: &'static str,
+    status: &'static str,
+    host: String,
+    slug: String,
+    change: LocationProposalChange,
+    target: LocationProposalTarget,
+    janus: ProposalJanus,
+    safety: ProposalSafety,
+    patch: ProposalPatch,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LocationProposalChange {
+    setting: &'static str,
+    declared: String,
+    proposed: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LocationProposalTarget {
+    repo: &'static str,
+    path: &'static str,
+    attribute: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +272,37 @@ pub(crate) async fn palette_proposal(
     }
 }
 
+pub(crate) async fn location_proposal(
+    State(state): State<AppState>,
+    Query(query): Query<LocationProposalQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(manifest) = find_manifest(state.manifests.manifests(), &query.host) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "host is not declared in the manifest registry" })),
+        );
+    };
+
+    let mode = match parse_location_mode(&query.mode) {
+        Ok(mode) => mode,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    };
+
+    match build_location_proposal(
+        manifest,
+        mode,
+        query.label.as_deref(),
+        query.latitude.as_deref(),
+        query.longitude.as_deref(),
+    ) {
+        Ok(proposal) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(proposal).expect("proposal serializes")),
+        ),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    }
+}
+
 fn render_page(
     manifests: &[HostManifest],
     runtime_hosts: &[Host],
@@ -245,7 +336,7 @@ fn render_page(
 
     if hosts.is_empty() {
         return format!(
-            r#"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host color</p></div><div class="asof">as of {as_of}</div></div><section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its color settings will appear here.</p></section></main></div></body></html>"#
+            r#"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host settings</p></div><div class="asof">as of {as_of}</div></div><section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#
         );
     }
 
@@ -258,7 +349,7 @@ fn render_page(
     };
 
     format!(
-        r##"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host color</p></div><div class="asof">as of {as_of}</div></div><section class="settings-bar" aria-label="host settings selector"><div class="host-picker"><label for="host-select">Host</label><span class="host-select-wrap"><select id="host-select" class="host-select" data-host-select>{options}</select></span><span class="host-context" style="--state:{state_color}"><span class="host-status-dot"></span><span>{role}</span></span></div><div class="settings-actions"><a class="settings-link" href="/">Fleet</a></div></section>{content}</main><script>
+        r##"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host settings</p></div><div class="asof">as of {as_of}</div></div><section class="settings-bar" aria-label="host settings selector"><div class="host-picker"><label for="host-select">Host</label><span class="host-select-wrap"><select id="host-select" class="host-select" data-host-select>{options}</select></span><span class="host-context" style="--state:{state_color}"><span class="host-status-dot"></span><span>{role}</span></span></div><div class="settings-actions"><a class="settings-link" href="/">Fleet</a></div></section>{content}</main><script>
 const hostSelect=document.querySelector('[data-host-select]');
 hostSelect?.addEventListener('change',event=>{{location.href='/agora?host='+encodeURIComponent(event.target.value)}});
 const root=document.querySelector('[data-color-root]');
@@ -300,6 +391,49 @@ if(root){{
     }}
   }});
 }}
+const locationRoot=document.querySelector('[data-location-root]');
+if(locationRoot){{
+  const mode=locationRoot.querySelector('[data-location-mode]');
+  const output=locationRoot.querySelector('[data-location-output]');
+  const advanced=locationRoot.querySelector('[data-location-advanced]');
+  const fields=locationRoot.querySelector('[data-location-fields]');
+  const copy=locationRoot.querySelector('[data-location-copy]');
+  function modeNeedsCoordinates(value){{return value==='declared-override'||value==='declared-fallback'}}
+  function refreshLocationFields(){{
+    const value=mode?.value||'auto';
+    if(fields)fields.hidden=!modeNeedsCoordinates(value);
+    if(copy){{
+      copy.textContent=value==='hidden'
+        ? 'Do not expose coordinates for this host.'
+        : value==='declared-override'
+          ? 'Always use the coordinates below, even when runtime detection reports something else.'
+          : value==='declared-fallback'
+            ? 'Use runtime detection first; use these coordinates only as the fallback.'
+            : 'Use runtime detection when available, then declared site metadata.';
+    }}
+  }}
+  mode?.addEventListener('change',refreshLocationFields);
+  refreshLocationFields();
+  locationRoot.querySelector('[data-location-review]')?.addEventListener('click',async()=>{{
+    if(!output)return;
+    if(advanced)advanced.open=true;
+    output.textContent='Preparing review...';
+    const params=new URLSearchParams();
+    const selectedMode=mode?.value||'auto';
+    params.set('host',locationRoot.dataset.host);
+    params.set('mode',selectedMode);
+    if(modeNeedsCoordinates(selectedMode)){{
+      locationRoot.querySelectorAll('[data-location-param]').forEach(input=>{{
+        if(input.value.trim())params.set(input.dataset.locationParam,input.value.trim());
+      }});
+    }}
+    try{{
+      const res=await fetch('/agora/proposals/host-location.json?'+params.toString(),{{headers:{{Accept:'application/json'}}}});
+      const data=await res.json();
+      output.textContent=res.ok?data.patch.value:(data.error||'review failed');
+    }}catch(_){{output.textContent='review failed'}}
+  }});
+}}
 </script></div></body></html>"##,
         role = html_escape(&selected.role),
         state_color = html_escape(&selected.state_color),
@@ -308,13 +442,17 @@ if(root){{
 }
 
 fn render_ready_content(host: &AgoraHostView) -> String {
-    render_color_panel(
-        host,
-        None,
-        "Review color change",
-        r#"<span class="review-note">Pharos only prepares a review. Applying it still happens in nixcfg.</span>"#,
-        "No color change reviewed yet.",
-        true,
+    format!(
+        "{}{}",
+        render_color_panel(
+            host,
+            None,
+            "Review color change",
+            r#"<span class="review-note">Pharos only prepares a review. Applying it still happens in nixcfg.</span>"#,
+            "No color change reviewed yet.",
+            true,
+        ),
+        render_location_panel(host)
     )
 }
 
@@ -388,6 +526,43 @@ fn render_color_panel(
             "No setup reviewed yet.".to_string()
         },
         setup_template = setup_template,
+    )
+}
+
+fn render_location_panel(host: &AgoraHostView) -> String {
+    let mode = location_mode_key(host.location_mode);
+    let mode_label = location_mode_label(host.location_mode);
+    let declared_copy = if host.location_latitude.is_empty() || host.location_longitude.is_empty() {
+        "No declared coordinates"
+    } else {
+        "Declared coordinates ready"
+    };
+    let fields_hidden = if matches!(
+        host.location_mode,
+        ManifestLocationMode::DeclaredOverride | ManifestLocationMode::DeclaredFallback
+    ) {
+        ""
+    } else {
+        " hidden"
+    };
+    format!(
+        r##"<section class="settings-panel location-panel" data-location-root data-host="{host_name}" style="--picked-color:{accent}"><header class="settings-panel-head"><div><span class="settings-kicker">{slug}</span><h2>Host location</h2><p>Choose how Pharos places this host on the map.</p></div><span class="settings-state" data-ready="true">{mode_label}</span></header><div class="location-layout"><section class="location-editor"><div class="location-mode-row"><div class="field"><label for="location-mode">Location mode</label><select id="location-mode" class="plain-select" data-location-mode><option value="auto"{auto_selected}>Use detected</option><option value="declared-fallback"{fallback_selected}>Manual fallback</option><option value="declared-override"{override_selected}>Always manual</option><option value="hidden"{hidden_selected}>Hide location</option></select></div><p class="location-mode-copy" data-location-copy></p></div><div class="location-fields" data-location-fields{fields_hidden}><div class="field"><label for="location-label">Label</label><input id="location-label" class="location-input" data-location-param="label" value="{location_label}" placeholder="Parents' home"></div><div class="field"><label for="location-latitude">Latitude</label><input id="location-latitude" class="location-input" data-location-param="latitude" inputmode="decimal" value="{latitude}" placeholder="48.2082"></div><div class="field"><label for="location-longitude">Longitude</label><input id="location-longitude" class="location-input" data-location-param="longitude" inputmode="decimal" value="{longitude}" placeholder="16.3738"></div></div><div class="location-action-row"><button class="primary-action" type="button" data-location-review>Review location change</button></div></section><aside class="preview-zone"><div class="location-preview" aria-label="host location preview"><span class="location-pin" aria-hidden="true"></span><div><strong>{declared_copy}</strong><span>{preview_text}</span></div></div></aside></div><section class="advanced"><details data-location-advanced><summary>Advanced review</summary><div class="advanced-body"><span class="review-note">Pharos prepares a nixcfg review only. It does not mutate the host or deploy.</span><div class="advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-location-output>No location change reviewed yet.</pre></div></details></section></section>"##,
+        host_name = html_escape(&host.name),
+        slug = html_escape(&host.slug),
+        accent = html_escape(&host.declared_accent),
+        mode_label = html_escape(mode_label),
+        auto_selected = selected_attr(mode == "auto"),
+        fallback_selected = selected_attr(mode == "declared-fallback"),
+        override_selected = selected_attr(mode == "declared-override"),
+        hidden_selected = selected_attr(mode == "hidden"),
+        fields_hidden = fields_hidden,
+        location_label = html_escape(&host.location_label),
+        latitude = html_escape(&host.location_latitude),
+        longitude = html_escape(&host.location_longitude),
+        declared_copy = declared_copy,
+        preview_text = html_escape(&location_preview_text(host)),
+        target_path = html_escape(&host.location_target_path),
+        target_attribute = html_escape(&host.location_target_attribute),
     )
 }
 
@@ -502,6 +677,7 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
         let palette_name = palette
             .map(|palette| palette.name.clone())
             .unwrap_or_else(|| format!("custom-{}", manifest.slug));
+        let location = manifest.host.location.as_ref();
         views.insert(
             manifest.host.name.clone(),
             AgoraHostView {
@@ -521,6 +697,18 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
                 janus_required: manifest.policy.privileged_actions.janus_required,
                 janus_mode: format!("{:?}", manifest.policy.privileged_actions.mode)
                     .to_ascii_lowercase(),
+                location_mode: manifest.host.location_mode,
+                location_label: location
+                    .and_then(|location| location.label.clone())
+                    .unwrap_or_default(),
+                location_latitude: location
+                    .map(|location| format_coordinate(location.latitude))
+                    .unwrap_or_default(),
+                location_longitude: location
+                    .map(|location| format_coordinate(location.longitude))
+                    .unwrap_or_default(),
+                location_target_path: LOCATION_TARGET_PATH.to_string(),
+                location_target_attribute: format!("hosts.{}.location", manifest.slug),
             },
         );
     }
@@ -562,6 +750,12 @@ fn setup_host_view(
         target_attribute: format!("palettes.{palette_name}.gradient.primary"),
         janus_required: false,
         janus_mode: "none".to_string(),
+        location_mode: ManifestLocationMode::Auto,
+        location_label: String::new(),
+        location_latitude: String::new(),
+        location_longitude: String::new(),
+        location_target_path: LOCATION_TARGET_PATH.to_string(),
+        location_target_attribute: format!("hosts.{name}.location"),
     }
 }
 
@@ -588,6 +782,70 @@ fn palette_accent(palette: &ManifestPalette) -> Option<String> {
         .clone()
         .or_else(|| palette.gradient.get("primary").cloned())
         .map(|value| value.to_ascii_lowercase())
+}
+
+fn selected_attr(selected: bool) -> &'static str {
+    if selected {
+        " selected"
+    } else {
+        ""
+    }
+}
+
+fn format_coordinate(value: f64) -> String {
+    let mut text = format!("{value:.6}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
+}
+
+fn location_mode_key(mode: ManifestLocationMode) -> &'static str {
+    match mode {
+        ManifestLocationMode::Auto => "auto",
+        ManifestLocationMode::DeclaredOverride => "declared-override",
+        ManifestLocationMode::DeclaredFallback => "declared-fallback",
+        ManifestLocationMode::Hidden => "hidden",
+    }
+}
+
+fn location_mode_label(mode: ManifestLocationMode) -> &'static str {
+    match mode {
+        ManifestLocationMode::Auto => "Use detected",
+        ManifestLocationMode::DeclaredOverride => "Always manual",
+        ManifestLocationMode::DeclaredFallback => "Manual fallback",
+        ManifestLocationMode::Hidden => "Hidden",
+    }
+}
+
+fn location_preview_text(host: &AgoraHostView) -> String {
+    match host.location_mode {
+        ManifestLocationMode::Auto => "Runtime detection can update the map placement.".to_string(),
+        ManifestLocationMode::DeclaredOverride => {
+            format!("{} is pinned to the declared map position.", host.name)
+        }
+        ManifestLocationMode::DeclaredFallback => {
+            "Runtime detection wins; declared coordinates are the fallback.".to_string()
+        }
+        ManifestLocationMode::Hidden => "Pharos will not expose host coordinates.".to_string(),
+    }
+}
+
+fn parse_location_mode(value: &str) -> Result<ManifestLocationMode, &'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "detected" | "use-detected" => Ok(ManifestLocationMode::Auto),
+        "declared-override" | "override" | "manual" | "always-manual" => {
+            Ok(ManifestLocationMode::DeclaredOverride)
+        }
+        "declared-fallback" | "fallback" | "manual-fallback" => {
+            Ok(ManifestLocationMode::DeclaredFallback)
+        }
+        "hidden" | "hide" | "disabled" => Ok(ManifestLocationMode::Hidden),
+        _ => Err("location mode must be auto, declared-fallback, declared-override, or hidden"),
+    }
 }
 
 fn build_palette_proposal(
@@ -661,6 +919,163 @@ fn render_palette_patch(
     )
 }
 
+fn build_location_proposal(
+    manifest: &HostManifest,
+    proposed_mode: ManifestLocationMode,
+    label: Option<&str>,
+    latitude: Option<&str>,
+    longitude: Option<&str>,
+) -> Result<LocationProposal, String> {
+    let proposed_location = proposed_location(proposed_mode, label, latitude, longitude)?;
+    let current = location_summary(manifest.host.location_mode, manifest.host.location.as_ref());
+    let proposed = location_summary(proposed_mode, proposed_location.as_ref());
+    let status = if manifest.host.location_mode == proposed_mode
+        && manifest.host.location == proposed_location
+    {
+        "no_change"
+    } else {
+        "draft"
+    };
+    let patch = render_location_patch(manifest, proposed_mode, proposed_location.as_ref());
+    Ok(LocationProposal {
+        schema: "inspr.pharos.agora.location-proposal.v1",
+        status,
+        host: manifest.host.name.clone(),
+        slug: manifest.slug.clone(),
+        change: LocationProposalChange {
+            setting: "host.location",
+            declared: current,
+            proposed,
+        },
+        target: LocationProposalTarget {
+            repo: "nixcfg",
+            path: LOCATION_TARGET_PATH,
+            attribute: format!("hosts.{}.location", manifest.slug),
+        },
+        janus: ProposalJanus {
+            required: false,
+            mode: "none".to_string(),
+            reason: "declarative metadata proposal only; no privileged host action is executed by Pharos",
+        },
+        safety: ProposalSafety {
+            applies_change: false,
+            deploys_host: false,
+            next_gate: "review and apply in nixcfg, then run nixcfg QA/backup/deploy gates",
+        },
+        patch: ProposalPatch {
+            format: "unified-diff",
+            value: patch,
+        },
+    })
+}
+
+fn proposed_location(
+    mode: ManifestLocationMode,
+    label: Option<&str>,
+    latitude: Option<&str>,
+    longitude: Option<&str>,
+) -> Result<Option<HostLocation>, String> {
+    let label = label.and_then(non_empty);
+    let latitude = latitude.and_then(non_empty);
+    let longitude = longitude.and_then(non_empty);
+
+    match mode {
+        ManifestLocationMode::Auto | ManifestLocationMode::Hidden => {
+            if latitude.is_some() || longitude.is_some() || label.is_some() {
+                return Err("auto and hidden location modes do not accept coordinates".to_string());
+            }
+            Ok(None)
+        }
+        ManifestLocationMode::DeclaredOverride | ManifestLocationMode::DeclaredFallback => {
+            let (Some(latitude), Some(longitude)) = (latitude, longitude) else {
+                return Err("manual location modes require both latitude and longitude".to_string());
+            };
+            let location = HostLocation {
+                latitude: parse_coordinate(latitude, "latitude")?,
+                longitude: parse_coordinate(longitude, "longitude")?,
+                source: HostLocationSource::Declared,
+                accuracy_meters: None,
+                precision_meters: None,
+                observed_at: None,
+                stale: false,
+                manual_override: mode == ManifestLocationMode::DeclaredOverride,
+                label: label.map(str::to_string),
+            };
+            location.validate_contract()?;
+            Ok(Some(location))
+        }
+    }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn parse_coordinate(value: &str, label: &'static str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .map_err(|_| format!("{label} must be a decimal number"))
+}
+
+fn location_summary(mode: ManifestLocationMode, location: Option<&HostLocation>) -> String {
+    let mut summary = location_mode_key(mode).to_string();
+    if let Some(location) = location {
+        summary.push_str(&format!(
+            " ({}, {})",
+            format_coordinate(location.latitude),
+            format_coordinate(location.longitude)
+        ));
+        if let Some(label) = location.label.as_deref().and_then(non_empty) {
+            summary.push_str(&format!(" {label}"));
+        }
+    }
+    summary
+}
+
+fn render_location_patch(
+    manifest: &HostManifest,
+    proposed_mode: ManifestLocationMode,
+    location: Option<&HostLocation>,
+) -> String {
+    let target_path = LOCATION_TARGET_PATH;
+    let slug = &manifest.slug;
+    let mode = location_mode_key(proposed_mode);
+    let body = if let Some(location) = location {
+        let label = location
+            .label
+            .as_deref()
+            .and_then(non_empty)
+            .map(|label| format!("\n      label = \"{}\";", escape_nix_string(label)))
+            .unwrap_or_default();
+        format!(
+            "    locationMode = \"{mode}\";\n    location = {{\n      latitude = {};\n      longitude = {};\n      source = \"declared\";\n      manual_override = {};{label}\n    }};",
+            format_coordinate(location.latitude),
+            format_coordinate(location.longitude),
+            if location.manual_override { "true" } else { "false" },
+        )
+    } else {
+        format!("    locationMode = \"{mode}\";\n    location = null;")
+    };
+    let added_body = body
+        .lines()
+        .map(|line| format!("+{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "diff --git a/{target_path} b/{target_path}\n--- a/{target_path}\n+++ b/{target_path}\n@@\n   {slug} = {{\n{body}\n   }};\n",
+        body = added_body
+    )
+}
+
+fn escape_nix_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn live_key(live: Liveness) -> &'static str {
     match live {
         Liveness::Live => "live",
@@ -683,8 +1098,9 @@ fn state_color(live: Liveness) -> &'static str {
 mod tests {
     use super::*;
     use pharos_core::{
-        Host, ManifestHost, ManifestPalette, ManifestPolicy, NixFreshness, PrivilegedActionMode,
-        PrivilegedActions, RuntimeStateOwner, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+        Host, ManifestHost, ManifestLocationMode, ManifestPalette, ManifestPolicy, NixFreshness,
+        PrivilegedActionMode, PrivilegedActions, RuntimeStateOwner, HOST_MANIFEST_SCHEMA,
+        HOST_MANIFEST_VERSION,
     };
 
     fn manifest() -> HostManifest {
@@ -701,6 +1117,7 @@ mod tests {
                 fqdn: Some("hsb8.lan".to_string()),
                 ip: Some("192.168.1.100".to_string()),
                 site: None,
+                location_mode: ManifestLocationMode::Auto,
                 location: None,
                 title: None,
                 heading: None,
@@ -781,6 +1198,65 @@ mod tests {
     }
 
     #[test]
+    fn location_proposal_generates_reviewable_nixcfg_patch() {
+        let proposal = build_location_proposal(
+            &manifest(),
+            ManifestLocationMode::DeclaredFallback,
+            Some("Parents' home"),
+            Some("48.32"),
+            Some("15.92"),
+        )
+        .expect("proposal");
+
+        assert_eq!(proposal.schema, "inspr.pharos.agora.location-proposal.v1");
+        assert_eq!(proposal.status, "draft");
+        assert_eq!(proposal.target.repo, "nixcfg");
+        assert_eq!(proposal.target.path, LOCATION_TARGET_PATH);
+        assert_eq!(proposal.target.attribute, "hosts.hsb8.location");
+        assert!(!proposal.janus.required);
+        assert!(!proposal.safety.applies_change);
+        assert!(proposal
+            .patch
+            .value
+            .contains("+    locationMode = \"declared-fallback\";"));
+        assert!(proposal.patch.value.contains("+      latitude = 48.32;"));
+        assert!(proposal.patch.value.contains("+      longitude = 15.92;"));
+        assert!(proposal
+            .patch
+            .value
+            .contains("+      manual_override = false;"));
+    }
+
+    #[test]
+    fn location_proposal_rejects_ambiguous_coordinates() {
+        let error = build_location_proposal(
+            &manifest(),
+            ManifestLocationMode::DeclaredOverride,
+            Some("Parents' home"),
+            Some("48.32"),
+            None,
+        )
+        .expect_err("partial coordinates rejected");
+        assert_eq!(
+            error,
+            "manual location modes require both latitude and longitude"
+        );
+
+        let error = build_location_proposal(
+            &manifest(),
+            ManifestLocationMode::Hidden,
+            None,
+            Some("48.32"),
+            Some("15.92"),
+        )
+        .expect_err("hidden coordinates rejected");
+        assert_eq!(
+            error,
+            "auto and hidden location modes do not accept coordinates"
+        );
+    }
+
+    #[test]
     fn settings_page_uses_shared_shell_and_simple_color_task() {
         let runtime = runtime_host("hsb8");
         let html = render_page(&[manifest()], &[runtime], None, "markus", true);
@@ -789,12 +1265,17 @@ mod tests {
         assert!(html.contains(r#"<aside class="sidebar" aria-label="primary navigation""#));
         assert!(html.contains(r#"href="/agora" aria-current="page""#));
         assert!(html.contains("<h1>Settings</h1>"));
-        assert!(html.contains("Host color"));
+        assert!(html.contains("Host settings"));
         assert!(html.contains("Choose color"));
         assert!(html.contains("Review color change"));
+        assert!(html.contains("Host location"));
+        assert!(html.contains("Use detected"));
+        assert!(html.contains("Manual fallback"));
+        assert!(html.contains("Review location change"));
         assert!(html.contains("Advanced review"));
         assert!(html.contains("preview-card"));
         assert!(html.contains("palettes.custom-hsb8.gradient.primary"));
+        assert!(html.contains("hosts.hsb8.location"));
         assert!(!html.contains(r#"class="rail""#));
         assert!(!html.contains("Services</button>"));
         assert!(!html.contains("Access</button>"));

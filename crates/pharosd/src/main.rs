@@ -28,9 +28,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
     liveness, Host, HostLocation, HostLocationSource, HostManifest, HostRegistration,
-    HostRegistrationResponse, HostReport, Liveness, ManifestProbePolicy, ManifestService,
-    ManifestStatusSource, NixFreshness, ServiceObservation, ServiceObservationState,
-    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    HostRegistrationResponse, HostReport, Liveness, ManifestLocationMode, ManifestProbePolicy,
+    ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
+    ServiceObservationState, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -2174,6 +2174,7 @@ struct SiteLocation {
     lat: f64,
     lon: f64,
     source: HostLocationSource,
+    mode: &'static str,
     state: &'static str,
     stale: bool,
     manual_override: bool,
@@ -2201,6 +2202,7 @@ impl SiteLocation {
             lat,
             lon,
             source,
+            mode: "auto",
             state: if id == "unknown" { "unknown" } else { "known" },
             stale: false,
             manual_override: false,
@@ -2214,6 +2216,7 @@ impl SiteLocation {
         location: &HostLocation,
         fallback_label: impl Into<String>,
         fallback_region: impl Into<String>,
+        mode: &'static str,
         state: &'static str,
         now: i64,
     ) -> Self {
@@ -2236,12 +2239,31 @@ impl SiteLocation {
             lat: location.latitude,
             lon: location.longitude,
             source: location.source,
+            mode,
             state: if stale { "stale" } else { state },
             stale,
             manual_override: location.manual_override,
             observed_at: location.observed_at,
             accuracy_meters: location.accuracy_meters,
             precision_meters: location.precision_meters,
+        }
+    }
+
+    fn hidden() -> Self {
+        Self {
+            id: "hidden".to_string(),
+            label: "Location hidden".to_string(),
+            region: "Not shown".to_string(),
+            lat: 46.8,
+            lon: 8.2,
+            source: HostLocationSource::Unknown,
+            mode: "hidden",
+            state: "hidden",
+            stale: false,
+            manual_override: false,
+            observed_at: None,
+            accuracy_meters: None,
+            precision_meters: None,
         }
     }
 }
@@ -2324,6 +2346,7 @@ fn location_payload(location: &SiteLocation) -> serde_json::Value {
         "latitude": location.lat,
         "longitude": location.lon,
         "source": location_source_key(location.source),
+        "mode": location.mode,
         "state": location.state,
         "stale": location.stale,
         "manual_override": location.manual_override,
@@ -2342,6 +2365,13 @@ fn resolve_host_location(
     host_name: &str,
     now: i64,
 ) -> SiteLocation {
+    let mode = manifest
+        .map(|manifest| manifest.host.location_mode)
+        .unwrap_or_default();
+    if mode == ManifestLocationMode::Hidden {
+        return SiteLocation::hidden();
+    }
+
     let provider = manifest
         .and_then(|manifest| {
             manifest
@@ -2352,10 +2382,12 @@ fn resolve_host_location(
         })
         .map(site_location);
 
-    if let Some(location) = manifest
-        .and_then(|manifest| manifest.host.location.as_ref())
-        .filter(|location| location.manual_override)
-    {
+    let declared_location = manifest.and_then(|manifest| manifest.host.location.as_ref());
+
+    if let Some(location) = declared_location.filter(|location| {
+        mode == ManifestLocationMode::DeclaredOverride
+            || (mode == ManifestLocationMode::Auto && location.manual_override)
+    }) {
         let fallback = provider
             .as_ref()
             .cloned()
@@ -2364,6 +2396,7 @@ fn resolve_host_location(
             location,
             fallback.label,
             fallback.region,
+            "declared-override",
             "declared",
             now,
         );
@@ -2379,11 +2412,17 @@ fn resolve_host_location(
             fallback.label,
             fallback.region,
             "observed",
+            "observed",
             now,
         );
     }
 
-    if let Some(location) = manifest.and_then(|manifest| manifest.host.location.as_ref()) {
+    if let Some(location) = declared_location.filter(|_| {
+        matches!(
+            mode,
+            ManifestLocationMode::DeclaredFallback | ManifestLocationMode::Auto
+        )
+    }) {
         let fallback = provider
             .as_ref()
             .cloned()
@@ -2392,6 +2431,7 @@ fn resolve_host_location(
             location,
             fallback.label,
             fallback.region,
+            "declared-fallback",
             "declared",
             now,
         );
@@ -4355,6 +4395,10 @@ async fn main() {
             "/agora/proposals/host-palette.json",
             get(agora::palette_proposal),
         )
+        .route(
+            "/agora/proposals/host-location.json",
+            get(agora::location_proposal),
+        )
         .route("/hosts.json", get(hosts_json))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
@@ -5094,6 +5138,13 @@ mod tests {
         assert!(declared.manual_override);
 
         manifest.host.location.as_mut().unwrap().manual_override = false;
+        manifest.host.location_mode = ManifestLocationMode::DeclaredOverride;
+        let declared_mode = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(declared_mode.source, HostLocationSource::Declared);
+        assert_eq!(declared_mode.mode, "declared-override");
+        assert_eq!(declared_mode.label, "Declared DSC");
+
+        manifest.host.location_mode = ManifestLocationMode::DeclaredFallback;
         let runtime = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
         assert_eq!(runtime.source, HostLocationSource::Wifi);
         assert_eq!(runtime.label, "Runtime wifi");
@@ -5106,6 +5157,18 @@ mod tests {
         assert!(stale.stale);
 
         host.location = None;
+        let declared_fallback = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(declared_fallback.source, HostLocationSource::Declared);
+        assert_eq!(declared_fallback.mode, "declared-fallback");
+
+        manifest.host.location_mode = ManifestLocationMode::Hidden;
+        let hidden = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
+        assert_eq!(hidden.source, HostLocationSource::Unknown);
+        assert_eq!(hidden.mode, "hidden");
+        assert_eq!(hidden.state, "hidden");
+        assert_eq!(hidden.id, "hidden");
+
+        manifest.host.location_mode = ManifestLocationMode::Auto;
         manifest.host.location = None;
         let provider = resolve_host_location(Some(&host), Some(&manifest), "dsc0", 1000);
         assert_eq!(provider.source, HostLocationSource::Provider);

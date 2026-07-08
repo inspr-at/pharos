@@ -137,6 +137,20 @@ impl HostLocation {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManifestLocationMode {
+    /// Use runtime observations when available, then declared/site fallback.
+    #[default]
+    Auto,
+    /// Always use the declared coordinates for this host.
+    DeclaredOverride,
+    /// Use declared coordinates only when no runtime observation exists.
+    DeclaredFallback,
+    /// Do not expose host-level coordinates in Pharos.
+    Hidden,
+}
+
 /// Derived liveness — never stored; computed from `now - last_seen` (PHAROS-9).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -382,6 +396,22 @@ impl HostManifest {
                 ));
             }
         }
+        match self.host.location_mode {
+            ManifestLocationMode::DeclaredOverride | ManifestLocationMode::DeclaredFallback
+                if self.host.location.is_none() =>
+            {
+                return Err(ManifestContractError::InvalidHostLocation(format!(
+                    "locationMode {:?} requires declared host.location",
+                    self.host.location_mode
+                )));
+            }
+            ManifestLocationMode::Hidden if self.host.location.is_some() => {
+                return Err(ManifestContractError::InvalidHostLocation(
+                    "locationMode hidden cannot also declare host.location".to_string(),
+                ));
+            }
+            _ => {}
+        }
         if !self.policy.declared_only {
             return Err(ManifestContractError::ManifestEmbedsRuntimeState);
         }
@@ -418,6 +448,8 @@ pub struct ManifestHost {
     pub ip: Option<String>,
     #[serde(default)]
     pub site: Option<String>,
+    #[serde(default, rename = "locationMode")]
+    pub location_mode: ManifestLocationMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<HostLocation>,
     #[serde(default)]
@@ -897,6 +929,7 @@ mod tests {
                 .map(|location| location.source),
             Some(HostLocationSource::Declared)
         );
+        assert_eq!(manifest.host.location_mode, ManifestLocationMode::Auto);
         assert_eq!(
             manifest
                 .host
@@ -964,5 +997,61 @@ mod tests {
             invalid_location.validate_contract(),
             Err(ManifestContractError::InvalidHostLocation(_))
         ));
+    }
+
+    #[test]
+    fn manifest_location_mode_validation_is_explicit() {
+        let hidden_with_location: HostManifest = serde_json::from_value(serde_json::json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": {
+                "name": "hsb8",
+                "locationMode": "hidden",
+                "location": {
+                    "latitude": 48.32,
+                    "longitude": 15.92,
+                    "source": "declared"
+                }
+            },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest json parses");
+        assert!(matches!(
+            hidden_with_location.validate_contract(),
+            Err(ManifestContractError::InvalidHostLocation(_))
+        ));
+
+        let fallback_without_location: HostManifest = serde_json::from_value(serde_json::json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": {
+                "name": "hsb8",
+                "locationMode": "declared-fallback"
+            },
+            "policy": { "declaredOnly": true }
+        }))
+        .expect("manifest json parses");
+        assert!(matches!(
+            fallback_without_location.validate_contract(),
+            Err(ManifestContractError::InvalidHostLocation(_))
+        ));
+
+        let partial_location = serde_json::from_value::<HostManifest>(serde_json::json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": "hsb8",
+            "host": {
+                "name": "hsb8",
+                "locationMode": "declared-override",
+                "location": {
+                    "latitude": 48.32,
+                    "source": "declared"
+                }
+            },
+            "policy": { "declaredOnly": true }
+        }));
+        assert!(partial_location.is_err());
     }
 }
