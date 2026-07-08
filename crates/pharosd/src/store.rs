@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use pharos_core::{Host, HostRegistration, HostReport, NixFreshness, UnixSeconds};
+use pharos_core::{
+    Host, HostRegistration, HostReport, InboundRttObservation, NixFreshness, UnixSeconds,
+};
 
 const HEARTBEAT_RETENTION_SECS: UnixSeconds = 24 * 3600;
 const MAX_HEARTBEAT_LOG: usize = 3_000;
@@ -72,6 +74,7 @@ impl Store {
                     .map(|h| h.heartbeat_log.clone())
                     .unwrap_or_default(),
                 heartbeat_interval_secs: Some(registration.heartbeat_interval_secs),
+                inbound_rtt: existing.and_then(|h| h.inbound_rtt),
                 location: existing.and_then(|h| h.location.clone()),
                 freshness: existing
                     .map(|h| h.freshness.clone())
@@ -121,6 +124,10 @@ impl Store {
                 heartbeat_log.push(now);
             }
             trim_heartbeat_log(&mut heartbeat_log, now);
+            let inbound_rtt = report.inbound_rtt_ms.map(|millis| InboundRttObservation {
+                millis,
+                observed_at: now,
+            });
             map.insert(
                 report.name.clone(),
                 Host {
@@ -132,6 +139,7 @@ impl Store {
                     last_seen: Some(now),
                     heartbeat_log,
                     heartbeat_interval_secs: Some(report.heartbeat_interval_secs),
+                    inbound_rtt,
                     location: report.location,
                     freshness: report.freshness,
                     service_observations: report.service_observations,
@@ -202,6 +210,7 @@ mod tests {
                         ..Default::default()
                     },
                     service_observations: vec![],
+                    inbound_rtt_ms: None,
                     location: None,
                 },
                 now,
@@ -254,6 +263,7 @@ mod tests {
                         commits_behind: Some(0),
                     },
                 )],
+                inbound_rtt_ms: Some(37),
                 location: None,
             },
             120,
@@ -273,6 +283,7 @@ mod tests {
         assert_eq!(host.last_seen, Some(120));
         assert_eq!(host.heartbeat_log, vec![120]);
         assert_eq!(host.heartbeat_interval_secs, Some(30));
+        assert_eq!(host.inbound_rtt.expect("rtt kept").millis, 37);
         assert_eq!(host.freshness.flake_lock_age_days, Some(1));
         assert!(store.has_token("athena"));
         assert_eq!(store.token_hash_for("athena").as_deref(), Some("hash"));
@@ -291,6 +302,7 @@ mod tests {
                     commits_behind: Some(0),
                 },
                 service_observations: vec![],
+                inbound_rtt_ms: None,
                 location: None,
             },
             150,
@@ -299,5 +311,6 @@ mod tests {
         let updated = store.list().pop().expect("host remains recorded");
         assert_eq!(updated.token_hash.as_deref(), Some("hash"));
         assert_eq!(updated.last_seen, Some(150));
+        assert!(updated.inbound_rtt.is_none());
     }
 }

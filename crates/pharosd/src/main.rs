@@ -1832,6 +1832,7 @@ async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
                 "last_seen": h.last_seen,
                 "heartbeat_log": h.heartbeat_log,
                 "heartbeat_interval_secs": h.heartbeat_interval_secs,
+                "inbound_rtt": h.inbound_rtt,
                 "liveness": live,
                 "location": location_payload(&location),
                 "freshness": h.freshness,
@@ -1918,6 +1919,7 @@ fn runtime_overlay(
             "last_seen": null,
             "heartbeat_log": [],
             "heartbeat_interval_secs": null,
+            "inbound_rtt": null,
             "location": location_payload(&location),
             "freshness": null,
             "freshness_tldr": null,
@@ -1934,6 +1936,7 @@ fn runtime_overlay(
         "last_seen": host.last_seen,
         "heartbeat_log": host.heartbeat_log,
         "heartbeat_interval_secs": host.heartbeat_interval_secs,
+        "inbound_rtt": host.inbound_rtt,
         "liveness": live,
         "location": location_payload(&location),
         "freshness": host.freshness,
@@ -3369,6 +3372,33 @@ fn map_inbound_signal(host: &Host, is_pharos: bool, now: i64) -> MapSignal {
             policy: None,
         };
     }
+    if let Some(rtt) = host.inbound_rtt {
+        let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
+        let level = match live {
+            Liveness::Live => {
+                if rtt.millis <= 500 {
+                    "good"
+                } else {
+                    "warn"
+                }
+            }
+            Liveness::Stale => "warn",
+            Liveness::Down => "down",
+            Liveness::AwaitingFirstHeartbeat => "wait",
+        };
+        let observed_age = (now - rtt.observed_at).max(0);
+        return MapSignal {
+            label: format!("{} ms", rtt.millis),
+            level,
+            title: format!(
+                "Host-to-Pharos report submit RTT from {} was {} ms, observed {} ago",
+                host.name,
+                rtt.millis,
+                duration_label(observed_age)
+            ),
+            policy: None,
+        };
+    }
     let Some(last_seen) = host.last_seen else {
         return MapSignal {
             label: "waiting".to_string(),
@@ -3386,10 +3416,10 @@ fn map_inbound_signal(host: &Host, is_pharos: bool, now: i64) -> MapSignal {
     };
     let age = (now - last_seen).max(0);
     MapSignal {
-        label: duration_label(age),
+        label: format!("beat {}", duration_label(age)),
         level,
         title: format!(
-            "Last heartbeat from {} reached Pharos {} ago",
+            "No measured inbound RTT yet; last heartbeat from {} reached Pharos {} ago",
             host.name,
             duration_label(age)
         ),
@@ -3431,7 +3461,7 @@ fn map_hosts(
                 .cloned()
                 .unwrap_or_else(default_map_signal);
             let search = format!(
-                "{} {} {} {} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {} {} {}",
                 host.name,
                 host.role,
                 status,
@@ -3440,6 +3470,7 @@ fn map_hosts(
                 site.region,
                 location_source_key(site.source),
                 location_source_label(site.source),
+                inbound.label,
                 outbound.label
             )
             .to_lowercase();
@@ -5241,6 +5272,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5257,6 +5289,7 @@ mod tests {
                 last_seen: Some(879),
                 heartbeat_log: vec![760, 819, 879],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5274,6 +5307,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5373,6 +5407,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5389,6 +5424,7 @@ mod tests {
                 last_seen: Some(500),
                 heartbeat_log: vec![380, 440, 500],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5405,6 +5441,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5434,6 +5471,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5526,6 +5564,7 @@ mod tests {
                 last_seen: Some(1000),
                 heartbeat_log: vec![880, 940, 1000],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5543,6 +5582,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5578,6 +5618,7 @@ mod tests {
                 last_seen: Some(760),
                 heartbeat_log: vec![640, 700, 760],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: true,
@@ -5662,6 +5703,7 @@ mod tests {
                 last_seen: Some(990),
                 heartbeat_log: vec![930, 990],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness {
                     applicable: false,
@@ -5701,6 +5743,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
@@ -5714,6 +5757,10 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: Some(pharos_core::InboundRttObservation {
+                    millis: 12,
+                    observed_at: 990,
+                }),
                 location: Some(HostLocation {
                     latitude: 50.1109,
                     longitude: 8.6821,
@@ -5737,6 +5784,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
@@ -5750,6 +5798,7 @@ mod tests {
                 last_seen: Some(970),
                 heartbeat_log: vec![850, 910, 970],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
@@ -5763,6 +5812,7 @@ mod tests {
                 last_seen: None,
                 heartbeat_log: vec![],
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
@@ -5910,7 +5960,10 @@ mod tests {
         assert!(data_json.contains(r#""source":"wifi""#));
         assert!(data_json.contains(r#""source":"fallback""#));
         assert!(data_json.contains("Hillsboro, OR, US"));
-        assert!(data_json.contains(r#""inbound_label":"30s""#));
+        assert!(data_json.contains(r#""inbound_label":"12 ms""#));
+        assert!(data_json
+            .contains(r#""inbound_title":"Host-to-Pharos report submit RTT from csb0 was 12 ms"#));
+        assert!(data_json.contains(r#""inbound_label":"beat 30s""#));
         assert!(data_json.contains(r#""outbound_label":"blocked""#));
         assert!(data_json.contains(r#""outbound_policy":"blocked""#));
         assert!(data_json.contains(r#""search":"csb1 server live"#));
@@ -5921,6 +5974,7 @@ mod tests {
         assert!(payload.hosts.iter().any(|host| host.name == "csb0"
             && host.location_source == "wifi"
             && host.location_state == "observed"
+            && host.inbound_label == "12 ms"
             && host.search.contains("auto")));
         assert!(payload.hosts.iter().any(|host| host.name == "new-host"
             && host.live == "awaiting_first_heartbeat"
@@ -5961,6 +6015,7 @@ mod tests {
             last_seen: Some(1000),
             heartbeat_log: vec![940, 1000],
             heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
             location: Some(location(
                 50.1109,
                 8.6821,
@@ -6066,6 +6121,7 @@ mod tests {
             last_seen: Some(970),
             heartbeat_log: vec![910, 970],
             heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
             location: Some(HostLocation {
                 latitude: 48.2082,
                 longitude: 16.3738,
@@ -6116,6 +6172,7 @@ mod tests {
                 last_seen,
                 heartbeat_log: last_seen.into_iter().collect(),
                 heartbeat_interval_secs: Some(60),
+                inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
@@ -6313,6 +6370,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             last_seen: Some(970),
             heartbeat_log: vec![850, 910, 970],
             heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
             location: None,
             freshness: NixFreshness {
                 applicable: true,
@@ -6363,6 +6421,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             last_seen: None,
             heartbeat_log: vec![],
             heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
             location: None,
             freshness: NixFreshness {
                 applicable: true,
@@ -6415,6 +6474,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             last_seen: Some(970),
             heartbeat_log: vec![910, 970],
             heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
             location: None,
             freshness: NixFreshness {
                 applicable: true,
@@ -6672,6 +6732,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ..Default::default()
             },
             service_observations: vec![],
+            inbound_rtt_ms: None,
             location: None,
         }
     }

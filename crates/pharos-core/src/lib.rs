@@ -14,6 +14,17 @@ use serde::{Deserialize, Serialize};
 /// always derived, never self-asserted by the agent (PHAROS-9).
 pub type UnixSeconds = i64;
 
+/// Upper bound for beacon-reported host-to-Pharos submit latency. This catches
+/// malformed values while keeping unusually slow mobile or VPN paths valid.
+pub const MAX_INBOUND_RTT_MS: u64 = 3_600_000;
+
+/// Server-stamped observation of the host-to-Pharos report submission path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboundRttObservation {
+    pub millis: u64,
+    pub observed_at: UnixSeconds,
+}
+
 /// A managed host as seen by the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Host {
@@ -35,6 +46,9 @@ pub struct Host {
     pub heartbeat_log: Vec<UnixSeconds>,
     /// Beacon's reported heartbeat cadence — drives the "expected next" pulse.
     pub heartbeat_interval_secs: Option<u64>,
+    /// Most recent measured host-to-Pharos report submission round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_rtt: Option<InboundRttObservation>,
     /// Optional runtime-reported approximate host location. This is an
     /// observation overlay, not declared config intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +238,10 @@ pub struct HostReport {
     pub freshness: NixFreshness,
     #[serde(default)]
     pub service_observations: Vec<ServiceObservation>,
+    /// Previous successful host-to-Pharos report submission round trip, in
+    /// milliseconds. First reports and old beacons omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_rtt_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<HostLocation>,
 }
@@ -241,6 +259,12 @@ impl HostReport {
                 "unsupported report version {}; expected {}",
                 self.version, HOST_REPORT_VERSION
             ));
+        }
+        if self
+            .inbound_rtt_ms
+            .is_some_and(|millis| millis > MAX_INBOUND_RTT_MS)
+        {
+            return Err(format!("inbound_rtt_ms must be <= {}", MAX_INBOUND_RTT_MS));
         }
         if let Some(location) = &self.location {
             location.validate_contract()?;
@@ -785,6 +809,7 @@ mod tests {
         assert_eq!(host.token_hash, None);
         assert_eq!(host.report_version, HOST_REPORT_VERSION);
         assert!(host.heartbeat_log.is_empty());
+        assert!(host.inbound_rtt.is_none());
         assert!(host.location.is_none());
         assert!(host.service_observations.is_empty());
     }
@@ -796,9 +821,11 @@ mod tests {
         )
         .expect("deserialize legacy report");
         assert!(legacy.location.is_none());
+        assert!(legacy.inbound_rtt_ms.is_none());
         legacy.validate_contract().expect("legacy report valid");
 
         let runtime = HostReport {
+            inbound_rtt_ms: Some(42),
             location: Some(HostLocation {
                 latitude: 48.2082,
                 longitude: 16.3738,
@@ -815,6 +842,13 @@ mod tests {
         runtime
             .validate_contract()
             .expect("runtime location source is valid");
+        assert_eq!(runtime.inbound_rtt_ms, Some(42));
+
+        let too_slow = HostReport {
+            inbound_rtt_ms: Some(MAX_INBOUND_RTT_MS + 1),
+            ..legacy.clone()
+        };
+        assert!(too_slow.validate_contract().is_err());
 
         let declared_runtime = HostReport {
             location: Some(HostLocation {

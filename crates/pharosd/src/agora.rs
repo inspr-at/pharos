@@ -1100,6 +1100,7 @@ mod tests {
             last_seen: Some(crate::now_unix()),
             heartbeat_log: vec![],
             heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
             location: None,
             freshness: NixFreshness {
                 applicable: true,

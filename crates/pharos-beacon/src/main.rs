@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
     HostLocation, HostLocationSource, HostReport, NixFreshness, ServiceObservation,
-    HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+    HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_INBOUND_RTT_MS,
 };
 
 fn now_unix() -> i64 {
@@ -25,6 +25,12 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+fn report_rtt_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis())
+        .unwrap_or(MAX_INBOUND_RTT_MS)
+        .clamp(1, MAX_INBOUND_RTT_MS)
 }
 
 fn hostname() -> String {
@@ -455,6 +461,7 @@ fn main() {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0);
     let beat = interval.unwrap_or(60);
+    let mut last_report_rtt_ms: Option<u64> = None;
 
     loop {
         let freshness = if is_nix {
@@ -477,6 +484,7 @@ fn main() {
             heartbeat_interval_secs: beat,
             freshness,
             service_observations,
+            inbound_rtt_ms: last_report_rtt_ms,
             location,
         };
         let body = serde_json::to_string(&report).expect("serialize report");
@@ -484,18 +492,23 @@ fn main() {
         if let Some(token) = &token {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
+        let started = Instant::now();
         match request.send_string(&body) {
-            Ok(resp) => println!(
-                "{}",
-                success_log_line(
-                    &host,
-                    &endpoint,
-                    resp.status(),
-                    &report.freshness,
-                    report.location.as_ref()
-                )
-            ),
+            Ok(resp) => {
+                last_report_rtt_ms = Some(report_rtt_millis(started.elapsed()));
+                println!(
+                    "{}",
+                    success_log_line(
+                        &host,
+                        &endpoint,
+                        resp.status(),
+                        &report.freshness,
+                        report.location.as_ref()
+                    )
+                );
+            }
             Err(e) => {
+                last_report_rtt_ms = None;
                 eprintln!("pharos-beacon: report to {endpoint} failed: {e}");
                 if interval.is_none() {
                     std::process::exit(1);
@@ -512,6 +525,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_rtt_millis_is_protocol_bounded() {
+        assert_eq!(report_rtt_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(report_rtt_millis(Duration::from_millis(42)), 42);
+        assert_eq!(
+            report_rtt_millis(Duration::from_millis(MAX_INBOUND_RTT_MS + 1)),
+            MAX_INBOUND_RTT_MS
+        );
+    }
 
     #[test]
     fn success_log_line_keeps_operational_context_without_report_body() {
