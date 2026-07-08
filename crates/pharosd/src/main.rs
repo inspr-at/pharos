@@ -137,12 +137,14 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .wave{width:44px;height:10px;color:var(--sea);opacity:.78}
 .asof{font-size:12px;color:var(--muted);white-space:nowrap;padding-top:22px}
 .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
-.metric{position:relative;min-width:0;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;background:rgba(255,255,255,.82);border:1px solid rgba(210,226,234,.78);border-radius:8px;padding:14px 16px;box-shadow:0 12px 30px rgba(54,88,108,.06);backdrop-filter:blur(10px)}
+.metric{appearance:none;position:relative;min-width:0;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;text-align:left;background:rgba(255,255,255,.82);border:1px solid rgba(210,226,234,.78);border-radius:8px;padding:14px 16px;box-shadow:0 12px 30px rgba(54,88,108,.06);backdrop-filter:blur(10px);cursor:pointer}
 .metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color,var(--wait)) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color,var(--wait)) 20%,transparent)}
 .metric b{display:block;font-family:Georgia,"Times New Roman",serif;font-size:29px;line-height:1;font-weight:500;color:var(--ink)}
 .metric span{display:block;font-size:12px;color:var(--muted);margin-top:2px}
 .metric.live{--metric-color:var(--sea)}.metric.stale{--metric-color:var(--sun)}.metric.down{--metric-color:var(--down)}
 .metric.live{border-color:rgba(37,132,95,.22)}.metric.stale{border-color:rgba(178,106,0,.24)}.metric.down{border-color:rgba(191,58,53,.24)}
+.metric:hover,.metric[aria-pressed="true"]{border-color:color-mix(in srgb,var(--metric-color,var(--accent)) 38%,rgba(210,226,234,.78));box-shadow:0 14px 32px rgba(54,88,108,.08),0 0 0 3px color-mix(in srgb,var(--metric-color,var(--accent)) 9%,transparent);transform:translateY(-1px)}
+.metric:focus-visible{outline:2px solid color-mix(in srgb,var(--metric-color,var(--accent)) 38%,transparent);outline-offset:3px}
 .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 18px;padding:9px;background:rgba(255,255,255,.72);border:1px solid rgba(210,226,234,.78);border-radius:8px;box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(10px)}
 .toolbar-left,.toolbar-right{display:flex;align-items:center;gap:10px;min-width:0}
 .seg{display:inline-flex;align-items:center;padding:3px;border:1px solid rgba(210,226,234,.86);border-radius:7px;background:rgba(244,250,251,.76)}
@@ -164,6 +166,8 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .card-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
 .card-actions{display:flex;align-items:center;gap:5px;flex:0 0 auto}
 .host{display:flex;align-items:center;gap:9px;min-width:0}
+.card-head .host{align-items:flex-start}
+.card-head .nix{margin-top:1px}
 .nix{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(102,121,139,.18);border-radius:50%;color:var(--accent);background:rgba(241,248,250,.72);transition:border-color .2s ease,box-shadow .2s ease}
 .card.has-settings .nix,.list tr.has-settings .nix{border-width:2px;border-color:var(--host-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color) 13%,transparent),0 0 17px color-mix(in srgb,var(--host-color) 18%,transparent);background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--host-color) 8%,#f5fbfc))}
 .name{font-weight:650;font-size:16px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -261,7 +265,7 @@ main[data-view="list"] .list-wrap{display:block}
 .map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
 .map-panel,.site-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.84);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
 .map-panel{position:relative;display:flex;min-height:560px}
-.fleet-map{flex:1 1 auto;height:auto;min-height:560px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}
+.fleet-map{flex:1 1 auto;height:100%;min-height:560px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}
 .map-layout[data-mode="maximized"]{grid-template-columns:minmax(0,1fr)}
 .map-layout[data-mode="maximized"] .site-panel{display:none}
 .map-layout[data-mode="maximized"] .map-panel{height:calc(100vh - 258px);min-height:640px}
@@ -269,12 +273,13 @@ main[data-view="list"] .list-wrap{display:block}
 .map-panel:fullscreen .fleet-map{min-height:100vh}
 .map-panel:-webkit-full-screen{width:100vw;height:100vh;min-height:100vh;border:0;border-radius:0;background:#f7fbfc}
 .map-panel:-webkit-full-screen .fleet-map{min-height:100vh}
-.map-mode-controls{position:absolute;right:12px;top:76px;z-index:1001;display:flex;align-items:center;gap:4px;padding:4px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 12px 28px rgba(45,75,95,.14);-webkit-backdrop-filter:blur(10px) saturate(1.06);backdrop-filter:blur(10px) saturate(1.06)}
+.map-mode-controls{position:absolute;right:12px;top:12px;z-index:1001;display:flex;align-items:center;gap:4px;padding:4px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 12px 28px rgba(45,75,95,.14);-webkit-backdrop-filter:blur(10px) saturate(1.06);backdrop-filter:blur(10px) saturate(1.06)}
 .map-mode-control{display:grid;place-items:center;width:34px;height:34px;border:1px solid transparent;border-radius:6px;background:transparent;color:#44637f;cursor:pointer}
 .map-mode-control:hover{border-color:rgba(173,205,220,.72);background:rgba(223,241,249,.56);color:#17304a}
 .map-mode-control[aria-pressed="true"]{border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.82);color:#187fb9;box-shadow:0 0 0 3px rgba(103,177,196,.10)}
 .map-mode-control .ico{width:17px;height:17px}
-.map-panel:fullscreen .map-mode-controls,.map-panel:-webkit-full-screen .map-mode-controls{right:14px;top:76px}
+.map-density-control{margin-left:5px;border-left:1px solid rgba(210,226,234,.86)}
+.map-panel:fullscreen .map-mode-controls,.map-panel:-webkit-full-screen .map-mode-controls{right:14px;top:14px}
 .map-fallback{display:none;position:absolute;inset:0;place-items:center;padding:28px;text-align:center;color:var(--muted);background:rgba(255,255,255,.82);z-index:2}
 .map-fallback strong{display:block;color:var(--ink);font-size:18px}
 .site-panel{padding:16px;display:flex;flex-direction:column;gap:14px}
@@ -293,7 +298,7 @@ main[data-view="list"] .list-wrap{display:block}
 .site-host-ping{line-height:1.1;font-size:10px;color:var(--muted);white-space:nowrap}
 .site-host-ping[data-probe-level="good"]{color:var(--live)}.site-host-ping[data-probe-level="warn"]{color:var(--stale)}.site-host-ping[data-probe-level="down"]{color:var(--down)}.site-host-ping[data-policy="blocked"]{color:var(--muted)}
 .map-note{margin-top:auto;padding-top:8px;border-top:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:11px}
-.leaflet-container{font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
+.leaflet-container{height:100%;font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
 .leaflet-control-zoom a{color:var(--ink)!important}
 .map-label-layer{position:absolute;inset:0;z-index:650;pointer-events:none;overflow:hidden}
 .map-links{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
@@ -312,9 +317,13 @@ main[data-view="list"] .list-wrap{display:block}
 .map-ping{display:flex;align-items:center;gap:4px;font-size:10px;line-height:1.15;color:var(--muted);white-space:nowrap}
 .map-ping:before{content:attr(data-dir);width:17px;color:var(--muted);font-weight:700;text-transform:uppercase;font-size:8px;letter-spacing:.03em}
 .map-ping[data-probe-level="good"]{color:var(--live)}.map-ping[data-probe-level="warn"]{color:var(--stale)}.map-ping[data-probe-level="down"]{color:var(--down)}.map-ping[data-policy="blocked"]{color:var(--muted)}
+.map-panel[data-label-density="compact"] .map-node{grid-template-columns:8px max-content;align-items:center;min-width:0;max-width:132px;padding:5px 8px 5px 7px}
+.map-panel[data-label-density="compact"] .map-status-dot{grid-row:auto;margin-top:0;width:8px;height:8px}
+.map-panel[data-label-density="compact"] .map-name{font-size:12px}
+.map-panel[data-label-density="compact"] .map-signals{display:none}
 @media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
-@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:76px;right:10px}}
+@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-command{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -326,13 +335,15 @@ const STALE_X=82;
 const HISTORY_STEP=EXPECT_X/HISTORY_DOTS;
 const SIGNAL_WINDOWS=[{key:'10m',label:'10m',secs:10*60},{key:'1h',label:'1h',secs:60*60},{key:'24h',label:'24h',secs:24*60*60}];
 let signalWindow=SIGNAL_WINDOWS[0];
+let activeSearch='';
+let activeLiveFilter='all';
 function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
 function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(name+'='))?.split('=').slice(1).join('=')||''}
 function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
-function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host]')).filter(el=>el.dataset.host===name)}
+function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host-surface="runtime"]')).filter(el=>el.dataset.host===name)}
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
 function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
 function historyWindowMeta(samples,windowDef){
@@ -649,12 +660,46 @@ function applyView(view,write=true){
   document.querySelectorAll('[data-view-button]').forEach(btn=>btn.setAttribute('aria-pressed',String(btn.dataset.viewButton===view)));
   if(write)setCookie('pharos_view',view);
 }
+function hostMatchesSurface(el,q,live){
+  const text=q===''||String(el.dataset.search||'').includes(q);
+  const state=live==='all'||el.dataset.live===live;
+  return text&&state;
+}
+function updateGroupVisibility(){
+  document.querySelectorAll('.site-item').forEach(site=>{
+    const visible=Array.from(site.querySelectorAll('.site-host')).some(host=>!host.hidden);
+    site.hidden=!visible;
+  });
+}
+function updateSummaryFilterButtons(){
+  document.querySelectorAll('[data-live-filter]').forEach(btn=>{
+    const active=btn.dataset.liveFilter===activeLiveFilter;
+    btn.setAttribute('aria-pressed',active?'true':'false');
+  });
+}
+function applySurfaceFilters(write=true){
+  const q=activeSearch.trim().toLowerCase();
+  document.querySelectorAll('[data-host]').forEach(el=>{
+    if(el.dataset.mapLayer==='managed')return;
+    el.hidden=!hostMatchesSurface(el,q,activeLiveFilter);
+  });
+  updateGroupVisibility();
+  if(typeof window.pharosMapApplyFilter==='function')window.pharosMapApplyFilter(q,activeLiveFilter);
+  updateSummaryFilterButtons();
+  if(write){
+    setCookie('pharos_search',activeSearch);
+    setCookie('pharos_live_filter',activeLiveFilter);
+  }
+}
 function applyFilter(query,write=true){
-  const q=query.trim().toLowerCase();
-  document.querySelectorAll('[data-host]').forEach(el=>{el.hidden=q!==''&&!el.dataset.search.includes(q)});
+  activeSearch=query;
   const input=document.querySelector('[data-search]');
   if(input&&input.value!==query)input.value=query;
-  if(write)setCookie('pharos_search',query);
+  applySurfaceFilters(write);
+}
+function applyLiveFilter(filter,write=true){
+  activeLiveFilter=['all','live','stale','down','awaiting_first_heartbeat'].includes(filter)?filter:'all';
+  applySurfaceFilters(write);
 }
 function applySignalWindow(key,write=true){
   signalWindow=signalWindowByKey(key);
@@ -738,6 +783,7 @@ function updateUrlState(){
   const params=new URLSearchParams(location.search);
   params.set('view',main?.dataset.view||'grid');
   params.set('sort',sort);
+  params.set('filter',activeLiveFilter);
   params.set('signal',signalWindow.key);
   const url=location.pathname+'?'+params.toString();
   history.replaceState(null,'',url);
@@ -747,14 +793,17 @@ function initControls(){
   const view=params.get('view')||decodeURIComponent(cookie('pharos_view'))||'grid';
   const sort=params.get('sort')||decodeURIComponent(cookie('pharos_sort'))||'attention';
   const search=decodeURIComponent(cookie('pharos_search'));
+  const liveFilter=params.get('filter')||decodeURIComponent(cookie('pharos_live_filter'))||'all';
   const selectedSignalWindow=params.get('signal')||decodeURIComponent(cookie('pharos_signal_window'))||SIGNAL_WINDOWS[0].key;
   applyView(view,false);
   applySort(sort,false);
   applyFilter(search,false);
+  applyLiveFilter(liveFilter,false);
   applySignalWindow(selectedSignalWindow,false);
   document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
   document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
   document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
+  document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
   bindFreeformDrag();
 }
@@ -833,6 +882,7 @@ async function refresh(reason='manual'){
       }
     }
     applySort(document.querySelector('[data-sort]')?.value||'attention',false);
+    applySurfaceFilters(false);
   }catch(_){}
   finally{
     clearTimeout(timeout);
@@ -1751,10 +1801,10 @@ fn clock_label(timestamp: i64) -> String {
 }
 
 fn summary_cards(hosts: &[Host], self_name: &str, now: i64) -> String {
+    let total = hosts.len();
     let mut live = 0;
     let mut stale = 0;
     let mut down = 0;
-    let mut awaiting = 0;
     for h in hosts {
         let live_state = if h.name == self_name {
             Liveness::Live
@@ -1765,11 +1815,11 @@ fn summary_cards(hosts: &[Host], self_name: &str, now: i64) -> String {
             Liveness::Live => live += 1,
             Liveness::Stale => stale += 1,
             Liveness::Down => down += 1,
-            Liveness::AwaitingFirstHeartbeat => awaiting += 1,
+            Liveness::AwaitingFirstHeartbeat => {}
         }
     }
     format!(
-        r#"<section class="summary" aria-label="fleet summary"><div class="metric live"><b>{live}</b><span>Live</span></div><div class="metric stale"><b>{stale}</b><span>Stale</span></div><div class="metric down"><b>{down}</b><span>Down</span></div><div class="metric"><b>{awaiting}</b><span>Awaiting</span></div></section>"#
+        r#"<section class="summary" aria-label="host summary"><button class="metric" type="button" data-live-filter="all" aria-pressed="true"><b>{total}</b><span>All hosts</span></button><button class="metric live" type="button" data-live-filter="live" aria-pressed="false"><b>{live}</b><span>Live</span></button><button class="metric stale" type="button" data-live-filter="stale" aria-pressed="false"><b>{stale}</b><span>Stale</span></button><button class="metric down" type="button" data-live-filter="down" aria-pressed="false"><b>{down}</b><span>Down</span></button></section>"#
     )
 }
 
@@ -1834,12 +1884,27 @@ fn header(now: i64) -> String {
     )
 }
 
+fn search_box(placeholder: &str) -> String {
+    format!(
+        r#"<label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="{placeholder}"></label>"#,
+        search = icons::SEARCH,
+        placeholder = html_escape(placeholder)
+    )
+}
+
 fn toolbar() -> String {
     format!(
-        r#"<section class="toolbar" aria-label="fleet controls"><div class="toolbar-left"><div class="seg" role="group" aria-label="view"><button type="button" data-view-button="grid" aria-pressed="true" title="Grid view">{grid}</button><button type="button" data-view-button="list" aria-pressed="false" title="List view">{list}</button></div><label class="arrange">Arrange by <select data-sort aria-label="arrange by"><option value="attention">Needs attention</option><option value="name">Name</option><option value="last">Last change</option><option value="freeform">Freeform</option></select></label></div><div class="toolbar-right"><label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="Search hosts..."></label></div></section>"#,
+        r#"<section class="toolbar" aria-label="fleet controls"><div class="toolbar-left"><div class="seg" role="group" aria-label="view"><button type="button" data-view-button="grid" aria-pressed="true" title="Grid view">{grid}</button><button type="button" data-view-button="list" aria-pressed="false" title="List view">{list}</button></div><label class="arrange">Arrange by <select data-sort aria-label="arrange by"><option value="attention">Needs attention</option><option value="name">Name</option><option value="last">Last change</option><option value="freeform">Freeform</option></select></label></div><div class="toolbar-right">{search}</div></section>"#,
         grid = icons::GRID,
         list = icons::LIST,
-        search = icons::SEARCH
+        search = search_box("Search hosts...")
+    )
+}
+
+fn map_toolbar() -> String {
+    format!(
+        r#"<section class="toolbar" aria-label="map controls"><div class="toolbar-left"><span class="arrange">All servers stay visible unless filtered</span></div><div class="toolbar-right">{search}</div></section>"#,
+        search = search_box("Search hosts...")
     )
 }
 
@@ -2003,6 +2068,7 @@ struct MapHost {
     live: &'static str,
     status: &'static str,
     attention: String,
+    search: String,
     site_id: &'static str,
     site_label: &'static str,
     region: &'static str,
@@ -2372,12 +2438,24 @@ fn map_hosts(
                 .get(&host.name)
                 .cloned()
                 .unwrap_or_else(default_map_signal);
+            let search = format!(
+                "{} {} {} {} {} {} {}",
+                host.name,
+                host.role,
+                status,
+                attention.label,
+                site.label,
+                site.region,
+                outbound.label
+            )
+            .to_lowercase();
             MapHost {
                 name: host.name.clone(),
                 role: host.role.clone(),
                 live: live_key(live),
                 status,
                 attention: attention.label,
+                search,
                 site_id: site.id,
                 site_label: site.label,
                 region: site.region,
@@ -2422,10 +2500,12 @@ fn map_site_list(hosts: &[MapHost]) -> String {
                         other => other,
                     };
                     format!(
-                        r#"<a class="site-host" href="{href}" style="--host-state:var(--{state_var})" title="{name}: {attention}; {inbound_title}; {outbound_title}"><span class="site-host-name">{name}</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="{inbound_level}">in {inbound_label}</span><span class="site-host-ping" data-probe-level="{outbound_level}" data-policy="{outbound_policy}">out {outbound_label}</span></span></a>"#,
+                        r#"<a class="site-host" href="{href}" data-host="{name}" data-live="{live}" data-search="{search}" style="--host-state:var(--{state_var})" title="{name}: {attention}; {inbound_title}; {outbound_title}"><span class="site-host-name">{name}</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="{inbound_level}">in {inbound_label}</span><span class="site-host-ping" data-probe-level="{outbound_level}" data-policy="{outbound_policy}">out {outbound_label}</span></span></a>"#,
                         href = html_escape(&host.settings_href),
                         state_var = html_escape(state_var),
                         name = html_escape(&host.name),
+                        live = html_escape(host.live),
+                        search = html_escape(&host.search),
                         attention = html_escape(&host.attention),
                         inbound_title = html_escape(&host.inbound_title),
                         outbound_title = html_escape(&host.outbound_title),
@@ -2459,11 +2539,8 @@ fn render_map(
     let mapped = map_hosts(hosts, self_name, now, manifests, probes);
     let hosts_json = serde_json::to_string(&mapped).expect("map hosts serialize");
     let site_list = map_site_list(&mapped);
-    let location_count = mapped
-        .iter()
-        .map(|host| host.site_id)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    let summary = summary_cards(hosts, self_name, now);
+    let toolbar = map_toolbar();
     let leaflet_assets =
         r#"<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">"#;
     let head = head_with_extra(leaflet_assets);
@@ -2526,7 +2603,9 @@ function addPacket(path,id,dir,level,policy,reverse){
   motion.appendChild(mpath);
   circle.appendChild(motion);
   path.parentNode.appendChild(circle);
+  return circle;
 }
+function mapHostMatches(host,q,live){return (q===''||String(host.search||'').includes(q))&&(live==='all'||host.live===live)}
 function buildLabels(map,el){
   const layer=document.createElement('div');
   layer.className='map-label-layer';
@@ -2548,6 +2627,10 @@ function buildLabels(map,el){
     const link=document.createElement('a');
     link.className='map-node '+escapeHtml(host.live);
     link.href=host.settings_href;
+    link.dataset.host=host.name;
+    link.dataset.live=host.live;
+    link.dataset.search=host.search||'';
+    link.dataset.mapLayer='managed';
     link.innerHTML=nodeHtml(host);
     link.title=host.name+': '+host.status+'; '+host.inbound_title+'; '+host.outbound_title;
     link.setAttribute('aria-label',host.name+', '+host.status+', inbound '+host.inbound_label+', outbound '+host.outbound_label);
@@ -2555,7 +2638,7 @@ function buildLabels(map,el){
     leaders.appendChild(line);
     layer.appendChild(anchor);
     layer.appendChild(link);
-    return {host,idx,anchor,link,line,groupIndex,groupCount:(groups.get(key)||[]).length,w:100,h:38,r:58,x:0,y:0,ax:0,ay:0};
+    return {host,idx,anchor,link,line,groupIndex,groupCount:(groups.get(key)||[]).length,visible:true,w:100,h:38,r:58,x:0,y:0,ax:0,ay:0};
   });
   const pharosNode=nodes.find(node=>node.host.is_pharos)||nodes[0];
   const linksByHost=nodes.filter(node=>node!==pharosNode).map((node,idx)=>{
@@ -2567,9 +2650,10 @@ function buildLabels(map,el){
     path.dataset.outboundLevel=node.host.outbound_level;
     path.dataset.outboundPolicy=node.host.outbound_policy;
     links.appendChild(path);
-    if(node.host.inbound_level!=='wait')addPacket(path,id,'inbound',node.host.inbound_level,node.host.outbound_policy,true);
-    if(node.host.outbound_level==='good')addPacket(path,id,'outbound',node.host.outbound_level,node.host.outbound_policy,false);
-    return {node,path};
+    const packets=[];
+    if(node.host.inbound_level!=='wait')packets.push(addPacket(path,id,'inbound',node.host.inbound_level,node.host.outbound_policy,true));
+    if(node.host.outbound_level==='good')packets.push(addPacket(path,id,'outbound',node.host.outbound_level,node.host.outbound_policy,false));
+    return {node,path,packets};
   });
   let scheduled=false;
   function layout(){
@@ -2578,11 +2662,19 @@ function buildLabels(map,el){
     const height=el.clientHeight||520;
     links.setAttribute('viewBox','0 0 '+width+' '+height);
     leaders.setAttribute('viewBox','0 0 '+width+' '+height);
-    nodes.forEach(node=>{
+    const visibleNodes=nodes.filter(node=>node.visible!==false);
+    nodes.filter(node=>node.visible===false).forEach(node=>{
+      node.anchor.hidden=true;
+      node.link.hidden=true;
+      node.line.style.opacity='0';
+    });
+    visibleNodes.forEach(node=>{
       const point=map.latLngToContainerPoint([node.host.lat,node.host.lon]);
       const offset=seedOffset(node.groupIndex,node.groupCount);
       node.ax=point.x;
       node.ay=point.y;
+      node.anchor.hidden=false;
+      node.link.hidden=false;
       node.anchor.style.left=point.x+'px';
       node.anchor.style.top=point.y+'px';
       node.link.style.transform='translate(-1000px,-1000px)';
@@ -2594,15 +2686,15 @@ function buildLabels(map,el){
       node.y=clamp(point.y+offset.y,node.h/2+8,height-node.h/2-8);
     });
     if(window.d3&&d3.forceSimulation){
-      const simulation=d3.forceSimulation(nodes)
+      const simulation=d3.forceSimulation(visibleNodes)
         .force('x',d3.forceX(d=>d.ax+seedOffset(d.groupIndex,d.groupCount).x).strength(.18))
         .force('y',d3.forceY(d=>d.ay+seedOffset(d.groupIndex,d.groupCount).y).strength(.18))
         .force('collide',d3.forceCollide(d=>d.r).strength(1))
-        .force('bounds',forceBounds(nodes,width,height))
+        .force('bounds',forceBounds(visibleNodes,width,height))
         .stop();
       for(let i=0;i<90;i++)simulation.tick();
     }
-    nodes.forEach(node=>{
+    visibleNodes.forEach(node=>{
       node.x=clamp(node.x,node.w/2+8,width-node.w/2-8);
       node.y=clamp(node.y,node.h/2+8,height-node.h/2-8);
       const left=node.x-node.w/2;
@@ -2617,6 +2709,10 @@ function buildLabels(map,el){
     });
     if(pharosNode){
       linksByHost.forEach(link=>{
+        const visible=pharosNode.visible!==false&&link.node.visible!==false;
+        link.path.style.display=visible?'':'none';
+        link.packets.forEach(packet=>{packet.style.display=visible?'':'none'});
+        if(!visible)return;
         link.path.setAttribute('d',curvePath(pharosNode,link.node));
       });
     }
@@ -2628,6 +2724,12 @@ function buildLabels(map,el){
   }
   map.on('move zoom moveend zoomend resize viewreset',scheduleLayout);
   window.addEventListener('resize',scheduleLayout);
+  window.pharosMapApplyFilter=(q='',live='all')=>{
+    nodes.forEach(node=>{
+      node.visible=mapHostMatches(node.host,q,live);
+    });
+    scheduleLayout();
+  };
   scheduleLayout();
   return scheduleLayout;
 }
@@ -2644,6 +2746,7 @@ function exitFullscreen(){
 }
 const MAP_VIEWPORT_STORAGE='pharos.map.viewport.v1';
 const MAP_MODE_STORAGE='pharos.map.mode.v1';
+const MAP_LABEL_DENSITY_STORAGE='pharos.map.labelDensity.v1';
 function storageGet(key){try{return window.localStorage.getItem(key)}catch(_){return null}}
 function storageSet(key,value){try{window.localStorage.setItem(key,value)}catch(_){}}
 function storedMapMode(){
@@ -2652,6 +2755,12 @@ function storedMapMode(){
 }
 function storeMapMode(mode){
   storageSet(MAP_MODE_STORAGE,mode==='standard'?'standard':'maximized');
+}
+function storedMapLabelDensity(){
+  return storageGet(MAP_LABEL_DENSITY_STORAGE)==='compact'?'compact':'normal';
+}
+function storeMapLabelDensity(density){
+  storageSet(MAP_LABEL_DENSITY_STORAGE,density==='compact'?'compact':'normal');
 }
 function storedViewport(){
   try{
@@ -2681,6 +2790,7 @@ function setupMapModes(map,el,relayout){
   const layout=document.querySelector('[data-map-layout]');
   const main=document.querySelector('[data-map-view]');
   const buttons=Array.from(document.querySelectorAll('[data-map-mode-button]'));
+  const densityButton=document.querySelector('[data-map-density-button]');
   if(!panel||!layout||!main||!buttons.length)return;
   let mode='standard';
   let beforeFullscreen='standard';
@@ -2720,6 +2830,16 @@ function setupMapModes(map,el,relayout){
   buttons.forEach(button=>{
     button.addEventListener('click',()=>setMode(button.dataset.mapModeButton||'standard'));
   });
+  function setDensity(next){
+    const density=next==='compact'?'compact':'normal';
+    panel.dataset.labelDensity=density;
+    if(densityButton)densityButton.setAttribute('aria-pressed',density==='compact'?'true':'false');
+    storeMapLabelDensity(density);
+    resizeSoon();
+  }
+  densityButton?.addEventListener('click',()=>{
+    setDensity(panel.dataset.labelDensity==='compact'?'normal':'compact');
+  });
   function onFullscreenChange(){
     if(fullscreenElement()===panel){
       commit('fullscreen');
@@ -2732,6 +2852,7 @@ function setupMapModes(map,el,relayout){
   document.addEventListener('fullscreenchange',onFullscreenChange);
   document.addEventListener('webkitfullscreenchange',onFullscreenChange);
   commit(storedMapMode());
+  setDensity(storedMapLabelDensity());
 }
 function initMap(){
   const el=document.getElementById('fleet-map');
@@ -2754,15 +2875,16 @@ initMap();
 </script>"#
         .replace("__MAP_HOSTS__", &hosts_json);
     format!(
-        r#"{head}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div><section class="summary" aria-label="map summary"><div class="metric live"><b>{host_count}</b><span>Hosts</span></div><div class="metric stale"><b>{location_count}</b><span>Locations</span></div><div class="metric"><b>{host_count}</b><span>Labels</span></div><div class="metric"><b>0</b><span>Clusters</span></div></section><section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">All servers stay visible; labels are separated by D3 force layout with leader lines.</div></aside></section></main>{map_script}{FOOT}"#,
+        r#"{head}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof">as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available.</p></div></div></div><aside class="site-panel" aria-label="server locations"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list">{site_list}</div><div class="map-note">All servers stay visible; labels are separated by D3 force layout with leader lines.</div></aside></section></main>{map_script}{FOOT}"#,
         head = head,
         sidebar = sidebar(user_label, logout_enabled, "map"),
         as_of = clock_label(now),
-        host_count = mapped.len(),
-        location_count = location_count,
+        summary = summary,
+        toolbar = toolbar,
         standard_icon = icons::PANEL_RIGHT,
         maximize_icon = icons::MAXIMIZE_2,
         fullscreen_icon = icons::FULLSCREEN,
+        compact_icon = icons::LIST,
     )
 }
 
@@ -3109,12 +3231,12 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -3494,9 +3616,19 @@ mod tests {
         assert!(html.contains(r#"data-map-mode-button="standard""#));
         assert!(html.contains(r#"data-map-mode-button="maximized""#));
         assert!(html.contains(r#"data-map-mode-button="fullscreen""#));
+        assert!(html.contains(r#"data-map-density-button"#));
+        assert!(html.contains("const MAP_LABEL_DENSITY_STORAGE='pharos.map.labelDensity.v1'"));
+        assert!(html.contains("window.pharosMapApplyFilter"));
+        assert!(html.contains("dataset.mapLayer='managed'"));
+        assert!(html.contains(r#"class="toolbar" aria-label="map controls""#));
+        assert!(html.contains(r#"placeholder="Search hosts...""#));
+        assert!(html.contains(r#"data-live-filter="all""#));
+        assert!(html.contains(r#"data-live-filter="live""#));
         assert!(html.contains("requestFullscreen(panel)"));
         assert!(html.contains("map.invalidateSize()"));
-        assert!(html.contains(".fleet-map{flex:1 1 auto;height:auto;min-height:560px"));
+        assert!(html.contains(".fleet-map{flex:1 1 auto;height:100%;min-height:560px"));
+        assert!(html.contains(".map-mode-controls{position:absolute;right:12px;top:12px"));
+        assert!(html.contains(r#".map-panel[data-label-density="compact"] .map-node"#));
         assert!(html.contains("data-dir=\"in\""));
         assert!(html.contains("data-dir=\"out\""));
         assert!(!html.contains("markercluster"));
@@ -3510,11 +3642,13 @@ mod tests {
         assert!(html.contains(r#""inbound_label":"30s""#));
         assert!(html.contains(r#""outbound_label":"blocked""#));
         assert!(html.contains(r#""outbound_policy":"blocked""#));
+        assert!(html.contains(r#""search":"csb1 server live"#));
         assert!(html.contains(r#"data-probe-level="wait" data-policy="blocked">out blocked"#));
         assert!(html.contains(r#"data-probe-level="warn" data-policy="unknown">out timeout"#));
+        assert!(html.contains(r#"data-host="hsb8" data-live="live" data-search="hsb8 parents&#39; home live"#));
         assert!(html.contains("Parents&#39; home"));
-        assert!(html.contains(r#"<b>5</b><span>Labels</span>"#));
-        assert!(html.contains(r#"<b>0</b><span>Clusters</span>"#));
+        assert!(html.contains(r#"<b>5</b><span>All hosts</span>"#));
+        assert!(html.contains(r#"<b>4</b><span>Live</span>"#));
         assert!(html.contains(r#"style="--host-state:var(--wait)""#));
         assert!(html.contains("Approximate site-level coordinates."));
         assert!(html.contains("All servers stay visible"));
