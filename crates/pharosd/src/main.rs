@@ -1304,8 +1304,10 @@ async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl 
         state.manifests.manifests(),
         state.manifests.load_errors(),
         &probes,
-        &user_label,
-        state.auth.is_some(),
+        ShellContext {
+            user_label: &user_label,
+            logout_enabled: state.auth.is_some(),
+        },
     ))
 }
 
@@ -1321,8 +1323,10 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
         state.manifests.manifests(),
         state.manifests.load_errors(),
         &probes,
-        &user_label,
-        state.auth.is_some(),
+        ShellContext {
+            user_label: &user_label,
+            logout_enabled: state.auth.is_some(),
+        },
     ))
 }
 
@@ -1976,6 +1980,12 @@ fn page_header(title: &str, subtitle: &str, now: i64) -> String {
 
 fn header(now: i64) -> String {
     page_header("Fleet", "All hosts at a glance", now)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShellContext<'a> {
+    user_label: &'a str,
+    logout_enabled: bool,
 }
 
 fn search_box(placeholder: &str) -> String {
@@ -2645,6 +2655,28 @@ struct ActivityEvent {
     source: &'static str,
 }
 
+impl ActivityEvent {
+    fn new(
+        timestamp: i64,
+        host: impl Into<String>,
+        level: &'static str,
+        kind: &'static str,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        source: &'static str,
+    ) -> Self {
+        Self {
+            timestamp,
+            host: host.into(),
+            level,
+            kind,
+            title: title.into(),
+            detail: detail.into(),
+            source,
+        }
+    }
+}
+
 fn level_rank(level: &str) -> usize {
     match level {
         "critical" => 0,
@@ -2983,40 +3015,18 @@ fn render_alerts(
     manifests: &[HostManifest],
     load_errors: &[ManifestLoadIssue],
     server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
-    user_label: &str,
-    logout_enabled: bool,
+    shell: ShellContext<'_>,
 ) -> String {
     let alerts = alert_items(hosts, self_name, now, manifests, load_errors, server_probes);
     let rows = render_alert_rows(&alerts);
     format!(
         r#"{HEAD}{sidebar}<main class="ops-main">{header}{summary}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div></section>{posture}</section></main></div></body></html>"#,
-        sidebar = sidebar(user_label, logout_enabled, "alerts"),
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, "alerts"),
         header = page_header("Alerts", "Needs attention", now),
         summary = ops_summary_metrics(&alerts, hosts),
         count = alerts.len(),
         posture = posture_panel(&alerts, hosts)
     )
-}
-
-fn add_activity_event(
-    events: &mut Vec<ActivityEvent>,
-    timestamp: i64,
-    host: impl Into<String>,
-    level: &'static str,
-    kind: &'static str,
-    title: impl Into<String>,
-    detail: impl Into<String>,
-    source: &'static str,
-) {
-    events.push(ActivityEvent {
-        timestamp,
-        host: host.into(),
-        level,
-        kind,
-        title: title.into(),
-        detail: detail.into(),
-        source,
-    });
 }
 
 fn activity_events(
@@ -3030,8 +3040,7 @@ fn activity_events(
     let mut events = Vec::new();
 
     for issue in load_errors {
-        add_activity_event(
-            &mut events,
+        events.push(ActivityEvent::new(
             now,
             "Pharos",
             "critical",
@@ -3039,12 +3048,11 @@ fn activity_events(
             "Manifest load failed",
             format!("{} - {}", issue.path, issue.error),
             "config",
-        );
+        ));
     }
 
     for manifest in manifests {
-        add_activity_event(
-            &mut events,
+        events.push(ActivityEvent::new(
             now,
             manifest.host.name.clone(),
             "info",
@@ -3052,7 +3060,7 @@ fn activity_events(
             "Declared host manifest loaded",
             format!("{} declared services", manifest.services.len()),
             "config",
-        );
+        ));
     }
 
     for host in hosts {
@@ -3063,8 +3071,7 @@ fn activity_events(
             liveness(host.last_seen, host.heartbeat_interval_secs, now)
         };
         match live {
-            Liveness::Down => add_activity_event(
-                &mut events,
+            Liveness::Down => events.push(ActivityEvent::new(
                 now,
                 host.name.clone(),
                 "critical",
@@ -3072,9 +3079,8 @@ fn activity_events(
                 "No heartbeat received",
                 format!("Last report was {}", seen_label(host.last_seen, now)),
                 "heartbeat",
-            ),
-            Liveness::Stale => add_activity_event(
-                &mut events,
+            )),
+            Liveness::Stale => events.push(ActivityEvent::new(
                 now,
                 host.name.clone(),
                 "warning",
@@ -3082,9 +3088,8 @@ fn activity_events(
                 "Heartbeat lateness detected",
                 format!("Last report was {}", seen_label(host.last_seen, now)),
                 "heartbeat",
-            ),
-            Liveness::AwaitingFirstHeartbeat => add_activity_event(
-                &mut events,
+            )),
+            Liveness::AwaitingFirstHeartbeat => events.push(ActivityEvent::new(
                 now,
                 host.name.clone(),
                 "watch",
@@ -3092,14 +3097,13 @@ fn activity_events(
                 "Awaiting first heartbeat",
                 "Host exists but has not reported yet.",
                 "heartbeat",
-            ),
+            )),
             Liveness::Live => {}
         }
 
         let samples = heartbeat_samples(&host.heartbeat_log, host.last_seen);
         for stamp in samples.iter().rev().take(4) {
-            add_activity_event(
-                &mut events,
+            events.push(ActivityEvent::new(
                 *stamp,
                 host.name.clone(),
                 if is_self { "recovery" } else { "info" },
@@ -3111,12 +3115,11 @@ fn activity_events(
                 },
                 format!("{} checked in at {}", host.name, clock_label(*stamp)),
                 "heartbeat",
-            );
+            ));
         }
 
         if let Some((level, issue, _action)) = freshness_alert(&host.freshness) {
-            add_activity_event(
-                &mut events,
+            events.push(ActivityEvent::new(
                 host.last_seen.unwrap_or(now),
                 host.name.clone(),
                 level,
@@ -3124,13 +3127,12 @@ fn activity_events(
                 "Freshness drift detected",
                 issue,
                 "freshness",
-            );
+            ));
         }
 
         for observation in &host.service_observations {
             if observation.state == ServiceObservationState::Healthy {
-                add_activity_event(
-                    &mut events,
+                events.push(ActivityEvent::new(
                     host.last_seen.unwrap_or(now),
                     host.name.clone(),
                     "info",
@@ -3138,15 +3140,14 @@ fn activity_events(
                     format!("{} is healthy", observation.label),
                     observation.summary.clone(),
                     "service",
-                );
+                ));
             } else {
                 let level = match observation.state {
                     ServiceObservationState::Warning | ServiceObservationState::Stale => "warning",
                     ServiceObservationState::Unknown => "watch",
                     ServiceObservationState::Healthy => "info",
                 };
-                add_activity_event(
-                    &mut events,
+                events.push(ActivityEvent::new(
                     host.last_seen.unwrap_or(now),
                     host.name.clone(),
                     level,
@@ -3154,7 +3155,7 @@ fn activity_events(
                     format!("{} {}", observation.label, observation.state.label()),
                     observation.summary.clone(),
                     "service",
-                );
+                ));
             }
         }
     }
@@ -3166,8 +3167,7 @@ fn activity_events(
                 ServiceObservationState::Warning | ServiceObservationState::Stale => "warning",
                 ServiceObservationState::Unknown => "watch",
             };
-            add_activity_event(
-                &mut events,
+            events.push(ActivityEvent::new(
                 probe.checked_at,
                 host.clone(),
                 level,
@@ -3175,7 +3175,7 @@ fn activity_events(
                 format!("{} probe {}", probe.service, probe.state.label()),
                 probe.summary.clone(),
                 "probe",
-            );
+            ));
         }
     }
 
@@ -3264,14 +3264,13 @@ fn render_activity(
     manifests: &[HostManifest],
     load_errors: &[ManifestLoadIssue],
     server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
-    user_label: &str,
-    logout_enabled: bool,
+    shell: ShellContext<'_>,
 ) -> String {
     let events = activity_events(hosts, self_name, now, manifests, load_errors, server_probes);
     let rows = activity_rows(&events);
     format!(
         r#"{HEAD}{sidebar}<main class="ops-main">{header}{summary}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
-        sidebar = sidebar(user_label, logout_enabled, "activity"),
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
         header = page_header("Activity", "Operational timeline", now),
         summary = activity_summary_metrics(&events),
         count = events.len(),
@@ -4331,8 +4330,10 @@ mod tests {
             &[manifest],
             &[load_error],
             &probes,
-            "markus",
-            true,
+            ShellContext {
+                user_label: "markus",
+                logout_enabled: true,
+            },
         );
 
         assert!(html.contains(r#"href="/alerts" aria-current="page""#));
@@ -4450,8 +4451,10 @@ mod tests {
             &[manifest],
             &[],
             &probes,
-            "markus",
-            true,
+            ShellContext {
+                user_label: "markus",
+                logout_enabled: true,
+            },
         );
 
         assert!(html.contains(r#"href="/activity" aria-current="page""#));
