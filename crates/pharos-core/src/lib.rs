@@ -155,6 +155,8 @@ pub const SERVER_LIFECYCLE_SCHEMA: &str = "inspr.pharos.server-lifecycle.v1";
 pub const SERVER_LIFECYCLE_VERSION: u16 = 1;
 pub const PROVISIONING_JOB_SCHEMA: &str = "inspr.pharos.provisioning-job.v1";
 pub const PROVISIONING_JOB_VERSION: u16 = 1;
+pub const EXISTING_HOST_PREFLIGHT_SCHEMA: &str = "inspr.pharos.existing-host-preflight.v1";
+pub const EXISTING_HOST_PREFLIGHT_VERSION: u16 = 1;
 
 fn default_server_lifecycle_schema() -> String {
     SERVER_LIFECYCLE_SCHEMA.to_string()
@@ -170,6 +172,14 @@ fn default_provisioning_job_schema() -> String {
 
 fn default_provisioning_job_version() -> u16 {
     PROVISIONING_JOB_VERSION
+}
+
+fn default_existing_host_preflight_schema() -> String {
+    EXISTING_HOST_PREFLIGHT_SCHEMA.to_string()
+}
+
+fn default_existing_host_preflight_version() -> u16 {
+    EXISTING_HOST_PREFLIGHT_VERSION
 }
 
 /// Provider/server intent for onboarding jobs. It is not embedded in
@@ -336,7 +346,7 @@ pub struct SshAccessIntent {
 }
 
 impl SshAccessIntent {
-    fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
         if matches!(
             self.route,
             SshRoute::Direct | SshRoute::Tailnet | SshRoute::Bastion
@@ -346,6 +356,203 @@ impl SshAccessIntent {
         }
         Ok(())
     }
+}
+
+/// Read-only facts used to decide whether an existing host can be bootstrapped.
+/// These are observations or operator-provided facts only; credentials and raw
+/// token material must never be sent in this request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingHostPreflightFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_authenticated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixos: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_disk_gib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pharos_reachable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingHostPreflightRequest {
+    #[serde(default = "default_existing_host_preflight_schema")]
+    pub schema: String,
+    #[serde(default = "default_existing_host_preflight_version")]
+    pub version: u16,
+    pub host_name: String,
+    pub ssh: SshAccessIntent,
+    #[serde(default)]
+    pub facts: ExistingHostPreflightFacts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pharos_url: Option<String>,
+}
+
+impl ExistingHostPreflightRequest {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        validate_preflight_schema_version(&self.schema, self.version)?;
+        if !safe_preflight_text(&self.host_name) {
+            return Err("preflight host_name must be plain non-secret text".to_string());
+        }
+        self.ssh
+            .validate_contract()
+            .map_err(|error| error.to_string())?;
+        for value in [
+            self.ssh.user.as_deref(),
+            self.ssh.host.as_deref(),
+            self.facts.os_family.as_deref(),
+            self.pharos_url.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !safe_preflight_text(value) {
+                return Err("preflight request contains unsafe text".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreflightCheckState {
+    Pass,
+    Warn,
+    Fail,
+    Unknown,
+}
+
+impl PreflightCheckState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingHostPreflightCheck {
+    pub key: String,
+    pub label: String,
+    pub state: PreflightCheckState,
+    pub message: String,
+}
+
+impl ExistingHostPreflightCheck {
+    fn validate_contract(&self) -> Result<(), String> {
+        for value in [&self.key, &self.label, self.state.label(), &self.message] {
+            if !safe_preflight_text(value) {
+                return Err("preflight check must be plain non-secret text".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingHostBootstrapOption {
+    pub method: BootstrapMethod,
+    pub label: String,
+    pub available: bool,
+    pub message: String,
+}
+
+impl ExistingHostBootstrapOption {
+    fn validate_contract(&self) -> Result<(), String> {
+        for value in [&self.label, &self.message] {
+            if !safe_preflight_text(value) {
+                return Err("bootstrap option must be plain non-secret text".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingHostPreflightSummary {
+    pub state: PreflightCheckState,
+    pub label: String,
+    pub message: String,
+}
+
+impl ExistingHostPreflightSummary {
+    fn validate_contract(&self) -> Result<(), String> {
+        for value in [&self.label, &self.message] {
+            if !safe_preflight_text(value) {
+                return Err("preflight summary must be plain non-secret text".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingHostPreflightReport {
+    #[serde(default = "default_existing_host_preflight_schema")]
+    pub schema: String,
+    #[serde(default = "default_existing_host_preflight_version")]
+    pub version: u16,
+    pub host_name: String,
+    pub checked_at: UnixSeconds,
+    pub summary: ExistingHostPreflightSummary,
+    #[serde(default)]
+    pub checks: Vec<ExistingHostPreflightCheck>,
+    #[serde(default)]
+    pub bootstrap_options: Vec<ExistingHostBootstrapOption>,
+    pub next_action: String,
+}
+
+impl ExistingHostPreflightReport {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        validate_preflight_schema_version(&self.schema, self.version)?;
+        if !safe_preflight_text(&self.host_name) {
+            return Err("preflight report host_name must be plain non-secret text".to_string());
+        }
+        self.summary.validate_contract()?;
+        for check in &self.checks {
+            check.validate_contract()?;
+        }
+        for option in &self.bootstrap_options {
+            option.validate_contract()?;
+        }
+        if !safe_preflight_text(&self.next_action) {
+            return Err("preflight next_action must be plain non-secret text".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn validate_preflight_schema_version(schema: &str, version: u16) -> Result<(), String> {
+    if schema != EXISTING_HOST_PREFLIGHT_SCHEMA {
+        return Err(format!(
+            "unsupported preflight schema {schema:?}; expected {EXISTING_HOST_PREFLIGHT_SCHEMA:?}"
+        ));
+    }
+    if version != EXISTING_HOST_PREFLIGHT_VERSION {
+        return Err(format!(
+            "unsupported preflight version {version}; expected {EXISTING_HOST_PREFLIGHT_VERSION}"
+        ));
+    }
+    Ok(())
+}
+
+fn safe_preflight_text(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && !value.contains('\n')
+        && !value.contains('\r')
+        && !looks_like_secret_material(value)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1568,6 +1775,65 @@ mod tests {
             empty_provider.validate_contract(),
             Err(ServerLifecycleContractError::EmptyProvider)
         );
+    }
+
+    #[test]
+    fn existing_host_preflight_contract_is_plain_and_actionable() {
+        let request = ExistingHostPreflightRequest {
+            schema: EXISTING_HOST_PREFLIGHT_SCHEMA.to_string(),
+            version: EXISTING_HOST_PREFLIGHT_VERSION,
+            host_name: "legacy-1".to_string(),
+            ssh: SshAccessIntent {
+                route: SshRoute::Tailnet,
+                user: Some("mba".to_string()),
+                host: Some("legacy-1.ts.barta.cm".to_string()),
+                port: Some(22),
+            },
+            facts: ExistingHostPreflightFacts {
+                ssh_authenticated: Some(true),
+                root: Some(false),
+                sudo: Some(true),
+                os_family: Some("linux".to_string()),
+                nixos: Some(false),
+                nix_available: Some(true),
+                free_disk_gib: Some(12),
+                pharos_reachable: Some(true),
+            },
+            pharos_url: Some("https://pharos.barta.cm/report".to_string()),
+        };
+        request.validate_contract().expect("request is valid");
+
+        let report = ExistingHostPreflightReport {
+            schema: EXISTING_HOST_PREFLIGHT_SCHEMA.to_string(),
+            version: EXISTING_HOST_PREFLIGHT_VERSION,
+            host_name: "legacy-1".to_string(),
+            checked_at: 1_700_000_000,
+            summary: ExistingHostPreflightSummary {
+                state: PreflightCheckState::Pass,
+                label: "Ready".to_string(),
+                message: "Choose a bootstrap method; no token has been registered yet.".to_string(),
+            },
+            checks: vec![ExistingHostPreflightCheck {
+                key: "ssh-authentication".to_string(),
+                label: "SSH authentication".to_string(),
+                state: PreflightCheckState::Pass,
+                message: "SSH authentication has been verified.".to_string(),
+            }],
+            bootstrap_options: vec![ExistingHostBootstrapOption {
+                method: BootstrapMethod::NativeSystemd,
+                label: "Native beacon".to_string(),
+                available: true,
+                message: "Use this when the host should keep its current OS.".to_string(),
+            }],
+            next_action: "Choose NixOS/declarative or native beacon bootstrap.".to_string(),
+        };
+        report.validate_contract().expect("report is valid");
+
+        let raw_secret = ExistingHostPreflightRequest {
+            host_name: "legacy-1 token=raw".to_string(),
+            ..request
+        };
+        assert!(raw_secret.validate_contract().is_err());
     }
 
     #[test]

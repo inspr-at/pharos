@@ -29,11 +29,15 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, Host, HostLocation, HostLocationSource, HostManifest, HostRegistration,
-    HostRegistrationResponse, HostReport, Liveness, ManifestLocationMode, ManifestProbePolicy,
-    ManifestService, ManifestStatusSource, NixFreshness, ProvisioningJob, ProvisioningJobState,
-    ProvisioningProgressEntry, ServiceObservation, ServiceObservationState, HOST_MANIFEST_SCHEMA,
-    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    liveness, BootstrapMethod, ExistingHostBootstrapOption, ExistingHostPreflightCheck,
+    ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
+    ExistingHostPreflightSummary, Host, HostLocation, HostLocationSource, HostManifest,
+    HostRegistration, HostRegistrationResponse, HostReport, Liveness, ManifestLocationMode,
+    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
+    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ServiceObservation,
+    ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2689,6 +2693,406 @@ async fn provisioning_job_json(
             no_store_headers(),
             Json(json!({ "error": "provisioning job not found" })),
         ),
+    }
+}
+
+async fn existing_host_preflight_json(
+    Json(request): Json<ExistingHostPreflightRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = request.validate_contract() {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": error })),
+        );
+    }
+    let report = existing_host_preflight_report(&request, now_unix()).await;
+    match report.validate_contract() {
+        Ok(()) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "preflight": report })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            no_store_headers(),
+            Json(json!({ "error": error })),
+        ),
+    }
+}
+
+async fn existing_host_preflight_report(
+    request: &ExistingHostPreflightRequest,
+    now: i64,
+) -> ExistingHostPreflightReport {
+    let mut checks = Vec::new();
+    let ssh_tcp_state = match preflight_ssh_endpoint(request) {
+        Some((host, port)) => {
+            let started = Instant::now();
+            match timeout(
+                SERVER_PROBE_TIMEOUT,
+                TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    let elapsed_ms = started.elapsed().as_millis().max(1);
+                    PreflightCheckState::Pass.with_message(format!(
+                        "SSH port is reachable from Pharos in {elapsed_ms} ms."
+                    ))
+                }
+                Ok(Err(_)) => PreflightCheckState::Fail
+                    .with_message("Pharos cannot open the SSH port for this host.".to_string()),
+                Err(_) => PreflightCheckState::Fail
+                    .with_message("Pharos timed out while checking the SSH port.".to_string()),
+            }
+        }
+        None => PreflightCheckState::Unknown
+            .with_message("Add an SSH target before automated bootstrap is offered.".to_string()),
+    };
+    checks.push(preflight_check(
+        "ssh-reachability",
+        "SSH reachability",
+        ssh_tcp_state.0,
+        ssh_tcp_state.1,
+    ));
+    checks.push(preflight_bool_check(
+        "ssh-authentication",
+        "SSH authentication",
+        request.facts.ssh_authenticated,
+        "SSH authentication has been verified.",
+        "SSH authentication failed or is not available.",
+        "Verify SSH login without sending any password or key material to Pharos.",
+    ));
+    checks.push(privilege_check(&request.facts));
+    checks.push(os_family_check(&request.facts));
+    checks.push(nix_capability_check(&request.facts));
+    checks.push(disk_check(&request.facts));
+    checks.push(preflight_bool_check(
+        "pharos-reachability",
+        "Host can reach Pharos",
+        request.facts.pharos_reachable,
+        "The host can reach the Pharos report endpoint.",
+        "The host cannot reach Pharos yet.",
+        "Confirm outbound HTTPS from the host to Pharos before registering a beacon.",
+    ));
+
+    let bootstrap_options = bootstrap_options(&request.facts, &checks);
+    let summary = preflight_summary(&checks);
+    let next_action = preflight_next_action(&summary, &bootstrap_options).to_string();
+    ExistingHostPreflightReport {
+        schema: EXISTING_HOST_PREFLIGHT_SCHEMA.to_string(),
+        version: EXISTING_HOST_PREFLIGHT_VERSION,
+        host_name: request.host_name.trim().to_string(),
+        checked_at: now,
+        summary,
+        checks,
+        bootstrap_options,
+        next_action,
+    }
+}
+
+fn preflight_ssh_endpoint(request: &ExistingHostPreflightRequest) -> Option<(String, u16)> {
+    if matches!(request.ssh.route, SshRoute::None | SshRoute::Unknown) {
+        return None;
+    }
+    request
+        .ssh
+        .host
+        .as_deref()
+        .and_then(|host| split_probe_host_port(host, request.ssh.port.unwrap_or(22)))
+}
+
+fn preflight_check(
+    key: &str,
+    label: &str,
+    state: PreflightCheckState,
+    message: String,
+) -> ExistingHostPreflightCheck {
+    ExistingHostPreflightCheck {
+        key: key.to_string(),
+        label: label.to_string(),
+        state,
+        message,
+    }
+}
+
+trait PreflightStateMessage {
+    fn with_message(self, message: String) -> (PreflightCheckState, String);
+}
+
+impl PreflightStateMessage for PreflightCheckState {
+    fn with_message(self, message: String) -> (PreflightCheckState, String) {
+        (self, message)
+    }
+}
+
+fn preflight_bool_check(
+    key: &str,
+    label: &str,
+    value: Option<bool>,
+    pass: &str,
+    fail: &str,
+    unknown: &str,
+) -> ExistingHostPreflightCheck {
+    match value {
+        Some(true) => preflight_check(key, label, PreflightCheckState::Pass, pass.to_string()),
+        Some(false) => preflight_check(key, label, PreflightCheckState::Fail, fail.to_string()),
+        None => preflight_check(
+            key,
+            label,
+            PreflightCheckState::Unknown,
+            unknown.to_string(),
+        ),
+    }
+}
+
+fn privilege_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
+    match (facts.root, facts.sudo) {
+        (Some(true), _) => preflight_check(
+            "privilege",
+            "Privilege model",
+            PreflightCheckState::Pass,
+            "Root access is available for bootstrap.".to_string(),
+        ),
+        (_, Some(true)) => preflight_check(
+            "privilege",
+            "Privilege model",
+            PreflightCheckState::Pass,
+            "The SSH user can elevate with sudo.".to_string(),
+        ),
+        (Some(false), Some(false)) => preflight_check(
+            "privilege",
+            "Privilege model",
+            PreflightCheckState::Fail,
+            "Automated bootstrap needs root or sudo access.".to_string(),
+        ),
+        _ => preflight_check(
+            "privilege",
+            "Privilege model",
+            PreflightCheckState::Unknown,
+            "Verify root or sudo capability before choosing an automated path.".to_string(),
+        ),
+    }
+}
+
+fn os_family_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
+    let Some(os) = facts.os_family.as_deref().map(str::trim) else {
+        return preflight_check(
+            "os-family",
+            "Operating system",
+            PreflightCheckState::Unknown,
+            "Identify the host operating system before bootstrap.".to_string(),
+        );
+    };
+    let lowered = os.to_ascii_lowercase();
+    if lowered.contains("linux") || lowered.contains("nixos") {
+        preflight_check(
+            "os-family",
+            "Operating system",
+            PreflightCheckState::Pass,
+            format!("{os} is a supported existing-host target."),
+        )
+    } else if lowered.contains("darwin")
+        || lowered.contains("macos")
+        || lowered.contains("windows")
+        || lowered.contains("bsd")
+    {
+        preflight_check(
+            "os-family",
+            "Operating system",
+            PreflightCheckState::Fail,
+            format!("{os} is not supported by the automated existing-host bootstrap path."),
+        )
+    } else {
+        preflight_check(
+            "os-family",
+            "Operating system",
+            PreflightCheckState::Warn,
+            format!("{os} needs manual review before automated bootstrap."),
+        )
+    }
+}
+
+fn nix_capability_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
+    match (facts.nixos, facts.nix_available) {
+        (Some(true), _) => preflight_check(
+            "nix-capability",
+            "Nix capability",
+            PreflightCheckState::Pass,
+            "NixOS is already detected.".to_string(),
+        ),
+        (Some(false), Some(true)) => preflight_check(
+            "nix-capability",
+            "Nix capability",
+            PreflightCheckState::Warn,
+            "Nix is available, but the host is not confirmed as NixOS.".to_string(),
+        ),
+        (Some(false), Some(false)) => preflight_check(
+            "nix-capability",
+            "Nix capability",
+            PreflightCheckState::Warn,
+            "Nix is not detected; use native beacon or manual bootstrap unless converting the host.".to_string(),
+        ),
+        _ => preflight_check(
+            "nix-capability",
+            "Nix capability",
+            PreflightCheckState::Unknown,
+            "Check whether the host is NixOS or can run the portable beacon.".to_string(),
+        ),
+    }
+}
+
+fn disk_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
+    match facts.free_disk_gib {
+        Some(gib) if gib >= 8 => preflight_check(
+            "disk-space",
+            "Disk headroom",
+            PreflightCheckState::Pass,
+            format!("{gib} GiB free is enough for setup checks."),
+        ),
+        Some(gib) if gib >= 4 => preflight_check(
+            "disk-space",
+            "Disk headroom",
+            PreflightCheckState::Warn,
+            format!("{gib} GiB free is tight; review before bootstrap."),
+        ),
+        Some(gib) => preflight_check(
+            "disk-space",
+            "Disk headroom",
+            PreflightCheckState::Fail,
+            format!("{gib} GiB free is too little for a safe bootstrap."),
+        ),
+        None => preflight_check(
+            "disk-space",
+            "Disk headroom",
+            PreflightCheckState::Unknown,
+            "Check free disk space before installing or converting the host.".to_string(),
+        ),
+    }
+}
+
+fn bootstrap_options(
+    facts: &ExistingHostPreflightFacts,
+    checks: &[ExistingHostPreflightCheck],
+) -> Vec<ExistingHostBootstrapOption> {
+    let ssh_reachable = check_passed(checks, "ssh-reachability");
+    let auth_ok = facts.ssh_authenticated == Some(true);
+    let privilege_ok = facts.root == Some(true) || facts.sudo == Some(true);
+    let disk_ok = !check_failed(checks, "disk-space");
+    let os_supported = check_passed(checks, "os-family") || facts.os_family.is_none();
+    let linuxish = facts
+        .os_family
+        .as_deref()
+        .map(|os| {
+            let os = os.to_ascii_lowercase();
+            os.contains("linux") || os.contains("nixos")
+        })
+        .unwrap_or(false);
+    let automated_ready = ssh_reachable && auth_ok && privilege_ok && disk_ok && os_supported;
+    vec![
+        ExistingHostBootstrapOption {
+            method: BootstrapMethod::NixosAnywhere,
+            label: "NixOS / declarative".to_string(),
+            available: automated_ready && linuxish,
+            message: if automated_ready && linuxish {
+                "Use this when the host should be managed declaratively.".to_string()
+            } else {
+                "Needs reachable SSH, authentication, privilege, Linux/NixOS facts, and enough disk."
+                    .to_string()
+            },
+        },
+        ExistingHostBootstrapOption {
+            method: BootstrapMethod::NativeSystemd,
+            label: "Native beacon".to_string(),
+            available: automated_ready && linuxish,
+            message: if automated_ready && linuxish {
+                "Use this when the host should keep its current OS and only report to Pharos."
+                    .to_string()
+            } else {
+                "Needs verified Linux SSH access with root or sudo.".to_string()
+            },
+        },
+        ExistingHostBootstrapOption {
+            method: BootstrapMethod::Manual,
+            label: "Manual / deferred".to_string(),
+            available: true,
+            message:
+                "Always available; the operator completes setup without automated host changes."
+                    .to_string(),
+        },
+    ]
+}
+
+fn check_passed(checks: &[ExistingHostPreflightCheck], key: &str) -> bool {
+    checks
+        .iter()
+        .any(|check| check.key == key && check.state == PreflightCheckState::Pass)
+}
+
+fn check_failed(checks: &[ExistingHostPreflightCheck], key: &str) -> bool {
+    checks
+        .iter()
+        .any(|check| check.key == key && check.state == PreflightCheckState::Fail)
+}
+
+fn preflight_summary(checks: &[ExistingHostPreflightCheck]) -> ExistingHostPreflightSummary {
+    if checks
+        .iter()
+        .any(|check| check.state == PreflightCheckState::Fail)
+    {
+        ExistingHostPreflightSummary {
+            state: PreflightCheckState::Fail,
+            label: "Needs attention".to_string(),
+            message: "Fix failed checks before registering a beacon token.".to_string(),
+        }
+    } else if checks
+        .iter()
+        .any(|check| check.state == PreflightCheckState::Unknown)
+    {
+        ExistingHostPreflightSummary {
+            state: PreflightCheckState::Unknown,
+            label: "Needs details".to_string(),
+            message: "Collect the missing read-only facts before automated bootstrap.".to_string(),
+        }
+    } else if checks
+        .iter()
+        .any(|check| check.state == PreflightCheckState::Warn)
+    {
+        ExistingHostPreflightSummary {
+            state: PreflightCheckState::Warn,
+            label: "Review first".to_string(),
+            message: "Bootstrap may be possible, but one check needs operator review.".to_string(),
+        }
+    } else {
+        ExistingHostPreflightSummary {
+            state: PreflightCheckState::Pass,
+            label: "Ready".to_string(),
+            message: "Choose a bootstrap method; no token has been registered yet.".to_string(),
+        }
+    }
+}
+
+fn preflight_next_action(
+    summary: &ExistingHostPreflightSummary,
+    options: &[ExistingHostBootstrapOption],
+) -> &'static str {
+    match summary.state {
+        PreflightCheckState::Fail => "Fix failed checks, then run preflight again.",
+        PreflightCheckState::Unknown => {
+            "Collect SSH, privilege, OS, disk, and host-to-Pharos facts."
+        }
+        PreflightCheckState::Warn => "Review warnings, then choose a bootstrap method.",
+        PreflightCheckState::Pass => {
+            if options
+                .iter()
+                .any(|option| option.available && option.method != BootstrapMethod::Manual)
+            {
+                "Choose NixOS/declarative or native beacon bootstrap."
+            } else {
+                "Use manual/deferred setup or collect more automation facts."
+            }
+        }
     }
 }
 
@@ -6252,6 +6656,10 @@ async fn main() {
         .route("/setup/provider-plan.json", get(setup_provider_plan_json))
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
         .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
+        .route(
+            "/setup/existing-host/preflight",
+            post(existing_host_preflight_json),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
         // version, declared manifests, and the auth flow.
@@ -6302,6 +6710,94 @@ mod tests {
         assert!(svg.contains(r#"<svg xmlns="http://www.w3.org/2000/svg""#));
         assert!(svg.contains(r##"stroke="#d69b31""##));
         assert!(svg.contains(r#"M10.5 5 12 2.5 13.5 5"#));
+    }
+
+    #[tokio::test]
+    async fn existing_host_preflight_keeps_unknowns_read_only() {
+        let request = ExistingHostPreflightRequest {
+            schema: EXISTING_HOST_PREFLIGHT_SCHEMA.to_string(),
+            version: EXISTING_HOST_PREFLIGHT_VERSION,
+            host_name: "legacy-1".to_string(),
+            ssh: pharos_core::SshAccessIntent {
+                route: SshRoute::None,
+                user: None,
+                host: None,
+                port: None,
+            },
+            facts: ExistingHostPreflightFacts::default(),
+            pharos_url: None,
+        };
+
+        let report = existing_host_preflight_report(&request, 1_700_000_000).await;
+
+        report.validate_contract().expect("report contract valid");
+        assert_eq!(report.summary.state, PreflightCheckState::Unknown);
+        assert_eq!(
+            report.next_action,
+            "Collect SSH, privilege, OS, disk, and host-to-Pharos facts."
+        );
+        assert!(report.checks.iter().any(|check| {
+            check.key == "ssh-reachability" && check.state == PreflightCheckState::Unknown
+        }));
+        assert!(report
+            .bootstrap_options
+            .iter()
+            .any(|option| option.method == BootstrapMethod::Manual && option.available));
+        assert!(!serde_json::to_string(&report)
+            .expect("report serializes")
+            .to_ascii_lowercase()
+            .contains("token="));
+    }
+
+    #[tokio::test]
+    async fn existing_host_preflight_offers_automated_paths_when_ready() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let request = ExistingHostPreflightRequest {
+            schema: EXISTING_HOST_PREFLIGHT_SCHEMA.to_string(),
+            version: EXISTING_HOST_PREFLIGHT_VERSION,
+            host_name: "legacy-2".to_string(),
+            ssh: pharos_core::SshAccessIntent {
+                route: SshRoute::Direct,
+                user: Some("mba".to_string()),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(port),
+            },
+            facts: ExistingHostPreflightFacts {
+                ssh_authenticated: Some(true),
+                root: Some(false),
+                sudo: Some(true),
+                os_family: Some("linux".to_string()),
+                nixos: Some(true),
+                nix_available: Some(true),
+                free_disk_gib: Some(16),
+                pharos_reachable: Some(true),
+            },
+            pharos_url: Some("https://pharos.barta.cm/report".to_string()),
+        };
+
+        let report = existing_host_preflight_report(&request, 1_700_000_001).await;
+        let _ = accept.await;
+
+        report.validate_contract().expect("report contract valid");
+        assert_eq!(report.summary.state, PreflightCheckState::Pass);
+        assert_eq!(
+            report.next_action,
+            "Choose NixOS/declarative or native beacon bootstrap."
+        );
+        assert!(report
+            .bootstrap_options
+            .iter()
+            .any(|option| { option.method == BootstrapMethod::NixosAnywhere && option.available }));
+        assert!(report
+            .bootstrap_options
+            .iter()
+            .any(|option| { option.method == BootstrapMethod::NativeSystemd && option.available }));
     }
 
     #[test]
