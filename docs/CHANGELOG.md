@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.2 - 2026-07-09
+
+- Made existing-host onboarding collect SSH user and heartbeat cadence explicitly.
+- Hardened preflight parsing so pasted `user@host:port` SSH targets probe the host correctly.
+- Persisted non-default heartbeat cadence into tracked setup jobs and handoff text.
+
 ## 0.1.1 - 2026-07-09
 
 - Added read-only existing-host backup signal detection during setup preflight.
