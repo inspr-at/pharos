@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{FromRef, Path as AxumPath, State};
+use axum::extract::{FromRef, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse};
@@ -216,6 +216,165 @@ fn valid_setup_template(provider: &str, template: &str) -> bool {
             | ("hetzner-cloud", "bring-own-plan")
             | ("manual-import", "manual-import")
     )
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SetupProviderPlan {
+    schema: &'static str,
+    version: u16,
+    provider: &'static str,
+    template: &'static str,
+    strategy: &'static str,
+    summary: &'static str,
+    docs: Vec<SetupProviderPlanDoc>,
+    steps: Vec<SetupProviderPlanStep>,
+    runtime_checks: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SetupProviderPlanDoc {
+    label: &'static str,
+    url: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SetupProviderPlanStep {
+    key: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    status: &'static str,
+}
+
+fn setup_provider_plan(
+    provider: &str,
+    template: &str,
+) -> Result<SetupProviderPlan, ProvisioningJobStartError> {
+    if !valid_setup_provider(provider) {
+        return Err(ProvisioningJobStartError::UnsupportedProvider);
+    }
+    if !valid_setup_template(provider, template) {
+        return Err(ProvisioningJobStartError::UnsupportedTemplate);
+    }
+    match (provider, template) {
+        ("hetzner-cloud", "hetzner-small-nixos")
+        | ("hetzner-cloud", "hetzner-lab")
+        | ("hetzner-cloud", "bring-own-plan") => Ok(hetzner_cloud_setup_plan(template)),
+        ("manual-import", "manual-import") => Ok(manual_import_setup_plan()),
+        _ => Err(ProvisioningJobStartError::UnsupportedTemplate),
+    }
+}
+
+fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
+    SetupProviderPlan {
+        schema: "inspr.pharos.setup-provider-plan.v1",
+        version: 1,
+        provider: "hetzner-cloud",
+        template: match template {
+            "hetzner-lab" => "hetzner-lab",
+            "bring-own-plan" => "bring-own-plan",
+            _ => "hetzner-small-nixos",
+        },
+        strategy: "hcloud-api-plus-nixos-anywhere",
+        summary: "Plan Hetzner Cloud resources through the Cloud API, then bootstrap NixOS with nixos-anywhere before waiting for the first beacon heartbeat.",
+        docs: vec![
+            SetupProviderPlanDoc {
+                label: "Hetzner Cloud API reference",
+                url: "https://docs.hetzner.cloud/reference/cloud",
+            },
+            SetupProviderPlanDoc {
+                label: "Hetzner Cloud API getting started",
+                url: "https://docs.hetzner.cloud/",
+            },
+            SetupProviderPlanDoc {
+                label: "Hetzner Cloud Terraform provider",
+                url: "https://registry.terraform.io/providers/hetznercloud/hcloud/latest/docs",
+            },
+            SetupProviderPlanDoc {
+                label: "nixos-anywhere quickstart",
+                url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
+            },
+        ],
+        steps: vec![
+            SetupProviderPlanStep {
+                key: "provider_resources",
+                title: "Provider resources",
+                detail: "Create or dry-run the server, SSH public key attachment, labels, and a minimal firewall through Hetzner Cloud API calls.",
+                status: "planned",
+            },
+            SetupProviderPlanStep {
+                key: "runtime_verify",
+                title: "Runtime verification",
+                detail: "Fetch server types, images, locations, and prices at plan time; do not hardcode price or availability promises.",
+                status: "required",
+            },
+            SetupProviderPlanStep {
+                key: "bootstrap",
+                title: "NixOS bootstrap",
+                detail: "Boot a runtime-verified Linux base with SSH access, then run nixos-anywhere from a Pharos/nixcfg flake profile.",
+                status: "planned",
+            },
+            SetupProviderPlanStep {
+                key: "beacon_handoff",
+                title: "Beacon handoff",
+                detail: "Install pharos-beacon using a token file or secret reference; raw tokens never appear in job progress, logs, or URLs.",
+                status: "protected",
+            },
+            SetupProviderPlanStep {
+                key: "observable_finish",
+                title: "Observable finish",
+                detail: "Wait for the first valid heartbeat, then mark backup enrollment and location source as complete or explicitly pending.",
+                status: "waiting",
+            },
+        ],
+        runtime_checks: vec![
+            "server_type availability",
+            "location availability",
+            "image/base OS availability",
+            "current provider price",
+            "SSH key and firewall compatibility",
+            "backup/snapshot option availability",
+        ],
+    }
+}
+
+fn manual_import_setup_plan() -> SetupProviderPlan {
+    SetupProviderPlan {
+        schema: "inspr.pharos.setup-provider-plan.v1",
+        version: 1,
+        provider: "manual-import",
+        template: "manual-import",
+        strategy: "operator-managed-import",
+        summary: "Keep provider creation outside Pharos, then import and bootstrap the already-created host.",
+        docs: vec![SetupProviderPlanDoc {
+            label: "nixos-anywhere quickstart",
+            url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
+        }],
+        steps: vec![
+            SetupProviderPlanStep {
+                key: "provider_resources",
+                title: "Provider resources",
+                detail: "Operator creates or keeps the server with the external provider; Pharos stores no provider credentials for this path.",
+                status: "external",
+            },
+            SetupProviderPlanStep {
+                key: "bootstrap",
+                title: "Bootstrap",
+                detail: "Run existing-host preflight, then choose NixOS, portable beacon, or manual/deferred bootstrap.",
+                status: "handoff",
+            },
+            SetupProviderPlanStep {
+                key: "observable_finish",
+                title: "Observable finish",
+                detail: "Wait for first heartbeat and record backup/location decisions explicitly.",
+                status: "waiting",
+            },
+        ],
+        runtime_checks: vec![
+            "SSH reachability",
+            "OS/bootstrap capability",
+            "Pharos endpoint reachability",
+        ],
+    }
 }
 
 fn provisioning_jobs_path(host_store_path: Option<&Path>) -> Option<PathBuf> {
@@ -2194,6 +2353,27 @@ async fn version() -> Json<serde_json::Value> {
 struct ProvisioningJobStartRequest {
     provider: String,
     template: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupProviderPlanQuery {
+    provider: String,
+    template: String,
+}
+
+async fn setup_provider_plan_json(Query(query): Query<SetupProviderPlanQuery>) -> impl IntoResponse {
+    match setup_provider_plan(&query.provider, &query.template) {
+        Ok(plan) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "plan": plan })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
 }
 
 async fn create_provisioning_job(
@@ -5790,6 +5970,7 @@ async fn main() {
             get(agora::location_proposal),
         )
         .route("/hosts.json", get(hosts_json))
+        .route("/setup/provider-plan.json", get(setup_provider_plan_json))
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
         .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
@@ -7324,6 +7505,36 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!contents.to_ascii_lowercase().contains("token="));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hetzner_setup_plan_selects_api_and_nixos_anywhere_path() {
+        let plan = setup_provider_plan("hetzner-cloud", "hetzner-small-nixos")
+            .expect("hetzner template has a plan");
+
+        assert_eq!(plan.strategy, "hcloud-api-plus-nixos-anywhere");
+        assert_eq!(plan.provider, "hetzner-cloud");
+        assert_eq!(plan.template, "hetzner-small-nixos");
+        assert!(plan
+            .docs
+            .iter()
+            .any(|doc| doc.url == "https://docs.hetzner.cloud/reference/cloud"));
+        assert!(plan
+            .docs
+            .iter()
+            .any(|doc| doc.url.contains("nixos-anywhere")));
+        assert!(plan.runtime_checks.contains(&"current provider price"));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.key == "beacon_handoff" && step.status == "protected"));
+        let json = serde_json::to_string(&plan).expect("plan serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+        assert_eq!(
+            setup_provider_plan("hetzner-cloud", "manual-import").err(),
+            Some(ProvisioningJobStartError::UnsupportedTemplate)
+        );
     }
 
     fn report_test_state(require_report_token: bool) -> AppState {
