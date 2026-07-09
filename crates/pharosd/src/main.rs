@@ -6255,15 +6255,14 @@ fn backup_validation_alert(
                 .clone()
                 .unwrap_or_else(|| backup_validation_label(observation, now)),
         )
-    } else if let Some(state) = observation.last_check_state {
+    } else {
+        let state = observation.last_check_state?;
         (
             state,
             observation.last_check_at,
             "backup check".to_string(),
             backup_validation_label(observation, now),
         )
-    } else {
-        return None;
     };
 
     let (level, issue, action) = match state {
