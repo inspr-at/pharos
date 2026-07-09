@@ -683,6 +683,8 @@ fn valid_setup_template(provider: &str, template: &str) -> bool {
             | ("hetzner-cloud", "bring-own-plan")
             | ("manual-import", "manual-import")
             | ("manual-import", "netcup-manual-import")
+            | ("manual-import", "oracle-always-free-lab")
+            | ("manual-import", "gcp-free-tier-lab")
             | ("existing-host", "nixos-anywhere")
             | ("existing-host", "native-systemd")
             | ("existing-host", "manual-deferred")
@@ -757,9 +759,10 @@ fn setup_provider_plan(
         ("hetzner-cloud", "hetzner-small-nixos")
         | ("hetzner-cloud", "hetzner-lab")
         | ("hetzner-cloud", "bring-own-plan") => Ok(hetzner_cloud_setup_plan(template)),
-        ("manual-import", "manual-import") | ("manual-import", "netcup-manual-import") => {
-            Ok(manual_import_setup_plan(template))
-        }
+        ("manual-import", "manual-import")
+        | ("manual-import", "netcup-manual-import")
+        | ("manual-import", "oracle-always-free-lab")
+        | ("manual-import", "gcp-free-tier-lab") => Ok(manual_import_setup_plan(template)),
         _ => Err(ProvisioningJobStartError::UnsupportedTemplate),
     }
 }
@@ -916,6 +919,8 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
 
 fn manual_import_setup_plan(template: &str) -> SetupProviderPlan {
     let netcup = template == "netcup-manual-import";
+    let oracle = template == "oracle-always-free-lab";
+    let gcp = template == "gcp-free-tier-lab";
     let (strategy, approach, summary, docs, resources, steps, runtime_checks) = if netcup {
         (
             "netcup-manual-import",
@@ -990,6 +995,156 @@ fn manual_import_setup_plan(template: &str) -> SetupProviderPlan {
                 "Pharos endpoint reachability",
             ],
         )
+    } else if oracle {
+        (
+            "oracle-always-free-lab-import",
+            "Treat Oracle Always Free as an externally-created lab VM first: create the VM in Oracle Cloud, verify current free-tier eligibility, quota, and capacity, then import it through existing-host onboarding.",
+            "Use Oracle Cloud only as a lab/demo host source. Pharos does not promise permanent zero cost, does not manage Oracle tenancy resources, and does not store Oracle credentials.",
+            vec![
+                SetupProviderPlanDoc {
+                    label: "Oracle Always Free resources",
+                    url: "https://docs.oracle.com/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm",
+                },
+                SetupProviderPlanDoc {
+                    label: "nixos-anywhere quickstart",
+                    url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
+                },
+            ],
+            vec![
+                SetupProviderPlanResource {
+                    key: "oracle_vm",
+                    kind: "externally-created-oracle-vm",
+                    required: true,
+                    api: "operator / Oracle Cloud Console",
+                    detail: "Create or select an Oracle Cloud VM outside Pharos; verify Always Free eligibility, region capacity, shape availability, boot image, and current cost before import.",
+                },
+                SetupProviderPlanResource {
+                    key: "network_access",
+                    kind: "cloud-network-rule",
+                    required: true,
+                    api: "operator / Oracle Cloud Console",
+                    detail: "Prepare ingress and egress rules for SSH and beacon reporting; Pharos records only the SSH route and runtime heartbeat.",
+                },
+                SetupProviderPlanResource {
+                    key: "ssh_access",
+                    kind: "ssh-route",
+                    required: true,
+                    api: "preflight",
+                    detail: "Verify SSH user, host, privilege level, and bootstrap capability before install; private keys remain outside Pharos records.",
+                },
+                SetupProviderPlanResource {
+                    key: "backup_expectation",
+                    kind: "operator-decision",
+                    required: true,
+                    api: "runtime check",
+                    detail: "Decide whether Oracle snapshots, external backup, or Pharos-observed backup jobs are expected; pricing and retention must be checked at setup time.",
+                },
+            ],
+            vec![
+                SetupProviderPlanStep {
+                    key: "provider_resources",
+                    title: "Oracle lab VM prepared externally",
+                    detail: "Create the VM in Oracle Cloud, verify Always Free assumptions, region capacity, boot image, and billing before Pharos imports anything.",
+                    status: "external",
+                },
+                SetupProviderPlanStep {
+                    key: "bootstrap",
+                    title: "Import through existing-host onboarding",
+                    detail: "Run Pharos existing-host read-only preflight, then choose NixOS/nixos-anywhere, portable systemd beacon, or manual/deferred bootstrap.",
+                    status: "handoff",
+                },
+                SetupProviderPlanStep {
+                    key: "observable_finish",
+                    title: "Observable finish",
+                    detail: "Wait for first heartbeat, then record backup and location decisions explicitly.",
+                    status: "waiting",
+                },
+            ],
+            vec![
+                "current Oracle Always Free eligibility",
+                "region capacity and VM shape availability",
+                "current billing and quota state",
+                "SSH reachability and cloud firewall rules",
+                "OS/bootstrap capability",
+                "backup/snapshot expectation",
+                "Pharos endpoint reachability",
+            ],
+        )
+    } else if gcp {
+        (
+            "gcp-free-tier-lab-import",
+            "Treat Google Cloud free tier as an externally-created lab VM first: create the VM in Google Cloud, verify current free-tier limits, region eligibility, and billing state, then import it through existing-host onboarding.",
+            "Use Google Cloud only as a lab/demo host source. Pharos does not promise a permanently free VM, does not manage Google Cloud projects, and does not store Google Cloud credentials.",
+            vec![
+                SetupProviderPlanDoc {
+                    label: "Google Cloud free program",
+                    url: "https://cloud.google.com/free/docs/free-cloud-features",
+                },
+                SetupProviderPlanDoc {
+                    label: "nixos-anywhere quickstart",
+                    url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
+                },
+            ],
+            vec![
+                SetupProviderPlanResource {
+                    key: "gcp_vm",
+                    kind: "externally-created-gcp-vm",
+                    required: true,
+                    api: "operator / Google Cloud Console",
+                    detail: "Create or select the Google Cloud VM outside Pharos; verify current free-tier eligibility, eligible region, machine type, boot image, and billing state before import.",
+                },
+                SetupProviderPlanResource {
+                    key: "network_access",
+                    kind: "cloud-firewall-rule",
+                    required: true,
+                    api: "operator / Google Cloud Console",
+                    detail: "Prepare firewall and egress access for SSH and beacon reporting; Pharos stores no Google Cloud project credentials for this path.",
+                },
+                SetupProviderPlanResource {
+                    key: "ssh_access",
+                    kind: "ssh-route",
+                    required: true,
+                    api: "preflight",
+                    detail: "Verify SSH user, host, privilege level, and bootstrap capability before install; private keys remain outside Pharos records.",
+                },
+                SetupProviderPlanResource {
+                    key: "backup_expectation",
+                    kind: "operator-decision",
+                    required: true,
+                    api: "runtime check",
+                    detail: "Decide whether provider snapshots, external backup, or Pharos-observed backup jobs are expected; pricing and retention must be checked at setup time.",
+                },
+            ],
+            vec![
+                SetupProviderPlanStep {
+                    key: "provider_resources",
+                    title: "Google Cloud lab VM prepared externally",
+                    detail: "Create the VM in Google Cloud, verify free-tier assumptions, eligible region, machine type, boot image, and billing before Pharos imports anything.",
+                    status: "external",
+                },
+                SetupProviderPlanStep {
+                    key: "bootstrap",
+                    title: "Import through existing-host onboarding",
+                    detail: "Run Pharos existing-host read-only preflight, then choose NixOS/nixos-anywhere, portable systemd beacon, or manual/deferred bootstrap.",
+                    status: "handoff",
+                },
+                SetupProviderPlanStep {
+                    key: "observable_finish",
+                    title: "Observable finish",
+                    detail: "Wait for first heartbeat, then record backup and location decisions explicitly.",
+                    status: "waiting",
+                },
+            ],
+            vec![
+                "current Google Cloud free-tier limits",
+                "eligible region and machine type",
+                "current billing and quota state",
+                "SSH reachability and cloud firewall rules",
+                "OS/bootstrap capability",
+                "backup/snapshot expectation",
+                "Pharos endpoint reachability",
+            ],
+        )
     } else {
         (
             "operator-managed-import",
@@ -1049,6 +1204,10 @@ fn manual_import_setup_plan(template: &str) -> SetupProviderPlan {
         provider: "manual-import",
         template: if netcup {
             "netcup-manual-import"
+        } else if oracle {
+            "oracle-always-free-lab"
+        } else if gcp {
+            "gcp-free-tier-lab"
         } else {
             "manual-import"
         },
@@ -2447,6 +2606,8 @@ const ASSISTANT_TEMPLATE_PROVIDERS={
 	  'bring-own-plan':'hetzner-cloud',
 	  'manual-import':'manual-import',
 	  'netcup-manual-import':'manual-import',
+	  'oracle-always-free-lab':'manual-import',
+	  'gcp-free-tier-lab':'manual-import',
 	  'nixos-anywhere':'existing-host',
   'native-systemd':'existing-host',
   'manual-deferred':'existing-host'
@@ -6114,6 +6275,10 @@ fn setup_assistant() -> String {
     .replace(
         r#"</div></div><label class="assistant-confirm">"#,
         r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div><label class="assistant-confirm">"#,
+    )
+    .replace(
+        r#"<button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button>"#,
+        r#"<button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="oracle-always-free-lab" data-assistant-next="Next: verify Oracle Always Free eligibility, quota, and capacity, then import the VM. No Oracle resources are created by Pharos." aria-pressed="false" hidden><span><strong>Oracle Always Free lab</strong><span>Create the VM externally, confirm current free-tier limits, then import it safely.</span></span><em>verify cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="gcp-free-tier-lab" data-assistant-next="Next: verify Google Cloud free-tier limits, region, and billing, then import the VM. No Google Cloud resources are created by Pharos." aria-pressed="false" hidden><span><strong>Google Cloud free-tier lab</strong><span>Create the VM externally, confirm current free-tier limits, then import it safely.</span></span><em>verify cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button>"#,
     )
 }
 
@@ -11266,8 +11431,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Lab / free-tier style"));
         assert!(empty.contains("Bring your own plan"));
         assert!(empty.contains("Netcup manual import"));
+        assert!(empty.contains("Oracle Always Free lab"));
+        assert!(empty.contains("Google Cloud free-tier lab"));
         assert!(empty.contains("data-assistant-template=\"hetzner-small-nixos\""));
         assert!(empty.contains("data-assistant-template=\"netcup-manual-import\""));
+        assert!(empty.contains("data-assistant-template=\"oracle-always-free-lab\""));
+        assert!(empty.contains("data-assistant-template=\"gcp-free-tier-lab\""));
         assert!(empty.contains("No provider resources are created here."));
         assert!(empty.contains("Review plan"));
         assert!(empty.contains("Provider resources"));
@@ -12278,6 +12447,53 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let json = serde_json::to_string(&plan).expect("plan serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    #[test]
+    fn free_tier_lab_plans_are_import_only_and_runtime_verified() {
+        for (template, strategy, doc_url, expected_check) in [
+            (
+                "oracle-always-free-lab",
+                "oracle-always-free-lab-import",
+                "https://docs.oracle.com/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm",
+                "current Oracle Always Free eligibility",
+            ),
+            (
+                "gcp-free-tier-lab",
+                "gcp-free-tier-lab-import",
+                "https://cloud.google.com/free/docs/free-cloud-features",
+                "current Google Cloud free-tier limits",
+            ),
+        ] {
+            let plan = setup_provider_plan("manual-import", template)
+                .expect("free-tier lab template has a plan");
+
+            assert_eq!(plan.provider, "manual-import");
+            assert_eq!(plan.template, template);
+            assert_eq!(plan.strategy, strategy);
+            assert!(plan.approach.contains("externally-created lab VM"));
+            assert!(plan.summary.contains("lab/demo"));
+            assert!(plan.summary.contains("does not promise"));
+            assert!(plan.summary.contains("does not store"));
+            assert!(plan.docs.iter().any(|doc| doc.url == doc_url));
+            assert!(plan
+                .resources
+                .iter()
+                .any(|resource| resource.key.ends_with("_vm")
+                    && resource.detail.contains("before import")));
+            assert!(plan.runtime_checks.contains(&expected_check));
+            assert!(plan
+                .runtime_checks
+                .iter()
+                .any(|check| check.contains("billing")));
+            assert!(plan
+                .steps
+                .iter()
+                .any(|step| step.key == "bootstrap" && step.status == "handoff"));
+            let json = serde_json::to_string(&plan).expect("plan serializes");
+            assert!(!json.to_ascii_lowercase().contains("bearer "));
+            assert!(!json.to_ascii_lowercase().contains("token="));
+        }
     }
 
     fn report_test_state(require_report_token: bool) -> AppState {

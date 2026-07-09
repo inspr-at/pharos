@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.4 - 2026-07-09
+
+- Added Oracle Always Free and Google Cloud free-tier lab import templates.
+- Kept lab VMs provider-neutral: create externally, verify pricing/limits/capacity at runtime, then import through existing-host onboarding.
+- Avoided promising permanently free capacity or collecting cloud credentials for lab templates.
+
 ## 0.1.3 - 2026-07-09
 
 - Added an explicit Netcup manual-import setup template.
