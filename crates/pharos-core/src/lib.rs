@@ -740,6 +740,14 @@ pub struct ProvisioningJob {
     pub id: String,
     pub provider: String,
     pub template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_nix: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval_secs: Option<u64>,
     pub state: ProvisioningJobState,
     pub created_at: UnixSeconds,
     pub updated_at: UnixSeconds,
@@ -1773,6 +1781,10 @@ mod tests {
             id: "setup-1700000000-1".to_string(),
             provider: "hetzner-cloud".to_string(),
             template: "hetzner-small-nixos".to_string(),
+            host_name: Some("hcloud-lab-1".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(true),
+            heartbeat_interval_secs: Some(60),
             state: ProvisioningJobState::Planning,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,

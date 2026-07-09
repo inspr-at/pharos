@@ -129,12 +129,28 @@ impl ProvisioningJobStore {
             self.counter.fetch_add(1, Ordering::Relaxed)
         );
         let (state, progress) = provisioning_job_progress(request, provider_runtime, now);
+        let host_name = request
+            .host_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let role = request
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let job = ProvisioningJob {
             schema: PROVISIONING_JOB_SCHEMA.to_string(),
             version: PROVISIONING_JOB_VERSION,
             id,
             provider: request.provider.to_string(),
             template: request.template.to_string(),
+            host_name,
+            role,
+            is_nix: request.is_nix,
+            heartbeat_interval_secs: request.heartbeat_interval_secs.filter(|value| *value > 0),
             state,
             created_at: now,
             updated_at: now,
@@ -190,6 +206,12 @@ struct ProvisioningJobStartRequest {
     apply: bool,
     #[serde(default)]
     host_name: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    is_nix: Option<bool>,
+    #[serde(default)]
+    heartbeat_interval_secs: Option<u64>,
     #[serde(default)]
     location: Option<String>,
     #[serde(default)]
@@ -1426,7 +1448,7 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-close{appearance:none;display:grid;place-items:center;min-width:34px;height:34px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-close:hover,.assistant-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}
 .assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
 .assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
-.assistant-existing-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-step{display:grid}.assistant-preflight-form{display:grid;grid-template-columns:1fr 1.35fr .8fr auto;gap:10px;align-items:end;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.78)}.assistant-preflight-form label,.assistant-preflight-facts label{display:grid;gap:5px;min-width:0}.assistant-preflight-form label span,.assistant-preflight-facts label span{color:var(--muted);font-size:11px;font-weight:650}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-preflight-form input:focus,.assistant-preflight-form select:focus,.assistant-preflight-facts input:focus,.assistant-preflight-facts select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}.assistant-preflight-details{grid-column:1/-1;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.74);padding:8px 10px}.assistant-preflight-details summary{cursor:pointer;color:#0f4f80;font-size:12px;font-weight:760}.assistant-preflight-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}.assistant-check{min-height:36px;padding:0 13px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760;white-space:nowrap;cursor:pointer}.assistant-check:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-preflight-result{display:grid;gap:10px;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(247,252,253,.78)}.assistant-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.assistant-result-head strong{font-size:14px;color:var(--ink)}.assistant-result-head span{max-width:430px;color:var(--muted);font-size:12px;line-height:1.35;text-align:right}.assistant-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.assistant-check-row{--check-color:var(--wait);display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start;min-height:42px;padding:8px 9px;border:1px solid rgba(214,226,234,.70);border-radius:7px;background:rgba(255,255,255,.72)}.assistant-check-row:before{content:"";width:8px;height:8px;margin-top:4px;border-radius:50%;background:var(--check-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--check-color) 10%,transparent)}.assistant-check-row[data-state="pass"]{--check-color:var(--live)}.assistant-check-row[data-state="warn"]{--check-color:var(--stale)}.assistant-check-row[data-state="fail"]{--check-color:var(--down)}.assistant-check-row strong{display:block;font-size:12px;color:var(--ink)}.assistant-check-row span{display:block;margin-top:1px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.assistant-bootstrap-option{--option-color:var(--wait);appearance:none;display:block;width:100%;min-height:72px;padding:10px;border:1px solid rgba(214,226,234,.74);border-radius:7px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;opacity:.72}.assistant-bootstrap-option[data-available="true"]{--option-color:var(--sea);opacity:1;border-color:rgba(21,158,153,.26);background:rgba(233,249,248,.62);cursor:pointer}.assistant-bootstrap-option[data-selected="true"]{border-color:rgba(21,158,153,.58);box-shadow:0 0 0 3px rgba(21,158,153,.10),0 10px 22px rgba(45,75,95,.08)}.assistant-bootstrap-option:disabled{cursor:not-allowed}.assistant-bootstrap-option strong{display:block;color:var(--ink);font-size:12px}.assistant-bootstrap-option span{display:block;margin-top:3px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap-option:before{content:"";display:block;width:8px;height:8px;margin-bottom:7px;border-radius:50%;background:var(--option-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--option-color) 10%,transparent)}
+.assistant-existing-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-step{display:grid}.assistant-preflight-form{display:grid;grid-template-columns:1fr .85fr 1fr 1.25fr .8fr auto;gap:10px;align-items:end;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.78)}.assistant-preflight-form label,.assistant-preflight-facts label{display:grid;gap:5px;min-width:0}.assistant-preflight-form label span,.assistant-preflight-facts label span{color:var(--muted);font-size:11px;font-weight:650}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-preflight-form input:focus,.assistant-preflight-form select:focus,.assistant-preflight-facts input:focus,.assistant-preflight-facts select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}.assistant-preflight-details{grid-column:1/-1;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.74);padding:8px 10px}.assistant-preflight-details summary{cursor:pointer;color:#0f4f80;font-size:12px;font-weight:760}.assistant-preflight-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}.assistant-check{min-height:36px;padding:0 13px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760;white-space:nowrap;cursor:pointer}.assistant-check:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-preflight-result{display:grid;gap:10px;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(247,252,253,.78)}.assistant-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.assistant-result-head strong{font-size:14px;color:var(--ink)}.assistant-result-head span{max-width:430px;color:var(--muted);font-size:12px;line-height:1.35;text-align:right}.assistant-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.assistant-check-row{--check-color:var(--wait);display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start;min-height:42px;padding:8px 9px;border:1px solid rgba(214,226,234,.70);border-radius:7px;background:rgba(255,255,255,.72)}.assistant-check-row:before{content:"";width:8px;height:8px;margin-top:4px;border-radius:50%;background:var(--check-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--check-color) 10%,transparent)}.assistant-check-row[data-state="pass"]{--check-color:var(--live)}.assistant-check-row[data-state="warn"]{--check-color:var(--stale)}.assistant-check-row[data-state="fail"]{--check-color:var(--down)}.assistant-check-row strong{display:block;font-size:12px;color:var(--ink)}.assistant-check-row span{display:block;margin-top:1px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.assistant-bootstrap-option{--option-color:var(--wait);appearance:none;display:block;width:100%;min-height:72px;padding:10px;border:1px solid rgba(214,226,234,.74);border-radius:7px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;opacity:.72}.assistant-bootstrap-option[data-available="true"]{--option-color:var(--sea);opacity:1;border-color:rgba(21,158,153,.26);background:rgba(233,249,248,.62);cursor:pointer}.assistant-bootstrap-option[data-selected="true"]{border-color:rgba(21,158,153,.58);box-shadow:0 0 0 3px rgba(21,158,153,.10),0 10px 22px rgba(45,75,95,.08)}.assistant-bootstrap-option:disabled{cursor:not-allowed}.assistant-bootstrap-option strong{display:block;color:var(--ink);font-size:12px}.assistant-bootstrap-option span{display:block;margin-top:3px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap-option:before{content:"";display:block;width:8px;height:8px;margin-bottom:7px;border-radius:50%;background:var(--option-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--option-color) 10%,transparent)}
 .assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
 .assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
@@ -2112,8 +2134,21 @@ function preflightBoolValue(overlay,name){
   if(value==='false')return false;
   return undefined;
 }
+function existingHostRole(overlay){
+  return (overlay.querySelector('[data-preflight-role]')?.value||'server').trim()||'server';
+}
+function existingHostType(overlay){
+  return overlay.querySelector('[data-preflight-host-type]')?.value||'';
+}
+function existingHostIsNix(overlay){
+  const type=existingHostType(overlay);
+  if(type==='nixos')return true;
+  if(type==='linux-beacon')return false;
+  return undefined;
+}
 function existingPreflightRequest(overlay){
   const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
+  const hostType=existingHostType(overlay);
   const route=overlay.querySelector('[data-preflight-route]')?.value||'tailnet';
   const sshHost=(overlay.querySelector('[data-preflight-ssh-host]')?.value||'').trim();
   const admin=overlay.querySelector('[data-preflight-admin]')?.value||'';
@@ -2123,6 +2158,8 @@ function existingPreflightRequest(overlay){
   const sshAuthenticated=preflightBoolValue(overlay,'ssh_authenticated');
   const nixAvailable=preflightBoolValue(overlay,'nix_available');
   const pharosReachable=preflightBoolValue(overlay,'pharos_reachable');
+  if(hostType==='nixos'){facts.os_family='nixos';facts.nixos=true;facts.nix_available=true}
+  else if(hostType==='linux-beacon'){facts.os_family='linux';facts.nixos=false}
   if(sshAuthenticated!==undefined)facts.ssh_authenticated=sshAuthenticated;
   if(nixAvailable!==undefined)facts.nix_available=nixAvailable;
   if(pharosReachable!==undefined)facts.pharos_reachable=pharosReachable;
@@ -2295,6 +2332,10 @@ async function startProvisioningJob(overlay,start){
     body.provider='existing-host';
     body.template=template;
     body.host_name=hostName;
+    body.role=existingHostRole(overlay);
+    const isNix=existingHostIsNix(overlay);
+    if(isNix!==undefined)body.is_nix=isNix;
+    body.heartbeat_interval_secs=60;
     body.apply=true;
   }
   start.textContent='Starting setup';
@@ -4655,6 +4696,10 @@ fn setup_assistant() -> String {
         r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-provider-step" data-assistant-provider-step><div class="assistant-step-head"><strong>New server</strong><span>Choose where this server starts.</span></div><div class="assistant-providers"><button class="assistant-provider" type="button" data-assistant-provider="hetzner-cloud" aria-pressed="false"><span class="assistant-provider-title"><strong>Hetzner Cloud</strong><span class="assistant-badge">Recommended</span></span><p>Best supported path for a fresh Pharos-managed server.</p><span class="assistant-facts"><span><b>Credentials needed</b>API token later</span><span><b>Cost</b>Paid cloud</span><span><b>Bootstrap</b>NixOS ready</span></span></button><button class="assistant-provider" type="button" data-assistant-provider="manual-import" aria-pressed="false"><span class="assistant-provider-title"><strong>Manual / existing provider</strong></span><p>Use this for Netcup or any provider that is not safely automated yet.</p><span class="assistant-facts"><span><b>Credentials needed</b>SSH later</span><span><b>Cost</b>Your provider</span><span><b>Bootstrap</b>Import path</span></span></button></div><div class="assistant-step-head"><strong>Template</strong><span>No provider resources are created here.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" data-assistant-next="Next: review a Hetzner Cloud plan for a small NixOS server. No resources have been created." aria-pressed="false"><span><strong>Small NixOS server</strong><span>Low monthly cost, automatic NixOS bootstrap, good first production default.</span></span><em>low cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" data-assistant-next="Next: review a lab-style plan and confirm current pricing before creating anything." aria-pressed="false"><span><strong>Lab / free-tier style</strong><span>Smallest practical shape. Pricing and availability must be checked at plan time.</span></span><em>check cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" data-assistant-next="Next: choose exact provider size, region, and image before creating anything." aria-pressed="false"><span><strong>Bring your own plan</strong><span>Use when you already know the size, region, and bootstrap profile you want.</span></span><em>custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Netcup is not treated as fully automated yet." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For Netcup and other providers, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button></div></div><div class="assistant-existing-step" data-assistant-existing-step><div class="assistant-step-head"><strong>Add existing server</strong><span>Read-only check first.</span></div><form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label><details class="assistant-preflight-details"><summary>Known facts</summary><div class="assistant-preflight-facts"><label><span>Login works</span><select data-preflight-fact="ssh_authenticated"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Admin access</span><select data-preflight-admin><option value="">Unknown</option><option value="sudo">sudo</option><option value="root">root</option><option value="none">No</option></select></label><label><span>Operating system</span><select data-preflight-os><option value="">Unknown</option><option value="linux">Linux</option><option value="nixos">NixOS</option><option value="other">Other</option></select></label><label><span>Nix available</span><select data-preflight-fact="nix_available"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Disk free</span><input data-preflight-disk type="number" min="0" step="1" inputmode="numeric" placeholder="GiB"></label><label><span>Can reach Pharos</span><select data-preflight-fact="pharos_reachable"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label></div></details><button class="assistant-check" type="submit" data-preflight-check>Check server</button></form><div class="assistant-preflight-result" data-preflight-result hidden><div class="assistant-result-head"><strong data-preflight-summary>Preflight</strong><span data-preflight-message>Waiting for checks.</span></div><div class="assistant-checks" data-preflight-checks></div><div class="assistant-bootstrap" data-preflight-bootstrap hidden></div></div></div><div class="assistant-plan" data-assistant-plan><div class="assistant-plan-head"><strong>Review plan</strong><span>Nothing is created until you start setup.</span></div><div class="assistant-plan-list"><div class="assistant-plan-row"><span><strong>Provider resources</strong><span>Prepare server, SSH key, firewall, and selected region.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>SSH and bootstrap</strong><span>Prepare NixOS bootstrap path without exposing private key material.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>Beacon registration</strong><span>Create only a safe handoff; raw tokens are never shown.</span></span><em class="assistant-plan-chip" data-kind="protected">protected</em></div><div class="assistant-plan-row"><span><strong>First heartbeat</strong><span>Wait until the new host reports before marking it live.</span></span><em class="assistant-plan-chip">waiting</em></div><div class="assistant-plan-row"><span><strong>Backup and location</strong><span>Hand off backup enrollment and site/location setup after first contact.</span></span><em class="assistant-plan-chip" data-kind="later">later</em></div></div><label class="assistant-confirm"><input type="checkbox" data-assistant-confirm><span>I understand this may create provider resources.</span><button class="assistant-start" type="button" data-assistant-start disabled>Start setup</button></label><div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states"><span data-progress-state="planning">planning</span><span data-progress-state="provisioning">provisioning</span><span data-progress-state="bootstrapping">bootstrapping</span><span data-progress-state="waiting-for-heartbeat">waiting for heartbeat</span><span data-progress-state="backup-pending">backup pending</span><span data-progress-state="complete" data-risk="ok">complete</span><span data-progress-state="failed" data-risk="fail">failed</span><span data-progress-state="cleanup-needed" data-risk="fail">cleanup needed</span></div></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" data-assistant-continue disabled>Continue</button></div></div></div></section>"#,
         plus = icons::PLUS,
         server = icons::SERVER
+    )
+    .replace(
+        r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
+        r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>Role</span><input data-preflight-role autocomplete="off" placeholder="server"></label><label><span>Host type</span><select data-preflight-host-type><option value="">Decide after check</option><option value="nixos">NixOS</option><option value="linux-beacon">Linux beacon</option></select></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
     )
 }
 
@@ -8543,6 +8588,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Add existing server"));
         assert!(empty.contains(r#"data-preflight-form"#));
         assert!(empty.contains(r#"data-preflight-host-name"#));
+        assert!(empty.contains(r#"data-preflight-role"#));
+        assert!(empty.contains(r#"data-preflight-host-type"#));
         assert!(empty.contains(r#"data-preflight-ssh-host"#));
         assert!(empty.contains(r#"data-preflight-result"#));
         assert!(empty.contains(r#"data-preflight-bootstrap"#));
@@ -8852,6 +8899,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             template: "hetzner-small-nixos".to_string(),
             apply: false,
             host_name: None,
+            role: None,
+            is_nix: None,
+            heartbeat_interval_secs: None,
             location: None,
             server_type: None,
             image: None,
@@ -8895,6 +8945,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             template: "hetzner-small-nixos".to_string(),
             apply: false,
             host_name: None,
+            role: None,
+            is_nix: None,
+            heartbeat_interval_secs: None,
             location: None,
             server_type: None,
             image: None,
@@ -8962,6 +9015,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             template: "manual-deferred".to_string(),
             apply: true,
             host_name: Some("legacy-1".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
             location: None,
             server_type: None,
             image: None,
@@ -8974,6 +9030,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("manual existing-host path records setup state");
 
         assert_eq!(job.state, ProvisioningJobState::WaitingForHeartbeat);
+        assert_eq!(job.host_name.as_deref(), Some("legacy-1"));
+        assert_eq!(job.role.as_deref(), Some("server"));
+        assert_eq!(job.is_nix, Some(false));
+        assert_eq!(job.heartbeat_interval_secs, Some(60));
         assert_eq!(
             job.progress.last().expect("progress entry").state,
             ProvisioningJobState::WaitingForHeartbeat
@@ -8997,6 +9057,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             template: "native-systemd".to_string(),
             apply: true,
             host_name: Some("legacy-2".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
             location: None,
             server_type: None,
             image: None,
@@ -9009,6 +9072,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("automated existing-host path records safe failure");
 
         assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert_eq!(job.host_name.as_deref(), Some("legacy-2"));
+        assert_eq!(job.role.as_deref(), Some("server"));
+        assert_eq!(job.is_nix, Some(false));
+        assert_eq!(job.heartbeat_interval_secs, Some(60));
         assert_eq!(
             job.progress.last().expect("progress entry").state,
             ProvisioningJobState::Failed
