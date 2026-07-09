@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.7 - 2026-07-09
+
+- Reconcile tracked setup jobs after the first runtime heartbeat: jobs move to backup-pending when backup work remains, or complete when the selected backup policy does not block onboarding.
+- Complete backup-pending jobs once Pharos receives backup observation evidence from the runtime host.
+- Keep setup job polling and Alerts/Activity aligned with the persisted job state instead of hiding first-heartbeat jobs without closing them.
+
 ## 0.1.6 - 2026-07-09
 
 - Added a real Hetzner Cloud create executor behind setup jobs, gated by explicit runtime config and complete create inputs.

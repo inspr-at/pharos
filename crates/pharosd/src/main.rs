@@ -4050,6 +4050,11 @@ async fn provisioning_job_json(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
+    reconcile_provisioning_jobs_with_runtime(
+        &state.provisioning_jobs,
+        &state.store.list(),
+        now_unix(),
+    );
     let access = access_for_headers(&state.auth, &headers);
     match state.provisioning_jobs.get(&id) {
         Some(job)
@@ -5142,7 +5147,9 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
             "fleet",
         ));
     }
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    let all_hosts = state.store.list();
+    reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now_unix());
+    let hosts = filter_hosts_by_access(all_hosts, &access);
     let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     no_store_html(render_home(
@@ -5209,10 +5216,12 @@ async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl 
             "alerts",
         ));
     }
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    let now = now_unix();
+    let all_hosts = state.store.list();
+    reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now);
+    let hosts = filter_hosts_by_access(all_hosts, &access);
     let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let now = now_unix();
     let probes = server_probe_overlays(&manifests, now).await;
     let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
         state.manifests.load_errors()
@@ -5250,10 +5259,12 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
             "activity",
         ));
     }
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    let now = now_unix();
+    let all_hosts = state.store.list();
+    reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now);
+    let hosts = filter_hosts_by_access(all_hosts, &access);
     let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let now = now_unix();
     let probes = server_probe_overlays(&manifests, now).await;
     let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
         state.manifests.load_errors()
@@ -6733,6 +6744,53 @@ fn pending_setup_jobs<'a>(hosts: &[Host], jobs: &'a [ProvisioningJob]) -> Vec<&'
             .then_with(|| provisioning_job_host_name(left).cmp(&provisioning_job_host_name(right)))
     });
     jobs
+}
+
+fn reconcile_provisioning_jobs_with_runtime(
+    provisioning_jobs: &ProvisioningJobStore,
+    hosts: &[Host],
+    now: i64,
+) {
+    let runtime_by_name: BTreeMap<&str, &Host> = hosts
+        .iter()
+        .map(|host| (host.name.as_str(), host))
+        .collect();
+    for job in provisioning_jobs.list() {
+        let Some(host_name) = provisioning_job_host_name(&job) else {
+            continue;
+        };
+        let Some(host) = runtime_by_name.get(host_name) else {
+            continue;
+        };
+        match job.state {
+            ProvisioningJobState::WaitingForHeartbeat => {
+                let setup = provisioning_job_setup_intent(&job);
+                let next_state = if matches!(
+                    setup.backup,
+                    BackupSetupIntent::External | BackupSetupIntent::Absent
+                ) {
+                    ProvisioningJobState::Complete
+                } else {
+                    ProvisioningJobState::BackupPending
+                };
+                let message = if next_state == ProvisioningJobState::Complete {
+                    "First heartbeat observed; onboarding is complete for the selected backup policy."
+                } else {
+                    "First heartbeat observed; backup decision or enrollment remains pending."
+                };
+                let _ = provisioning_jobs.append_progress(&job.id, next_state, message, now);
+            }
+            ProvisioningJobState::BackupPending if !host.backup_observations.is_empty() => {
+                let _ = provisioning_jobs.append_progress(
+                    &job.id,
+                    ProvisioningJobState::Complete,
+                    "Backup observation received; setup job complete.",
+                    now,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
@@ -12535,6 +12593,104 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
         let _ = std::fs::remove_file(token_path);
+    }
+
+    fn setup_runtime_host(name: &str, backup_observations: Vec<BackupObservation>) -> Host {
+        Host {
+            name: name.to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(1_700_000_020),
+            heartbeat_log: vec![1_700_000_020],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness::default(),
+            service_observations: vec![],
+            backup_observations,
+        }
+    }
+
+    #[test]
+    fn setup_jobs_reconcile_first_heartbeat_to_backup_pending_and_complete() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "manual-deferred".to_string(),
+            apply: true,
+            host_name: Some("reconcile-1".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(true),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::EnrollLater),
+            location_intent: Some(LocationSetupIntent::Auto),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let job = store
+            .start(&request, 1_700_000_010, &ProviderRuntimeConfig::default())
+            .expect("setup job starts");
+        assert_eq!(job.state, ProvisioningJobState::WaitingForHeartbeat);
+
+        reconcile_provisioning_jobs_with_runtime(
+            &store,
+            &[setup_runtime_host("reconcile-1", vec![])],
+            1_700_000_020,
+        );
+        assert_eq!(
+            store.get(&job.id).expect("job persisted").state,
+            ProvisioningJobState::BackupPending
+        );
+
+        reconcile_provisioning_jobs_with_runtime(
+            &store,
+            &[setup_runtime_host(
+                "reconcile-1",
+                vec![backup_observation(BackupPostureState::Healthy)],
+            )],
+            1_700_000_030,
+        );
+        assert_eq!(
+            store.get(&job.id).expect("job persisted").state,
+            ProvisioningJobState::Complete
+        );
+    }
+
+    #[test]
+    fn setup_jobs_reconcile_external_backup_policy_to_complete() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "manual-deferred".to_string(),
+            apply: true,
+            host_name: Some("reconcile-2".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::External),
+            location_intent: Some(LocationSetupIntent::SiteFallback),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let job = store
+            .start(&request, 1_700_000_011, &ProviderRuntimeConfig::default())
+            .expect("setup job starts");
+
+        reconcile_provisioning_jobs_with_runtime(
+            &store,
+            &[setup_runtime_host("reconcile-2", vec![])],
+            1_700_000_021,
+        );
+        assert_eq!(
+            store.get(&job.id).expect("job persisted").state,
+            ProvisioningJobState::Complete
+        );
     }
 
     #[test]
