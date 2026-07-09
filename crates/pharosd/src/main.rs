@@ -35,8 +35,8 @@ use pharos_core::{
     ExistingHostPreflightSummary, Host, HostLocation, HostLocationSource, HostManifest,
     HostRegistration, HostRegistrationResponse, HostReport, Liveness, ManifestLocationMode,
     ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
-    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ServiceObservation,
-    ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
+    ServiceObservation, ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
     EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
     PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
@@ -129,6 +129,7 @@ impl ProvisioningJobStore {
             self.counter.fetch_add(1, Ordering::Relaxed)
         );
         let (state, progress) = provisioning_job_progress(request, provider_runtime, now);
+        let handoff = provisioning_job_handoff(request);
         let host_name = request
             .host_name
             .as_deref()
@@ -154,6 +155,7 @@ impl ProvisioningJobStore {
             state,
             created_at: now,
             updated_at: now,
+            handoff,
             progress,
         };
         job.validate_contract()
@@ -395,6 +397,65 @@ fn existing_host_job_progress(
             (ProvisioningJobState::Failed, progress)
         }
         _ => (ProvisioningJobState::Failed, progress),
+    }
+}
+
+fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<ProvisioningHandoff> {
+    if request.provider != "existing-host" {
+        return None;
+    }
+    let method = match request.template.as_str() {
+        "nixos-anywhere" => BootstrapMethod::NixosAnywhere,
+        "native-systemd" => BootstrapMethod::NativeSystemd,
+        "manual-deferred" => BootstrapMethod::Manual,
+        _ => return None,
+    };
+    let interval = request.heartbeat_interval_secs.unwrap_or(60).max(1);
+    match method {
+        BootstrapMethod::NixosAnywhere => Some(ProvisioningHandoff {
+            method,
+            status: "executor-pending".to_string(),
+            title: "NixOS bootstrap handoff".to_string(),
+            summary: "Declarative bootstrap is selected; automated apply stays disabled until the executor can stream credentials without exposing them.".to_string(),
+            token_policy: "Beacon credentials must be installed through a runtime file or secret manager reference, never as a command-line value.".to_string(),
+            secret_target: Some("/run/agenix/pharos-beacon-token".to_string()),
+            command_ref: Some("nixos-anywhere plus services.pharos-beacon".to_string()),
+            next_steps: vec![
+                "Prepare the target flake/module so services.pharos-beacon reads a runtime credential file.".to_string(),
+                "Run the NixOS bootstrap only after SSH, privilege, disk, and rollback checks pass.".to_string(),
+                "Wait for the first heartbeat before marking onboarding complete.".to_string(),
+            ],
+        }),
+        BootstrapMethod::NativeSystemd => Some(ProvisioningHandoff {
+            method,
+            status: "executor-pending".to_string(),
+            title: "Native systemd beacon handoff".to_string(),
+            summary: "Portable beacon install is selected; automated apply stays disabled until Pharos can write the env file over a safe channel.".to_string(),
+            token_policy: "Beacon credentials belong in a root-owned env file or token file and must not be pasted into shell history.".to_string(),
+            secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
+            command_ref: Some("scripts/install-pharos-beacon-systemd.sh".to_string()),
+            next_steps: vec![
+                "Create the env file through an approved secret channel before starting the service.".to_string(),
+                format!(
+                    "Run the native installer with the selected host, role, and {interval}s heartbeat interval."
+                ),
+                "Start pharos-beacon and wait for the first heartbeat before marking onboarding complete.".to_string(),
+            ],
+        }),
+        BootstrapMethod::Manual | BootstrapMethod::Deferred => Some(ProvisioningHandoff {
+            method: BootstrapMethod::Manual,
+            status: "manual-handoff".to_string(),
+            title: "Manual beacon handoff".to_string(),
+            summary: "No automated host changes were made; Pharos is waiting for the operator-managed beacon install.".to_string(),
+            token_policy: "Use a file or env-file secret handoff; never place the beacon credential in command arguments, chat, PPM, or logs.".to_string(),
+            secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
+            command_ref: Some("scripts/install-pharos-beacon-systemd.sh or nixosModules.pharos-beacon".to_string()),
+            next_steps: vec![
+                "Install or enable pharos-beacon using the appropriate NixOS or native systemd path.".to_string(),
+                format!("Configure the beacon to report with a {interval}s heartbeat interval."),
+                "Confirm the first heartbeat appears in Pharos, then continue backup and location decisions.".to_string(),
+            ],
+        }),
     }
 }
 
@@ -2106,6 +2167,19 @@ function latestProvisioningMessage(job){
   const latest=progress[progress.length-1];
   return latest?.message||'Tracked setup job is waiting for progress.';
 }
+function provisioningHandoffMessage(job){
+  const handoff=job?.handoff;
+  if(!handoff)return '';
+  const parts=[
+    handoff.title||'Bootstrap handoff',
+    handoff.summary||'',
+    handoff.token_policy||'',
+    handoff.secret_target?`Target: ${handoff.secret_target}.`:'',
+    handoff.command_ref?`Use: ${handoff.command_ref}.`:'',
+    ...(Array.isArray(handoff.next_steps)?handoff.next_steps:[])
+  ];
+  return parts.filter(Boolean).join(' ');
+}
 function renderProvisioningJob(overlay,job){
   if(!overlay||!job)return;
   overlay.dataset.assistantJobId=job.id||'';
@@ -2116,14 +2190,15 @@ function renderProvisioningJob(overlay,job){
   const jobMessage=overlay.querySelector('[data-assistant-job-message]');
   const label=provisioningJobLabel(job.state);
   const message=latestProvisioningMessage(job);
+  const handoff=provisioningHandoffMessage(job);
   if(title)title.textContent=job.state==='failed'?'Setup did not start':`Setup ${label}`;
-  if(copy)copy.textContent=message;
+  if(copy)copy.textContent=handoff||message;
   if(jobBox){
     jobBox.hidden=false;
     jobBox.scrollIntoView({block:'nearest'});
   }
   if(jobTitle)jobTitle.textContent=`Tracked job: ${label}`;
-  if(jobMessage)jobMessage.textContent=message;
+  if(jobMessage)jobMessage.textContent=handoff?`${message} ${handoff}`:message;
   overlay.querySelectorAll('[data-progress-state]').forEach(step=>{
     step.dataset.active=String(step.dataset.progressState===job.state);
   });
@@ -9034,6 +9109,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(job.role.as_deref(), Some("server"));
         assert_eq!(job.is_nix, Some(false));
         assert_eq!(job.heartbeat_interval_secs, Some(60));
+        let handoff = job.handoff.as_ref().expect("manual handoff");
+        assert_eq!(handoff.method, BootstrapMethod::Manual);
+        assert_eq!(handoff.status, "manual-handoff");
+        assert!(handoff
+            .token_policy
+            .contains("never place the beacon credential"));
+        assert_eq!(
+            handoff.secret_target.as_deref(),
+            Some("/etc/pharos/pharos-beacon.env")
+        );
         assert_eq!(
             job.progress.last().expect("progress entry").state,
             ProvisioningJobState::WaitingForHeartbeat
@@ -9076,6 +9161,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(job.role.as_deref(), Some("server"));
         assert_eq!(job.is_nix, Some(false));
         assert_eq!(job.heartbeat_interval_secs, Some(60));
+        let handoff = job.handoff.as_ref().expect("native handoff");
+        assert_eq!(handoff.method, BootstrapMethod::NativeSystemd);
+        assert_eq!(handoff.status, "executor-pending");
+        assert!(handoff
+            .command_ref
+            .as_deref()
+            .is_some_and(|value| value.contains("install-pharos-beacon-systemd")));
         assert_eq!(
             job.progress.last().expect("progress entry").state,
             ProvisioningJobState::Failed

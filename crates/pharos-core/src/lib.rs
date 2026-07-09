@@ -732,6 +732,48 @@ impl ProvisioningProgressEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningHandoff {
+    pub method: BootstrapMethod,
+    pub status: String,
+    pub title: String,
+    pub summary: String,
+    pub token_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_ref: Option<String>,
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+}
+
+impl ProvisioningHandoff {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        for value in [
+            self.status.as_str(),
+            self.title.as_str(),
+            self.summary.as_str(),
+            self.token_policy.as_str(),
+        ] {
+            if !safe_provisioning_text(value) {
+                return Err(ServerLifecycleContractError::InvalidHandoff);
+            }
+        }
+        for value in self
+            .secret_target
+            .as_deref()
+            .into_iter()
+            .chain(self.command_ref.as_deref())
+            .chain(self.next_steps.iter().map(String::as_str))
+        {
+            if !safe_provisioning_text(value) {
+                return Err(ServerLifecycleContractError::InvalidHandoff);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningJob {
     #[serde(default = "default_provisioning_job_schema")]
     pub schema: String,
@@ -751,6 +793,8 @@ pub struct ProvisioningJob {
     pub state: ProvisioningJobState,
     pub created_at: UnixSeconds,
     pub updated_at: UnixSeconds,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<ProvisioningHandoff>,
     #[serde(default)]
     pub progress: Vec<ProvisioningProgressEntry>,
 }
@@ -778,11 +822,22 @@ impl ProvisioningJob {
         if self.template.trim().is_empty() {
             return Err(ServerLifecycleContractError::EmptyTemplate);
         }
+        if let Some(handoff) = &self.handoff {
+            handoff.validate_contract()?;
+        }
         for entry in &self.progress {
             entry.validate_contract()?;
         }
         Ok(())
     }
+}
+
+fn safe_provisioning_text(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && !value.contains('\n')
+        && !value.contains('\r')
+        && !looks_like_secret_material(value)
 }
 
 fn looks_like_secret_material(value: &str) -> bool {
@@ -806,6 +861,7 @@ pub enum ServerLifecycleContractError {
     SshHostRequired,
     InvalidSecretReference,
     InvalidProgressMessage,
+    InvalidHandoff,
     EmptyJobId,
     EmptyProvider,
     EmptyTemplate,
@@ -840,6 +896,7 @@ impl std::fmt::Display for ServerLifecycleContractError {
             Self::InvalidProgressMessage => {
                 write!(f, "progress message must be plain non-secret text")
             }
+            Self::InvalidHandoff => write!(f, "handoff must be plain non-secret text"),
             Self::EmptyJobId => write!(f, "provisioning job id is required"),
             Self::EmptyProvider => write!(f, "provisioning provider is required"),
             Self::EmptyTemplate => write!(f, "provisioning template is required"),
@@ -1788,9 +1845,32 @@ mod tests {
             state: ProvisioningJobState::Planning,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
+            handoff: Some(ProvisioningHandoff {
+                method: BootstrapMethod::NativeSystemd,
+                status: "manual-handoff".to_string(),
+                title: "Native beacon handoff".to_string(),
+                summary: "Install the beacon with a runtime credential file.".to_string(),
+                token_policy: "Use a file handoff; do not put credentials in command arguments."
+                    .to_string(),
+                secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
+                command_ref: Some("scripts/install-pharos-beacon-systemd.sh".to_string()),
+                next_steps: vec!["Wait for the first heartbeat.".to_string()],
+            }),
             progress: vec![entry],
         };
         job.validate_contract().expect("job contract is valid");
+
+        let secret_handoff = ProvisioningJob {
+            handoff: Some(ProvisioningHandoff {
+                token_policy: "set PHAROS_TOKEN=raw-value".to_string(),
+                ..job.handoff.clone().expect("handoff")
+            }),
+            ..job.clone()
+        };
+        assert_eq!(
+            secret_handoff.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidHandoff)
+        );
 
         let empty_provider = ProvisioningJob {
             provider: " ".to_string(),
