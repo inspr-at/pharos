@@ -311,6 +311,65 @@ fn provisioning_job_progress(
             });
             (ProvisioningJobState::Failed, progress)
         }
+        "existing-host" => existing_host_job_progress(request, now, progress),
+        _ => (ProvisioningJobState::Failed, progress),
+    }
+}
+
+fn existing_host_job_progress(
+    request: &ProvisioningJobStartRequest,
+    now: i64,
+    mut progress: Vec<ProvisioningProgressEntry>,
+) -> (ProvisioningJobState, Vec<ProvisioningProgressEntry>) {
+    if request
+        .host_name
+        .as_deref()
+        .is_none_or(|host_name| host_name.trim().is_empty())
+    {
+        progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Failed,
+            message: "Existing-host setup needs a host name; no token files or host services were changed.".to_string(),
+            observed_at: now,
+        });
+        return (ProvisioningJobState::Failed, progress);
+    }
+    if !request.apply {
+        progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Failed,
+            message: "Existing-host setup needs explicit confirmation; no token files or host services were changed.".to_string(),
+            observed_at: now,
+        });
+        return (ProvisioningJobState::Failed, progress);
+    }
+
+    match request.template.as_str() {
+        "manual-deferred" => {
+            progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::Bootstrapping,
+                message: "Manual existing-host path recorded; no automated host changes were made."
+                    .to_string(),
+                observed_at: now,
+            });
+            progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::WaitingForHeartbeat,
+                message: "Waiting for file/env-file beacon handoff and first heartbeat; keep existing token files unchanged unless rotation is explicit.".to_string(),
+                observed_at: now,
+            });
+            (ProvisioningJobState::WaitingForHeartbeat, progress)
+        }
+        "nixos-anywhere" | "native-systemd" => {
+            progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::Bootstrapping,
+                message: "Automated existing-host apply was requested; no token files or host services were changed by this build.".to_string(),
+                observed_at: now,
+            });
+            progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::Failed,
+                message: "Automated existing-host apply is not active yet; use manual/deferred handoff or retry after the executor slice.".to_string(),
+                observed_at: now,
+            });
+            (ProvisioningJobState::Failed, progress)
+        }
         _ => (ProvisioningJobState::Failed, progress),
     }
 }
@@ -345,7 +404,10 @@ impl std::fmt::Display for ProvisioningJobStartError {
 }
 
 fn valid_setup_provider(provider: &str) -> bool {
-    matches!(provider, "hetzner-cloud" | "manual-import")
+    matches!(
+        provider,
+        "hetzner-cloud" | "manual-import" | "existing-host"
+    )
 }
 
 fn valid_setup_template(provider: &str, template: &str) -> bool {
@@ -355,6 +417,9 @@ fn valid_setup_template(provider: &str, template: &str) -> bool {
             | ("hetzner-cloud", "hetzner-lab")
             | ("hetzner-cloud", "bring-own-plan")
             | ("manual-import", "manual-import")
+            | ("existing-host", "nixos-anywhere")
+            | ("existing-host", "native-systemd")
+            | ("existing-host", "manual-deferred")
     )
 }
 
@@ -1920,13 +1985,16 @@ const ASSISTANT_TEMPLATE_PROVIDERS={
   'hetzner-small-nixos':'hetzner-cloud',
   'hetzner-lab':'hetzner-cloud',
   'bring-own-plan':'hetzner-cloud',
-  'manual-import':'manual-import'
+  'manual-import':'manual-import',
+  'nixos-anywhere':'existing-host',
+  'native-systemd':'existing-host',
+  'manual-deferred':'existing-host'
 };
 function assistantPath(path){
   return ['new','existing'].includes(path)?path:'';
 }
 function assistantProvider(provider){
-  return ['hetzner-cloud','manual-import'].includes(provider)?provider:'';
+  return ['hetzner-cloud','manual-import','existing-host'].includes(provider)?provider:'';
 }
 function assistantTemplate(template){
   return Object.prototype.hasOwnProperty.call(ASSISTANT_TEMPLATE_PROVIDERS,template)?template:'';
@@ -2096,9 +2164,16 @@ function selectExistingBootstrap(overlay,option,button){
   ].filter(Boolean);
   if(copy)copy.textContent=parts.join(' ');
   if(continueButton){
-    continueButton.disabled=true;
-    continueButton.textContent='Apply later';
+    continueButton.disabled=false;
+    continueButton.textContent='Record path';
   }
+}
+function existingBootstrapTemplate(method){
+  if(method==='nixos-anywhere')return 'nixos-anywhere';
+  if(method==='native-systemd')return 'native-systemd';
+  if(method==='manual')return 'manual-deferred';
+  if(method==='deferred')return 'manual-deferred';
+  return '';
 }
 function renderExistingPreflight(overlay,preflight){
   const box=overlay.querySelector('[data-preflight-result]');
@@ -2108,6 +2183,7 @@ function renderExistingPreflight(overlay,preflight){
   const bootstrap=overlay.querySelector('[data-preflight-bootstrap]');
   if(!box||!preflight)return;
   box.hidden=false;
+  overlay.dataset.existingBootstrapMethod='';
   if(summary)summary.textContent=preflight.summary?.label||'Preflight';
   if(message)message.textContent=preflight.summary?.message||preflight.next_action||'Review checks before continuing.';
   if(checks){
@@ -2207,12 +2283,23 @@ function scheduleProvisioningPoll(overlay,id){
 }
 async function startProvisioningJob(overlay,start){
   const state=assistantState(overlay);
+  const body={provider:state.provider,template:state.template};
+  if(state.path==='existing'){
+    const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
+    const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
+    if(!hostName)throw new Error('Enter a server name first.');
+    if(!template)throw new Error('Choose a bootstrap path first.');
+    body.provider='existing-host';
+    body.template=template;
+    body.host_name=hostName;
+    body.apply=true;
+  }
   start.textContent='Starting setup';
   start.disabled=true;
   const response=await fetch('/setup/provisioning-jobs',{
     method:'POST',
     headers:{'content-type':'application/json','accept':'application/json'},
-    body:JSON.stringify({provider:state.provider,template:state.template}),
+    body:JSON.stringify(body),
     cache:'no-store'
   });
   const payload=await response.json().catch(()=>({}));
@@ -2366,6 +2453,15 @@ function initSetupAssistant(){
   overlay.querySelector('[data-assistant-continue]')?.addEventListener('click',event=>{
     if(event.currentTarget.disabled)return;
     overlay.dataset.assistantStage='plan';
+    if(assistantState(overlay).path==='existing'){
+      const start=overlay.querySelector('[data-assistant-start]');
+      const confirm=overlay.querySelector('[data-assistant-confirm]');
+      if(confirm)confirm.checked=true;
+      if(start){
+        start.disabled=false;
+        start.textContent='Record setup path';
+      }
+    }
     const state=assistantState(overlay);
     writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
     syncAssistantNext(overlay);
@@ -8584,6 +8680,76 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .message
             .contains("no provider resources were created"));
         let json = serde_json::to_string(&gated).expect("job serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    #[test]
+    fn existing_host_manual_path_waits_for_heartbeat_without_secrets() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "manual-deferred".to_string(),
+            apply: true,
+            host_name: Some("legacy-1".to_string()),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let runtime = ProviderRuntimeConfig::default();
+
+        let job = store
+            .start(&request, 1_700_000_005, &runtime)
+            .expect("manual existing-host path records setup state");
+
+        assert_eq!(job.state, ProvisioningJobState::WaitingForHeartbeat);
+        assert_eq!(
+            job.progress.last().expect("progress entry").state,
+            ProvisioningJobState::WaitingForHeartbeat
+        );
+        assert!(job
+            .progress
+            .last()
+            .expect("progress entry")
+            .message
+            .contains("first heartbeat"));
+        let json = serde_json::to_string(&job).expect("job serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    #[test]
+    fn existing_host_automated_path_fails_closed_until_executor_exists() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "native-systemd".to_string(),
+            apply: true,
+            host_name: Some("legacy-2".to_string()),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let runtime = ProviderRuntimeConfig::default();
+
+        let job = store
+            .start(&request, 1_700_000_006, &runtime)
+            .expect("automated existing-host path records safe failure");
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert_eq!(
+            job.progress.last().expect("progress entry").state,
+            ProvisioningJobState::Failed
+        );
+        assert!(job
+            .progress
+            .last()
+            .expect("progress entry")
+            .message
+            .contains("Automated existing-host apply is not active yet"));
+        let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
     }
