@@ -210,6 +210,7 @@ mod tests {
                         ..Default::default()
                     },
                     service_observations: vec![],
+                    backup_observations: vec![],
                     inbound_rtt_ms: None,
                     location: None,
                 },
@@ -263,6 +264,7 @@ mod tests {
                         commits_behind: Some(0),
                     },
                 )],
+                backup_observations: vec![],
                 inbound_rtt_ms: Some(37),
                 location: None,
             },
@@ -302,6 +304,7 @@ mod tests {
                     commits_behind: Some(0),
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
                 inbound_rtt_ms: None,
                 location: None,
             },

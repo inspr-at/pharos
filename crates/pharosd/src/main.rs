@@ -9420,6 +9420,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ..Default::default()
             },
             service_observations: vec![],
+            backup_observations: vec![],
             inbound_rtt_ms: None,
             location: None,
         }

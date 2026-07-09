@@ -1080,6 +1080,8 @@ pub struct HostReport {
     pub freshness: NixFreshness,
     #[serde(default)]
     pub service_observations: Vec<ServiceObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_observations: Vec<BackupObservation>,
     /// Previous successful host-to-Pharos report submission round trip, in
     /// milliseconds. First reports and old beacons omit this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1107,6 +1109,9 @@ impl HostReport {
             .is_some_and(|millis| millis > MAX_INBOUND_RTT_MS)
         {
             return Err(format!("inbound_rtt_ms must be <= {}", MAX_INBOUND_RTT_MS));
+        }
+        for observation in &self.backup_observations {
+            observation.validate_contract()?;
         }
         if let Some(location) = &self.location {
             location.validate_contract()?;
@@ -1182,6 +1187,183 @@ impl ServiceObservation {
             summary,
         }
     }
+}
+
+/// Typed backup posture observation carried by beacons once PHAROS-63 adds
+/// collectors. PHAROS-62 deliberately keeps this separate from the generic
+/// `ServiceObservation`: backup status needs attempt/success/check/restore
+/// evidence, while `ServiceObservation` stays a compact scan signal.
+///
+/// Staged rollout relationship:
+/// - `HostReport.backup_observations` can accept these additively now.
+/// - `Host` JSON persistence and dashboard overlays stay unchanged until
+///   PHAROS-64 wires storage/API surfaces.
+/// - Values are sanitized metadata only: no repository passwords, env values,
+///   credential-bearing URLs, raw logs, or secret paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupObservation {
+    pub id: String,
+    pub label: String,
+    pub engine: BackupEngine,
+    pub state: BackupPostureState,
+    pub configured: BackupConfiguredState,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_state: Option<BackupRunState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_snapshot_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_state: Option<BackupValidationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_validation: Option<BackupValidationObservation>,
+}
+
+impl BackupObservation {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        for value in [self.id.as_str(), self.label.as_str(), self.summary.as_str()] {
+            if !safe_observation_text(value) {
+                return Err("backup observation text must be sanitized".to_string());
+            }
+        }
+        for value in self
+            .target_label
+            .as_deref()
+            .into_iter()
+            .chain(self.repository_id.as_deref())
+            .chain(self.schedule.as_deref())
+        {
+            if !safe_observation_text(value) {
+                return Err("backup observation metadata must be sanitized".to_string());
+            }
+        }
+        if let Some(restore) = &self.restore_validation {
+            restore.validate_contract()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupEngine {
+    Restic,
+    Borg,
+    Kopia,
+    ProviderSnapshot,
+    Other,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupPostureState {
+    Healthy,
+    Warning,
+    Stale,
+    Failed,
+    Unknown,
+    Missing,
+    NotConfigured,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupConfiguredState {
+    Enabled,
+    Disabled,
+    External,
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupRunState {
+    Succeeded,
+    Failed,
+    Running,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupValidationObservation {
+    pub level: BackupValidationLevel,
+    pub state: BackupValidationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl BackupValidationObservation {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        for value in self
+            .evidence_label
+            .as_deref()
+            .into_iter()
+            .chain(self.summary.as_deref())
+        {
+            if !safe_observation_text(value) {
+                return Err("backup validation evidence must be sanitized".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupValidationLevel {
+    SnapshotExists,
+    RepositoryCheck,
+    MountList,
+    RestoreSample,
+    DiffHash,
+    OperatorTest,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupValidationState {
+    Passed,
+    Failed,
+    Stale,
+    Unknown,
+}
+
+fn safe_observation_text(value: &str) -> bool {
+    let value = value.trim();
+    let lowered = value.to_ascii_lowercase();
+    !value.is_empty()
+        && !value.contains('\n')
+        && !value.contains('\r')
+        && !value.contains("://")
+        && !value.contains('?')
+        && !value.contains('#')
+        && !lowered.contains("password")
+        && !lowered.contains("secret=")
+        && !lowered.contains("pass=")
+        && !looks_like_secret_material(value)
 }
 
 /// What `inspr onboard` will send before installing `pharos-beacon` (PHAROS-7).
@@ -1664,6 +1846,7 @@ mod tests {
         .expect("deserialize legacy report");
         assert!(legacy.location.is_none());
         assert!(legacy.inbound_rtt_ms.is_none());
+        assert!(legacy.backup_observations.is_empty());
         legacy.validate_contract().expect("legacy report valid");
 
         let runtime = HostReport {
@@ -1707,6 +1890,89 @@ mod tests {
             ..legacy
         };
         assert!(declared_runtime.validate_contract().is_err());
+    }
+
+    #[test]
+    fn backup_observation_contract_is_typed_and_sanitized() {
+        let supported_states = serde_json::to_value([
+            BackupPostureState::Healthy,
+            BackupPostureState::Warning,
+            BackupPostureState::Stale,
+            BackupPostureState::Failed,
+            BackupPostureState::Unknown,
+            BackupPostureState::Missing,
+            BackupPostureState::NotConfigured,
+        ])
+        .expect("states serialize");
+        assert_eq!(
+            supported_states,
+            serde_json::json!([
+                "healthy",
+                "warning",
+                "stale",
+                "failed",
+                "unknown",
+                "missing",
+                "not-configured"
+            ])
+        );
+
+        let observation = BackupObservation {
+            id: "restic-main".to_string(),
+            label: "Restic main".to_string(),
+            engine: BackupEngine::Restic,
+            state: BackupPostureState::Healthy,
+            configured: BackupConfiguredState::Enabled,
+            summary: "last backup succeeded".to_string(),
+            target_label: Some("off-box repository".to_string()),
+            repository_id: Some("restic-main-repository".to_string()),
+            schedule: Some("hourly".to_string()),
+            next_run_at: Some(1_700_003_600),
+            last_attempt_at: Some(1_700_000_000),
+            last_attempt_state: Some(BackupRunState::Succeeded),
+            last_success_at: Some(1_700_000_000),
+            snapshot_count: Some(42),
+            total_bytes: Some(1_024 * 1_024),
+            latest_snapshot_bytes: Some(12_345),
+            last_check_at: Some(1_699_990_000),
+            last_check_state: Some(BackupValidationState::Passed),
+            restore_validation: Some(BackupValidationObservation {
+                level: BackupValidationLevel::RestoreSample,
+                state: BackupValidationState::Passed,
+                checked_at: Some(1_699_980_000),
+                evidence_label: Some("sample restore drill".to_string()),
+                summary: Some("operator-validated sample restore".to_string()),
+            }),
+        };
+        observation
+            .validate_contract()
+            .expect("sanitized observation validates");
+
+        let report = HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
+            name: "hsb8".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            heartbeat_interval_secs: 60,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            service_observations: vec![],
+            backup_observations: vec![observation.clone()],
+            inbound_rtt_ms: None,
+            location: None,
+        };
+        report
+            .validate_contract()
+            .expect("backup observations are accepted additively");
+
+        let credential_bearing = BackupObservation {
+            repository_id: Some("s3://user:password@example.invalid/bucket".to_string()),
+            ..observation
+        };
+        assert!(credential_bearing.validate_contract().is_err());
     }
 
     #[test]

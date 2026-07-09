@@ -484,6 +484,7 @@ fn main() {
             heartbeat_interval_secs: beat,
             freshness,
             service_observations,
+            backup_observations: vec![],
             inbound_rtt_ms: last_report_rtt_ms,
             location,
         };
