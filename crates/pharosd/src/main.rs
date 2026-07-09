@@ -179,6 +179,15 @@ impl ProvisioningJobStore {
             .cloned()
     }
 
+    fn list(&self) -> Vec<ProvisioningJob> {
+        self.jobs
+            .read()
+            .expect("provisioning job store lock")
+            .values()
+            .cloned()
+            .collect()
+    }
+
     fn persist(&self) {
         let Some(path) = &self.path else { return };
         let snapshot: Vec<ProvisioningJob> = self
@@ -1454,6 +1463,18 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .backup-list{min-width:150px;margin:0}
 .backup-list span{font-size:11px}
 .backup-list strong{font-size:12px}
+.setup-card{border-color:rgba(214,155,49,.34);background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(247,252,253,.82));box-shadow:0 14px 32px rgba(45,75,95,.08),inset 0 0 0 1px rgba(214,155,49,.08)}
+.setup-card[data-setup-level="warning"]{border-color:rgba(178,106,0,.32)}
+.setup-card .nix{color:var(--sun);border-color:rgba(214,155,49,.24);box-shadow:0 0 0 5px rgba(214,155,49,.06)}
+.setup-intent{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.setup-chip{display:inline-flex;align-items:center;min-height:25px;max-width:100%;padding:4px 8px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:720;white-space:nowrap}
+.setup-chip.backup{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.72);color:#9a5b00}
+.setup-chip.location{border-color:rgba(103,177,196,.30);background:rgba(223,241,249,.62);color:#0f4f80}
+.setup-detail{min-height:40px;margin:2px 0 10px;color:var(--muted);font-size:12px;line-height:1.35}
+.setup-action{display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:6px 10px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;text-decoration:none;font-size:12px;font-weight:760;box-shadow:0 8px 18px rgba(18,48,75,.12)}
+.setup-action:hover,.setup-action:focus-visible{background:#0f2941;box-shadow:0 10px 22px rgba(18,48,75,.16);outline:0}
+.setup-row td{border-color:rgba(214,155,49,.30);background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(247,252,253,.78))}
+.setup-row[data-setup-level="warning"] td{border-color:rgba(178,106,0,.32)}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
 .card-tools{display:flex;align-items:center;justify-content:center;min-height:25px;margin-top:5px}
@@ -1600,6 +1621,7 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
 .assistant-existing-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-step{display:grid}.assistant-preflight-form{display:grid;grid-template-columns:1fr .85fr 1fr 1.25fr .8fr auto;gap:10px;align-items:end;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.78)}.assistant-preflight-form label,.assistant-preflight-facts label{display:grid;gap:5px;min-width:0}.assistant-preflight-form label span,.assistant-preflight-facts label span{color:var(--muted);font-size:11px;font-weight:650}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-preflight-form input:focus,.assistant-preflight-form select:focus,.assistant-preflight-facts input:focus,.assistant-preflight-facts select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}.assistant-preflight-details{grid-column:1/-1;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.74);padding:8px 10px}.assistant-preflight-details summary{cursor:pointer;color:#0f4f80;font-size:12px;font-weight:760}.assistant-preflight-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}.assistant-check{min-height:36px;padding:0 13px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760;white-space:nowrap;cursor:pointer}.assistant-check:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-preflight-result{display:grid;gap:10px;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(247,252,253,.78)}.assistant-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.assistant-result-head strong{font-size:14px;color:var(--ink)}.assistant-result-head span{max-width:430px;color:var(--muted);font-size:12px;line-height:1.35;text-align:right}.assistant-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.assistant-check-row{--check-color:var(--wait);display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start;min-height:42px;padding:8px 9px;border:1px solid rgba(214,226,234,.70);border-radius:7px;background:rgba(255,255,255,.72)}.assistant-check-row:before{content:"";width:8px;height:8px;margin-top:4px;border-radius:50%;background:var(--check-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--check-color) 10%,transparent)}.assistant-check-row[data-state="pass"]{--check-color:var(--live)}.assistant-check-row[data-state="warn"]{--check-color:var(--stale)}.assistant-check-row[data-state="fail"]{--check-color:var(--down)}.assistant-check-row strong{display:block;font-size:12px;color:var(--ink)}.assistant-check-row span{display:block;margin-top:1px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.assistant-bootstrap-option{--option-color:var(--wait);appearance:none;display:block;width:100%;min-height:72px;padding:10px;border:1px solid rgba(214,226,234,.74);border-radius:7px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;opacity:.72}.assistant-bootstrap-option[data-available="true"]{--option-color:var(--sea);opacity:1;border-color:rgba(21,158,153,.26);background:rgba(233,249,248,.62);cursor:pointer}.assistant-bootstrap-option[data-selected="true"]{border-color:rgba(21,158,153,.58);box-shadow:0 0 0 3px rgba(21,158,153,.10),0 10px 22px rgba(45,75,95,.08)}.assistant-bootstrap-option:disabled{cursor:not-allowed}.assistant-bootstrap-option strong{display:block;color:var(--ink);font-size:12px}.assistant-bootstrap-option span{display:block;margin-top:3px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap-option:before{content:"";display:block;width:8px;height:8px;margin-bottom:7px;border-radius:50%;background:var(--option-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--option-color) 10%,transparent)}
 .assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
+.assistant-plan-field{display:grid;gap:5px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-plan-field span{color:var(--muted);font-size:11px;font-weight:650}.assistant-plan-field input{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-plan-field input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
 .assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
 .assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
@@ -2571,7 +2593,14 @@ async function startProvisioningJob(overlay,start){
   const body={provider:state.provider,template:state.template};
   body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
   body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
-  if(state.path==='existing'){
+  if(state.path==='new'){
+    const hostName=(overlay.querySelector('[data-new-host-name]')?.value||'').trim();
+    if(!hostName)throw new Error('Enter a server name first.');
+    body.host_name=hostName;
+    body.role='server';
+    body.is_nix=state.provider==='hetzner-cloud';
+    body.heartbeat_interval_secs=60;
+  }else if(state.path==='existing'){
     const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
     const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
     if(!hostName)throw new Error('Enter a server name first.');
@@ -4191,13 +4220,20 @@ fn no_store_json(value: serde_json::Value) -> impl IntoResponse {
 
 async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
+    let hosts = state.store.list();
+    let jobs = state.provisioning_jobs.list();
     no_store_html(render_home(
-        &state.store.list(),
+        RuntimeSnapshot {
+            hosts: &hosts,
+            jobs: &jobs,
+        },
         &self_host(),
         now_unix(),
         state.manifests.manifests(),
-        &user_label,
-        state.auth.is_some(),
+        ShellContext {
+            user_label: &user_label,
+            logout_enabled: state.auth.is_some(),
+        },
         true,
     ))
 }
@@ -4231,10 +4267,14 @@ async fn map_data_json(State(state): State<AppState>) -> impl IntoResponse {
 async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let hosts = state.store.list();
+    let jobs = state.provisioning_jobs.list();
     let now = now_unix();
     let probes = server_probe_overlays(state.manifests.manifests(), now).await;
     no_store_html(render_alerts(
-        &hosts,
+        RuntimeSnapshot {
+            hosts: &hosts,
+            jobs: &jobs,
+        },
         &self_host(),
         now,
         state.manifests.manifests(),
@@ -4250,10 +4290,14 @@ async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl 
 async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let hosts = state.store.list();
+    let jobs = state.provisioning_jobs.list();
     let now = now_unix();
     let probes = server_probe_overlays(state.manifests.manifests(), now).await;
     no_store_html(render_activity(
-        &hosts,
+        RuntimeSnapshot {
+            hosts: &hosts,
+            jobs: &jobs,
+        },
         &self_host(),
         now,
         state.manifests.manifests(),
@@ -5207,6 +5251,12 @@ struct ShellContext<'a> {
     logout_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RuntimeSnapshot<'a> {
+    hosts: &'a [Host],
+    jobs: &'a [ProvisioningJob],
+}
+
 fn search_box(placeholder: &str) -> String {
     format!(
         r#"<label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="{placeholder}"></label>"#,
@@ -5260,6 +5310,10 @@ fn setup_assistant() -> String {
         server = icons::SERVER
     )
     .replace(
+        r#"<div class="assistant-plan-list">"#,
+        r#"<label class="assistant-plan-field"><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01"></label><div class="assistant-plan-list">"#,
+    )
+    .replace(
         r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
         r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>Role</span><input data-preflight-role autocomplete="off" placeholder="server"></label><label><span>Host type</span><select data-preflight-host-type><option value="">Decide after check</option><option value="nixos">NixOS</option><option value="linux-beacon">Linux beacon</option></select></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
     )
@@ -5292,6 +5346,228 @@ fn lone_host_state(can_onboard: bool) -> String {
         r#"<aside class="lone-state" aria-label="lone host state"><span class="lone-mark">{lighthouse}</span><div class="lone-copy"><span class="lone-kicker">one light</span><strong>First host is on the map</strong><p>The fleet view is ready for the next onboarded machine.</p></div>{action}</aside>"#,
         lighthouse = icons::LIGHTHOUSE,
         action = action
+    )
+}
+
+fn provisioning_job_host_name(job: &ProvisioningJob) -> Option<&str> {
+    job.host_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+}
+
+fn provisioning_job_role(job: &ProvisioningJob) -> &str {
+    job.role
+        .as_deref()
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .unwrap_or("server")
+}
+
+fn provisioning_job_visible_in_fleet(job: &ProvisioningJob) -> bool {
+    matches!(
+        job.state,
+        ProvisioningJobState::Planning
+            | ProvisioningJobState::Provisioning
+            | ProvisioningJobState::Bootstrapping
+            | ProvisioningJobState::WaitingForHeartbeat
+            | ProvisioningJobState::BackupPending
+    )
+}
+
+fn first_heartbeat_timeout_secs(job: &ProvisioningJob) -> i64 {
+    let interval = i64::try_from(job.heartbeat_interval_secs.unwrap_or(60))
+        .unwrap_or(60)
+        .max(1);
+    (interval * 5).clamp(300, 1800)
+}
+
+fn provisioning_job_first_heartbeat_overdue(job: &ProvisioningJob, now: i64) -> bool {
+    job.state == ProvisioningJobState::WaitingForHeartbeat
+        && now.saturating_sub(job.updated_at) > first_heartbeat_timeout_secs(job)
+}
+
+fn provisioning_job_fleet_status(
+    job: &ProvisioningJob,
+    now: i64,
+) -> (&'static str, &'static str, &'static str, u8, String) {
+    if provisioning_job_first_heartbeat_overdue(job, now) {
+        return (
+            "stale",
+            "warning",
+            "warn",
+            1,
+            "first heartbeat overdue".to_string(),
+        );
+    }
+
+    match job.state {
+        ProvisioningJobState::Planning
+        | ProvisioningJobState::Provisioning
+        | ProvisioningJobState::Bootstrapping => (
+            "awaiting_first_heartbeat",
+            "watch",
+            "wait",
+            2,
+            format!("setup {}", job.state.label()),
+        ),
+        ProvisioningJobState::WaitingForHeartbeat => (
+            "awaiting_first_heartbeat",
+            "watch",
+            "wait",
+            2,
+            "waiting for first heartbeat".to_string(),
+        ),
+        ProvisioningJobState::BackupPending => (
+            "awaiting_first_heartbeat",
+            "watch",
+            "wait",
+            2,
+            "backup pending".to_string(),
+        ),
+        ProvisioningJobState::Complete => ("live", "clear", "ok", 4, "setup complete".to_string()),
+        ProvisioningJobState::Failed | ProvisioningJobState::CleanupNeeded => {
+            ("down", "critical", "down", 0, job.state.label().to_string())
+        }
+    }
+}
+
+fn provisioning_job_setup_intent(job: &ProvisioningJob) -> ProvisioningSetupIntent {
+    job.setup_intent.clone().unwrap_or(ProvisioningSetupIntent {
+        backup: BackupSetupIntent::Deferred,
+        location: LocationSetupIntent::Auto,
+    })
+}
+
+fn provisioning_job_latest_message(job: &ProvisioningJob) -> String {
+    job.progress
+        .last()
+        .map(|entry| entry.message.clone())
+        .unwrap_or_else(|| "Setup job is waiting for progress.".to_string())
+}
+
+fn setup_intent_markup(intent: &ProvisioningSetupIntent) -> String {
+    format!(
+        r#"<div class="setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div>"#,
+        backup = html_escape(intent.backup_label()),
+        location = html_escape(intent.location_label())
+    )
+}
+
+fn setup_intent_search_text(intent: &ProvisioningSetupIntent) -> String {
+    format!(
+        "{} {} {} {}",
+        intent.backup_label(),
+        intent.backup_next_action(),
+        intent.location_label(),
+        intent.location_next_action()
+    )
+}
+
+fn pending_setup_jobs<'a>(hosts: &[Host], jobs: &'a [ProvisioningJob]) -> Vec<&'a ProvisioningJob> {
+    let runtime_names: BTreeSet<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
+    let mut latest_by_host: BTreeMap<&str, &ProvisioningJob> = BTreeMap::new();
+    for job in jobs {
+        let Some(host_name) = provisioning_job_host_name(job) else {
+            continue;
+        };
+        if runtime_names.contains(host_name) || !provisioning_job_visible_in_fleet(job) {
+            continue;
+        }
+        let replace = latest_by_host
+            .get(host_name)
+            .is_none_or(|existing| job.updated_at >= existing.updated_at);
+        if replace {
+            latest_by_host.insert(host_name, job);
+        }
+    }
+    let mut jobs: Vec<&ProvisioningJob> = latest_by_host.into_values().collect();
+    jobs.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| provisioning_job_host_name(left).cmp(&provisioning_job_host_name(right)))
+    });
+    jobs
+}
+
+fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
+    let Some(raw_name) = provisioning_job_host_name(job) else {
+        return String::new();
+    };
+    let name = html_escape(raw_name);
+    let role = html_escape(provisioning_job_role(job));
+    let is_nix = job.is_nix.unwrap_or(false);
+    let host_icon = if is_nix {
+        icons::SNOWFLAKE
+    } else {
+        icons::SERVER
+    };
+    let (live_key, level, reason_level, sev, reason) = provisioning_job_fleet_status(job, now);
+    let intent = provisioning_job_setup_intent(job);
+    let intent_markup = setup_intent_markup(&intent);
+    let search = html_escape(&format!(
+        "{} {} setup provisioning {} {} {}",
+        raw_name.to_lowercase(),
+        provisioning_job_role(job).to_lowercase(),
+        reason.to_lowercase(),
+        job.state.label(),
+        setup_intent_search_text(&intent).to_lowercase()
+    ));
+    let detail = if provisioning_job_first_heartbeat_overdue(job, now) {
+        format!(
+            "No first heartbeat after {}. Check beacon install, network, and host power.",
+            duration_label(now.saturating_sub(job.updated_at))
+        )
+    } else {
+        provisioning_job_latest_message(job)
+    };
+    let started = format!("setup started {} ago", duration_label(now - job.created_at));
+    format!(
+        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="settings-card" href="/?setup=add-server" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server">Continue setup</a></div></article>"#,
+        sort_name = html_escape(&raw_name.to_lowercase()),
+        updated_at = job.updated_at,
+        settings = icons::SLIDERS,
+        reason = html_escape(&reason),
+        detail = html_escape(&detail),
+        started = html_escape(&started),
+        as_of = clock_label(now)
+    )
+}
+
+fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
+    let Some(raw_name) = provisioning_job_host_name(job) else {
+        return String::new();
+    };
+    let name = html_escape(raw_name);
+    let role = html_escape(provisioning_job_role(job));
+    let is_nix = job.is_nix.unwrap_or(false);
+    let host_icon = if is_nix {
+        icons::SNOWFLAKE
+    } else {
+        icons::SERVER
+    };
+    let (live_key, level, reason_level, sev, reason) = provisioning_job_fleet_status(job, now);
+    let intent = provisioning_job_setup_intent(job);
+    let search = html_escape(&format!(
+        "{} {} setup provisioning {} {} {}",
+        raw_name.to_lowercase(),
+        provisioning_job_role(job).to_lowercase(),
+        reason.to_lowercase(),
+        job.state.label(),
+        setup_intent_search_text(&intent).to_lowercase()
+    ));
+    let started = format!("setup started {} ago", duration_label(now - job.created_at));
+    let status_icon = status_icon_stack();
+    format!(
+        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {reason}">{status_icon}<span class="word" data-status-word>{reason}</span></span></td><td><div class="reason {reason_level}" data-reason><span>{reason}</span></div></td><td><span class="setup-chip backup">{backup}</span></td><td><span class="setup-chip location">{location}</span></td><td><span>{started}</span></td><td><span>{job_state}</span></td><td><a class="setup-action" href="/?setup=add-server">Continue</a></td></tr>"#,
+        sort_name = html_escape(&raw_name.to_lowercase()),
+        updated_at = job.updated_at,
+        reason = html_escape(&reason),
+        backup = html_escape(intent.backup_label()),
+        location = html_escape(intent.location_label()),
+        started = html_escape(&started),
+        job_state = html_escape(job.state.label())
     )
 }
 
@@ -6370,8 +6646,83 @@ fn probe_alert(host: &str, role: &str, probe: &ServerProbeObservation) -> Option
     })
 }
 
+fn provisioning_job_alert(
+    job: &ProvisioningJob,
+    runtime_names: &BTreeSet<&str>,
+    now: i64,
+) -> Option<AlertItem> {
+    let host = provisioning_job_host_name(job)?;
+    if runtime_names.contains(host) && !matches!(job.state, ProvisioningJobState::BackupPending) {
+        return None;
+    }
+
+    let latest = provisioning_job_latest_message(job);
+    let (level, issue, detail, action) = match job.state {
+        ProvisioningJobState::Planning
+        | ProvisioningJobState::Provisioning
+        | ProvisioningJobState::Bootstrapping => (
+            "watch",
+            "Setup in progress",
+            latest,
+            "Continue setup and wait for the first valid beacon heartbeat.",
+        ),
+        ProvisioningJobState::WaitingForHeartbeat => {
+            if provisioning_job_first_heartbeat_overdue(job, now) {
+                (
+                    "warning",
+                    "First heartbeat overdue",
+                    format!(
+                        "No first heartbeat after {}.",
+                        duration_label(now.saturating_sub(job.updated_at))
+                    ),
+                    "Check beacon install, network, and host power.",
+                )
+            } else {
+                (
+                    "watch",
+                    "Waiting for first heartbeat",
+                    latest,
+                    "Finish the beacon handoff and keep onboarding open.",
+                )
+            }
+        }
+        ProvisioningJobState::BackupPending => (
+            "watch",
+            "Backup enrollment pending",
+            latest,
+            "Record backup posture or wait for the first backup observation.",
+        ),
+        ProvisioningJobState::Failed => (
+            "critical",
+            "Setup failed",
+            latest,
+            "Open the setup assistant, correct the blocker, and retry.",
+        ),
+        ProvisioningJobState::CleanupNeeded => (
+            "critical",
+            "Setup cleanup needed",
+            latest,
+            "Review provider state before retrying or removing the job.",
+        ),
+        ProvisioningJobState::Complete => return None,
+    };
+
+    Some(AlertItem {
+        level,
+        host: host.to_string(),
+        role: provisioning_job_role(job).to_string(),
+        issue: issue.to_string(),
+        detail,
+        source: "setup",
+        seen: format!("as of {}", clock_label(job.updated_at)),
+        next_action: action.to_string(),
+        sort_time: job.updated_at,
+    })
+}
+
 fn alert_items(
     hosts: &[Host],
+    jobs: &[ProvisioningJob],
     _self_name: &str,
     now: i64,
     manifests: &[HostManifest],
@@ -6383,6 +6734,7 @@ fn alert_items(
         .iter()
         .map(|host| (host.name.as_str(), host))
         .collect();
+    let runtime_names: BTreeSet<&str> = runtime_by_name.keys().copied().collect();
     let manifest_roles: BTreeMap<&str, &str> = manifests
         .iter()
         .map(|manifest| {
@@ -6501,6 +6853,12 @@ fn alert_items(
             if let Some(alert) = backup_validation_alert(host, observation, now) {
                 alerts.push(alert);
             }
+        }
+    }
+
+    for job in jobs {
+        if let Some(alert) = provisioning_job_alert(job, &runtime_names, now) {
+            alerts.push(alert);
         }
     }
 
@@ -6686,7 +7044,7 @@ fn posture_panel(alerts: &[AlertItem], hosts: &[Host]) -> String {
 }
 
 fn render_alerts(
-    hosts: &[Host],
+    runtime: RuntimeSnapshot<'_>,
     self_name: &str,
     now: i64,
     manifests: &[HostManifest],
@@ -6694,17 +7052,25 @@ fn render_alerts(
     server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
     shell: ShellContext<'_>,
 ) -> String {
-    let alerts = alert_items(hosts, self_name, now, manifests, load_errors, server_probes);
+    let alerts = alert_items(
+        runtime.hosts,
+        runtime.jobs,
+        self_name,
+        now,
+        manifests,
+        load_errors,
+        server_probes,
+    );
     let groups = alert_groups(&alerts);
     let rows = render_alert_rows(&groups);
     format!(
         r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, backup, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "alerts"),
         header = page_header("Alerts", "Needs attention", now),
-        summary = ops_summary_metrics(&alerts, hosts),
+        summary = ops_summary_metrics(&alerts, runtime.hosts),
         toolbar = ops_toolbar(),
         count = alerts.len(),
-        posture = posture_panel(&alerts, hosts),
+        posture = posture_panel(&alerts, runtime.hosts),
         script = ops_script()
     )
 }
@@ -7011,6 +7377,7 @@ fn push_backup_activity_events(
 
 fn activity_events(
     hosts: &[Host],
+    jobs: &[ProvisioningJob],
     _self_name: &str,
     now: i64,
     manifests: &[HostManifest],
@@ -7018,6 +7385,7 @@ fn activity_events(
     server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
 ) -> Vec<ActivityEvent> {
     let mut events = Vec::new();
+    let runtime_names: BTreeSet<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
 
     for issue in load_errors {
         events.push(ActivityEvent::new(
@@ -7041,6 +7409,46 @@ fn activity_events(
             format!("{} declared services", manifest.services.len()),
             "config",
         ));
+    }
+
+    for job in jobs {
+        let Some(host) = provisioning_job_host_name(job) else {
+            continue;
+        };
+        if provisioning_job_first_heartbeat_overdue(job, now) && !runtime_names.contains(host) {
+            events.push(ActivityEvent::new(
+                now,
+                host.to_string(),
+                "warning",
+                "setup",
+                "First heartbeat overdue",
+                format!(
+                    "No first heartbeat after {}.",
+                    duration_label(now.saturating_sub(job.updated_at))
+                ),
+                "setup",
+            ));
+        }
+        for entry in &job.progress {
+            let level = match entry.state {
+                ProvisioningJobState::Failed | ProvisioningJobState::CleanupNeeded => "critical",
+                ProvisioningJobState::WaitingForHeartbeat
+                | ProvisioningJobState::BackupPending
+                | ProvisioningJobState::Planning
+                | ProvisioningJobState::Provisioning
+                | ProvisioningJobState::Bootstrapping => "watch",
+                ProvisioningJobState::Complete => "recovery",
+            };
+            events.push(ActivityEvent::new(
+                entry.observed_at,
+                host.to_string(),
+                level,
+                "setup",
+                format!("Setup {}", entry.state.label()),
+                entry.message.clone(),
+                "setup",
+            ));
+        }
     }
 
     for host in hosts {
@@ -7177,14 +7585,16 @@ fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
     let freshness = activity_source_count(events, "freshness");
     let service = activity_source_count(events, "service");
     let backup = activity_source_count(events, "backup");
+    let setup = activity_source_count(events, "setup");
     format!(
-        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
+        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="setup" aria-pressed="false"><b>{setup}</b><span>setup</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
         total = events.len()
     )
 }
 
 fn activity_filter_bar(events: &[ActivityEvent]) -> String {
     let config = activity_source_count(events, "config");
+    let setup = activity_source_count(events, "setup");
     let critical = events
         .iter()
         .filter(|event| event.level == "critical")
@@ -7194,7 +7604,7 @@ fn activity_filter_bar(events: &[ActivityEvent]) -> String {
         .filter(|event| event.level == "warning")
         .count();
     format!(
-        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
+        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="setup" data-ops-filter="setup" aria-pressed="false">Setup {setup}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
         total = events.len(),
         heartbeat = activity_source_count(events, "heartbeat"),
         freshness = activity_source_count(events, "freshness"),
@@ -7236,7 +7646,7 @@ fn activity_script() -> &'static str {
 }
 
 fn render_activity(
-    hosts: &[Host],
+    runtime: RuntimeSnapshot<'_>,
     self_name: &str,
     now: i64,
     manifests: &[HostManifest],
@@ -7244,7 +7654,15 @@ fn render_activity(
     server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
     shell: ShellContext<'_>,
 ) -> String {
-    let events = activity_events(hosts, self_name, now, manifests, load_errors, server_probes);
+    let events = activity_events(
+        runtime.hosts,
+        runtime.jobs,
+        self_name,
+        now,
+        manifests,
+        load_errors,
+        server_probes,
+    );
     let rows = activity_rows(&events);
     format!(
         r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
@@ -7969,15 +8387,16 @@ fn heartbeat_card(
 }
 
 fn render_home(
-    hosts: &[Host],
+    runtime: RuntimeSnapshot<'_>,
     self_name: &str,
     now: i64,
     manifests: &[HostManifest],
-    user_label: &str,
-    logout_enabled: bool,
+    shell: ShellContext<'_>,
     can_onboard: bool,
 ) -> String {
-    if hosts.is_empty() {
+    let hosts = runtime.hosts;
+    let setup_jobs = pending_setup_jobs(runtime.hosts, runtime.jobs);
+    if runtime.hosts.is_empty() && setup_jobs.is_empty() {
         let assistant = if can_onboard {
             setup_assistant()
         } else {
@@ -7985,7 +8404,7 @@ fn render_home(
         };
         return format!(
             "{HEAD}{sidebar}<main>{header}{empty}</main>{assistant}{FOOT}",
-            sidebar = sidebar(user_label, logout_enabled, "fleet"),
+            sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
             header = header(now),
             empty = empty_state(can_onboard),
             assistant = assistant
@@ -8105,6 +8524,10 @@ fn render_home(
             live_key = live_key(live),
         ));
     }
+    for job in setup_jobs {
+        cards.push_str(&render_setup_card(job, now));
+        rows.push_str(&render_setup_row(job, now));
+    }
 
     let lone = if hosts.len() == 1 {
         lone_host_state(can_onboard)
@@ -8123,7 +8546,7 @@ fn render_home(
 
     format!(
         "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Backup</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{FOOT}",
-        sidebar = sidebar(user_label, logout_enabled, "fleet"),
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar(),
@@ -8245,6 +8668,59 @@ mod tests {
                 evidence_label: Some("repo check".to_string()),
                 summary: None,
             }),
+        }
+    }
+
+    fn setup_job(
+        host_name: &str,
+        state: ProvisioningJobState,
+        created_at: i64,
+        updated_at: i64,
+        setup_intent: ProvisioningSetupIntent,
+    ) -> ProvisioningJob {
+        ProvisioningJob {
+            schema: PROVISIONING_JOB_SCHEMA.to_string(),
+            version: PROVISIONING_JOB_VERSION,
+            id: format!("setup-{created_at}-test"),
+            provider: "existing-host".to_string(),
+            template: "manual-deferred".to_string(),
+            host_name: Some(host_name.to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(true),
+            heartbeat_interval_secs: Some(60),
+            state,
+            created_at,
+            updated_at,
+            handoff: None,
+            setup_intent: Some(setup_intent),
+            progress: vec![ProvisioningProgressEntry {
+                state,
+                message: match state {
+                    ProvisioningJobState::WaitingForHeartbeat => {
+                        "Waiting for file/env-file beacon handoff and first heartbeat."
+                    }
+                    ProvisioningJobState::Failed => {
+                        "Setup could not continue; no host services were changed."
+                    }
+                    ProvisioningJobState::BackupPending => {
+                        "First heartbeat seen; waiting for backup posture."
+                    }
+                    _ => "Setup progress recorded.",
+                }
+                .to_string(),
+                observed_at: updated_at,
+            }],
+        }
+    }
+
+    fn runtime<'a>(hosts: &'a [Host], jobs: &'a [ProvisioningJob]) -> RuntimeSnapshot<'a> {
+        RuntimeSnapshot { hosts, jobs }
+    }
+
+    fn shell(user_label: &str, logout_enabled: bool) -> ShellContext<'_> {
+        ShellContext {
+            user_label,
+            logout_enabled,
         }
     }
 
@@ -8480,7 +8956,14 @@ mod tests {
             },
         ];
 
-        let html = render_home(&hosts, "csb1", 1000, &[], "markus", true, true);
+        let html = render_home(
+            runtime(&hosts, &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
 
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains(r#"<section class="toolbar""#));
@@ -8580,7 +9063,14 @@ mod tests {
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
         };
 
-        let html = render_home(&[host], "csb1", 1_700_000_120, &[], "markus", true, true);
+        let html = render_home(
+            runtime(&[host], &[]),
+            "csb1",
+            1_700_000_120,
+            &[],
+            shell("markus", true),
+            true,
+        );
 
         assert!(html.contains(r#"data-backup-state="healthy""#));
         assert!(html.contains(">Protected<"));
@@ -8818,16 +9308,13 @@ mod tests {
         );
 
         let html = render_alerts(
-            &hosts,
+            runtime(&hosts, &[]),
             "csb1",
             1000,
             &[manifest],
             &[load_error],
             &probes,
-            ShellContext {
-                user_label: "markus",
-                logout_enabled: true,
-            },
+            shell("markus", true),
         );
 
         assert!(html.contains(r#"href="/alerts" aria-current="page""#));
@@ -8984,16 +9471,13 @@ mod tests {
         );
 
         let html = render_activity(
-            &hosts,
+            runtime(&hosts, &[]),
             "csb1",
             1000,
             &[manifest],
             &[],
             &probes,
-            ShellContext {
-                user_label: "markus",
-                logout_enabled: true,
-            },
+            shell("markus", true),
         );
 
         assert!(html.contains(r#"href="/activity" aria-current="page""#));
@@ -9050,12 +9534,11 @@ mod tests {
         }
 
         let html = render_home(
-            &[host("csb1"), host("csb0")],
+            runtime(&[host("csb1"), host("csb0")], &[]),
             "csb1",
             1000,
             &[],
-            "markus",
-            true,
+            shell("markus", true),
             true,
         );
         let csb0 = html.find(r#"data-host="csb0""#).expect("csb0 rendered");
@@ -9738,7 +10221,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         }))
         .expect("manifest parses");
 
-        let html = render_home(&[host], "csb1", 1000, &[manifest], "markus", true, true);
+        let html = render_home(
+            runtime(&[host], &[]),
+            "csb1",
+            1000,
+            &[manifest],
+            shell("markus", true),
+            true,
+        );
 
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(html.contains(r#"class="card has-settings""#));
@@ -9752,7 +10242,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn render_home_has_deliberate_empty_and_lone_host_states() {
-        let empty = render_home(&[], "csb1", 1000, &[], "local access", false, true);
+        let empty = render_home(
+            runtime(&[], &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("local access", false),
+            true,
+        );
         assert!(empty.contains(r#"<section class="empty-state""#));
         assert!(empty.contains("Waiting for the first host"));
         assert!(empty.contains("Add first server"));
@@ -9817,12 +10314,146 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             service_observations: vec![],
             backup_observations: vec![],
         };
-        let lone = render_home(&[host], "csb1", 1000, &[], "local access", false, true);
+        let lone = render_home(
+            runtime(&[host], &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("local access", false),
+            true,
+        );
         assert!(lone.contains(r#"<aside class="lone-state""#));
         assert!(lone.contains("First host is on the map"));
         assert!(lone.contains(r#"data-onboard-tile"#));
         assert!(lone.contains(r#"<tr class="onboard-row""#));
         assert!(lone.contains(r#"data-live="awaiting_first_heartbeat""#));
+    }
+
+    #[test]
+    fn render_home_shows_pending_setup_job_before_first_heartbeat() {
+        let job = setup_job(
+            "lab-01",
+            ProvisioningJobState::WaitingForHeartbeat,
+            1_000,
+            1_000,
+            ProvisioningSetupIntent {
+                backup: BackupSetupIntent::Required,
+                location: LocationSetupIntent::Manual,
+            },
+        );
+
+        let html = render_home(
+            runtime(&[], &[job]),
+            "csb1",
+            1_120,
+            &[],
+            shell("local access", false),
+            true,
+        );
+
+        assert!(!html.contains("Waiting for the first host"));
+        assert!(html.contains(r#"class="card setup-card""#));
+        assert!(html.contains("lab-01"));
+        assert!(html.contains("waiting for first heartbeat"));
+        assert!(html.contains("backup required"));
+        assert!(html.contains("manual location"));
+        assert!(html.contains("Continue setup"));
+        assert!(html.contains(r#"data-host-surface="setup""#));
+        assert!(html.contains(r#"<tr class="setup-row""#));
+    }
+
+    #[test]
+    fn render_home_hides_setup_job_once_runtime_host_exists() {
+        let job = setup_job(
+            "lab-01",
+            ProvisioningJobState::WaitingForHeartbeat,
+            1_000,
+            1_000,
+            ProvisioningSetupIntent {
+                backup: BackupSetupIntent::Required,
+                location: LocationSetupIntent::Auto,
+            },
+        );
+        let host = Host {
+            name: "lab-01".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(1_110),
+            heartbeat_log: vec![1_110],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness::default(),
+            service_observations: vec![],
+            backup_observations: vec![],
+        };
+
+        let html = render_home(
+            runtime(&[host], &[job]),
+            "csb1",
+            1_120,
+            &[],
+            shell("local access", false),
+            true,
+        );
+
+        assert!(html.contains(r#"data-host-surface="runtime""#));
+        assert!(!html.contains(r#"class="card setup-card""#));
+        assert!(!html.contains(r#"<tr class="setup-row""#));
+    }
+
+    #[test]
+    fn alerts_and_activity_include_setup_overdue_and_failure_states() {
+        let overdue = setup_job(
+            "lab-01",
+            ProvisioningJobState::WaitingForHeartbeat,
+            1_000,
+            1_000,
+            ProvisioningSetupIntent {
+                backup: BackupSetupIntent::Required,
+                location: LocationSetupIntent::Auto,
+            },
+        );
+        let failed = setup_job(
+            "lab-02",
+            ProvisioningJobState::Failed,
+            1_050,
+            1_060,
+            ProvisioningSetupIntent {
+                backup: BackupSetupIntent::Optional,
+                location: LocationSetupIntent::SiteFallback,
+            },
+        );
+        let jobs = vec![overdue, failed];
+        let probes = BTreeMap::new();
+
+        let alerts = render_alerts(
+            runtime(&[], &jobs),
+            "csb1",
+            1_400,
+            &[],
+            &[],
+            &probes,
+            shell("markus", true),
+        );
+        assert!(alerts.contains("First heartbeat overdue"));
+        assert!(alerts.contains("Setup failed"));
+        assert!(alerts.contains(r#"data-ops-filter="warning""#));
+
+        let activity = render_activity(
+            runtime(&[], &jobs),
+            "csb1",
+            1_400,
+            &[],
+            &[],
+            &probes,
+            shell("markus", true),
+        );
+        assert!(activity.contains(r#"data-activity-filter="setup""#));
+        assert!(activity.contains("First heartbeat overdue"));
+        assert!(activity.contains("Setup failed"));
     }
 
     #[test]
@@ -9846,7 +10477,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             backup_observations: vec![],
         };
 
-        let html = render_home(&[host], "csb1", 1000, &[], "reader", true, false);
+        let html = render_home(
+            runtime(&[host], &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("reader", true),
+            false,
+        );
 
         assert!(!html.contains(r#"<button class="onboard-tile""#));
         assert!(!html.contains("Add server"));
