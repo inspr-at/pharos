@@ -1398,6 +1398,14 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .fresh-row span{color:var(--muted);font-size:12px}
 .fresh-row strong{font-size:12px;font-weight:650;color:var(--ink)}
 .fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
+.backup-mini{--backup-color:var(--wait);display:grid;grid-template-columns:8px minmax(0,1fr);align-items:center;column-gap:8px;min-height:32px;margin:-1px 0 10px;padding:7px 8px;border:1px solid color-mix(in srgb,var(--backup-color) 20%,rgba(210,226,234,.82));border-radius:7px;background:linear-gradient(135deg,rgba(255,255,255,.78),color-mix(in srgb,var(--backup-color) 6%,white));color:var(--ink)}
+.backup-mini:before{content:"";grid-row:1/3;width:8px;height:8px;border-radius:50%;background:var(--backup-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--backup-color) 10%,transparent)}
+.backup-mini strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;color:var(--ink)}
+.backup-mini span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;line-height:1.2}
+.backup-mini.clear{--backup-color:var(--live)}.backup-mini.warning{--backup-color:var(--stale)}.backup-mini.critical{--backup-color:var(--down)}.backup-mini.watch{--backup-color:var(--wait)}
+.backup-list{min-width:150px;margin:0}
+.backup-list span{font-size:11px}
+.backup-list strong{font-size:12px}
 .meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
 .meta strong{font-weight:600;color:var(--ink)}
 .card-tools{display:flex;align-items:center;justify-content:center;min-height:25px;margin-top:5px}
@@ -1501,6 +1509,20 @@ main[data-view="list"] .list-wrap{display:block}
 .ops-note{padding:11px 13px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.78);color:var(--muted);font-size:12px}
 .ops-filter-empty{display:none;margin:0;padding:22px;border-top:1px solid rgba(214,226,234,.66);color:var(--muted);font-size:13px;background:rgba(255,255,255,.64)}
 .ops-filter-empty[data-visible="true"]{display:block}
+.backup-page .ops-panel{overflow:auto}
+.backup-list-full{display:grid;min-width:920px}
+.backup-row{--row-color:var(--wait);display:grid;grid-template-columns:minmax(150px,.9fr) 104px minmax(190px,1.15fr) minmax(96px,.58fr) minmax(92px,.52fr) minmax(132px,.72fr) minmax(120px,.68fr);gap:12px;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.66);background:rgba(255,255,255,.72)}
+.backup-row:last-child{border-bottom:0}
+.backup-row.critical{--row-color:var(--down)}.backup-row.warning{--row-color:var(--stale)}.backup-row.watch{--row-color:var(--wait)}.backup-row.clear{--row-color:var(--live)}
+.backup-host{display:grid;grid-template-columns:9px minmax(0,1fr);align-items:center;gap:8px;min-width:0}
+.backup-host:before{content:"";width:9px;height:9px;border-radius:50%;background:var(--row-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-color) 12%,transparent)}
+.backup-host strong,.backup-issue strong,.backup-field strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-size:13px}
+.backup-host span,.backup-issue p,.backup-field span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;line-height:1.3}
+.backup-state{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.backup-count{display:inline-flex;align-items:center;min-height:22px;padding:0 7px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:720}
+.backup-issue{min-width:0}
+.backup-issue p{font-size:12px;white-space:normal}
+.backup-field{min-width:0}
 [hidden]{display:none!important}
 .empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
 .empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
@@ -1618,7 +1640,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .map-panel[data-label-density="compact"] .map-status-dot{grid-row:auto;margin-top:0;width:8px;height:8px}
 .map-panel[data-label-density="compact"] .map-name{font-size:12px}
 .map-panel[data-label-density="compact"] .map-signals,.map-panel[data-label-density="compact"] .map-source{display:none}
-@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:900px}}
+@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:1050px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
 @media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-primary{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
@@ -1705,6 +1727,42 @@ function attentionFor(live,f){
   if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
   if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
   return freshnessAttention(f)||{label:'all clear',level:'ok',rank:4};
+}
+const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
+const BACKUP_LEVEL={failed:'critical',missing:'critical',stale:'warning',warning:'warning',unknown:'watch','not-configured':'watch',healthy:'clear'};
+const BACKUP_LABEL={failed:'Backup failed',missing:'Backup missing',stale:'Backup stale',warning:'Review backup',unknown:'Backup pending','not-configured':'No backup',healthy:'Protected'};
+function backupRunLabel(state){
+  return ({succeeded:'succeeded',failed:'failed',running:'running',unknown:'unknown'})[state]||String(state||'unknown');
+}
+function backupDetail(obs,now){
+  if(!obs)return 'No backup signal yet';
+  if(obs.state==='healthy'&&Number.isFinite(Number(obs.last_success_at)))return 'last success '+dur(now-Number(obs.last_success_at))+' ago';
+  if(Number.isFinite(Number(obs.last_attempt_at))&&obs.last_attempt_state)return backupRunLabel(obs.last_attempt_state)+' · '+dur(now-Number(obs.last_attempt_at))+' ago';
+  return String(obs.summary||'backup status reported');
+}
+function backupInfo(host,now){
+  const observations=Array.isArray(host.backup_observations)?host.backup_observations:[];
+  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0};
+  const primary=[...observations].sort((a,b)=>(BACKUP_RANK[a.state]??4)-(BACKUP_RANK[b.state]??4))[0];
+  const state=primary.state||'unknown';
+  const label=BACKUP_LABEL[state]||'Backup pending';
+  const detail=backupDetail(primary,now);
+  const last=Number.isFinite(Number(primary.last_success_at))?dur(now-Number(primary.last_success_at))+' ago':'not yet';
+  const schedule=String(primary.schedule||'not declared');
+  const target=String(primary.target_label||'not declared');
+  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' ')};
+}
+function updateBackup(surface,info){
+  const el=surface.querySelector('[data-backup-state]');
+  if(!el)return;
+  const list=el.classList.contains('backup-list');
+  el.className='backup-mini'+(list?' backup-list':'')+' '+info.level;
+  el.dataset.backupState=info.state;
+  el.title='Backup: '+info.label+' - '+info.detail;
+  const label=el.querySelector('strong');
+  const detail=el.querySelector('span');
+  if(label)label.textContent=info.label;
+  if(detail)detail.textContent=info.detail;
 }
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
@@ -2736,14 +2794,16 @@ async function refresh(reason='manual'){
         const live=h.liveness;
         card.dataset.live=live;
         const attention=h.attention||attentionFor(h.liveness,h.freshness);
+        const backup=backupInfo(h,now);
         card.dataset.sev=String(attention.rank ?? sevFor(live));
         card.dataset.last=h.last_seen ?? 0;
-        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')).toLowerCase();
+        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')).toLowerCase().trim();
         const word=card.querySelector('[data-status-word]');
         if(word)word.textContent=words[h.liveness]||h.liveness;
         setReason(card,attention);
         const fresh=card.querySelector('[data-fresh]');
         if(fresh)fresh.innerHTML=freshHtml(h.freshness);
+        updateBackup(card,backup);
         setSeen(card,h.last_seen,now);
         setCardAsOf(card,now);
         const beat=card.querySelector('.beat');
@@ -4157,6 +4217,18 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
     ))
 }
 
+async fn backups_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    no_store_html(render_backups(
+        &state.store.list(),
+        now_unix(),
+        ShellContext {
+            user_label: &user_label,
+            logout_enabled: state.auth.is_some(),
+        },
+    ))
+}
+
 async fn fleet_horizon_asset() -> impl axum::response::IntoResponse {
     (
         [
@@ -4440,6 +4512,221 @@ fn backup_observations_summary(observations: &[BackupObservation]) -> serde_json
         "missing": missing,
         "not_configured": not_configured,
         "total": observations.len(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct BackupUiSummary {
+    state: &'static str,
+    level: &'static str,
+    label: String,
+    detail: String,
+    last_success: String,
+    schedule: String,
+    target: String,
+    validation: String,
+    total: usize,
+    rank: usize,
+}
+
+fn backup_posture_rank(state: BackupPostureState) -> usize {
+    match state {
+        BackupPostureState::Failed => 0,
+        BackupPostureState::Missing => 1,
+        BackupPostureState::Stale => 2,
+        BackupPostureState::Warning => 3,
+        BackupPostureState::Unknown => 4,
+        BackupPostureState::NotConfigured => 5,
+        BackupPostureState::Healthy => 6,
+    }
+}
+
+fn backup_level(state: BackupPostureState) -> &'static str {
+    match state {
+        BackupPostureState::Failed | BackupPostureState::Missing => "critical",
+        BackupPostureState::Stale | BackupPostureState::Warning => "warning",
+        BackupPostureState::Unknown | BackupPostureState::NotConfigured => "watch",
+        BackupPostureState::Healthy => "clear",
+    }
+}
+
+fn backup_state_key(state: BackupPostureState) -> &'static str {
+    match state {
+        BackupPostureState::Healthy => "healthy",
+        BackupPostureState::Warning => "warning",
+        BackupPostureState::Stale => "stale",
+        BackupPostureState::Failed => "failed",
+        BackupPostureState::Unknown => "unknown",
+        BackupPostureState::Missing => "missing",
+        BackupPostureState::NotConfigured => "not-configured",
+    }
+}
+
+fn backup_state_label(state: BackupPostureState) -> &'static str {
+    match state {
+        BackupPostureState::Healthy => "Protected",
+        BackupPostureState::Warning => "Review backup",
+        BackupPostureState::Stale => "Backup stale",
+        BackupPostureState::Failed => "Backup failed",
+        BackupPostureState::Unknown => "Backup pending",
+        BackupPostureState::Missing => "Backup missing",
+        BackupPostureState::NotConfigured => "No backup",
+    }
+}
+
+fn backup_run_label(state: pharos_core::BackupRunState) -> &'static str {
+    match state {
+        pharos_core::BackupRunState::Succeeded => "succeeded",
+        pharos_core::BackupRunState::Failed => "failed",
+        pharos_core::BackupRunState::Running => "running",
+        pharos_core::BackupRunState::Unknown => "unknown",
+    }
+}
+
+fn backup_validation_state_label(state: pharos_core::BackupValidationState) -> &'static str {
+    match state {
+        pharos_core::BackupValidationState::Passed => "passed",
+        pharos_core::BackupValidationState::Failed => "failed",
+        pharos_core::BackupValidationState::Stale => "stale",
+        pharos_core::BackupValidationState::Unknown => "unknown",
+    }
+}
+
+fn backup_validation_level_label(level: pharos_core::BackupValidationLevel) -> &'static str {
+    match level {
+        pharos_core::BackupValidationLevel::SnapshotExists => "snapshot",
+        pharos_core::BackupValidationLevel::RepositoryCheck => "repo check",
+        pharos_core::BackupValidationLevel::MountList => "mount/list",
+        pharos_core::BackupValidationLevel::RestoreSample => "restore sample",
+        pharos_core::BackupValidationLevel::DiffHash => "diff/hash",
+        pharos_core::BackupValidationLevel::OperatorTest => "operator test",
+    }
+}
+
+fn backup_last_success_label(observation: &BackupObservation, now: i64) -> String {
+    observation
+        .last_success_at
+        .map(|timestamp| format!("{} ago", duration_label(now - timestamp)))
+        .unwrap_or_else(|| "not yet".to_string())
+}
+
+fn backup_validation_label(observation: &BackupObservation, now: i64) -> String {
+    if let Some(restore) = &observation.restore_validation {
+        let label = restore
+            .evidence_label
+            .as_deref()
+            .unwrap_or_else(|| backup_validation_level_label(restore.level));
+        return restore
+            .checked_at
+            .map(|timestamp| {
+                format!(
+                    "{} {} · {} ago",
+                    label,
+                    backup_validation_state_label(restore.state),
+                    duration_label(now - timestamp)
+                )
+            })
+            .unwrap_or_else(|| {
+                format!("{} {}", label, backup_validation_state_label(restore.state))
+            });
+    }
+
+    if let (Some(timestamp), Some(state)) =
+        (observation.last_check_at, observation.last_check_state)
+    {
+        return format!(
+            "check {} · {} ago",
+            backup_validation_state_label(state),
+            duration_label(now - timestamp)
+        );
+    }
+
+    "not checked".to_string()
+}
+
+fn backup_attempt_detail(observation: &BackupObservation, now: i64) -> String {
+    if observation.state == BackupPostureState::Healthy {
+        return observation
+            .last_success_at
+            .map(|timestamp| format!("last success {} ago", duration_label(now - timestamp)))
+            .unwrap_or_else(|| observation.summary.clone());
+    }
+
+    if let (Some(timestamp), Some(state)) =
+        (observation.last_attempt_at, observation.last_attempt_state)
+    {
+        return format!(
+            "{} · {} ago",
+            backup_run_label(state),
+            duration_label(now - timestamp)
+        );
+    }
+
+    observation.summary.clone()
+}
+
+fn backup_ui_summary(observations: &[BackupObservation], now: i64) -> BackupUiSummary {
+    let Some(primary) = observations
+        .iter()
+        .min_by_key(|observation| backup_posture_rank(observation.state))
+    else {
+        return BackupUiSummary {
+            state: "unknown",
+            level: "watch",
+            label: "Not observed".to_string(),
+            detail: "No backup signal yet".to_string(),
+            last_success: "not observed".to_string(),
+            schedule: "not declared".to_string(),
+            target: "not declared".to_string(),
+            validation: "not checked".to_string(),
+            total: 0,
+            rank: backup_posture_rank(BackupPostureState::Unknown),
+        };
+    };
+
+    BackupUiSummary {
+        state: backup_state_key(primary.state),
+        level: backup_level(primary.state),
+        label: backup_state_label(primary.state).to_string(),
+        detail: backup_attempt_detail(primary, now),
+        last_success: backup_last_success_label(primary, now),
+        schedule: primary
+            .schedule
+            .clone()
+            .unwrap_or_else(|| "not declared".to_string()),
+        target: primary
+            .target_label
+            .clone()
+            .unwrap_or_else(|| "not declared".to_string()),
+        validation: backup_validation_label(primary, now),
+        total: observations.len(),
+        rank: backup_posture_rank(primary.state),
+    }
+}
+
+fn backup_card_markup(summary: &BackupUiSummary, extra_class: &str) -> String {
+    let extra_class = if extra_class.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", html_escape(extra_class))
+    };
+    format!(
+        r#"<div class="backup-mini{extra_class} {level}" data-backup-state="{state}" title="{title}"><strong>{label}</strong><span>{detail}</span></div>"#,
+        extra_class = extra_class,
+        level = html_escape(summary.level),
+        state = html_escape(summary.state),
+        title = html_escape(&format!("Backup: {} - {}", summary.label, summary.detail)),
+        label = html_escape(&summary.label),
+        detail = html_escape(&summary.detail)
+    )
+}
+
+fn backup_search_text(summary: &BackupUiSummary) -> Option<String> {
+    (summary.total > 0).then(|| {
+        format!(
+            "{} {} {} {} {}",
+            summary.label, summary.detail, summary.last_success, summary.schedule, summary.target
+        )
     })
 }
 
@@ -4816,6 +5103,11 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
     } else {
         ""
     };
+    let backups_current = if active == "backups" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
     let activity_current = if active == "activity" {
         r#" aria-current="page""#
     } else {
@@ -4827,16 +5119,18 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
         alerts = icons::status_svg(Liveness::Stale),
+        backups = icons::SHIELD_CHECK,
         activity = icons::LIST,
         settings = icons::SLIDERS,
         fleet_current = fleet_current,
         map_current = map_current,
         alerts_current = alerts_current,
+        backups_current = backups_current,
         activity_current = activity_current,
         settings_current = settings_current,
         user_label = html_escape(user_label),
@@ -6248,6 +6542,97 @@ fn ops_toolbar() -> String {
     )
 }
 
+fn backup_summary_metrics(hosts: &[Host], now: i64) -> String {
+    let mut protected = 0;
+    let mut review = 0;
+    let mut failed = 0;
+    let mut unknown = 0;
+
+    for host in hosts {
+        match backup_ui_summary(&host.backup_observations, now).level {
+            "clear" => protected += 1,
+            "warning" => review += 1,
+            "critical" => failed += 1,
+            _ => unknown += 1,
+        }
+    }
+
+    format!(
+        r#"<section class="ops-summary backup-summary" aria-label="backup summary"><button class="ops-metric clear" type="button" data-ops-filter="clear" aria-pressed="false"><b>{protected}</b><span>Protected</span></button><button class="ops-metric warning" type="button" data-ops-filter="warning" aria-pressed="false"><b>{review}</b><span>Review</span></button><button class="ops-metric critical" type="button" data-ops-filter="critical" aria-pressed="false"><b>{failed}</b><span>Failed or missing</span></button><button class="ops-metric watch" type="button" data-ops-filter="watch" aria-pressed="false"><b>{unknown}</b><span>Unknown</span></button></section>"#
+    )
+}
+
+fn render_backup_rows(hosts: &[Host], now: i64) -> String {
+    if hosts.is_empty() {
+        return r#"<section class="ops-empty"><h2>No hosts yet</h2><p>Once hosts report, Pharos will show backup posture here.</p></section>"#.to_string();
+    }
+
+    let mut rows: Vec<(&Host, BackupUiSummary)> = hosts
+        .iter()
+        .map(|host| (host, backup_ui_summary(&host.backup_observations, now)))
+        .collect();
+    rows.sort_by(|(left_host, left), (right_host, right)| {
+        left.rank
+            .cmp(&right.rank)
+            .then_with(|| left_host.name.cmp(&right_host.name))
+    });
+
+    rows.into_iter()
+        .map(|(host, backup)| {
+            let count = if backup.total > 1 {
+                format!(
+                    r#"<span class="backup-count">{count} jobs</span>"#,
+                    count = backup.total
+                )
+            } else {
+                String::new()
+            };
+            let search = html_escape(
+                &format!(
+                    "{} {} {} {} {} {} {}",
+                    host.name,
+                    host.role,
+                    backup.label,
+                    backup.detail,
+                    backup.last_success,
+                    backup.schedule,
+                    backup.target
+                )
+                .to_lowercase(),
+            );
+            format!(
+                r#"<article class="backup-row {level}" data-ops-row data-ops-level="{level}" data-host-search="{search}"><div class="backup-host"><div><strong>{host}</strong><span>{role}</span></div></div><div class="backup-state"><span class="severity">{label}</span>{count}</div><div class="backup-issue"><strong>{detail}</strong><p>{state}</p></div><div class="backup-field"><span>Last success</span><strong>{last_success}</strong></div><div class="backup-field"><span>Schedule</span><strong>{schedule}</strong></div><div class="backup-field"><span>Target</span><strong>{target}</strong></div><div class="backup-field"><span>Validation</span><strong>{validation}</strong></div></article>"#,
+                level = html_escape(backup.level),
+                search = search,
+                host = html_escape(&host.name),
+                role = html_escape(&host.role),
+                label = html_escape(&backup.label),
+                count = count,
+                detail = html_escape(&backup.detail),
+                state = html_escape(backup.state),
+                last_success = html_escape(&backup.last_success),
+                schedule = html_escape(&backup.schedule),
+                target = html_escape(&backup.target),
+                validation = html_escape(&backup.validation)
+            )
+        })
+        .collect()
+}
+
+fn render_backups(hosts: &[Host], now: i64, shell: ShellContext<'_>) -> String {
+    let rows = render_backup_rows(hosts, now);
+    format!(
+        r#"{HEAD}{sidebar}<main class="ops-main backup-page" data-ops-page="backups">{header}{summary}{toolbar}<section class="ops-panel" aria-label="backup posture"><header class="ops-panel-head"><div><h2>Backup posture</h2><p>Sanitized runtime evidence from backup jobs. No logs, paths, repositories, or credentials are shown.</p></div><span class="ops-count">{count}</span></header><div class="backup-list-full">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching backup rows.</section></section><div class="ops-note" style="margin-top:14px">A protected state means the latest reported backup source is healthy. Restore validation is tracked separately from last backup success when evidence exists.</div></main>{script}</div></body></html>"#,
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, "backups"),
+        header = page_header("Backups", "Protection at a glance", now),
+        summary = backup_summary_metrics(hosts, now),
+        toolbar = ops_toolbar(),
+        count = hosts.len(),
+        rows = rows,
+        script = ops_script()
+    )
+}
+
 fn ops_script() -> &'static str {
     r#"<script>
 document.querySelectorAll('[data-ops-page]').forEach(root=>{
@@ -7286,13 +7671,20 @@ fn render_home(
         let fresh = freshness_markup(&h.freshness);
         let attention = attention_reason(live, &h.freshness, &h.service_observations);
         let reason = reason_markup(&attention);
-        let search = html_escape(&format!(
+        let backup = backup_ui_summary(&h.backup_observations, now);
+        let backup_card = backup_card_markup(&backup, "");
+        let backup_list = backup_card_markup(&backup, "backup-list");
+        let mut search_parts = vec![format!(
             "{} {} {} {}",
             h.name.to_lowercase(),
             h.role.to_lowercase(),
             fresh_tldr.to_lowercase(),
             attention.label.to_lowercase()
-        ));
+        )];
+        if let Some(backup_text) = backup_search_text(&backup) {
+            search_parts.push(backup_text.to_lowercase());
+        }
+        let search = html_escape(&search_parts.join(" "));
         let sort_name = html_escape(&h.name.to_lowercase());
         let last_sort = h.last_seen.unwrap_or(0);
         let sev = attention.rank;
@@ -7358,12 +7750,12 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div><div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div>{backup_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td>{backup_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -7384,7 +7776,7 @@ fn render_home(
     };
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Backup</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{FOOT}",
         sidebar = sidebar(user_label, logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
@@ -7426,6 +7818,7 @@ async fn main() {
         .route("/map", get(map_page))
         .route("/map/data.json", get(map_data_json))
         .route("/alerts", get(alerts_page))
+        .route("/backups", get(backups_page))
         .route("/activity", get(activity_page))
         .route("/agora", get(agora::page))
         .route(
@@ -7756,6 +8149,7 @@ mod tests {
         );
         assert!(html.contains(r#"href="/" aria-current="page""#));
         assert!(html.contains(r#"href="/map""#));
+        assert!(html.contains(r#"href="/backups""#));
         assert!(html.contains(r#"href="/auth/logout""#));
         assert!(html.contains(r#"aria-label="Log out of Pharos""#));
         assert!(!html.contains(">mba<"));
@@ -7776,6 +8170,7 @@ mod tests {
         assert!(html.contains(r#"class="pharos-mark""#));
         assert!(!html.contains("the light is lit"));
         assert!(html.contains(r#"<th>Attention</th>"#));
+        assert!(html.contains(r#"<th>Backup</th>"#));
         assert!(html.contains(r#"<th>Actions</th>"#));
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains("No settings yet"));
@@ -7816,6 +8211,81 @@ mod tests {
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
         assert!(html.contains("state-icon stale"));
+    }
+
+    #[test]
+    fn render_home_surfaces_backup_posture_in_grid_and_list() {
+        let host = Host {
+            name: "athena".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(1_700_000_100),
+            heartbeat_log: vec![1_700_000_040, 1_700_000_100],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            service_observations: vec![],
+            backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
+        };
+
+        let html = render_home(&[host], "csb1", 1_700_000_120, &[], "markus", true, true);
+
+        assert!(html.contains(r#"data-backup-state="healthy""#));
+        assert!(html.contains(">Protected<"));
+        assert!(html.contains("last success 2m 00s ago"));
+        assert!(html.contains(r#"class="backup-mini backup-list clear""#));
+        assert!(html.contains("off-box repository"));
+        assert!(!html.contains("restic-main-repository"));
+    }
+
+    #[test]
+    fn render_backups_shows_first_class_backup_page() {
+        let host = Host {
+            name: "athena".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(1_700_000_100),
+            heartbeat_log: vec![1_700_000_040, 1_700_000_100],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            service_observations: vec![],
+            backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
+        };
+
+        let html = render_backups(
+            &[host],
+            1_700_000_120,
+            ShellContext {
+                user_label: "markus",
+                logout_enabled: true,
+            },
+        );
+
+        assert!(html.contains(r#"<h1>Backups</h1>"#));
+        assert!(html.contains(r#"href="/backups" aria-current="page""#));
+        assert!(html.contains(r#"data-ops-page="backups""#));
+        assert!(html.contains(r#"data-ops-filter="clear""#));
+        assert!(html.contains(r#"class="backup-row clear""#));
+        assert!(html.contains("Last success"));
+        assert!(html.contains("Schedule"));
+        assert!(html.contains("Target"));
+        assert!(html.contains("Validation"));
+        assert!(html.contains("repo check passed"));
+        assert!(html.contains("off-box repository"));
+        assert!(!html.contains("restic-main-repository"));
     }
 
     #[test]
