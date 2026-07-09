@@ -1463,6 +1463,12 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .backup-list{min-width:150px;margin:0}
 .backup-list span{font-size:11px}
 .backup-list strong{font-size:12px}
+.protection-onboard{--protect-color:var(--wait);display:grid;grid-template-columns:8px minmax(0,1fr);align-items:center;column-gap:8px;min-height:30px;margin:-3px 0 10px;padding:7px 8px;border:1px solid color-mix(in srgb,var(--protect-color) 18%,rgba(210,226,234,.82));border-radius:7px;background:linear-gradient(135deg,rgba(255,255,255,.76),color-mix(in srgb,var(--protect-color) 5%,white));color:var(--ink)}
+.protection-onboard:before{content:"";grid-row:1/3;width:8px;height:8px;border-radius:50%;background:var(--protect-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--protect-color) 10%,transparent)}
+.protection-onboard strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;color:var(--ink)}
+.protection-onboard span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;line-height:1.2}
+.protection-onboard.clear{--protect-color:var(--live)}.protection-onboard.warning{--protect-color:var(--stale)}.protection-onboard.critical{--protect-color:var(--down)}.protection-onboard.watch{--protect-color:var(--wait)}
+.protection-list{min-width:150px;margin:6px 0 0}
 .setup-card{border-color:rgba(214,155,49,.34);background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(247,252,253,.82));box-shadow:0 14px 32px rgba(45,75,95,.08),inset 0 0 0 1px rgba(214,155,49,.08)}
 .setup-card[data-setup-level="warning"]{border-color:rgba(178,106,0,.32)}
 .setup-card .nix{color:var(--sun);border-color:rgba(214,155,49,.24);box-shadow:0 0 0 5px rgba(214,155,49,.06)}
@@ -4823,6 +4829,258 @@ fn backup_search_text(summary: &BackupUiSummary) -> Option<String> {
     })
 }
 
+const FIRST_BACKUP_PENDING_GRACE_SECS: i64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone)]
+struct ProtectionOnboardingStatus {
+    state: &'static str,
+    level: &'static str,
+    label: String,
+    detail: String,
+    sort_time: i64,
+}
+
+impl ProtectionOnboardingStatus {
+    fn search_text(&self) -> String {
+        format!("{} {} {}", self.state, self.label, self.detail)
+    }
+}
+
+fn protection_setup_job_for_host<'a>(
+    host_name: &str,
+    jobs: &'a [ProvisioningJob],
+) -> Option<&'a ProvisioningJob> {
+    jobs.iter()
+        .filter(|job| {
+            !matches!(
+                job.state,
+                ProvisioningJobState::Failed | ProvisioningJobState::CleanupNeeded
+            ) && provisioning_job_host_name(job).is_some_and(|name| name == host_name)
+        })
+        .max_by_key(|job| job.updated_at)
+}
+
+fn first_runtime_seen_at(host: &Host, job: &ProvisioningJob) -> i64 {
+    host.heartbeat_log
+        .iter()
+        .copied()
+        .filter(|stamp| *stamp >= job.created_at)
+        .min()
+        .or(host.last_seen)
+        .unwrap_or(job.updated_at)
+}
+
+fn backup_observation_success_at(observation: &BackupObservation) -> Option<i64> {
+    if observation.state == BackupPostureState::Healthy
+        || observation.last_attempt_state == Some(pharos_core::BackupRunState::Succeeded)
+        || observation.last_success_at.is_some()
+    {
+        return observation
+            .last_success_at
+            .or(observation.last_attempt_at)
+            .or(observation.last_check_at);
+    }
+    None
+}
+
+fn protection_onboarding_status(
+    host: &Host,
+    jobs: &[ProvisioningJob],
+    now: i64,
+) -> Option<ProtectionOnboardingStatus> {
+    let job = protection_setup_job_for_host(&host.name, jobs)?;
+    let intent = provisioning_job_setup_intent(job);
+    let first_seen = first_runtime_seen_at(host, job);
+
+    if let Some(failed) = host.backup_observations.iter().find(|observation| {
+        matches!(
+            observation.state,
+            BackupPostureState::Failed | BackupPostureState::Missing
+        ) || observation.last_attempt_state == Some(pharos_core::BackupRunState::Failed)
+    }) {
+        return Some(ProtectionOnboardingStatus {
+            state: "first-backup-failed",
+            level: "critical",
+            label: "First backup failed".to_string(),
+            detail: failed.summary.clone(),
+            sort_time: failed
+                .last_attempt_at
+                .or(failed.last_check_at)
+                .unwrap_or(now),
+        });
+    }
+
+    if let Some(review) = host.backup_observations.iter().find(|observation| {
+        matches!(
+            observation.state,
+            BackupPostureState::Stale | BackupPostureState::Warning
+        )
+    }) {
+        return Some(ProtectionOnboardingStatus {
+            state: "first-backup-review",
+            level: "warning",
+            label: "First backup needs review".to_string(),
+            detail: review.summary.clone(),
+            sort_time: backup_sort_time(host, review, now),
+        });
+    }
+
+    if let Some(success_at) = host
+        .backup_observations
+        .iter()
+        .filter_map(backup_observation_success_at)
+        .max()
+    {
+        return Some(ProtectionOnboardingStatus {
+            state: "first-backup-succeeded",
+            level: "clear",
+            label: "First backup succeeded".to_string(),
+            detail: format!(
+                "Successful backup observed {} ago",
+                duration_label(now - success_at)
+            ),
+            sort_time: success_at,
+        });
+    }
+
+    match intent.backup {
+        BackupSetupIntent::Required => {
+            let age = now.saturating_sub(first_seen);
+            if age > FIRST_BACKUP_PENDING_GRACE_SECS {
+                Some(ProtectionOnboardingStatus {
+                    state: "first-backup-overdue",
+                    level: "warning",
+                    label: "First backup overdue".to_string(),
+                    detail: format!(
+                        "No successful backup after {} from first heartbeat",
+                        duration_label(FIRST_BACKUP_PENDING_GRACE_SECS)
+                    ),
+                    sort_time: first_seen + FIRST_BACKUP_PENDING_GRACE_SECS,
+                })
+            } else {
+                Some(ProtectionOnboardingStatus {
+                    state: "first-backup-pending",
+                    level: "watch",
+                    label: "First backup pending".to_string(),
+                    detail: "First heartbeat seen; waiting for backup evidence".to_string(),
+                    sort_time: first_seen,
+                })
+            }
+        }
+        BackupSetupIntent::Optional => Some(ProtectionOnboardingStatus {
+            state: "backup-optional",
+            level: "clear",
+            label: "Backup optional".to_string(),
+            detail: "Not required to finish onboarding".to_string(),
+            sort_time: job.updated_at,
+        }),
+        BackupSetupIntent::External => Some(ProtectionOnboardingStatus {
+            state: "backup-external",
+            level: "watch",
+            label: "Managed elsewhere".to_string(),
+            detail: "External evidence will appear when detected".to_string(),
+            sort_time: job.updated_at,
+        }),
+        BackupSetupIntent::EnrollLater => Some(ProtectionOnboardingStatus {
+            state: "backup-enroll-later",
+            level: "watch",
+            label: "Backup enrollment queued".to_string(),
+            detail: "Follow up after onboarding is stable".to_string(),
+            sort_time: job.updated_at,
+        }),
+        BackupSetupIntent::Absent => Some(ProtectionOnboardingStatus {
+            state: "backup-absent",
+            level: "clear",
+            label: "Backups intentionally absent".to_string(),
+            detail: "Host is recorded as intentionally unprotected".to_string(),
+            sort_time: job.updated_at,
+        }),
+        BackupSetupIntent::Deferred => Some(ProtectionOnboardingStatus {
+            state: "backup-deferred",
+            level: "watch",
+            label: "Backup decision pending".to_string(),
+            detail: "Ask again before closing onboarding".to_string(),
+            sort_time: job.updated_at,
+        }),
+    }
+}
+
+fn protection_onboarding_markup(status: &ProtectionOnboardingStatus, extra_class: &str) -> String {
+    let extra_class = if extra_class.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", html_escape(extra_class))
+    };
+    format!(
+        r#"<div class="protection-onboard{extra_class} {level}" data-protection-state="{state}" title="{title}"><strong>{label}</strong><span>{detail}</span></div>"#,
+        extra_class = extra_class,
+        level = html_escape(status.level),
+        state = html_escape(status.state),
+        title = html_escape(&format!(
+            "Protection onboarding: {} - {}",
+            status.label, status.detail
+        )),
+        label = html_escape(&status.label),
+        detail = html_escape(&status.detail)
+    )
+}
+
+fn protection_onboarding_alert(
+    host: &Host,
+    jobs: &[ProvisioningJob],
+    now: i64,
+) -> Option<AlertItem> {
+    let status = protection_onboarding_status(host, jobs, now)?;
+    if status.level == "clear" {
+        return None;
+    }
+    let action = match status.state {
+        "first-backup-overdue" => "Inspect backup enrollment and run or observe the first backup.",
+        "first-backup-failed" => "Fix the backup job, then confirm the next successful run.",
+        "first-backup-review" => "Review backup evidence before closing onboarding.",
+        "first-backup-pending" => "Keep onboarding open until the first backup is observed.",
+        "backup-deferred" => "Choose whether this host should be protected.",
+        "backup-enroll-later" => "Schedule or start backup enrollment after the host is stable.",
+        "backup-external" => "Confirm external backup evidence can be observed when available.",
+        _ => "Review protection onboarding.",
+    };
+    Some(AlertItem {
+        level: status.level,
+        host: host.name.clone(),
+        role: host.role.clone(),
+        issue: status.label,
+        detail: status.detail,
+        source: "setup",
+        seen: format!("as of {}", clock_label(now)),
+        next_action: action.to_string(),
+        sort_time: status.sort_time,
+    })
+}
+
+fn push_protection_onboarding_activity(
+    events: &mut Vec<ActivityEvent>,
+    host: &Host,
+    jobs: &[ProvisioningJob],
+    now: i64,
+) {
+    let Some(status) = protection_onboarding_status(host, jobs, now) else {
+        return;
+    };
+    let level = match status.level {
+        "clear" => "recovery",
+        level => level,
+    };
+    events.push(ActivityEvent::new(
+        status.sort_time,
+        host.name.clone(),
+        level,
+        "setup",
+        status.label,
+        status.detail,
+        "setup",
+    ));
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct ServerProbeObservation {
     id: String,
@@ -6854,6 +7112,10 @@ fn alert_items(
                 alerts.push(alert);
             }
         }
+
+        if let Some(alert) = protection_onboarding_alert(host, jobs, now) {
+            alerts.push(alert);
+        }
     }
 
     for job in jobs {
@@ -7545,6 +7807,8 @@ fn activity_events(
         for observation in &host.backup_observations {
             push_backup_activity_events(&mut events, host, observation, now);
         }
+
+        push_protection_onboarding_activity(&mut events, host, jobs, now);
     }
 
     for (host, probes) in server_probes {
@@ -8439,6 +8703,15 @@ fn render_home(
         let backup = backup_ui_summary(&h.backup_observations, now);
         let backup_card = backup_card_markup(&backup, "");
         let backup_list = backup_card_markup(&backup, "backup-list");
+        let protection = protection_onboarding_status(h, runtime.jobs, now);
+        let protection_card = protection
+            .as_ref()
+            .map(|status| protection_onboarding_markup(status, ""))
+            .unwrap_or_default();
+        let protection_list = protection
+            .as_ref()
+            .map(|status| protection_onboarding_markup(status, "protection-list"))
+            .unwrap_or_default();
         let mut search_parts = vec![format!(
             "{} {} {} {}",
             h.name.to_lowercase(),
@@ -8448,6 +8721,9 @@ fn render_home(
         )];
         if let Some(backup_text) = backup_search_text(&backup) {
             search_parts.push(backup_text.to_lowercase());
+        }
+        if let Some(status) = &protection {
+            search_parts.push(status.search_text().to_lowercase());
         }
         let search = html_escape(&search_parts.join(" "));
         let sort_name = html_escape(&h.name.to_lowercase());
@@ -8515,12 +8791,12 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div>{backup_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div>{backup_card}{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td>{backup_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td>{backup_list}{protection_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -8710,6 +8986,28 @@ mod tests {
                 .to_string(),
                 observed_at: updated_at,
             }],
+        }
+    }
+
+    fn host_with_backups(
+        name: &str,
+        last_seen: i64,
+        backup_observations: Vec<BackupObservation>,
+    ) -> Host {
+        Host {
+            name: name.to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(last_seen),
+            heartbeat_log: vec![last_seen],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness::default(),
+            service_observations: vec![],
+            backup_observations,
         }
     }
 
@@ -10374,21 +10672,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 location: LocationSetupIntent::Auto,
             },
         );
-        let host = Host {
-            name: "lab-01".to_string(),
-            role: "server".to_string(),
-            is_nix: true,
-            report_version: pharos_core::HOST_REPORT_VERSION,
-            token_hash: None,
-            last_seen: Some(1_110),
-            heartbeat_log: vec![1_110],
-            heartbeat_interval_secs: Some(60),
-            inbound_rtt: None,
-            location: None,
-            freshness: NixFreshness::default(),
-            service_observations: vec![],
-            backup_observations: vec![],
-        };
+        let host = host_with_backups("lab-01", 1_110, vec![]);
 
         let html = render_home(
             runtime(&[host], &[job]),
@@ -10402,6 +10686,110 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"data-host-surface="runtime""#));
         assert!(!html.contains(r#"class="card setup-card""#));
         assert!(!html.contains(r#"<tr class="setup-row""#));
+        assert!(html.contains(r#"data-protection-state="first-backup-pending""#));
+        assert!(html.contains("First backup pending"));
+    }
+
+    #[test]
+    fn first_backup_onboarding_states_are_visible() {
+        let now = 100_000;
+        let intent = ProvisioningSetupIntent {
+            backup: BackupSetupIntent::Required,
+            location: LocationSetupIntent::Auto,
+        };
+        let pending_job = setup_job(
+            "lab-pending",
+            ProvisioningJobState::WaitingForHeartbeat,
+            now - 120,
+            now - 120,
+            intent.clone(),
+        );
+        let overdue_job = setup_job(
+            "lab-overdue",
+            ProvisioningJobState::WaitingForHeartbeat,
+            2_000,
+            2_000,
+            intent.clone(),
+        );
+        let failed_job = setup_job(
+            "lab-failed",
+            ProvisioningJobState::WaitingForHeartbeat,
+            3_000,
+            3_000,
+            intent.clone(),
+        );
+        let succeeded_job = setup_job(
+            "lab-succeeded",
+            ProvisioningJobState::WaitingForHeartbeat,
+            4_000,
+            4_000,
+            intent,
+        );
+
+        let mut failed_backup = backup_observation(BackupPostureState::Failed);
+        failed_backup.summary = "first backup attempt failed".to_string();
+        failed_backup.last_success_at = None;
+        failed_backup.last_attempt_at = Some(3_080);
+        failed_backup.last_attempt_state = Some(pharos_core::BackupRunState::Failed);
+
+        let mut succeeded_backup = backup_observation(BackupPostureState::Healthy);
+        succeeded_backup.last_success_at = Some(4_090);
+        succeeded_backup.last_attempt_at = Some(4_090);
+        succeeded_backup.last_attempt_state = Some(pharos_core::BackupRunState::Succeeded);
+
+        let hosts = vec![
+            host_with_backups("lab-pending", now - 60, vec![]),
+            host_with_backups("lab-overdue", 2_060, vec![]),
+            host_with_backups("lab-failed", 3_060, vec![failed_backup]),
+            host_with_backups("lab-succeeded", 4_060, vec![succeeded_backup]),
+        ];
+        let jobs = vec![pending_job, overdue_job, failed_job, succeeded_job];
+
+        let html = render_home(
+            runtime(&hosts, &jobs),
+            "csb1",
+            now,
+            &[],
+            shell("markus", true),
+            true,
+        );
+
+        assert!(html.contains(r#"data-protection-state="first-backup-pending""#));
+        assert!(html.contains(r#"data-protection-state="first-backup-overdue""#));
+        assert!(html.contains(r#"data-protection-state="first-backup-failed""#));
+        assert!(html.contains(r#"data-protection-state="first-backup-succeeded""#));
+        assert!(html.contains("First backup pending"));
+        assert!(html.contains("First backup overdue"));
+        assert!(html.contains("First backup failed"));
+        assert!(html.contains("First backup succeeded"));
+
+        let probes = BTreeMap::new();
+        let alerts = render_alerts(
+            runtime(&hosts, &jobs),
+            "csb1",
+            now,
+            &[],
+            &[],
+            &probes,
+            shell("markus", true),
+        );
+        assert!(alerts.contains("First backup overdue"));
+        assert!(alerts.contains("First backup failed"));
+        assert!(!alerts.contains("First backup succeeded"));
+
+        let activity = render_activity(
+            runtime(&hosts, &jobs),
+            "csb1",
+            now,
+            &[],
+            &[],
+            &probes,
+            shell("markus", true),
+        );
+        assert!(activity.contains("First backup pending"));
+        assert!(activity.contains("First backup overdue"));
+        assert!(activity.contains("First backup failed"));
+        assert!(activity.contains("First backup succeeded"));
     }
 
     #[test]
