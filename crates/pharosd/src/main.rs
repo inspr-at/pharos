@@ -405,15 +405,15 @@ fn existing_host_job_progress(
         "nixos-anywhere" | "native-systemd" => {
             progress.push(ProvisioningProgressEntry {
                 state: ProvisioningJobState::Bootstrapping,
-                message: "Automated existing-host apply was requested; no token files or host services were changed by this build.".to_string(),
+                message: "Existing-host bootstrap handoff prepared; no raw beacon credential was generated, rendered, or installed by Pharos.".to_string(),
                 observed_at: now,
             });
             progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::Failed,
-                message: "Automated existing-host apply is not active yet; use manual/deferred handoff or retry after the executor slice.".to_string(),
+                state: ProvisioningJobState::WaitingForHeartbeat,
+                message: "Waiting for Janus-backed or dev-local runtime credential handoff, beacon start, and first heartbeat.".to_string(),
                 observed_at: now,
             });
-            (ProvisioningJobState::Failed, progress)
+            (ProvisioningJobState::WaitingForHeartbeat, progress)
         }
         _ => (ProvisioningJobState::Failed, progress),
     }
@@ -441,9 +441,9 @@ fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<Pro
             next_steps.extend(backup_steps);
             Some(ProvisioningHandoff {
                 method,
-                status: "executor-pending".to_string(),
+                status: "runtime-credential-required".to_string(),
                 title: "NixOS bootstrap handoff".to_string(),
-                summary: "Declarative bootstrap is selected; automated apply stays disabled until the executor can stream credentials without exposing them.".to_string(),
+                summary: "Declarative bootstrap is selected; Pharos prepared the non-secret handoff and is waiting for a runtime credential file plus the first heartbeat.".to_string(),
                 token_policy: "Beacon credentials must be installed through a runtime file or secret manager reference, never as a command-line value.".to_string(),
                 secret_target: Some("/run/agenix/pharos-beacon-token".to_string()),
                 command_ref: Some("nixos-anywhere plus services.pharos-beacon".to_string()),
@@ -461,9 +461,9 @@ fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<Pro
             next_steps.extend(backup_steps);
             Some(ProvisioningHandoff {
                 method,
-                status: "executor-pending".to_string(),
+                status: "runtime-credential-required".to_string(),
                 title: "Native systemd beacon handoff".to_string(),
-                summary: "Portable beacon install is selected; automated apply stays disabled until Pharos can write the env file over a safe channel.".to_string(),
+                summary: "Portable beacon install is selected; Pharos prepared the non-secret handoff and is waiting for a root-owned runtime env file plus the first heartbeat.".to_string(),
                 token_policy: "Beacon credentials belong in a root-owned env file or token file and must not be pasted into shell history.".to_string(),
                 secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
                 command_ref: Some("scripts/install-pharos-beacon-systemd.sh".to_string()),
@@ -12236,7 +12236,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
-    fn existing_host_automated_path_fails_closed_until_executor_exists() {
+    fn existing_host_automated_path_waits_for_runtime_credential_handoff() {
         let store = ProvisioningJobStore::new(None);
         let request = ProvisioningJobStartRequest {
             provider: "existing-host".to_string(),
@@ -12257,9 +12257,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let job = store
             .start(&request, 1_700_000_006, &runtime)
-            .expect("automated existing-host path records safe failure");
+            .expect("automated existing-host path records safe handoff");
 
-        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert_eq!(job.state, ProvisioningJobState::WaitingForHeartbeat);
         assert_eq!(job.host_name.as_deref(), Some("legacy-2"));
         assert_eq!(job.role.as_deref(), Some("server"));
         assert_eq!(job.is_nix, Some(false));
@@ -12269,7 +12269,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(setup_intent.location, LocationSetupIntent::Auto);
         let handoff = job.handoff.as_ref().expect("native handoff");
         assert_eq!(handoff.method, BootstrapMethod::NativeSystemd);
-        assert_eq!(handoff.status, "executor-pending");
+        assert_eq!(handoff.status, "runtime-credential-required");
         assert!(handoff
             .command_ref
             .as_deref()
@@ -12281,14 +12281,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(job.backup_proposal.is_none());
         assert_eq!(
             job.progress.last().expect("progress entry").state,
-            ProvisioningJobState::Failed
+            ProvisioningJobState::WaitingForHeartbeat
         );
         assert!(job
             .progress
             .last()
             .expect("progress entry")
             .message
-            .contains("Automated existing-host apply is not active yet"));
+            .contains("runtime credential handoff"));
         let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
@@ -12318,11 +12318,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .start(&request, 1_700_000_007, &runtime)
             .expect("nixos existing-host handoff records setup state");
 
-        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert_eq!(job.state, ProvisioningJobState::WaitingForHeartbeat);
         let setup_intent = job.setup_intent.as_ref().expect("setup intent");
         assert_eq!(setup_intent.backup, BackupSetupIntent::Required);
         let handoff = job.handoff.as_ref().expect("nixos handoff");
         assert_eq!(handoff.method, BootstrapMethod::NixosAnywhere);
+        assert_eq!(handoff.status, "runtime-credential-required");
         assert!(handoff
             .next_steps
             .iter()

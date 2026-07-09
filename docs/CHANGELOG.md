@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.5 - 2026-07-09
+
+- Changed existing-host NixOS/native bootstrap jobs from generic failed executor state to an explicit runtime-credential handoff.
+- Kept Janus/dev-local beacon credential creation outside the UI response: no raw tokens, token files, env contents, or hashes are rendered by setup jobs.
+- Existing-host jobs now remain visible while waiting for the first heartbeat after approved credential handoff and beacon start.
+
 ## 0.1.4 - 2026-07-09
 
 - Added Oracle Always Free and Google Cloud free-tier lab import templates.
