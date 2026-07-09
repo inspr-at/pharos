@@ -748,14 +748,16 @@ main[data-view="list"] .list-wrap{display:block}
 .lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
 .onboard-primary{appearance:none;position:relative;display:inline-flex;align-items:center;justify-content:center;gap:9px;min-height:38px;margin-top:18px;padding:0 14px;border:1px solid rgba(103,177,196,.42);border-radius:7px;background:rgba(223,241,249,.74);color:#0f4f80;text-decoration:none;font:inherit;font-size:13px;font-weight:760;box-shadow:0 8px 20px rgba(45,75,95,.07);cursor:pointer}.onboard-primary:hover,.onboard-primary:focus-visible{background:rgba(207,235,244,.92);box-shadow:0 10px 24px rgba(45,75,95,.10);outline:0}.onboard-primary .ico{width:15px;height:15px}
 .lone-state .onboard-primary{margin:0}
-.assistant-overlay{position:fixed;inset:0;z-index:5000;display:grid;place-items:center;padding:24px;background:rgba(20,43,63,.20);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
-.assistant-sheet{width:min(560px,100%);border:1px solid rgba(210,226,234,.92);border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(247,252,253,.94));box-shadow:0 28px 70px rgba(31,61,82,.22);overflow:hidden}
+.assistant-overlay{position:fixed;inset:0;z-index:5000;display:grid;place-items:center;padding:24px;overflow:auto;background:rgba(20,43,63,.20);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.assistant-sheet{width:min(760px,100%);max-height:calc(100vh - 48px);border:1px solid rgba(210,226,234,.92);border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(247,252,253,.94));box-shadow:0 28px 70px rgba(31,61,82,.22);overflow:auto}
 .assistant-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 22px 16px;border-bottom:1px solid rgba(214,226,234,.72)}.assistant-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;color:#12304b}.assistant-head p{margin:5px 0 0;color:var(--muted);font-size:13px}
 .assistant-close{appearance:none;display:grid;place-items:center;min-width:34px;height:34px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-close:hover,.assistant-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}
 .assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
+.assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
+.assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
 body[data-assistant-open="true"]{overflow:hidden}
-@media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}}
+@media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths,.assistant-providers{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}.assistant-facts{grid-template-columns:1fr}.assistant-template{grid-template-columns:1fr}.assistant-template em{white-space:normal}}
 .map-main{width:min(1380px,100%)}
 .map-main[data-map-view="maximized"]{width:100%}
 .map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
@@ -1303,22 +1305,120 @@ function bindFreeformDrag(){
 }
 const ASSISTANT_SETUP_PARAM='setup';
 const ASSISTANT_PATH_PARAM='setup_path';
+const ASSISTANT_PROVIDER_PARAM='setup_provider';
+const ASSISTANT_TEMPLATE_PARAM='setup_template';
+const ASSISTANT_TEMPLATE_PROVIDERS={
+  'hetzner-small-nixos':'hetzner-cloud',
+  'hetzner-lab':'hetzner-cloud',
+  'bring-own-plan':'hetzner-cloud',
+  'manual-import':'manual-import'
+};
 function assistantPath(path){
   return ['new','existing'].includes(path)?path:'';
 }
-function writeAssistantUrl(open,path=''){
+function assistantProvider(provider){
+  return ['hetzner-cloud','manual-import'].includes(provider)?provider:'';
+}
+function assistantTemplate(template){
+  return Object.prototype.hasOwnProperty.call(ASSISTANT_TEMPLATE_PROVIDERS,template)?template:'';
+}
+function assistantState(overlay){
+  return {
+    path: assistantPath(overlay?.dataset.assistantSelectedPath||''),
+    provider: assistantProvider(overlay?.dataset.assistantSelectedProvider||''),
+    template: assistantTemplate(overlay?.dataset.assistantSelectedTemplate||'')
+  };
+}
+function writeAssistantUrl(open,path='',provider='',template=''){
   const params=new URLSearchParams(location.search);
   if(open){
     params.set(ASSISTANT_SETUP_PARAM,'add-server');
     const safePath=assistantPath(path);
     if(safePath)params.set(ASSISTANT_PATH_PARAM,safePath);
     else params.delete(ASSISTANT_PATH_PARAM);
+    const safeProvider=safePath==='new'?assistantProvider(provider):'';
+    const safeTemplate=safePath==='new'?assistantTemplate(template):'';
+    if(safeProvider)params.set(ASSISTANT_PROVIDER_PARAM,safeProvider);
+    else params.delete(ASSISTANT_PROVIDER_PARAM);
+    if(safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===safeProvider)params.set(ASSISTANT_TEMPLATE_PARAM,safeTemplate);
+    else params.delete(ASSISTANT_TEMPLATE_PARAM);
   }else{
     params.delete(ASSISTANT_SETUP_PARAM);
     params.delete(ASSISTANT_PATH_PARAM);
+    params.delete(ASSISTANT_PROVIDER_PARAM);
+    params.delete(ASSISTANT_TEMPLATE_PARAM);
   }
   const query=params.toString();
   history.replaceState(null,'',location.pathname+(query?'?'+query:''));
+}
+function syncAssistantNext(overlay){
+  const {path,provider,template}=assistantState(overlay);
+  const title=overlay.querySelector('[data-assistant-next-title]');
+  const copy=overlay.querySelector('[data-assistant-next-copy]');
+  const button=overlay.querySelector('[data-assistant-continue]');
+  if(button){
+    button.disabled=true;
+    button.textContent='Continue';
+  }
+  if(path==='new'){
+    if(template){
+      const selected=[...overlay.querySelectorAll('[data-assistant-template]')].find(btn=>btn.dataset.assistantTemplate===template);
+      if(title)title.textContent='Template selected';
+      if(copy)copy.textContent=selected?.dataset.assistantNext||'Next: review the provisioning plan before anything is created.';
+      if(button)button.disabled=false;
+    }else if(provider){
+      if(title)title.textContent='Choose a template';
+      if(copy)copy.textContent='Pick a starting point. No credentials, resources, or host records have been created.';
+    }else{
+      if(title)title.textContent='Choose a provider';
+      if(copy)copy.textContent='Hetzner is the polished path. Manual and Netcup-style hosts route through import.';
+    }
+  }else if(path==='existing'){
+    if(title)title.textContent='Existing server selected';
+    if(copy)copy.textContent='Next: enter connection details. No tokens or host records have been created.';
+  }else{
+    if(title)title.textContent='Next step';
+    if(copy)copy.textContent='Choose a path to preview the next step. No changes have been started.';
+  }
+}
+function setAssistantTemplate(template,write=true){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const provider=assistantProvider(overlay.dataset.assistantSelectedProvider||'');
+  const safeTemplate=assistantTemplate(template);
+  const nextTemplate=safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===provider?safeTemplate:'';
+  overlay.dataset.assistantSelectedTemplate=nextTemplate;
+  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
+    const visible=!btn.hidden&&btn.dataset.assistantTemplateProvider===provider;
+    btn.setAttribute('aria-pressed',String(visible&&btn.dataset.assistantTemplate===nextTemplate));
+  });
+  syncAssistantNext(overlay);
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template);
+  }
+}
+function setAssistantProvider(provider,write=true){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const safeProvider=assistantProvider(provider);
+  overlay.dataset.assistantSelectedProvider=safeProvider;
+  overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>{
+    btn.setAttribute('aria-pressed',String(btn.dataset.assistantProvider===safeProvider));
+  });
+  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
+    btn.hidden=!(safeProvider&&btn.dataset.assistantTemplateProvider===safeProvider);
+  });
+  if(ASSISTANT_TEMPLATE_PROVIDERS[assistantTemplate(overlay.dataset.assistantSelectedTemplate||'')]!==safeProvider){
+    setAssistantTemplate('',false);
+  }else{
+    setAssistantTemplate(overlay.dataset.assistantSelectedTemplate,false);
+  }
+  syncAssistantNext(overlay);
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template);
+  }
 }
 function setAssistantPath(path,write=true){
   const overlay=document.querySelector('[data-setup-assistant]');
@@ -1328,19 +1428,20 @@ function setAssistantPath(path,write=true){
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>{
     btn.setAttribute('aria-pressed',String(btn.dataset.assistantPath===safePath));
   });
-  const title=overlay.querySelector('[data-assistant-next-title]');
-  const copy=overlay.querySelector('[data-assistant-next-copy]');
   if(safePath==='new'){
-    if(title)title.textContent='New server selected';
-    if(copy)copy.textContent='Next: choose a provider template. No resources have been created.';
+    setAssistantProvider(assistantProvider(overlay.dataset.assistantSelectedProvider||'')||'hetzner-cloud',false);
   }else if(safePath==='existing'){
-    if(title)title.textContent='Existing server selected';
-    if(copy)copy.textContent='Next: enter connection details. No tokens or host records have been created.';
+    setAssistantProvider('',false);
+    setAssistantTemplate('',false);
   }else{
-    if(title)title.textContent='Next step';
-    if(copy)copy.textContent='Choose a path to preview the next step. No changes have been started.';
+    setAssistantProvider('',false);
+    setAssistantTemplate('',false);
   }
-  if(write)writeAssistantUrl(!overlay.hidden,safePath);
+  syncAssistantNext(overlay);
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template);
+  }
 }
 function setAssistantOpen(open,write=true){
   const overlay=document.querySelector('[data-setup-assistant]');
@@ -1348,14 +1449,28 @@ function setAssistantOpen(open,write=true){
   overlay.hidden=!open;
   document.body.dataset.assistantOpen=open?'true':'false';
   if(!open)setAssistantPath('',false);
-  if(write)writeAssistantUrl(open,open?(overlay.dataset.assistantSelectedPath||''):'');
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(open,state.path,state.provider,state.template);
+  }
   if(open)overlay.querySelector('[data-assistant-close]')?.focus();
 }
 function restoreAssistantFromUrl(){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
   const params=new URLSearchParams(location.search);
   const open=params.get(ASSISTANT_SETUP_PARAM)==='add-server';
   setAssistantOpen(open,false);
-  setAssistantPath(open?params.get(ASSISTANT_PATH_PARAM):'',false);
+  if(!open){
+    setAssistantPath('',false);
+    return;
+  }
+  const path=assistantPath(params.get(ASSISTANT_PATH_PARAM));
+  setAssistantPath(path,false);
+  if(path==='new'){
+    setAssistantProvider(assistantProvider(params.get(ASSISTANT_PROVIDER_PARAM))||'hetzner-cloud',false);
+    setAssistantTemplate(params.get(ASSISTANT_TEMPLATE_PARAM),false);
+  }
 }
 function initSetupAssistant(){
   const overlay=document.querySelector('[data-setup-assistant]');
@@ -1365,6 +1480,15 @@ function initSetupAssistant(){
   overlay.addEventListener('click',event=>{if(event.target===overlay)setAssistantOpen(false)});
   document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!overlay.hidden)setAssistantOpen(false)});
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>setAssistantPath(btn.dataset.assistantPath)));
+  overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>btn.addEventListener('click',()=>setAssistantProvider(btn.dataset.assistantProvider)));
+  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>btn.addEventListener('click',()=>setAssistantTemplate(btn.dataset.assistantTemplate)));
+  overlay.querySelector('[data-assistant-continue]')?.addEventListener('click',event=>{
+    if(event.currentTarget.disabled)return;
+    const title=overlay.querySelector('[data-assistant-next-title]');
+    const copy=overlay.querySelector('[data-assistant-next-copy]');
+    if(title)title.textContent='Ready for plan';
+    if(copy)copy.textContent='Next: review the provisioning plan before creating provider resources, tokens, or host records.';
+  });
   window.addEventListener('popstate',restoreAssistantFromUrl);
   restoreAssistantFromUrl();
 }
@@ -2838,7 +2962,7 @@ fn onboard_row() -> String {
 
 fn setup_assistant() -> String {
     format!(
-        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" disabled>Continue</button></div></div></div></section>"#,
+        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-provider-step" data-assistant-provider-step><div class="assistant-step-head"><strong>New server</strong><span>Choose where this server starts.</span></div><div class="assistant-providers"><button class="assistant-provider" type="button" data-assistant-provider="hetzner-cloud" aria-pressed="false"><span class="assistant-provider-title"><strong>Hetzner Cloud</strong><span class="assistant-badge">Recommended</span></span><p>Best supported path for a fresh Pharos-managed server.</p><span class="assistant-facts"><span><b>Credentials needed</b>API token later</span><span><b>Cost</b>Paid cloud</span><span><b>Bootstrap</b>NixOS ready</span></span></button><button class="assistant-provider" type="button" data-assistant-provider="manual-import" aria-pressed="false"><span class="assistant-provider-title"><strong>Manual / existing provider</strong></span><p>Use this for Netcup or any provider that is not safely automated yet.</p><span class="assistant-facts"><span><b>Credentials needed</b>SSH later</span><span><b>Cost</b>Your provider</span><span><b>Bootstrap</b>Import path</span></span></button></div><div class="assistant-step-head"><strong>Template</strong><span>No provider resources are created here.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" data-assistant-next="Next: review a Hetzner Cloud plan for a small NixOS server. No resources have been created." aria-pressed="false"><span><strong>Small NixOS server</strong><span>Low monthly cost, automatic NixOS bootstrap, good first production default.</span></span><em>low cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" data-assistant-next="Next: review a lab-style plan and confirm current pricing before creating anything." aria-pressed="false"><span><strong>Lab / free-tier style</strong><span>Smallest practical shape. Pricing and availability must be checked at plan time.</span></span><em>check cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" data-assistant-next="Next: choose exact provider size, region, and image before creating anything." aria-pressed="false"><span><strong>Bring your own plan</strong><span>Use when you already know the size, region, and bootstrap profile you want.</span></span><em>custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Netcup is not treated as fully automated yet." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For Netcup and other providers, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button></div></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" data-assistant-continue disabled>Continue</button></div></div></div></section>"#,
         plus = icons::PLUS,
         server = icons::SERVER
     )
@@ -6556,6 +6680,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Add first server"));
         assert!(empty.contains("Add a server"));
         assert!(empty.contains("setup_path"));
+        assert!(empty.contains("setup_provider"));
+        assert!(empty.contains("setup_template"));
+        assert!(empty.contains("Hetzner Cloud"));
+        assert!(empty.contains("Manual / existing provider"));
+        assert!(empty.contains("Small NixOS server"));
+        assert!(empty.contains("Lab / free-tier style"));
+        assert!(empty.contains("Bring your own plan"));
+        assert!(empty.contains("Netcup"));
+        assert!(empty.contains("data-assistant-template=\"hetzner-small-nixos\""));
+        assert!(empty.contains("No provider resources are created here."));
         assert!(empty.contains(r#"data-assistant-next-title"#));
         assert!(empty.contains(r#"aria-pressed="false""#));
         assert!(empty.contains("awaiting first heartbeat"));
