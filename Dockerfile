@@ -6,9 +6,10 @@
 # rustls uses bundled roots, so no system OpenSSL at build or runtime.
 
 FROM rust:1-bookworm AS build
+ARG GIT_COMMIT=dev
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p pharosd -p pharos-beacon \
+RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p pharos-beacon \
     && strip target/release/pharosd target/release/pharos-beacon
 
 FROM debian:bookworm-slim

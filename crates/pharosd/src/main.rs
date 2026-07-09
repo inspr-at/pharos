@@ -1478,6 +1478,9 @@ fn unquote_env_value(value: &str) -> &str {
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
 const SIDEBAR_LIGHTHOUSE_PNG: &[u8] = include_bytes!("../assets/sidebar-lighthouse.png");
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="5" fill="#f7fbfc"/><path d="M10.5 5 12 2.5 13.5 5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="10" y="5" width="4" height="3" rx=".5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 8 8.6 20M14 8l1.4 12M9.2 13.5h5.6M7 20h10M6 22h12M16.6 6.4l2.4-1M7.4 6.4l-2.4-1" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const APP_VERSION: &str = env!("PHAROS_APP_VERSION");
+const GIT_COMMIT: &str = env!("PHAROS_GIT_COMMIT");
+const CHANGELOG_MD: &str = include_str!("../../../docs/CHANGELOG.md");
 
 const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
 :root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--card:#ffffff;--card-soft:rgba(255,255,255,.82);--accent:#1f7fb5;--sea:#159e99;--sun:#d69b31;--live:#25845f;--stale:#b26a00;--down:#bf3a35;--wait:#8997a3;--side:232px}
@@ -1489,7 +1492,8 @@ body:before{content:"";position:fixed;inset:0;z-index:-3;background:radial-gradi
 .sidebar:before{content:"";position:absolute;left:-18%;right:-20%;bottom:-10%;height:66%;background:url('/assets/sidebar-lighthouse.png') left bottom/118% auto no-repeat;opacity:.78;pointer-events:none;-webkit-mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%);mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%)}
 .side-brand,.side-nav,.side-foot{position:relative;z-index:1}.side-brand{display:flex;align-items:center;gap:13px;padding:0 12px}.side-mark{display:grid;place-items:center;width:36px;height:50px;color:var(--sun)}.side-mark .ico{width:31px;height:31px}.side-logo{font-family:Georgia,"Times New Roman",serif;font-size:22px;letter-spacing:.18em;color:#14304b;text-transform:uppercase}
 .side-nav{display:grid;gap:7px}.side-link{display:grid;grid-template-columns:23px minmax(0,1fr) auto;align-items:center;gap:11px;min-height:46px;padding:0 13px;border-radius:7px;color:#294761;text-decoration:none;font-weight:520}.side-link[aria-current="page"]{background:rgba(223,241,249,.76);color:#0f4f80}.side-link .ico{width:18px;height:18px}.side-badge{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:#ffe7bb;color:#9a5b00;font-size:12px;font-weight:700}
-.side-foot{margin-top:auto;display:flex;align-items:center;justify-content:space-between;gap:9px;min-height:48px;padding:7px 8px 7px 11px;border:1px solid rgba(211,225,233,.70);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.78),rgba(247,252,253,.62));box-shadow:0 10px 26px rgba(45,75,95,.12);-webkit-backdrop-filter:blur(10px) saturate(1.08);backdrop-filter:blur(10px) saturate(1.08);color:#294761;font-size:13px}.side-user{min-width:0;display:flex;align-items:center;gap:9px;font-weight:650;text-shadow:0 1px 0 rgba(255,255,255,.76)}.side-user:before{content:"";flex:0 0 auto;width:24px;height:24px;border-radius:50%;border:1px solid rgba(214,155,49,.38);background:radial-gradient(circle,#fff 0 33%,rgba(214,155,49,.18) 36%,transparent 68%)}.side-user span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.side-logout{display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border-radius:50%;color:#4c6780;text-decoration:none}.side-logout:hover{background:rgba(223,241,249,.78);color:#0f4f80}.side-logout .ico{width:16px;height:16px}
+.side-bottom{position:relative;z-index:1;margin-top:auto;display:grid;gap:8px}.side-version{appearance:none;display:flex;align-items:center;justify-content:center;gap:7px;min-height:32px;width:100%;border:1px solid rgba(211,225,233,.70);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.68),rgba(247,252,253,.54));box-shadow:0 8px 20px rgba(45,75,95,.08);-webkit-backdrop-filter:blur(10px) saturate(1.05);backdrop-filter:blur(10px) saturate(1.05);color:#4c6780;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.side-version:hover,.side-version:focus-visible{color:#0f4f80;background:rgba(223,241,249,.72);outline:0}.side-version .ico{width:14px;height:14px}.side-foot{display:flex;align-items:center;justify-content:space-between;gap:9px;min-height:48px;padding:7px 8px 7px 11px;border:1px solid rgba(211,225,233,.70);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.78),rgba(247,252,253,.62));box-shadow:0 10px 26px rgba(45,75,95,.12);-webkit-backdrop-filter:blur(10px) saturate(1.08);backdrop-filter:blur(10px) saturate(1.08);color:#294761;font-size:13px}.side-user{min-width:0;display:flex;align-items:center;gap:9px;font-weight:650;text-shadow:0 1px 0 rgba(255,255,255,.76)}.side-user:before{content:"";flex:0 0 auto;width:24px;height:24px;border-radius:50%;border:1px solid rgba(214,155,49,.38);background:radial-gradient(circle,#fff 0 33%,rgba(214,155,49,.18) 36%,transparent 68%)}.side-user span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.side-logout{display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border-radius:50%;color:#4c6780;text-decoration:none}.side-logout:hover{background:rgba(223,241,249,.78);color:#0f4f80}.side-logout .ico{width:16px;height:16px}
+.release-overlay{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:28px;background:rgba(20,48,75,.18);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}.release-backdrop{position:absolute;inset:0}.release-sheet{position:relative;width:min(660px,calc(100vw - 36px));max-height:min(720px,calc(100vh - 42px));display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.94);box-shadow:0 24px 70px rgba(45,75,95,.22);overflow:hidden}.release-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 22px 16px;border-bottom:1px solid rgba(214,226,234,.72);background:linear-gradient(180deg,rgba(247,252,253,.86),rgba(255,255,255,.72))}.release-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500;color:#12304b}.release-head p{margin:4px 0 0;color:var(--muted);font-size:12px}.release-close{appearance:none;border:1px solid rgba(210,226,234,.86);border-radius:7px;background:#fff;color:#294761;font:inherit;font-size:12px;font-weight:760;padding:8px 11px;cursor:pointer}.release-close:hover,.release-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}.release-body{padding:18px 22px 22px;overflow:auto;color:var(--ink)}.release-body h2{display:none}.release-body h3{margin:0 0 8px;font-family:Georgia,"Times New Roman",serif;font-size:21px;font-weight:500;color:#12304b}.release-body ul{margin:0 0 18px;padding-left:20px}.release-body li{margin:6px 0;color:#294761}.release-body p{margin:0 0 14px;color:var(--muted)}
 main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .ico{width:16px;height:16px;display:inline-block;vertical-align:middle;flex:0 0 auto}
 .top{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:22px;min-height:118px;margin:-10px 0 20px;padding:10px 0 18px;overflow:hidden}
@@ -1820,7 +1824,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .map-panel[data-label-density="compact"] .map-status-dot{grid-row:auto;margin-top:0;width:8px;height:8px}
 .map-panel[data-label-density="compact"] .map-name{font-size:12px}
 .map-panel[data-label-density="compact"] .map-signals,.map-panel[data-label-density="compact"] .map-source{display:none}
-@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-foot{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:1050px}}
+@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-bottom{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:1050px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
 @media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-primary{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
@@ -1841,6 +1845,26 @@ function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);r
 function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
+function initReleaseHistory(){
+  const modal=document.querySelector('[data-release-modal]');
+  const open=document.querySelector('[data-release-open]');
+  if(!modal||!open)return;
+  let opener=null;
+  function show(){
+    opener=document.activeElement;
+    modal.hidden=false;
+    document.body.dataset.releaseOpen='true';
+    modal.querySelector('[data-release-close]')?.focus();
+  }
+  function hide(){
+    modal.hidden=true;
+    delete document.body.dataset.releaseOpen;
+    if(opener&&typeof opener.focus==='function')opener.focus();
+  }
+  open.addEventListener('click',show);
+  modal.querySelectorAll('[data-release-close]').forEach(el=>el.addEventListener('click',hide));
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!modal.hidden)hide()});
+}
 function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(name+'='))?.split('=').slice(1).join('=')||''}
 function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
 function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host-surface="runtime"]')).filter(el=>el.dataset.host===name)}
@@ -3056,6 +3080,7 @@ window.addEventListener('pageshow',()=>resumeRefresh('pageshow'));
 window.addEventListener('online',()=>resumeRefresh('online'));
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
+initReleaseHistory();
 initControls();
 requestAnimationFrame(frame);
 scheduleRefresh(3000);
@@ -3340,12 +3365,74 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn release_label() -> String {
+    format!("v{APP_VERSION}")
+}
+
+fn changelog_html() -> String {
+    let mut html = String::new();
+    let mut in_list = false;
+    for line in CHANGELOG_MD.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("## ") {
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            html.push_str(&format!("<h3>{}</h3>", html_escape(text)));
+        } else if let Some(text) = trimmed.strip_prefix("# ") {
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            html.push_str(&format!("<h2>{}</h2>", html_escape(text)));
+        } else if let Some(text) = trimmed.strip_prefix("- ") {
+            if !in_list {
+                html.push_str("<ul>");
+                in_list = true;
+            }
+            html.push_str(&format!("<li>{}</li>", html_escape(text)));
+        } else {
+            if in_list {
+                html.push_str("</ul>");
+                in_list = false;
+            }
+            html.push_str(&format!("<p>{}</p>", html_escape(trimmed)));
+        }
+    }
+    if in_list {
+        html.push_str("</ul>");
+    }
+    html
+}
+
+fn release_dialog() -> String {
+    format!(
+        r#"<section class="release-overlay" data-release-modal hidden aria-label="release history"><div class="release-backdrop" data-release-close></div><div class="release-sheet" role="dialog" aria-modal="true" aria-labelledby="release-history-title"><header class="release-head"><div><h2 id="release-history-title">Release history</h2><p>Running {version} · build {commit}</p></div><button class="release-close" type="button" data-release-close>Close</button></header><div class="release-body">{history}</div></div></section>"#,
+        version = html_escape(&release_label()),
+        commit = html_escape(GIT_COMMIT),
+        history = changelog_html()
+    )
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
 
 async fn version() -> Json<serde_json::Value> {
-    Json(json!({ "name": "pharosd", "version": env!("CARGO_PKG_VERSION") }))
+    Json(json!({
+        "name": "pharosd",
+        "version": APP_VERSION,
+        "git_commit": GIT_COMMIT,
+        "display_version": release_label()
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5750,7 +5837,7 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></aside>"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div>{release_dialog}</aside>"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
@@ -5758,6 +5845,9 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         backups = icons::SHIELD_CHECK,
         activity = icons::LIST,
         settings = icons::SLIDERS,
+        history = icons::HISTORY,
+        version = html_escape(&release_label()),
+        release_dialog = release_dialog(),
         fleet_current = fleet_current,
         map_current = map_current,
         alerts_current = alerts_current,
@@ -9197,6 +9287,36 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn version_endpoint_reports_embedded_build_metadata() {
+        let Json(payload) = version().await;
+
+        assert_eq!(payload["name"], "pharosd");
+        assert_eq!(payload["version"], APP_VERSION);
+        assert_eq!(payload["display_version"], release_label());
+        assert_eq!(payload["git_commit"], GIT_COMMIT);
+    }
+
+    #[test]
+    fn sidebar_exposes_release_history_dialog() {
+        let html = sidebar("markus", true, "fleet");
+
+        assert!(html.contains(r#"class="side-version""#));
+        assert!(html.contains(&release_label()));
+        assert!(html.contains("Release history"));
+        assert!(html.contains("Pharos Changelog"));
+        assert!(html.contains("0.1.0 - 2026-07-09"));
+    }
+
+    #[test]
+    fn changelog_renderer_escapes_operator_text() {
+        let html = changelog_html();
+
+        assert!(html.contains("<h3>0.1.0 - 2026-07-09</h3>"));
+        assert!(html.contains("<li>Added a visible dashboard version badge"));
+        assert!(!html.contains("<script"));
+    }
 
     fn backup_observation(state: BackupPostureState) -> BackupObservation {
         BackupObservation {

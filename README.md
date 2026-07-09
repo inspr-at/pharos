@@ -57,6 +57,20 @@ cargo test --all
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Release Versioning
+
+`VERSION` is the visible product version and must match the Cargo workspace
+version. `pharosd` embeds that version at build time and reports it from
+`/version` together with the build commit. The dashboard sidebar shows the same
+version and links to the release history rendered from `docs/CHANGELOG.md`.
+
+Before every production deploy:
+
+1. Bump `VERSION` using semver.
+2. Keep the Cargo workspace version in sync.
+3. Add the newest entry to `docs/CHANGELOG.md` in operator-facing language.
+4. Do not deploy a changed product with an unchanged visible version.
+
 `PHAROS_MANIFEST_PATHS` may point to one or more nixcfg-generated v1 host
 manifests, separated by `:` or `,`. pharosd serves them at
 `/declared-hosts.json` with runtime state overlaid separately from the declared
