@@ -151,6 +151,343 @@ impl HostLocation {
     }
 }
 
+pub const SERVER_LIFECYCLE_SCHEMA: &str = "inspr.pharos.server-lifecycle.v1";
+pub const SERVER_LIFECYCLE_VERSION: u16 = 1;
+
+fn default_server_lifecycle_schema() -> String {
+    SERVER_LIFECYCLE_SCHEMA.to_string()
+}
+
+fn default_server_lifecycle_version() -> u16 {
+    SERVER_LIFECYCLE_VERSION
+}
+
+/// Provider/server intent for onboarding jobs. It is not embedded in
+/// `HostManifest`: manifests stay declared service/host intent, while this
+/// model tracks provisioning/import intent and safe secret references.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerLifecycleIntent {
+    #[serde(default = "default_server_lifecycle_schema")]
+    pub schema: String,
+    #[serde(default = "default_server_lifecycle_version")]
+    pub version: u16,
+    pub host_name: String,
+    pub origin: ServerOrigin,
+    pub owner: ServerLifecycleOwner,
+    pub state: ServerLifecycleState,
+    pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ServerProviderRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ServerImageRef>,
+    pub bootstrap: BootstrapSource,
+    pub ssh: SshAccessIntent,
+    #[serde(default)]
+    pub secrets: ServerSecretBoundary,
+}
+
+impl ServerLifecycleIntent {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        if self.schema != SERVER_LIFECYCLE_SCHEMA {
+            return Err(ServerLifecycleContractError::UnsupportedSchema {
+                expected: SERVER_LIFECYCLE_SCHEMA.to_string(),
+                actual: self.schema.clone(),
+            });
+        }
+        if self.version != SERVER_LIFECYCLE_VERSION {
+            return Err(ServerLifecycleContractError::UnsupportedVersion {
+                expected: SERVER_LIFECYCLE_VERSION,
+                actual: self.version,
+            });
+        }
+        if self.host_name.trim().is_empty() {
+            return Err(ServerLifecycleContractError::EmptyHostName);
+        }
+        if self.hostname.trim().is_empty() {
+            return Err(ServerLifecycleContractError::EmptyHostname);
+        }
+        match self.origin {
+            ServerOrigin::ProviderCreated if self.provider.is_none() => {
+                return Err(ServerLifecycleContractError::ProviderRequired);
+            }
+            ServerOrigin::ImportedExisting | ServerOrigin::ManualDeferred => {}
+            ServerOrigin::ProviderCreated => {}
+        }
+        if matches!(self.owner, ServerLifecycleOwner::External)
+            && !matches!(self.state, ServerLifecycleState::ExternallyManaged)
+        {
+            return Err(ServerLifecycleContractError::ExternalOwnerMustBeExternal);
+        }
+        self.ssh.validate_contract()?;
+        self.secrets.validate_contract()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerOrigin {
+    ProviderCreated,
+    ImportedExisting,
+    ManualDeferred,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerLifecycleOwner {
+    Pharos,
+    Nixcfg,
+    Janus,
+    Operator,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerLifecycleState {
+    Pending,
+    Planning,
+    Provisioning,
+    Bootstrapping,
+    AwaitingFirstHeartbeat,
+    Live,
+    Failed,
+    CleanupNeeded,
+    Retired,
+    ExternallyManaged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerProviderRef {
+    pub kind: ServerProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerProviderKind {
+    HetznerCloud,
+    NetcupManual,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerImageRef {
+    pub source: ServerImageSource,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerImageSource {
+    ProviderImage,
+    NixosAnywhere,
+    Snapshot,
+    ImportedHost,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapSource {
+    pub method: BootstrapMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flake_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BootstrapMethod {
+    NixosAnywhere,
+    NativeSystemd,
+    Manual,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshAccessIntent {
+    pub route: SshRoute,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+impl SshAccessIntent {
+    fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        if matches!(self.route, SshRoute::Direct | SshRoute::Tailnet | SshRoute::Bastion)
+            && self.host.as_ref().is_none_or(|host| host.trim().is_empty())
+        {
+            return Err(ServerLifecycleContractError::SshHostRequired);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshRoute {
+    Direct,
+    Tailnet,
+    Bastion,
+    None,
+    Unknown,
+}
+
+/// Secret material is modeled only as references to the owner/location that
+/// stores it. Provider API tokens, SSH private keys, registration tokens, and
+/// raw beacon tokens must never live in this value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerSecretBoundary {
+    #[serde(default)]
+    pub refs: Vec<SecretReference>,
+}
+
+impl ServerSecretBoundary {
+    fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        for reference in &self.refs {
+            reference.validate_contract()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretReference {
+    pub kind: SecretMaterialKind,
+    pub owner: SecretOwner,
+    pub location: SecretLocation,
+    pub reference: String,
+}
+
+impl SecretReference {
+    fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        let value = self.reference.trim();
+        if value.is_empty() || value.contains('\n') || value.contains('\r') {
+            return Err(ServerLifecycleContractError::InvalidSecretReference);
+        }
+        let lowered = value.to_ascii_lowercase();
+        if lowered.contains("-----begin")
+            || lowered.starts_with("bearer ")
+            || lowered.starts_with("pat_")
+        {
+            return Err(ServerLifecycleContractError::InvalidSecretReference);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretMaterialKind {
+    ProviderApiToken,
+    SshPrivateKey,
+    RegistrationToken,
+    BeaconToken,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretOwner {
+    Janus,
+    Agenix,
+    OperatorLocal,
+    ExternalVault,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretLocation {
+    Environment,
+    File,
+    JanusSecret,
+    AgeRecipient,
+    ExternalSecretRef,
+}
+
+/// Runtime-only overlay derived from `Host`/`HostReport`; this is what can back
+/// `/hosts.json` or `/declared-hosts.json` without contaminating declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerObservedState {
+    pub liveness: Liveness,
+    pub last_seen: Option<UnixSeconds>,
+    pub heartbeat_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_rtt: Option<InboundRttObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<HostLocation>,
+    pub freshness: NixFreshness,
+    #[serde(default)]
+    pub service_observations: Vec<ServiceObservation>,
+}
+
+impl ServerObservedState {
+    pub fn from_host(host: &Host, now: UnixSeconds) -> Self {
+        Self {
+            liveness: liveness(host.last_seen, host.heartbeat_interval_secs, now),
+            last_seen: host.last_seen,
+            heartbeat_interval_secs: host.heartbeat_interval_secs,
+            inbound_rtt: host.inbound_rtt,
+            location: host.location.clone(),
+            freshness: host.freshness.clone(),
+            service_observations: host.service_observations.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerLifecycleContractError {
+    UnsupportedSchema { expected: String, actual: String },
+    UnsupportedVersion { expected: u16, actual: u16 },
+    EmptyHostName,
+    EmptyHostname,
+    ProviderRequired,
+    ExternalOwnerMustBeExternal,
+    SshHostRequired,
+    InvalidSecretReference,
+}
+
+impl std::fmt::Display for ServerLifecycleContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchema { expected, actual } => {
+                write!(
+                    f,
+                    "unsupported server lifecycle schema {actual:?}; expected {expected:?}"
+                )
+            }
+            Self::UnsupportedVersion { expected, actual } => {
+                write!(
+                    f,
+                    "unsupported server lifecycle version {actual}; expected {expected}"
+                )
+            }
+            Self::EmptyHostName => write!(f, "server lifecycle host_name is empty"),
+            Self::EmptyHostname => write!(f, "server lifecycle hostname is empty"),
+            Self::ProviderRequired => write!(f, "provider-created server requires provider"),
+            Self::ExternalOwnerMustBeExternal => {
+                write!(f, "external owner requires externally-managed lifecycle state")
+            }
+            Self::SshHostRequired => write!(f, "ssh route requires host"),
+            Self::InvalidSecretReference => write!(f, "secret reference must not be raw material"),
+        }
+    }
+}
+
+impl std::error::Error for ServerLifecycleContractError {}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ManifestLocationMode {
@@ -884,6 +1221,152 @@ mod tests {
             commits_behind: Some(0),
         });
         assert_eq!(healthy.state, ServiceObservationState::Healthy);
+    }
+
+    #[test]
+    fn server_lifecycle_accepts_provider_created_intent_without_secret_values() {
+        let intent = ServerLifecycleIntent {
+            schema: SERVER_LIFECYCLE_SCHEMA.to_string(),
+            version: SERVER_LIFECYCLE_VERSION,
+            host_name: "hcloud-lab-1".to_string(),
+            origin: ServerOrigin::ProviderCreated,
+            owner: ServerLifecycleOwner::Pharos,
+            state: ServerLifecycleState::Planning,
+            hostname: "hcloud-lab-1".to_string(),
+            provider: Some(ServerProviderRef {
+                kind: ServerProviderKind::HetznerCloud,
+                account_ref: Some("janus:pharos/hcloud/main".to_string()),
+                resource_id: None,
+            }),
+            region: Some("fsn1".to_string()),
+            site: Some("cloud-de".to_string()),
+            instance_type: Some("cx22".to_string()),
+            image: Some(ServerImageRef {
+                source: ServerImageSource::ProviderImage,
+                name: "debian-12".to_string(),
+            }),
+            bootstrap: BootstrapSource {
+                method: BootstrapMethod::NixosAnywhere,
+                flake_ref: Some("nixcfg#hcloud-lab-1".to_string()),
+                profile: Some("server".to_string()),
+            },
+            ssh: SshAccessIntent {
+                route: SshRoute::Direct,
+                user: Some("root".to_string()),
+                host: Some("203.0.113.10".to_string()),
+                port: Some(22),
+            },
+            secrets: ServerSecretBoundary {
+                refs: vec![
+                    SecretReference {
+                        kind: SecretMaterialKind::ProviderApiToken,
+                        owner: SecretOwner::Janus,
+                        location: SecretLocation::JanusSecret,
+                        reference: "pharos/hcloud/main".to_string(),
+                    },
+                    SecretReference {
+                        kind: SecretMaterialKind::SshPrivateKey,
+                        owner: SecretOwner::Agenix,
+                        location: SecretLocation::AgeRecipient,
+                        reference: "pharos-bootstrap-root".to_string(),
+                    },
+                ],
+            },
+        };
+
+        intent.validate_contract().expect("provider intent valid");
+        let serialized = serde_json::to_string(&intent).expect("intent serializes");
+        assert!(serialized.contains("hetzner-cloud"));
+        assert!(serialized.contains("fsn1"));
+        assert!(!serialized.contains("BEGIN OPENSSH"));
+        assert!(!serialized.contains("Bearer "));
+
+        let mut missing_provider = intent.clone();
+        missing_provider.provider = None;
+        assert_eq!(
+            missing_provider.validate_contract(),
+            Err(ServerLifecycleContractError::ProviderRequired)
+        );
+
+        let mut raw_secret = intent;
+        raw_secret.secrets.refs[0].reference = "Bearer raw-provider-token".to_string();
+        assert_eq!(
+            raw_secret.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidSecretReference)
+        );
+    }
+
+    #[test]
+    fn server_lifecycle_supports_imported_hosts_and_runtime_overlay() {
+        let intent = ServerLifecycleIntent {
+            schema: SERVER_LIFECYCLE_SCHEMA.to_string(),
+            version: SERVER_LIFECYCLE_VERSION,
+            host_name: "hsb8".to_string(),
+            origin: ServerOrigin::ImportedExisting,
+            owner: ServerLifecycleOwner::Nixcfg,
+            state: ServerLifecycleState::AwaitingFirstHeartbeat,
+            hostname: "hsb8.lan".to_string(),
+            provider: None,
+            region: None,
+            site: Some("parents-home".to_string()),
+            instance_type: None,
+            image: Some(ServerImageRef {
+                source: ServerImageSource::ImportedHost,
+                name: "existing-nixos".to_string(),
+            }),
+            bootstrap: BootstrapSource {
+                method: BootstrapMethod::NativeSystemd,
+                flake_ref: Some("nixcfg#hsb8".to_string()),
+                profile: None,
+            },
+            ssh: SshAccessIntent {
+                route: SshRoute::Tailnet,
+                user: Some("mba".to_string()),
+                host: Some("hsb8".to_string()),
+                port: None,
+            },
+            secrets: ServerSecretBoundary {
+                refs: vec![SecretReference {
+                    kind: SecretMaterialKind::BeaconToken,
+                    owner: SecretOwner::Janus,
+                    location: SecretLocation::JanusSecret,
+                    reference: "pharos/beacon/hsb8".to_string(),
+                }],
+            },
+        };
+        intent.validate_contract().expect("imported host intent valid");
+
+        let host = Host {
+            name: "hsb8".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(1_000),
+            heartbeat_log: vec![940, 1_000],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: Some(InboundRttObservation {
+                millis: 42,
+                observed_at: 1_000,
+            }),
+            location: None,
+            freshness: NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(0),
+                commits_behind: Some(0),
+            },
+            service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(0),
+                commits_behind: Some(0),
+            })],
+        };
+
+        let observed = ServerObservedState::from_host(&host, 1_020);
+        assert_eq!(observed.liveness, Liveness::Live);
+        assert_eq!(observed.last_seen, Some(1_000));
+        assert_eq!(observed.inbound_rtt.map(|rtt| rtt.millis), Some(42));
+        assert_eq!(observed.freshness.tldr(), "up to date");
     }
 
     #[test]
