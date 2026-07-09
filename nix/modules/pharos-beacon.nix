@@ -149,7 +149,10 @@ in
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
 
-      path = [ pkgs.gitMinimal ];
+      path = [
+        pkgs.gitMinimal
+        pkgs.restic
+      ];
       environment = baseEnvironment;
 
       serviceConfig = {
