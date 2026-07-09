@@ -31,10 +31,9 @@ use axum::{Json, Router};
 use pharos_core::{
     liveness, Host, HostLocation, HostLocationSource, HostManifest, HostRegistration,
     HostRegistrationResponse, HostReport, Liveness, ManifestLocationMode, ManifestProbePolicy,
-    ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
-    ServiceObservationState, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
-    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION, HOST_MANIFEST_SCHEMA,
-    HOST_MANIFEST_VERSION,
+    ManifestService, ManifestStatusSource, NixFreshness, ProvisioningJob, ProvisioningJobState,
+    ProvisioningProgressEntry, ServiceObservation, ServiceObservationState, HOST_MANIFEST_SCHEMA,
+    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -180,7 +179,10 @@ impl ProvisioningJobStore {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Err(e) = std::fs::write(path, json) {
-            tracing::warn!("failed to persist provisioning jobs to {}: {e}", path.display());
+            tracing::warn!(
+                "failed to persist provisioning jobs to {}: {e}",
+                path.display()
+            );
         }
     }
 }
@@ -2202,7 +2204,11 @@ async fn create_provisioning_job(
         .provisioning_jobs
         .start(&request.provider, &request.template, now_unix())
     {
-        Ok(job) => (StatusCode::CREATED, no_store_headers(), Json(json!({ "job": job }))),
+        Ok(job) => (
+            StatusCode::CREATED,
+            no_store_headers(),
+            Json(json!({ "job": job })),
+        ),
         Err(error) => (
             StatusCode::BAD_REQUEST,
             no_store_headers(),
@@ -2216,7 +2222,11 @@ async fn provisioning_job_json(
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
     match state.provisioning_jobs.get(&id) {
-        Some(job) => (StatusCode::OK, no_store_headers(), Json(json!({ "job": job }))),
+        Some(job) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "job": job })),
+        ),
         None => (
             StatusCode::NOT_FOUND,
             no_store_headers(),
@@ -5781,10 +5791,7 @@ async fn main() {
         )
         .route("/hosts.json", get(hosts_json))
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
-        .route(
-            "/setup/provisioning-jobs/{id}",
-            get(provisioning_job_json),
-        )
+        .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
         // version, declared manifests, and the auth flow.
@@ -7303,11 +7310,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(job.progress.len(), 2);
         assert_eq!(job.progress[0].state, ProvisioningJobState::Planning);
         assert_eq!(job.progress[1].state, ProvisioningJobState::Failed);
-        assert!(
-            job.progress[1]
-                .message
-                .contains("no provider resources were created")
-        );
+        assert!(job.progress[1]
+            .message
+            .contains("no provider resources were created"));
         assert!(store.start("hetzner-cloud", "manual-import", 1).is_err());
 
         let reloaded = ProvisioningJobStore::new(Some(path.clone()));
