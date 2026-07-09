@@ -13,8 +13,10 @@ RUN cargo build --release --locked -p pharosd -p pharos-beacon \
 
 FROM debian:bookworm-slim
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
+# openssh-client: pharosd can run read-only existing-host preflight probes when
+# the runtime has non-interactive SSH access configured.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
 # /data owned by pharos so a named volume mounted here inherits writable

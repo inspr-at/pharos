@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -52,6 +53,7 @@ use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::store::Store;
 
 const SERVER_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+const EXISTING_HOST_SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const ALERT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const ALERT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2140,7 +2142,8 @@ function existingPreflightRequest(overlay){
       route,
       host:route==='none'?undefined:sshHost||undefined
     },
-    facts
+    facts,
+    pharos_url:location.origin
   };
 }
 function preflightStateTitle(state){
@@ -2991,6 +2994,14 @@ async fn existing_host_preflight_report(
     now: i64,
 ) -> ExistingHostPreflightReport {
     let mut checks = Vec::new();
+    let facts = if needs_existing_host_ssh_fact_probe(&request.facts) {
+        merge_preflight_facts(
+            request.facts.clone(),
+            existing_host_ssh_fact_probe(request).await,
+        )
+    } else {
+        request.facts.clone()
+    };
     let ssh_tcp_state = match preflight_ssh_endpoint(request) {
         Some((host, port)) => {
             let started = Instant::now();
@@ -3024,25 +3035,25 @@ async fn existing_host_preflight_report(
     checks.push(preflight_bool_check(
         "ssh-authentication",
         "SSH authentication",
-        request.facts.ssh_authenticated,
+        facts.ssh_authenticated,
         "SSH authentication has been verified.",
         "SSH authentication failed or is not available.",
         "Verify SSH login without sending any password or key material to Pharos.",
     ));
-    checks.push(privilege_check(&request.facts));
-    checks.push(os_family_check(&request.facts));
-    checks.push(nix_capability_check(&request.facts));
-    checks.push(disk_check(&request.facts));
+    checks.push(privilege_check(&facts));
+    checks.push(os_family_check(&facts));
+    checks.push(nix_capability_check(&facts));
+    checks.push(disk_check(&facts));
     checks.push(preflight_bool_check(
         "pharos-reachability",
         "Host can reach Pharos",
-        request.facts.pharos_reachable,
+        facts.pharos_reachable,
         "The host can reach the Pharos report endpoint.",
         "The host cannot reach Pharos yet.",
         "Confirm outbound HTTPS from the host to Pharos before registering a beacon.",
     ));
 
-    let bootstrap_options = bootstrap_options(&request.facts, &checks);
+    let bootstrap_options = bootstrap_options(&facts, &checks);
     let summary = preflight_summary(&checks);
     let next_action = preflight_next_action(&summary, &bootstrap_options).to_string();
     ExistingHostPreflightReport {
@@ -3066,6 +3077,209 @@ fn preflight_ssh_endpoint(request: &ExistingHostPreflightRequest) -> Option<(Str
         .host
         .as_deref()
         .and_then(|host| split_probe_host_port(host, request.ssh.port.unwrap_or(22)))
+}
+
+fn needs_existing_host_ssh_fact_probe(facts: &ExistingHostPreflightFacts) -> bool {
+    facts.ssh_authenticated.is_none()
+        || facts.root.is_none()
+        || facts.sudo.is_none()
+        || facts.os_family.is_none()
+        || facts.nixos.is_none()
+        || facts.nix_available.is_none()
+        || facts.free_disk_gib.is_none()
+        || facts.pharos_reachable.is_none()
+}
+
+async fn existing_host_ssh_fact_probe(
+    request: &ExistingHostPreflightRequest,
+) -> ExistingHostPreflightFacts {
+    let Some((host, port)) = preflight_ssh_endpoint(request) else {
+        return ExistingHostPreflightFacts::default();
+    };
+    let user = request.ssh.user.clone();
+    let pharos_url = request.pharos_url.clone();
+    match timeout(
+        EXISTING_HOST_SSH_PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            run_existing_host_ssh_probe(host, port, user, pharos_url)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(facts)) => facts,
+        _ => ExistingHostPreflightFacts {
+            ssh_authenticated: Some(false),
+            ..ExistingHostPreflightFacts::default()
+        },
+    }
+}
+
+fn run_existing_host_ssh_probe(
+    host: String,
+    port: u16,
+    user: Option<String>,
+    pharos_url: Option<String>,
+) -> ExistingHostPreflightFacts {
+    let target = match user
+        .as_deref()
+        .map(str::trim)
+        .filter(|user| !user.is_empty())
+    {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    };
+    let mut remote = String::new();
+    if let Some(url) = pharos_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        remote.push_str("PHAROS_PREFLIGHT_URL=");
+        remote.push_str(&shell_single_quote(url));
+        remote.push_str("; export PHAROS_PREFLIGHT_URL; ");
+    }
+    remote.push_str("sh -c ");
+    remote.push_str(&shell_single_quote(EXISTING_HOST_SSH_PROBE_SCRIPT));
+
+    let output = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
+        .arg("-o")
+        .arg("ConnectTimeout=4")
+        .arg("-o")
+        .arg("ServerAliveInterval=2")
+        .arg("-o")
+        .arg("ServerAliveCountMax=1")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg(target)
+        .arg(remote)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_existing_host_ssh_probe_stdout(&output.stdout)
+        }
+        Ok(_) => ExistingHostPreflightFacts {
+            ssh_authenticated: Some(false),
+            ..ExistingHostPreflightFacts::default()
+        },
+        Err(_) => ExistingHostPreflightFacts::default(),
+    }
+}
+
+const EXISTING_HOST_SSH_PROBE_SCRIPT: &str = r#"uid=$(id -u 2>/dev/null || printf unknown)
+case "$uid" in
+  0) root=true ;;
+  *) root=false ;;
+esac
+if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  sudo=true
+else
+  sudo=false
+fi
+if [ -r /etc/os-release ]; then
+  os=$(. /etc/os-release >/dev/null 2>&1; printf '%s' "${ID:-linux}")
+else
+  os=$(uname -s 2>/dev/null || printf unknown)
+fi
+if [ -e /etc/NIXOS ]; then nixos=true; else nixos=false; fi
+if command -v nix >/dev/null 2>&1; then nix=true; else nix=false; fi
+disk=$(df -Pk / 2>/dev/null | awk 'NR==2 { printf "%d", $4 / 1048576 }')
+case "$disk" in ''|*[!0-9]*) disk=0 ;; esac
+pharos=unknown
+if [ -n "${PHAROS_PREFLIGHT_URL:-}" ]; then
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 4 "${PHAROS_PREFLIGHT_URL%/}/healthz" >/dev/null 2>&1; then pharos=true; else pharos=false; fi
+  elif command -v wget >/dev/null 2>&1; then
+    if wget -q -T 4 -O /dev/null "${PHAROS_PREFLIGHT_URL%/}/healthz" >/dev/null 2>&1; then pharos=true; else pharos=false; fi
+  fi
+fi
+printf 'ssh_authenticated=true\n'
+printf 'root=%s\n' "$root"
+printf 'sudo=%s\n' "$sudo"
+printf 'os_family=%s\n' "$os"
+printf 'nixos=%s\n' "$nixos"
+printf 'nix_available=%s\n' "$nix"
+printf 'free_disk_gib=%s\n' "$disk"
+printf 'pharos_reachable=%s\n' "$pharos"
+"#;
+
+fn parse_existing_host_ssh_probe_stdout(stdout: &[u8]) -> ExistingHostPreflightFacts {
+    let mut facts = ExistingHostPreflightFacts::default();
+    let text = String::from_utf8_lossy(stdout);
+    for line in text.lines().take(32) {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "ssh_authenticated" => facts.ssh_authenticated = parse_probe_bool(value),
+            "root" => facts.root = parse_probe_bool(value),
+            "sudo" => facts.sudo = parse_probe_bool(value),
+            "os_family" => facts.os_family = sanitize_probe_text(value),
+            "nixos" => facts.nixos = parse_probe_bool(value),
+            "nix_available" => facts.nix_available = parse_probe_bool(value),
+            "free_disk_gib" => facts.free_disk_gib = value.parse::<u32>().ok(),
+            "pharos_reachable" => facts.pharos_reachable = parse_probe_bool(value),
+            _ => {}
+        }
+    }
+    facts
+}
+
+fn parse_probe_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn sanitize_probe_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 80
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.to_ascii_lowercase().contains("token=")
+        || value.to_ascii_lowercase().contains("bearer ")
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn merge_preflight_facts(
+    mut base: ExistingHostPreflightFacts,
+    probe: ExistingHostPreflightFacts,
+) -> ExistingHostPreflightFacts {
+    base.ssh_authenticated = base.ssh_authenticated.or(probe.ssh_authenticated);
+    base.root = base.root.or(probe.root);
+    base.sudo = base.sudo.or(probe.sudo);
+    base.os_family = base.os_family.or(probe.os_family);
+    base.nixos = base.nixos.or(probe.nixos);
+    base.nix_available = base.nix_available.or(probe.nix_available);
+    base.free_disk_gib = base.free_disk_gib.or(probe.free_disk_gib);
+    base.pharos_reachable = base.pharos_reachable.or(probe.pharos_reachable);
+    base
+}
+
+fn shell_single_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn preflight_check(
@@ -7110,6 +7324,62 @@ mod tests {
             .existing_token_policy
             .as_deref()
             .is_some_and(|policy| policy.contains("rotation-sensitive")));
+    }
+
+    #[test]
+    fn existing_host_ssh_probe_output_is_sanitized_facts() {
+        let facts = parse_existing_host_ssh_probe_stdout(
+            b"ssh_authenticated=true\nroot=false\nsudo=true\nos_family=ubuntu\nnixos=false\nnix_available=true\nfree_disk_gib=42\npharos_reachable=true\nignored=value\n",
+        );
+
+        assert_eq!(facts.ssh_authenticated, Some(true));
+        assert_eq!(facts.root, Some(false));
+        assert_eq!(facts.sudo, Some(true));
+        assert_eq!(facts.os_family.as_deref(), Some("ubuntu"));
+        assert_eq!(facts.nixos, Some(false));
+        assert_eq!(facts.nix_available, Some(true));
+        assert_eq!(facts.free_disk_gib, Some(42));
+        assert_eq!(facts.pharos_reachable, Some(true));
+    }
+
+    #[test]
+    fn existing_host_probe_does_not_override_operator_facts() {
+        let base = ExistingHostPreflightFacts {
+            ssh_authenticated: Some(true),
+            root: None,
+            sudo: Some(false),
+            os_family: None,
+            nixos: None,
+            nix_available: None,
+            free_disk_gib: None,
+            pharos_reachable: None,
+        };
+        let probe = ExistingHostPreflightFacts {
+            ssh_authenticated: Some(false),
+            root: Some(false),
+            sudo: Some(true),
+            os_family: Some("linux".to_string()),
+            nixos: Some(false),
+            nix_available: Some(true),
+            free_disk_gib: Some(12),
+            pharos_reachable: Some(true),
+        };
+
+        let merged = merge_preflight_facts(base, probe);
+
+        assert_eq!(merged.ssh_authenticated, Some(true));
+        assert_eq!(merged.sudo, Some(false));
+        assert_eq!(merged.root, Some(false));
+        assert_eq!(merged.os_family.as_deref(), Some("linux"));
+        assert_eq!(merged.free_disk_gib, Some(12));
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(
+            shell_single_quote("https://pharos.example/a'b"),
+            "'https://pharos.example/a'\"'\"'b'"
+        );
     }
 
     #[test]
