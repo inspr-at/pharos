@@ -59,6 +59,7 @@ struct AppState {
     manifests: Arc<ManifestRegistry>,
     auth: AuthState,
     beacon_auth: BeaconAuth,
+    provider_runtime: ProviderRuntimeConfig,
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -107,40 +108,28 @@ impl ProvisioningJobStore {
 
     fn start(
         &self,
-        provider: &str,
-        template: &str,
+        request: &ProvisioningJobStartRequest,
         now: i64,
+        provider_runtime: &ProviderRuntimeConfig,
     ) -> Result<ProvisioningJob, ProvisioningJobStartError> {
-        if !valid_setup_provider(provider) {
+        if !valid_setup_provider(&request.provider) {
             return Err(ProvisioningJobStartError::UnsupportedProvider);
         }
-        if !valid_setup_template(provider, template) {
+        if !valid_setup_template(&request.provider, &request.template) {
             return Err(ProvisioningJobStartError::UnsupportedTemplate);
         }
         let id = format!(
             "setup-{now}-{}",
             self.counter.fetch_add(1, Ordering::Relaxed)
         );
-        let progress = vec![
-            ProvisioningProgressEntry {
-                state: ProvisioningJobState::Planning,
-                message: "Plan accepted; tracked job created.".to_string(),
-                observed_at: now,
-            },
-            ProvisioningProgressEntry {
-                state: ProvisioningJobState::Failed,
-                message: "Provider backend is not configured; no provider resources were created."
-                    .to_string(),
-                observed_at: now,
-            },
-        ];
+        let (state, progress) = provisioning_job_progress(request, provider_runtime, now);
         let job = ProvisioningJob {
             schema: PROVISIONING_JOB_SCHEMA.to_string(),
             version: PROVISIONING_JOB_VERSION,
             id,
-            provider: provider.to_string(),
-            template: template.to_string(),
-            state: ProvisioningJobState::Failed,
+            provider: request.provider.to_string(),
+            template: request.template.to_string(),
+            state,
             created_at: now,
             updated_at: now,
             progress,
@@ -185,6 +174,153 @@ impl ProvisioningJobStore {
             );
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProvisioningJobStartRequest {
+    provider: String,
+    template: String,
+    #[serde(default)]
+    apply: bool,
+    #[serde(default)]
+    host_name: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    server_type: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    ssh_key_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProviderRuntimeConfig {
+    hetzner_cloud: HetznerCloudRuntimeConfig,
+}
+
+impl ProviderRuntimeConfig {
+    fn from_env() -> Self {
+        Self {
+            hetzner_cloud: HetznerCloudRuntimeConfig::from_env(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HetznerCloudRuntimeConfig {
+    credential_source: Option<ProviderCredentialSource>,
+    execute_enabled: bool,
+}
+
+impl HetznerCloudRuntimeConfig {
+    fn from_env() -> Self {
+        let credential_source = env_nonempty("PHAROS_HCLOUD_API_TOKEN_FILE")
+            .map(|_| ProviderCredentialSource::File)
+            .or_else(|| {
+                env_nonempty("PHAROS_HCLOUD_API_TOKEN")
+                    .map(|_| ProviderCredentialSource::Environment)
+            });
+        let execute_enabled = env_nonempty("PHAROS_HCLOUD_EXECUTE")
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(false);
+        Self {
+            credential_source,
+            execute_enabled,
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        self.credential_source.is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProviderCredentialSource {
+    Environment,
+    File,
+}
+
+fn provisioning_job_progress(
+    request: &ProvisioningJobStartRequest,
+    provider_runtime: &ProviderRuntimeConfig,
+    now: i64,
+) -> (ProvisioningJobState, Vec<ProvisioningProgressEntry>) {
+    let mut progress = vec![ProvisioningProgressEntry {
+        state: ProvisioningJobState::Planning,
+        message: "Plan accepted; tracked job created.".to_string(),
+        observed_at: now,
+    }];
+
+    match request.provider.as_str() {
+        "hetzner-cloud" => {
+            let hetzner = &provider_runtime.hetzner_cloud;
+            if !hetzner.is_configured() {
+                progress.push(ProvisioningProgressEntry {
+                    state: ProvisioningJobState::Failed,
+                    message: "Hetzner Cloud executor is not configured; no provider resources were created.".to_string(),
+                    observed_at: now,
+                });
+                return (ProvisioningJobState::Failed, progress);
+            }
+            if !request.apply {
+                progress.push(ProvisioningProgressEntry {
+                    state: ProvisioningJobState::Failed,
+                    message: "Hetzner Cloud executor requires explicit apply confirmation; no provider resources were created.".to_string(),
+                    observed_at: now,
+                });
+                return (ProvisioningJobState::Failed, progress);
+            }
+            if !hetzner.execute_enabled {
+                progress.push(ProvisioningProgressEntry {
+                    state: ProvisioningJobState::Failed,
+                    message: "Hetzner Cloud executor is configured but live execution is disabled; no provider resources were created.".to_string(),
+                    observed_at: now,
+                });
+                return (ProvisioningJobState::Failed, progress);
+            }
+            if missing_hetzner_create_inputs(request) {
+                progress.push(ProvisioningProgressEntry {
+                    state: ProvisioningJobState::Failed,
+                    message: "Hetzner Cloud executor needs host, location, server type, image, and SSH key reference before create/apply; no provider resources were created.".to_string(),
+                    observed_at: now,
+                });
+                return (ProvisioningJobState::Failed, progress);
+            }
+            progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::Provisioning,
+                message: "Hetzner Cloud create/apply is gated for the next executor slice; no provider resources were created.".to_string(),
+                observed_at: now,
+            });
+            progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::Failed,
+                message: "Provider apply is not active in this build; retry after PHAROS-97 executor apply is enabled.".to_string(),
+                observed_at: now,
+            });
+            (ProvisioningJobState::Failed, progress)
+        }
+        "manual-import" => {
+            progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::Failed,
+                message: "Manual import is routed to the existing-host flow; no provider resources were created.".to_string(),
+                observed_at: now,
+            });
+            (ProvisioningJobState::Failed, progress)
+        }
+        _ => (ProvisioningJobState::Failed, progress),
+    }
+}
+
+fn missing_hetzner_create_inputs(request: &ProvisioningJobStartRequest) -> bool {
+    [
+        request.host_name.as_deref(),
+        request.location.as_deref(),
+        request.server_type.as_deref(),
+        request.image.as_deref(),
+        request.ssh_key_ref.as_deref(),
+    ]
+    .iter()
+    .any(|value| value.is_none_or(|value| value.trim().is_empty()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2495,12 +2631,6 @@ async fn version() -> Json<serde_json::Value> {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProvisioningJobStartRequest {
-    provider: String,
-    template: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct SetupProviderPlanQuery {
     provider: String,
     template: String,
@@ -2529,7 +2659,7 @@ async fn create_provisioning_job(
 ) -> impl IntoResponse {
     match state
         .provisioning_jobs
-        .start(&request.provider, &request.template, now_unix())
+        .start(&request, now_unix(), &state.provider_runtime)
     {
         Ok(job) => (
             StatusCode::CREATED,
@@ -6090,6 +6220,7 @@ async fn main() {
     let manifests = Arc::new(ManifestRegistry::from_env());
     let auth = Auth::from_env().await;
     let beacon_auth = BeaconAuth::from_env();
+    let provider_runtime = ProviderRuntimeConfig::from_env();
     let alert_notifier = AlertNotifier::from_env();
     let state = AppState {
         store,
@@ -6097,6 +6228,7 @@ async fn main() {
         manifests,
         auth,
         beacon_auth,
+        provider_runtime,
     };
     spawn_alert_loop(state.clone(), alert_notifier);
 
@@ -7629,9 +7761,20 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             nanos
         ));
         let store = ProvisioningJobStore::new(Some(path.clone()));
+        let request = ProvisioningJobStartRequest {
+            provider: "hetzner-cloud".to_string(),
+            template: "hetzner-small-nixos".to_string(),
+            apply: false,
+            host_name: None,
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let runtime = ProviderRuntimeConfig::default();
 
         let job = store
-            .start("hetzner-cloud", "hetzner-small-nixos", 1_700_000_000)
+            .start(&request, 1_700_000_000, &runtime)
             .expect("supported plan starts a tracked job");
 
         assert_eq!(job.state, ProvisioningJobState::Failed);
@@ -7641,7 +7784,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(job.progress[1]
             .message
             .contains("no provider resources were created"));
-        assert!(store.start("hetzner-cloud", "manual-import", 1).is_err());
+        let unsupported = ProvisioningJobStartRequest {
+            template: "manual-import".to_string(),
+            ..request.clone()
+        };
+        assert!(store.start(&unsupported, 1, &runtime).is_err());
 
         let reloaded = ProvisioningJobStore::new(Some(path.clone()));
         let persisted = reloaded.get(&job.id).expect("job persisted");
@@ -7652,6 +7799,73 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!contents.to_ascii_lowercase().contains("token="));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hetzner_executor_gate_persists_precise_safe_failures() {
+        let store = ProvisioningJobStore::new(None);
+        let mut request = ProvisioningJobStartRequest {
+            provider: "hetzner-cloud".to_string(),
+            template: "hetzner-small-nixos".to_string(),
+            apply: false,
+            host_name: None,
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let runtime = ProviderRuntimeConfig {
+            hetzner_cloud: HetznerCloudRuntimeConfig {
+                credential_source: Some(ProviderCredentialSource::File),
+                execute_enabled: false,
+            },
+        };
+
+        let job = store
+            .start(&request, 1_700_000_001, &runtime)
+            .expect("configured backend still creates recoverable job");
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert!(job.progress[1]
+            .message
+            .contains("explicit apply confirmation"));
+
+        request.apply = true;
+        let disabled = store
+            .start(&request, 1_700_000_002, &runtime)
+            .expect("disabled execution records safe failure");
+        assert!(disabled.progress[1]
+            .message
+            .contains("live execution is disabled"));
+
+        let enabled = ProviderRuntimeConfig {
+            hetzner_cloud: HetznerCloudRuntimeConfig {
+                credential_source: Some(ProviderCredentialSource::Environment),
+                execute_enabled: true,
+            },
+        };
+        let missing_inputs = store
+            .start(&request, 1_700_000_003, &enabled)
+            .expect("missing inputs record safe failure");
+        assert!(missing_inputs.progress[1]
+            .message
+            .contains("needs host, location, server type, image, and SSH key reference"));
+
+        request.host_name = Some("hcloud-lab-1".to_string());
+        request.location = Some("fsn1".to_string());
+        request.server_type = Some("cx22".to_string());
+        request.image = Some("debian-12".to_string());
+        request.ssh_key_ref = Some("janus:pharos/ssh/hcloud-lab-1".to_string());
+        let gated = store
+            .start(&request, 1_700_000_004, &enabled)
+            .expect("fully shaped request reaches provider gate");
+        assert_eq!(gated.state, ProvisioningJobState::Failed);
+        assert_eq!(gated.progress[1].state, ProvisioningJobState::Provisioning);
+        assert!(gated.progress[1]
+            .message
+            .contains("no provider resources were created"));
+        let json = serde_json::to_string(&gated).expect("job serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
     }
 
     #[test]
@@ -7725,6 +7939,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             manifests: Arc::new(ManifestRegistry::default()),
             auth: None,
             beacon_auth,
+            provider_runtime: ProviderRuntimeConfig::default(),
         }
     }
 
