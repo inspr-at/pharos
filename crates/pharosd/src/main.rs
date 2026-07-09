@@ -18,10 +18,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{FromRef, State};
+use axum::extract::{FromRef, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse};
@@ -31,7 +32,9 @@ use pharos_core::{
     liveness, Host, HostLocation, HostLocationSource, HostManifest, HostRegistration,
     HostRegistrationResponse, HostReport, Liveness, ManifestLocationMode, ManifestProbePolicy,
     ManifestService, ManifestStatusSource, NixFreshness, ServiceObservation,
-    ServiceObservationState, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    ServiceObservationState, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
+    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION, HOST_MANIFEST_SCHEMA,
+    HOST_MANIFEST_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -53,6 +56,7 @@ const ALERT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
+    provisioning_jobs: Arc<ProvisioningJobStore>,
     manifests: Arc<ManifestRegistry>,
     auth: AuthState,
     beacon_auth: BeaconAuth,
@@ -74,6 +78,161 @@ impl FromRef<AppState> for Arc<ManifestRegistry> {
     fn from_ref(s: &AppState) -> Self {
         s.manifests.clone()
     }
+}
+
+struct ProvisioningJobStore {
+    path: Option<PathBuf>,
+    jobs: RwLock<BTreeMap<String, ProvisioningJob>>,
+    counter: AtomicU64,
+}
+
+impl ProvisioningJobStore {
+    fn new(path: Option<PathBuf>) -> Self {
+        let jobs = path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| serde_json::from_slice::<Vec<ProvisioningJob>>(&bytes).ok())
+            .map(|jobs| {
+                jobs.into_iter()
+                    .filter(|job| job.validate_contract().is_ok())
+                    .map(|job| (job.id.clone(), job))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            path,
+            jobs: RwLock::new(jobs),
+            counter: AtomicU64::new(1),
+        }
+    }
+
+    fn start(
+        &self,
+        provider: &str,
+        template: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningJobStartError> {
+        if !valid_setup_provider(provider) {
+            return Err(ProvisioningJobStartError::UnsupportedProvider);
+        }
+        if !valid_setup_template(provider, template) {
+            return Err(ProvisioningJobStartError::UnsupportedTemplate);
+        }
+        let id = format!(
+            "setup-{now}-{}",
+            self.counter.fetch_add(1, Ordering::Relaxed)
+        );
+        let progress = vec![
+            ProvisioningProgressEntry {
+                state: ProvisioningJobState::Planning,
+                message: "Plan accepted; tracked job created.".to_string(),
+                observed_at: now,
+            },
+            ProvisioningProgressEntry {
+                state: ProvisioningJobState::Failed,
+                message: "Provider backend is not configured; no provider resources were created."
+                    .to_string(),
+                observed_at: now,
+            },
+        ];
+        let job = ProvisioningJob {
+            schema: PROVISIONING_JOB_SCHEMA.to_string(),
+            version: PROVISIONING_JOB_VERSION,
+            id,
+            provider: provider.to_string(),
+            template: template.to_string(),
+            state: ProvisioningJobState::Failed,
+            created_at: now,
+            updated_at: now,
+            progress,
+        };
+        job.validate_contract()
+            .map_err(|_| ProvisioningJobStartError::InvalidJob)?;
+        {
+            let mut jobs = self.jobs.write().expect("provisioning job store lock");
+            jobs.insert(job.id.clone(), job.clone());
+        }
+        self.persist();
+        Ok(job)
+    }
+
+    fn get(&self, id: &str) -> Option<ProvisioningJob> {
+        self.jobs
+            .read()
+            .expect("provisioning job store lock")
+            .get(id)
+            .cloned()
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.path else { return };
+        let snapshot: Vec<ProvisioningJob> = self
+            .jobs
+            .read()
+            .expect("provisioning job store lock")
+            .values()
+            .cloned()
+            .collect();
+        let Ok(json) = serde_json::to_vec_pretty(&snapshot) else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(path, json) {
+            tracing::warn!("failed to persist provisioning jobs to {}: {e}", path.display());
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProvisioningJobStartError {
+    UnsupportedProvider,
+    UnsupportedTemplate,
+    InvalidJob,
+}
+
+impl std::fmt::Display for ProvisioningJobStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedProvider => write!(f, "unsupported setup provider"),
+            Self::UnsupportedTemplate => write!(f, "unsupported setup template"),
+            Self::InvalidJob => write!(f, "provisioning job contract failed validation"),
+        }
+    }
+}
+
+fn valid_setup_provider(provider: &str) -> bool {
+    matches!(provider, "hetzner-cloud" | "manual-import")
+}
+
+fn valid_setup_template(provider: &str, template: &str) -> bool {
+    matches!(
+        (provider, template),
+        ("hetzner-cloud", "hetzner-small-nixos")
+            | ("hetzner-cloud", "hetzner-lab")
+            | ("hetzner-cloud", "bring-own-plan")
+            | ("manual-import", "manual-import")
+    )
+}
+
+fn provisioning_jobs_path(host_store_path: Option<&Path>) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PHAROS_PROVISIONING_JOBS_DB") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    host_store_path.map(derived_provisioning_jobs_path)
+}
+
+fn derived_provisioning_jobs_path(host_store_path: &Path) -> PathBuf {
+    let file_name = host_store_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("pharos.json");
+    host_store_path.with_file_name(format!("{file_name}.provisioning-jobs.json"))
 }
 
 #[derive(Clone)]
@@ -754,6 +913,8 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-close{appearance:none;display:grid;place-items:center;min-width:34px;height:34px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-close:hover,.assistant-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}
 .assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
 .assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
+.assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
+.assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
 .assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
 body[data-assistant-open="true"]{overflow:hidden}
@@ -1307,6 +1468,7 @@ const ASSISTANT_SETUP_PARAM='setup';
 const ASSISTANT_PATH_PARAM='setup_path';
 const ASSISTANT_PROVIDER_PARAM='setup_provider';
 const ASSISTANT_TEMPLATE_PARAM='setup_template';
+const ASSISTANT_STAGE_PARAM='setup_stage';
 const ASSISTANT_TEMPLATE_PROVIDERS={
   'hetzner-small-nixos':'hetzner-cloud',
   'hetzner-lab':'hetzner-cloud',
@@ -1322,14 +1484,18 @@ function assistantProvider(provider){
 function assistantTemplate(template){
   return Object.prototype.hasOwnProperty.call(ASSISTANT_TEMPLATE_PROVIDERS,template)?template:'';
 }
+function assistantStage(stage){
+  return stage==='plan'?'plan':'';
+}
 function assistantState(overlay){
   return {
     path: assistantPath(overlay?.dataset.assistantSelectedPath||''),
     provider: assistantProvider(overlay?.dataset.assistantSelectedProvider||''),
-    template: assistantTemplate(overlay?.dataset.assistantSelectedTemplate||'')
+    template: assistantTemplate(overlay?.dataset.assistantSelectedTemplate||''),
+    stage: assistantStage(overlay?.dataset.assistantStage||'')
   };
 }
-function writeAssistantUrl(open,path='',provider='',template=''){
+function writeAssistantUrl(open,path='',provider='',template='',stage=''){
   const params=new URLSearchParams(location.search);
   if(open){
     params.set(ASSISTANT_SETUP_PARAM,'add-server');
@@ -1342,17 +1508,21 @@ function writeAssistantUrl(open,path='',provider='',template=''){
     else params.delete(ASSISTANT_PROVIDER_PARAM);
     if(safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===safeProvider)params.set(ASSISTANT_TEMPLATE_PARAM,safeTemplate);
     else params.delete(ASSISTANT_TEMPLATE_PARAM);
+    const safeStage=safeTemplate?assistantStage(stage):'';
+    if(safeStage)params.set(ASSISTANT_STAGE_PARAM,safeStage);
+    else params.delete(ASSISTANT_STAGE_PARAM);
   }else{
     params.delete(ASSISTANT_SETUP_PARAM);
     params.delete(ASSISTANT_PATH_PARAM);
     params.delete(ASSISTANT_PROVIDER_PARAM);
     params.delete(ASSISTANT_TEMPLATE_PARAM);
+    params.delete(ASSISTANT_STAGE_PARAM);
   }
   const query=params.toString();
   history.replaceState(null,'',location.pathname+(query?'?'+query:''));
 }
 function syncAssistantNext(overlay){
-  const {path,provider,template}=assistantState(overlay);
+  const {path,provider,template,stage}=assistantState(overlay);
   const title=overlay.querySelector('[data-assistant-next-title]');
   const copy=overlay.querySelector('[data-assistant-next-copy]');
   const button=overlay.querySelector('[data-assistant-continue]');
@@ -1361,7 +1531,10 @@ function syncAssistantNext(overlay){
     button.textContent='Continue';
   }
   if(path==='new'){
-    if(template){
+    if(template&&stage==='plan'){
+      if(title)title.textContent='Review plan';
+      if(copy)copy.textContent='Confirm only after the plan looks right. No resources or tokens are created by viewing this plan.';
+    }else if(template){
       const selected=[...overlay.querySelectorAll('[data-assistant-template]')].find(btn=>btn.dataset.assistantTemplate===template);
       if(title)title.textContent='Template selected';
       if(copy)copy.textContent=selected?.dataset.assistantNext||'Next: review the provisioning plan before anything is created.';
@@ -1381,6 +1554,78 @@ function syncAssistantNext(overlay){
     if(copy)copy.textContent='Choose a path to preview the next step. No changes have been started.';
   }
 }
+function provisioningJobTerminal(state){
+  return ['complete','failed','cleanup-needed'].includes(state||'');
+}
+function provisioningJobLabel(state){
+  return String(state||'pending').replace(/-/g,' ');
+}
+function latestProvisioningMessage(job){
+  const progress=Array.isArray(job?.progress)?job.progress:[];
+  const latest=progress[progress.length-1];
+  return latest?.message||'Tracked setup job is waiting for progress.';
+}
+function renderProvisioningJob(overlay,job){
+  if(!overlay||!job)return;
+  overlay.dataset.assistantJobId=job.id||'';
+  const title=overlay.querySelector('[data-assistant-next-title]');
+  const copy=overlay.querySelector('[data-assistant-next-copy]');
+  const jobBox=overlay.querySelector('[data-assistant-job]');
+  const jobTitle=overlay.querySelector('[data-assistant-job-title]');
+  const jobMessage=overlay.querySelector('[data-assistant-job-message]');
+  const label=provisioningJobLabel(job.state);
+  const message=latestProvisioningMessage(job);
+  if(title)title.textContent=job.state==='failed'?'Setup did not start':`Setup ${label}`;
+  if(copy)copy.textContent=message;
+  if(jobBox){
+    jobBox.hidden=false;
+    jobBox.scrollIntoView({block:'nearest'});
+  }
+  if(jobTitle)jobTitle.textContent=`Tracked job: ${label}`;
+  if(jobMessage)jobMessage.textContent=message;
+  overlay.querySelectorAll('[data-progress-state]').forEach(step=>{
+    step.dataset.active=String(step.dataset.progressState===job.state);
+  });
+}
+async function fetchProvisioningJob(id){
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(id)}`,{
+    headers:{'accept':'application/json'},
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'setup job could not be loaded');
+  return payload.job;
+}
+function scheduleProvisioningPoll(overlay,id){
+  if(!id)return;
+  window.clearTimeout(window.pharosAssistantJobTimer);
+  window.pharosAssistantJobTimer=window.setTimeout(async()=>{
+    try{
+      const job=await fetchProvisioningJob(id);
+      renderProvisioningJob(overlay,job);
+      if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,id);
+    }catch(error){
+      const copy=overlay.querySelector('[data-assistant-next-copy]');
+      if(copy)copy.textContent=error.message||'setup job could not be refreshed';
+    }
+  },1500);
+}
+async function startProvisioningJob(overlay,start){
+  const state=assistantState(overlay);
+  start.textContent='Starting setup';
+  start.disabled=true;
+  const response=await fetch('/setup/provisioning-jobs',{
+    method:'POST',
+    headers:{'content-type':'application/json','accept':'application/json'},
+    body:JSON.stringify({provider:state.provider,template:state.template}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'setup job could not be started');
+  renderProvisioningJob(overlay,payload.job);
+  start.textContent='Setup job recorded';
+  if(payload.job?.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
+}
 function setAssistantTemplate(template,write=true){
   const overlay=document.querySelector('[data-setup-assistant]');
   if(!overlay)return;
@@ -1388,6 +1633,7 @@ function setAssistantTemplate(template,write=true){
   const safeTemplate=assistantTemplate(template);
   const nextTemplate=safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===provider?safeTemplate:'';
   overlay.dataset.assistantSelectedTemplate=nextTemplate;
+  if(!nextTemplate)overlay.dataset.assistantStage='';
   overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
     const visible=!btn.hidden&&btn.dataset.assistantTemplateProvider===provider;
     btn.setAttribute('aria-pressed',String(visible&&btn.dataset.assistantTemplate===nextTemplate));
@@ -1395,7 +1641,7 @@ function setAssistantTemplate(template,write=true){
   syncAssistantNext(overlay);
   if(write){
     const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
   }
 }
 function setAssistantProvider(provider,write=true){
@@ -1417,7 +1663,7 @@ function setAssistantProvider(provider,write=true){
   syncAssistantNext(overlay);
   if(write){
     const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
   }
 }
 function setAssistantPath(path,write=true){
@@ -1440,7 +1686,7 @@ function setAssistantPath(path,write=true){
   syncAssistantNext(overlay);
   if(write){
     const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
   }
 }
 function setAssistantOpen(open,write=true){
@@ -1451,7 +1697,7 @@ function setAssistantOpen(open,write=true){
   if(!open)setAssistantPath('',false);
   if(write){
     const state=assistantState(overlay);
-    writeAssistantUrl(open,state.path,state.provider,state.template);
+    writeAssistantUrl(open,state.path,state.provider,state.template,state.stage);
   }
   if(open)overlay.querySelector('[data-assistant-close]')?.focus();
 }
@@ -1470,6 +1716,8 @@ function restoreAssistantFromUrl(){
   if(path==='new'){
     setAssistantProvider(assistantProvider(params.get(ASSISTANT_PROVIDER_PARAM))||'hetzner-cloud',false);
     setAssistantTemplate(params.get(ASSISTANT_TEMPLATE_PARAM),false);
+    overlay.dataset.assistantStage=assistantStage(params.get(ASSISTANT_STAGE_PARAM));
+    syncAssistantNext(overlay);
   }
 }
 function initSetupAssistant(){
@@ -1482,12 +1730,30 @@ function initSetupAssistant(){
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>setAssistantPath(btn.dataset.assistantPath)));
   overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>btn.addEventListener('click',()=>setAssistantProvider(btn.dataset.assistantProvider)));
   overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>btn.addEventListener('click',()=>setAssistantTemplate(btn.dataset.assistantTemplate)));
-  overlay.querySelector('[data-assistant-continue]')?.addEventListener('click',event=>{
+  overlay.querySelector('[data-assistant-confirm]')?.addEventListener('change',event=>{
+    const start=overlay.querySelector('[data-assistant-start]');
+    if(start)start.disabled=!event.currentTarget.checked;
+  });
+  overlay.querySelector('[data-assistant-start]')?.addEventListener('click',async event=>{
     if(event.currentTarget.disabled)return;
+    const start=event.currentTarget;
     const title=overlay.querySelector('[data-assistant-next-title]');
     const copy=overlay.querySelector('[data-assistant-next-copy]');
-    if(title)title.textContent='Ready for plan';
-    if(copy)copy.textContent='Next: review the provisioning plan before creating provider resources, tokens, or host records.';
+    try{
+      await startProvisioningJob(overlay,start);
+    }catch(error){
+      start.textContent='Start setup';
+      start.disabled=false;
+      if(title)title.textContent='Setup could not start';
+      if(copy)copy.textContent=error.message||'The setup job could not be created.';
+    }
+  });
+  overlay.querySelector('[data-assistant-continue]')?.addEventListener('click',event=>{
+    if(event.currentTarget.disabled)return;
+    overlay.dataset.assistantStage='plan';
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
+    syncAssistantNext(overlay);
   });
   window.addEventListener('popstate',restoreAssistantFromUrl);
   restoreAssistantFromUrl();
@@ -1920,6 +2186,43 @@ async fn healthz() -> &'static str {
 
 async fn version() -> Json<serde_json::Value> {
     Json(json!({ "name": "pharosd", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisioningJobStartRequest {
+    provider: String,
+    template: String,
+}
+
+async fn create_provisioning_job(
+    State(state): State<AppState>,
+    Json(request): Json<ProvisioningJobStartRequest>,
+) -> impl IntoResponse {
+    match state
+        .provisioning_jobs
+        .start(&request.provider, &request.template, now_unix())
+    {
+        Ok(job) => (StatusCode::CREATED, no_store_headers(), Json(json!({ "job": job }))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+async fn provisioning_job_json(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.provisioning_jobs.get(&id) {
+        Some(job) => (StatusCode::OK, no_store_headers(), Json(json!({ "job": job }))),
+        None => (
+            StatusCode::NOT_FOUND,
+            no_store_headers(),
+            Json(json!({ "error": "provisioning job not found" })),
+        ),
+    }
 }
 
 /// Beacon ingestion (PHAROS-9): upsert the host, stamping server receive time.
@@ -2962,7 +3265,7 @@ fn onboard_row() -> String {
 
 fn setup_assistant() -> String {
     format!(
-        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-provider-step" data-assistant-provider-step><div class="assistant-step-head"><strong>New server</strong><span>Choose where this server starts.</span></div><div class="assistant-providers"><button class="assistant-provider" type="button" data-assistant-provider="hetzner-cloud" aria-pressed="false"><span class="assistant-provider-title"><strong>Hetzner Cloud</strong><span class="assistant-badge">Recommended</span></span><p>Best supported path for a fresh Pharos-managed server.</p><span class="assistant-facts"><span><b>Credentials needed</b>API token later</span><span><b>Cost</b>Paid cloud</span><span><b>Bootstrap</b>NixOS ready</span></span></button><button class="assistant-provider" type="button" data-assistant-provider="manual-import" aria-pressed="false"><span class="assistant-provider-title"><strong>Manual / existing provider</strong></span><p>Use this for Netcup or any provider that is not safely automated yet.</p><span class="assistant-facts"><span><b>Credentials needed</b>SSH later</span><span><b>Cost</b>Your provider</span><span><b>Bootstrap</b>Import path</span></span></button></div><div class="assistant-step-head"><strong>Template</strong><span>No provider resources are created here.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" data-assistant-next="Next: review a Hetzner Cloud plan for a small NixOS server. No resources have been created." aria-pressed="false"><span><strong>Small NixOS server</strong><span>Low monthly cost, automatic NixOS bootstrap, good first production default.</span></span><em>low cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" data-assistant-next="Next: review a lab-style plan and confirm current pricing before creating anything." aria-pressed="false"><span><strong>Lab / free-tier style</strong><span>Smallest practical shape. Pricing and availability must be checked at plan time.</span></span><em>check cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" data-assistant-next="Next: choose exact provider size, region, and image before creating anything." aria-pressed="false"><span><strong>Bring your own plan</strong><span>Use when you already know the size, region, and bootstrap profile you want.</span></span><em>custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Netcup is not treated as fully automated yet." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For Netcup and other providers, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button></div></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" data-assistant-continue disabled>Continue</button></div></div></div></section>"#,
+        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-provider-step" data-assistant-provider-step><div class="assistant-step-head"><strong>New server</strong><span>Choose where this server starts.</span></div><div class="assistant-providers"><button class="assistant-provider" type="button" data-assistant-provider="hetzner-cloud" aria-pressed="false"><span class="assistant-provider-title"><strong>Hetzner Cloud</strong><span class="assistant-badge">Recommended</span></span><p>Best supported path for a fresh Pharos-managed server.</p><span class="assistant-facts"><span><b>Credentials needed</b>API token later</span><span><b>Cost</b>Paid cloud</span><span><b>Bootstrap</b>NixOS ready</span></span></button><button class="assistant-provider" type="button" data-assistant-provider="manual-import" aria-pressed="false"><span class="assistant-provider-title"><strong>Manual / existing provider</strong></span><p>Use this for Netcup or any provider that is not safely automated yet.</p><span class="assistant-facts"><span><b>Credentials needed</b>SSH later</span><span><b>Cost</b>Your provider</span><span><b>Bootstrap</b>Import path</span></span></button></div><div class="assistant-step-head"><strong>Template</strong><span>No provider resources are created here.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" data-assistant-next="Next: review a Hetzner Cloud plan for a small NixOS server. No resources have been created." aria-pressed="false"><span><strong>Small NixOS server</strong><span>Low monthly cost, automatic NixOS bootstrap, good first production default.</span></span><em>low cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" data-assistant-next="Next: review a lab-style plan and confirm current pricing before creating anything." aria-pressed="false"><span><strong>Lab / free-tier style</strong><span>Smallest practical shape. Pricing and availability must be checked at plan time.</span></span><em>check cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" data-assistant-next="Next: choose exact provider size, region, and image before creating anything." aria-pressed="false"><span><strong>Bring your own plan</strong><span>Use when you already know the size, region, and bootstrap profile you want.</span></span><em>custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Netcup is not treated as fully automated yet." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For Netcup and other providers, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button></div></div><div class="assistant-plan" data-assistant-plan><div class="assistant-plan-head"><strong>Review plan</strong><span>Nothing is created until you start setup.</span></div><div class="assistant-plan-list"><div class="assistant-plan-row"><span><strong>Provider resources</strong><span>Prepare server, SSH key, firewall, and selected region.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>SSH and bootstrap</strong><span>Prepare NixOS bootstrap path without exposing private key material.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>Beacon registration</strong><span>Create only a safe handoff; raw tokens are never shown.</span></span><em class="assistant-plan-chip" data-kind="protected">protected</em></div><div class="assistant-plan-row"><span><strong>First heartbeat</strong><span>Wait until the new host reports before marking it live.</span></span><em class="assistant-plan-chip">waiting</em></div><div class="assistant-plan-row"><span><strong>Backup and location</strong><span>Hand off backup enrollment and site/location setup after first contact.</span></span><em class="assistant-plan-chip" data-kind="later">later</em></div></div><label class="assistant-confirm"><input type="checkbox" data-assistant-confirm><span>I understand this may create provider resources.</span><button class="assistant-start" type="button" data-assistant-start disabled>Start setup</button></label><div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states"><span data-progress-state="planning">planning</span><span data-progress-state="provisioning">provisioning</span><span data-progress-state="bootstrapping">bootstrapping</span><span data-progress-state="waiting-for-heartbeat">waiting for heartbeat</span><span data-progress-state="backup-pending">backup pending</span><span data-progress-state="complete" data-risk="ok">complete</span><span data-progress-state="failed" data-risk="fail">failed</span><span data-progress-state="cleanup-needed" data-risk="fail">cleanup needed</span></div></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" data-assistant-continue disabled>Continue</button></div></div></div></section>"#,
         plus = icons::PLUS,
         server = icons::SERVER
     )
@@ -5443,15 +5746,17 @@ async fn main() {
         )
         .init();
 
-    let store = Arc::new(Store::new(
-        std::env::var("PHAROS_DB").ok().map(PathBuf::from),
-    ));
+    let host_store_path = std::env::var("PHAROS_DB").ok().map(PathBuf::from);
+    let provisioning_job_store_path = provisioning_jobs_path(host_store_path.as_deref());
+    let store = Arc::new(Store::new(host_store_path));
+    let provisioning_jobs = Arc::new(ProvisioningJobStore::new(provisioning_job_store_path));
     let manifests = Arc::new(ManifestRegistry::from_env());
     let auth = Auth::from_env().await;
     let beacon_auth = BeaconAuth::from_env();
     let alert_notifier = AlertNotifier::from_env();
     let state = AppState {
         store,
+        provisioning_jobs,
         manifests,
         auth,
         beacon_auth,
@@ -5475,6 +5780,11 @@ async fn main() {
             get(agora::location_proposal),
         )
         .route("/hosts.json", get(hosts_json))
+        .route("/setup/provisioning-jobs", post(create_provisioning_job))
+        .route(
+            "/setup/provisioning-jobs/{id}",
+            get(provisioning_job_json),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
         // version, declared manifests, and the auth flow.
@@ -6682,6 +6992,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("setup_path"));
         assert!(empty.contains("setup_provider"));
         assert!(empty.contains("setup_template"));
+        assert!(empty.contains("setup_stage"));
         assert!(empty.contains("Hetzner Cloud"));
         assert!(empty.contains("Manual / existing provider"));
         assert!(empty.contains("Small NixOS server"));
@@ -6690,6 +7001,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Netcup"));
         assert!(empty.contains("data-assistant-template=\"hetzner-small-nixos\""));
         assert!(empty.contains("No provider resources are created here."));
+        assert!(empty.contains("Review plan"));
+        assert!(empty.contains("Provider resources"));
+        assert!(empty.contains("SSH and bootstrap"));
+        assert!(empty.contains("Beacon registration"));
+        assert!(empty.contains("First heartbeat"));
+        assert!(empty.contains("Backup and location"));
+        assert!(empty.contains("I understand this may create provider resources."));
+        assert!(empty.contains("data-assistant-job"));
+        assert!(empty.contains("data-progress-state=\"failed\""));
+        assert!(empty.contains("cleanup needed"));
         assert!(empty.contains(r#"data-assistant-next-title"#));
         assert!(empty.contains(r#"aria-pressed="false""#));
         assert!(empty.contains("awaiting first heartbeat"));
@@ -6961,6 +7282,45 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
     }
 
+    #[test]
+    fn provisioning_job_store_persists_safe_backend_failure() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pharos-provisioning-jobs-{}-{}.json",
+            std::process::id(),
+            nanos
+        ));
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+
+        let job = store
+            .start("hetzner-cloud", "hetzner-small-nixos", 1_700_000_000)
+            .expect("supported plan starts a tracked job");
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert_eq!(job.progress.len(), 2);
+        assert_eq!(job.progress[0].state, ProvisioningJobState::Planning);
+        assert_eq!(job.progress[1].state, ProvisioningJobState::Failed);
+        assert!(
+            job.progress[1]
+                .message
+                .contains("no provider resources were created")
+        );
+        assert!(store.start("hetzner-cloud", "manual-import", 1).is_err());
+
+        let reloaded = ProvisioningJobStore::new(Some(path.clone()));
+        let persisted = reloaded.get(&job.id).expect("job persisted");
+        assert_eq!(persisted, job);
+        let contents = std::fs::read_to_string(&path).expect("persisted json is readable");
+        assert!(contents.contains(PROVISIONING_JOB_SCHEMA));
+        assert!(!contents.to_ascii_lowercase().contains("bearer "));
+        assert!(!contents.to_ascii_lowercase().contains("token="));
+
+        let _ = std::fs::remove_file(path);
+    }
+
     fn report_test_state(require_report_token: bool) -> AppState {
         report_test_state_with_auth(BeaconAuth {
             registration_token: None,
@@ -6974,6 +7334,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     fn report_test_state_with_auth(beacon_auth: BeaconAuth) -> AppState {
         AppState {
             store: Arc::new(Store::new(None)),
+            provisioning_jobs: Arc::new(ProvisioningJobStore::new(None)),
             manifests: Arc::new(ManifestRegistry::default()),
             auth: None,
             beacon_auth,

@@ -153,6 +153,8 @@ impl HostLocation {
 
 pub const SERVER_LIFECYCLE_SCHEMA: &str = "inspr.pharos.server-lifecycle.v1";
 pub const SERVER_LIFECYCLE_VERSION: u16 = 1;
+pub const PROVISIONING_JOB_SCHEMA: &str = "inspr.pharos.provisioning-job.v1";
+pub const PROVISIONING_JOB_VERSION: u16 = 1;
 
 fn default_server_lifecycle_schema() -> String {
     SERVER_LIFECYCLE_SCHEMA.to_string()
@@ -160,6 +162,14 @@ fn default_server_lifecycle_schema() -> String {
 
 fn default_server_lifecycle_version() -> u16 {
     SERVER_LIFECYCLE_VERSION
+}
+
+fn default_provisioning_job_schema() -> String {
+    PROVISIONING_JOB_SCHEMA.to_string()
+}
+
+fn default_provisioning_job_version() -> u16 {
+    PROVISIONING_JOB_VERSION
 }
 
 /// Provider/server intent for onboarding jobs. It is not embedded in
@@ -449,6 +459,114 @@ impl ServerObservedState {
     }
 }
 
+/// Visible state machine for a provisioning/import job. These values are safe
+/// for activity text and UI progress strips; provider credentials and raw
+/// tokens are never represented here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvisioningJobState {
+    Planning,
+    Provisioning,
+    Bootstrapping,
+    WaitingForHeartbeat,
+    BackupPending,
+    Complete,
+    Failed,
+    CleanupNeeded,
+}
+
+impl ProvisioningJobState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Provisioning => "provisioning",
+            Self::Bootstrapping => "bootstrapping",
+            Self::WaitingForHeartbeat => "waiting for heartbeat",
+            Self::BackupPending => "backup pending",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::CleanupNeeded => "cleanup needed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningProgressEntry {
+    pub state: ProvisioningJobState,
+    pub message: String,
+    pub observed_at: UnixSeconds,
+}
+
+impl ProvisioningProgressEntry {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        let message = self.message.trim();
+        if message.is_empty()
+            || message.contains('\n')
+            || message.contains('\r')
+            || looks_like_secret_material(message)
+        {
+            return Err(ServerLifecycleContractError::InvalidProgressMessage);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningJob {
+    #[serde(default = "default_provisioning_job_schema")]
+    pub schema: String,
+    #[serde(default = "default_provisioning_job_version")]
+    pub version: u16,
+    pub id: String,
+    pub provider: String,
+    pub template: String,
+    pub state: ProvisioningJobState,
+    pub created_at: UnixSeconds,
+    pub updated_at: UnixSeconds,
+    #[serde(default)]
+    pub progress: Vec<ProvisioningProgressEntry>,
+}
+
+impl ProvisioningJob {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        if self.schema != PROVISIONING_JOB_SCHEMA {
+            return Err(ServerLifecycleContractError::UnsupportedSchema {
+                expected: PROVISIONING_JOB_SCHEMA.to_string(),
+                actual: self.schema.clone(),
+            });
+        }
+        if self.version != PROVISIONING_JOB_VERSION {
+            return Err(ServerLifecycleContractError::UnsupportedVersion {
+                expected: PROVISIONING_JOB_VERSION,
+                actual: self.version,
+            });
+        }
+        if self.id.trim().is_empty() {
+            return Err(ServerLifecycleContractError::EmptyJobId);
+        }
+        if self.provider.trim().is_empty() {
+            return Err(ServerLifecycleContractError::EmptyProvider);
+        }
+        if self.template.trim().is_empty() {
+            return Err(ServerLifecycleContractError::EmptyTemplate);
+        }
+        for entry in &self.progress {
+            entry.validate_contract()?;
+        }
+        Ok(())
+    }
+}
+
+fn looks_like_secret_material(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    lowered.contains("-----begin")
+        || lowered.contains("bearer ")
+        || lowered.contains(" api_key")
+        || lowered.contains("api-key")
+        || lowered.contains("token=")
+        || lowered.starts_with("pat_")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerLifecycleContractError {
     UnsupportedSchema { expected: String, actual: String },
@@ -459,6 +577,10 @@ pub enum ServerLifecycleContractError {
     ExternalOwnerMustBeExternal,
     SshHostRequired,
     InvalidSecretReference,
+    InvalidProgressMessage,
+    EmptyJobId,
+    EmptyProvider,
+    EmptyTemplate,
 }
 
 impl std::fmt::Display for ServerLifecycleContractError {
@@ -487,6 +609,12 @@ impl std::fmt::Display for ServerLifecycleContractError {
             }
             Self::SshHostRequired => write!(f, "ssh route requires host"),
             Self::InvalidSecretReference => write!(f, "secret reference must not be raw material"),
+            Self::InvalidProgressMessage => {
+                write!(f, "progress message must be plain non-secret text")
+            }
+            Self::EmptyJobId => write!(f, "provisioning job id is required"),
+            Self::EmptyProvider => write!(f, "provisioning provider is required"),
+            Self::EmptyTemplate => write!(f, "provisioning template is required"),
         }
     }
 }
@@ -1374,6 +1502,72 @@ mod tests {
         assert_eq!(observed.last_seen, Some(1_000));
         assert_eq!(observed.inbound_rtt.map(|rtt| rtt.millis), Some(42));
         assert_eq!(observed.freshness.tldr(), "up to date");
+    }
+
+    #[test]
+    fn provisioning_progress_states_are_plain_and_non_secret() {
+        let states = [
+            ProvisioningJobState::Planning,
+            ProvisioningJobState::Provisioning,
+            ProvisioningJobState::Bootstrapping,
+            ProvisioningJobState::WaitingForHeartbeat,
+            ProvisioningJobState::BackupPending,
+            ProvisioningJobState::Complete,
+            ProvisioningJobState::Failed,
+            ProvisioningJobState::CleanupNeeded,
+        ];
+        let labels: Vec<&str> = states.iter().map(|state| state.label()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "planning",
+                "provisioning",
+                "bootstrapping",
+                "waiting for heartbeat",
+                "backup pending",
+                "complete",
+                "failed",
+                "cleanup needed"
+            ]
+        );
+
+        let entry = ProvisioningProgressEntry {
+            state: ProvisioningJobState::Planning,
+            message: "Plan prepared; waiting for operator confirmation.".to_string(),
+            observed_at: 1_700_000_000,
+        };
+        entry.validate_contract().expect("plain progress is valid");
+
+        let token_shaped = ProvisioningProgressEntry {
+            message: "provider token=raw-value".to_string(),
+            ..entry.clone()
+        };
+        assert_eq!(
+            token_shaped.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidProgressMessage)
+        );
+
+        let job = ProvisioningJob {
+            schema: PROVISIONING_JOB_SCHEMA.to_string(),
+            version: PROVISIONING_JOB_VERSION,
+            id: "setup-1700000000-1".to_string(),
+            provider: "hetzner-cloud".to_string(),
+            template: "hetzner-small-nixos".to_string(),
+            state: ProvisioningJobState::Planning,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            progress: vec![entry],
+        };
+        job.validate_contract().expect("job contract is valid");
+
+        let empty_provider = ProvisioningJob {
+            provider: " ".to_string(),
+            ..job
+        };
+        assert_eq!(
+            empty_provider.validate_contract(),
+            Err(ServerLifecycleContractError::EmptyProvider)
+        );
     }
 
     #[test]
