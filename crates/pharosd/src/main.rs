@@ -682,6 +682,7 @@ fn valid_setup_template(provider: &str, template: &str) -> bool {
             | ("hetzner-cloud", "hetzner-lab")
             | ("hetzner-cloud", "bring-own-plan")
             | ("manual-import", "manual-import")
+            | ("manual-import", "netcup-manual-import")
             | ("existing-host", "nixos-anywhere")
             | ("existing-host", "native-systemd")
             | ("existing-host", "manual-deferred")
@@ -756,7 +757,9 @@ fn setup_provider_plan(
         ("hetzner-cloud", "hetzner-small-nixos")
         | ("hetzner-cloud", "hetzner-lab")
         | ("hetzner-cloud", "bring-own-plan") => Ok(hetzner_cloud_setup_plan(template)),
-        ("manual-import", "manual-import") => Ok(manual_import_setup_plan()),
+        ("manual-import", "manual-import") | ("manual-import", "netcup-manual-import") => {
+            Ok(manual_import_setup_plan(template))
+        }
         _ => Err(ProvisioningJobStartError::UnsupportedTemplate),
     }
 }
@@ -911,55 +914,150 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
     }
 }
 
-fn manual_import_setup_plan() -> SetupProviderPlan {
+fn manual_import_setup_plan(template: &str) -> SetupProviderPlan {
+    let netcup = template == "netcup-manual-import";
+    let (strategy, approach, summary, docs, resources, steps, runtime_checks) = if netcup {
+        (
+            "netcup-manual-import",
+            "Treat Netcup as an externally-created server first: buy/create and prepare the VPS or root server outside Pharos, then import it through existing-host onboarding.",
+            "Use Netcup for the server, but keep ordering, cancellation, billing, image choice, rescue/ISO work, snapshots, and SSH preparation explicit operator steps before Pharos imports the host.",
+            vec![
+                SetupProviderPlanDoc {
+                    label: "netcup server REST API",
+                    url: "https://www.netcup.com/en/helpcenter/documentation/server/rest-api",
+                },
+                SetupProviderPlanDoc {
+                    label: "nixos-anywhere quickstart",
+                    url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
+                },
+            ],
+            vec![
+                SetupProviderPlanResource {
+                    key: "netcup_server",
+                    kind: "externally-created-netcup-server",
+                    required: true,
+                    api: "operator / Netcup SCP",
+                    detail: "Create or select the Netcup VPS/root server outside Pharos; Pharos does not order, cancel, resize, or bill provider resources for this path.",
+                },
+                SetupProviderPlanResource {
+                    key: "base_os_or_rescue",
+                    kind: "provider-image-or-rescue",
+                    required: true,
+                    api: "operator / Netcup SCP",
+                    detail: "Install a Debian/Ubuntu or NixOS-capable base, or prepare the rescue/ISO route before running Pharos preflight.",
+                },
+                SetupProviderPlanResource {
+                    key: "ssh_access",
+                    kind: "ssh-route",
+                    required: true,
+                    api: "preflight",
+                    detail: "Verify SSH address, user, privilege level, and firewall/reachability before bootstrap; private keys remain outside Pharos records.",
+                },
+                SetupProviderPlanResource {
+                    key: "backup_snapshot_expectation",
+                    kind: "operator-decision",
+                    required: true,
+                    api: "runtime check",
+                    detail: "Confirm current Netcup backup/snapshot options and pricing separately; Pharos records backup intent and later observes runtime backup evidence.",
+                },
+            ],
+            vec![
+                SetupProviderPlanStep {
+                    key: "provider_resources",
+                    title: "Netcup server prepared externally",
+                    detail: "Buy/create or select the server in Netcup, verify current billing/pricing, choose the base image or rescue/ISO path, and keep provider credentials out of Pharos.",
+                    status: "external",
+                },
+                SetupProviderPlanStep {
+                    key: "bootstrap",
+                    title: "Import through existing-host onboarding",
+                    detail: "Run Pharos existing-host read-only preflight, then choose NixOS/nixos-anywhere, portable systemd beacon, or manual/deferred bootstrap.",
+                    status: "handoff",
+                },
+                SetupProviderPlanStep {
+                    key: "observable_finish",
+                    title: "Observable finish",
+                    detail: "Wait for first heartbeat, then record backup/snapshot expectation and location decisions explicitly.",
+                    status: "waiting",
+                },
+            ],
+            vec![
+                "current Netcup product price and billing state",
+                "SSH reachability and firewall access",
+                "OS/bootstrap capability",
+                "rescue or ISO path if reinstall is needed",
+                "backup/snapshot availability and expectations",
+                "Pharos endpoint reachability",
+            ],
+        )
+    } else {
+        (
+            "operator-managed-import",
+            "Keep provider creation external; Pharos plans the import/bootstrap checks and records only safe runtime observations.",
+            "Keep provider creation outside Pharos, then import and bootstrap the already-created host.",
+            vec![SetupProviderPlanDoc {
+                label: "nixos-anywhere quickstart",
+                url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
+            }],
+            vec![
+                SetupProviderPlanResource {
+                    key: "existing_server",
+                    kind: "operator-owned-server",
+                    required: true,
+                    api: "external",
+                    detail: "Operator supplies an already-created host and SSH route; Pharos does not create provider resources for this path.",
+                },
+                SetupProviderPlanResource {
+                    key: "ssh_access",
+                    kind: "ssh-route",
+                    required: true,
+                    api: "preflight",
+                    detail: "Verify reachability and privilege level before bootstrap; private keys remain outside Pharos records.",
+                },
+            ],
+            vec![
+                SetupProviderPlanStep {
+                    key: "provider_resources",
+                    title: "Provider resources",
+                    detail: "Operator creates or keeps the server with the external provider; Pharos stores no provider credentials for this path.",
+                    status: "external",
+                },
+                SetupProviderPlanStep {
+                    key: "bootstrap",
+                    title: "Bootstrap",
+                    detail: "Run existing-host preflight, then choose NixOS, portable beacon, or manual/deferred bootstrap.",
+                    status: "handoff",
+                },
+                SetupProviderPlanStep {
+                    key: "observable_finish",
+                    title: "Observable finish",
+                    detail: "Wait for first heartbeat and record backup/location decisions explicitly.",
+                    status: "waiting",
+                },
+            ],
+            vec![
+                "SSH reachability",
+                "OS/bootstrap capability",
+                "Pharos endpoint reachability",
+            ],
+        )
+    };
+
     SetupProviderPlan {
         schema: "inspr.pharos.setup-provider-plan.v1",
         version: 1,
         provider: "manual-import",
-        template: "manual-import",
-        strategy: "operator-managed-import",
-        approach: "Keep provider creation external; Pharos plans the import/bootstrap checks and records only safe runtime observations.",
-        summary: "Keep provider creation outside Pharos, then import and bootstrap the already-created host.",
-        docs: vec![SetupProviderPlanDoc {
-            label: "nixos-anywhere quickstart",
-            url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
-        }],
-        resources: vec![
-            SetupProviderPlanResource {
-                key: "existing_server",
-                kind: "operator-owned-server",
-                required: true,
-                api: "external",
-                detail: "Operator supplies an already-created host and SSH route; Pharos does not create provider resources for this path.",
-            },
-            SetupProviderPlanResource {
-                key: "ssh_access",
-                kind: "ssh-route",
-                required: true,
-                api: "preflight",
-                detail: "Verify reachability and privilege level before bootstrap; private keys remain outside Pharos records.",
-            },
-        ],
-        steps: vec![
-            SetupProviderPlanStep {
-                key: "provider_resources",
-                title: "Provider resources",
-                detail: "Operator creates or keeps the server with the external provider; Pharos stores no provider credentials for this path.",
-                status: "external",
-            },
-            SetupProviderPlanStep {
-                key: "bootstrap",
-                title: "Bootstrap",
-                detail: "Run existing-host preflight, then choose NixOS, portable beacon, or manual/deferred bootstrap.",
-                status: "handoff",
-            },
-            SetupProviderPlanStep {
-                key: "observable_finish",
-                title: "Observable finish",
-                detail: "Wait for first heartbeat and record backup/location decisions explicitly.",
-                status: "waiting",
-            },
-        ],
+        template: if netcup {
+            "netcup-manual-import"
+        } else {
+            "manual-import"
+        },
+        strategy,
+        approach,
+        summary,
+        docs,
+        resources,
+        steps,
         secret_boundary: vec![
             SetupProviderPlanSecretBoundary {
                 key: "ssh_private_key",
@@ -984,11 +1082,7 @@ fn manual_import_setup_plan() -> SetupProviderPlan {
                 detail: "Records backup and location setup decisions after the imported host reports.",
             },
         ],
-        runtime_checks: vec![
-            "SSH reachability",
-            "OS/bootstrap capability",
-            "Pharos endpoint reachability",
-        ],
+        runtime_checks,
     }
 }
 
@@ -2348,11 +2442,12 @@ const ASSISTANT_PROVIDER_PARAM='setup_provider';
 const ASSISTANT_TEMPLATE_PARAM='setup_template';
 const ASSISTANT_STAGE_PARAM='setup_stage';
 const ASSISTANT_TEMPLATE_PROVIDERS={
-  'hetzner-small-nixos':'hetzner-cloud',
-  'hetzner-lab':'hetzner-cloud',
-  'bring-own-plan':'hetzner-cloud',
-  'manual-import':'manual-import',
-  'nixos-anywhere':'existing-host',
+	  'hetzner-small-nixos':'hetzner-cloud',
+	  'hetzner-lab':'hetzner-cloud',
+	  'bring-own-plan':'hetzner-cloud',
+	  'manual-import':'manual-import',
+	  'netcup-manual-import':'manual-import',
+	  'nixos-anywhere':'existing-host',
   'native-systemd':'existing-host',
   'manual-deferred':'existing-host'
 };
@@ -6004,7 +6099,7 @@ fn onboard_row() -> String {
 
 fn setup_assistant() -> String {
     format!(
-        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-provider-step" data-assistant-provider-step><div class="assistant-step-head"><strong>New server</strong><span>Choose where this server starts.</span></div><div class="assistant-providers"><button class="assistant-provider" type="button" data-assistant-provider="hetzner-cloud" aria-pressed="false"><span class="assistant-provider-title"><strong>Hetzner Cloud</strong><span class="assistant-badge">Recommended</span></span><p>Best supported path for a fresh Pharos-managed server.</p><span class="assistant-facts"><span><b>Credentials needed</b>API token later</span><span><b>Cost</b>Paid cloud</span><span><b>Bootstrap</b>NixOS ready</span></span></button><button class="assistant-provider" type="button" data-assistant-provider="manual-import" aria-pressed="false"><span class="assistant-provider-title"><strong>Manual / existing provider</strong></span><p>Use this for Netcup or any provider that is not safely automated yet.</p><span class="assistant-facts"><span><b>Credentials needed</b>SSH later</span><span><b>Cost</b>Your provider</span><span><b>Bootstrap</b>Import path</span></span></button></div><div class="assistant-step-head"><strong>Template</strong><span>No provider resources are created here.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" data-assistant-next="Next: review a Hetzner Cloud plan for a small NixOS server. No resources have been created." aria-pressed="false"><span><strong>Small NixOS server</strong><span>Low monthly cost, automatic NixOS bootstrap, good first production default.</span></span><em>low cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" data-assistant-next="Next: review a lab-style plan and confirm current pricing before creating anything." aria-pressed="false"><span><strong>Lab / free-tier style</strong><span>Smallest practical shape. Pricing and availability must be checked at plan time.</span></span><em>check cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" data-assistant-next="Next: choose exact provider size, region, and image before creating anything." aria-pressed="false"><span><strong>Bring your own plan</strong><span>Use when you already know the size, region, and bootstrap profile you want.</span></span><em>custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Netcup is not treated as fully automated yet." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For Netcup and other providers, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button></div></div><div class="assistant-existing-step" data-assistant-existing-step><div class="assistant-step-head"><strong>Add existing server</strong><span>Read-only check first.</span></div><form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label><details class="assistant-preflight-details"><summary>Known facts</summary><div class="assistant-preflight-facts"><label><span>Login works</span><select data-preflight-fact="ssh_authenticated"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Admin access</span><select data-preflight-admin><option value="">Unknown</option><option value="sudo">sudo</option><option value="root">root</option><option value="none">No</option></select></label><label><span>Operating system</span><select data-preflight-os><option value="">Unknown</option><option value="linux">Linux</option><option value="nixos">NixOS</option><option value="other">Other</option></select></label><label><span>Nix available</span><select data-preflight-fact="nix_available"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Disk free</span><input data-preflight-disk type="number" min="0" step="1" inputmode="numeric" placeholder="GiB"></label><label><span>Can reach Pharos</span><select data-preflight-fact="pharos_reachable"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label></div></details><button class="assistant-check" type="submit" data-preflight-check>Check server</button></form><div class="assistant-preflight-result" data-preflight-result hidden><div class="assistant-result-head"><strong data-preflight-summary>Preflight</strong><span data-preflight-message>Waiting for checks.</span></div><div class="assistant-checks" data-preflight-checks></div><div class="assistant-bootstrap" data-preflight-bootstrap hidden></div></div></div><div class="assistant-plan" data-assistant-plan><div class="assistant-plan-head"><strong>Review plan</strong><span>Nothing is created until you start setup.</span></div><div class="assistant-plan-list"><div class="assistant-plan-row"><span><strong>Provider resources</strong><span>Prepare server, SSH key, firewall, and selected region.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>SSH and bootstrap</strong><span>Prepare NixOS bootstrap path without exposing private key material.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>Beacon registration</strong><span>Create only a safe handoff; raw tokens are never shown.</span></span><em class="assistant-plan-chip" data-kind="protected">protected</em></div><div class="assistant-plan-row"><span><strong>First heartbeat</strong><span>Wait until the new host reports before marking it live.</span></span><em class="assistant-plan-chip">waiting</em></div><div class="assistant-plan-row"><span><strong>Backup and location</strong><span>Hand off backup enrollment and site/location setup after first contact.</span></span><em class="assistant-plan-chip" data-kind="later">later</em></div></div><label class="assistant-confirm"><input type="checkbox" data-assistant-confirm><span>I understand this may create provider resources.</span><button class="assistant-start" type="button" data-assistant-start disabled>Start setup</button></label><div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states"><span data-progress-state="planning">planning</span><span data-progress-state="provisioning">provisioning</span><span data-progress-state="bootstrapping">bootstrapping</span><span data-progress-state="waiting-for-heartbeat">waiting for heartbeat</span><span data-progress-state="backup-pending">backup pending</span><span data-progress-state="complete" data-risk="ok">complete</span><span data-progress-state="failed" data-risk="fail">failed</span><span data-progress-state="cleanup-needed" data-risk="fail">cleanup needed</span></div></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" data-assistant-continue disabled>Continue</button></div></div></div></section>"#,
+        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-provider-step" data-assistant-provider-step><div class="assistant-step-head"><strong>New server</strong><span>Choose where this server starts.</span></div><div class="assistant-providers"><button class="assistant-provider" type="button" data-assistant-provider="hetzner-cloud" aria-pressed="false"><span class="assistant-provider-title"><strong>Hetzner Cloud</strong><span class="assistant-badge">Recommended</span></span><p>Best supported path for a fresh Pharos-managed server.</p><span class="assistant-facts"><span><b>Credentials needed</b>API token later</span><span><b>Cost</b>Paid cloud</span><span><b>Bootstrap</b>NixOS ready</span></span></button><button class="assistant-provider" type="button" data-assistant-provider="manual-import" aria-pressed="false"><span class="assistant-provider-title"><strong>Manual / existing provider</strong></span><p>Use this for Netcup or any provider that is not safely automated yet.</p><span class="assistant-facts"><span><b>Credentials needed</b>SSH later</span><span><b>Cost</b>Your provider</span><span><b>Bootstrap</b>Import path</span></span></button></div><div class="assistant-step-head"><strong>Template</strong><span>No provider resources are created here.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" data-assistant-next="Next: review a Hetzner Cloud plan for a small NixOS server. No resources have been created." aria-pressed="false"><span><strong>Small NixOS server</strong><span>Low monthly cost, automatic NixOS bootstrap, good first production default.</span></span><em>low cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" data-assistant-next="Next: review a lab-style plan and confirm current pricing before creating anything." aria-pressed="false"><span><strong>Lab / free-tier style</strong><span>Smallest practical shape. Pricing and availability must be checked at plan time.</span></span><em>check cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" data-assistant-next="Next: choose exact provider size, region, and image before creating anything." aria-pressed="false"><span><strong>Bring your own plan</strong><span>Use when you already know the size, region, and bootstrap profile you want.</span></span><em>custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button></div></div><div class="assistant-existing-step" data-assistant-existing-step><div class="assistant-step-head"><strong>Add existing server</strong><span>Read-only check first.</span></div><form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label><details class="assistant-preflight-details"><summary>Known facts</summary><div class="assistant-preflight-facts"><label><span>Login works</span><select data-preflight-fact="ssh_authenticated"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Admin access</span><select data-preflight-admin><option value="">Unknown</option><option value="sudo">sudo</option><option value="root">root</option><option value="none">No</option></select></label><label><span>Operating system</span><select data-preflight-os><option value="">Unknown</option><option value="linux">Linux</option><option value="nixos">NixOS</option><option value="other">Other</option></select></label><label><span>Nix available</span><select data-preflight-fact="nix_available"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Disk free</span><input data-preflight-disk type="number" min="0" step="1" inputmode="numeric" placeholder="GiB"></label><label><span>Can reach Pharos</span><select data-preflight-fact="pharos_reachable"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label></div></details><button class="assistant-check" type="submit" data-preflight-check>Check server</button></form><div class="assistant-preflight-result" data-preflight-result hidden><div class="assistant-result-head"><strong data-preflight-summary>Preflight</strong><span data-preflight-message>Waiting for checks.</span></div><div class="assistant-checks" data-preflight-checks></div><div class="assistant-bootstrap" data-preflight-bootstrap hidden></div></div></div><div class="assistant-plan" data-assistant-plan><div class="assistant-plan-head"><strong>Review plan</strong><span>Nothing is created until you start setup.</span></div><div class="assistant-plan-list"><div class="assistant-plan-row"><span><strong>Provider resources</strong><span>Prepare server, SSH key, firewall, and selected region.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>SSH and bootstrap</strong><span>Prepare NixOS bootstrap path without exposing private key material.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>Beacon registration</strong><span>Create only a safe handoff; raw tokens are never shown.</span></span><em class="assistant-plan-chip" data-kind="protected">protected</em></div><div class="assistant-plan-row"><span><strong>First heartbeat</strong><span>Wait until the new host reports before marking it live.</span></span><em class="assistant-plan-chip">waiting</em></div><div class="assistant-plan-row"><span><strong>Backup and location</strong><span>Hand off backup enrollment and site/location setup after first contact.</span></span><em class="assistant-plan-chip" data-kind="later">later</em></div></div><label class="assistant-confirm"><input type="checkbox" data-assistant-confirm><span>I understand this may create provider resources.</span><button class="assistant-start" type="button" data-assistant-start disabled>Start setup</button></label><div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states"><span data-progress-state="planning">planning</span><span data-progress-state="provisioning">provisioning</span><span data-progress-state="bootstrapping">bootstrapping</span><span data-progress-state="waiting-for-heartbeat">waiting for heartbeat</span><span data-progress-state="backup-pending">backup pending</span><span data-progress-state="complete" data-risk="ok">complete</span><span data-progress-state="failed" data-risk="fail">failed</span><span data-progress-state="cleanup-needed" data-risk="fail">cleanup needed</span></div></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" data-assistant-continue disabled>Continue</button></div></div></div></section>"#,
         plus = icons::PLUS,
         server = icons::SERVER
     )
@@ -11170,8 +11265,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Small NixOS server"));
         assert!(empty.contains("Lab / free-tier style"));
         assert!(empty.contains("Bring your own plan"));
-        assert!(empty.contains("Netcup"));
+        assert!(empty.contains("Netcup manual import"));
         assert!(empty.contains("data-assistant-template=\"hetzner-small-nixos\""));
+        assert!(empty.contains("data-assistant-template=\"netcup-manual-import\""));
         assert!(empty.contains("No provider resources are created here."));
         assert!(empty.contains("Review plan"));
         assert!(empty.contains("Provider resources"));
@@ -12142,6 +12238,46 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             setup_provider_plan("hetzner-cloud", "manual-import").err(),
             Some(ProvisioningJobStartError::UnsupportedTemplate)
         );
+    }
+
+    #[test]
+    fn netcup_manual_import_plan_stays_external_and_caveated() {
+        let plan = setup_provider_plan("manual-import", "netcup-manual-import")
+            .expect("netcup manual import has a plan");
+
+        assert_eq!(plan.provider, "manual-import");
+        assert_eq!(plan.template, "netcup-manual-import");
+        assert_eq!(plan.strategy, "netcup-manual-import");
+        assert!(plan.approach.contains("externally-created server"));
+        assert!(plan.summary.contains("ordering"));
+        assert!(plan.summary.contains("billing"));
+        assert!(plan.summary.contains("rescue/ISO"));
+        assert!(plan
+            .docs
+            .iter()
+            .any(|doc| doc.url
+                == "https://www.netcup.com/en/helpcenter/documentation/server/rest-api"));
+        assert!(plan
+            .resources
+            .iter()
+            .any(|resource| resource.key == "netcup_server"
+                && resource.api.contains("Netcup SCP")
+                && resource.detail.contains("does not order")));
+        assert!(plan
+            .resources
+            .iter()
+            .any(|resource| resource.key == "backup_snapshot_expectation"
+                && resource.detail.contains("pricing")));
+        assert!(plan
+            .runtime_checks
+            .contains(&"current Netcup product price and billing state"));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.key == "bootstrap" && step.detail.contains("existing-host")));
+        let json = serde_json::to_string(&plan).expect("plan serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
     }
 
     fn report_test_state(require_report_token: bool) -> AppState {

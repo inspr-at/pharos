@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.3 - 2026-07-09
+
+- Added an explicit Netcup manual-import setup template.
+- Kept Netcup server creation, billing, rescue/ISO, snapshot, and SSH preparation as external operator steps.
+- Linked Netcup to the existing-host import/bootstrap contract without introducing provider credentials or unsupported automated ordering.
+
 ## 0.1.2 - 2026-07-09
 
 - Made existing-host onboarding collect SSH user and heartbeat cadence explicitly.
