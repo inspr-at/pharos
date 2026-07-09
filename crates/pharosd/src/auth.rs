@@ -14,7 +14,8 @@
 //! restart drops them — the dashboard reloads from disk, the user just logs in
 //! again.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,6 +38,7 @@ const SESSION_COOKIE: &str = "pharos_session";
 const SESSION_TTL_SECS: i64 = 8 * 3600;
 const FLOW_TTL_SECS: i64 = 600;
 const ALLOWED_OPERATORS_ENV: &str = "PHAROS_ALLOWED_OPERATORS";
+const ACCESS_POLICY_FILE_ENV: &str = "PHAROS_ACCESS_POLICY_FILE";
 
 type OidcClient = CoreClient<
     EndpointSet,
@@ -67,6 +69,55 @@ pub struct AuthUser {
     pub display_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessGrant {
+    all_hosts: bool,
+    hosts: BTreeSet<String>,
+    agora: bool,
+}
+
+impl AccessGrant {
+    pub fn full() -> Self {
+        Self {
+            all_hosts: true,
+            hosts: BTreeSet::new(),
+            agora: true,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            all_hosts: false,
+            hosts: BTreeSet::new(),
+            agora: false,
+        }
+    }
+
+    pub fn limited<I, S>(hosts: I, agora: bool) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            all_hosts: false,
+            hosts: hosts.into_iter().map(Into::into).collect(),
+            agora,
+        }
+    }
+
+    pub fn allows_host(&self, host: &str) -> bool {
+        self.all_hosts || self.hosts.contains(host)
+    }
+
+    pub fn can_agora(&self) -> bool {
+        self.agora
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.all_hosts && self.hosts.is_empty() && !self.agora
+    }
+}
+
 struct LoginIdentity {
     subject: SubjectIdentifier,
     display_name: String,
@@ -77,6 +128,7 @@ struct Session {
     #[allow(dead_code)]
     subject: String,
     display_name: String,
+    identifiers: Vec<String>,
     expires: i64,
 }
 
@@ -87,6 +139,7 @@ pub struct Auth {
     http_client: reqwest::Client,
     client: Mutex<OidcClient>,
     operator_policy: OperatorPolicy,
+    access_policy_file: Option<PathBuf>,
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, Session>>,
 }
@@ -113,6 +166,7 @@ impl Auth {
             .build()
             .expect("OIDC HTTP client builds");
         let operator_policy = OperatorPolicy::from_env();
+        let access_policy_file = access_policy_file_from_env();
         let client = discover_client(
             issuer_url.clone(),
             client_id.clone(),
@@ -124,9 +178,13 @@ impl Auth {
         tracing::info!("OIDC auth enabled (issuer {issuer})");
         if operator_policy.is_enforced() {
             tracing::info!("Pharos operator authorization enabled");
-        } else {
+        }
+        if let Some(path) = &access_policy_file {
+            tracing::info!(path = %path.display(), "Pharos access policy file enabled");
+        }
+        if !operator_policy.is_enforced() && access_policy_file.is_none() {
             tracing::warn!(
-                "{ALLOWED_OPERATORS_ENV} is not configured; all authenticated OIDC users are allowed"
+                "{ALLOWED_OPERATORS_ENV} and {ACCESS_POLICY_FILE_ENV} are not configured; all authenticated OIDC users are allowed"
             );
         }
         Some(Arc::new(Auth {
@@ -136,6 +194,7 @@ impl Auth {
             http_client,
             client: Mutex::new(client),
             operator_policy,
+            access_policy_file,
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
         }))
@@ -225,6 +284,46 @@ impl Auth {
                 display_name: s.display_name.clone(),
             })
     }
+
+    pub fn current_access(&self, headers: &HeaderMap) -> AccessGrant {
+        let Some(sid) = cookie(headers, SESSION_COOKIE) else {
+            return AccessGrant::empty();
+        };
+        let identifiers = self
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .get(&sid)
+            .filter(|s| s.expires > now())
+            .map(|s| s.identifiers.clone());
+        identifiers
+            .as_deref()
+            .map(|identifiers| self.access_for_identifiers(identifiers))
+            .unwrap_or_else(AccessGrant::empty)
+    }
+
+    fn access_for_identifiers(&self, identifiers: &[String]) -> AccessGrant {
+        if !self.operator_policy.is_enforced() && self.access_policy_file.is_none() {
+            return AccessGrant::full();
+        }
+        if self.operator_policy.matches_identifiers(identifiers) {
+            return AccessGrant::full();
+        }
+        let Some(path) = &self.access_policy_file else {
+            return AccessGrant::empty();
+        };
+        match std::fs::read_to_string(path)
+            .map_err(|err| err.to_string())
+            .and_then(|raw| {
+                AccessPolicyDocument::from_json(&raw).map(|policy| policy.grant_for(identifiers))
+            }) {
+            Ok(grant) => grant,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "could not read Pharos access policy; denying non-operator access");
+                AccessGrant::empty()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -255,12 +354,81 @@ impl OperatorPolicy {
         !self.allowed.is_empty()
     }
 
-    fn allows(&self, identity: &LoginIdentity) -> bool {
-        !self.is_enforced()
-            || identity
-                .identifiers
+    fn matches_identifiers(&self, identifiers: &[String]) -> bool {
+        self.is_enforced()
+            && identifiers
                 .iter()
                 .any(|identifier| self.allowed.contains(identifier))
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AccessPolicyDocument {
+    #[serde(default)]
+    grants: Vec<AccessPolicyEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AccessPolicyEntry {
+    #[serde(default, alias = "users")]
+    identifiers: Vec<String>,
+    #[serde(default)]
+    hosts: Vec<String>,
+    #[serde(default)]
+    agora: bool,
+}
+
+impl AccessPolicyDocument {
+    fn from_json(raw: &str) -> Result<Self, String> {
+        serde_json::from_str(raw).map_err(|err| err.to_string())
+    }
+
+    fn grant_for(&self, identifiers: &[String]) -> AccessGrant {
+        let mut grant = AccessGrant::empty();
+        for entry in &self.grants {
+            let entry_identifiers: Vec<_> = entry
+                .identifiers
+                .iter()
+                .filter_map(|identifier| normalize_identifier(identifier))
+                .collect();
+            if entry_identifiers.is_empty()
+                || !identifiers
+                    .iter()
+                    .any(|identifier| entry_identifiers.contains(identifier))
+            {
+                continue;
+            }
+            if entry.agora {
+                grant.agora = true;
+            }
+            for host in &entry.hosts {
+                let host = host.trim();
+                if host.is_empty() {
+                    continue;
+                }
+                if host == "*" || host.eq_ignore_ascii_case("all") {
+                    grant.all_hosts = true;
+                } else {
+                    grant.hosts.insert(host.to_string());
+                }
+            }
+        }
+        grant
+    }
+}
+
+fn access_policy_file_from_env() -> Option<PathBuf> {
+    std::env::var(ACCESS_POLICY_FILE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub fn access_for_headers(auth: &AuthState, headers: &HeaderMap) -> AccessGrant {
+    match auth {
+        None => AccessGrant::full(),
+        Some(auth) => auth.current_access(headers),
     }
 }
 
@@ -520,17 +688,13 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
         &mut identity,
     )
     .await;
-    if !auth.operator_policy.allows(&identity) {
-        tracing::warn!("OIDC login denied by Pharos operator policy");
-        return forbidden().into_response();
-    }
-
     let sid = CsrfToken::new_random().secret().clone();
     auth.sessions.lock().expect("sessions lock").insert(
         sid.clone(),
         Session {
             subject: identity.subject.as_str().to_string(),
             display_name: identity.display_name,
+            identifiers: identity.identifiers,
             expires: now() + SESSION_TTL_SECS,
         },
     );
@@ -545,6 +709,7 @@ pub async fn callback(State(auth): State<AuthState>, Query(p): Query<CallbackPar
     (headers, Redirect::temporary("/")).into_response()
 }
 
+#[cfg(test)]
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -689,13 +854,7 @@ mod tests {
 
     #[test]
     fn operator_policy_allows_when_not_configured() {
-        let identity = LoginIdentity {
-            subject: SubjectIdentifier::new("subject-1".to_string()),
-            display_name: "markus".to_string(),
-            identifiers: vec!["subject-1".to_string()],
-        };
-
-        assert!(OperatorPolicy::from_raw(None).allows(&identity));
+        assert!(!OperatorPolicy::from_raw(None).is_enforced());
     }
 
     #[test]
@@ -709,8 +868,11 @@ mod tests {
         identity.add_identifier("Markus");
         identity.add_identifier("markus@example.invalid");
 
-        assert!(OperatorPolicy::from_raw(Some("markus")).allows(&identity));
-        assert!(OperatorPolicy::from_raw(Some("other, markus@example.invalid")).allows(&identity));
+        assert!(OperatorPolicy::from_raw(Some("markus")).matches_identifiers(&identity.identifiers));
+        assert!(
+            OperatorPolicy::from_raw(Some("other, markus@example.invalid"))
+                .matches_identifiers(&identity.identifiers)
+        );
     }
 
     #[test]
@@ -723,7 +885,61 @@ mod tests {
         identity.add_identifier("subject-1");
         identity.add_identifier("markus");
 
-        assert!(!OperatorPolicy::from_raw(Some("athena")).allows(&identity));
+        assert!(
+            !OperatorPolicy::from_raw(Some("athena")).matches_identifiers(&identity.identifiers)
+        );
+    }
+
+    #[test]
+    fn access_policy_grants_hosts_and_agora_by_identifier() {
+        let policy = AccessPolicyDocument::from_json(
+            r#"{
+                "grants": [
+                    {
+                        "identifiers": ["dad@example.invalid"],
+                        "hosts": ["hsb8"],
+                        "agora": false
+                    },
+                    {
+                        "identifiers": ["markus"],
+                        "hosts": ["*"],
+                        "agora": true
+                    }
+                ]
+            }"#,
+        )
+        .expect("policy parses");
+
+        let dad = policy.grant_for(&["dad@example.invalid".to_string()]);
+        assert!(dad.allows_host("hsb8"));
+        assert!(!dad.allows_host("csb1"));
+        assert!(!dad.can_agora());
+
+        let markus = policy.grant_for(&["markus".to_string()]);
+        assert!(markus.allows_host("csb1"));
+        assert!(markus.allows_host("hsb8"));
+        assert!(markus.can_agora());
+    }
+
+    #[test]
+    fn access_policy_is_deny_by_default_for_unknown_users() {
+        let policy = AccessPolicyDocument::from_json(
+            r#"{
+                "grants": [
+                    {
+                        "identifiers": ["markus"],
+                        "hosts": ["*"],
+                        "agora": true
+                    }
+                ]
+            }"#,
+        )
+        .expect("policy parses");
+
+        let unknown = policy.grant_for(&["new-user@example.invalid".to_string()]);
+        assert!(unknown.is_empty());
+        assert!(!unknown.allows_host("csb1"));
+        assert!(!unknown.can_agora());
     }
 
     #[test]
@@ -743,7 +959,8 @@ mod tests {
 
         add_user_info_identifiers(&user_info, &mut identity);
 
-        assert!(OperatorPolicy::from_raw(Some("markus")).allows(&identity));
-        assert!(OperatorPolicy::from_raw(Some("markus@example.invalid")).allows(&identity));
+        assert!(OperatorPolicy::from_raw(Some("markus")).matches_identifiers(&identity.identifiers));
+        assert!(OperatorPolicy::from_raw(Some("markus@example.invalid"))
+            .matches_identifiers(&identity.identifiers));
     }
 }

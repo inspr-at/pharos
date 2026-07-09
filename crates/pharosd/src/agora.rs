@@ -16,7 +16,10 @@ use pharos_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{html_escape, AppState};
+use crate::{
+    auth::{access_for_headers, AccessGrant},
+    html_escape, AppState, ShellContext,
+};
 
 const DEFAULT_ACCENT: &str = "#1f7fb5";
 const TARGET_PATH: &str = "modules/uzumaki/theme/theme-palettes.nix";
@@ -251,9 +254,40 @@ pub(crate) async fn page(
     Query(query): Query<AgoraPageQuery>,
 ) -> Html<String> {
     let user_label = crate::sidebar_user_label(&state.auth, &headers);
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.can_agora()
+        || query.host.as_deref().is_some_and(|host| {
+            !access_allows_host_request(&access, state.manifests.manifests(), host)
+        })
+    {
+        return Html(crate::render_no_access_page(
+            "Settings",
+            "Host preferences",
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            "settings",
+        ));
+    }
+    let manifests: Vec<_> = state
+        .manifests
+        .manifests()
+        .iter()
+        .filter(|manifest| {
+            access.allows_host(&manifest.host.name) || access.allows_host(&manifest.slug)
+        })
+        .cloned()
+        .collect();
+    let runtime_hosts: Vec<_> = state
+        .store
+        .list()
+        .into_iter()
+        .filter(|host| access.allows_host(&host.name))
+        .collect();
     Html(render_page(
-        state.manifests.manifests(),
-        &state.store.list(),
+        &manifests,
+        &runtime_hosts,
         query.host.as_deref(),
         &user_label,
         state.auth.is_some(),
@@ -262,8 +296,18 @@ pub(crate) async fn page(
 
 pub(crate) async fn palette_proposal(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<PaletteProposalQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.can_agora()
+        || !access_allows_host_request(&access, state.manifests.manifests(), &query.host)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Agora access is not granted for this host" })),
+        );
+    }
     let Some(manifest) = find_manifest(state.manifests.manifests(), &query.host) else {
         return (
             StatusCode::NOT_FOUND,
@@ -289,8 +333,18 @@ pub(crate) async fn palette_proposal(
 
 pub(crate) async fn location_proposal(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<LocationProposalQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.can_agora()
+        || !access_allows_host_request(&access, state.manifests.manifests(), &query.host)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Agora access is not granted for this host" })),
+        );
+    }
     let Some(manifest) = find_manifest(state.manifests.manifests(), &query.host) else {
         return (
             StatusCode::NOT_FOUND,
@@ -722,6 +776,17 @@ fn find_manifest<'a>(manifests: &'a [HostManifest], host: &str) -> Option<&'a Ho
     manifests
         .iter()
         .find(|manifest| manifest.host.name == host || manifest.slug == host)
+}
+
+fn access_allows_host_request(
+    access: &AccessGrant,
+    manifests: &[HostManifest],
+    requested: &str,
+) -> bool {
+    access.allows_host(requested)
+        || find_manifest(manifests, requested).is_some_and(|manifest| {
+            access.allows_host(&manifest.host.name) || access.allows_host(&manifest.slug)
+        })
 }
 
 fn normalize_hex_color(value: &str) -> Result<String, &'static str> {
@@ -1264,6 +1329,31 @@ mod tests {
         assert!(html.contains(r#"<span class="settings-host-ready">Setup</span>"#));
         assert!(html.contains(r#"data-host="csb0""#));
         assert!(!html.contains("Settings unavailable"));
+    }
+
+    #[test]
+    fn agora_access_allows_declared_host_name_or_slug_only_when_granted() {
+        let manifest = manifest();
+        let hsb8_only = AccessGrant::limited(["hsb8"], true);
+        let csb1_only = AccessGrant::limited(["csb1"], true);
+        let no_agora = AccessGrant::limited(["hsb8"], false);
+
+        assert!(access_allows_host_request(
+            &hsb8_only,
+            std::slice::from_ref(&manifest),
+            "hsb8"
+        ));
+        assert!(access_allows_host_request(
+            &hsb8_only,
+            std::slice::from_ref(&manifest),
+            &manifest.slug
+        ));
+        assert!(!access_allows_host_request(
+            &csb1_only,
+            std::slice::from_ref(&manifest),
+            "hsb8"
+        ));
+        assert!(!no_agora.can_agora());
     }
 
     #[test]

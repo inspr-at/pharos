@@ -50,7 +50,7 @@ use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration, MissedTickBehavior};
 use url::Url;
 
-use crate::auth::{Auth, AuthState};
+use crate::auth::{access_for_headers, AccessGrant, Auth, AuthState};
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::store::Store;
 
@@ -3355,8 +3355,17 @@ struct SetupProviderPlanQuery {
 }
 
 async fn setup_provider_plan_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<SetupProviderPlanQuery>,
 ) -> impl IntoResponse {
+    if !access_for_headers(&state.auth, &headers).can_agora() {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(json!({ "error": "Agora access is not granted for this account" })),
+        );
+    }
     match setup_provider_plan(&query.provider, &query.template) {
         Ok(plan) => (
             StatusCode::OK,
@@ -3373,8 +3382,16 @@ async fn setup_provider_plan_json(
 
 async fn create_provisioning_job(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ProvisioningJobStartRequest>,
 ) -> impl IntoResponse {
+    if !access_for_headers(&state.auth, &headers).can_agora() {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(json!({ "error": "Agora access is not granted for this account" })),
+        );
+    }
     match state
         .provisioning_jobs
         .start(&request, now_unix(), &state.provider_runtime)
@@ -3394,13 +3411,26 @@ async fn create_provisioning_job(
 
 async fn provisioning_job_json(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
     match state.provisioning_jobs.get(&id) {
-        Some(job) => (
-            StatusCode::OK,
+        Some(job)
+            if provisioning_job_host_name(&job)
+                .map(|host| access.allows_host(host))
+                .unwrap_or_else(|| access.can_agora()) =>
+        {
+            (
+                StatusCode::OK,
+                no_store_headers(),
+                Json(json!({ "job": job })),
+            )
+        }
+        Some(_) => (
+            StatusCode::FORBIDDEN,
             no_store_headers(),
-            Json(json!({ "job": job })),
+            Json(json!({ "error": "this provisioning job is not granted to this account" })),
         ),
         None => (
             StatusCode::NOT_FOUND,
@@ -3411,8 +3441,17 @@ async fn provisioning_job_json(
 }
 
 async fn existing_host_preflight_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ExistingHostPreflightRequest>,
 ) -> impl IntoResponse {
+    if !access_for_headers(&state.auth, &headers).can_agora() {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(json!({ "error": "Agora access is not granted for this account" })),
+        );
+    }
     if let Err(error) = request.validate_contract() {
         return (
             StatusCode::BAD_REQUEST,
@@ -4160,14 +4199,12 @@ async fn register(
     )
 }
 
-async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
+async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let now = now_unix();
-    let runtime_hosts = state.store.list();
-    no_store_json(hosts_payload(
-        runtime_hosts,
-        state.manifests.manifests(),
-        now,
-    ))
+    let access = access_for_headers(&state.auth, &headers);
+    let runtime_hosts = filter_hosts_by_access(state.store.list(), &access);
+    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
+    no_store_json(hosts_payload(runtime_hosts, &manifests, now))
 }
 
 fn hosts_payload(
@@ -4216,13 +4253,23 @@ fn hosts_payload(
     json!({ "as_of": now, "hosts": hosts })
 }
 
-async fn declared_hosts_json(State(state): State<AppState>) -> impl IntoResponse {
+async fn declared_hosts_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let now = now_unix();
-    let runtime_hosts = state.store.list();
-    let server_probes = server_probe_overlays(state.manifests.manifests(), now).await;
+    let access = access_for_headers(&state.auth, &headers);
+    let runtime_hosts = filter_hosts_by_access(state.store.list(), &access);
+    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
+    let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
+        state.manifests.load_errors()
+    } else {
+        &[]
+    };
+    let server_probes = server_probe_overlays(&manifests, now).await;
     no_store_json(declared_hosts_payload(
-        state.manifests.manifests(),
-        state.manifests.load_errors(),
+        &manifests,
+        load_errors,
         &runtime_hosts,
         &server_probes,
         now,
@@ -4337,10 +4384,68 @@ fn no_store_json(value: serde_json::Value) -> impl IntoResponse {
     (no_store_headers(), Json(value))
 }
 
+fn filter_hosts_by_access(hosts: Vec<Host>, access: &AccessGrant) -> Vec<Host> {
+    hosts
+        .into_iter()
+        .filter(|host| access.allows_host(&host.name))
+        .collect()
+}
+
+fn filter_manifests_by_access(
+    manifests: &[HostManifest],
+    access: &AccessGrant,
+) -> Vec<HostManifest> {
+    manifests
+        .iter()
+        .filter(|manifest| {
+            access.allows_host(&manifest.host.name) || access.allows_host(&manifest.slug)
+        })
+        .cloned()
+        .collect()
+}
+
+fn filter_jobs_by_access(jobs: Vec<ProvisioningJob>, access: &AccessGrant) -> Vec<ProvisioningJob> {
+    jobs.into_iter()
+        .filter(|job| {
+            provisioning_job_host_name(job)
+                .map(|host| access.allows_host(host))
+                .unwrap_or_else(|| access.can_agora())
+        })
+        .collect()
+}
+
+pub(crate) fn render_no_access_page(
+    title: &str,
+    subtitle: &str,
+    shell: ShellContext<'_>,
+    active: &str,
+) -> String {
+    format!(
+        r#"{HEAD}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div><section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, active),
+        title = html_escape(title),
+        subtitle = html_escape(subtitle),
+        as_of = clock_label(now_unix()),
+    )
+}
+
 async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
-    let hosts = state.store.list();
-    let jobs = state.provisioning_jobs.list();
+    let access = access_for_headers(&state.auth, &headers);
+    if access.is_empty() {
+        return no_store_html(render_no_access_page(
+            "Fleet",
+            "All hosts at a glance",
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            "fleet",
+        ));
+    }
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
+    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     no_store_html(render_home(
         RuntimeSnapshot {
             hosts: &hosts,
@@ -4348,18 +4453,30 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
         },
         &self_host(),
         now_unix(),
-        state.manifests.manifests(),
+        &manifests,
         ShellContext {
             user_label: &user_label,
             logout_enabled: state.auth.is_some(),
         },
-        true,
+        access.can_agora(),
     ))
 }
 
 async fn map_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
-    let hosts = state.store.list();
+    let access = access_for_headers(&state.auth, &headers);
+    if access.is_empty() {
+        return no_store_html(render_no_access_page(
+            "Map",
+            "Server locations",
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            "map",
+        ));
+    }
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
     no_store_html(render_map(
         &hosts,
         &self_host(),
@@ -4369,26 +4486,40 @@ async fn map_page(State(state): State<AppState>, headers: HeaderMap) -> impl Int
     ))
 }
 
-async fn map_data_json(State(state): State<AppState>) -> impl IntoResponse {
-    let hosts = state.store.list();
+async fn map_data_json(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let now = now_unix();
-    let probes = map_connectivity_probes(&hosts, state.manifests.manifests()).await;
-    let payload = map_data_payload(
-        &hosts,
-        &self_host(),
-        now,
-        state.manifests.manifests(),
-        &probes,
-    );
+    let probes = map_connectivity_probes(&hosts, &manifests).await;
+    let payload = map_data_payload(&hosts, &self_host(), now, &manifests, &probes);
     no_store_json(serde_json::to_value(payload).expect("map data serializes"))
 }
 
 async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
-    let hosts = state.store.list();
-    let jobs = state.provisioning_jobs.list();
+    let access = access_for_headers(&state.auth, &headers);
+    if access.is_empty() {
+        return no_store_html(render_no_access_page(
+            "Alerts",
+            "Needs attention",
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            "alerts",
+        ));
+    }
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
+    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let now = now_unix();
-    let probes = server_probe_overlays(state.manifests.manifests(), now).await;
+    let probes = server_probe_overlays(&manifests, now).await;
+    let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
+        state.manifests.load_errors()
+    } else {
+        &[]
+    };
     no_store_html(render_alerts(
         RuntimeSnapshot {
             hosts: &hosts,
@@ -4396,8 +4527,8 @@ async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl 
         },
         &self_host(),
         now,
-        state.manifests.manifests(),
-        state.manifests.load_errors(),
+        &manifests,
+        load_errors,
         &probes,
         ShellContext {
             user_label: &user_label,
@@ -4408,10 +4539,28 @@ async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl 
 
 async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
-    let hosts = state.store.list();
-    let jobs = state.provisioning_jobs.list();
+    let access = access_for_headers(&state.auth, &headers);
+    if access.is_empty() {
+        return no_store_html(render_no_access_page(
+            "Activity",
+            "Operational timeline",
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            "activity",
+        ));
+    }
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
+    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let now = now_unix();
-    let probes = server_probe_overlays(state.manifests.manifests(), now).await;
+    let probes = server_probe_overlays(&manifests, now).await;
+    let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
+        state.manifests.load_errors()
+    } else {
+        &[]
+    };
     no_store_html(render_activity(
         RuntimeSnapshot {
             hosts: &hosts,
@@ -4419,8 +4568,8 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
         },
         &self_host(),
         now,
-        state.manifests.manifests(),
-        state.manifests.load_errors(),
+        &manifests,
+        load_errors,
         &probes,
         ShellContext {
             user_label: &user_label,
@@ -4431,8 +4580,21 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
 
 async fn backups_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
+    let access = access_for_headers(&state.auth, &headers);
+    if access.is_empty() {
+        return no_store_html(render_no_access_page(
+            "Backups",
+            "Protection at a glance",
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            "backups",
+        ));
+    }
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
     no_store_html(render_backups(
-        &state.store.list(),
+        &hosts,
         now_unix(),
         ShellContext {
             user_label: &user_label,
@@ -9001,10 +9163,10 @@ async fn main() {
             "/setup/existing-host/preflight",
             post(existing_host_preflight_json),
         )
+        .route("/declared-hosts.json", get(declared_hosts_json))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
-        // version, declared manifests, and the auth flow.
-        .route("/declared-hosts.json", get(declared_hosts_json))
+        // version, static assets, and the auth flow.
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/favicon.svg", get(favicon_svg))
@@ -9140,6 +9302,29 @@ mod tests {
             user_label,
             logout_enabled,
         }
+    }
+
+    #[test]
+    fn access_grants_filter_hosts_and_render_safe_empty_state() {
+        let hosts = vec![
+            host_with_backups("csb1", 1_000, vec![]),
+            host_with_backups("hsb8", 1_000, vec![]),
+        ];
+        let limited = AccessGrant::limited(["hsb8"], false);
+        let filtered = filter_hosts_by_access(hosts, &limited);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "hsb8");
+
+        let html = render_no_access_page(
+            "Fleet",
+            "All hosts at a glance",
+            shell("new-user", true),
+            "fleet",
+        );
+        assert!(html.contains("No access yet"));
+        assert!(html.contains("Your login works"));
+        assert!(html.contains(r#"href="/auth/logout""#));
     }
 
     #[tokio::test]
@@ -11757,15 +11942,19 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         }
     }
 
+    static JANUS_HASH_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn janus_hash_file(host: &str, token: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time moves forward")
             .as_nanos();
+        let counter = JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "pharos-janus-token-hashes-{}-{}.json",
+            "pharos-janus-token-hashes-{}-{}-{}.json",
             std::process::id(),
-            nanos
+            nanos,
+            counter
         ));
         let payload = json!({
             "schema": JANUS_BEACON_TOKEN_HASH_SCHEMA,
@@ -11785,10 +11974,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .duration_since(UNIX_EPOCH)
             .expect("time moves forward")
             .as_nanos();
+        let counter = JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "pharos-janus-token-hash-dir-{}-{}",
+            "pharos-janus-token-hash-dir-{}-{}-{}",
             std::process::id(),
-            nanos
+            nanos,
+            counter
         ));
         std::fs::create_dir(&dir).expect("create hash dir");
         for (host, token) in entries {
