@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.9 - 2026-07-10
+
+- Fail closed before automated existing-host handoff unless SSH plus required preflight checks are verified.
+- Keep failed existing-host preflight context on the tracked job so operators can see why no handoff was recorded.
+- Added tests for missing and failed preflight blockers before native or NixOS bootstrap handoff.
+
 ## 0.1.8 - 2026-07-10
 
 - Persist existing-host setup context on tracked jobs: SSH route, selected bootstrap method, preflight summary/checks, and non-secret verification steps.

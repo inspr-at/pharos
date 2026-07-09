@@ -599,10 +599,10 @@ fn existing_host_job_progress(
             (ProvisioningJobState::WaitingForHeartbeat, progress)
         }
         "nixos-anywhere" | "native-systemd" => {
-            if !existing_host_has_ssh_target(request) {
+            if let Some(message) = existing_host_automated_handoff_blocker(request) {
                 progress.push(ProvisioningProgressEntry {
                     state: ProvisioningJobState::Failed,
-                    message: "Existing-host automated bootstrap needs a non-secret SSH target before any handoff is recorded.".to_string(),
+                    message: message.to_string(),
                     observed_at: now,
                 });
                 return (ProvisioningJobState::Failed, progress);
@@ -631,6 +631,56 @@ fn existing_host_has_ssh_target(request: &ProvisioningJobStartRequest) -> bool {
                 .as_deref()
                 .is_some_and(|host| !host.trim().is_empty())
     })
+}
+
+fn existing_host_automated_handoff_blocker(
+    request: &ProvisioningJobStartRequest,
+) -> Option<&'static str> {
+    if !existing_host_has_ssh_target(request) {
+        return Some(
+            "Existing-host automated bootstrap needs a non-secret SSH target before any handoff is recorded.",
+        );
+    }
+    let Some(summary) = &request.preflight_summary else {
+        return Some(
+            "Existing-host automated bootstrap needs a completed preflight before any handoff is recorded.",
+        );
+    };
+    if summary.state == PreflightCheckState::Fail {
+        return Some(
+            "Existing-host automated bootstrap cannot proceed while preflight has failed checks.",
+        );
+    }
+
+    const REQUIRED_CHECKS: &[&str] = &[
+        "ssh-reachability",
+        "ssh-authentication",
+        "privilege",
+        "os-family",
+        "disk-space",
+        "pharos-reachability",
+    ];
+    for key in REQUIRED_CHECKS {
+        match request
+            .preflight_checks
+            .iter()
+            .find(|check| check.key == *key)
+            .map(|check| check.state)
+        {
+            Some(PreflightCheckState::Pass | PreflightCheckState::Warn) => {}
+            Some(PreflightCheckState::Fail) => {
+                return Some(
+                    "Existing-host automated bootstrap cannot proceed while a blocking preflight check is failing.",
+                );
+            }
+            Some(PreflightCheckState::Unknown) | None => {
+                return Some(
+                    "Existing-host automated bootstrap needs verified SSH, privilege, OS, disk, and outbound Pharos checks before handoff.",
+                );
+            }
+        }
+    }
+    None
 }
 
 fn provisioning_existing_host_context(
@@ -698,7 +748,7 @@ fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<Pro
     if matches!(
         method,
         BootstrapMethod::NixosAnywhere | BootstrapMethod::NativeSystemd
-    ) && !existing_host_has_ssh_target(request)
+    ) && existing_host_automated_handoff_blocker(request).is_some()
     {
         return None;
     }
@@ -10183,6 +10233,67 @@ mod tests {
         }
     }
 
+    fn test_preflight_check(
+        key: &str,
+        label: &str,
+        state: PreflightCheckState,
+        message: &str,
+    ) -> ExistingHostPreflightCheck {
+        ExistingHostPreflightCheck {
+            key: key.to_string(),
+            label: label.to_string(),
+            state,
+            message: message.to_string(),
+        }
+    }
+
+    fn ready_existing_host_preflight_checks() -> Vec<ExistingHostPreflightCheck> {
+        vec![
+            test_preflight_check(
+                "ssh-reachability",
+                "SSH reachability",
+                PreflightCheckState::Pass,
+                "SSH port is reachable from Pharos.",
+            ),
+            test_preflight_check(
+                "ssh-authentication",
+                "SSH authentication",
+                PreflightCheckState::Pass,
+                "SSH authentication has been verified.",
+            ),
+            test_preflight_check(
+                "privilege",
+                "Privilege model",
+                PreflightCheckState::Pass,
+                "Root access is available for bootstrap.",
+            ),
+            test_preflight_check(
+                "os-family",
+                "Operating system",
+                PreflightCheckState::Pass,
+                "linux is a supported existing-host target.",
+            ),
+            test_preflight_check(
+                "disk-space",
+                "Disk headroom",
+                PreflightCheckState::Pass,
+                "16 GiB free is enough for setup checks.",
+            ),
+            test_preflight_check(
+                "pharos-reachability",
+                "Host can reach Pharos",
+                PreflightCheckState::Pass,
+                "The host can reach the Pharos report endpoint.",
+            ),
+            test_preflight_check(
+                "backup-observation",
+                "Backup signal",
+                PreflightCheckState::Warn,
+                "No existing backup job was detected during read-only preflight.",
+            ),
+        ]
+    }
+
     fn host_with_backups(
         name: &str,
         last_seen: i64,
@@ -12988,12 +13099,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 label: "Ready for bootstrap".to_string(),
                 message: "Existing host checks passed.".to_string(),
             }),
-            preflight_checks: vec![ExistingHostPreflightCheck {
-                key: "ssh-reachability".to_string(),
-                label: "SSH reachability".to_string(),
-                state: PreflightCheckState::Pass,
-                message: "SSH port is reachable from Pharos.".to_string(),
-            }],
+            preflight_checks: ready_existing_host_preflight_checks(),
         };
         let runtime = ProviderRuntimeConfig::default();
 
@@ -13093,6 +13199,108 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn automated_existing_host_handoff_requires_completed_preflight() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "native-systemd".to_string(),
+            apply: true,
+            host_name: Some("needs-preflight".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::Deferred),
+            location_intent: Some(LocationSetupIntent::Auto),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+            ssh: Some(SshAccessIntent {
+                route: SshRoute::Tailnet,
+                user: Some("root".to_string()),
+                host: Some("needs-preflight".to_string()),
+                port: None,
+            }),
+            preflight_summary: None,
+            preflight_checks: vec![],
+        };
+
+        let job = store
+            .start(&request, 1_700_000_006, &ProviderRuntimeConfig::default())
+            .expect("failed handoff is still tracked");
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert!(job.handoff.is_none());
+        assert!(job.existing_host_context.is_some());
+        assert!(job
+            .progress
+            .last()
+            .expect("progress")
+            .message
+            .contains("needs a completed preflight"));
+    }
+
+    #[test]
+    fn automated_existing_host_handoff_rejects_failed_preflight() {
+        let store = ProvisioningJobStore::new(None);
+        let mut checks = ready_existing_host_preflight_checks();
+        let disk = checks
+            .iter_mut()
+            .find(|check| check.key == "disk-space")
+            .expect("disk check");
+        disk.state = PreflightCheckState::Fail;
+        disk.message = "1 GiB free is too little for a safe bootstrap.".to_string();
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "native-systemd".to_string(),
+            apply: true,
+            host_name: Some("failed-preflight".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::Deferred),
+            location_intent: Some(LocationSetupIntent::Auto),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+            ssh: Some(SshAccessIntent {
+                route: SshRoute::Tailnet,
+                user: Some("root".to_string()),
+                host: Some("failed-preflight".to_string()),
+                port: None,
+            }),
+            preflight_summary: Some(ExistingHostPreflightSummary {
+                state: PreflightCheckState::Fail,
+                label: "Needs attention".to_string(),
+                message: "Fix failed checks before registering a beacon token.".to_string(),
+            }),
+            preflight_checks: checks,
+        };
+
+        let job = store
+            .start(&request, 1_700_000_006, &ProviderRuntimeConfig::default())
+            .expect("failed handoff is still tracked");
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert!(job.handoff.is_none());
+        let context = job
+            .existing_host_context
+            .as_ref()
+            .expect("failed preflight context");
+        assert!(context
+            .preflight_checks
+            .iter()
+            .any(|check| check.key == "disk-space" && check.state == PreflightCheckState::Fail));
+        assert!(job
+            .progress
+            .last()
+            .expect("progress")
+            .message
+            .contains("preflight has failed checks"));
+    }
+
+    #[test]
     fn nixos_existing_host_handoff_proposes_secret_safe_backup_config() {
         let store = ProvisioningJobStore::new(None);
         let request = ProvisioningJobStartRequest {
@@ -13120,12 +13328,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 label: "Ready for bootstrap".to_string(),
                 message: "Existing host checks passed.".to_string(),
             }),
-            preflight_checks: vec![ExistingHostPreflightCheck {
-                key: "ssh-reachability".to_string(),
-                label: "SSH reachability".to_string(),
-                state: PreflightCheckState::Pass,
-                message: "SSH port is reachable from Pharos.".to_string(),
-            }],
+            preflight_checks: ready_existing_host_preflight_checks(),
         };
         let runtime = ProviderRuntimeConfig::default();
 
