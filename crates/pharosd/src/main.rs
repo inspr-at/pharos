@@ -2361,7 +2361,9 @@ struct SetupProviderPlanQuery {
     template: String,
 }
 
-async fn setup_provider_plan_json(Query(query): Query<SetupProviderPlanQuery>) -> impl IntoResponse {
+async fn setup_provider_plan_json(
+    Query(query): Query<SetupProviderPlanQuery>,
+) -> impl IntoResponse {
     match setup_provider_plan(&query.provider, &query.template) {
         Ok(plan) => (
             StatusCode::OK,
