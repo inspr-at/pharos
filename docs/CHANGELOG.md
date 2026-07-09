@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.1 - 2026-07-09
+
+- Added read-only existing-host backup signal detection during setup preflight.
+- Surface detected backup tools as setup evidence so operators can choose managed-elsewhere, Pharos enrollment, or deferred backup handling deliberately.
+- Kept backup facts sanitized: no command output, credentials, repository paths, or raw runtime values are stored or shown.
+
 ## 0.1.0 - 2026-07-09
 
 - Added a visible dashboard version badge and release-history dialog.

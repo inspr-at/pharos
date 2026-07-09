@@ -3624,6 +3624,7 @@ async fn existing_host_preflight_report(
         "The host cannot reach Pharos yet.",
         "Confirm outbound HTTPS from the host to Pharos before registering a beacon.",
     ));
+    checks.push(backup_observation_check(&facts));
 
     let bootstrap_options = bootstrap_options(&facts, &checks);
     let summary = preflight_summary(&checks);
@@ -3660,6 +3661,7 @@ fn needs_existing_host_ssh_fact_probe(facts: &ExistingHostPreflightFacts) -> boo
         || facts.nix_available.is_none()
         || facts.free_disk_gib.is_none()
         || facts.pharos_reachable.is_none()
+        || facts.backup_tools.is_empty()
 }
 
 async fn existing_host_ssh_fact_probe(
@@ -3771,6 +3773,24 @@ if [ -n "${PHAROS_PREFLIGHT_URL:-}" ]; then
     if wget -q -T 4 -O /dev/null "${PHAROS_PREFLIGHT_URL%/}/healthz" >/dev/null 2>&1; then pharos=true; else pharos=false; fi
   fi
 fi
+backup_tools=
+add_backup_tool() {
+  case ",$backup_tools," in
+    *,"$1",*) ;;
+    *) if [ -n "$backup_tools" ]; then backup_tools="$backup_tools,$1"; else backup_tools="$1"; fi ;;
+  esac
+}
+for tool in restic borg kopia duplicity duplicacy rclone; do
+  if command -v "$tool" >/dev/null 2>&1; then add_backup_tool "$tool"; fi
+done
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl list-timers --all --no-legend 2>/dev/null | grep -Eiq 'backup|restic|borg|kopia|duplicity|duplicacy|rclone'; then
+    add_backup_tool systemd-timer
+  fi
+  if systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -Eiq 'backup|restic|borg|kopia|duplicity|duplicacy|rclone'; then
+    add_backup_tool systemd-service
+  fi
+fi
 printf 'ssh_authenticated=true\n'
 printf 'root=%s\n' "$root"
 printf 'sudo=%s\n' "$sudo"
@@ -3779,6 +3799,7 @@ printf 'nixos=%s\n' "$nixos"
 printf 'nix_available=%s\n' "$nix"
 printf 'free_disk_gib=%s\n' "$disk"
 printf 'pharos_reachable=%s\n' "$pharos"
+printf 'backup_tools=%s\n' "$backup_tools"
 "#;
 
 fn parse_existing_host_ssh_probe_stdout(stdout: &[u8]) -> ExistingHostPreflightFacts {
@@ -3798,6 +3819,7 @@ fn parse_existing_host_ssh_probe_stdout(stdout: &[u8]) -> ExistingHostPreflightF
             "nix_available" => facts.nix_available = parse_probe_bool(value),
             "free_disk_gib" => facts.free_disk_gib = value.parse::<u32>().ok(),
             "pharos_reachable" => facts.pharos_reachable = parse_probe_bool(value),
+            "backup_tools" => facts.backup_tools = parse_backup_tools(value),
             _ => {}
         }
     }
@@ -3826,6 +3848,23 @@ fn sanitize_probe_text(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+fn parse_backup_tools(value: &str) -> Vec<String> {
+    let mut tools = Vec::new();
+    for raw in value.split(',').take(12) {
+        let Some(tool) = sanitize_probe_text(raw) else {
+            continue;
+        };
+        if tool
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+            && !tools.iter().any(|existing| existing == &tool)
+        {
+            tools.push(tool);
+        }
+    }
+    tools
+}
+
 fn merge_preflight_facts(
     mut base: ExistingHostPreflightFacts,
     probe: ExistingHostPreflightFacts,
@@ -3838,6 +3877,9 @@ fn merge_preflight_facts(
     base.nix_available = base.nix_available.or(probe.nix_available);
     base.free_disk_gib = base.free_disk_gib.or(probe.free_disk_gib);
     base.pharos_reachable = base.pharos_reachable.or(probe.pharos_reachable);
+    if base.backup_tools.is_empty() {
+        base.backup_tools = probe.backup_tools;
+    }
     base
 }
 
@@ -4021,6 +4063,27 @@ fn disk_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck 
             "Check free disk space before installing or converting the host.".to_string(),
         ),
     }
+}
+
+fn backup_observation_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
+    if facts.backup_tools.is_empty() {
+        return preflight_check(
+            "backup-observation",
+            "Backup signal",
+            PreflightCheckState::Warn,
+            "No existing backup job was detected during read-only preflight; choose backup intent before finishing onboarding.".to_string(),
+        );
+    }
+
+    preflight_check(
+        "backup-observation",
+        "Backup signal",
+        PreflightCheckState::Pass,
+        format!(
+            "Detected backup signal: {}. Choose managed elsewhere to observe it, or required to enroll Pharos-managed backups.",
+            facts.backup_tools.join(", ")
+        ),
+    )
 }
 
 fn bootstrap_options(
@@ -9529,6 +9592,7 @@ mod tests {
                 nix_available: Some(true),
                 free_disk_gib: Some(16),
                 pharos_reachable: Some(true),
+                backup_tools: vec!["restic".to_string(), "systemd-timer".to_string()],
             },
             pharos_url: Some("https://pharos.barta.cm/report".to_string()),
         };
@@ -9560,12 +9624,17 @@ mod tests {
             .existing_token_policy
             .as_deref()
             .is_some_and(|policy| policy.contains("rotation-sensitive")));
+        assert!(report.checks.iter().any(|check| {
+            check.key == "backup-observation"
+                && check.state == PreflightCheckState::Pass
+                && check.message.contains("restic")
+        }));
     }
 
     #[test]
     fn existing_host_ssh_probe_output_is_sanitized_facts() {
         let facts = parse_existing_host_ssh_probe_stdout(
-            b"ssh_authenticated=true\nroot=false\nsudo=true\nos_family=ubuntu\nnixos=false\nnix_available=true\nfree_disk_gib=42\npharos_reachable=true\nignored=value\n",
+            b"ssh_authenticated=true\nroot=false\nsudo=true\nos_family=ubuntu\nnixos=false\nnix_available=true\nfree_disk_gib=42\npharos_reachable=true\nbackup_tools=restic,systemd-timer,bad/tool,restic\nignored=value\n",
         );
 
         assert_eq!(facts.ssh_authenticated, Some(true));
@@ -9576,6 +9645,7 @@ mod tests {
         assert_eq!(facts.nix_available, Some(true));
         assert_eq!(facts.free_disk_gib, Some(42));
         assert_eq!(facts.pharos_reachable, Some(true));
+        assert_eq!(facts.backup_tools, vec!["restic", "systemd-timer"]);
     }
 
     #[test]
@@ -9589,6 +9659,7 @@ mod tests {
             nix_available: None,
             free_disk_gib: None,
             pharos_reachable: None,
+            backup_tools: vec!["restic".to_string()],
         };
         let probe = ExistingHostPreflightFacts {
             ssh_authenticated: Some(false),
@@ -9599,6 +9670,7 @@ mod tests {
             nix_available: Some(true),
             free_disk_gib: Some(12),
             pharos_reachable: Some(true),
+            backup_tools: vec!["systemd-timer".to_string()],
         };
 
         let merged = merge_preflight_facts(base, probe);
@@ -9608,6 +9680,7 @@ mod tests {
         assert_eq!(merged.root, Some(false));
         assert_eq!(merged.os_family.as_deref(), Some("linux"));
         assert_eq!(merged.free_disk_gib, Some(12));
+        assert_eq!(merged.backup_tools, vec!["restic"]);
     }
 
     #[test]

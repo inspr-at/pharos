@@ -383,6 +383,8 @@ pub struct ExistingHostPreflightFacts {
     pub free_disk_gib: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pharos_reachable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -419,6 +421,11 @@ impl ExistingHostPreflightRequest {
         {
             if !safe_preflight_text(value) {
                 return Err("preflight request contains unsafe text".to_string());
+            }
+        }
+        for value in &self.facts.backup_tools {
+            if !safe_preflight_text(value) {
+                return Err("preflight request contains unsafe backup facts".to_string());
             }
         }
         Ok(())
@@ -2403,6 +2410,7 @@ mod tests {
                 nix_available: Some(true),
                 free_disk_gib: Some(12),
                 pharos_reachable: Some(true),
+                backup_tools: vec!["restic".to_string()],
             },
             pharos_url: Some("https://pharos.barta.cm/report".to_string()),
         };
