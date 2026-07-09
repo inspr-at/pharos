@@ -805,6 +805,66 @@ impl ProvisioningSetupIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvisioningBackupProposalKind {
+    NixosResticBeaconObservation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningBackupSecretFile {
+    pub key: String,
+    pub owner: SecretOwner,
+    pub path: String,
+    pub purpose: String,
+}
+
+impl ProvisioningBackupSecretFile {
+    fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        for value in [&self.key, &self.path, &self.purpose] {
+            if !safe_provisioning_text(value) {
+                return Err(ServerLifecycleContractError::InvalidBackupProposal);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningBackupProposal {
+    pub kind: ProvisioningBackupProposalKind,
+    pub title: String,
+    pub summary: String,
+    pub module_attribute: String,
+    pub nix_module: String,
+    #[serde(default)]
+    pub secret_files: Vec<ProvisioningBackupSecretFile>,
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+}
+
+impl ProvisioningBackupProposal {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        for value in [&self.title, &self.summary, &self.module_attribute] {
+            if !safe_provisioning_text(value) {
+                return Err(ServerLifecycleContractError::InvalidBackupProposal);
+            }
+        }
+        if !safe_provisioning_artifact_text(&self.nix_module) {
+            return Err(ServerLifecycleContractError::InvalidBackupProposal);
+        }
+        for secret_file in &self.secret_files {
+            secret_file.validate_contract()?;
+        }
+        for value in self.next_steps.iter().map(String::as_str) {
+            if !safe_provisioning_text(value) {
+                return Err(ServerLifecycleContractError::InvalidBackupProposal);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningProgressEntry {
     pub state: ProvisioningJobState,
@@ -892,6 +952,8 @@ pub struct ProvisioningJob {
     pub handoff: Option<ProvisioningHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_intent: Option<ProvisioningSetupIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_proposal: Option<ProvisioningBackupProposal>,
     #[serde(default)]
     pub progress: Vec<ProvisioningProgressEntry>,
 }
@@ -922,6 +984,9 @@ impl ProvisioningJob {
         if let Some(handoff) = &self.handoff {
             handoff.validate_contract()?;
         }
+        if let Some(backup_proposal) = &self.backup_proposal {
+            backup_proposal.validate_contract()?;
+        }
         for entry in &self.progress {
             entry.validate_contract()?;
         }
@@ -937,6 +1002,11 @@ fn safe_provisioning_text(value: &str) -> bool {
         && !looks_like_secret_material(value)
 }
 
+fn safe_provisioning_artifact_text(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.contains('\r') && !looks_like_secret_material(value)
+}
+
 fn looks_like_secret_material(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
     lowered.contains("-----begin")
@@ -944,6 +1014,14 @@ fn looks_like_secret_material(value: &str) -> bool {
         || lowered.contains(" api_key")
         || lowered.contains("api-key")
         || lowered.contains("token=")
+        || lowered.contains("token =")
+        || lowered.contains("token:")
+        || lowered.contains("password=")
+        || lowered.contains("password =")
+        || lowered.contains("password:")
+        || lowered.contains("secret=")
+        || lowered.contains("secret =")
+        || lowered.contains("secret:")
         || lowered.starts_with("pat_")
 }
 
@@ -959,6 +1037,7 @@ pub enum ServerLifecycleContractError {
     InvalidSecretReference,
     InvalidProgressMessage,
     InvalidHandoff,
+    InvalidBackupProposal,
     EmptyJobId,
     EmptyProvider,
     EmptyTemplate,
@@ -994,6 +1073,9 @@ impl std::fmt::Display for ServerLifecycleContractError {
                 write!(f, "progress message must be plain non-secret text")
             }
             Self::InvalidHandoff => write!(f, "handoff must be plain non-secret text"),
+            Self::InvalidBackupProposal => {
+                write!(f, "backup proposal must be plain non-secret text")
+            }
             Self::EmptyJobId => write!(f, "provisioning job id is required"),
             Self::EmptyProvider => write!(f, "provisioning provider is required"),
             Self::EmptyTemplate => write!(f, "provisioning template is required"),
@@ -2226,6 +2308,7 @@ mod tests {
                 backup: BackupSetupIntent::External,
                 location: LocationSetupIntent::SiteFallback,
             }),
+            backup_proposal: None,
             progress: vec![entry],
         };
         job.validate_contract().expect("job contract is valid");
@@ -2239,6 +2322,42 @@ mod tests {
         assert_eq!(
             setup_intent.location_next_action(),
             "use provider or site fallback when runtime is missing"
+        );
+
+        let backup_proposal = ProvisioningBackupProposal {
+            kind: ProvisioningBackupProposalKind::NixosResticBeaconObservation,
+            title: "NixOS restic backup proposal".to_string(),
+            summary: "Uses runtime files for restic configuration.".to_string(),
+            module_attribute: "services.pharos-beacon.extraEnvironment".to_string(),
+            nix_module: r#"{ config, ... }:
+{
+  services.pharos-beacon.extraEnvironment = {
+    PHAROS_BACKUP_MODE = "restic";
+    RESTIC_REPOSITORY_FILE = "/run/agenix/host-restic-repository";
+    RESTIC_PASSWORD_FILE = "/run/agenix/host-restic-password";
+  };
+}
+"#
+            .to_string(),
+            secret_files: vec![ProvisioningBackupSecretFile {
+                key: "restic-repository-file".to_string(),
+                owner: SecretOwner::Agenix,
+                path: "/run/agenix/host-restic-repository".to_string(),
+                purpose: "Repository file reference.".to_string(),
+            }],
+            next_steps: vec!["Create the runtime files before deployment.".to_string()],
+        };
+        backup_proposal
+            .validate_contract()
+            .expect("safe backup proposal is valid");
+
+        let secret_proposal = ProvisioningBackupProposal {
+            nix_module: r#"{ config, ... }: { services.pharos-beacon.extraEnvironment.PHAROS_TOKEN = "raw"; }"#.to_string(),
+            ..backup_proposal
+        };
+        assert_eq!(
+            secret_proposal.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidBackupProposal)
         );
 
         let secret_handoff = ProvisioningJob {

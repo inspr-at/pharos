@@ -35,11 +35,12 @@ use pharos_core::{
     ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary, Host,
     HostLocation, HostLocationSource, HostManifest, HostRegistration, HostRegistrationResponse,
     HostReport, Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy,
-    ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningHandoff,
-    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningSetupIntent,
-    ServiceObservation, ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
-    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
-    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
+    ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
+    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
+    ProvisioningSetupIntent, SecretOwner, ServiceObservation, ServiceObservationState, SshRoute,
+    EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
+    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -132,6 +133,7 @@ impl ProvisioningJobStore {
         let (state, progress) = provisioning_job_progress(request, provider_runtime, now);
         let handoff = provisioning_job_handoff(request);
         let setup_intent = provisioning_setup_intent(request);
+        let backup_proposal = provisioning_backup_proposal(request);
         let host_name = request
             .host_name
             .as_deref()
@@ -159,6 +161,7 @@ impl ProvisioningJobStore {
             updated_at: now,
             handoff,
             setup_intent,
+            backup_proposal,
             progress,
         };
         job.validate_contract()
@@ -533,6 +536,107 @@ fn provisioning_setup_intent(
         backup: request.backup_intent.unwrap_or(BackupSetupIntent::Deferred),
         location: request.location_intent.unwrap_or(LocationSetupIntent::Auto),
     })
+}
+
+fn provisioning_backup_proposal(
+    request: &ProvisioningJobStartRequest,
+) -> Option<ProvisioningBackupProposal> {
+    let intent = request.backup_intent.unwrap_or(BackupSetupIntent::Deferred);
+    if !matches!(
+        intent,
+        BackupSetupIntent::Required | BackupSetupIntent::Optional | BackupSetupIntent::EnrollLater
+    ) {
+        return None;
+    }
+
+    let nix_path = request.is_nix.unwrap_or_else(|| {
+        request.provider == "hetzner-cloud" || request.template == "nixos-anywhere"
+    });
+    if !nix_path {
+        return None;
+    }
+
+    let host_slug = request
+        .host_name
+        .as_deref()
+        .map(secret_ref_slug)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "pharos-host".to_string());
+    let repository_file = format!("/run/agenix/{host_slug}-restic-repository");
+    let password_file = format!("/run/agenix/{host_slug}-restic-password");
+    let nix_module = format!(
+        r#"{{
+  config,
+  lib,
+  ...
+}}:
+
+{{
+  services.pharos-beacon.extraEnvironment = {{
+    PHAROS_BACKUP_MODE = "restic";
+    PHAROS_BACKUP_ID = "restic-main";
+    PHAROS_BACKUP_LABEL = "Restic backup";
+    PHAROS_BACKUP_TARGET_LABEL = "off-box repository";
+    PHAROS_BACKUP_SCHEDULE = "daily";
+    PHAROS_BACKUP_STALE_AFTER_SECS = "129600";
+    RESTIC_REPOSITORY_FILE = "{repository_file}";
+    RESTIC_PASSWORD_FILE = "{password_file}";
+  }};
+
+  systemd.services.pharos-beacon.serviceConfig.ReadOnlyPaths = [
+    "{repository_file}"
+    "{password_file}"
+  ];
+}}
+"#
+    );
+
+    Some(ProvisioningBackupProposal {
+        kind: ProvisioningBackupProposalKind::NixosResticBeaconObservation,
+        title: "NixOS restic backup proposal".to_string(),
+        summary: "Declarative beacon backup observation using runtime agenix files for repository and password material.".to_string(),
+        module_attribute: "services.pharos-beacon.extraEnvironment".to_string(),
+        nix_module,
+        secret_files: vec![
+            ProvisioningBackupSecretFile {
+                key: "restic-repository-file".to_string(),
+                owner: SecretOwner::Agenix,
+                path: repository_file,
+                purpose: "Restic repository location, stored outside the Nix store.".to_string(),
+            },
+            ProvisioningBackupSecretFile {
+                key: "restic-password-file".to_string(),
+                owner: SecretOwner::Agenix,
+                path: password_file,
+                purpose: "Restic repository password, readable only by pharos-beacon.".to_string(),
+            },
+        ],
+        next_steps: vec![
+            "Create or reference the agenix files before deployment.".to_string(),
+            "Review the NixOS module snippet in nixcfg and keep raw values out of Nix options.".to_string(),
+            "Deploy the host, wait for the first heartbeat, then verify first backup evidence in Pharos.".to_string(),
+        ],
+    })
+}
+
+fn secret_ref_slug(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            last_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if !last_dash {
+            last_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(next) = next {
+            out.push(next);
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 fn missing_hetzner_create_inputs(request: &ProvisioningJobStartRequest) -> bool {
@@ -2376,6 +2480,14 @@ function provisioningIntentMessage(job){
   if(!intent)return '';
   return `Setup intent recorded. ${setupIntentSummary(intent.backup,intent.location)} ${setupIntentDetail(intent.backup,intent.location)}`;
 }
+function provisioningBackupProposalMessage(job){
+  const proposal=job?.backup_proposal;
+  if(!proposal)return '';
+  const files=Array.isArray(proposal.secret_files)?proposal.secret_files:[];
+  const fileCopy=files.map(file=>`${file.key||'runtime file'} at ${file.path||'runtime path'}`).join('; ');
+  const next=Array.isArray(proposal.next_steps)?proposal.next_steps.join(' '):'';
+  return [`Backup proposal: ${proposal.title||'declarative backup proposal'}.`,proposal.summary||'',fileCopy?`Runtime files: ${fileCopy}.`:'',next].filter(Boolean).join(' ');
+}
 function renderProvisioningJob(overlay,job){
   if(!overlay||!job)return;
   overlay.dataset.assistantJobId=job.id||'';
@@ -2388,7 +2500,8 @@ function renderProvisioningJob(overlay,job){
   const message=latestProvisioningMessage(job);
   const handoff=provisioningHandoffMessage(job);
   const setupIntent=provisioningIntentMessage(job);
-  const fullMessage=[handoff||message,setupIntent].filter(Boolean).join(' ');
+  const backupProposal=provisioningBackupProposalMessage(job);
+  const fullMessage=[handoff||message,setupIntent,backupProposal].filter(Boolean).join(' ');
   if(title)title.textContent=job.state==='failed'?'Setup did not start':`Setup ${label}`;
   if(copy)copy.textContent=fullMessage;
   if(jobBox){
@@ -2396,7 +2509,7 @@ function renderProvisioningJob(overlay,job){
     jobBox.scrollIntoView({block:'nearest'});
   }
   if(jobTitle)jobTitle.textContent=`Tracked job: ${label}`;
-  if(jobMessage)jobMessage.textContent=[message,handoff,setupIntent].filter(Boolean).join(' ');
+  if(jobMessage)jobMessage.textContent=[message,handoff,setupIntent,backupProposal].filter(Boolean).join(' ');
   overlay.querySelectorAll('[data-progress-state]').forEach(step=>{
     step.dataset.active=String(step.dataset.progressState===job.state);
   });
@@ -8969,6 +9082,7 @@ mod tests {
             updated_at,
             handoff: None,
             setup_intent: Some(setup_intent),
+            backup_proposal: None,
             progress: vec![ProvisioningProgressEntry {
                 state,
                 message: match state {
@@ -11279,6 +11393,25 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             "offer enrollment, but do not block onboarding"
         );
         assert_eq!(setup_intent.location, LocationSetupIntent::Manual);
+        let proposal = job.backup_proposal.as_ref().expect("backup proposal");
+        assert_eq!(
+            proposal.kind,
+            ProvisioningBackupProposalKind::NixosResticBeaconObservation
+        );
+        assert!(proposal
+            .nix_module
+            .contains(r#"RESTIC_REPOSITORY_FILE = "/run/agenix/hcloud-lab-2-restic-repository""#));
+        assert!(proposal
+            .nix_module
+            .contains(r#"RESTIC_PASSWORD_FILE = "/run/agenix/hcloud-lab-2-restic-password""#));
+        assert!(proposal
+            .secret_files
+            .iter()
+            .any(|file| file.path == "/run/agenix/hcloud-lab-2-restic-repository"));
+        assert!(proposal
+            .secret_files
+            .iter()
+            .any(|file| file.path == "/run/agenix/hcloud-lab-2-restic-password"));
         let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
@@ -11316,6 +11449,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let setup_intent = job.setup_intent.as_ref().expect("setup intent");
         assert_eq!(setup_intent.backup, BackupSetupIntent::External);
         assert_eq!(setup_intent.location, LocationSetupIntent::SiteFallback);
+        assert!(job.backup_proposal.is_none());
         assert_eq!(setup_intent.backup_label(), "managed elsewhere");
         assert_eq!(setup_intent.location_label(), "site fallback");
         let handoff = job.handoff.as_ref().expect("manual handoff");
@@ -11390,6 +11524,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .next_steps
             .iter()
             .any(|step| step.contains("Backup enrollment later")));
+        assert!(job.backup_proposal.is_none());
         assert_eq!(
             job.progress.last().expect("progress entry").state,
             ProvisioningJobState::Failed
@@ -11441,9 +11576,29 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(handoff.next_steps.iter().any(
             |step| step.contains("do not embed secret values in Nix options or the Nix store")
         ));
+        let proposal = job.backup_proposal.as_ref().expect("backup proposal");
+        assert_eq!(
+            proposal.kind,
+            ProvisioningBackupProposalKind::NixosResticBeaconObservation
+        );
+        assert_eq!(
+            proposal.module_attribute,
+            "services.pharos-beacon.extraEnvironment"
+        );
+        assert!(proposal.nix_module.contains("PHAROS_BACKUP_MODE"));
+        assert!(proposal.nix_module.contains("RESTIC_REPOSITORY_FILE"));
+        assert!(proposal.nix_module.contains("RESTIC_PASSWORD_FILE"));
+        assert!(proposal
+            .nix_module
+            .contains("/run/agenix/nix-1-restic-repository"));
+        assert!(proposal
+            .next_steps
+            .iter()
+            .any(|step| step.contains("Create or reference the agenix files")));
         let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
+        assert!(!json.contains("PHAROS_TOKEN ="));
     }
 
     #[test]

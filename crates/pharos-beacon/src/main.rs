@@ -720,6 +720,14 @@ fn restic_repository_args_from_backup_options(raw: &str) -> Vec<String> {
                     continue;
                 }
             }
+            "--repository-file" => {
+                if let Some(repo) = parts.get(idx + 1) {
+                    args.push("--repository-file".to_string());
+                    args.push((*repo).to_string());
+                    idx += 2;
+                    continue;
+                }
+            }
             value if value.starts_with("-r=") => {
                 args.push("-r".to_string());
                 args.push(value.trim_start_matches("-r=").to_string());
@@ -732,6 +740,10 @@ fn restic_repository_args_from_backup_options(raw: &str) -> Vec<String> {
                 args.push("-r".to_string());
                 args.push(value.trim_start_matches("--repository=").to_string());
             }
+            value if value.starts_with("--repository-file=") => {
+                args.push("--repository-file".to_string());
+                args.push(value.trim_start_matches("--repository-file=").to_string());
+            }
             _ => {}
         }
         idx += 1;
@@ -742,6 +754,9 @@ fn restic_repository_args_from_backup_options(raw: &str) -> Vec<String> {
 fn restic_repository_args() -> Vec<String> {
     if let Some(repo) = env_value("RESTIC_REPOSITORY") {
         return vec!["-r".to_string(), repo];
+    }
+    if let Some(repo_file) = env_value("RESTIC_REPOSITORY_FILE") {
+        return vec!["--repository-file".to_string(), repo_file];
     }
     env_value("RESTIC_BACKUP_OPTIONS")
         .map(|raw| restic_repository_args_from_backup_options(&raw))
@@ -1173,6 +1188,24 @@ mod tests {
             vec![
                 "-r".to_string(),
                 "sftp:backup.example.invalid:/".to_string()
+            ]
+        );
+        assert_eq!(
+            restic_repository_args_from_backup_options(
+                "--repository-file /run/agenix/restic-repository --password-file /run/agenix/restic-password"
+            ),
+            vec![
+                "--repository-file".to_string(),
+                "/run/agenix/restic-repository".to_string()
+            ]
+        );
+        assert_eq!(
+            restic_repository_args_from_backup_options(
+                "--repository-file=/run/agenix/restic-repository --password-file /run/agenix/restic-password"
+            ),
+            vec![
+                "--repository-file".to_string(),
+                "/run/agenix/restic-repository".to_string()
             ]
         );
         assert!(restic_repository_args_from_backup_options("--host csb1").is_empty());
