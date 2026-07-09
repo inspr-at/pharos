@@ -30,13 +30,14 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, BootstrapMethod, ExistingHostBootstrapOption, ExistingHostPreflightCheck,
-    ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
-    ExistingHostPreflightSummary, Host, HostLocation, HostLocationSource, HostManifest,
-    HostRegistration, HostRegistrationResponse, HostReport, Liveness, ManifestLocationMode,
-    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
-    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
-    ServiceObservation, ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    liveness, BackupSetupIntent, BootstrapMethod, ExistingHostBootstrapOption,
+    ExistingHostPreflightCheck, ExistingHostPreflightFacts, ExistingHostPreflightReport,
+    ExistingHostPreflightRequest, ExistingHostPreflightSummary, Host, HostLocation,
+    HostLocationSource, HostManifest, HostRegistration, HostRegistrationResponse, HostReport,
+    Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
+    ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningHandoff, ProvisioningJob,
+    ProvisioningJobState, ProvisioningProgressEntry, ProvisioningSetupIntent, ServiceObservation,
+    ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
     EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
     PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
@@ -130,6 +131,7 @@ impl ProvisioningJobStore {
         );
         let (state, progress) = provisioning_job_progress(request, provider_runtime, now);
         let handoff = provisioning_job_handoff(request);
+        let setup_intent = provisioning_setup_intent(request);
         let host_name = request
             .host_name
             .as_deref()
@@ -156,6 +158,7 @@ impl ProvisioningJobStore {
             created_at: now,
             updated_at: now,
             handoff,
+            setup_intent,
             progress,
         };
         job.validate_contract()
@@ -214,6 +217,10 @@ struct ProvisioningJobStartRequest {
     is_nix: Option<bool>,
     #[serde(default)]
     heartbeat_interval_secs: Option<u64>,
+    #[serde(default)]
+    backup_intent: Option<BackupSetupIntent>,
+    #[serde(default)]
+    location_intent: Option<LocationSetupIntent>,
     #[serde(default)]
     location: Option<String>,
     #[serde(default)]
@@ -457,6 +464,18 @@ fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<Pro
             ],
         }),
     }
+}
+
+fn provisioning_setup_intent(
+    request: &ProvisioningJobStartRequest,
+) -> Option<ProvisioningSetupIntent> {
+    if request.provider != "existing-host" {
+        return None;
+    }
+    Some(ProvisioningSetupIntent {
+        backup: request.backup_intent.unwrap_or(BackupSetupIntent::Deferred),
+        location: request.location_intent.unwrap_or(LocationSetupIntent::Auto),
+    })
 }
 
 fn missing_hetzner_create_inputs(request: &ProvisioningJobStartRequest) -> bool {
@@ -1510,7 +1529,7 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
 .assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
 .assistant-existing-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-step{display:grid}.assistant-preflight-form{display:grid;grid-template-columns:1fr .85fr 1fr 1.25fr .8fr auto;gap:10px;align-items:end;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.78)}.assistant-preflight-form label,.assistant-preflight-facts label{display:grid;gap:5px;min-width:0}.assistant-preflight-form label span,.assistant-preflight-facts label span{color:var(--muted);font-size:11px;font-weight:650}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-preflight-form input:focus,.assistant-preflight-form select:focus,.assistant-preflight-facts input:focus,.assistant-preflight-facts select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}.assistant-preflight-details{grid-column:1/-1;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.74);padding:8px 10px}.assistant-preflight-details summary{cursor:pointer;color:#0f4f80;font-size:12px;font-weight:760}.assistant-preflight-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}.assistant-check{min-height:36px;padding:0 13px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760;white-space:nowrap;cursor:pointer}.assistant-check:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-preflight-result{display:grid;gap:10px;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(247,252,253,.78)}.assistant-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.assistant-result-head strong{font-size:14px;color:var(--ink)}.assistant-result-head span{max-width:430px;color:var(--muted);font-size:12px;line-height:1.35;text-align:right}.assistant-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.assistant-check-row{--check-color:var(--wait);display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start;min-height:42px;padding:8px 9px;border:1px solid rgba(214,226,234,.70);border-radius:7px;background:rgba(255,255,255,.72)}.assistant-check-row:before{content:"";width:8px;height:8px;margin-top:4px;border-radius:50%;background:var(--check-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--check-color) 10%,transparent)}.assistant-check-row[data-state="pass"]{--check-color:var(--live)}.assistant-check-row[data-state="warn"]{--check-color:var(--stale)}.assistant-check-row[data-state="fail"]{--check-color:var(--down)}.assistant-check-row strong{display:block;font-size:12px;color:var(--ink)}.assistant-check-row span{display:block;margin-top:1px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.assistant-bootstrap-option{--option-color:var(--wait);appearance:none;display:block;width:100%;min-height:72px;padding:10px;border:1px solid rgba(214,226,234,.74);border-radius:7px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;opacity:.72}.assistant-bootstrap-option[data-available="true"]{--option-color:var(--sea);opacity:1;border-color:rgba(21,158,153,.26);background:rgba(233,249,248,.62);cursor:pointer}.assistant-bootstrap-option[data-selected="true"]{border-color:rgba(21,158,153,.58);box-shadow:0 0 0 3px rgba(21,158,153,.10),0 10px 22px rgba(45,75,95,.08)}.assistant-bootstrap-option:disabled{cursor:not-allowed}.assistant-bootstrap-option strong{display:block;color:var(--ink);font-size:12px}.assistant-bootstrap-option span{display:block;margin-top:3px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap-option:before{content:"";display:block;width:8px;height:8px;margin-bottom:7px;border-radius:50%;background:var(--option-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--option-color) 10%,transparent)}
-.assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
+.assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-selected-path="existing"][data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
 .assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
 .assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
@@ -2149,8 +2168,13 @@ function syncAssistantNext(overlay){
   }else if(path==='existing'){
     const result=overlay.querySelector('[data-preflight-result]');
     const summary=overlay.querySelector('[data-preflight-summary]');
-    if(title)title.textContent=result&&!result.hidden?(summary?.textContent||'Preflight complete'):'Check existing server';
-    if(copy)copy.textContent=result&&!result.hidden?'Choose a bootstrap path only after the read-only checks look right.':'Enter the server name and SSH address, then run a read-only preflight. No tokens or host records are created.';
+    if(stage==='plan'){
+      if(title)title.textContent='Protection and place';
+      if(copy)copy.textContent=`${currentSetupIntentSummary(overlay)} These choices are setup intent only; no runtime facts or secrets are stored here.`;
+    }else{
+      if(title)title.textContent=result&&!result.hidden?(summary?.textContent||'Preflight complete'):'Check existing server';
+      if(copy)copy.textContent=result&&!result.hidden?'Choose a bootstrap path only after the read-only checks look right.':'Enter the server name and SSH address, then run a read-only preflight. No tokens or host records are created.';
+    }
   }else{
     if(title)title.textContent='Next step';
     if(copy)copy.textContent='Choose a path to preview the next step. No changes have been started.';
@@ -2180,6 +2204,43 @@ function provisioningHandoffMessage(job){
   ];
   return parts.filter(Boolean).join(' ');
 }
+const BACKUP_INTENT_COPY={
+  'required':['backup required','observe existing jobs or queue Pharos enrollment'],
+  'external':['managed elsewhere','observe external backup evidence when available'],
+  'enroll-later':['enroll later','queue backup enrollment after first heartbeat'],
+  'absent':['no backups','record that backups are intentionally absent'],
+  'deferred':['backup decision pending','ask again before marking onboarding complete']
+};
+const LOCATION_INTENT_COPY={
+  'auto':['auto location','use runtime auto-detection when the beacon reports'],
+  'manual':['manual location','collect declared coordinates outside runtime facts'],
+  'site-fallback':['site fallback','use provider or site fallback when runtime is missing'],
+  'hidden':['hidden location','keep host coordinates hidden']
+};
+function setupIntentChoice(overlay,name,fallback){
+  return overlay.querySelector(`input[name="${name}"]:checked`)?.value||fallback;
+}
+function setupIntentSummary(backup,location){
+  const backupCopy=BACKUP_INTENT_COPY[backup]||BACKUP_INTENT_COPY.deferred;
+  const locationCopy=LOCATION_INTENT_COPY[location]||LOCATION_INTENT_COPY.auto;
+  return `Backups: ${backupCopy[0]}. Location: ${locationCopy[0]}.`;
+}
+function setupIntentDetail(backup,location){
+  const backupCopy=BACKUP_INTENT_COPY[backup]||BACKUP_INTENT_COPY.deferred;
+  const locationCopy=LOCATION_INTENT_COPY[location]||LOCATION_INTENT_COPY.auto;
+  return `Next: ${backupCopy[1]}; ${locationCopy[1]}.`;
+}
+function currentSetupIntentSummary(overlay){
+  return setupIntentSummary(
+    setupIntentChoice(overlay,'backup_intent','deferred'),
+    setupIntentChoice(overlay,'location_intent','auto')
+  );
+}
+function provisioningIntentMessage(job){
+  const intent=job?.setup_intent;
+  if(!intent)return '';
+  return `Setup intent recorded. ${setupIntentSummary(intent.backup,intent.location)} ${setupIntentDetail(intent.backup,intent.location)}`;
+}
 function renderProvisioningJob(overlay,job){
   if(!overlay||!job)return;
   overlay.dataset.assistantJobId=job.id||'';
@@ -2191,14 +2252,16 @@ function renderProvisioningJob(overlay,job){
   const label=provisioningJobLabel(job.state);
   const message=latestProvisioningMessage(job);
   const handoff=provisioningHandoffMessage(job);
+  const setupIntent=provisioningIntentMessage(job);
+  const fullMessage=[handoff||message,setupIntent].filter(Boolean).join(' ');
   if(title)title.textContent=job.state==='failed'?'Setup did not start':`Setup ${label}`;
-  if(copy)copy.textContent=handoff||message;
+  if(copy)copy.textContent=fullMessage;
   if(jobBox){
     jobBox.hidden=false;
     jobBox.scrollIntoView({block:'nearest'});
   }
   if(jobTitle)jobTitle.textContent=`Tracked job: ${label}`;
-  if(jobMessage)jobMessage.textContent=handoff?`${message} ${handoff}`:message;
+  if(jobMessage)jobMessage.textContent=[message,handoff,setupIntent].filter(Boolean).join(' ');
   overlay.querySelectorAll('[data-progress-state]').forEach(step=>{
     step.dataset.active=String(step.dataset.progressState===job.state);
   });
@@ -2411,6 +2474,8 @@ async function startProvisioningJob(overlay,start){
     const isNix=existingHostIsNix(overlay);
     if(isNix!==undefined)body.is_nix=isNix;
     body.heartbeat_interval_secs=60;
+    body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
+    body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
     body.apply=true;
   }
   start.textContent='Starting setup';
@@ -2471,7 +2536,12 @@ function setAssistantPath(path,write=true){
   const overlay=document.querySelector('[data-setup-assistant]');
   if(!overlay)return;
   const safePath=assistantPath(path);
+  const previousPath=assistantPath(overlay.dataset.assistantSelectedPath||'');
   overlay.dataset.assistantSelectedPath=safePath;
+  if(safePath!==previousPath){
+    overlay.dataset.assistantStage='';
+    overlay.dataset.existingBootstrapMethod='';
+  }
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>{
     btn.setAttribute('aria-pressed',String(btn.dataset.assistantPath===safePath));
   });
@@ -2554,6 +2624,9 @@ function initSetupAssistant(){
   overlay.querySelector('[data-assistant-confirm]')?.addEventListener('change',event=>{
     const start=overlay.querySelector('[data-assistant-start]');
     if(start)start.disabled=!event.currentTarget.checked;
+  });
+  overlay.querySelectorAll('input[name="backup_intent"],input[name="location_intent"]').forEach(input=>{
+    input.addEventListener('change',()=>syncAssistantNext(overlay));
   });
   overlay.querySelector('[data-assistant-start]')?.addEventListener('click',async event=>{
     if(event.currentTarget.disabled)return;
@@ -4775,6 +4848,10 @@ fn setup_assistant() -> String {
     .replace(
         r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
         r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>Role</span><input data-preflight-role autocomplete="off" placeholder="server"></label><label><span>Host type</span><select data-preflight-host-type><option value="">Decide after check</option><option value="nixos">NixOS</option><option value="linux-beacon">Linux beacon</option></select></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
+    )
+    .replace(
+        r#"</div></div><label class="assistant-confirm">"#,
+        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div><label class="assistant-confirm">"#,
     )
 }
 
@@ -8682,6 +8759,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Beacon registration"));
         assert!(empty.contains("First heartbeat"));
         assert!(empty.contains("Backup and location"));
+        assert!(empty.contains(r#"data-existing-setup-intent"#));
+        assert!(empty.contains("Protection and place"));
+        assert!(empty.contains(r#"name="backup_intent" value="external""#));
+        assert!(empty.contains(r#"name="location_intent" value="site-fallback""#));
+        assert!(empty.contains("No secrets stored"));
         assert!(empty.contains("I understand this may create provider resources."));
         assert!(empty.contains("data-assistant-job"));
         assert!(empty.contains("data-progress-state=\"failed\""));
@@ -8977,6 +9059,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             role: None,
             is_nix: None,
             heartbeat_interval_secs: None,
+            backup_intent: None,
+            location_intent: None,
             location: None,
             server_type: None,
             image: None,
@@ -9023,6 +9107,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             role: None,
             is_nix: None,
             heartbeat_interval_secs: None,
+            backup_intent: None,
+            location_intent: None,
             location: None,
             server_type: None,
             image: None,
@@ -9093,6 +9179,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             role: Some("server".to_string()),
             is_nix: Some(false),
             heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::External),
+            location_intent: Some(LocationSetupIntent::SiteFallback),
             location: None,
             server_type: None,
             image: None,
@@ -9109,6 +9197,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(job.role.as_deref(), Some("server"));
         assert_eq!(job.is_nix, Some(false));
         assert_eq!(job.heartbeat_interval_secs, Some(60));
+        let setup_intent = job.setup_intent.as_ref().expect("setup intent");
+        assert_eq!(setup_intent.backup, BackupSetupIntent::External);
+        assert_eq!(setup_intent.location, LocationSetupIntent::SiteFallback);
+        assert_eq!(setup_intent.backup_label(), "managed elsewhere");
+        assert_eq!(setup_intent.location_label(), "site fallback");
         let handoff = job.handoff.as_ref().expect("manual handoff");
         assert_eq!(handoff.method, BootstrapMethod::Manual);
         assert_eq!(handoff.status, "manual-handoff");
@@ -9145,6 +9238,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             role: Some("server".to_string()),
             is_nix: Some(false),
             heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::EnrollLater),
+            location_intent: Some(LocationSetupIntent::Auto),
             location: None,
             server_type: None,
             image: None,
@@ -9161,6 +9256,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(job.role.as_deref(), Some("server"));
         assert_eq!(job.is_nix, Some(false));
         assert_eq!(job.heartbeat_interval_secs, Some(60));
+        let setup_intent = job.setup_intent.as_ref().expect("setup intent");
+        assert_eq!(setup_intent.backup, BackupSetupIntent::EnrollLater);
+        assert_eq!(setup_intent.location, LocationSetupIntent::Auto);
         let handoff = job.handoff.as_ref().expect("native handoff");
         assert_eq!(handoff.method, BootstrapMethod::NativeSystemd);
         assert_eq!(handoff.status, "executor-pending");

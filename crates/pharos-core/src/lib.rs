@@ -710,6 +710,91 @@ impl ProvisioningJobState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupSetupIntent {
+    Required,
+    External,
+    EnrollLater,
+    Absent,
+    Deferred,
+}
+
+impl BackupSetupIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Required => "backup required",
+            Self::External => "managed elsewhere",
+            Self::EnrollLater => "enroll later",
+            Self::Absent => "no backups",
+            Self::Deferred => "backup decision pending",
+        }
+    }
+
+    pub fn next_action(self) -> &'static str {
+        match self {
+            Self::Required => "observe existing jobs or queue Pharos enrollment",
+            Self::External => "observe external backup evidence when available",
+            Self::EnrollLater => "queue backup enrollment after first heartbeat",
+            Self::Absent => "record that backups are intentionally absent",
+            Self::Deferred => "ask again before marking onboarding complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocationSetupIntent {
+    Auto,
+    Manual,
+    SiteFallback,
+    Hidden,
+}
+
+impl LocationSetupIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto location",
+            Self::Manual => "manual location",
+            Self::SiteFallback => "site fallback",
+            Self::Hidden => "hidden location",
+        }
+    }
+
+    pub fn next_action(self) -> &'static str {
+        match self {
+            Self::Auto => "use runtime auto-detection when the beacon reports",
+            Self::Manual => "collect declared coordinates outside runtime facts",
+            Self::SiteFallback => "use provider or site fallback when runtime is missing",
+            Self::Hidden => "keep host coordinates hidden",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningSetupIntent {
+    pub backup: BackupSetupIntent,
+    pub location: LocationSetupIntent,
+}
+
+impl ProvisioningSetupIntent {
+    pub fn backup_label(&self) -> &'static str {
+        self.backup.label()
+    }
+
+    pub fn backup_next_action(&self) -> &'static str {
+        self.backup.next_action()
+    }
+
+    pub fn location_label(&self) -> &'static str {
+        self.location.label()
+    }
+
+    pub fn location_next_action(&self) -> &'static str {
+        self.location.next_action()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningProgressEntry {
     pub state: ProvisioningJobState,
@@ -795,6 +880,8 @@ pub struct ProvisioningJob {
     pub updated_at: UnixSeconds,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<ProvisioningHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_intent: Option<ProvisioningSetupIntent>,
     #[serde(default)]
     pub progress: Vec<ProvisioningProgressEntry>,
 }
@@ -1856,9 +1943,24 @@ mod tests {
                 command_ref: Some("scripts/install-pharos-beacon-systemd.sh".to_string()),
                 next_steps: vec!["Wait for the first heartbeat.".to_string()],
             }),
+            setup_intent: Some(ProvisioningSetupIntent {
+                backup: BackupSetupIntent::External,
+                location: LocationSetupIntent::SiteFallback,
+            }),
             progress: vec![entry],
         };
         job.validate_contract().expect("job contract is valid");
+        let setup_intent = job.setup_intent.as_ref().expect("setup intent");
+        assert_eq!(setup_intent.backup_label(), "managed elsewhere");
+        assert_eq!(
+            setup_intent.backup_next_action(),
+            "observe external backup evidence when available"
+        );
+        assert_eq!(setup_intent.location_label(), "site fallback");
+        assert_eq!(
+            setup_intent.location_next_action(),
+            "use provider or site fallback when runtime is missing"
+        );
 
         let secret_handoff = ProvisioningJob {
             handoff: Some(ProvisioningHandoff {
