@@ -721,6 +721,7 @@ impl ProvisioningJobState {
 #[serde(rename_all = "kebab-case")]
 pub enum BackupSetupIntent {
     Required,
+    Optional,
     External,
     EnrollLater,
     Absent,
@@ -731,6 +732,7 @@ impl BackupSetupIntent {
     pub fn label(self) -> &'static str {
         match self {
             Self::Required => "backup required",
+            Self::Optional => "backup optional",
             Self::External => "managed elsewhere",
             Self::EnrollLater => "enroll later",
             Self::Absent => "no backups",
@@ -741,6 +743,7 @@ impl BackupSetupIntent {
     pub fn next_action(self) -> &'static str {
         match self {
             Self::Required => "observe existing jobs or queue Pharos enrollment",
+            Self::Optional => "offer enrollment, but do not block onboarding",
             Self::External => "observe external backup evidence when available",
             Self::EnrollLater => "queue backup enrollment after first heartbeat",
             Self::Absent => "record that backups are intentionally absent",

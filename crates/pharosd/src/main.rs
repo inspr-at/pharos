@@ -418,60 +418,108 @@ fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<Pro
         _ => return None,
     };
     let interval = request.heartbeat_interval_secs.unwrap_or(60).max(1);
+    let backup_steps = backup_enrollment_steps(request, method);
     match method {
-        BootstrapMethod::NixosAnywhere => Some(ProvisioningHandoff {
-            method,
-            status: "executor-pending".to_string(),
-            title: "NixOS bootstrap handoff".to_string(),
-            summary: "Declarative bootstrap is selected; automated apply stays disabled until the executor can stream credentials without exposing them.".to_string(),
-            token_policy: "Beacon credentials must be installed through a runtime file or secret manager reference, never as a command-line value.".to_string(),
-            secret_target: Some("/run/agenix/pharos-beacon-token".to_string()),
-            command_ref: Some("nixos-anywhere plus services.pharos-beacon".to_string()),
-            next_steps: vec![
+        BootstrapMethod::NixosAnywhere => {
+            let mut next_steps = vec![
                 "Prepare the target flake/module so services.pharos-beacon reads a runtime credential file.".to_string(),
                 "Run the NixOS bootstrap only after SSH, privilege, disk, and rollback checks pass.".to_string(),
                 "Wait for the first heartbeat before marking onboarding complete.".to_string(),
-            ],
-        }),
-        BootstrapMethod::NativeSystemd => Some(ProvisioningHandoff {
-            method,
-            status: "executor-pending".to_string(),
-            title: "Native systemd beacon handoff".to_string(),
-            summary: "Portable beacon install is selected; automated apply stays disabled until Pharos can write the env file over a safe channel.".to_string(),
-            token_policy: "Beacon credentials belong in a root-owned env file or token file and must not be pasted into shell history.".to_string(),
-            secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
-            command_ref: Some("scripts/install-pharos-beacon-systemd.sh".to_string()),
-            next_steps: vec![
+            ];
+            next_steps.extend(backup_steps);
+            Some(ProvisioningHandoff {
+                method,
+                status: "executor-pending".to_string(),
+                title: "NixOS bootstrap handoff".to_string(),
+                summary: "Declarative bootstrap is selected; automated apply stays disabled until the executor can stream credentials without exposing them.".to_string(),
+                token_policy: "Beacon credentials must be installed through a runtime file or secret manager reference, never as a command-line value.".to_string(),
+                secret_target: Some("/run/agenix/pharos-beacon-token".to_string()),
+                command_ref: Some("nixos-anywhere plus services.pharos-beacon".to_string()),
+                next_steps,
+            })
+        }
+        BootstrapMethod::NativeSystemd => {
+            let mut next_steps = vec![
                 "Create the env file through an approved secret channel before starting the service.".to_string(),
                 format!(
                     "Run the native installer with the selected host, role, and {interval}s heartbeat interval."
                 ),
                 "Start pharos-beacon and wait for the first heartbeat before marking onboarding complete.".to_string(),
-            ],
-        }),
-        BootstrapMethod::Manual | BootstrapMethod::Deferred => Some(ProvisioningHandoff {
-            method: BootstrapMethod::Manual,
-            status: "manual-handoff".to_string(),
-            title: "Manual beacon handoff".to_string(),
-            summary: "No automated host changes were made; Pharos is waiting for the operator-managed beacon install.".to_string(),
-            token_policy: "Use a file or env-file secret handoff; never place the beacon credential in command arguments, chat, PPM, or logs.".to_string(),
-            secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
-            command_ref: Some("scripts/install-pharos-beacon-systemd.sh or nixosModules.pharos-beacon".to_string()),
-            next_steps: vec![
+            ];
+            next_steps.extend(backup_steps);
+            Some(ProvisioningHandoff {
+                method,
+                status: "executor-pending".to_string(),
+                title: "Native systemd beacon handoff".to_string(),
+                summary: "Portable beacon install is selected; automated apply stays disabled until Pharos can write the env file over a safe channel.".to_string(),
+                token_policy: "Beacon credentials belong in a root-owned env file or token file and must not be pasted into shell history.".to_string(),
+                secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
+                command_ref: Some("scripts/install-pharos-beacon-systemd.sh".to_string()),
+                next_steps,
+            })
+        }
+        BootstrapMethod::Manual | BootstrapMethod::Deferred => {
+            let mut next_steps = vec![
                 "Install or enable pharos-beacon using the appropriate NixOS or native systemd path.".to_string(),
                 format!("Configure the beacon to report with a {interval}s heartbeat interval."),
                 "Confirm the first heartbeat appears in Pharos, then continue backup and location decisions.".to_string(),
-            ],
-        }),
+            ];
+            next_steps.extend(backup_steps);
+            Some(ProvisioningHandoff {
+                method: BootstrapMethod::Manual,
+                status: "manual-handoff".to_string(),
+                title: "Manual beacon handoff".to_string(),
+                summary: "No automated host changes were made; Pharos is waiting for the operator-managed beacon install.".to_string(),
+                token_policy: "Use a file or env-file secret handoff; never place the beacon credential in command arguments, chat, PPM, or logs.".to_string(),
+                secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
+                command_ref: Some("scripts/install-pharos-beacon-systemd.sh or nixosModules.pharos-beacon".to_string()),
+                next_steps,
+            })
+        }
+    }
+}
+
+fn backup_enrollment_steps(
+    request: &ProvisioningJobStartRequest,
+    method: BootstrapMethod,
+) -> Vec<String> {
+    let intent = request.backup_intent.unwrap_or(BackupSetupIntent::Deferred);
+    let nix_path = request
+        .is_nix
+        .unwrap_or(matches!(method, BootstrapMethod::NixosAnywhere));
+    match intent {
+        BackupSetupIntent::Required => {
+            let mut steps = vec![
+                "Backup required: keep onboarding open after first heartbeat until Pharos observes a first successful backup or a concrete failure.".to_string(),
+            ];
+            if nix_path {
+                steps.push("For NixOS, prepare a declarative backup module proposal that reads repository and password material from agenix or Janus-rendered runtime files; do not embed secret values in Nix options or the Nix store.".to_string());
+            } else {
+                steps.push("For non-Nix hosts, install or observe a native backup job through a runtime secret file, then let pharos-beacon report sanitized backup evidence.".to_string());
+            }
+            steps
+        }
+        BackupSetupIntent::Optional => vec![
+            "Backup optional: offer enrollment after first heartbeat, but allow onboarding to finish if the operator explicitly defers protection.".to_string(),
+        ],
+        BackupSetupIntent::External => vec![
+            "Backups managed elsewhere: keep Pharos read-only and observe external backup evidence when the beacon can detect it.".to_string(),
+        ],
+        BackupSetupIntent::EnrollLater => vec![
+            "Backup enrollment later: create a backup-pending follow-up after first heartbeat and do not block beacon onboarding.".to_string(),
+        ],
+        BackupSetupIntent::Absent => vec![
+            "No backups requested: record the host as intentionally unprotected until the operator changes backup intent.".to_string(),
+        ],
+        BackupSetupIntent::Deferred => vec![
+            "Backup decision pending: ask for backup intent again before considering onboarding complete.".to_string(),
+        ],
     }
 }
 
 fn provisioning_setup_intent(
     request: &ProvisioningJobStartRequest,
 ) -> Option<ProvisioningSetupIntent> {
-    if request.provider != "existing-host" {
-        return None;
-    }
     Some(ProvisioningSetupIntent {
         backup: request.backup_intent.unwrap_or(BackupSetupIntent::Deferred),
         location: request.location_intent.unwrap_or(LocationSetupIntent::Auto),
@@ -1551,7 +1599,7 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
 .assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
 .assistant-existing-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-step{display:grid}.assistant-preflight-form{display:grid;grid-template-columns:1fr .85fr 1fr 1.25fr .8fr auto;gap:10px;align-items:end;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.78)}.assistant-preflight-form label,.assistant-preflight-facts label{display:grid;gap:5px;min-width:0}.assistant-preflight-form label span,.assistant-preflight-facts label span{color:var(--muted);font-size:11px;font-weight:650}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-preflight-form input:focus,.assistant-preflight-form select:focus,.assistant-preflight-facts input:focus,.assistant-preflight-facts select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}.assistant-preflight-details{grid-column:1/-1;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.74);padding:8px 10px}.assistant-preflight-details summary{cursor:pointer;color:#0f4f80;font-size:12px;font-weight:760}.assistant-preflight-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}.assistant-check{min-height:36px;padding:0 13px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760;white-space:nowrap;cursor:pointer}.assistant-check:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-preflight-result{display:grid;gap:10px;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(247,252,253,.78)}.assistant-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.assistant-result-head strong{font-size:14px;color:var(--ink)}.assistant-result-head span{max-width:430px;color:var(--muted);font-size:12px;line-height:1.35;text-align:right}.assistant-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.assistant-check-row{--check-color:var(--wait);display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start;min-height:42px;padding:8px 9px;border:1px solid rgba(214,226,234,.70);border-radius:7px;background:rgba(255,255,255,.72)}.assistant-check-row:before{content:"";width:8px;height:8px;margin-top:4px;border-radius:50%;background:var(--check-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--check-color) 10%,transparent)}.assistant-check-row[data-state="pass"]{--check-color:var(--live)}.assistant-check-row[data-state="warn"]{--check-color:var(--stale)}.assistant-check-row[data-state="fail"]{--check-color:var(--down)}.assistant-check-row strong{display:block;font-size:12px;color:var(--ink)}.assistant-check-row span{display:block;margin-top:1px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.assistant-bootstrap-option{--option-color:var(--wait);appearance:none;display:block;width:100%;min-height:72px;padding:10px;border:1px solid rgba(214,226,234,.74);border-radius:7px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;opacity:.72}.assistant-bootstrap-option[data-available="true"]{--option-color:var(--sea);opacity:1;border-color:rgba(21,158,153,.26);background:rgba(233,249,248,.62);cursor:pointer}.assistant-bootstrap-option[data-selected="true"]{border-color:rgba(21,158,153,.58);box-shadow:0 0 0 3px rgba(21,158,153,.10),0 10px 22px rgba(45,75,95,.08)}.assistant-bootstrap-option:disabled{cursor:not-allowed}.assistant-bootstrap-option strong{display:block;color:var(--ink);font-size:12px}.assistant-bootstrap-option span{display:block;margin-top:3px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap-option:before{content:"";display:block;width:8px;height:8px;margin-bottom:7px;border-radius:50%;background:var(--option-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--option-color) 10%,transparent)}
-.assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-selected-path="existing"][data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
+.assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
 .assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
 .assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
@@ -2264,6 +2312,7 @@ function provisioningHandoffMessage(job){
 }
 const BACKUP_INTENT_COPY={
   'required':['backup required','observe existing jobs or queue Pharos enrollment'],
+  'optional':['backup optional','offer enrollment, but do not block onboarding'],
   'external':['managed elsewhere','observe external backup evidence when available'],
   'enroll-later':['enroll later','queue backup enrollment after first heartbeat'],
   'absent':['no backups','record that backups are intentionally absent'],
@@ -2520,6 +2569,8 @@ function scheduleProvisioningPoll(overlay,id){
 async function startProvisioningJob(overlay,start){
   const state=assistantState(overlay);
   const body={provider:state.provider,template:state.template};
+  body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
+  body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
   if(state.path==='existing'){
     const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
     const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
@@ -2532,8 +2583,6 @@ async function startProvisioningJob(overlay,start){
     const isNix=existingHostIsNix(overlay);
     if(isNix!==undefined)body.is_nix=isNix;
     body.heartbeat_interval_secs=60;
-    body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
-    body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
     body.apply=true;
   }
   start.textContent='Starting setup';
@@ -5216,7 +5265,7 @@ fn setup_assistant() -> String {
     )
     .replace(
         r#"</div></div><label class="assistant-confirm">"#,
-        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div><label class="assistant-confirm">"#,
+        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div><label class="assistant-confirm">"#,
     )
 }
 
@@ -9738,6 +9787,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Backup and location"));
         assert!(empty.contains(r#"data-existing-setup-intent"#));
         assert!(empty.contains("Protection and place"));
+        assert!(empty.contains(r#"name="backup_intent" value="optional""#));
         assert!(empty.contains(r#"name="backup_intent" value="external""#));
         assert!(empty.contains(r#"name="location_intent" value="site-fallback""#));
         assert!(empty.contains("No secrets stored"));
@@ -10078,6 +10128,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(job.progress[1]
             .message
             .contains("no provider resources were created"));
+        let setup_intent = job.setup_intent.as_ref().expect("setup intent");
+        assert_eq!(setup_intent.backup, BackupSetupIntent::Deferred);
+        assert_eq!(setup_intent.location, LocationSetupIntent::Auto);
         let unsupported = ProvisioningJobStartRequest {
             template: "manual-import".to_string(),
             ..request.clone()
@@ -10168,6 +10221,44 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn provider_setup_job_persists_backup_intent_without_provider_apply() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "hetzner-cloud".to_string(),
+            template: "hetzner-small-nixos".to_string(),
+            apply: false,
+            host_name: Some("hcloud-lab-2".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(true),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::Optional),
+            location_intent: Some(LocationSetupIntent::Manual),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let runtime = ProviderRuntimeConfig::default();
+
+        let job = store
+            .start(&request, 1_700_000_004, &runtime)
+            .expect("provider job stores setup intent even when execution is gated");
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        let setup_intent = job.setup_intent.as_ref().expect("setup intent");
+        assert_eq!(setup_intent.backup, BackupSetupIntent::Optional);
+        assert_eq!(setup_intent.backup_label(), "backup optional");
+        assert_eq!(
+            setup_intent.backup_next_action(),
+            "offer enrollment, but do not block onboarding"
+        );
+        assert_eq!(setup_intent.location, LocationSetupIntent::Manual);
+        let json = serde_json::to_string(&job).expect("job serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    #[test]
     fn existing_host_manual_path_waits_for_heartbeat_without_secrets() {
         let store = ProvisioningJobStore::new(None);
         let request = ProvisioningJobStartRequest {
@@ -10211,6 +10302,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             handoff.secret_target.as_deref(),
             Some("/etc/pharos/pharos-beacon.env")
         );
+        assert!(handoff
+            .next_steps
+            .iter()
+            .any(|step| step.contains("Backups managed elsewhere")));
         assert_eq!(
             job.progress.last().expect("progress entry").state,
             ProvisioningJobState::WaitingForHeartbeat
@@ -10265,6 +10360,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .command_ref
             .as_deref()
             .is_some_and(|value| value.contains("install-pharos-beacon-systemd")));
+        assert!(handoff
+            .next_steps
+            .iter()
+            .any(|step| step.contains("Backup enrollment later")));
         assert_eq!(
             job.progress.last().expect("progress entry").state,
             ProvisioningJobState::Failed
@@ -10275,6 +10374,47 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("progress entry")
             .message
             .contains("Automated existing-host apply is not active yet"));
+        let json = serde_json::to_string(&job).expect("job serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    #[test]
+    fn nixos_existing_host_handoff_proposes_secret_safe_backup_config() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "nixos-anywhere".to_string(),
+            apply: true,
+            host_name: Some("nix-1".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(true),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::Required),
+            location_intent: Some(LocationSetupIntent::Auto),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+        };
+        let runtime = ProviderRuntimeConfig::default();
+
+        let job = store
+            .start(&request, 1_700_000_007, &runtime)
+            .expect("nixos existing-host handoff records setup state");
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        let setup_intent = job.setup_intent.as_ref().expect("setup intent");
+        assert_eq!(setup_intent.backup, BackupSetupIntent::Required);
+        let handoff = job.handoff.as_ref().expect("nixos handoff");
+        assert_eq!(handoff.method, BootstrapMethod::NixosAnywhere);
+        assert!(handoff
+            .next_steps
+            .iter()
+            .any(|step| step.contains("declarative backup module proposal")));
+        assert!(handoff.next_steps.iter().any(
+            |step| step.contains("do not embed secret values in Nix options or the Nix store")
+        ));
         let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
