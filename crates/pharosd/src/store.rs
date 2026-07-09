@@ -85,6 +85,9 @@ impl Store {
                 service_observations: existing
                     .map(|h| h.service_observations.clone())
                     .unwrap_or_default(),
+                backup_observations: existing
+                    .map(|h| h.backup_observations.clone())
+                    .unwrap_or_default(),
             };
             map.insert(registration.name, host.clone());
             host
@@ -143,6 +146,7 @@ impl Store {
                     location: report.location,
                     freshness: report.freshness,
                     service_observations: report.service_observations,
+                    backup_observations: report.backup_observations,
                 },
             );
         }
@@ -190,7 +194,34 @@ fn trim_heartbeat_log(log: &mut Vec<UnixSeconds>, now: UnixSeconds) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pharos_core::{NixFreshness, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION};
+    use pharos_core::{
+        BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
+        NixFreshness, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+    };
+
+    fn backup_observation(state: BackupPostureState) -> BackupObservation {
+        BackupObservation {
+            id: "restic-main".to_string(),
+            label: "Restic main".to_string(),
+            engine: BackupEngine::Restic,
+            state,
+            configured: BackupConfiguredState::Enabled,
+            summary: "last backup succeeded".to_string(),
+            target_label: Some("off-box repository".to_string()),
+            repository_id: Some("restic-main-repository".to_string()),
+            schedule: Some("hourly".to_string()),
+            next_run_at: None,
+            last_attempt_at: Some(1_700_000_000),
+            last_attempt_state: Some(BackupRunState::Succeeded),
+            last_success_at: Some(1_700_000_000),
+            snapshot_count: Some(3),
+            total_bytes: None,
+            latest_snapshot_bytes: None,
+            last_check_at: None,
+            last_check_state: None,
+            restore_validation: None,
+        }
+    }
 
     #[test]
     fn record_retains_recent_real_heartbeat_events() {
@@ -244,6 +275,7 @@ mod tests {
     #[test]
     fn register_preserves_report_history_and_sets_token_hash() {
         let store = Store::new(None);
+        let backup = backup_observation(BackupPostureState::Healthy);
         store.record(
             HostReport {
                 schema: HOST_REPORT_SCHEMA.to_string(),
@@ -264,7 +296,7 @@ mod tests {
                         commits_behind: Some(0),
                     },
                 )],
-                backup_observations: vec![],
+                backup_observations: vec![backup.clone()],
                 inbound_rtt_ms: Some(37),
                 location: None,
             },
@@ -287,6 +319,7 @@ mod tests {
         assert_eq!(host.heartbeat_interval_secs, Some(30));
         assert_eq!(host.inbound_rtt.expect("rtt kept").millis, 37);
         assert_eq!(host.freshness.flake_lock_age_days, Some(1));
+        assert_eq!(host.backup_observations, vec![backup]);
         assert!(store.has_token("athena"));
         assert_eq!(store.token_hash_for("athena").as_deref(), Some("hash"));
 
@@ -315,5 +348,6 @@ mod tests {
         assert_eq!(updated.token_hash.as_deref(), Some("hash"));
         assert_eq!(updated.last_seen, Some(150));
         assert!(updated.inbound_rtt.is_none());
+        assert!(updated.backup_observations.is_empty());
     }
 }

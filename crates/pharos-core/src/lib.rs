@@ -58,6 +58,10 @@ pub struct Host {
     /// declared service intent stays in the manifest.
     #[serde(default)]
     pub service_observations: Vec<ServiceObservation>,
+    /// Latest non-secret backup runtime observations from the beacon.
+    /// Declared backup intent and enrollment policy are modeled elsewhere.
+    #[serde(default)]
+    pub backup_observations: Vec<BackupObservation>,
 }
 
 /// Nix freshness for a host (PHAROS-15): what it is "missing".
@@ -663,6 +667,8 @@ pub struct ServerObservedState {
     pub freshness: NixFreshness,
     #[serde(default)]
     pub service_observations: Vec<ServiceObservation>,
+    #[serde(default)]
+    pub backup_observations: Vec<BackupObservation>,
 }
 
 impl ServerObservedState {
@@ -675,6 +681,7 @@ impl ServerObservedState {
             location: host.location.clone(),
             freshness: host.freshness.clone(),
             service_observations: host.service_observations.clone(),
+            backup_observations: host.backup_observations.clone(),
         }
     }
 }
@@ -1836,6 +1843,7 @@ mod tests {
         assert!(host.inbound_rtt.is_none());
         assert!(host.location.is_none());
         assert!(host.service_observations.is_empty());
+        assert!(host.backup_observations.is_empty());
     }
 
     #[test]
@@ -2133,6 +2141,7 @@ mod tests {
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(0),
             })],
+            backup_observations: vec![],
         };
 
         let observed = ServerObservedState::from_host(&host, 1_020);
@@ -2140,6 +2149,7 @@ mod tests {
         assert_eq!(observed.last_seen, Some(1_000));
         assert_eq!(observed.inbound_rtt.map(|rtt| rtt.millis), Some(42));
         assert_eq!(observed.freshness.tldr(), "up to date");
+        assert!(observed.backup_observations.is_empty());
     }
 
     #[test]

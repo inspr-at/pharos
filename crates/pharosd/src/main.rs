@@ -30,14 +30,14 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, BackupSetupIntent, BootstrapMethod, ExistingHostBootstrapOption,
-    ExistingHostPreflightCheck, ExistingHostPreflightFacts, ExistingHostPreflightReport,
-    ExistingHostPreflightRequest, ExistingHostPreflightSummary, Host, HostLocation,
-    HostLocationSource, HostManifest, HostRegistration, HostRegistrationResponse, HostReport,
-    Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
-    ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningHandoff, ProvisioningJob,
-    ProvisioningJobState, ProvisioningProgressEntry, ProvisioningSetupIntent, ServiceObservation,
-    ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    liveness, BackupObservation, BackupPostureState, BackupSetupIntent, BootstrapMethod,
+    ExistingHostBootstrapOption, ExistingHostPreflightCheck, ExistingHostPreflightFacts,
+    ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary, Host,
+    HostLocation, HostLocationSource, HostManifest, HostRegistration, HostRegistrationResponse,
+    HostReport, Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy,
+    ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningHandoff,
+    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningSetupIntent,
+    ServiceObservation, ServiceObservationState, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
     EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
     PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
@@ -3906,7 +3906,19 @@ async fn register(
 async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
     let now = now_unix();
     let runtime_hosts = state.store.list();
-    let manifests = manifest_by_host(state.manifests.manifests());
+    no_store_json(hosts_payload(
+        runtime_hosts,
+        state.manifests.manifests(),
+        now,
+    ))
+}
+
+fn hosts_payload(
+    runtime_hosts: Vec<Host>,
+    manifests: &[HostManifest],
+    now: i64,
+) -> serde_json::Value {
+    let manifests = manifest_by_host(manifests);
     let hosts: Vec<_> = runtime_hosts
         .into_iter()
         .map(|h| {
@@ -3934,6 +3946,8 @@ async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
                 "freshness_tldr": freshness_tldr,
                 "service_observations": h.service_observations,
                 "service_observations_summary": service_observations_summary(&h.service_observations),
+                "backup_observations": h.backup_observations,
+                "backup_observations_summary": backup_observations_summary(&h.backup_observations),
                 "attention": {
                     "label": attention.label,
                     "level": attention.level,
@@ -3942,7 +3956,7 @@ async fn hosts_json(State(state): State<AppState>) -> impl IntoResponse {
             })
         })
         .collect();
-    no_store_json(json!({ "as_of": now, "hosts": hosts }))
+    json!({ "as_of": now, "hosts": hosts })
 }
 
 async fn declared_hosts_json(State(state): State<AppState>) -> impl IntoResponse {
@@ -4020,6 +4034,8 @@ fn runtime_overlay(
             "freshness_tldr": null,
             "service_observations": [],
             "service_observations_summary": service_observations_summary(&[]),
+            "backup_observations": [],
+            "backup_observations_summary": backup_observations_summary(&[]),
             "server_probes": server_probes,
             "server_probes_summary": server_probe_summary(server_probes),
         });
@@ -4038,6 +4054,8 @@ fn runtime_overlay(
         "freshness_tldr": host.freshness.tldr(),
         "service_observations": host.service_observations,
         "service_observations_summary": service_observations_summary(&host.service_observations),
+        "backup_observations": host.backup_observations,
+        "backup_observations_summary": backup_observations_summary(&host.backup_observations),
         "server_probes": server_probes,
         "server_probes_summary": server_probe_summary(server_probes),
     })
@@ -4369,6 +4387,59 @@ fn service_observations_summary(observations: &[ServiceObservation]) -> serde_js
         "warning": warning,
         "stale": stale,
         "unknown": unknown,
+    })
+}
+
+fn backup_observations_summary(observations: &[BackupObservation]) -> serde_json::Value {
+    let mut healthy = 0;
+    let mut warning = 0;
+    let mut stale = 0;
+    let mut failed = 0;
+    let mut unknown = 0;
+    let mut missing = 0;
+    let mut not_configured = 0;
+    for observation in observations {
+        match observation.state {
+            BackupPostureState::Healthy => healthy += 1,
+            BackupPostureState::Warning => warning += 1,
+            BackupPostureState::Stale => stale += 1,
+            BackupPostureState::Failed => failed += 1,
+            BackupPostureState::Unknown => unknown += 1,
+            BackupPostureState::Missing => missing += 1,
+            BackupPostureState::NotConfigured => not_configured += 1,
+        }
+    }
+    let (state, label) = if observations.is_empty() {
+        ("unknown", "not observed".to_string())
+    } else if failed > 0 {
+        ("failed", format!("{failed} failed"))
+    } else if missing > 0 {
+        ("missing", format!("{missing} missing"))
+    } else if stale > 0 {
+        ("stale", format!("{stale} stale"))
+    } else if warning > 0 {
+        (
+            "warning",
+            format!("{warning} warning{}", if warning == 1 { "" } else { "s" }),
+        )
+    } else if unknown > 0 {
+        ("unknown", format!("{unknown} unknown"))
+    } else if not_configured > 0 {
+        ("not-configured", format!("{not_configured} not configured"))
+    } else {
+        ("healthy", "healthy".to_string())
+    };
+    json!({
+        "state": state,
+        "label": label,
+        "healthy": healthy,
+        "warning": warning,
+        "stale": stale,
+        "failed": failed,
+        "unknown": unknown,
+        "missing": missing,
+        "not_configured": not_configured,
+        "total": observations.len(),
     })
 }
 
@@ -7408,6 +7479,36 @@ async fn main() {
 mod tests {
     use super::*;
 
+    fn backup_observation(state: BackupPostureState) -> BackupObservation {
+        BackupObservation {
+            id: "restic-main".to_string(),
+            label: "Restic main".to_string(),
+            engine: pharos_core::BackupEngine::Restic,
+            state,
+            configured: pharos_core::BackupConfiguredState::Enabled,
+            summary: "last backup succeeded".to_string(),
+            target_label: Some("off-box repository".to_string()),
+            repository_id: Some("restic-main-repository".to_string()),
+            schedule: Some("hourly".to_string()),
+            next_run_at: None,
+            last_attempt_at: Some(1_700_000_000),
+            last_attempt_state: Some(pharos_core::BackupRunState::Succeeded),
+            last_success_at: Some(1_700_000_000),
+            snapshot_count: Some(3),
+            total_bytes: None,
+            latest_snapshot_bytes: None,
+            last_check_at: Some(1_700_000_100),
+            last_check_state: Some(pharos_core::BackupValidationState::Passed),
+            restore_validation: Some(pharos_core::BackupValidationObservation {
+                level: pharos_core::BackupValidationLevel::RepositoryCheck,
+                state: pharos_core::BackupValidationState::Passed,
+                checked_at: Some(1_700_000_100),
+                evidence_label: Some("repo check".to_string()),
+                summary: None,
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn favicon_serves_pharos_lighthouse_svg() {
         let response = favicon_svg().await.into_response();
@@ -7598,6 +7699,7 @@ mod tests {
                     ..Default::default()
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "hades".to_string(),
@@ -7616,6 +7718,7 @@ mod tests {
                     commits_behind: Some(3),
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "poseidon".to_string(),
@@ -7634,6 +7737,7 @@ mod tests {
                     commits_behind: Some(3),
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
         ];
 
@@ -7715,6 +7819,53 @@ mod tests {
     }
 
     #[test]
+    fn hosts_payload_exposes_backup_runtime_overlay() {
+        let host = Host {
+            name: "athena".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: Some("not-rendered-token-hash".to_string()),
+            last_seen: Some(970),
+            heartbeat_log: vec![910, 970],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            service_observations: vec![],
+            backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
+        };
+
+        let payload = hosts_payload(vec![host], &[], 1000);
+
+        assert_eq!(payload["as_of"], 1000);
+        assert_eq!(
+            payload["hosts"][0]["backup_observations"][0]["id"],
+            "restic-main"
+        );
+        assert_eq!(
+            payload["hosts"][0]["backup_observations"][0]["restore_validation"]["level"],
+            "repository-check"
+        );
+        assert_eq!(
+            payload["hosts"][0]["backup_observations_summary"]["state"],
+            "healthy"
+        );
+        assert_eq!(
+            payload["hosts"][0]["backup_observations_summary"]["label"],
+            "healthy"
+        );
+        assert_eq!(
+            payload["hosts"][0]["backup_observations_summary"]["total"],
+            1
+        );
+        assert!(!payload.to_string().contains("not-rendered-token-hash"));
+    }
+
+    #[test]
     fn render_alerts_derives_actionable_attention_queue() {
         let hosts = vec![
             Host {
@@ -7733,6 +7884,7 @@ mod tests {
                     ..Default::default()
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "poseidon".to_string(),
@@ -7750,6 +7902,7 @@ mod tests {
                     ..Default::default()
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "athena".to_string(),
@@ -7780,6 +7933,7 @@ mod tests {
                         summary: "response is slow".to_string(),
                     },
                 ],
+                backup_observations: vec![],
             },
             Host {
                 name: "hermes".to_string(),
@@ -7798,6 +7952,7 @@ mod tests {
                     commits_behind: Some(3),
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -7891,6 +8046,7 @@ mod tests {
                     commits_behind: Some(0),
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "athena".to_string(),
@@ -7927,6 +8083,7 @@ mod tests {
                         summary: "response is slow".to_string(),
                     },
                 ],
+                backup_observations: vec![],
             },
             Host {
                 name: "hades".to_string(),
@@ -7944,6 +8101,7 @@ mod tests {
                     ..Default::default()
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -8029,6 +8187,7 @@ mod tests {
                     ..Default::default()
                 },
                 service_observations: vec![],
+                backup_observations: vec![],
             }
         }
 
@@ -8067,6 +8226,7 @@ mod tests {
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "csb0".to_string(),
@@ -8094,6 +8254,7 @@ mod tests {
                 }),
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "hsb8".to_string(),
@@ -8108,6 +8269,7 @@ mod tests {
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "dsc0".to_string(),
@@ -8122,6 +8284,7 @@ mod tests {
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
+                backup_observations: vec![],
             },
             Host {
                 name: "new-host".to_string(),
@@ -8136,6 +8299,7 @@ mod tests {
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
+                backup_observations: vec![],
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -8346,6 +8510,7 @@ mod tests {
             )),
             freshness: NixFreshness::default(),
             service_observations: vec![],
+            backup_observations: vec![],
         };
         let mut manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -8455,6 +8620,7 @@ mod tests {
             }),
             freshness: NixFreshness::default(),
             service_observations: vec![],
+            backup_observations: vec![],
         };
 
         let payload = declared_hosts_payload(
@@ -8496,6 +8662,7 @@ mod tests {
                 location: None,
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
+                backup_observations: vec![],
             }
         }
 
@@ -8697,6 +8864,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ..Default::default()
             },
             service_observations: vec![],
+            backup_observations: vec![],
         };
         let manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -8788,6 +8956,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ..Default::default()
             },
             service_observations: vec![],
+            backup_observations: vec![],
         };
         let lone = render_home(&[host], "csb1", 1000, &[], "local access", false, true);
         assert!(lone.contains(r#"<aside class="lone-state""#));
@@ -8815,6 +8984,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ..Default::default()
             },
             service_observations: vec![],
+            backup_observations: vec![],
         };
 
         let html = render_home(&[host], "csb1", 1000, &[], "reader", true, false);
@@ -8876,6 +9046,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(1),
             })],
+            backup_observations: vec![backup_observation(BackupPostureState::Warning)],
         };
 
         let payload = declared_hosts_payload(
@@ -8898,6 +9069,17 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             payload["declared_hosts"][0]["runtime"]["server_probes_summary"]["label"],
             "not probed"
         );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["backup_observations"][0]["id"],
+            "restic-main"
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["backup_observations_summary"]["state"],
+            "warning"
+        );
+        assert!(payload["declared_hosts"][0]["declared"]
+            .get("backup_observations")
+            .is_none());
         assert!(!payload.to_string().contains("stored-token-hash"));
     }
 
@@ -8985,6 +9167,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(
             payload["declared_hosts"][0]["runtime"]["liveness"],
             "awaiting_first_heartbeat"
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["backup_observations_summary"]["state"],
+            "unknown"
+        );
+        assert_eq!(
+            payload["declared_hosts"][0]["runtime"]["backup_observations_summary"]["total"],
+            0
         );
     }
 

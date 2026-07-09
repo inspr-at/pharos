@@ -1108,6 +1108,7 @@ mod tests {
                 commits_behind: Some(0),
             },
             service_observations: vec![],
+            backup_observations: vec![],
         }
     }
 
