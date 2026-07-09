@@ -225,9 +225,13 @@ struct SetupProviderPlan {
     provider: &'static str,
     template: &'static str,
     strategy: &'static str,
+    approach: &'static str,
     summary: &'static str,
     docs: Vec<SetupProviderPlanDoc>,
+    resources: Vec<SetupProviderPlanResource>,
     steps: Vec<SetupProviderPlanStep>,
+    secret_boundary: Vec<SetupProviderPlanSecretBoundary>,
+    handoffs: Vec<SetupProviderPlanHandoff>,
     runtime_checks: Vec<&'static str>,
 }
 
@@ -238,11 +242,34 @@ struct SetupProviderPlanDoc {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SetupProviderPlanResource {
+    key: &'static str,
+    kind: &'static str,
+    required: bool,
+    api: &'static str,
+    detail: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct SetupProviderPlanStep {
     key: &'static str,
     title: &'static str,
     detail: &'static str,
     status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SetupProviderPlanSecretBoundary {
+    key: &'static str,
+    source: &'static str,
+    rule: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SetupProviderPlanHandoff {
+    key: &'static str,
+    target: &'static str,
+    detail: &'static str,
 }
 
 fn setup_provider_plan(
@@ -275,6 +302,7 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
             _ => "hetzner-small-nixos",
         },
         strategy: "hcloud-api-plus-nixos-anywhere",
+        approach: "Use direct Hetzner Cloud API execution for live jobs; keep the hcloud Terraform/OpenTofu provider as the plan-compatible reference, not as a required state backend.",
         summary: "Plan Hetzner Cloud resources through the Cloud API, then bootstrap NixOS with nixos-anywhere before waiting for the first beacon heartbeat.",
         docs: vec![
             SetupProviderPlanDoc {
@@ -294,11 +322,48 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
                 url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
             },
         ],
+        resources: vec![
+            SetupProviderPlanResource {
+                key: "server",
+                kind: "hetzner-cloud-server",
+                required: true,
+                api: "GET /server_types, GET /locations, GET /images, POST /servers",
+                detail: "Select server type, location, and bootstrap-capable base image at plan time, then create the server only after operator confirmation.",
+            },
+            SetupProviderPlanResource {
+                key: "ssh_key",
+                kind: "hetzner-cloud-ssh-key",
+                required: true,
+                api: "GET /ssh_keys, POST /ssh_keys",
+                detail: "Attach or create an SSH public key only; private key material stays outside provider state and outside Pharos job records.",
+            },
+            SetupProviderPlanResource {
+                key: "firewall",
+                kind: "hetzner-cloud-firewall",
+                required: true,
+                api: "GET /firewalls, POST /firewalls, POST /firewalls/{id}/actions/apply_to_resources",
+                detail: "Apply a minimal firewall profile for SSH/bootstrap and Pharos beacon egress; rules are visible in the review plan before creation.",
+            },
+            SetupProviderPlanResource {
+                key: "volume",
+                kind: "hetzner-cloud-volume",
+                required: false,
+                api: "GET /volumes, POST /volumes",
+                detail: "Optional data volume; availability, size, attachment, and cost are verified at plan time before inclusion.",
+            },
+            SetupProviderPlanResource {
+                key: "backup_or_snapshot",
+                kind: "hetzner-cloud-backup-snapshot",
+                required: false,
+                api: "GET /pricing, POST /servers/{id}/actions/create_image",
+                detail: "Optional provider backup or initial snapshot handoff; pricing and support are runtime checks, not hardcoded promises.",
+            },
+        ],
         steps: vec![
             SetupProviderPlanStep {
                 key: "provider_resources",
                 title: "Provider resources",
-                detail: "Create or dry-run the server, SSH public key attachment, labels, and a minimal firewall through Hetzner Cloud API calls.",
+                detail: "Plan or create the server, SSH public key attachment, labels, and a minimal firewall through Hetzner Cloud API calls.",
                 status: "planned",
             },
             SetupProviderPlanStep {
@@ -326,6 +391,45 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
                 status: "waiting",
             },
         ],
+        secret_boundary: vec![
+            SetupProviderPlanSecretBoundary {
+                key: "provider_api_token",
+                source: "runtime secret reference",
+                rule: "Use only for the provider executor call; never serialize into plan JSON, PPM notes, logs, progress messages, URLs, or OpenTofu state.",
+            },
+            SetupProviderPlanSecretBoundary {
+                key: "ssh_private_key",
+                source: "operator or agent runtime",
+                rule: "Only public keys may be sent to Hetzner Cloud; private key material must stay in the runtime secret store.",
+            },
+            SetupProviderPlanSecretBoundary {
+                key: "pharos_registration_and_beacon",
+                source: "Pharos/Janus handoff",
+                rule: "Registration and per-host beacon values are one-time or secret-store handoffs; job output may show refs and states only.",
+            },
+        ],
+        handoffs: vec![
+            SetupProviderPlanHandoff {
+                key: "provider_executor",
+                target: "PHAROS-97",
+                detail: "Consumes this plan contract to call Hetzner Cloud and persist safe resource identifiers plus cleanup guidance.",
+            },
+            SetupProviderPlanHandoff {
+                key: "nixos_bootstrap",
+                target: "nixos-anywhere",
+                detail: "Runs against the freshly reachable server using a reviewed flake profile and generated hardware facts.",
+            },
+            SetupProviderPlanHandoff {
+                key: "beacon_token",
+                target: "Pharos/Janus",
+                detail: "Installs pharos-beacon with a token file or managed secret ref, then waits for first heartbeat before live state.",
+            },
+            SetupProviderPlanHandoff {
+                key: "backup_location",
+                target: "PHAROS-83/86",
+                detail: "Leaves backup enrollment and location source as explicit pending work when they are not completed during provisioning.",
+            },
+        ],
         runtime_checks: vec![
             "server_type availability",
             "location availability",
@@ -344,11 +448,28 @@ fn manual_import_setup_plan() -> SetupProviderPlan {
         provider: "manual-import",
         template: "manual-import",
         strategy: "operator-managed-import",
+        approach: "Keep provider creation external; Pharos plans the import/bootstrap checks and records only safe runtime observations.",
         summary: "Keep provider creation outside Pharos, then import and bootstrap the already-created host.",
         docs: vec![SetupProviderPlanDoc {
             label: "nixos-anywhere quickstart",
             url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
         }],
+        resources: vec![
+            SetupProviderPlanResource {
+                key: "existing_server",
+                kind: "operator-owned-server",
+                required: true,
+                api: "external",
+                detail: "Operator supplies an already-created host and SSH route; Pharos does not create provider resources for this path.",
+            },
+            SetupProviderPlanResource {
+                key: "ssh_access",
+                kind: "ssh-route",
+                required: true,
+                api: "preflight",
+                detail: "Verify reachability and privilege level before bootstrap; private keys remain outside Pharos records.",
+            },
+        ],
         steps: vec![
             SetupProviderPlanStep {
                 key: "provider_resources",
@@ -367,6 +488,30 @@ fn manual_import_setup_plan() -> SetupProviderPlan {
                 title: "Observable finish",
                 detail: "Wait for first heartbeat and record backup/location decisions explicitly.",
                 status: "waiting",
+            },
+        ],
+        secret_boundary: vec![
+            SetupProviderPlanSecretBoundary {
+                key: "ssh_private_key",
+                source: "operator runtime",
+                rule: "Use only for preflight/bootstrap; never serialize private key material into Pharos job state.",
+            },
+            SetupProviderPlanSecretBoundary {
+                key: "pharos_registration_and_beacon",
+                source: "Pharos/Janus handoff",
+                rule: "Registration and beacon values stay in runtime secret handling; UI and progress text show states only.",
+            },
+        ],
+        handoffs: vec![
+            SetupProviderPlanHandoff {
+                key: "existing_host_preflight",
+                target: "PHAROS-84/85",
+                detail: "Chooses SSH/bootstrap method and validates the host before installing or configuring the beacon.",
+            },
+            SetupProviderPlanHandoff {
+                key: "backup_location",
+                target: "PHAROS-86",
+                detail: "Records backup and location setup decisions after the imported host reports.",
             },
         ],
         runtime_checks: vec![
@@ -7517,6 +7662,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(plan.strategy, "hcloud-api-plus-nixos-anywhere");
         assert_eq!(plan.provider, "hetzner-cloud");
         assert_eq!(plan.template, "hetzner-small-nixos");
+        assert!(plan.approach.contains("direct Hetzner Cloud API"));
         assert!(plan
             .docs
             .iter()
@@ -7525,11 +7671,34 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .docs
             .iter()
             .any(|doc| doc.url.contains("nixos-anywhere")));
+        assert!(plan
+            .resources
+            .iter()
+            .any(|resource| resource.key == "server"
+                && resource.required
+                && resource.api.contains("POST /servers")));
+        assert!(plan
+            .resources
+            .iter()
+            .any(|resource| resource.key == "firewall" && resource.required));
+        assert!(plan
+            .resources
+            .iter()
+            .any(|resource| resource.key == "volume" && !resource.required));
         assert!(plan.runtime_checks.contains(&"current provider price"));
         assert!(plan
             .steps
             .iter()
             .any(|step| step.key == "beacon_handoff" && step.status == "protected"));
+        assert!(plan
+            .secret_boundary
+            .iter()
+            .any(|boundary| boundary.key == "provider_api_token"
+                && boundary.rule.contains("never serialize")));
+        assert!(plan
+            .handoffs
+            .iter()
+            .any(|handoff| handoff.key == "provider_executor" && handoff.target == "PHAROS-97"));
         let json = serde_json::to_string(&plan).expect("plan serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
