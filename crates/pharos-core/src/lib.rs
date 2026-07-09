@@ -327,8 +327,10 @@ pub struct SshAccessIntent {
 
 impl SshAccessIntent {
     fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
-        if matches!(self.route, SshRoute::Direct | SshRoute::Tailnet | SshRoute::Bastion)
-            && self.host.as_ref().is_none_or(|host| host.trim().is_empty())
+        if matches!(
+            self.route,
+            SshRoute::Direct | SshRoute::Tailnet | SshRoute::Bastion
+        ) && self.host.as_ref().is_none_or(|host| host.trim().is_empty())
         {
             return Err(ServerLifecycleContractError::SshHostRequired);
         }
@@ -478,7 +480,10 @@ impl std::fmt::Display for ServerLifecycleContractError {
             Self::EmptyHostname => write!(f, "server lifecycle hostname is empty"),
             Self::ProviderRequired => write!(f, "provider-created server requires provider"),
             Self::ExternalOwnerMustBeExternal => {
-                write!(f, "external owner requires externally-managed lifecycle state")
+                write!(
+                    f,
+                    "external owner requires externally-managed lifecycle state"
+                )
             }
             Self::SshHostRequired => write!(f, "ssh route requires host"),
             Self::InvalidSecretReference => write!(f, "secret reference must not be raw material"),
@@ -1334,7 +1339,9 @@ mod tests {
                 }],
             },
         };
-        intent.validate_contract().expect("imported host intent valid");
+        intent
+            .validate_contract()
+            .expect("imported host intent valid");
 
         let host = Host {
             name: "hsb8".to_string(),
