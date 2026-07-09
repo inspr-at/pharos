@@ -1458,7 +1458,7 @@ main[data-view="list"] .list-wrap{display:block}
 .onboard-row button{appearance:none;width:100%;display:flex;align-items:center;gap:12px;border:0;background:transparent;color:var(--ink);font:inherit;text-align:left;cursor:pointer}.onboard-row button:hover strong,.onboard-row button:focus-visible strong{color:#0f4f80}.onboard-row button:focus-visible{outline:0}
 .onboard-row .onboard-mark{width:32px;height:32px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.onboard-row .onboard-mark .ico{width:16px;height:16px}.onboard-row strong{display:block;font-size:13px}.onboard-row span:last-child{display:block;color:var(--muted);font-size:12px}
 .ops-main{width:min(1280px,100%)}
-.ops-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
+.ops-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:0 0 18px}
 .ops-metric{--metric-color:var(--wait);appearance:none;width:100%;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;min-height:78px;padding:14px 16px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.82);box-shadow:0 12px 30px rgba(54,88,108,.06);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);text-align:left;cursor:pointer}
 .ops-metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color) 20%,transparent)}
 .ops-metric b{display:block;font-family:Georgia,"Times New Roman",serif;font-size:28px;line-height:1;font-weight:500;color:var(--ink)}
@@ -6178,6 +6178,123 @@ fn service_alert(host: &Host, observation: &ServiceObservation, now: i64) -> Opt
     })
 }
 
+fn backup_sort_time(host: &Host, observation: &BackupObservation, now: i64) -> i64 {
+    observation
+        .last_attempt_at
+        .or(observation.last_success_at)
+        .or(observation.last_check_at)
+        .or(host.last_seen)
+        .unwrap_or(now)
+}
+
+fn backup_alert(host: &Host, observation: &BackupObservation, now: i64) -> Option<AlertItem> {
+    let (level, action) = match observation.state {
+        BackupPostureState::Healthy => return None,
+        BackupPostureState::Failed => (
+            "critical",
+            "Inspect the backup job, fix the failure, then confirm the next successful run.",
+        ),
+        BackupPostureState::Missing => (
+            "critical",
+            "Restore or declare the expected backup job for this host.",
+        ),
+        BackupPostureState::Stale => (
+            "warning",
+            "Confirm the backup schedule, runner, and latest successful snapshot.",
+        ),
+        BackupPostureState::Warning => (
+            "warning",
+            "Review backup evidence and schedule before the next maintenance window.",
+        ),
+        BackupPostureState::Unknown => (
+            "watch",
+            "Confirm the backup collector can observe this job.",
+        ),
+        BackupPostureState::NotConfigured => (
+            "watch",
+            "Decide whether this host should be protected or intentionally unprotected.",
+        ),
+    };
+    Some(AlertItem {
+        level,
+        host: host.name.clone(),
+        role: host.role.clone(),
+        issue: format!(
+            "{}: {}",
+            observation.label,
+            backup_state_label(observation.state)
+        ),
+        detail: observation.summary.clone(),
+        source: "backup",
+        seen: format!(
+            "{} ago",
+            duration_label((now - backup_sort_time(host, observation, now)).max(0))
+        ),
+        next_action: action.to_string(),
+        sort_time: backup_sort_time(host, observation, now),
+    })
+}
+
+fn backup_validation_alert(
+    host: &Host,
+    observation: &BackupObservation,
+    now: i64,
+) -> Option<AlertItem> {
+    let restore = observation.restore_validation.as_ref();
+    let (state, checked_at, label, detail) = if let Some(restore) = restore {
+        (
+            restore.state,
+            restore.checked_at,
+            restore
+                .evidence_label
+                .as_deref()
+                .unwrap_or_else(|| backup_validation_level_label(restore.level))
+                .to_string(),
+            restore
+                .summary
+                .clone()
+                .unwrap_or_else(|| backup_validation_label(observation, now)),
+        )
+    } else if let Some(state) = observation.last_check_state {
+        (
+            state,
+            observation.last_check_at,
+            "backup check".to_string(),
+            backup_validation_label(observation, now),
+        )
+    } else {
+        return None;
+    };
+
+    let (level, issue, action) = match state {
+        pharos_core::BackupValidationState::Failed => (
+            "critical",
+            "Restore validation failed",
+            "Inspect validation evidence and run a clean restore or repository check.",
+        ),
+        pharos_core::BackupValidationState::Stale => (
+            "warning",
+            "Restore validation overdue",
+            "Run a restore validation or repository check and let Pharos observe it.",
+        ),
+        pharos_core::BackupValidationState::Passed
+        | pharos_core::BackupValidationState::Unknown => return None,
+    };
+
+    let sort_time = checked_at.unwrap_or_else(|| backup_sort_time(host, observation, now));
+    Some(AlertItem {
+        level,
+        host: host.name.clone(),
+        role: host.role.clone(),
+        issue: format!("{}: {}", observation.label, issue),
+        detail: label + " - " + &detail,
+        source: "backup",
+        seen: format!("{} ago", duration_label((now - sort_time).max(0))),
+        next_action: action.to_string(),
+        sort_time,
+    })
+}
+
 fn is_nix_freshness_observation(observation: &ServiceObservation) -> bool {
     observation.id == "nix-freshness" || observation.label.eq_ignore_ascii_case("Nix freshness")
 }
@@ -6325,6 +6442,15 @@ fn alert_items(
 
         for observation in &host.service_observations {
             if let Some(alert) = service_alert(host, observation, now) {
+                alerts.push(alert);
+            }
+        }
+
+        for observation in &host.backup_observations {
+            if let Some(alert) = backup_alert(host, observation, now) {
+                alerts.push(alert);
+            }
+            if let Some(alert) = backup_validation_alert(host, observation, now) {
                 alerts.push(alert);
             }
         }
@@ -6484,7 +6610,7 @@ fn render_alert_row(group: &AlertGroup) -> String {
 
 fn render_alert_rows(groups: &[AlertGroup]) -> String {
     if groups.is_empty() {
-        return r#"<section class="ops-empty"><h2>All clear</h2><p>No host, freshness, service, probe, or manifest alert needs attention right now.</p></section>"#.to_string();
+        return r#"<section class="ops-empty"><h2>All clear</h2><p>No host, backup, freshness, service, probe, or manifest alert needs attention right now.</p></section>"#.to_string();
     }
     groups.iter().map(render_alert_row).collect()
 }
@@ -6524,7 +6650,7 @@ fn render_alerts(
     let groups = alert_groups(&alerts);
     let rows = render_alert_rows(&groups);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, backup, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "alerts"),
         header = page_header("Alerts", "Needs attention", now),
         summary = ops_summary_metrics(&alerts, hosts),
@@ -6669,6 +6795,172 @@ document.querySelectorAll('[data-ops-page]').forEach(root=>{
 </script>"#
 }
 
+fn backup_engine_label(engine: pharos_core::BackupEngine) -> &'static str {
+    match engine {
+        pharos_core::BackupEngine::Restic => "Restic",
+        pharos_core::BackupEngine::Borg => "Borg",
+        pharos_core::BackupEngine::Kopia => "Kopia",
+        pharos_core::BackupEngine::ProviderSnapshot => "provider snapshot",
+        pharos_core::BackupEngine::Other => "backup",
+        pharos_core::BackupEngine::Unknown => "backup",
+    }
+}
+
+fn backup_activity_level(state: BackupPostureState) -> &'static str {
+    match backup_level(state) {
+        "clear" => "info",
+        level => level,
+    }
+}
+
+fn backup_activity_detail(observation: &BackupObservation) -> String {
+    let mut parts = vec![backup_engine_label(observation.engine).to_string()];
+    if let Some(schedule) = &observation.schedule {
+        parts.push(format!("schedule {}", schedule));
+    }
+    if let Some(target) = &observation.target_label {
+        parts.push(format!("target {}", target));
+    }
+    parts.join(" · ")
+}
+
+fn push_backup_activity_events(
+    events: &mut Vec<ActivityEvent>,
+    host: &Host,
+    observation: &BackupObservation,
+    now: i64,
+) {
+    let observed_at = backup_sort_time(host, observation, now);
+    events.push(ActivityEvent::new(
+        host.last_seen.unwrap_or(observed_at),
+        host.name.clone(),
+        "info",
+        "backup",
+        "Backup source observed",
+        backup_activity_detail(observation),
+        "backup",
+    ));
+
+    if let Some(timestamp) = observation.last_success_at {
+        events.push(ActivityEvent::new(
+            timestamp,
+            host.name.clone(),
+            "info",
+            "backup",
+            format!("{} succeeded", observation.label),
+            backup_activity_detail(observation),
+            "backup",
+        ));
+    }
+
+    if let (Some(timestamp), Some(state)) =
+        (observation.last_attempt_at, observation.last_attempt_state)
+    {
+        match state {
+            pharos_core::BackupRunState::Succeeded => {}
+            pharos_core::BackupRunState::Failed => events.push(ActivityEvent::new(
+                timestamp,
+                host.name.clone(),
+                "critical",
+                "backup",
+                format!("{} failed", observation.label),
+                observation.summary.clone(),
+                "backup",
+            )),
+            pharos_core::BackupRunState::Running => events.push(ActivityEvent::new(
+                timestamp,
+                host.name.clone(),
+                "watch",
+                "backup",
+                format!("{} running", observation.label),
+                observation.summary.clone(),
+                "backup",
+            )),
+            pharos_core::BackupRunState::Unknown => events.push(ActivityEvent::new(
+                timestamp,
+                host.name.clone(),
+                "watch",
+                "backup",
+                format!("{} state unknown", observation.label),
+                observation.summary.clone(),
+                "backup",
+            )),
+        }
+    }
+
+    if observation.state != BackupPostureState::Healthy {
+        events.push(ActivityEvent::new(
+            observed_at,
+            host.name.clone(),
+            backup_activity_level(observation.state),
+            "backup",
+            format!(
+                "{}: {}",
+                observation.label,
+                backup_state_label(observation.state)
+            ),
+            observation.summary.clone(),
+            "backup",
+        ));
+    }
+
+    if let Some(restore) = &observation.restore_validation {
+        let level = match restore.state {
+            pharos_core::BackupValidationState::Passed => "info",
+            pharos_core::BackupValidationState::Failed => "critical",
+            pharos_core::BackupValidationState::Stale => "warning",
+            pharos_core::BackupValidationState::Unknown => "watch",
+        };
+        let checked_at = restore.checked_at.unwrap_or(observed_at);
+        let label = restore
+            .evidence_label
+            .as_deref()
+            .unwrap_or_else(|| backup_validation_level_label(restore.level));
+        events.push(ActivityEvent::new(
+            checked_at,
+            host.name.clone(),
+            level,
+            "backup",
+            format!(
+                "{} validation {}",
+                observation.label,
+                backup_validation_state_label(restore.state)
+            ),
+            format!(
+                "{} - {}",
+                label,
+                restore
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| backup_validation_label(observation, now))
+            ),
+            "backup",
+        ));
+    } else if let (Some(timestamp), Some(state)) =
+        (observation.last_check_at, observation.last_check_state)
+    {
+        let level = match state {
+            pharos_core::BackupValidationState::Passed => "info",
+            pharos_core::BackupValidationState::Failed => "critical",
+            pharos_core::BackupValidationState::Stale => "warning",
+            pharos_core::BackupValidationState::Unknown => "watch",
+        };
+        events.push(ActivityEvent::new(
+            timestamp,
+            host.name.clone(),
+            level,
+            "backup",
+            format!(
+                "{} validation {}",
+                observation.label,
+                backup_validation_state_label(state)
+            ),
+            backup_validation_label(observation, now),
+            "backup",
+        ));
+    }
+}
+
 fn activity_events(
     hosts: &[Host],
     _self_name: &str,
@@ -6793,6 +7085,10 @@ fn activity_events(
                 ));
             }
         }
+
+        for observation in &host.backup_observations {
+            push_backup_activity_events(&mut events, host, observation, now);
+        }
     }
 
     for (host, probes) in server_probes {
@@ -6832,8 +7128,9 @@ fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
     let heartbeat = activity_source_count(events, "heartbeat");
     let freshness = activity_source_count(events, "freshness");
     let service = activity_source_count(events, "service");
+    let backup = activity_source_count(events, "backup");
     format!(
-        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button></section>"#,
+        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
         total = events.len()
     )
 }
@@ -6849,11 +7146,12 @@ fn activity_filter_bar(events: &[ActivityEvent]) -> String {
         .filter(|event| event.level == "warning")
         .count();
     format!(
-        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
+        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
         total = events.len(),
         heartbeat = activity_source_count(events, "heartbeat"),
         freshness = activity_source_count(events, "freshness"),
         service = activity_source_count(events, "service"),
+        backup = activity_source_count(events, "backup"),
     )
 }
 
@@ -6880,7 +7178,7 @@ fn render_activity_row(event: &ActivityEvent) -> String {
 
 fn activity_rows(events: &[ActivityEvent]) -> String {
     if events.is_empty() {
-        return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, freshness changes, service observations, and config events here.</p></section>"#.to_string();
+        return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, backup changes, freshness changes, service observations, and config events here.</p></section>"#.to_string();
     }
     events.iter().take(80).map(render_activity_row).collect()
 }
@@ -6901,7 +7199,7 @@ fn render_activity(
     let events = activity_events(hosts, self_name, now, manifests, load_errors, server_probes);
     let rows = activity_rows(&events);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
         header = page_header("Activity", "Operational timeline", now),
         summary = activity_summary_metrics(&events),
@@ -8337,6 +8635,22 @@ mod tests {
 
     #[test]
     fn render_alerts_derives_actionable_attention_queue() {
+        let mut failed_backup = backup_observation(BackupPostureState::Failed);
+        failed_backup.summary = "backup command failed".to_string();
+        failed_backup.last_attempt_at = Some(940);
+        failed_backup.last_attempt_state = Some(pharos_core::BackupRunState::Failed);
+        failed_backup.last_success_at = None;
+        failed_backup.restore_validation = None;
+
+        let mut stale_validation = backup_observation(BackupPostureState::Healthy);
+        stale_validation.restore_validation = Some(pharos_core::BackupValidationObservation {
+            level: pharos_core::BackupValidationLevel::RestoreSample,
+            state: pharos_core::BackupValidationState::Stale,
+            checked_at: Some(900),
+            evidence_label: Some("restore sample".to_string()),
+            summary: Some("restore drill is overdue".to_string()),
+        });
+
         let hosts = vec![
             Host {
                 name: "csb1".to_string(),
@@ -8354,7 +8668,7 @@ mod tests {
                     ..Default::default()
                 },
                 service_observations: vec![],
-                backup_observations: vec![],
+                backup_observations: vec![failed_backup],
             },
             Host {
                 name: "poseidon".to_string(),
@@ -8372,7 +8686,7 @@ mod tests {
                     ..Default::default()
                 },
                 service_observations: vec![],
-                backup_observations: vec![],
+                backup_observations: vec![stale_validation],
             },
             Host {
                 name: "athena".to_string(),
@@ -8478,6 +8792,12 @@ mod tests {
         assert!(html.contains(r#"<span class="alert-repeat">2 alerts</span>"#));
         assert!(html.contains("athena, hermes"));
         assert!(html.contains("nginx: warning"));
+        assert!(html.contains("Restic main: Backup failed"));
+        assert!(html.contains("backup command failed"));
+        assert!(html.contains("Inspect the backup job"));
+        assert!(html.contains("Restic main: Restore validation overdue"));
+        assert!(html.contains("restore sample - restore drill is overdue"));
+        assert!(html.contains(r#"data-ops-kind="backup""#));
         assert!(!html.contains("Nix freshness: warning"));
         assert!(html.contains("Home Assistant probe warning"));
         assert!(html.contains("Install or start pharos-beacon"));
@@ -8490,14 +8810,27 @@ mod tests {
         assert!(html.contains(r#"placeholder="Search hosts...""#));
         assert!(html.contains(r#"data-host-search="athena server hermes server"#));
         assert!(html.contains(r#"class="posture-ring" type="button" data-ops-filter="critical""#));
-        assert!(html.contains(r#"<strong>2</strong><span>critical</span>"#));
+        assert!(html.contains(r#"<strong>3</strong><span>critical</span>"#));
         assert!(html.contains("Repeated alerts are grouped."));
         assert!(html.contains("const filterOk=active==='all'"));
+        assert!(!html.contains("restic-main-repository"));
         assert!(!html.contains("not-rendered-token-hash"));
     }
 
     #[test]
     fn render_activity_derives_operational_timeline() {
+        let mut healthy_backup = backup_observation(BackupPostureState::Healthy);
+        healthy_backup.last_attempt_at = Some(940);
+        healthy_backup.last_success_at = Some(940);
+        healthy_backup.last_check_at = Some(950);
+        healthy_backup.restore_validation = Some(pharos_core::BackupValidationObservation {
+            level: pharos_core::BackupValidationLevel::RepositoryCheck,
+            state: pharos_core::BackupValidationState::Passed,
+            checked_at: Some(950),
+            evidence_label: Some("repo check".to_string()),
+            summary: Some("repository check passed".to_string()),
+        });
+
         let hosts = vec![
             Host {
                 name: "csb1".to_string(),
@@ -8516,7 +8849,7 @@ mod tests {
                     commits_behind: Some(0),
                 },
                 service_observations: vec![],
-                backup_observations: vec![],
+                backup_observations: vec![healthy_backup],
             },
             Host {
                 name: "athena".to_string(),
@@ -8624,10 +8957,16 @@ mod tests {
         assert!(html.contains("Freshness drift detected"));
         assert!(html.contains("ssh is healthy"));
         assert!(html.contains("nginx warning"));
+        assert!(html.contains("Backup source observed"));
+        assert!(html.contains("Restic main succeeded"));
+        assert!(html.contains("Restic main validation passed"));
+        assert!(html.contains("repository check passed"));
         assert!(!html.contains("Nix freshness warning"));
         assert!(html.contains("ssh probe healthy"));
         assert!(html.contains("Declared host manifest loaded"));
         assert!(html.contains(r#"data-activity-filter="heartbeat""#));
+        assert!(html.contains(r#"data-activity-filter="backup""#));
+        assert!(html.contains(r#"data-ops-filter="backup""#));
         assert!(html.contains(r#"data-ops-filter="heartbeat""#));
         assert!(html.contains(r#"placeholder="Search hosts...""#));
         assert!(html.contains(r#"data-host-search="athena freshness freshness drift detected"#));
@@ -8635,6 +8974,7 @@ mod tests {
         assert!(html.contains(r#"data-activity-filter="critical""#));
         assert!(html.contains("const filterOk=active==='all'"));
         assert!(html.contains("Activity is derived from current retained Pharos state."));
+        assert!(!html.contains("restic-main-repository"));
         assert!(!html.contains("not-rendered-token-hash"));
     }
 
