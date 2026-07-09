@@ -2115,7 +2115,17 @@ function renderExistingPreflight(overlay,preflight){
       title.textContent=option.label||preflightStateTitle(option.method);
       const text=document.createElement('span');
       text.textContent=option.message||'Review this path before applying changes.';
+      const detail=document.createElement('span');
+      const changes=Array.isArray(option.changes)?option.changes:[];
+      const detailParts=[
+        changes.join(' '),
+        option.token_handoff||'',
+        option.existing_token_policy||'',
+        option.next_state?`Next: ${option.next_state}.`:''
+      ].filter(Boolean);
+      detail.textContent=detailParts.join(' ');
       row.append(title,text);
+      if(detail.textContent)row.append(detail);
       bootstrap.append(row);
     });
     bootstrap.hidden=options.length===0;
@@ -3134,6 +3144,19 @@ fn bootstrap_options(
                 "Needs reachable SSH, authentication, privilege, Linux/NixOS facts, and enough disk."
                     .to_string()
             },
+            changes: vec![
+                "Review and apply a declarative NixOS bootstrap.".to_string(),
+                "Install or update pharos-beacon through managed system configuration.".to_string(),
+            ],
+            token_handoff: Some(
+                "Beacon token handoff uses a managed file or env-file, never a command-line argument."
+                    .to_string(),
+            ),
+            existing_token_policy: Some(
+                "Existing beacon token files are rotation-sensitive and must be reviewed before replacement."
+                    .to_string(),
+            ),
+            next_state: Some("awaiting-first-heartbeat after setup starts".to_string()),
         },
         ExistingHostBootstrapOption {
             method: BootstrapMethod::NativeSystemd,
@@ -3145,6 +3168,18 @@ fn bootstrap_options(
             } else {
                 "Needs verified Linux SSH access with root or sudo.".to_string()
             },
+            changes: vec![
+                "Install the portable pharos-beacon service on the existing OS.".to_string(),
+                "Create a least-surprise service environment file for beacon configuration.".to_string(),
+            ],
+            token_handoff: Some(
+                "Beacon token handoff uses a local env-file path owned by the service user."
+                    .to_string(),
+            ),
+            existing_token_policy: Some(
+                "Existing token files are rotation-sensitive and preserved until explicit rotation is confirmed.".to_string(),
+            ),
+            next_state: Some("awaiting-first-heartbeat after setup starts".to_string()),
         },
         ExistingHostBootstrapOption {
             method: BootstrapMethod::Manual,
@@ -3153,6 +3188,18 @@ fn bootstrap_options(
             message:
                 "Always available; the operator completes setup without automated host changes."
                     .to_string(),
+            changes: vec![
+                "No automated host changes are made by Pharos.".to_string(),
+                "Show manual instructions and wait for the first heartbeat.".to_string(),
+            ],
+            token_handoff: Some(
+                "Token handoff stays file/env-file based; do not paste raw tokens into shell history."
+                    .to_string(),
+            ),
+            existing_token_policy: Some(
+                "If a token already exists, treat it as rotation-sensitive state.".to_string(),
+            ),
+            next_state: Some("manual setup or awaiting-first-heartbeat".to_string()),
         },
     ]
 }
@@ -6927,10 +6974,20 @@ mod tests {
             .bootstrap_options
             .iter()
             .any(|option| { option.method == BootstrapMethod::NixosAnywhere && option.available }));
-        assert!(report
+        let native = report
             .bootstrap_options
             .iter()
-            .any(|option| { option.method == BootstrapMethod::NativeSystemd && option.available }));
+            .find(|option| option.method == BootstrapMethod::NativeSystemd)
+            .expect("native beacon option");
+        assert!(native.available);
+        assert!(native
+            .token_handoff
+            .as_deref()
+            .is_some_and(|handoff| handoff.contains("env-file")));
+        assert!(native
+            .existing_token_policy
+            .as_deref()
+            .is_some_and(|policy| policy.contains("rotation-sensitive")));
     }
 
     #[test]

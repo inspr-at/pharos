@@ -466,11 +466,24 @@ pub struct ExistingHostBootstrapOption {
     pub label: String,
     pub available: bool,
     pub message: String,
+    #[serde(default)]
+    pub changes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_handoff: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_token_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_state: Option<String>,
 }
 
 impl ExistingHostBootstrapOption {
     fn validate_contract(&self) -> Result<(), String> {
-        for value in [&self.label, &self.message] {
+        let mut values = vec![self.label.as_str(), self.message.as_str()];
+        values.extend(self.changes.iter().map(String::as_str));
+        values.extend(self.token_handoff.as_deref());
+        values.extend(self.existing_token_policy.as_deref());
+        values.extend(self.next_state.as_deref());
+        for value in values {
             if !safe_preflight_text(value) {
                 return Err("bootstrap option must be plain non-secret text".to_string());
             }
@@ -1824,6 +1837,12 @@ mod tests {
                 label: "Native beacon".to_string(),
                 available: true,
                 message: "Use this when the host should keep its current OS.".to_string(),
+                changes: vec!["Install the portable beacon service.".to_string()],
+                token_handoff: Some("Use a file or env-file handoff.".to_string()),
+                existing_token_policy: Some(
+                    "Review existing token files before rotation.".to_string(),
+                ),
+                next_state: Some("awaiting-first-heartbeat".to_string()),
             }],
             next_action: "Choose NixOS/declarative or native beacon bootstrap.".to_string(),
         };
