@@ -32,15 +32,16 @@ use axum::{Json, Router};
 use pharos_core::{
     liveness, BackupObservation, BackupPostureState, BackupSetupIntent, BootstrapMethod,
     ExistingHostBootstrapOption, ExistingHostPreflightCheck, ExistingHostPreflightFacts,
-    ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary, Host,
-    HostLocation, HostLocationSource, HostManifest, HostRegistration, HostRegistrationResponse,
-    HostReport, Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy,
-    ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
-    ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
-    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
-    ProvisioningSetupIntent, SecretOwner, ServiceObservation, ServiceObservationState, SshRoute,
-    EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
-    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary,
+    ExistingHostSetupContext, Host, HostLocation, HostLocationSource, HostManifest,
+    HostRegistration, HostRegistrationResponse, HostReport, Liveness, LocationSetupIntent,
+    ManifestLocationMode, ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness,
+    PreflightCheckState, ProvisioningBackupProposal, ProvisioningBackupProposalKind,
+    ProvisioningBackupSecretFile, ProvisioningHandoff, ProvisioningJob, ProvisioningJobState,
+    ProvisioningProgressEntry, ProvisioningSetupIntent, SecretOwner, ServiceObservation,
+    ServiceObservationState, SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -134,6 +135,7 @@ impl ProvisioningJobStore {
         let handoff = provisioning_job_handoff(request);
         let setup_intent = provisioning_setup_intent(request);
         let backup_proposal = provisioning_backup_proposal(request);
+        let existing_host_context = provisioning_existing_host_context(request);
         let host_name = request
             .host_name
             .as_deref()
@@ -156,6 +158,7 @@ impl ProvisioningJobStore {
             role,
             is_nix: request.is_nix,
             heartbeat_interval_secs: request.heartbeat_interval_secs.filter(|value| *value > 0),
+            existing_host_context,
             state,
             created_at: now,
             updated_at: now,
@@ -266,6 +269,12 @@ struct ProvisioningJobStartRequest {
     image: Option<String>,
     #[serde(default)]
     ssh_key_ref: Option<String>,
+    #[serde(default)]
+    ssh: Option<SshAccessIntent>,
+    #[serde(default)]
+    preflight_summary: Option<ExistingHostPreflightSummary>,
+    #[serde(default)]
+    preflight_checks: Vec<ExistingHostPreflightCheck>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -590,6 +599,14 @@ fn existing_host_job_progress(
             (ProvisioningJobState::WaitingForHeartbeat, progress)
         }
         "nixos-anywhere" | "native-systemd" => {
+            if !existing_host_has_ssh_target(request) {
+                progress.push(ProvisioningProgressEntry {
+                    state: ProvisioningJobState::Failed,
+                    message: "Existing-host automated bootstrap needs a non-secret SSH target before any handoff is recorded.".to_string(),
+                    observed_at: now,
+                });
+                return (ProvisioningJobState::Failed, progress);
+            }
             progress.push(ProvisioningProgressEntry {
                 state: ProvisioningJobState::Bootstrapping,
                 message: "Existing-host bootstrap handoff prepared; no raw beacon credential was generated, rendered, or installed by Pharos.".to_string(),
@@ -606,6 +623,68 @@ fn existing_host_job_progress(
     }
 }
 
+fn existing_host_has_ssh_target(request: &ProvisioningJobStartRequest) -> bool {
+    request.ssh.as_ref().is_some_and(|ssh| {
+        !matches!(ssh.route, SshRoute::None | SshRoute::Unknown)
+            && ssh
+                .host
+                .as_deref()
+                .is_some_and(|host| !host.trim().is_empty())
+    })
+}
+
+fn provisioning_existing_host_context(
+    request: &ProvisioningJobStartRequest,
+) -> Option<ExistingHostSetupContext> {
+    if request.provider != "existing-host" {
+        return None;
+    }
+    let selected_bootstrap = match request.template.as_str() {
+        "nixos-anywhere" => BootstrapMethod::NixosAnywhere,
+        "native-systemd" => BootstrapMethod::NativeSystemd,
+        "manual-deferred" => BootstrapMethod::Manual,
+        _ => return None,
+    };
+    if matches!(
+        selected_bootstrap,
+        BootstrapMethod::NixosAnywhere | BootstrapMethod::NativeSystemd
+    ) && !existing_host_has_ssh_target(request)
+    {
+        return None;
+    }
+    let ssh = request.ssh.clone().unwrap_or(SshAccessIntent {
+        route: SshRoute::None,
+        user: None,
+        host: None,
+        port: None,
+    });
+    let host = request
+        .host_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or("the host");
+    let method_label = match selected_bootstrap {
+        BootstrapMethod::NixosAnywhere => "NixOS declarative bootstrap",
+        BootstrapMethod::NativeSystemd => "native systemd beacon install",
+        BootstrapMethod::Manual | BootstrapMethod::Deferred => "manual beacon handoff",
+    };
+    let verification_steps = vec![
+        format!("Confirm the selected path for {host}: {method_label}."),
+        "Install or reference the beacon credential through the runtime secret target only."
+            .to_string(),
+        "Start pharos-beacon and wait until Pharos records the first heartbeat.".to_string(),
+        "Finish backup and location decisions according to the recorded setup intent.".to_string(),
+    ];
+    Some(ExistingHostSetupContext {
+        ssh,
+        selected_bootstrap,
+        preflight_summary: request.preflight_summary.clone(),
+        preflight_checks: request.preflight_checks.iter().take(12).cloned().collect(),
+        verification_steps,
+    })
+}
+
 fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<ProvisioningHandoff> {
     if request.provider != "existing-host" {
         return None;
@@ -616,6 +695,13 @@ fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<Pro
         "manual-deferred" => BootstrapMethod::Manual,
         _ => return None,
     };
+    if matches!(
+        method,
+        BootstrapMethod::NixosAnywhere | BootstrapMethod::NativeSystemd
+    ) && !existing_host_has_ssh_target(request)
+    {
+        return None;
+    }
     let interval = request.heartbeat_interval_secs.unwrap_or(60).max(1);
     let backup_steps = backup_enrollment_steps(request, method);
     match method {
@@ -2955,6 +3041,19 @@ function provisioningBackupProposalMessage(job){
   const next=Array.isArray(proposal.next_steps)?proposal.next_steps.join(' '):'';
   return [`Backup proposal: ${proposal.title||'declarative backup proposal'}.`,proposal.summary||'',fileCopy?`Runtime files: ${fileCopy}.`:'',next].filter(Boolean).join(' ');
 }
+function provisioningExistingContextMessage(job){
+  const context=job?.existing_host_context;
+  if(!context)return '';
+  const ssh=context.ssh||{};
+  const route=ssh.route||'manual';
+  const target=ssh.host?` to ${ssh.host}`:'';
+  const user=ssh.user?` as ${ssh.user}`:'';
+  const summary=context.preflight_summary?.label?`Preflight: ${context.preflight_summary.label}.`:'';
+  const checks=Array.isArray(context.preflight_checks)?context.preflight_checks:[];
+  const checkCopy=checks.length?`${checks.length} preflight checks saved.`:'No preflight checks were saved.';
+  const steps=Array.isArray(context.verification_steps)?context.verification_steps.join(' '):'';
+  return [`Existing host: ${route}${target}${user}.`,summary,checkCopy,steps].filter(Boolean).join(' ');
+}
 function renderProvisioningJob(overlay,job){
   if(!overlay||!job)return;
   overlay.dataset.assistantJobId=job.id||'';
@@ -2968,7 +3067,8 @@ function renderProvisioningJob(overlay,job){
   const handoff=provisioningHandoffMessage(job);
   const setupIntent=provisioningIntentMessage(job);
   const backupProposal=provisioningBackupProposalMessage(job);
-  const fullMessage=[handoff||message,setupIntent,backupProposal].filter(Boolean).join(' ');
+  const existingContext=provisioningExistingContextMessage(job);
+  const fullMessage=[handoff||message,existingContext,setupIntent,backupProposal].filter(Boolean).join(' ');
   if(title)title.textContent=job.state==='failed'?'Setup did not start':`Setup ${label}`;
   if(copy)copy.textContent=fullMessage;
   if(jobBox){
@@ -2976,7 +3076,7 @@ function renderProvisioningJob(overlay,job){
     jobBox.scrollIntoView({block:'nearest'});
   }
   if(jobTitle)jobTitle.textContent=`Tracked job: ${label}`;
-  if(jobMessage)jobMessage.textContent=[message,handoff,setupIntent,backupProposal].filter(Boolean).join(' ');
+  if(jobMessage)jobMessage.textContent=[message,handoff,existingContext,setupIntent,backupProposal].filter(Boolean).join(' ');
   overlay.querySelectorAll('[data-progress-state]').forEach(step=>{
     step.dataset.active=String(step.dataset.progressState===job.state);
   });
@@ -3084,6 +3184,7 @@ function renderExistingPreflight(overlay,preflight){
   const bootstrap=overlay.querySelector('[data-preflight-bootstrap]');
   if(!box||!preflight)return;
   box.hidden=false;
+  overlay.pharosExistingPreflight=preflight;
   overlay.dataset.existingBootstrapMethod='';
   if(summary)summary.textContent=preflight.summary?.label||'Preflight';
   if(message)message.textContent=preflight.summary?.message||preflight.next_action||'Review checks before continuing.';
@@ -3212,6 +3313,7 @@ async function startProvisioningJob(overlay,start){
   }else if(state.path==='existing'){
     const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
     const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
+    const preflight=overlay.pharosExistingPreflight||{};
     if(!hostName)throw new Error('Enter a server name first.');
     if(!template)throw new Error('Choose a bootstrap path first.');
     body.provider='existing-host';
@@ -3221,6 +3323,16 @@ async function startProvisioningJob(overlay,start){
     const isNix=existingHostIsNix(overlay);
     if(isNix!==undefined)body.is_nix=isNix;
     body.heartbeat_interval_secs=existingHeartbeatInterval(overlay);
+    body.ssh=existingPreflightRequest(overlay).ssh;
+    if(preflight.summary)body.preflight_summary=preflight.summary;
+    if(Array.isArray(preflight.checks)){
+      body.preflight_checks=preflight.checks.slice(0,12).map(check=>({
+        key:String(check.key||'check'),
+        label:String(check.label||check.key||'Check'),
+        state:String(check.state||'unknown'),
+        message:String(check.message||'No detail recorded.')
+      }));
+    }
     body.apply=true;
   }
   start.textContent='Starting setup';
@@ -3286,6 +3398,7 @@ function setAssistantPath(path,write=true){
   if(safePath!==previousPath){
     overlay.dataset.assistantStage='';
     overlay.dataset.existingBootstrapMethod='';
+    overlay.pharosExistingPreflight=null;
   }
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>{
     btn.setAttribute('aria-pressed',String(btn.dataset.assistantPath===safePath));
@@ -10043,6 +10156,7 @@ mod tests {
             role: Some("server".to_string()),
             is_nix: Some(true),
             heartbeat_interval_secs: Some(60),
+            existing_host_context: None,
             state,
             created_at,
             updated_at,
@@ -12352,6 +12466,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
         };
         let runtime = ProviderRuntimeConfig::default();
 
@@ -12403,6 +12520,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
         };
         let runtime = ProviderRuntimeConfig {
             hetzner_cloud: HetznerCloudRuntimeConfig {
@@ -12503,6 +12623,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: Some("cx22".to_string()),
             image: Some("debian-12".to_string()),
             ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
         }
     }
 
@@ -12630,6 +12753,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
         };
         let job = store
             .start(&request, 1_700_000_010, &ProviderRuntimeConfig::default())
@@ -12677,6 +12803,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
         };
         let job = store
             .start(&request, 1_700_000_011, &ProviderRuntimeConfig::default())
@@ -12710,6 +12839,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
         };
         let runtime = ProviderRuntimeConfig::default();
 
@@ -12767,6 +12899,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
         };
         let runtime = ProviderRuntimeConfig::default();
 
@@ -12779,6 +12914,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(job.role.as_deref(), Some("server"));
         assert_eq!(job.is_nix, Some(false));
         assert_eq!(job.heartbeat_interval_secs, Some(120));
+        let context = job.existing_host_context.as_ref().expect("manual context");
+        assert_eq!(context.selected_bootstrap, BootstrapMethod::Manual);
+        assert_eq!(context.ssh.route, SshRoute::None);
+        assert!(context
+            .verification_steps
+            .iter()
+            .any(|step| step.contains("legacy-1")));
         let setup_intent = job.setup_intent.as_ref().expect("setup intent");
         assert_eq!(setup_intent.backup, BackupSetupIntent::External);
         assert_eq!(setup_intent.location, LocationSetupIntent::SiteFallback);
@@ -12835,6 +12977,23 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: Some(SshAccessIntent {
+                route: SshRoute::Tailnet,
+                user: Some("root".to_string()),
+                host: Some("legacy-2".to_string()),
+                port: None,
+            }),
+            preflight_summary: Some(ExistingHostPreflightSummary {
+                state: PreflightCheckState::Pass,
+                label: "Ready for bootstrap".to_string(),
+                message: "Existing host checks passed.".to_string(),
+            }),
+            preflight_checks: vec![ExistingHostPreflightCheck {
+                key: "ssh-reachability".to_string(),
+                label: "SSH reachability".to_string(),
+                state: PreflightCheckState::Pass,
+                message: "SSH port is reachable from Pharos.".to_string(),
+            }],
         };
         let runtime = ProviderRuntimeConfig::default();
 
@@ -12847,6 +13006,25 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(job.role.as_deref(), Some("server"));
         assert_eq!(job.is_nix, Some(false));
         assert_eq!(job.heartbeat_interval_secs, Some(60));
+        let context = job
+            .existing_host_context
+            .as_ref()
+            .expect("existing-host context");
+        assert_eq!(context.selected_bootstrap, BootstrapMethod::NativeSystemd);
+        assert_eq!(context.ssh.route, SshRoute::Tailnet);
+        assert_eq!(context.ssh.host.as_deref(), Some("legacy-2"));
+        assert_eq!(
+            context
+                .preflight_summary
+                .as_ref()
+                .expect("preflight summary")
+                .label,
+            "Ready for bootstrap"
+        );
+        assert!(context
+            .preflight_checks
+            .iter()
+            .any(|check| check.key == "ssh-reachability"));
         let setup_intent = job.setup_intent.as_ref().expect("setup intent");
         assert_eq!(setup_intent.backup, BackupSetupIntent::EnrollLater);
         assert_eq!(setup_intent.location, LocationSetupIntent::Auto);
@@ -12878,6 +13056,43 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn automated_existing_host_handoff_requires_ssh_target() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "native-systemd".to_string(),
+            apply: true,
+            host_name: Some("missing-ssh".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::Deferred),
+            location_intent: Some(LocationSetupIntent::Auto),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
+        };
+
+        let job = store
+            .start(&request, 1_700_000_006, &ProviderRuntimeConfig::default())
+            .expect("failed handoff is still tracked");
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert!(job.handoff.is_none());
+        assert!(job.existing_host_context.is_none());
+        assert!(job
+            .progress
+            .last()
+            .expect("progress")
+            .message
+            .contains("needs a non-secret SSH target"));
+    }
+
+    #[test]
     fn nixos_existing_host_handoff_proposes_secret_safe_backup_config() {
         let store = ProvisioningJobStore::new(None);
         let request = ProvisioningJobStartRequest {
@@ -12894,6 +13109,23 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             server_type: None,
             image: None,
             ssh_key_ref: None,
+            ssh: Some(SshAccessIntent {
+                route: SshRoute::Tailnet,
+                user: Some("root".to_string()),
+                host: Some("nix-1".to_string()),
+                port: None,
+            }),
+            preflight_summary: Some(ExistingHostPreflightSummary {
+                state: PreflightCheckState::Pass,
+                label: "Ready for bootstrap".to_string(),
+                message: "Existing host checks passed.".to_string(),
+            }),
+            preflight_checks: vec![ExistingHostPreflightCheck {
+                key: "ssh-reachability".to_string(),
+                label: "SSH reachability".to_string(),
+                state: PreflightCheckState::Pass,
+                message: "SSH port is reachable from Pharos.".to_string(),
+            }],
         };
         let runtime = ProviderRuntimeConfig::default();
 

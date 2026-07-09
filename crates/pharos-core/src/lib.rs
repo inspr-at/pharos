@@ -936,6 +936,48 @@ impl ProvisioningHandoff {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingHostSetupContext {
+    pub ssh: SshAccessIntent,
+    pub selected_bootstrap: BootstrapMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_summary: Option<ExistingHostPreflightSummary>,
+    #[serde(default)]
+    pub preflight_checks: Vec<ExistingHostPreflightCheck>,
+    #[serde(default)]
+    pub verification_steps: Vec<String>,
+}
+
+impl ExistingHostSetupContext {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        self.ssh.validate_contract()?;
+        for value in [self.ssh.user.as_deref(), self.ssh.host.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !safe_preflight_text(value) {
+                return Err(ServerLifecycleContractError::InvalidExistingHostContext);
+            }
+        }
+        if let Some(summary) = &self.preflight_summary {
+            summary
+                .validate_contract()
+                .map_err(|_| ServerLifecycleContractError::InvalidExistingHostContext)?;
+        }
+        for check in &self.preflight_checks {
+            check
+                .validate_contract()
+                .map_err(|_| ServerLifecycleContractError::InvalidExistingHostContext)?;
+        }
+        for value in self.verification_steps.iter().map(String::as_str) {
+            if !safe_provisioning_text(value) {
+                return Err(ServerLifecycleContractError::InvalidExistingHostContext);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningJob {
     #[serde(default = "default_provisioning_job_schema")]
     pub schema: String,
@@ -952,6 +994,8 @@ pub struct ProvisioningJob {
     pub is_nix: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_host_context: Option<ExistingHostSetupContext>,
     pub state: ProvisioningJobState,
     pub created_at: UnixSeconds,
     pub updated_at: UnixSeconds,
@@ -990,6 +1034,9 @@ impl ProvisioningJob {
         }
         if let Some(handoff) = &self.handoff {
             handoff.validate_contract()?;
+        }
+        if let Some(context) = &self.existing_host_context {
+            context.validate_contract()?;
         }
         if let Some(backup_proposal) = &self.backup_proposal {
             backup_proposal.validate_contract()?;
@@ -1044,6 +1091,7 @@ pub enum ServerLifecycleContractError {
     InvalidSecretReference,
     InvalidProgressMessage,
     InvalidHandoff,
+    InvalidExistingHostContext,
     InvalidBackupProposal,
     EmptyJobId,
     EmptyProvider,
@@ -1080,6 +1128,9 @@ impl std::fmt::Display for ServerLifecycleContractError {
                 write!(f, "progress message must be plain non-secret text")
             }
             Self::InvalidHandoff => write!(f, "handoff must be plain non-secret text"),
+            Self::InvalidExistingHostContext => {
+                write!(f, "existing-host context must be plain non-secret text")
+            }
             Self::InvalidBackupProposal => {
                 write!(f, "backup proposal must be plain non-secret text")
             }
@@ -2297,6 +2348,7 @@ mod tests {
             role: Some("server".to_string()),
             is_nix: Some(true),
             heartbeat_interval_secs: Some(60),
+            existing_host_context: None,
             state: ProvisioningJobState::Planning,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,

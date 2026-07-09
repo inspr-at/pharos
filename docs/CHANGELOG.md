@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.8 - 2026-07-10
+
+- Persist existing-host setup context on tracked jobs: SSH route, selected bootstrap method, preflight summary/checks, and non-secret verification steps.
+- Require a non-secret SSH target before recording automated existing-host bootstrap handoffs.
+- Render the saved existing-host context in the setup assistant job status so operators can see what Pharos is waiting for without exposing tokens.
+
 ## 0.1.7 - 2026-07-09
 
 - Reconcile tracked setup jobs after the first runtime heartbeat: jobs move to backup-pending when backup work remains, or complete when the selected backup policy does not block onboarding.
