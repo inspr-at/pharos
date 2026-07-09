@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.6 - 2026-07-09
+
+- Added a real Hetzner Cloud create executor behind setup jobs, gated by explicit runtime config and complete create inputs.
+- Persisted safe provider progress: provisioning, bootstrapping handoff, waiting for heartbeat, and cleanup-needed recovery when provider state is uncertain.
+- Extended the new-host assistant to send host, location, server type, image, and SSH key reference without collecting provider credentials in the UI.
+
 ## 0.1.5 - 2026-07-09
 
 - Changed existing-host NixOS/native bootstrap jobs from generic failed executor state to an explicit runtime-credential handoff.

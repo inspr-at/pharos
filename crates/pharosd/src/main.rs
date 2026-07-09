@@ -191,6 +191,31 @@ impl ProvisioningJobStore {
             .collect()
     }
 
+    fn append_progress(
+        &self,
+        id: &str,
+        state: ProvisioningJobState,
+        message: impl Into<String>,
+        now: i64,
+    ) -> Option<ProvisioningJob> {
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let job = jobs.get_mut(id)?;
+        job.state = state;
+        job.updated_at = now;
+        job.progress.push(ProvisioningProgressEntry {
+            state,
+            message: message.into(),
+            observed_at: now,
+        });
+        if job.validate_contract().is_err() {
+            return None;
+        }
+        let job = job.clone();
+        drop(jobs);
+        self.persist();
+        Some(job)
+    }
+
     fn persist(&self) {
         let Some(path) = &self.path else { return };
         let snapshot: Vec<ProvisioningJob> = self
@@ -256,26 +281,48 @@ impl ProviderRuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct HetznerCloudRuntimeConfig {
     credential_source: Option<ProviderCredentialSource>,
     execute_enabled: bool,
+    api_base_url: String,
+    request_timeout: Duration,
+}
+
+impl Default for HetznerCloudRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            credential_source: None,
+            execute_enabled: false,
+            api_base_url: "https://api.hetzner.cloud/v1".to_string(),
+            request_timeout: Duration::from_secs(20),
+        }
+    }
 }
 
 impl HetznerCloudRuntimeConfig {
     fn from_env() -> Self {
         let credential_source = env_nonempty("PHAROS_HCLOUD_API_TOKEN_FILE")
-            .map(|_| ProviderCredentialSource::File)
+            .map(|path| ProviderCredentialSource::File(PathBuf::from(path)))
             .or_else(|| {
                 env_nonempty("PHAROS_HCLOUD_API_TOKEN")
-                    .map(|_| ProviderCredentialSource::Environment)
+                    .map(|_| ProviderCredentialSource::Environment("PHAROS_HCLOUD_API_TOKEN"))
             });
         let execute_enabled = env_nonempty("PHAROS_HCLOUD_EXECUTE")
             .and_then(|value| parse_bool(&value))
             .unwrap_or(false);
+        let api_base_url = env_nonempty("PHAROS_HCLOUD_API_BASE")
+            .unwrap_or_else(|| "https://api.hetzner.cloud/v1".to_string());
+        let request_timeout = env_nonempty("PHAROS_HCLOUD_TIMEOUT_SECS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds >= 1)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(20));
         Self {
             credential_source,
             execute_enabled,
+            api_base_url,
+            request_timeout,
         }
     }
 
@@ -286,8 +333,153 @@ impl HetznerCloudRuntimeConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProviderCredentialSource {
-    Environment,
-    File,
+    Environment(&'static str),
+    File(PathBuf),
+}
+
+#[derive(Debug)]
+enum HetznerExecutionError {
+    CredentialUnavailable,
+    ClientUnavailable,
+    RequestFailed,
+    HttpStatus(u16),
+    InvalidResponse,
+}
+
+impl HetznerExecutionError {
+    fn safe_message(&self) -> String {
+        match self {
+            Self::CredentialUnavailable => {
+                "Hetzner Cloud credential source was configured but not readable".to_string()
+            }
+            Self::ClientUnavailable => "Hetzner Cloud HTTP client could not be prepared".to_string(),
+            Self::RequestFailed => {
+                "Hetzner Cloud request did not complete; verify provider console before retry"
+                    .to_string()
+            }
+            Self::HttpStatus(status) => {
+                format!("Hetzner Cloud API returned HTTP status {status}; verify provider console before retry")
+            }
+            Self::InvalidResponse => {
+                "Hetzner Cloud API response could not be parsed; verify provider console before retry"
+                    .to_string()
+            }
+        }
+    }
+
+    fn resource_state_uncertain(&self) -> bool {
+        !matches!(self, Self::CredentialUnavailable | Self::ClientUnavailable)
+    }
+}
+
+impl HetznerCloudRuntimeConfig {
+    fn api_token(&self) -> Result<String, HetznerExecutionError> {
+        let Some(source) = &self.credential_source else {
+            return Err(HetznerExecutionError::CredentialUnavailable);
+        };
+        let token = match source {
+            ProviderCredentialSource::Environment(name) => env_nonempty(name),
+            ProviderCredentialSource::File(path) => std::fs::read_to_string(path)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        };
+        token.ok_or(HetznerExecutionError::CredentialUnavailable)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HetznerCreateServerRequest {
+    name: String,
+    server_type: String,
+    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ssh_keys: Vec<String>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    start_after_create: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HetznerCreateServerResponse {
+    server: HetznerCreatedServer,
+}
+
+#[derive(Debug, Deserialize)]
+struct HetznerCreatedServer {
+    id: u64,
+    name: String,
+}
+
+async fn create_hetzner_server(
+    request: &ProvisioningJobStartRequest,
+    config: &HetznerCloudRuntimeConfig,
+) -> Result<HetznerCreatedServer, HetznerExecutionError> {
+    let token = config.api_token()?;
+    let client = reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|_| HetznerExecutionError::ClientUnavailable)?;
+    let endpoint = format!("{}/servers", config.api_base_url.trim_end_matches('/'));
+    let mut labels = BTreeMap::new();
+    labels.insert("managed-by".to_string(), "pharos".to_string());
+    labels.insert("pharos-setup".to_string(), "tracked-job".to_string());
+    let payload = HetznerCreateServerRequest {
+        name: request
+            .host_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("pharos-host")
+            .to_string(),
+        server_type: request
+            .server_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("cx22")
+            .to_string(),
+        image: request
+            .image
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("debian-12")
+            .to_string(),
+        location: request
+            .location
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        ssh_keys: request
+            .ssh_key_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
+        labels,
+        start_after_create: true,
+    };
+    let response = client
+        .post(endpoint)
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| HetznerExecutionError::RequestFailed)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(HetznerExecutionError::HttpStatus(status.as_u16()));
+    }
+    response
+        .json::<HetznerCreateServerResponse>()
+        .await
+        .map(|payload| payload.server)
+        .map_err(|_| HetznerExecutionError::InvalidResponse)
 }
 
 fn provisioning_job_progress(
@@ -338,15 +530,10 @@ fn provisioning_job_progress(
             }
             progress.push(ProvisioningProgressEntry {
                 state: ProvisioningJobState::Provisioning,
-                message: "Hetzner Cloud create/apply is gated for the next executor slice; no provider resources were created.".to_string(),
+                message: "Hetzner Cloud create/apply accepted; provider request is running through the configured executor.".to_string(),
                 observed_at: now,
             });
-            progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::Failed,
-                message: "Provider apply is not active in this build; retry after PHAROS-97 executor apply is enabled.".to_string(),
-                observed_at: now,
-            });
-            (ProvisioningJobState::Failed, progress)
+            (ProvisioningJobState::Provisioning, progress)
         }
         "manual-import" => {
             progress.push(ProvisioningProgressEntry {
@@ -3002,11 +3189,26 @@ async function startProvisioningJob(overlay,start){
   body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
   if(state.path==='new'){
     const hostName=(overlay.querySelector('[data-new-host-name]')?.value||'').trim();
+    const location=(overlay.querySelector('[data-new-location]')?.value||'').trim();
+    const serverType=(overlay.querySelector('[data-new-server-type]')?.value||'').trim();
+    const image=(overlay.querySelector('[data-new-image]')?.value||'').trim();
+    const sshKey=(overlay.querySelector('[data-new-ssh-key]')?.value||'').trim();
     if(!hostName)throw new Error('Enter a server name first.');
+    if(state.provider==='hetzner-cloud'){
+      if(!location)throw new Error('Enter a Hetzner location first.');
+      if(!serverType)throw new Error('Enter a Hetzner server type first.');
+      if(!image)throw new Error('Enter a Hetzner image first.');
+      if(!sshKey)throw new Error('Enter a Hetzner SSH key reference first.');
+    }
     body.host_name=hostName;
     body.role='server';
     body.is_nix=state.provider==='hetzner-cloud';
     body.heartbeat_interval_secs=60;
+    if(location)body.location=location;
+    if(serverType)body.server_type=serverType;
+    if(image)body.image=image;
+    if(sshKey)body.ssh_key_ref=sshKey;
+    body.apply=true;
   }else if(state.path==='existing'){
     const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
     const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
@@ -3747,16 +3949,99 @@ async fn create_provisioning_job(
         .provisioning_jobs
         .start(&request, now_unix(), &state.provider_runtime)
     {
-        Ok(job) => (
-            StatusCode::CREATED,
-            no_store_headers(),
-            Json(json!({ "job": job })),
-        ),
+        Ok(job) => {
+            let job = if should_run_hetzner_executor(&request, &job) {
+                execute_hetzner_setup_job(&state, &request, job).await
+            } else {
+                job
+            };
+            (
+                StatusCode::CREATED,
+                no_store_headers(),
+                Json(json!({ "job": job })),
+            )
+        }
         Err(error) => (
             StatusCode::BAD_REQUEST,
             no_store_headers(),
             Json(json!({ "error": error.to_string() })),
         ),
+    }
+}
+
+fn should_run_hetzner_executor(
+    request: &ProvisioningJobStartRequest,
+    job: &ProvisioningJob,
+) -> bool {
+    request.provider == "hetzner-cloud"
+        && request.apply
+        && job.state == ProvisioningJobState::Provisioning
+}
+
+async fn execute_hetzner_setup_job(
+    state: &AppState,
+    request: &ProvisioningJobStartRequest,
+    job: ProvisioningJob,
+) -> ProvisioningJob {
+    let now = now_unix();
+    match create_hetzner_server(request, &state.provider_runtime.hetzner_cloud).await {
+        Ok(server) => {
+            let safe_resource = format!("hcloud-server-{}", server.id);
+            let host_name = request
+                .host_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(server.name.as_str());
+            let bootstrapping = state
+                .provisioning_jobs
+                .append_progress(
+                    &job.id,
+                    ProvisioningJobState::Bootstrapping,
+                    format!(
+                        "Hetzner Cloud server created as {safe_resource} for {host_name}; bootstrap handoff is required before beacon start."
+                    ),
+                    now,
+                )
+                .unwrap_or_else(|| job.clone());
+            state
+                .provisioning_jobs
+                .append_progress(
+                    &bootstrapping.id,
+                    ProvisioningJobState::WaitingForHeartbeat,
+                    "Waiting for SSH bootstrap, runtime credential handoff, beacon start, and first heartbeat.",
+                    now_unix(),
+                )
+                .unwrap_or(bootstrapping)
+        }
+        Err(error) => {
+            let host_name = request
+                .host_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("requested host");
+            let state_after_error = if error.resource_state_uncertain() {
+                ProvisioningJobState::CleanupNeeded
+            } else {
+                ProvisioningJobState::Failed
+            };
+            let message = if state_after_error == ProvisioningJobState::CleanupNeeded {
+                format!(
+                    "{}. Cleanup needed: verify Hetzner Cloud for provider resource name {host_name} before retrying.",
+                    error.safe_message()
+                )
+            } else {
+                format!(
+                    "{}; no provider resources were created by Pharos.",
+                    error.safe_message()
+                )
+            };
+            state
+                .provisioning_jobs
+                .append_progress(&job.id, state_after_error, message, now)
+                .unwrap_or(job)
+        }
     }
 }
 
@@ -6266,7 +6551,7 @@ fn setup_assistant() -> String {
     )
     .replace(
         r#"<div class="assistant-plan-list">"#,
-        r#"<label class="assistant-plan-field"><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01"></label><div class="assistant-plan-list">"#,
+        r#"<label class="assistant-plan-field"><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01"></label><label class="assistant-plan-field"><span>Location</span><input data-new-location autocomplete="off" value="fsn1" placeholder="fsn1"></label><label class="assistant-plan-field"><span>Server type</span><input data-new-server-type autocomplete="off" value="cx22" placeholder="cx22"></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH key reference</span><input data-new-ssh-key autocomplete="off" placeholder="pharos-bootstrap-key"></label><div class="assistant-plan-list">"#,
     )
     .replace(
         r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
@@ -11415,6 +11700,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("setup_stage"));
         assert!(empty.contains("Hetzner Cloud"));
         assert!(empty.contains("Manual / existing provider"));
+        assert!(empty.contains(r#"data-new-host-name"#));
+        assert!(empty.contains(r#"data-new-location"#));
+        assert!(empty.contains(r#"data-new-server-type"#));
+        assert!(empty.contains(r#"data-new-image"#));
+        assert!(empty.contains(r#"data-new-ssh-key"#));
         assert!(empty.contains("Add existing server"));
         assert!(empty.contains(r#"data-preflight-form"#));
         assert!(empty.contains(r#"data-preflight-host-name"#));
@@ -12058,8 +12348,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         };
         let runtime = ProviderRuntimeConfig {
             hetzner_cloud: HetznerCloudRuntimeConfig {
-                credential_source: Some(ProviderCredentialSource::File),
+                credential_source: Some(ProviderCredentialSource::File(PathBuf::from(
+                    "/run/secrets/pharos-hcloud-token",
+                ))),
                 execute_enabled: false,
+                ..HetznerCloudRuntimeConfig::default()
             },
         };
 
@@ -12081,8 +12374,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let enabled = ProviderRuntimeConfig {
             hetzner_cloud: HetznerCloudRuntimeConfig {
-                credential_source: Some(ProviderCredentialSource::Environment),
+                credential_source: Some(ProviderCredentialSource::Environment(
+                    "PHAROS_HCLOUD_API_TOKEN",
+                )),
                 execute_enabled: true,
+                ..HetznerCloudRuntimeConfig::default()
             },
         };
         let missing_inputs = store
@@ -12100,14 +12396,145 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let gated = store
             .start(&request, 1_700_000_004, &enabled)
             .expect("fully shaped request reaches provider gate");
-        assert_eq!(gated.state, ProvisioningJobState::Failed);
+        assert_eq!(gated.state, ProvisioningJobState::Provisioning);
         assert_eq!(gated.progress[1].state, ProvisioningJobState::Provisioning);
         assert!(gated.progress[1]
             .message
-            .contains("no provider resources were created"));
+            .contains("provider request is running"));
         let json = serde_json::to_string(&gated).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    async fn hcloud_mock_server(status: &str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind hcloud mock");
+        let addr = listener.local_addr().expect("mock address");
+        let status = status.to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept hcloud request");
+            let mut buf = vec![0; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write hcloud response");
+        });
+        format!("http://{addr}")
+    }
+
+    fn hcloud_apply_request(host_name: &str) -> ProvisioningJobStartRequest {
+        ProvisioningJobStartRequest {
+            provider: "hetzner-cloud".to_string(),
+            template: "hetzner-small-nixos".to_string(),
+            apply: true,
+            host_name: Some(host_name.to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(true),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::EnrollLater),
+            location_intent: Some(LocationSetupIntent::SiteFallback),
+            location: Some("fsn1".to_string()),
+            server_type: Some("cx22".to_string()),
+            image: Some("debian-12".to_string()),
+            ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
+        }
+    }
+
+    fn test_hcloud_state(api_base_url: String) -> (AppState, PathBuf) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_nanos();
+        let token_path = std::env::temp_dir().join(format!(
+            "pharos-hcloud-test-token-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::write(&token_path, "test-hcloud-token").expect("write test token");
+        let mut state = report_test_state(false);
+        state.provider_runtime = ProviderRuntimeConfig {
+            hetzner_cloud: HetznerCloudRuntimeConfig {
+                credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
+                execute_enabled: true,
+                api_base_url,
+                request_timeout: Duration::from_secs(2),
+            },
+        };
+        (state, token_path)
+    }
+
+    #[tokio::test]
+    async fn hetzner_executor_success_persists_waiting_for_heartbeat() {
+        let api = hcloud_mock_server(
+            "201 Created",
+            r#"{"server":{"id":4242,"name":"hcloud-lab-3"}}"#,
+        )
+        .await;
+        let (state, token_path) = test_hcloud_state(api);
+        let request = hcloud_apply_request("hcloud-lab-3");
+
+        let job = state
+            .provisioning_jobs
+            .start(&request, 1_700_000_008, &state.provider_runtime)
+            .expect("hetzner job starts");
+        assert_eq!(job.state, ProvisioningJobState::Provisioning);
+        let job = execute_hetzner_setup_job(&state, &request, job).await;
+
+        assert_eq!(job.state, ProvisioningJobState::WaitingForHeartbeat);
+        assert!(job.progress.iter().any(|entry| {
+            entry.state == ProvisioningJobState::Bootstrapping
+                && entry.message.contains("hcloud-server-4242")
+        }));
+        assert_eq!(
+            state
+                .provisioning_jobs
+                .get(&job.id)
+                .expect("persisted")
+                .state,
+            ProvisioningJobState::WaitingForHeartbeat
+        );
+        let json = serde_json::to_string(&job).expect("job serializes");
+        assert!(!json.contains("test-hcloud-token"));
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn hetzner_executor_failure_persists_cleanup_guidance() {
+        let api = hcloud_mock_server("500 Internal Server Error", r#"{"error":"temporary"}"#).await;
+        let (state, token_path) = test_hcloud_state(api);
+        let request = hcloud_apply_request("hcloud-lab-4");
+
+        let job = state
+            .provisioning_jobs
+            .start(&request, 1_700_000_009, &state.provider_runtime)
+            .expect("hetzner job starts");
+        let job = execute_hetzner_setup_job(&state, &request, job).await;
+
+        assert_eq!(job.state, ProvisioningJobState::CleanupNeeded);
+        let message = job
+            .progress
+            .last()
+            .expect("cleanup progress")
+            .message
+            .as_str();
+        assert!(message.contains("HTTP status 500"));
+        assert!(message.contains("provider resource name hcloud-lab-4"));
+        assert!(!message.contains("temporary"));
+        let json = serde_json::to_string(&job).expect("job serializes");
+        assert!(!json.contains("test-hcloud-token"));
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+        let _ = std::fs::remove_file(token_path);
     }
 
     #[test]
