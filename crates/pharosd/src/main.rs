@@ -4936,8 +4936,13 @@ fn backup_card_markup(summary: &BackupUiSummary, extra_class: &str) -> String {
 fn backup_search_text(summary: &BackupUiSummary) -> Option<String> {
     (summary.total > 0).then(|| {
         format!(
-            "{} {} {} {} {}",
-            summary.label, summary.detail, summary.last_success, summary.schedule, summary.target
+            "{} {} {} {} {} {}",
+            summary.label,
+            summary.detail,
+            summary.last_success,
+            summary.schedule,
+            summary.target,
+            summary.validation
         )
     })
 }
@@ -7504,14 +7509,15 @@ fn render_backup_rows(hosts: &[Host], now: i64) -> String {
             };
             let search = html_escape(
                 &format!(
-                    "{} {} {} {} {} {} {}",
+                    "{} {} {} {} {} {} {} {}",
                     host.name,
                     host.role,
                     backup.label,
                     backup.detail,
                     backup.last_success,
                     backup.schedule,
-                    backup.target
+                    backup.target,
+                    backup.validation
                 )
                 .to_lowercase(),
             );
@@ -9534,6 +9540,81 @@ mod tests {
         assert!(html.contains("repo check passed"));
         assert!(html.contains("off-box repository"));
         assert!(!html.contains("restic-main-repository"));
+    }
+
+    #[test]
+    fn backup_page_search_includes_restore_validation_evidence() {
+        let mut observation = backup_observation(BackupPostureState::Healthy);
+        observation.restore_validation = Some(pharos_core::BackupValidationObservation {
+            level: pharos_core::BackupValidationLevel::RestoreSample,
+            state: pharos_core::BackupValidationState::Stale,
+            checked_at: Some(1_700_000_050),
+            evidence_label: Some("restore sample".to_string()),
+            summary: Some("restore drill overdue".to_string()),
+        });
+        let host = host_with_backups("athena", 1_700_000_100, vec![observation]);
+
+        let html = render_backups(
+            &[host],
+            1_700_000_120,
+            ShellContext {
+                user_label: "markus",
+                logout_enabled: true,
+            },
+        );
+        let row_search = html
+            .split("data-host-search=\"")
+            .nth(1)
+            .expect("backup row search haystack")
+            .split('"')
+            .next()
+            .expect("backup row search value");
+
+        assert!(html.contains("Last success"));
+        assert!(html.contains("Validation"));
+        assert!(html.contains("restore sample stale"));
+        assert!(row_search.contains("restore sample stale"));
+    }
+
+    #[test]
+    fn validation_alerts_are_separate_from_successful_backup_alerts() {
+        let mut observation = backup_observation(BackupPostureState::Healthy);
+        observation.restore_validation = Some(pharos_core::BackupValidationObservation {
+            level: pharos_core::BackupValidationLevel::RestoreSample,
+            state: pharos_core::BackupValidationState::Failed,
+            checked_at: Some(1_700_000_050),
+            evidence_label: Some("restore sample".to_string()),
+            summary: Some("restore sample failed".to_string()),
+        });
+        let host = host_with_backups("csb1", 1_700_000_100, vec![]);
+
+        assert!(backup_alert(&host, &observation, 1_700_000_120).is_none());
+        let alert = backup_validation_alert(&host, &observation, 1_700_000_120)
+            .expect("failed validation alert");
+
+        assert_eq!(alert.level, "critical");
+        assert_eq!(alert.source, "backup");
+        assert_eq!(alert.issue, "Restic main: Restore validation failed");
+        assert!(alert.detail.contains("restore sample"));
+        assert!(alert.next_action.contains("validation evidence"));
+    }
+
+    #[test]
+    fn repository_check_state_can_raise_validation_overdue_alert() {
+        let mut observation = backup_observation(BackupPostureState::Healthy);
+        observation.restore_validation = None;
+        observation.last_check_at = Some(1_700_000_050);
+        observation.last_check_state = Some(pharos_core::BackupValidationState::Stale);
+        let host = host_with_backups("csb1", 1_700_000_100, vec![]);
+
+        assert!(backup_alert(&host, &observation, 1_700_000_120).is_none());
+        let alert = backup_validation_alert(&host, &observation, 1_700_000_120)
+            .expect("stale repository check alert");
+
+        assert_eq!(alert.level, "warning");
+        assert_eq!(alert.issue, "Restic main: Restore validation overdue");
+        assert!(alert.detail.contains("backup check"));
+        assert!(alert.next_action.contains("restore validation"));
     }
 
     #[test]
