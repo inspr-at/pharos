@@ -3318,6 +3318,12 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .fresh-row span{color:var(--muted);font-size:12px}
 .fresh-row strong{font-size:12px;font-weight:650;color:var(--ink)}
 .fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
+.backup-chip{--backup-color:var(--wait);display:inline-flex;align-items:center;justify-content:center;gap:5px;height:25px;min-width:68px;margin:0;padding:0 8px;border:1px solid color-mix(in srgb,var(--backup-color) 38%,rgba(210,226,234,.82));border-radius:999px;background:color-mix(in srgb,var(--backup-color) 9%,rgba(255,255,255,.94));color:var(--backup-color);font-size:11px;font-weight:760;line-height:1;text-decoration:none;white-space:nowrap;box-shadow:0 5px 12px color-mix(in srgb,var(--backup-color) 7%,transparent);transition:background-color .16s ease,border-color .16s ease,box-shadow .16s ease,transform .16s ease}
+.backup-chip.clear{--backup-color:var(--live)}.backup-chip.warning{--backup-color:var(--stale)}.backup-chip.critical{--backup-color:var(--down)}.backup-chip.watch{--backup-color:var(--wait)}
+.backup-chip:hover{background:color-mix(in srgb,var(--backup-color) 14%,white);border-color:color-mix(in srgb,var(--backup-color) 55%,rgba(210,226,234,.82));box-shadow:0 7px 16px color-mix(in srgb,var(--backup-color) 12%,transparent);transform:translateY(-1px)}
+.backup-chip:focus-visible{outline:2px solid color-mix(in srgb,var(--backup-color) 34%,transparent);outline-offset:2px}
+.backup-chip-glyphs{display:grid;place-items:center;width:13px;height:13px;flex:0 0 13px}.backup-chip-glyph{display:none;place-items:center;width:13px;height:13px}.backup-chip-glyph .ico{width:13px;height:13px;stroke-width:2.15}
+.backup-chip[data-backup-glyph="check"] .backup-chip-glyph.check,.backup-chip[data-backup-glyph="question"] .backup-chip-glyph.question,.backup-chip[data-backup-glyph="alert"] .backup-chip-glyph.alert,.backup-chip[data-backup-glyph="x"] .backup-chip-glyph.x{display:grid}
 .backup-mini{--backup-color:var(--wait);display:grid;grid-template-columns:8px minmax(0,1fr);align-items:center;column-gap:8px;min-height:32px;margin:-1px 0 10px;padding:7px 8px;border:1px solid color-mix(in srgb,var(--backup-color) 20%,rgba(210,226,234,.82));border-radius:7px;background:linear-gradient(135deg,rgba(255,255,255,.78),color-mix(in srgb,var(--backup-color) 6%,white));color:var(--ink)}
 .backup-mini:before{content:"";grid-row:1/3;width:8px;height:8px;border-radius:50%;background:var(--backup-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--backup-color) 10%,transparent)}
 .backup-mini strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;color:var(--ink)}
@@ -3452,6 +3458,7 @@ main[data-view="list"] .list-wrap{display:block}
 .backup-row{--row-color:var(--wait);display:grid;grid-template-columns:minmax(150px,.9fr) 104px minmax(190px,1.15fr) minmax(96px,.58fr) minmax(92px,.52fr) minmax(132px,.72fr) minmax(120px,.68fr);gap:12px;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.66);background:rgba(255,255,255,.72)}
 .backup-row:last-child{border-bottom:0}
 .backup-row.critical{--row-color:var(--down)}.backup-row.warning{--row-color:var(--stale)}.backup-row.watch{--row-color:var(--wait)}.backup-row.clear{--row-color:var(--live)}
+.backup-row[data-deep-linked="true"]{position:relative;background:color-mix(in srgb,var(--row-color) 6%,white);box-shadow:inset 3px 0 0 var(--row-color),0 8px 22px color-mix(in srgb,var(--row-color) 8%,transparent)}
 .backup-host{display:grid;grid-template-columns:9px minmax(0,1fr);align-items:center;gap:8px;min-width:0}
 .backup-host:before{content:"";width:9px;height:9px;border-radius:50%;background:var(--row-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-color) 12%,transparent)}
 .backup-host strong,.backup-issue strong,.backup-field strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-size:13px}
@@ -3708,6 +3715,18 @@ function backupInfo(host,now){
 function updateBackup(surface,info){
   const el=surface.querySelector('[data-backup-state]');
   if(!el)return;
+  if(el.classList.contains('backup-chip')){
+    const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
+    const host=surface.dataset.host||'';
+    el.className='backup-chip '+info.level;
+    el.dataset.backupState=info.state;
+    el.dataset.backupLevel=info.level;
+    el.dataset.backupGlyph=glyph;
+    el.href='/backups?host='+encodeURIComponent(host);
+    el.title='Backup: '+info.label+' - '+info.detail;
+    el.setAttribute('aria-label','Backup for '+host+': '+info.label+', '+info.detail);
+    return;
+  }
   const list=el.classList.contains('backup-list');
   el.className='backup-mini'+(list?' backup-list':'')+' '+info.level;
   el.dataset.backupState=info.state;
@@ -7997,15 +8016,36 @@ fn backup_ui_summary(observations: &[BackupObservation], now: i64) -> BackupUiSu
     }
 }
 
-fn backup_card_markup(summary: &BackupUiSummary, extra_class: &str) -> String {
-    let extra_class = if extra_class.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", html_escape(extra_class))
-    };
+fn backup_glyph(level: &str) -> &'static str {
+    match level {
+        "clear" => "check",
+        "warning" => "alert",
+        "critical" => "x",
+        _ => "question",
+    }
+}
+
+fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
+    let title = format!("Backup: {} - {}", summary.label, summary.detail);
+    let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
     format!(
-        r#"<div class="backup-mini{extra_class} {level}" data-backup-state="{state}" title="{title}"><strong>{label}</strong><span>{detail}</span></div>"#,
-        extra_class = extra_class,
+        r#"<a class="backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span>Backup</span></a>"#,
+        level = html_escape(summary.level),
+        host_query = html_escape(&url_query_escape(host)),
+        state = html_escape(summary.state),
+        glyph = backup_glyph(summary.level),
+        title = html_escape(&title),
+        aria_label = html_escape(&aria_label),
+        check = icons::SHIELD_CHECK,
+        question = icons::SHIELD_QUESTION,
+        alert = icons::SHIELD_ALERT,
+        x = icons::SHIELD_X,
+    )
+}
+
+fn backup_list_markup(summary: &BackupUiSummary) -> String {
+    format!(
+        r#"<div class="backup-mini backup-list {level}" data-backup-state="{state}" title="{title}"><strong>{label}</strong><span>{detail}</span></div>"#,
         level = html_escape(summary.level),
         state = html_escape(summary.state),
         title = html_escape(&format!("Backup: {} - {}", summary.label, summary.detail)),
@@ -10791,7 +10831,7 @@ fn render_backup_rows(hosts: &[Host], now: i64) -> String {
                 .to_lowercase(),
             );
             format!(
-                r#"<article class="backup-row {level}" data-ops-row data-ops-level="{level}" data-host-search="{search}"><div class="backup-host"><div><strong>{host}</strong><span>{role}</span></div></div><div class="backup-state"><span class="severity">{label}</span>{count}</div><div class="backup-issue"><strong>{detail}</strong><p>{state}</p></div><div class="backup-field"><span>Last success</span><strong>{last_success}</strong></div><div class="backup-field"><span>Schedule</span><strong>{schedule}</strong></div><div class="backup-field"><span>Target</span><strong>{target}</strong></div><div class="backup-field"><span>Validation</span><strong>{validation}</strong></div></article>"#,
+                r#"<article class="backup-row {level}" data-ops-row data-ops-level="{level}" data-host="{host}" data-host-search="{search}"><div class="backup-host"><div><strong>{host}</strong><span>{role}</span></div></div><div class="backup-state"><span class="severity">{label}</span>{count}</div><div class="backup-issue"><strong>{detail}</strong><p>{state}</p></div><div class="backup-field"><span>Last success</span><strong>{last_success}</strong></div><div class="backup-field"><span>Schedule</span><strong>{schedule}</strong></div><div class="backup-field"><span>Target</span><strong>{target}</strong></div><div class="backup-field"><span>Validation</span><strong>{validation}</strong></div></article>"#,
                 level = html_escape(backup.level),
                 search = search,
                 host = html_escape(&host.name),
@@ -10829,6 +10869,7 @@ document.querySelectorAll('[data-ops-page]').forEach(root=>{
   const search=root.querySelector('[data-search]');
   const rows=[...root.querySelectorAll('[data-ops-row]')];
   const empty=root.querySelector('[data-ops-empty]');
+  const requestedHost=new URLSearchParams(window.location.search).get('host')?.trim()||'';
   let active='all';
   function setFilter(filter){
     active=filter||'all';
@@ -10854,7 +10895,16 @@ document.querySelectorAll('[data-ops-page]').forEach(root=>{
     button.addEventListener('click',()=>setFilter(button.dataset.opsFilter||'all'));
   });
   search?.addEventListener('input',apply);
+  if(requestedHost&&search)search.value=requestedHost;
   setFilter('all');
+  if(requestedHost){
+    const normalized=requestedHost.toLowerCase();
+    const target=rows.find(row=>(row.dataset.host||'').toLowerCase()===normalized);
+    if(target){
+      target.dataset.deepLinked='true';
+      requestAnimationFrame(()=>target.scrollIntoView({block:'center',behavior:'smooth'}));
+    }
+  }
 });
 </script>"#
 }
@@ -12105,8 +12155,8 @@ fn render_home(
         let reason = reason_markup(&attention);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
-        let backup_card = backup_card_markup(&backup, "");
-        let backup_list = backup_card_markup(&backup, "backup-list");
+        let backup_chip = backup_chip_markup(&backup, &h.name);
+        let backup_list = backup_list_markup(&backup);
         let protection = protection_onboarding_status(h, runtime.jobs, now);
         let protection_card = protection
             .as_ref()
@@ -12201,7 +12251,7 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}{muted}<div class="fresh" data-fresh>{fresh}</div>{backup_card}{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{settings_action}</div></header>{reason}{muted}<div class="fresh" data-fresh>{fresh}</div>{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
@@ -13055,11 +13105,36 @@ mod tests {
         );
 
         assert!(html.contains(r#"data-backup-state="healthy""#));
+        assert!(html.contains(r#"class="backup-chip clear""#));
+        assert!(html.contains(r#"href="/backups?host=athena""#));
+        assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
+        assert!(
+            html.contains(r#"aria-label="Backup for athena: Protected, last success 2m 00s ago""#)
+        );
         assert!(html.contains(">Protected<"));
         assert!(html.contains("last success 2m 00s ago"));
         assert!(html.contains(r#"class="backup-mini backup-list clear""#));
         assert!(html.contains("off-box repository"));
         assert!(!html.contains("restic-main-repository"));
+    }
+
+    #[test]
+    fn backup_chip_maps_posture_to_distinct_glyphs() {
+        let cases = [
+            (BackupPostureState::Healthy, "clear", "check"),
+            (BackupPostureState::Unknown, "watch", "question"),
+            (BackupPostureState::Stale, "warning", "alert"),
+            (BackupPostureState::Failed, "critical", "x"),
+        ];
+
+        for (state, level, glyph) in cases {
+            let summary = backup_ui_summary(&[backup_observation(state)], 1_700_000_120);
+            let html = backup_chip_markup(&summary, "athena");
+            assert!(html.contains(&format!(r#"class="backup-chip {level}""#)));
+            assert!(html.contains(&format!(r#"data-backup-glyph="{glyph}""#)));
+            assert!(html.contains(r#"href="/backups?host=athena""#));
+            assert!(html.contains(">Backup</span></a>"));
+        }
     }
 
     #[test]
@@ -13098,7 +13173,11 @@ mod tests {
         assert!(html.contains(r#"href="/backups" aria-current="page""#));
         assert!(html.contains(r#"data-ops-page="backups""#));
         assert!(html.contains(r#"data-ops-filter="clear""#));
-        assert!(html.contains(r#"class="backup-row clear""#));
+        assert!(html.contains(
+            r#"class="backup-row clear" data-ops-row data-ops-level="clear" data-host="athena""#
+        ));
+        assert!(html.contains("new URLSearchParams(window.location.search).get('host')"));
+        assert!(html.contains("target.scrollIntoView({block:'center',behavior:'smooth'})"));
         assert!(html.contains("Last success"));
         assert!(html.contains("Schedule"));
         assert!(html.contains("Target"));

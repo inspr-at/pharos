@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.20 - 2026-07-10
+
+- Move each host's backup posture into a compact, clickable Fleet header chip beside Host settings, with distinct protected, unreported, stale, and failed shield states.
+- Open Backups already filtered, highlighted, and scrolled to the selected host while preserving the existing detailed backup rendering in Fleet list view.
+- Keep backup chips synchronized with live host reports without reloading the Fleet page.
+
 ## 0.1.19 - 2026-07-10
 
 - Replace the dense Agora mini-app with shared Pharos navigation, one host selector, one color task, and collapsed declarative details that also work on narrow screens.
