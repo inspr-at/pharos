@@ -18,11 +18,13 @@ use serde_json::json;
 
 use crate::{
     auth::{access_for_headers, AccessGrant},
-    html_escape, AppState, ShellContext,
+    html_escape,
+    nixcfg_dispatch::NixcfgDispatchError,
+    AppState, ShellContext,
 };
 
 const DEFAULT_ACCENT: &str = "#1f7fb5";
-const TARGET_PATH: &str = "modules/uzumaki/theme/theme-palettes.nix";
+const TARGET_PATH: &str = "modules/pharos-host-preferences.json";
 const LOCATION_TARGET_PATH: &str = "modules/uzumaki/hosts/host-settings.nix";
 
 const AGORA_CSS: &str = r#"<style>
@@ -59,8 +61,9 @@ const AGORA_CSS: &str = r#"<style>
 .settings-disclosure-body{padding:0 14px 20px}.preference-list{display:grid}.preference-row{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:54px;border-top:1px solid rgba(214,226,234,.62)}.preference-row:first-child{border-top:0}.preference-row strong{display:block;font-size:13px}.preference-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px}.preference-switch{position:relative;flex:0 0 auto;width:38px;height:22px}.preference-switch input{position:absolute;opacity:0;pointer-events:none}.preference-switch i{position:absolute;inset:0;border:1px solid rgba(137,151,163,.38);border-radius:999px;background:#edf2f4;transition:.16s}.preference-switch i:after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(45,75,95,.18);transition:.16s}.preference-switch input:checked+i{border-color:rgba(37,132,95,.36);background:rgba(37,132,95,.78)}.preference-switch input:checked+i:after{transform:translateX(16px)}.preference-switch input:focus-visible+i{outline:2px solid rgba(31,127,181,.42);outline-offset:2px}
 .preference-actions{display:flex;align-items:center;gap:12px;margin-top:14px}.preference-actions .primary-action{min-height:38px;background:#fff;color:var(--ink)}.preference-actions .primary-action:hover{background:#f4fafb}
 .host-advanced{display:grid;gap:12px}.host-advanced-note{margin:0;color:var(--muted);font-size:12px}.host-advanced-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.host-advanced-meta div{min-width:0;padding:9px 10px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,252,253,.72)}.host-advanced-meta span,.host-advanced-meta strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.host-advanced-meta span{color:var(--muted);font-size:10px}.host-advanced-meta strong{margin-top:2px;font-size:11px}.host-advanced .review-output{min-height:120px;max-height:260px}
+.host-kind-row{display:grid;grid-template-columns:minmax(0,1fr) 180px auto;align-items:center;gap:12px;padding:11px 0;border-top:1px solid rgba(214,226,234,.62);border-bottom:1px solid rgba(214,226,234,.62)}.host-kind-copy strong,.host-kind-copy span{display:block}.host-kind-copy strong{font-size:13px}.host-kind-copy span{margin-top:2px;color:var(--muted);font-size:11px}.host-kind-row select{height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px;padding:0 10px}.host-kind-row .primary-action{min-height:38px;background:#fff;color:var(--ink)}
 .empty-settings{width:min(840px,100%);margin:26px auto 0;box-shadow:none}
-@media (max-width:640px){.host-picker{grid-template-columns:1fr;gap:6px}.host-settings-surface{margin-top:18px}.host-settings-identity,.host-color-task,.settings-disclosure>summary,.settings-disclosure-body{padding-left:4px;padding-right:4px}.host-color-choice{gap:13px}.host-color-actions,.preference-actions{align-items:stretch;flex-direction:column}.host-color-actions .primary-action,.preference-actions .primary-action{width:100%}.host-advanced-meta{grid-template-columns:1fr}}
+@media (max-width:640px){.host-picker{grid-template-columns:1fr;gap:6px}.host-settings-surface{margin-top:18px}.host-settings-identity,.host-color-task,.settings-disclosure>summary,.settings-disclosure-body{padding-left:4px;padding-right:4px}.host-color-choice{gap:13px}.host-color-actions,.preference-actions{align-items:stretch;flex-direction:column}.host-color-actions .primary-action,.preference-actions .primary-action{width:100%}.host-advanced-meta,.host-kind-row{grid-template-columns:1fr}.host-kind-row .primary-action{width:100%}}
 </style>"#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +78,7 @@ struct AgoraHostView {
     target_path: String,
     target_attribute: String,
     preferences: HostPreferences,
+    declared_preferences: Option<HostPreferences>,
     requested_preferences: Option<HostPreferences>,
 }
 
@@ -280,6 +284,22 @@ pub(crate) async fn request_host_preferences(
         );
     }
 
+    let manifest = find_manifest(state.manifests.manifests(), host_name);
+    let canonical_host = manifest
+        .map(|manifest| manifest.host.name.as_str())
+        .unwrap_or(host_name);
+    let Some(runtime_host) = state
+        .store
+        .list()
+        .into_iter()
+        .find(|host| host.name == canonical_host)
+    else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "The host must report once before settings can be requested" })),
+        );
+    };
+
     if let Some(accent) = request.preferences.accent.as_deref() {
         request.preferences.accent = match normalize_hex_color(accent) {
             Ok(accent) => Some(accent),
@@ -287,37 +307,78 @@ pub(crate) async fn request_host_preferences(
                 return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
             }
         };
+    } else {
+        request.preferences.accent = manifest
+            .and_then(|manifest| manifest.host.preferences.accent.clone())
+            .or_else(|| runtime_host.preferences.accent.clone())
+            .or_else(|| {
+                manifest
+                    .and_then(|manifest| manifest.palette.as_ref())
+                    .and_then(palette_accent)
+            })
+            .or_else(|| Some(DEFAULT_ACCENT.to_string()));
     }
     if let Err(error) = request.preferences.validate_contract() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
     }
 
+    let dispatch_request_id = if runtime_host.is_nix {
+        match state
+            .nixcfg_dispatch
+            .dispatch(canonical_host, &request.preferences)
+            .await
+        {
+            Ok(request_id) => Some(request_id),
+            Err(error) => {
+                let status = match &error {
+                    NixcfgDispatchError::Disabled | NixcfgDispatchError::CredentialUnavailable => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    NixcfgDispatchError::InvalidHost | NixcfgDispatchError::InvalidPreferences => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    NixcfgDispatchError::RequestFailed | NixcfgDispatchError::Rejected(_) => {
+                        StatusCode::BAD_GATEWAY
+                    }
+                };
+                return (status, Json(json!({ "error": error.safe_message() })));
+            }
+        }
+    } else {
+        None
+    };
+
     match state
         .store
-        .request_preferences(host_name, request.preferences)
+        .request_preferences(canonical_host, request.preferences)
     {
         Ok(host) => {
-            let status = if host.requested_preferences.is_some() {
+            let status = if dispatch_request_id.is_some() {
+                "dispatch_accepted"
+            } else if host.requested_preferences.is_some() {
                 "pending_host"
             } else {
                 "applied"
             };
-            let delivery = if host.is_nix { "nixcfg" } else { "beacon_pull" };
+            let delivery = if host.is_nix {
+                "nixcfg_workflow"
+            } else {
+                "beacon_pull"
+            };
             (
                 StatusCode::OK,
                 Json(json!({
                     "status": status,
                     "host": host.name,
                     "delivery": delivery,
+                    "request_id": dispatch_request_id,
                     "applied": host.preferences,
+                    "declared": manifest.map(|manifest| &manifest.host.preferences),
                     "requested": host.requested_preferences,
                 })),
             )
         }
-        Err("host not found") => (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "The host must report once before settings can be requested" })),
-        ),
+        Err("host not found") => unreachable!("runtime host checked before workflow dispatch"),
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
     }
 }
@@ -433,6 +494,7 @@ if(root){{
   const down=root.querySelector('[data-alert-down]');
   const backup=root.querySelector('[data-alert-backup]');
   const nix=root.querySelector('[data-alert-nix]');
+  const kind=root.querySelector('[data-host-kind]');
   function setStatus(state,text){{if(!status)return;status.dataset.state=state;status.textContent=text}}
   function setPressed(value){{root.querySelectorAll('[data-preset]').forEach(button=>button.setAttribute('aria-pressed',String((button.dataset.preset||'').toLowerCase()===value.toLowerCase())))}}
   function setPicked(value){{
@@ -452,7 +514,7 @@ if(root){{
   function requestedPreferences(){{
     return {{
       accent:color?.value||null,
-      kind:root.dataset.kind||'server',
+      kind:kind?.value||root.dataset.kind||'server',
       alerts:{{
         suppress_down:!down?.checked,
         suppress_backup:!backup?.checked,
@@ -481,7 +543,8 @@ if(root){{
       const data=await res.json();
       if(!res.ok)throw new Error(data.error||'Request failed');
       if(data.status==='applied')setStatus('applied','Already active on this host.');
-      else setStatus('pending',data.delivery==='nixcfg'?'Saved. Waiting for nixcfg delivery.':'Saved. Waiting for the host.');
+      else if(data.status==='dispatch_accepted')setStatus('pending','Change requested. Validation is running.');
+      else setStatus('pending','Saved. Waiting for the host.');
       await loadReview();
     }}catch(error){{setStatus('error',error.message||'Request failed')}}
     finally{{button.disabled=false}}
@@ -490,6 +553,7 @@ if(root){{
   root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>setPicked(button.dataset.preset)));
   root.querySelector('[data-save-color]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
   root.querySelector('[data-save-alerts]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
+  root.querySelector('[data-save-kind]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
   [down,backup,nix].forEach(input=>input?.addEventListener('change',updateAlertSummary));
   setPicked(color?.value||'{accent}');
   updateAlertSummary();
@@ -520,11 +584,8 @@ fn render_host_table(hosts: &[AgoraHostView], selected_index: usize) -> String {
         .map(|(idx, host)| render_host_row(host, idx == selected_index))
         .collect::<String>();
     let selected = &hosts[selected_index];
-    let accent = selected
-        .requested_preferences
-        .as_ref()
+    let accent = displayed_preferences(selected)
         .and_then(|preferences| preferences.accent.as_deref())
-        .or(selected.preferences.accent.as_deref())
         .unwrap_or(&selected.declared_accent);
     let badge = if selected.is_nix {
         crate::icons::SNOWFLAKE
@@ -552,11 +613,15 @@ fn render_host_row(host: &AgoraHostView, selected: bool) -> String {
     )
 }
 
-fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
-    let shown_preferences = host
-        .requested_preferences
+fn displayed_preferences(host: &AgoraHostView) -> Option<&HostPreferences> {
+    host.requested_preferences
         .as_ref()
-        .unwrap_or(&host.preferences);
+        .or(host.declared_preferences.as_ref())
+        .or(Some(&host.preferences))
+}
+
+fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
+    let shown_preferences = displayed_preferences(host).unwrap_or(&host.preferences);
     let accent = shown_preferences
         .accent
         .as_deref()
@@ -583,13 +648,21 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
     .into_iter()
     .filter(|enabled| *enabled)
     .count();
-    let pending = host.requested_preferences.is_some();
-    let pending_copy = if pending {
-        if host.is_nix {
-            "Saved. Waiting for nixcfg delivery."
-        } else {
-            "Saved. Waiting for the host."
-        }
+    let declared_waiting = host
+        .declared_preferences
+        .as_ref()
+        .is_some_and(|declared| declared != &host.preferences);
+    let request_pending = host
+        .requested_preferences
+        .as_ref()
+        .is_some_and(|requested| {
+            host.declared_preferences.as_ref() != Some(requested) && requested != &host.preferences
+        });
+    let pending = request_pending || declared_waiting;
+    let pending_copy = if request_pending && host.is_nix {
+        "Change requested. Validation is running."
+    } else if pending {
+        "Change declared. Waiting for the host."
     } else {
         ""
     };
@@ -608,7 +681,10 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         crate::icons::SERVER
     };
     let checked = |enabled: bool| if enabled { " checked" } else { "" };
-    let advanced_note = if ready {
+    let advanced_note = if declared_waiting {
+        "The declaration is saved, but this host has not reported the same settings yet."
+            .to_string()
+    } else if ready {
         "Declared details stay separate from the host-reported applied state.".to_string()
     } else if !host.has_reported {
         "Settings become available after the first host report.".to_string()
@@ -617,8 +693,18 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
     } else {
         "The pending request is pulled by pharos-beacon and becomes active only after the host reports it.".to_string()
     };
+    let server_selected = if shown_preferences.kind.label() == "server" {
+        " selected"
+    } else {
+        ""
+    };
+    let workstation_selected = if shown_preferences.kind.label() == "workstation" {
+        " selected"
+    } else {
+        ""
+    };
     format!(
-        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-kind="{kind}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><button class="primary-action" type="button" data-save-color{disabled}>{color_action}</button><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span>Warn when this host stops reporting.</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div><div class="preference-actions"><button class="primary-action" type="button" data-save-alerts{disabled}>Save alert preferences</button></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section></section>"##,
+        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-kind="{kind}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><button class="primary-action" type="button" data-save-color{disabled}>{color_action}</button><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span>Warn when this host stops reporting.</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div><div class="preference-actions"><button class="primary-action" type="button" data-save-alerts{disabled}>Save alert preferences</button></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select><button class="primary-action" type="button" data-save-kind{disabled}>Save host type</button></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section></section>"##,
         host_name = html_escape(&host.name),
         ready = if ready { "true" } else { "false" },
         has_reported = if host.has_reported { "true" } else { "false" },
@@ -645,6 +731,8 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         backup_checked = checked(!shown_preferences.alerts.suppress_backup),
         nix_checked = checked(!shown_preferences.alerts.suppress_nix_freshness),
         sliders = crate::icons::SLIDERS,
+        server_selected = server_selected,
+        workstation_selected = workstation_selected,
         advanced_note = html_escape(&advanced_note),
         target_path = html_escape(&host.target_path),
         target_attribute = html_escape(&host.target_attribute),
@@ -719,15 +807,17 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
             .or_else(|| runtime.map(|host| host.role.clone()))
             .unwrap_or_else(|| "host".to_string());
         let palette = manifest.palette.as_ref();
-        let accent = palette.and_then(palette_accent);
+        let accent = manifest
+            .host
+            .preferences
+            .accent
+            .clone()
+            .or_else(|| palette.and_then(palette_accent));
         let settings_ready = accent.is_some();
         let declared_accent = accent.unwrap_or_else(|| DEFAULT_ACCENT.to_string());
-        let palette_name = palette
-            .map(|palette| palette.name.clone())
-            .unwrap_or_else(|| format!("custom-{}", manifest.slug));
         let preferences = runtime
             .map(|host| host.preferences.clone())
-            .unwrap_or_else(|| manifest.host.preferences.clone());
+            .unwrap_or_default();
         let requested_preferences = runtime.and_then(|host| host.requested_preferences.clone());
         let is_nix = runtime.map(|host| host.is_nix).unwrap_or_else(|| {
             manifest
@@ -747,8 +837,9 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
                 has_reported: runtime.is_some(),
                 settings_ready,
                 target_path: TARGET_PATH.to_string(),
-                target_attribute: format!("palettes.{palette_name}.gradient.primary"),
+                target_attribute: format!("hosts.{}", manifest.host.name),
                 preferences,
+                declared_preferences: Some(manifest.host.preferences.clone()),
                 requested_preferences,
             },
         );
@@ -775,7 +866,6 @@ fn setup_host_view(
             }
         })
         .collect::<String>();
-    let palette_name = format!("custom-{slug}");
     AgoraHostView {
         name: name.to_string(),
         slug,
@@ -785,8 +875,9 @@ fn setup_host_view(
         has_reported,
         settings_ready: false,
         target_path: TARGET_PATH.to_string(),
-        target_attribute: format!("palettes.{palette_name}.gradient.primary"),
+        target_attribute: format!("hosts.{name}"),
         preferences,
+        declared_preferences: None,
         requested_preferences,
     }
 }
@@ -865,15 +956,19 @@ fn build_palette_proposal(
     manifest: &HostManifest,
     proposed: &str,
 ) -> Result<PaletteProposal, &'static str> {
-    let Some(palette) = &manifest.palette else {
-        return Err("host manifest has no palette");
-    };
-    let Some(current) = palette_accent(palette) else {
-        return Err("host palette has no declared accent");
+    let palette = manifest.palette.as_ref();
+    let Some(current) = manifest
+        .host
+        .preferences
+        .accent
+        .clone()
+        .or_else(|| palette.and_then(palette_accent))
+    else {
+        return Err("host has no declared accent");
     };
     let normalized = normalize_hex_color(proposed)?;
-    let attribute = format!("palettes.{}.gradient.primary", palette.name);
-    let patch = render_palette_patch(TARGET_PATH, &current, &normalized, palette);
+    let attribute = format!("hosts.{}.accent", manifest.host.name);
+    let patch = render_palette_patch(TARGET_PATH, &manifest.host.name, &current, &normalized);
     Ok(PaletteProposal {
         schema: "inspr.pharos.agora.palette-proposal.v1",
         status: if current == normalized {
@@ -884,14 +979,16 @@ fn build_palette_proposal(
         host: manifest.host.name.clone(),
         slug: manifest.slug.clone(),
         change: ProposalChange {
-            setting: "host.palette.accent",
+            setting: "host.preferences.accent",
             declared: current,
             proposed: normalized,
         },
         target: ProposalTarget {
             repo: "nixcfg",
             path: TARGET_PATH,
-            palette: palette.name.clone(),
+            palette: palette
+                .map(|palette| palette.name.clone())
+                .unwrap_or_else(|| format!("custom-{}", manifest.slug)),
             attribute,
         },
         janus: ProposalJanus {
@@ -902,7 +999,7 @@ fn build_palette_proposal(
         safety: ProposalSafety {
             applies_change: false,
             deploys_host: false,
-            next_gate: "review and apply in nixcfg, then run nixcfg QA/backup/deploy gates",
+            next_gate: "dispatch the guarded nixcfg workflow and wait for repository checks",
         },
         patch: ProposalPatch {
             format: "unified-diff",
@@ -911,24 +1008,9 @@ fn build_palette_proposal(
     })
 }
 
-fn render_palette_patch(
-    target_path: &str,
-    current: &str,
-    proposed: &str,
-    palette: &ManifestPalette,
-) -> String {
-    let zellij_bg = palette
-        .zellij
-        .get("bg")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(current);
-    let zellij_frame = palette
-        .zellij
-        .get("frame")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(current);
+fn render_palette_patch(target_path: &str, host: &str, current: &str, proposed: &str) -> String {
     format!(
-        "diff --git a/{target_path} b/{target_path}\n--- a/{target_path}\n+++ b/{target_path}\n@@\n-        primary = \"{current}\";\n+        primary = \"{proposed}\";\n@@\n-        bg = \"{zellij_bg}\";\n+        bg = \"{proposed}\";\n@@\n-        frame = \"{zellij_frame}\";\n+        frame = \"{proposed}\";\n"
+        "diff --git a/{target_path} b/{target_path}\n--- a/{target_path}\n+++ b/{target_path}\n@@ hosts.{host}.accent @@\n-    \"accent\": \"{current}\"\n+    \"accent\": \"{proposed}\"\n"
     )
 }
 
@@ -1177,24 +1259,17 @@ mod tests {
         assert_eq!(proposal.status, "draft");
         assert_eq!(proposal.target.repo, "nixcfg");
         assert_eq!(proposal.target.path, TARGET_PATH);
-        assert_eq!(
-            proposal.target.attribute,
-            "palettes.custom-hsb8.gradient.primary"
-        );
+        assert_eq!(proposal.target.attribute, "hosts.hsb8.accent");
         assert!(!proposal.janus.required);
         assert!(!proposal.safety.applies_change);
         assert!(proposal
             .patch
             .value
-            .contains("-        primary = \"#e09051\";"));
+            .contains("-    \"accent\": \"#e09051\""));
         assert!(proposal
             .patch
             .value
-            .contains("+        primary = \"#48b8a8\";"));
-        assert!(proposal
-            .patch
-            .value
-            .contains("+        frame = \"#48b8a8\";"));
+            .contains("+    \"accent\": \"#48b8a8\""));
     }
 
     #[test]
@@ -1279,7 +1354,9 @@ mod tests {
         assert_eq!(html.matches(r#"class="preference-switch""#).count(), 3);
         assert!(html.contains(r#"<details class="settings-disclosure" data-advanced>"#));
         assert!(!html.contains(r#"<details class="settings-disclosure" open"#));
-        assert!(html.contains("palettes.custom-hsb8.gradient.primary"));
+        assert!(html.contains("hosts.hsb8"));
+        assert!(html.contains(r#"<select data-host-kind aria-label="Host type""#));
+        assert!(html.contains(r#"data-save-kind"#));
         assert!(!html.contains(r#"class="settings-ia""#));
         assert!(!html.contains(r#"class="settings-workspace""#));
         assert!(!html.contains(r#"class="settings-host-table""#));

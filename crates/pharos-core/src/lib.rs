@@ -79,6 +79,61 @@ impl HostPreferences {
     }
 }
 
+pub const HOST_PREFERENCES_SCHEMA: &str = "inspr.pharos.host-preferences.v1";
+pub const HOST_PREFERENCES_VERSION: u16 = 1;
+
+/// Narrow declarative preference registry shared with nixcfg. It contains
+/// display/alert metadata only and is not extensible to commands or paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostPreferencesRegistry {
+    pub schema: String,
+    pub version: u16,
+    pub hosts: BTreeMap<String, HostPreferences>,
+}
+
+impl HostPreferencesRegistry {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.schema != HOST_PREFERENCES_SCHEMA {
+            return Err(format!(
+                "unsupported host preferences schema {:?}",
+                self.schema
+            ));
+        }
+        if self.version != HOST_PREFERENCES_VERSION {
+            return Err(format!(
+                "unsupported host preferences version {}",
+                self.version
+            ));
+        }
+        if self.hosts.is_empty() {
+            return Err("host preferences registry must contain at least one host".to_string());
+        }
+        for (host, preferences) in &self.hosts {
+            if host.is_empty()
+                || host.len() > 63
+                || !host.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || (byte == b'-' && index > 0)
+                })
+                || host.ends_with('-')
+            {
+                return Err("host preferences registry contains an invalid host name".to_string());
+            }
+            preferences.validate_contract()?;
+            if preferences.accent.is_none() {
+                return Err("declared host preferences require an accent".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn preferences_for(&self, host: &str) -> Option<&HostPreferences> {
+        self.hosts.get(host)
+    }
+}
+
 /// A managed host as seen by the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Host {
@@ -2271,6 +2326,41 @@ mod tests {
         assert!(
             serde_json::from_value::<HostPreferences>(serde_json::json!({
                 "alerts": { "unexpected": true }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn host_preferences_registry_matches_nixcfg_schema_and_rejects_extensions() {
+        let registry: HostPreferencesRegistry = serde_json::from_value(serde_json::json!({
+            "schema": "inspr.pharos.host-preferences.v1",
+            "version": 1,
+            "hosts": {
+                "gpc0": {
+                    "accent": "#9868d0",
+                    "kind": "workstation",
+                    "alerts": {
+                        "suppress_down": true,
+                        "suppress_backup": false,
+                        "suppress_nix_freshness": true
+                    }
+                }
+            }
+        }))
+        .expect("nixcfg registry parses");
+        registry.validate_contract().expect("registry validates");
+        assert_eq!(
+            registry.preferences_for("gpc0").map(|value| value.kind),
+            Some(HostKind::Workstation)
+        );
+
+        assert!(
+            serde_json::from_value::<HostPreferencesRegistry>(serde_json::json!({
+                "schema": "inspr.pharos.host-preferences.v1",
+                "version": 1,
+                "hosts": {},
+                "commands": ["rebuild"]
             }))
             .is_err()
         );

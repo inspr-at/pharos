@@ -6,6 +6,22 @@
 }:
 
 let
+  preferencesRegistry = pkgs.writeText "pharos-test-host-preferences.json" (
+    builtins.toJSON {
+      schema = "inspr.pharos.host-preferences.v1";
+      version = 1;
+      hosts.vm-beacon = {
+        accent = "#48b8a8";
+        kind = "workstation";
+        alerts = {
+          suppress_down = true;
+          suppress_backup = false;
+          suppress_nix_freshness = true;
+        };
+      };
+    }
+  );
+
   pharosdTestRunner = pkgs.writeShellScript "pharosd-test-runner" ''
     set -euo pipefail
     export PHAROS_REGISTRATION_TOKEN="$(<"$CREDENTIALS_DIRECTORY/registration-token")"
@@ -43,7 +59,14 @@ let
   verifyFirstHeartbeat = pkgs.writeShellScript "verify-pharos-test-heartbeat" ''
     set -euo pipefail
     ${pkgs.curl}/bin/curl --fail --silent http://127.0.0.1:18080/hosts.json \
-      | ${pkgs.jq}/bin/jq -e 'any(.hosts[]?; .name == "vm-beacon" and (.last_seen | type == "number"))' \
+      | ${pkgs.jq}/bin/jq -e 'any(.hosts[]?;
+          .name == "vm-beacon"
+          and (.last_seen | type == "number")
+          and .preferences.accent == "#48b8a8"
+          and .preferences.kind == "workstation"
+          and .preferences.alerts.suppress_down == true
+          and .preferences.alerts.suppress_nix_freshness == true
+        )' \
       >/dev/null
   '';
 in
@@ -75,6 +98,7 @@ pkgs.testers.nixosTest {
         hostName = "vm-beacon";
         role = "NixOS integration test";
         tokenFile = "/run/pharos-test/beacon-token";
+        preferencesFile = toString preferencesRegistry;
         extraEnvironment = {
           PHAROS_BACKUP_MODE = "off";
           PHAROS_LOCATION_MODE = "off";

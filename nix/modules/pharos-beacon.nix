@@ -22,6 +22,9 @@ let
   // lib.optionalAttrs (cfg.nixcfgDir != null) {
     NIXCFG_DIR = cfg.nixcfgDir;
   }
+  // lib.optionalAttrs (cfg.preferencesFile != null) {
+    PHAROS_PREFERENCES_FILE = cfg.preferencesFile;
+  }
   // cfg.extraEnvironment
   // lib.optionalAttrs (cfg.tokenFile != null) {
     PHAROS_TOKEN_FILE = "%d/pharos-token";
@@ -68,6 +71,17 @@ in
       default = null;
       example = "/home/mba/Code/nixcfg";
       description = "Optional nixcfg checkout path used for flake.lock age and commits-behind freshness.";
+    };
+
+    preferencesFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/etc/pharos/host-preferences.json";
+      description = ''
+        Optional declared inspr.pharos.host-preferences.v1 registry. The beacon
+        selects its own host and reports that validated preference set as
+        applied runtime fact.
+      '';
     };
 
     tokenEnvironmentFile = lib.mkOption {
@@ -180,6 +194,9 @@ in
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
         SystemCallArchitectures = "native";
+      }
+      // lib.optionalAttrs (cfg.preferencesFile != null) {
+        ReadOnlyPaths = [ cfg.preferencesFile ];
       }
       // lib.optionalAttrs (cfg.tokenFile != null) {
         LoadCredential = "pharos-token:${cfg.tokenFile}";

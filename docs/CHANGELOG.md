@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## 0.1.21 - 2026-07-10
+
+- Dispatch Nix host color, host type, and alert preferences through nixcfg's fixed guarded workflow using an opt-in, file-only Actions credential; Pharos never writes git or deploys a host.
+- Keep requested, declared, and beacon-applied settings separate in the Fleet API and UI, with a compact change-waiting state that never presents a pending color as live.
+- Let the beacon validate and report its host's applied preferences from the shared `inspr.pharos.host-preferences.v1` registry while rejecting unknown fields and retaining its last valid state on read failures.
+- Add the NixOS preference-file option and KVM coverage for the complete declared-file-to-beacon-to-Pharos report path.
+
 ## 0.1.20 - 2026-07-10
 
 - Move each host's backup posture into a compact, clickable Fleet header chip beside Host settings, with distinct protected, unreported, stale, and failed shield states.

@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
     BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
-    HostLocation, HostLocationSource, HostReport, NixFreshness, ServiceObservation,
-    HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_INBOUND_RTT_MS,
+    HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
+    NixFreshness, ServiceObservation, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_INBOUND_RTT_MS,
 };
 
 fn now_unix() -> i64 {
@@ -63,6 +63,24 @@ fn bearer_token() -> Option<String> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
+}
+
+fn parse_host_preferences(raw: &str, host: &str) -> Result<HostPreferences, &'static str> {
+    let registry = serde_json::from_str::<HostPreferencesRegistry>(raw)
+        .map_err(|_| "host preference registry is invalid")?;
+    registry
+        .validate_contract()
+        .map_err(|_| "host preference registry is invalid")?;
+    registry
+        .preferences_for(host)
+        .cloned()
+        .ok_or("host preference registry does not contain this host")
+}
+
+fn read_host_preferences(path: &Path, host: &str) -> Result<HostPreferences, &'static str> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|_| "host preference registry is unavailable")?;
+    parse_host_preferences(&raw, host)
 }
 
 /// Locate a flake checkout (one containing flake.lock).
@@ -1021,6 +1039,9 @@ fn main() {
     let dir = nixcfg_dir();
     let role = std::env::var("PHAROS_ROLE").unwrap_or_else(|_| "server".into());
     let token = bearer_token();
+    let preferences_path = env_value("PHAROS_PREFERENCES_FILE").map(std::path::PathBuf::from);
+    let mut preferences = HostPreferences::default();
+    let mut preferences_error_reported = false;
 
     // PHAROS_INTERVAL (secs) set => loop forever (recurring service);
     // unset => report once and exit (one-shot / timer-driven).
@@ -1032,6 +1053,19 @@ fn main() {
     let mut last_report_rtt_ms: Option<u64> = None;
 
     loop {
+        if let Some(path) = preferences_path.as_deref() {
+            match read_host_preferences(path, &host) {
+                Ok(next) => {
+                    preferences = next;
+                    preferences_error_reported = false;
+                }
+                Err(error) if !preferences_error_reported => {
+                    eprintln!("pharos-beacon: {error}; keeping last valid host preferences");
+                    preferences_error_reported = true;
+                }
+                Err(_) => {}
+            }
+        }
         let freshness = if is_nix {
             NixFreshness {
                 applicable: true,
@@ -1057,7 +1091,7 @@ fn main() {
             backup_observations,
             inbound_rtt_ms: last_report_rtt_ms,
             location,
-            preferences: Default::default(),
+            preferences: preferences.clone(),
         };
         let body = serde_json::to_string(&report).expect("serialize report");
         let mut request = ureq::post(&endpoint).set("Content-Type", "application/json");
@@ -1098,6 +1132,60 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beacon_reads_exact_nixcfg_host_preferences_schema() {
+        let raw = r##"{
+          "schema": "inspr.pharos.host-preferences.v1",
+          "version": 1,
+          "hosts": {
+            "gpc0": {
+              "accent": "#9868d0",
+              "kind": "workstation",
+              "alerts": {
+                "suppress_backup": false,
+                "suppress_down": true,
+                "suppress_nix_freshness": true
+              }
+            }
+          }
+        }"##;
+
+        let preferences = parse_host_preferences(raw, "gpc0").expect("preferences parse");
+        assert_eq!(preferences.accent.as_deref(), Some("#9868d0"));
+        assert_eq!(preferences.kind, pharos_core::HostKind::Workstation);
+        assert!(preferences.alerts.suppress_down);
+        assert!(preferences.alerts.suppress_nix_freshness);
+    }
+
+    #[test]
+    fn beacon_rejects_unknown_preferences_and_keeps_previous_state_available() {
+        let extended = r##"{
+          "schema": "inspr.pharos.host-preferences.v1",
+          "version": 1,
+          "hosts": {
+            "gpc0": {
+              "accent": "#9868d0",
+              "kind": "workstation",
+              "alerts": {
+                "suppress_backup": false,
+                "suppress_down": false,
+                "suppress_nix_freshness": false
+              },
+              "command": "rebuild"
+            }
+          }
+        }"##;
+        let previous = HostPreferences::default();
+
+        assert!(parse_host_preferences(extended, "gpc0").is_err());
+        assert!(parse_host_preferences(
+            r#"{"schema":"inspr.pharos.host-preferences.v1","version":1,"hosts":{}}"#,
+            "gpc0"
+        )
+        .is_err());
+        assert_eq!(previous, HostPreferences::default());
+    }
 
     #[test]
     fn report_rtt_millis_is_protocol_bounded() {

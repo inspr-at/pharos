@@ -80,6 +80,39 @@ manifest. Agora uses the same manifest data for per-host settings proposals.
 PHAROS_MANIFEST_PATHS=/etc/hostdash-config/hsb8.json cargo run -p pharosd
 ```
 
+### Declarative Nix host settings
+
+Agora can request the fixed `inspr.pharos.host-preferences.v1` preference set
+through nixcfg's guarded `pharos-host-settings.yml` workflow. This integration
+is off by default. Enable it only with a fine-grained GitHub token that has
+**Actions: write** for the `markus-barta/nixcfg` repository and no repository
+contents or pull-request write permission:
+
+```bash
+export PHAROS_NIXCFG_DISPATCH_ENABLED=1
+export PHAROS_NIXCFG_DISPATCH_TOKEN_FILE=/run/pharos/nixcfg-dispatch-token
+```
+
+Mount the token as a private, read-only runtime file; never place its value in
+Compose, an environment variable, logs, or the host store. pharosd calls only
+the fixed workflow-dispatch endpoint. The workflow owns validation, commit,
+pull request, checks, and ordinary merge; pharosd has no git or merge logic.
+
+An accepted dispatch means only that the request reached GitHub. It does not
+mean the workflow merged or that a host rebuilt. Fleet therefore keeps three
+states separate: requested operator intent, the declaration currently loaded
+from the nixcfg-generated manifest, and the last preference set reported by
+the beacon. A declared change remains **change waiting** until the host's own
+later rebuild applies it and the beacon reports the matching value. Pharos does
+not trigger that rebuild or any fleet-wide deployment.
+
+After a NixOS generation owns the declaration, point the beacon at that
+generation's registry with
+`PHAROS_PREFERENCES_FILE=/etc/pharos/host-preferences.json` (or the NixOS module
+option below). The beacon validates the complete fixed schema, selects only its
+own hostname, and keeps its last valid value if a later read is missing or
+malformed. Unknown fields are rejected; the file cannot carry commands.
+
 ### Local Docker Compose
 
 `docker-compose.yml` is a local smoke topology, not the production deployment.
@@ -189,6 +222,7 @@ beacon with a native systemd service:
     enable = true;
     tokenFile = "/etc/pharos/pharos-beacon.token";
     nixcfgDir = "/home/mba/Code/nixcfg";
+    preferencesFile = "/etc/pharos/host-preferences.json";
   };
 }
 ```
