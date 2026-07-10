@@ -1,5 +1,13 @@
 # Pharos Changelog
 
+## 0.1.12 - 2026-07-10
+
+- Added an opt-in, fail-closed native systemd executor for existing-host onboarding after successful SSH/preflight review.
+- Kept raw beacon credentials out of process arguments, persisted jobs, and logs: the one-time value travels only over SSH stdin into a root-owned runtime env file.
+- Refused unknown SSH host keys, missing runtime references, unsupported routes/architectures, and implicit token-file rotation before changing a target.
+- Required a heartbeat at or after the current wait state so old host data cannot falsely complete a new onboarding job; a valid heartbeat can resolve an uncertain install result.
+- Bundled the portable systemd installer in the released container and documented the advanced self-host executor contract while leaving it disabled by default.
+
 ## 0.1.11 - 2026-07-10
 
 - Added a separate self-host Docker Compose template for running the released Pharos image outside the Markus-owned nixcfg deployment.

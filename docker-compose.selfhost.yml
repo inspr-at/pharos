@@ -27,6 +27,14 @@ services:
       PHAROS_REQUIRE_BEACON_TOKEN: "1"
       PHAROS_BEACON_TOKEN_MODE: ${PHAROS_BEACON_TOKEN_MODE:-local}
 
+      # Optional existing-host native bootstrap executor. It remains disabled
+      # unless every trust/route input is supplied explicitly. Mount the
+      # referenced SSH files read-only with a local compose override.
+      PHAROS_EXISTING_HOST_EXECUTE: ${PHAROS_EXISTING_HOST_EXECUTE:-0}
+      PHAROS_EXISTING_HOST_PHAROS_URL: ${PHAROS_EXISTING_HOST_PHAROS_URL:-}
+      PHAROS_EXISTING_HOST_IDENTITY_FILE: ${PHAROS_EXISTING_HOST_IDENTITY_FILE:-}
+      PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE: ${PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE:-}
+
       # Optional declared-host manifest paths, for example:
       # PHAROS_MANIFEST_PATHS=/manifests/host-a.json:/manifests/host-b.json
       PHAROS_MANIFEST_PATHS: ${PHAROS_MANIFEST_PATHS:-}
@@ -36,6 +44,8 @@ services:
       - pharos_data:/data
       # Optional manifest mount for declared hosts:
       # - ./manifests:/manifests:ro
+      # Optional bootstrap SSH mount (use a private local compose override):
+      # - ./private/pharos-ssh:/run/pharos/ssh:ro
 
 volumes:
   pharos_data: {}

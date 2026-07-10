@@ -27,6 +27,7 @@ RUN useradd --system --uid 10001 pharos
 RUN install -d -o pharos -g pharos /data
 COPY --from=build /src/target/release/pharosd /usr/local/bin/pharosd
 COPY --from=build /src/target/release/pharos-beacon /usr/local/bin/pharos-beacon
+COPY --chmod=0755 scripts/install-pharos-beacon-systemd.sh /usr/local/share/pharos/install-pharos-beacon-systemd.sh
 USER pharos
 ENV PHAROS_ADDR=0.0.0.0:8080 \
     RUST_LOG=info

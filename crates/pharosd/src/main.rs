@@ -16,12 +16,15 @@ mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use axum::extract::{FromRef, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -219,6 +222,37 @@ impl ProvisioningJobStore {
         Some(job)
     }
 
+    fn transition_existing_host(
+        &self,
+        id: &str,
+        state: ProvisioningJobState,
+        message: impl Into<String>,
+        handoff_status: &str,
+        handoff_summary: &str,
+        now: i64,
+    ) -> Option<ProvisioningJob> {
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let job = jobs.get_mut(id)?;
+        job.state = state;
+        job.updated_at = now;
+        job.progress.push(ProvisioningProgressEntry {
+            state,
+            message: message.into(),
+            observed_at: now,
+        });
+        if let Some(handoff) = job.handoff.as_mut() {
+            handoff.status = handoff_status.to_string();
+            handoff.summary = handoff_summary.to_string();
+        }
+        if job.validate_contract().is_err() {
+            return None;
+        }
+        let job = job.clone();
+        drop(jobs);
+        self.persist();
+        Some(job)
+    }
+
     fn persist(&self) {
         let Some(path) = &self.path else { return };
         let snapshot: Vec<ProvisioningJob> = self
@@ -282,13 +316,403 @@ struct ProvisioningJobStartRequest {
 #[derive(Clone, Debug, Default)]
 struct ProviderRuntimeConfig {
     hetzner_cloud: HetznerCloudRuntimeConfig,
+    existing_host: ExistingHostRuntimeConfig,
 }
 
 impl ProviderRuntimeConfig {
     fn from_env() -> Self {
         Self {
             hetzner_cloud: HetznerCloudRuntimeConfig::from_env(),
+            existing_host: ExistingHostRuntimeConfig::from_env(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExistingHostRuntimeConfig {
+    execute_enabled: bool,
+    identity_file: Option<PathBuf>,
+    known_hosts_file: Option<PathBuf>,
+    beacon_binary_path: PathBuf,
+    installer_path: PathBuf,
+    pharos_url: Option<String>,
+}
+
+impl Default for ExistingHostRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            execute_enabled: false,
+            identity_file: None,
+            known_hosts_file: None,
+            beacon_binary_path: PathBuf::from("/usr/local/bin/pharos-beacon"),
+            installer_path: PathBuf::from(
+                "/usr/local/share/pharos/install-pharos-beacon-systemd.sh",
+            ),
+            pharos_url: None,
+        }
+    }
+}
+
+impl ExistingHostRuntimeConfig {
+    fn from_env() -> Self {
+        Self {
+            execute_enabled: env_nonempty("PHAROS_EXISTING_HOST_EXECUTE")
+                .and_then(|value| parse_bool(&value))
+                .unwrap_or(false),
+            identity_file: env_nonempty("PHAROS_EXISTING_HOST_IDENTITY_FILE").map(PathBuf::from),
+            known_hosts_file: env_nonempty("PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE")
+                .map(PathBuf::from),
+            beacon_binary_path: env_nonempty("PHAROS_EXISTING_HOST_BEACON_BINARY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/usr/local/bin/pharos-beacon")),
+            installer_path: env_nonempty("PHAROS_EXISTING_HOST_INSTALLER")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from("/usr/local/share/pharos/install-pharos-beacon-systemd.sh")
+                }),
+            pharos_url: env_nonempty("PHAROS_EXISTING_HOST_PHAROS_URL"),
+        }
+    }
+
+    fn validate_native_systemd(&self) -> Result<&str, ExistingHostExecutionError> {
+        if !self.execute_enabled {
+            return Err(ExistingHostExecutionError::RuntimeDisabled);
+        }
+        let known_hosts = self
+            .known_hosts_file
+            .as_deref()
+            .ok_or(ExistingHostExecutionError::KnownHostsUnavailable)?;
+        if !trusted_known_hosts_file(known_hosts) {
+            return Err(ExistingHostExecutionError::KnownHostsUnavailable);
+        }
+        if self
+            .identity_file
+            .as_deref()
+            .is_some_and(|path| !private_identity_file(path))
+        {
+            return Err(ExistingHostExecutionError::IdentityUnavailable);
+        }
+        if !self.beacon_binary_path.is_file() {
+            return Err(ExistingHostExecutionError::BeaconBinaryUnavailable);
+        }
+        if !self.installer_path.is_file() {
+            return Err(ExistingHostExecutionError::InstallerUnavailable);
+        }
+        let pharos_url = self
+            .pharos_url
+            .as_deref()
+            .ok_or(ExistingHostExecutionError::PharosUrlUnavailable)?;
+        let parsed =
+            Url::parse(pharos_url).map_err(|_| ExistingHostExecutionError::PharosUrlUnavailable)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(ExistingHostExecutionError::PharosUrlUnavailable);
+        }
+        Ok(pharos_url)
+    }
+}
+
+fn trusted_known_hosts_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return false;
+    }
+    true
+}
+
+fn private_identity_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return false;
+    }
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExistingHostExecutionError {
+    RuntimeDisabled,
+    UnsupportedTokenMode,
+    KnownHostsUnavailable,
+    IdentityUnavailable,
+    BeaconBinaryUnavailable,
+    InstallerUnavailable,
+    PharosUrlUnavailable,
+    InvalidTarget,
+    UnsupportedSshRoute,
+    ArchitectureMismatch,
+    RemoteCommandFailed,
+    RemoteResponseInvalid,
+    ExistingTokenFile,
+    TokenGenerationFailed,
+    ExecutorTaskFailed,
+}
+
+impl ExistingHostExecutionError {
+    fn safe_message(&self) -> &'static str {
+        match self {
+            Self::RuntimeDisabled => {
+                "Existing-host execution is disabled; the safe handoff remains available"
+            }
+            Self::UnsupportedTokenMode => {
+                "Existing-host execution needs local token issuance or a configured Janus credential broker"
+            }
+            Self::KnownHostsUnavailable => {
+                "Existing-host execution needs a readable strict SSH known-hosts file"
+            }
+            Self::IdentityUnavailable => {
+                "Existing-host SSH identity reference is configured but not readable"
+            }
+            Self::BeaconBinaryUnavailable => {
+                "The pharos-beacon runtime artifact is not readable by the executor"
+            }
+            Self::InstallerUnavailable => {
+                "The native systemd installer artifact is not readable by the executor"
+            }
+            Self::PharosUrlUnavailable => {
+                "Existing-host execution needs a target-facing HTTP or HTTPS Pharos URL"
+            }
+            Self::InvalidTarget => "Existing-host SSH target contains unsupported characters",
+            Self::UnsupportedSshRoute => {
+                "This SSH route needs an external bastion handoff and cannot run directly"
+            }
+            Self::ArchitectureMismatch => {
+                "The target architecture does not match the bundled pharos-beacon artifact"
+            }
+            Self::RemoteCommandFailed => {
+                "The remote bootstrap command did not complete; inspect the target before retrying"
+            }
+            Self::RemoteResponseInvalid => {
+                "The remote bootstrap response was not recognized; no credential was exposed"
+            }
+            Self::ExistingTokenFile => {
+                "The target already has a Pharos token file; explicit rotation is required"
+            }
+            Self::TokenGenerationFailed => "Pharos could not generate the one-time beacon token",
+            Self::ExecutorTaskFailed => {
+                "The existing-host executor stopped before it could confirm the result"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NativeSystemdBootstrapSpec {
+    host_name: String,
+    role: String,
+    interval: u64,
+    target: String,
+    port: u16,
+}
+
+impl NativeSystemdBootstrapSpec {
+    fn from_request(
+        request: &ProvisioningJobStartRequest,
+    ) -> Result<Self, ExistingHostExecutionError> {
+        if request.is_nix == Some(true) {
+            return Err(ExistingHostExecutionError::InvalidTarget);
+        }
+        let host_name = request
+            .host_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| valid_bootstrap_name(value))
+            .ok_or(ExistingHostExecutionError::InvalidTarget)?;
+        let role = request
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| safe_bootstrap_role(value))
+            .unwrap_or("server");
+        let ssh = request
+            .ssh
+            .as_ref()
+            .ok_or(ExistingHostExecutionError::InvalidTarget)?;
+        if !matches!(ssh.route, SshRoute::Direct | SshRoute::Tailnet) {
+            return Err(ExistingHostExecutionError::UnsupportedSshRoute);
+        }
+        let ssh_host = ssh
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| valid_ssh_endpoint(value))
+            .ok_or(ExistingHostExecutionError::InvalidTarget)?;
+        let target = match ssh.user.as_deref().map(str::trim) {
+            Some(user) if valid_ssh_user(user) => format!("{user}@{ssh_host}"),
+            Some(_) => return Err(ExistingHostExecutionError::InvalidTarget),
+            None => ssh_host.to_string(),
+        };
+        Ok(Self {
+            host_name: host_name.to_string(),
+            role: role.to_string(),
+            interval: request
+                .heartbeat_interval_secs
+                .unwrap_or(60)
+                .clamp(1, 86_400),
+            target,
+            port: ssh.port.unwrap_or(22),
+        })
+    }
+}
+
+fn valid_bootstrap_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn safe_bootstrap_role(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && !value.contains('\n')
+        && !value.contains('\r')
+        && !value.to_ascii_lowercase().contains("token=")
+        && !value.to_ascii_lowercase().contains("bearer ")
+}
+
+fn valid_ssh_endpoint(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn valid_ssh_user(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn native_binary_matches_remote_arch(remote_arch: &str) -> bool {
+    match std::env::consts::ARCH {
+        "x86_64" => matches!(remote_arch, "x86_64" | "amd64"),
+        "aarch64" => matches!(remote_arch, "aarch64" | "arm64"),
+        local => remote_arch == local,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedNativeSystemdBootstrap {
+    remote_dir: String,
+    remote_binary: String,
+    remote_installer: String,
+}
+
+trait ExistingHostSshRunner {
+    fn run(
+        &self,
+        config: &ExistingHostRuntimeConfig,
+        spec: &NativeSystemdBootstrapSpec,
+        remote_command: &str,
+        stdin: Option<&[u8]>,
+    ) -> Result<Vec<u8>, ExistingHostExecutionError>;
+}
+
+struct SystemExistingHostSshRunner;
+
+impl ExistingHostSshRunner for SystemExistingHostSshRunner {
+    fn run(
+        &self,
+        config: &ExistingHostRuntimeConfig,
+        spec: &NativeSystemdBootstrapSpec,
+        remote_command: &str,
+        stdin: Option<&[u8]>,
+    ) -> Result<Vec<u8>, ExistingHostExecutionError> {
+        let known_hosts = config
+            .known_hosts_file
+            .as_deref()
+            .ok_or(ExistingHostExecutionError::KnownHostsUnavailable)?;
+        let mut command = Command::new("ssh");
+        command
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("PasswordAuthentication=no")
+            .arg("-o")
+            .arg("KbdInteractiveAuthentication=no")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=yes")
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+            .arg("-o")
+            .arg("ConnectTimeout=8")
+            .arg("-o")
+            .arg("ServerAliveInterval=5")
+            .arg("-o")
+            .arg("ServerAliveCountMax=2")
+            .arg("-o")
+            .arg("LogLevel=ERROR");
+        if let Some(identity_file) = &config.identity_file {
+            command
+                .arg("-o")
+                .arg("IdentitiesOnly=yes")
+                .arg("-i")
+                .arg(identity_file);
+        }
+        command
+            .arg("-p")
+            .arg(spec.port.to_string())
+            .arg(&spec.target)
+            .arg(remote_command)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = command
+            .spawn()
+            .map_err(|_| ExistingHostExecutionError::RemoteCommandFailed)?;
+        if let Some(input) = stdin {
+            child
+                .stdin
+                .take()
+                .ok_or(ExistingHostExecutionError::RemoteCommandFailed)?
+                .write_all(input)
+                .map_err(|_| ExistingHostExecutionError::RemoteCommandFailed)?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|_| ExistingHostExecutionError::RemoteCommandFailed)?;
+        if !output.status.success() || output.stdout.len() > 4096 {
+            return Err(ExistingHostExecutionError::RemoteCommandFailed);
+        }
+        Ok(output.stdout)
     }
 }
 
@@ -683,6 +1107,192 @@ fn existing_host_automated_handoff_blocker(
         }
     }
     None
+}
+
+const REMOTE_NATIVE_SYSTEMD_READINESS: &str = r#"set -eu
+for tool in systemctl install getent groupadd useradd; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'runtime-unavailable'
+    exit 0
+  fi
+done
+if [ "$(id -u)" -eq 0 ]; then
+  if [ -e /etc/pharos/pharos-beacon.env ] || [ -e /etc/pharos/pharos-beacon.token ]; then
+    printf 'existing-token'
+  else
+    printf 'ready:%s' "$(uname -m 2>/dev/null || printf unknown)"
+  fi
+elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  if sudo -n test -e /etc/pharos/pharos-beacon.env || sudo -n test -e /etc/pharos/pharos-beacon.token; then
+    printf 'existing-token'
+  else
+    printf 'ready:%s' "$(uname -m 2>/dev/null || printf unknown)"
+  fi
+else
+  printf 'privilege-unavailable'
+fi
+"#;
+
+const REMOTE_NATIVE_SYSTEMD_TOKEN_WRITE: &str = r#"set -eu
+if [ "$(id -u)" -eq 0 ]; then
+  install -d -m 0700 -o root -g root /etc/pharos
+  test ! -e /etc/pharos/pharos-beacon.env
+  test ! -e /etc/pharos/pharos-beacon.token
+  umask 077
+  cat > /etc/pharos/pharos-beacon.env
+  chmod 0600 /etc/pharos/pharos-beacon.env
+elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  sudo -n install -d -m 0700 -o root -g root /etc/pharos
+  sudo -n sh -c 'set -eu; test ! -e /etc/pharos/pharos-beacon.env; test ! -e /etc/pharos/pharos-beacon.token; umask 077; cat > /etc/pharos/pharos-beacon.env; chmod 0600 /etc/pharos/pharos-beacon.env'
+else
+  exit 77
+fi
+"#;
+
+fn valid_remote_bootstrap_dir(value: &str) -> bool {
+    value.starts_with("/tmp/pharos-bootstrap.")
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+}
+
+fn remote_upload_command(path: &str) -> String {
+    let path = shell_single_quote(path);
+    format!("set -eu; umask 077; cat > {path}; chmod 0700 {path}")
+}
+
+fn cleanup_native_systemd_bootstrap<R: ExistingHostSshRunner>(
+    runner: &R,
+    config: &ExistingHostRuntimeConfig,
+    spec: &NativeSystemdBootstrapSpec,
+    prepared: &PreparedNativeSystemdBootstrap,
+) {
+    let binary = shell_single_quote(&prepared.remote_binary);
+    let installer = shell_single_quote(&prepared.remote_installer);
+    let dir = shell_single_quote(&prepared.remote_dir);
+    let command =
+        format!("rm -f {binary} {installer} 2>/dev/null || true; rmdir {dir} 2>/dev/null || true");
+    let _ = runner.run(config, spec, &command, None);
+}
+
+fn prepare_native_systemd_bootstrap<R: ExistingHostSshRunner>(
+    runner: &R,
+    config: &ExistingHostRuntimeConfig,
+    spec: &NativeSystemdBootstrapSpec,
+) -> Result<PreparedNativeSystemdBootstrap, ExistingHostExecutionError> {
+    config.validate_native_systemd()?;
+    let beacon_binary = fs::read(&config.beacon_binary_path)
+        .map_err(|_| ExistingHostExecutionError::BeaconBinaryUnavailable)?;
+    let installer = fs::read(&config.installer_path)
+        .map_err(|_| ExistingHostExecutionError::InstallerUnavailable)?;
+    let remote_dir = String::from_utf8(runner.run(
+        config,
+        spec,
+        "set -eu; umask 077; mktemp -d /tmp/pharos-bootstrap.XXXXXX",
+        None,
+    )?)
+    .map_err(|_| ExistingHostExecutionError::RemoteResponseInvalid)?;
+    let remote_dir = remote_dir.trim();
+    if !valid_remote_bootstrap_dir(remote_dir) {
+        return Err(ExistingHostExecutionError::RemoteResponseInvalid);
+    }
+    let prepared = PreparedNativeSystemdBootstrap {
+        remote_dir: remote_dir.to_string(),
+        remote_binary: format!("{remote_dir}/pharos-beacon"),
+        remote_installer: format!("{remote_dir}/install-pharos-beacon-systemd.sh"),
+    };
+    if runner
+        .run(
+            config,
+            spec,
+            &remote_upload_command(&prepared.remote_binary),
+            Some(&beacon_binary),
+        )
+        .is_err()
+        || runner
+            .run(
+                config,
+                spec,
+                &remote_upload_command(&prepared.remote_installer),
+                Some(&installer),
+            )
+            .is_err()
+    {
+        cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
+        return Err(ExistingHostExecutionError::RemoteCommandFailed);
+    }
+    let readiness = match runner.run(config, spec, REMOTE_NATIVE_SYSTEMD_READINESS, None) {
+        Ok(readiness) => readiness,
+        Err(error) => {
+            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
+            return Err(error);
+        }
+    };
+    match std::str::from_utf8(&readiness).map(str::trim) {
+        Ok(value)
+            if value
+                .strip_prefix("ready:")
+                .is_some_and(native_binary_matches_remote_arch) =>
+        {
+            Ok(prepared)
+        }
+        Ok(value) if value.starts_with("ready:") => {
+            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
+            Err(ExistingHostExecutionError::ArchitectureMismatch)
+        }
+        Ok("existing-token") => {
+            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
+            Err(ExistingHostExecutionError::ExistingTokenFile)
+        }
+        Ok("runtime-unavailable" | "privilege-unavailable") => {
+            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
+            Err(ExistingHostExecutionError::RemoteCommandFailed)
+        }
+        _ => {
+            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
+            Err(ExistingHostExecutionError::RemoteResponseInvalid)
+        }
+    }
+}
+
+fn install_native_systemd_bootstrap<R: ExistingHostSshRunner>(
+    runner: &R,
+    config: &ExistingHostRuntimeConfig,
+    spec: &NativeSystemdBootstrapSpec,
+    prepared: &PreparedNativeSystemdBootstrap,
+    token: &str,
+) -> Result<(), ExistingHostExecutionError> {
+    let pharos_url = config.validate_native_systemd()?;
+    let token_payload = format!("PHAROS_TOKEN={token}\n");
+    if runner
+        .run(
+            config,
+            spec,
+            REMOTE_NATIVE_SYSTEMD_TOKEN_WRITE,
+            Some(token_payload.as_bytes()),
+        )
+        .is_err()
+    {
+        cleanup_native_systemd_bootstrap(runner, config, spec, prepared);
+        return Err(ExistingHostExecutionError::RemoteCommandFailed);
+    }
+
+    let installer = shell_single_quote(&prepared.remote_installer);
+    let binary = shell_single_quote(&prepared.remote_binary);
+    let pharos_url = shell_single_quote(pharos_url);
+    let host_name = shell_single_quote(&spec.host_name);
+    let role = shell_single_quote(&spec.role);
+    let interval = spec.interval;
+    let install_command = format!(
+        "{installer} --binary {binary} --token-env /etc/pharos/pharos-beacon.env --pharos-url {pharos_url} --host {host_name} --role {role} --interval {interval}"
+    );
+    let remote_command = format!(
+        "set -eu; if [ \"$(id -u)\" -eq 0 ]; then exec {install_command}; elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then exec sudo -n {install_command}; else exit 77; fi"
+    );
+    let result = runner.run(config, spec, &remote_command, None);
+    cleanup_native_systemd_bootstrap(runner, config, spec, prepared);
+    result.map(|_| ())
 }
 
 fn provisioning_existing_host_context(
@@ -4130,6 +4740,8 @@ async fn create_provisioning_job(
         Ok(job) => {
             let job = if should_run_hetzner_executor(&request, &job) {
                 execute_hetzner_setup_job(&state, &request, job).await
+            } else if should_run_existing_host_executor(&state, &request, &job) {
+                execute_existing_host_setup_job(&state, &request, job).await
             } else {
                 job
             };
@@ -4154,6 +4766,177 @@ fn should_run_hetzner_executor(
     request.provider == "hetzner-cloud"
         && request.apply
         && job.state == ProvisioningJobState::Provisioning
+}
+
+fn should_run_existing_host_executor(
+    state: &AppState,
+    request: &ProvisioningJobStartRequest,
+    job: &ProvisioningJob,
+) -> bool {
+    request.provider == "existing-host"
+        && request.template == "native-systemd"
+        && request.apply
+        && job.state == ProvisioningJobState::WaitingForHeartbeat
+        && state.provider_runtime.existing_host.execute_enabled
+}
+
+fn fail_existing_host_setup_job(
+    state: &AppState,
+    job: ProvisioningJob,
+    error: ExistingHostExecutionError,
+) -> ProvisioningJob {
+    state
+        .provisioning_jobs
+        .transition_existing_host(
+            &job.id,
+            ProvisioningJobState::Failed,
+            format!("{}; no beacon credential was installed.", error.safe_message()),
+            "bootstrap-failed",
+            "Automated bootstrap stopped before credential installation; review the safe error and retry only after the target is ready.",
+            now_unix(),
+        )
+        .unwrap_or(job)
+}
+
+async fn execute_existing_host_setup_job(
+    state: &AppState,
+    request: &ProvisioningJobStartRequest,
+    job: ProvisioningJob,
+) -> ProvisioningJob {
+    if matches!(state.beacon_auth.report_token_mode, BeaconTokenMode::Janus)
+        || !state.beacon_auth.local_register_enabled
+    {
+        return fail_existing_host_setup_job(
+            state,
+            job,
+            ExistingHostExecutionError::UnsupportedTokenMode,
+        );
+    }
+    let spec = match NativeSystemdBootstrapSpec::from_request(request) {
+        Ok(spec) => spec,
+        Err(error) => return fail_existing_host_setup_job(state, job, error),
+    };
+    if let Err(error) = state
+        .provider_runtime
+        .existing_host
+        .validate_native_systemd()
+    {
+        return fail_existing_host_setup_job(state, job, error);
+    }
+
+    let runtime = state.provider_runtime.existing_host.clone();
+    let prepare_spec = spec.clone();
+    let prepared = match tokio::task::spawn_blocking(move || {
+        prepare_native_systemd_bootstrap(&SystemExistingHostSshRunner, &runtime, &prepare_spec)
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => return fail_existing_host_setup_job(state, job, error),
+        Err(_) => {
+            return fail_existing_host_setup_job(
+                state,
+                job,
+                ExistingHostExecutionError::ExecutorTaskFailed,
+            )
+        }
+    };
+
+    let bootstrapping = state
+        .provisioning_jobs
+        .transition_existing_host(
+            &job.id,
+            ProvisioningJobState::Bootstrapping,
+            "SSH trust, privilege, destination, and installer artifacts verified; installing the native beacon through the protected runtime channel.",
+            "installing",
+            "The target passed the fail-closed execution gate; Pharos is installing the beacon without placing its credential in command arguments or job output.",
+            now_unix(),
+        )
+        .unwrap_or_else(|| job.clone());
+
+    let token = match new_beacon_token() {
+        Ok(token) => token,
+        Err(_) => {
+            let runtime = state.provider_runtime.existing_host.clone();
+            let cleanup_spec = spec.clone();
+            let cleanup_prepared = prepared.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                cleanup_native_systemd_bootstrap(
+                    &SystemExistingHostSshRunner,
+                    &runtime,
+                    &cleanup_spec,
+                    &cleanup_prepared,
+                );
+            })
+            .await;
+            return fail_existing_host_setup_job(
+                state,
+                bootstrapping,
+                ExistingHostExecutionError::TokenGenerationFailed,
+            );
+        }
+    };
+    state.store.register(
+        HostRegistration {
+            name: spec.host_name.clone(),
+            role: spec.role.clone(),
+            is_nix: false,
+            heartbeat_interval_secs: spec.interval,
+        },
+        token_hash(&token),
+    );
+
+    let runtime = state.provider_runtime.existing_host.clone();
+    let install_spec = spec.clone();
+    let install_prepared = prepared.clone();
+    let install_result = tokio::task::spawn_blocking(move || {
+        install_native_systemd_bootstrap(
+            &SystemExistingHostSshRunner,
+            &runtime,
+            &install_spec,
+            &install_prepared,
+            &token,
+        )
+    })
+    .await;
+    match install_result {
+        Ok(Ok(())) => state
+            .provisioning_jobs
+            .transition_existing_host(
+                &bootstrapping.id,
+                ProvisioningJobState::WaitingForHeartbeat,
+                "Native pharos-beacon installation completed; waiting for the first authenticated heartbeat.",
+                "installed-waiting-for-heartbeat",
+                "The native beacon and root-owned runtime credential file were installed; onboarding will reconcile after the first authenticated heartbeat.",
+                now_unix(),
+            )
+            .unwrap_or(bootstrapping),
+        Ok(Err(error)) => state
+            .provisioning_jobs
+            .transition_existing_host(
+                &bootstrapping.id,
+                ProvisioningJobState::CleanupNeeded,
+                format!(
+                    "{}. The target may contain a matching root-owned token file; inspect service state before retrying.",
+                    error.safe_message()
+                ),
+                "cleanup-needed",
+                "Credential handoff began but installation was not confirmed; inspect the target and do not rotate or retry blindly.",
+                now_unix(),
+            )
+            .unwrap_or(bootstrapping),
+        Err(_) => state
+            .provisioning_jobs
+            .transition_existing_host(
+                &bootstrapping.id,
+                ProvisioningJobState::CleanupNeeded,
+                "The executor stopped after credential handoff began; inspect the target service and token file before retrying.",
+                "cleanup-needed",
+                "Credential handoff may have completed but the result is unknown; inspect the target and do not rotate or retry blindly.",
+                now_unix(),
+            )
+            .unwrap_or(bootstrapping),
+    }
 }
 
 async fn execute_hetzner_setup_job(
@@ -6945,7 +7728,11 @@ fn reconcile_provisioning_jobs_with_runtime(
             continue;
         };
         match job.state {
-            ProvisioningJobState::WaitingForHeartbeat => {
+            ProvisioningJobState::WaitingForHeartbeat
+                if host
+                    .last_seen
+                    .is_some_and(|last_seen| last_seen >= job.updated_at) =>
+            {
                 let setup = provisioning_job_setup_intent(&job);
                 let next_state = if matches!(
                     setup.backup,
@@ -6959,6 +7746,28 @@ fn reconcile_provisioning_jobs_with_runtime(
                     "First heartbeat observed; onboarding is complete for the selected backup policy."
                 } else {
                     "First heartbeat observed; backup decision or enrollment remains pending."
+                };
+                let _ = provisioning_jobs.append_progress(&job.id, next_state, message, now);
+            }
+            ProvisioningJobState::CleanupNeeded
+                if job.provider == "existing-host"
+                    && host
+                        .last_seen
+                        .is_some_and(|last_seen| last_seen >= job.updated_at) =>
+            {
+                let setup = provisioning_job_setup_intent(&job);
+                let next_state = if matches!(
+                    setup.backup,
+                    BackupSetupIntent::External | BackupSetupIntent::Absent
+                ) {
+                    ProvisioningJobState::Complete
+                } else {
+                    ProvisioningJobState::BackupPending
+                };
+                let message = if next_state == ProvisioningJobState::Complete {
+                    "Authenticated heartbeat received after an uncertain install result; onboarding is complete for the selected backup policy."
+                } else {
+                    "Authenticated heartbeat received after an uncertain install result; backup decision or enrollment remains pending."
                 };
                 let _ = provisioning_jobs.append_progress(&job.id, next_state, message, now);
             }
@@ -10148,6 +10957,111 @@ async fn main() {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug)]
+    struct RecordedSshCall {
+        command: String,
+        stdin: Vec<u8>,
+    }
+
+    struct FakeExistingHostSshRunner {
+        readiness: &'static str,
+        calls: Mutex<Vec<RecordedSshCall>>,
+    }
+
+    impl FakeExistingHostSshRunner {
+        fn new(readiness: &'static str) -> Self {
+            Self {
+                readiness,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedSshCall> {
+            self.calls.lock().expect("fake runner lock").clone()
+        }
+    }
+
+    impl ExistingHostSshRunner for FakeExistingHostSshRunner {
+        fn run(
+            &self,
+            _config: &ExistingHostRuntimeConfig,
+            _spec: &NativeSystemdBootstrapSpec,
+            remote_command: &str,
+            stdin: Option<&[u8]>,
+        ) -> Result<Vec<u8>, ExistingHostExecutionError> {
+            self.calls
+                .lock()
+                .expect("fake runner lock")
+                .push(RecordedSshCall {
+                    command: remote_command.to_string(),
+                    stdin: stdin.unwrap_or_default().to_vec(),
+                });
+            if remote_command.contains("mktemp -d") {
+                return Ok(b"/tmp/pharos-bootstrap.test123\n".to_vec());
+            }
+            if remote_command == REMOTE_NATIVE_SYSTEMD_READINESS {
+                return Ok(self.readiness.as_bytes().to_vec());
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    fn test_existing_host_runtime() -> (ExistingHostRuntimeConfig, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-existing-runtime-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("test runtime dir");
+        let known_hosts_file = dir.join("known_hosts");
+        let beacon_binary_path = dir.join("pharos-beacon");
+        let installer_path = dir.join("installer.sh");
+        std::fs::write(&known_hosts_file, b"test-host-key\n").expect("known hosts");
+        std::fs::write(&beacon_binary_path, b"test-beacon-binary").expect("beacon binary");
+        std::fs::write(&installer_path, b"#!/bin/sh\nexit 0\n").expect("installer");
+        (
+            ExistingHostRuntimeConfig {
+                execute_enabled: true,
+                identity_file: None,
+                known_hosts_file: Some(known_hosts_file),
+                beacon_binary_path,
+                installer_path,
+                pharos_url: Some("https://pharos.example".to_string()),
+            },
+            dir,
+        )
+    }
+
+    fn cleanup_test_existing_host_runtime(config: &ExistingHostRuntimeConfig, dir: &Path) {
+        if let Some(path) = &config.known_hosts_file {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(&config.beacon_binary_path);
+        let _ = std::fs::remove_file(&config.installer_path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    fn test_native_bootstrap_spec() -> NativeSystemdBootstrapSpec {
+        NativeSystemdBootstrapSpec {
+            host_name: "legacy-test".to_string(),
+            role: "server".to_string(),
+            interval: 60,
+            target: "root@legacy-test".to_string(),
+            port: 22,
+        }
+    }
+
+    fn test_ready_arch() -> &'static str {
+        match std::env::consts::ARCH {
+            "x86_64" => "ready:x86_64",
+            "aarch64" => "ready:aarch64",
+            _ => "ready:unknown",
+        }
+    }
+
     #[tokio::test]
     async fn version_endpoint_reports_embedded_build_metadata() {
         let Json(payload) = version().await;
@@ -12672,6 +13586,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 execute_enabled: false,
                 ..HetznerCloudRuntimeConfig::default()
             },
+            ..ProviderRuntimeConfig::default()
         };
 
         let job = store
@@ -12698,6 +13613,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 execute_enabled: true,
                 ..HetznerCloudRuntimeConfig::default()
             },
+            ..ProviderRuntimeConfig::default()
         };
         let missing_inputs = store
             .start(&request, 1_700_000_003, &enabled)
@@ -12789,6 +13705,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 api_base_url,
                 request_timeout: Duration::from_secs(2),
             },
+            ..ProviderRuntimeConfig::default()
         };
         (state, token_path)
     }
@@ -12929,6 +13846,98 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn setup_job_does_not_accept_a_heartbeat_older_than_the_wait_state() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "manual-deferred".to_string(),
+            apply: true,
+            host_name: Some("reconcile-stale".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::External),
+            location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
+        };
+        let job = store
+            .start(&request, 1_700_000_100, &ProviderRuntimeConfig::default())
+            .expect("setup job starts");
+        let mut host = setup_runtime_host("reconcile-stale", vec![]);
+        host.last_seen = Some(1_700_000_099);
+
+        reconcile_provisioning_jobs_with_runtime(&store, &[host.clone()], 1_700_000_110);
+        assert_eq!(
+            store.get(&job.id).expect("job persisted").state,
+            ProvisioningJobState::WaitingForHeartbeat
+        );
+
+        host.last_seen = Some(1_700_000_100);
+        reconcile_provisioning_jobs_with_runtime(&store, &[host], 1_700_000_111);
+        assert_eq!(
+            store.get(&job.id).expect("job persisted").state,
+            ProvisioningJobState::Complete
+        );
+    }
+
+    #[test]
+    fn authenticated_heartbeat_resolves_uncertain_native_install() {
+        let store = ProvisioningJobStore::new(None);
+        let request = ProvisioningJobStartRequest {
+            provider: "existing-host".to_string(),
+            template: "manual-deferred".to_string(),
+            apply: true,
+            host_name: Some("reconcile-uncertain".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(false),
+            heartbeat_interval_secs: Some(60),
+            backup_intent: Some(BackupSetupIntent::External),
+            location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
+            location: None,
+            server_type: None,
+            image: None,
+            ssh_key_ref: None,
+            ssh: None,
+            preflight_summary: None,
+            preflight_checks: vec![],
+        };
+        let job = store
+            .start(&request, 1_700_000_120, &ProviderRuntimeConfig::default())
+            .expect("setup job starts");
+        let uncertain = store
+            .transition_existing_host(
+                &job.id,
+                ProvisioningJobState::CleanupNeeded,
+                "Install result unknown; inspect the target before retrying.",
+                "cleanup-needed",
+                "Credential handoff may have completed; inspect the target.",
+                1_700_000_125,
+            )
+            .expect("uncertain state persists");
+        let mut host = setup_runtime_host("reconcile-uncertain", vec![]);
+        host.last_seen = Some(1_700_000_126);
+
+        reconcile_provisioning_jobs_with_runtime(&store, &[host], 1_700_000_127);
+
+        let reconciled = store.get(&uncertain.id).expect("job persisted");
+        assert_eq!(reconciled.state, ProvisioningJobState::Complete);
+        assert!(reconciled
+            .progress
+            .last()
+            .expect("progress")
+            .message
+            .contains("uncertain install result"));
+    }
+
+    #[test]
     fn setup_jobs_reconcile_external_backup_policy_to_complete() {
         let store = ProvisioningJobStore::new(None);
         let request = ProvisioningJobStartRequest {
@@ -13024,6 +14033,96 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    #[test]
+    fn existing_host_runtime_defaults_fail_closed() {
+        let runtime = ExistingHostRuntimeConfig::default();
+
+        assert!(!runtime.execute_enabled);
+        assert_eq!(
+            runtime.validate_native_systemd(),
+            Err(ExistingHostExecutionError::RuntimeDisabled)
+        );
+    }
+
+    #[test]
+    fn native_systemd_target_fields_cannot_become_ssh_options() {
+        assert!(!valid_ssh_endpoint("-oProxyCommand=unsafe"));
+        assert!(!valid_ssh_user("-root"));
+        assert!(!valid_bootstrap_name("-host"));
+        assert!(valid_ssh_endpoint("host-01.example"));
+        assert!(valid_ssh_user("bootstrap_user"));
+        assert!(valid_bootstrap_name("host-01"));
+    }
+
+    #[test]
+    fn native_systemd_bootstrap_keeps_raw_token_on_stdin_only() {
+        let (runtime, dir) = test_existing_host_runtime();
+        let spec = test_native_bootstrap_spec();
+        let runner = FakeExistingHostSshRunner::new(test_ready_arch());
+        let prepared = prepare_native_systemd_bootstrap(&runner, &runtime, &spec)
+            .expect("target preparation succeeds");
+        let token = "pharos_test_runtime_token";
+
+        install_native_systemd_bootstrap(&runner, &runtime, &spec, &prepared, token)
+            .expect("native install succeeds");
+
+        let calls = runner.calls();
+        assert!(calls.iter().all(|call| !call.command.contains(token)));
+        let token_payload = format!("PHAROS_TOKEN={token}\n").into_bytes();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.stdin == token_payload)
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(|call| {
+            call.command == REMOTE_NATIVE_SYSTEMD_TOKEN_WRITE && call.stdin == token_payload
+        }));
+        assert!(calls.iter().any(|call| {
+            call.command.contains("install-pharos-beacon-systemd.sh")
+                && call
+                    .command
+                    .contains("--token-env /etc/pharos/pharos-beacon.env")
+                && call.stdin.is_empty()
+        }));
+        cleanup_test_existing_host_runtime(&runtime, &dir);
+    }
+
+    #[test]
+    fn native_systemd_bootstrap_refuses_implicit_token_rotation() {
+        let (runtime, dir) = test_existing_host_runtime();
+        let spec = test_native_bootstrap_spec();
+        let runner = FakeExistingHostSshRunner::new("existing-token");
+
+        let error = prepare_native_systemd_bootstrap(&runner, &runtime, &spec)
+            .expect_err("existing token blocks preparation");
+
+        assert_eq!(error, ExistingHostExecutionError::ExistingTokenFile);
+        assert!(runner
+            .calls()
+            .iter()
+            .all(|call| !String::from_utf8_lossy(&call.stdin).contains("PHAROS_TOKEN=")));
+        cleanup_test_existing_host_runtime(&runtime, &dir);
+    }
+
+    #[test]
+    fn native_systemd_bootstrap_refuses_mismatched_architecture() {
+        let (runtime, dir) = test_existing_host_runtime();
+        let spec = test_native_bootstrap_spec();
+        let runner = FakeExistingHostSshRunner::new("ready:unsupported-arch");
+
+        let error = prepare_native_systemd_bootstrap(&runner, &runtime, &spec)
+            .expect_err("architecture mismatch blocks preparation");
+
+        assert_eq!(error, ExistingHostExecutionError::ArchitectureMismatch);
+        assert!(runner
+            .calls()
+            .iter()
+            .all(|call| !String::from_utf8_lossy(&call.stdin).contains("PHAROS_TOKEN=")));
+        cleanup_test_existing_host_runtime(&runtime, &dir);
     }
 
     #[test]

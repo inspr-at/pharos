@@ -124,6 +124,25 @@ HTTPS to users. The registration token is only for initial beacon registration.
 After moving to Janus sidecars, set `PHAROS_BEACON_TOKEN_MODE=janus` and provide
 the private hash sidecar mount/env from your secret-rendering system.
 
+Existing-host native systemd execution is deliberately off by default. The
+assistant still provides a reviewable manual handoff without it. To enable the
+executor, mount a private SSH identity and a pinned `known_hosts` file
+read-only, then set:
+
+```bash
+export PHAROS_EXISTING_HOST_EXECUTE=1
+export PHAROS_EXISTING_HOST_PHAROS_URL=https://pharos.example
+export PHAROS_EXISTING_HOST_IDENTITY_FILE=/run/pharos/ssh/id
+export PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE=/run/pharos/ssh/known_hosts
+```
+
+The executor refuses unknown host keys, password/interactive SSH, an existing
+target token file, or an unreadable runtime reference. It transfers the bundled
+beacon and installer first, then sends the newly issued beacon token only over
+SSH stdin into a root-owned `0600` env file. Local/dual token mode supports this
+direct handoff; Janus-only mode fails closed until a Janus credential broker is
+configured. Do not put private SSH material in the Compose file or repository.
+
 ### Native NixOS beacon
 
 The flake exports a package and NixOS module for replacing the interim Docker
