@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.10 - 2026-07-10
+
+- Added access intent to setup jobs so new-host and existing-host onboarding record who should see the host after first heartbeat.
+- Exposed access policy choices in the setup assistant alongside backup and location intent.
+- Render setup access intent on pending setup cards and include it in setup search text.
+
 ## 0.1.9 - 2026-07-10
 
 - Fail closed before automated existing-host handoff unless SSH plus required preflight checks are verified.

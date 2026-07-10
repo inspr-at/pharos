@@ -30,18 +30,18 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, BackupObservation, BackupPostureState, BackupSetupIntent, BootstrapMethod,
-    ExistingHostBootstrapOption, ExistingHostPreflightCheck, ExistingHostPreflightFacts,
-    ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary,
-    ExistingHostSetupContext, Host, HostLocation, HostLocationSource, HostManifest,
-    HostRegistration, HostRegistrationResponse, HostReport, Liveness, LocationSetupIntent,
-    ManifestLocationMode, ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness,
-    PreflightCheckState, ProvisioningBackupProposal, ProvisioningBackupProposalKind,
-    ProvisioningBackupSecretFile, ProvisioningHandoff, ProvisioningJob, ProvisioningJobState,
-    ProvisioningProgressEntry, ProvisioningSetupIntent, SecretOwner, ServiceObservation,
-    ServiceObservationState, SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
-    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
-    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    liveness, AccessSetupIntent, BackupObservation, BackupPostureState, BackupSetupIntent,
+    BootstrapMethod, ExistingHostBootstrapOption, ExistingHostPreflightCheck,
+    ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
+    ExistingHostPreflightSummary, ExistingHostSetupContext, Host, HostLocation, HostLocationSource,
+    HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
+    LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
+    ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningBackupProposal,
+    ProvisioningBackupProposalKind, ProvisioningBackupSecretFile, ProvisioningHandoff,
+    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningSetupIntent,
+    SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
+    EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
+    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -261,6 +261,8 @@ struct ProvisioningJobStartRequest {
     backup_intent: Option<BackupSetupIntent>,
     #[serde(default)]
     location_intent: Option<LocationSetupIntent>,
+    #[serde(default)]
+    access_intent: Option<AccessSetupIntent>,
     #[serde(default)]
     location: Option<String>,
     #[serde(default)]
@@ -858,6 +860,9 @@ fn provisioning_setup_intent(
     Some(ProvisioningSetupIntent {
         backup: request.backup_intent.unwrap_or(BackupSetupIntent::Deferred),
         location: request.location_intent.unwrap_or(LocationSetupIntent::Auto),
+        access: request
+            .access_intent
+            .unwrap_or(AccessSetupIntent::OperatorOnly),
     })
 }
 
@@ -3059,29 +3064,38 @@ const LOCATION_INTENT_COPY={
   'site-fallback':['site fallback','use provider or site fallback when runtime is missing'],
   'hidden':['hidden location','keep host coordinates hidden']
 };
+const ACCESS_INTENT_COPY={
+  'operator-only':['operator only','keep visibility scoped to the onboarding operator until review'],
+  'all-operators':['all operators','grant the normal operator group after the host reports'],
+  'limited-users':['limited users','create an explicit host access grant before broadening visibility'],
+  'deferred':['access decision pending','ask again before making the host broadly visible']
+};
 function setupIntentChoice(overlay,name,fallback){
   return overlay.querySelector(`input[name="${name}"]:checked`)?.value||fallback;
 }
-function setupIntentSummary(backup,location){
+function setupIntentSummary(backup,location,access){
   const backupCopy=BACKUP_INTENT_COPY[backup]||BACKUP_INTENT_COPY.deferred;
   const locationCopy=LOCATION_INTENT_COPY[location]||LOCATION_INTENT_COPY.auto;
-  return `Backups: ${backupCopy[0]}. Location: ${locationCopy[0]}.`;
+  const accessCopy=ACCESS_INTENT_COPY[access]||ACCESS_INTENT_COPY['operator-only'];
+  return `Backups: ${backupCopy[0]}. Location: ${locationCopy[0]}. Access: ${accessCopy[0]}.`;
 }
-function setupIntentDetail(backup,location){
+function setupIntentDetail(backup,location,access){
   const backupCopy=BACKUP_INTENT_COPY[backup]||BACKUP_INTENT_COPY.deferred;
   const locationCopy=LOCATION_INTENT_COPY[location]||LOCATION_INTENT_COPY.auto;
-  return `Next: ${backupCopy[1]}; ${locationCopy[1]}.`;
+  const accessCopy=ACCESS_INTENT_COPY[access]||ACCESS_INTENT_COPY['operator-only'];
+  return `Next: ${backupCopy[1]}; ${locationCopy[1]}; ${accessCopy[1]}.`;
 }
 function currentSetupIntentSummary(overlay){
   return setupIntentSummary(
     setupIntentChoice(overlay,'backup_intent','deferred'),
-    setupIntentChoice(overlay,'location_intent','auto')
+    setupIntentChoice(overlay,'location_intent','auto'),
+    setupIntentChoice(overlay,'access_intent','operator-only')
   );
 }
 function provisioningIntentMessage(job){
   const intent=job?.setup_intent;
   if(!intent)return '';
-  return `Setup intent recorded. ${setupIntentSummary(intent.backup,intent.location)} ${setupIntentDetail(intent.backup,intent.location)}`;
+  return `Setup intent recorded. ${setupIntentSummary(intent.backup,intent.location,intent.access)} ${setupIntentDetail(intent.backup,intent.location,intent.access)}`;
 }
 function provisioningBackupProposalMessage(job){
   const proposal=job?.backup_proposal;
@@ -3338,6 +3352,7 @@ async function startProvisioningJob(overlay,start){
   const body={provider:state.provider,template:state.template};
   body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
   body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
+  body.access_intent=setupIntentChoice(overlay,'access_intent','operator-only');
   if(state.path==='new'){
     const hostName=(overlay.querySelector('[data-new-host-name]')?.value||'').trim();
     const location=(overlay.querySelector('[data-new-location]')?.value||'').trim();
@@ -3533,7 +3548,7 @@ function initSetupAssistant(){
     const start=overlay.querySelector('[data-assistant-start]');
     if(start)start.disabled=!event.currentTarget.checked;
   });
-  overlay.querySelectorAll('input[name="backup_intent"],input[name="location_intent"]').forEach(input=>{
+  overlay.querySelectorAll('input[name="backup_intent"],input[name="location_intent"],input[name="access_intent"]').forEach(input=>{
     input.addEventListener('change',()=>syncAssistantNext(overlay));
   });
   overlay.querySelector('[data-assistant-start]')?.addEventListener('click',async event=>{
@@ -6733,7 +6748,7 @@ fn setup_assistant() -> String {
     )
     .replace(
         r#"</div></div><label class="assistant-confirm">"#,
-        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div><label class="assistant-confirm">"#,
+        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div><label class="assistant-confirm">"#,
     )
     .replace(
         r#"<button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button>"#,
@@ -6854,6 +6869,7 @@ fn provisioning_job_setup_intent(job: &ProvisioningJob) -> ProvisioningSetupInte
     job.setup_intent.clone().unwrap_or(ProvisioningSetupIntent {
         backup: BackupSetupIntent::Deferred,
         location: LocationSetupIntent::Auto,
+        access: AccessSetupIntent::OperatorOnly,
     })
 }
 
@@ -6866,19 +6882,22 @@ fn provisioning_job_latest_message(job: &ProvisioningJob) -> String {
 
 fn setup_intent_markup(intent: &ProvisioningSetupIntent) -> String {
     format!(
-        r#"<div class="setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div>"#,
+        r#"<div class="setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span><span class="setup-chip access">{access}</span></div>"#,
         backup = html_escape(intent.backup_label()),
-        location = html_escape(intent.location_label())
+        location = html_escape(intent.location_label()),
+        access = html_escape(intent.access_label())
     )
 }
 
 fn setup_intent_search_text(intent: &ProvisioningSetupIntent) -> String {
     format!(
-        "{} {} {} {}",
+        "{} {} {} {} {} {}",
         intent.backup_label(),
         intent.backup_next_action(),
         intent.location_label(),
-        intent.location_next_action()
+        intent.location_next_action(),
+        intent.access_label(),
+        intent.access_next_action()
     )
 }
 
@@ -12022,6 +12041,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"name="backup_intent" value="optional""#));
         assert!(empty.contains(r#"name="backup_intent" value="external""#));
         assert!(empty.contains(r#"name="location_intent" value="site-fallback""#));
+        assert!(empty.contains(r#"name="access_intent" value="operator-only""#));
+        assert!(empty.contains(r#"name="access_intent" value="limited-users""#));
         assert!(empty.contains("No secrets stored"));
         assert!(empty.contains("I understand this may create provider resources."));
         assert!(empty.contains("data-assistant-job"));
@@ -12074,6 +12095,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ProvisioningSetupIntent {
                 backup: BackupSetupIntent::Required,
                 location: LocationSetupIntent::Manual,
+                access: AccessSetupIntent::LimitedUsers,
             },
         );
 
@@ -12092,6 +12114,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains("waiting for first heartbeat"));
         assert!(html.contains("backup required"));
         assert!(html.contains("manual location"));
+        assert!(html.contains("limited users"));
         assert!(html.contains("Continue setup"));
         assert!(html.contains(r#"data-host-surface="setup""#));
         assert!(html.contains(r#"<tr class="setup-row""#));
@@ -12107,6 +12130,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ProvisioningSetupIntent {
                 backup: BackupSetupIntent::Required,
                 location: LocationSetupIntent::Auto,
+                access: AccessSetupIntent::OperatorOnly,
             },
         );
         let host = host_with_backups("lab-01", 1_110, vec![]);
@@ -12133,6 +12157,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let intent = ProvisioningSetupIntent {
             backup: BackupSetupIntent::Required,
             location: LocationSetupIntent::Auto,
+            access: AccessSetupIntent::OperatorOnly,
         };
         let pending_job = setup_job(
             "lab-pending",
@@ -12239,6 +12264,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ProvisioningSetupIntent {
                 backup: BackupSetupIntent::Required,
                 location: LocationSetupIntent::Auto,
+                access: AccessSetupIntent::OperatorOnly,
             },
         );
         let failed = setup_job(
@@ -12249,6 +12275,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ProvisioningSetupIntent {
                 backup: BackupSetupIntent::Optional,
                 location: LocationSetupIntent::SiteFallback,
+                access: AccessSetupIntent::AllOperators,
             },
         );
         let jobs = vec![overdue, failed];
@@ -12573,6 +12600,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: None,
             backup_intent: None,
             location_intent: None,
+            access_intent: None,
             location: None,
             server_type: None,
             image: None,
@@ -12627,6 +12655,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: None,
             backup_intent: None,
             location_intent: None,
+            access_intent: None,
             location: None,
             server_type: None,
             image: None,
@@ -12730,6 +12759,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::EnrollLater),
             location_intent: Some(LocationSetupIntent::SiteFallback),
+            access_intent: Some(AccessSetupIntent::LimitedUsers),
             location: Some("fsn1".to_string()),
             server_type: Some("cx22".to_string()),
             image: Some("debian-12".to_string()),
@@ -12860,6 +12890,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::EnrollLater),
             location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,
@@ -12910,6 +12941,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::External),
             location_intent: Some(LocationSetupIntent::SiteFallback),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,
@@ -12946,6 +12978,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::Optional),
             location_intent: Some(LocationSetupIntent::Manual),
+            access_intent: Some(AccessSetupIntent::AllOperators),
             location: None,
             server_type: None,
             image: None,
@@ -13006,6 +13039,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(120),
             backup_intent: Some(BackupSetupIntent::External),
             location_intent: Some(LocationSetupIntent::SiteFallback),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,
@@ -13084,6 +13118,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::EnrollLater),
             location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,
@@ -13174,6 +13209,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::Deferred),
             location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,
@@ -13211,6 +13247,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::Deferred),
             location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,
@@ -13260,6 +13297,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::Deferred),
             location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,
@@ -13313,6 +13351,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             heartbeat_interval_secs: Some(60),
             backup_intent: Some(BackupSetupIntent::Required),
             location_intent: Some(LocationSetupIntent::Auto),
+            access_intent: Some(AccessSetupIntent::OperatorOnly),
             location: None,
             server_type: None,
             image: None,

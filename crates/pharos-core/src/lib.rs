@@ -788,10 +788,49 @@ impl LocationSetupIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessSetupIntent {
+    OperatorOnly,
+    AllOperators,
+    LimitedUsers,
+    Deferred,
+}
+
+impl AccessSetupIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OperatorOnly => "operator only",
+            Self::AllOperators => "all operators",
+            Self::LimitedUsers => "limited users",
+            Self::Deferred => "access decision pending",
+        }
+    }
+
+    pub fn next_action(self) -> &'static str {
+        match self {
+            Self::OperatorOnly => {
+                "keep the new host visible only to the onboarding operator until review"
+            }
+            Self::AllOperators => "grant the normal operator group after the host reports",
+            Self::LimitedUsers => {
+                "create an explicit host access grant before broadening visibility"
+            }
+            Self::Deferred => "ask again before making the host broadly visible",
+        }
+    }
+}
+
+fn default_access_setup_intent() -> AccessSetupIntent {
+    AccessSetupIntent::OperatorOnly
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningSetupIntent {
     pub backup: BackupSetupIntent,
     pub location: LocationSetupIntent,
+    #[serde(default = "default_access_setup_intent")]
+    pub access: AccessSetupIntent,
 }
 
 impl ProvisioningSetupIntent {
@@ -809,6 +848,14 @@ impl ProvisioningSetupIntent {
 
     pub fn location_next_action(&self) -> &'static str {
         self.location.next_action()
+    }
+
+    pub fn access_label(&self) -> &'static str {
+        self.access.label()
+    }
+
+    pub fn access_next_action(&self) -> &'static str {
+        self.access.next_action()
     }
 }
 
@@ -2366,6 +2413,7 @@ mod tests {
             setup_intent: Some(ProvisioningSetupIntent {
                 backup: BackupSetupIntent::External,
                 location: LocationSetupIntent::SiteFallback,
+                access: AccessSetupIntent::LimitedUsers,
             }),
             backup_proposal: None,
             progress: vec![entry],
@@ -2381,6 +2429,11 @@ mod tests {
         assert_eq!(
             setup_intent.location_next_action(),
             "use provider or site fallback when runtime is missing"
+        );
+        assert_eq!(setup_intent.access_label(), "limited users");
+        assert_eq!(
+            setup_intent.access_next_action(),
+            "create an explicit host access grant before broadening visibility"
         );
 
         let backup_proposal = ProvisioningBackupProposal {
