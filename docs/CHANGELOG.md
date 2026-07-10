@@ -1,5 +1,13 @@
 # Pharos Changelog
 
+## 0.1.15 - 2026-07-10
+
+- Reworked new-server review into a focused, imagegen-designed summary with server, setup, and post-setup intent visible while technical provider details stay collapsed.
+- Added safe provider-readiness feedback without returning API tokens, resource names, private key material, or other runtime secret references to the browser.
+- Resolve the configured Hetzner SSH public key and reviewed firewall before server creation, attach their provider IDs to the create request, and fail before create when either prerequisite is missing.
+- Route manual/free-tier provider choices into existing-host import instead of submitting an unsupported provider create job.
+- Documented the runtime-file credential, existing public-key, and pre-reviewed firewall requirements for self-host operators.
+
 ## 0.1.14 - 2026-07-10
 
 - Persist the created Hetzner server, provider location, and validated public SSH destination on the tracked setup job.

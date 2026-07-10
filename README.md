@@ -124,6 +124,23 @@ HTTPS to users. The registration token is only for initial beacon registration.
 After moving to Janus sidecars, set `PHAROS_BEACON_TOKEN_MODE=janus` and provide
 the private hash sidecar mount/env from your secret-rendering system.
 
+Hetzner Cloud creation is also off by default. Prepare an existing SSH public
+key and a reviewed firewall in the Hetzner project, mount the API token as a
+private runtime file, then set:
+
+```bash
+export PHAROS_HCLOUD_EXECUTE=1
+export PHAROS_HCLOUD_API_TOKEN_FILE=/run/pharos/hcloud-token
+export PHAROS_HCLOUD_SSH_KEY_REF=pharos-bootstrap-key
+export PHAROS_HCLOUD_FIREWALL_REF=pharos-bootstrap-firewall
+```
+
+Pharos resolves both named resources before the create call and attaches their
+numeric provider IDs to the server request. If the token, public key, or
+firewall is unavailable, setup fails before creating a server. Keep the token
+mount in a private Compose override or orchestrator secret; never place the raw
+value in Compose, an env file, or the setup UI.
+
 Existing-host native systemd execution is deliberately off by default. The
 assistant still provides a reviewable manual handoff without it. To enable the
 executor, mount a private SSH identity and a pinned `known_hosts` file

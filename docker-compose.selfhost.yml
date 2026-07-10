@@ -35,6 +35,14 @@ services:
       PHAROS_EXISTING_HOST_IDENTITY_FILE: ${PHAROS_EXISTING_HOST_IDENTITY_FILE:-}
       PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE: ${PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE:-}
 
+      # Optional Hetzner Cloud executor. Keep the API token in a mounted
+      # runtime file. The SSH public key and firewall must already exist in the
+      # Hetzner project; Pharos resolves both before creating a server.
+      PHAROS_HCLOUD_EXECUTE: ${PHAROS_HCLOUD_EXECUTE:-0}
+      PHAROS_HCLOUD_API_TOKEN_FILE: ${PHAROS_HCLOUD_API_TOKEN_FILE:-}
+      PHAROS_HCLOUD_SSH_KEY_REF: ${PHAROS_HCLOUD_SSH_KEY_REF:-}
+      PHAROS_HCLOUD_FIREWALL_REF: ${PHAROS_HCLOUD_FIREWALL_REF:-}
+
       # Optional declared-host manifest paths, for example:
       # PHAROS_MANIFEST_PATHS=/manifests/host-a.json:/manifests/host-b.json
       PHAROS_MANIFEST_PATHS: ${PHAROS_MANIFEST_PATHS:-}
@@ -46,6 +54,8 @@ services:
       # - ./manifests:/manifests:ro
       # Optional bootstrap SSH mount (use a private local compose override):
       # - ./private/pharos-ssh:/run/pharos/ssh:ro
+      # Optional provider token mount (use a private local compose override):
+      # - ./private/hcloud-token:/run/pharos/hcloud-token:ro
 
 volumes:
   pharos_data: {}

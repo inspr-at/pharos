@@ -755,6 +755,8 @@ impl ExistingHostSshRunner for SystemExistingHostSshRunner {
 struct HetznerCloudRuntimeConfig {
     credential_source: Option<ProviderCredentialSource>,
     execute_enabled: bool,
+    default_ssh_key_ref: Option<String>,
+    firewall_ref: Option<String>,
     api_base_url: String,
     request_timeout: Duration,
 }
@@ -764,6 +766,8 @@ impl Default for HetznerCloudRuntimeConfig {
         Self {
             credential_source: None,
             execute_enabled: false,
+            default_ssh_key_ref: None,
+            firewall_ref: None,
             api_base_url: "https://api.hetzner.cloud/v1".to_string(),
             request_timeout: Duration::from_secs(20),
         }
@@ -781,6 +785,8 @@ impl HetznerCloudRuntimeConfig {
         let execute_enabled = env_nonempty("PHAROS_HCLOUD_EXECUTE")
             .and_then(|value| parse_bool(&value))
             .unwrap_or(false);
+        let default_ssh_key_ref = env_nonempty("PHAROS_HCLOUD_SSH_KEY_REF");
+        let firewall_ref = env_nonempty("PHAROS_HCLOUD_FIREWALL_REF");
         let api_base_url = env_nonempty("PHAROS_HCLOUD_API_BASE")
             .unwrap_or_else(|| "https://api.hetzner.cloud/v1".to_string());
         let request_timeout = env_nonempty("PHAROS_HCLOUD_TIMEOUT_SECS")
@@ -791,6 +797,8 @@ impl HetznerCloudRuntimeConfig {
         Self {
             credential_source,
             execute_enabled,
+            default_ssh_key_ref,
+            firewall_ref,
             api_base_url,
             request_timeout,
         }
@@ -811,6 +819,9 @@ enum ProviderCredentialSource {
 enum HetznerExecutionError {
     CredentialUnavailable,
     ClientUnavailable,
+    PrerequisiteRequestFailed,
+    SshKeyUnavailable,
+    FirewallUnavailable,
     RequestFailed,
     HttpStatus(u16),
     InvalidResponse,
@@ -823,6 +834,18 @@ impl HetznerExecutionError {
                 "Hetzner Cloud credential source was configured but not readable".to_string()
             }
             Self::ClientUnavailable => "Hetzner Cloud HTTP client could not be prepared".to_string(),
+            Self::PrerequisiteRequestFailed => {
+                "Hetzner Cloud prerequisite checks did not complete; no provider resources were created"
+                    .to_string()
+            }
+            Self::SshKeyUnavailable => {
+                "The configured Hetzner Cloud SSH public key was not found; no provider resources were created"
+                    .to_string()
+            }
+            Self::FirewallUnavailable => {
+                "The configured Hetzner Cloud firewall was not found; no provider resources were created"
+                    .to_string()
+            }
             Self::RequestFailed => {
                 "Hetzner Cloud request did not complete; verify provider console before retry"
                     .to_string()
@@ -838,7 +861,10 @@ impl HetznerExecutionError {
     }
 
     fn resource_state_uncertain(&self) -> bool {
-        !matches!(self, Self::CredentialUnavailable | Self::ClientUnavailable)
+        matches!(
+            self,
+            Self::RequestFailed | Self::HttpStatus(_) | Self::InvalidResponse
+        )
     }
 }
 
@@ -866,10 +892,17 @@ struct HetznerCreateServerRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    ssh_keys: Vec<String>,
+    ssh_keys: Vec<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    firewalls: Vec<HetznerCreateFirewall>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
     start_after_create: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HetznerCreateFirewall {
+    firewall: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -907,6 +940,57 @@ struct HetznerPublicIp {
     ip: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct HetznerSshKeyListResponse {
+    #[serde(default)]
+    ssh_keys: Vec<HetznerNamedResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HetznerFirewallListResponse {
+    #[serde(default)]
+    firewalls: Vec<HetznerNamedResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HetznerNamedResource {
+    id: u64,
+    name: String,
+}
+
+async fn resolve_hetzner_resource_id<T>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    reference: &str,
+    select: impl FnOnce(T) -> Vec<HetznerNamedResource>,
+    missing: HetznerExecutionError,
+) -> Result<u64, HetznerExecutionError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let response = client
+        .get(endpoint)
+        .bearer_auth(token)
+        .query(&[("name", reference)])
+        .send()
+        .await
+        .map_err(|_| HetznerExecutionError::PrerequisiteRequestFailed)?;
+    if !response.status().is_success() {
+        return Err(HetznerExecutionError::PrerequisiteRequestFailed);
+    }
+    let resources = response
+        .json::<T>()
+        .await
+        .map(select)
+        .map_err(|_| HetznerExecutionError::PrerequisiteRequestFailed)?;
+    resources
+        .into_iter()
+        .find(|resource| resource.id > 0 && resource.name == reference)
+        .map(|resource| resource.id)
+        .ok_or(missing)
+}
+
 async fn create_hetzner_server(
     request: &ProvisioningJobStartRequest,
     config: &HetznerCloudRuntimeConfig,
@@ -916,7 +1000,39 @@ async fn create_hetzner_server(
         .timeout(config.request_timeout)
         .build()
         .map_err(|_| HetznerExecutionError::ClientUnavailable)?;
-    let endpoint = format!("{}/servers", config.api_base_url.trim_end_matches('/'));
+    let api_base = config.api_base_url.trim_end_matches('/');
+    let ssh_key_ref = request
+        .ssh_key_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(config.default_ssh_key_ref.as_deref())
+        .ok_or(HetznerExecutionError::SshKeyUnavailable)?;
+    let firewall_ref = config
+        .firewall_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(HetznerExecutionError::FirewallUnavailable)?;
+    let ssh_key_id = resolve_hetzner_resource_id::<HetznerSshKeyListResponse>(
+        &client,
+        &format!("{api_base}/ssh_keys"),
+        &token,
+        ssh_key_ref,
+        |response| response.ssh_keys,
+        HetznerExecutionError::SshKeyUnavailable,
+    )
+    .await?;
+    let firewall_id = resolve_hetzner_resource_id::<HetznerFirewallListResponse>(
+        &client,
+        &format!("{api_base}/firewalls"),
+        &token,
+        firewall_ref,
+        |response| response.firewalls,
+        HetznerExecutionError::FirewallUnavailable,
+    )
+    .await?;
+    let endpoint = format!("{api_base}/servers");
     let mut labels = BTreeMap::new();
     labels.insert("managed-by".to_string(), "pharos".to_string());
     labels.insert("pharos-setup".to_string(), "tracked-job".to_string());
@@ -948,13 +1064,10 @@ async fn create_hetzner_server(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
-        ssh_keys: request
-            .ssh_key_ref
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| vec![value.to_string()])
-            .unwrap_or_default(),
+        ssh_keys: vec![ssh_key_id],
+        firewalls: vec![HetznerCreateFirewall {
+            firewall: firewall_id,
+        }],
         labels,
         start_after_create: true,
     };
@@ -1014,15 +1127,15 @@ fn provisioning_job_progress(
                 });
                 return (ProvisioningJobState::Failed, progress);
             }
-            if missing_hetzner_create_inputs(request) {
+            if missing_hetzner_create_inputs(request, hetzner) {
                 progress.push(ProvisioningProgressEntry {
                     state: ProvisioningJobState::Failed,
-                    message: "Hetzner Cloud executor needs host, location, server type, image, and SSH key reference before create/apply; no provider resources were created.".to_string(),
+                    message: "Hetzner Cloud executor needs host, location, server type, image, an SSH public-key reference, and a configured firewall before create/apply; no provider resources were created.".to_string(),
                     observed_at: now,
                 });
                 return (ProvisioningJobState::Failed, progress);
             }
-            if invalid_hetzner_create_inputs(request) {
+            if invalid_hetzner_create_inputs(request, hetzner) {
                 progress.push(ProvisioningProgressEntry {
                     state: ProvisioningJobState::Failed,
                     message: "Hetzner Cloud create inputs contain unsupported characters; no provider resources were created.".to_string(),
@@ -1644,16 +1757,27 @@ fn secret_ref_slug(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn missing_hetzner_create_inputs(request: &ProvisioningJobStartRequest) -> bool {
+fn missing_hetzner_create_inputs(
+    request: &ProvisioningJobStartRequest,
+    config: &HetznerCloudRuntimeConfig,
+) -> bool {
     [
         request.host_name.as_deref(),
         request.location.as_deref(),
         request.server_type.as_deref(),
         request.image.as_deref(),
-        request.ssh_key_ref.as_deref(),
     ]
     .iter()
     .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+        || request
+            .ssh_key_ref
+            .as_deref()
+            .or(config.default_ssh_key_ref.as_deref())
+            .is_none_or(|value| value.trim().is_empty())
+        || config
+            .firewall_ref
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
 }
 
 fn valid_provider_selector(value: &str) -> bool {
@@ -1671,16 +1795,27 @@ fn valid_provider_selector(value: &str) -> bool {
         && !value.to_ascii_lowercase().contains("password=")
 }
 
-fn invalid_hetzner_create_inputs(request: &ProvisioningJobStartRequest) -> bool {
+fn invalid_hetzner_create_inputs(
+    request: &ProvisioningJobStartRequest,
+    config: &HetznerCloudRuntimeConfig,
+) -> bool {
     request
         .host_name
         .as_deref()
         .is_none_or(|value| !valid_bootstrap_name(value.trim()))
+        || request
+            .role
+            .as_deref()
+            .is_some_and(|value| !safe_bootstrap_role(value.trim()))
         || [
             request.location.as_deref(),
             request.server_type.as_deref(),
             request.image.as_deref(),
-            request.ssh_key_ref.as_deref(),
+            request
+                .ssh_key_ref
+                .as_deref()
+                .or(config.default_ssh_key_ref.as_deref()),
+            config.firewall_ref.as_deref(),
         ]
         .iter()
         .any(|value| value.is_none_or(|value| !valid_provider_selector(value)))
@@ -1780,6 +1915,52 @@ struct SetupProviderPlanHandoff {
     detail: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SetupProviderRuntimeReadiness {
+    credential_configured: bool,
+    execution_enabled: bool,
+    default_ssh_key_configured: bool,
+    firewall_configured: bool,
+    provider_ready: bool,
+    ready_with_defaults: bool,
+    message: &'static str,
+}
+
+fn hetzner_runtime_readiness(config: &HetznerCloudRuntimeConfig) -> SetupProviderRuntimeReadiness {
+    let credential_configured = config.api_token().is_ok();
+    let execution_enabled = config.execute_enabled;
+    let default_ssh_key_configured = config
+        .default_ssh_key_ref
+        .as_deref()
+        .is_some_and(valid_provider_selector);
+    let firewall_configured = config
+        .firewall_ref
+        .as_deref()
+        .is_some_and(valid_provider_selector);
+    let provider_ready = credential_configured && execution_enabled && firewall_configured;
+    let ready_with_defaults = provider_ready && default_ssh_key_configured;
+    let message = if !credential_configured {
+        "Provider connection needs administrator setup."
+    } else if !execution_enabled {
+        "Provider connection is configured, but server creation is disabled."
+    } else if !firewall_configured {
+        "A reviewed Hetzner Cloud firewall must be configured before creation."
+    } else if !default_ssh_key_configured {
+        "Enter an existing Hetzner Cloud SSH public-key name to continue."
+    } else {
+        "Provider connection, SSH public key, and firewall are ready."
+    };
+    SetupProviderRuntimeReadiness {
+        credential_configured,
+        execution_enabled,
+        default_ssh_key_configured,
+        firewall_configured,
+        provider_ready,
+        ready_with_defaults,
+        message,
+    }
+}
+
 fn setup_provider_plan(
     provider: &str,
     template: &str,
@@ -1845,15 +2026,15 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
                 key: "ssh_key",
                 kind: "hetzner-cloud-ssh-key",
                 required: true,
-                api: "GET /ssh_keys, POST /ssh_keys",
-                detail: "Attach or create an SSH public key only; private key material stays outside provider state and outside Pharos job records.",
+                api: "GET /ssh_keys",
+                detail: "Resolve and attach an existing SSH public key before server creation; private key material stays outside provider state and Pharos job records.",
             },
             SetupProviderPlanResource {
                 key: "firewall",
                 kind: "hetzner-cloud-firewall",
                 required: true,
-                api: "GET /firewalls, POST /firewalls, POST /firewalls/{id}/actions/apply_to_resources",
-                detail: "Apply a minimal firewall profile for SSH/bootstrap and Pharos beacon egress; rules are visible in the review plan before creation.",
+                api: "GET /firewalls, POST /servers",
+                detail: "Resolve a pre-reviewed firewall and attach it in the server create request; Pharos refuses to create an unprotected server when the firewall is missing.",
             },
             SetupProviderPlanResource {
                 key: "volume",
@@ -1874,7 +2055,7 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
             SetupProviderPlanStep {
                 key: "provider_resources",
                 title: "Provider resources",
-                detail: "Plan or create the server, SSH public key attachment, labels, and a minimal firewall through Hetzner Cloud API calls.",
+                detail: "Create the server with an existing SSH public key, reviewed firewall, and Pharos management labels through Hetzner Cloud API calls.",
                 status: "planned",
             },
             SetupProviderPlanStep {
@@ -1922,8 +2103,8 @@ fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
         handoffs: vec![
             SetupProviderPlanHandoff {
                 key: "provider_executor",
-                target: "PHAROS-97",
-                detail: "Consumes this plan contract to call Hetzner Cloud and persist safe resource identifiers plus cleanup guidance.",
+                target: "Hetzner Cloud executor",
+                detail: "Consumes this plan contract, validates required references before create, and persists safe resource identifiers plus cleanup guidance.",
             },
             SetupProviderPlanHandoff {
                 key: "nixos_bootstrap",
@@ -3022,14 +3203,16 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
 .assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
 .assistant-existing-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-step{display:grid}.assistant-preflight-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;align-items:end;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.78)}.assistant-preflight-form label,.assistant-preflight-facts label{display:grid;gap:5px;min-width:0}.assistant-preflight-form label span,.assistant-preflight-facts label span{color:var(--muted);font-size:11px;font-weight:650}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-preflight-form input:focus,.assistant-preflight-form select:focus,.assistant-preflight-facts input:focus,.assistant-preflight-facts select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}.assistant-preflight-details{grid-column:1/-1;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.74);padding:8px 10px}.assistant-preflight-details summary{cursor:pointer;color:#0f4f80;font-size:12px;font-weight:760}.assistant-preflight-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}.assistant-check{align-self:end;min-height:36px;padding:0 13px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760;white-space:nowrap;cursor:pointer}.assistant-check:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-preflight-result{display:grid;gap:10px;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(247,252,253,.78)}.assistant-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.assistant-result-head strong{font-size:14px;color:var(--ink)}.assistant-result-head span{max-width:430px;color:var(--muted);font-size:12px;line-height:1.35;text-align:right}.assistant-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.assistant-check-row{--check-color:var(--wait);display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start;min-height:42px;padding:8px 9px;border:1px solid rgba(214,226,234,.70);border-radius:7px;background:rgba(255,255,255,.72)}.assistant-check-row:before{content:"";width:8px;height:8px;margin-top:4px;border-radius:50%;background:var(--check-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--check-color) 10%,transparent)}.assistant-check-row[data-state="pass"]{--check-color:var(--live)}.assistant-check-row[data-state="warn"]{--check-color:var(--stale)}.assistant-check-row[data-state="fail"]{--check-color:var(--down)}.assistant-check-row strong{display:block;font-size:12px;color:var(--ink)}.assistant-check-row span{display:block;margin-top:1px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.assistant-bootstrap-option{--option-color:var(--wait);appearance:none;display:block;width:100%;min-height:72px;padding:10px;border:1px solid rgba(214,226,234,.74);border-radius:7px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;opacity:.72}.assistant-bootstrap-option[data-available="true"]{--option-color:var(--sea);opacity:1;border-color:rgba(21,158,153,.26);background:rgba(233,249,248,.62);cursor:pointer}.assistant-bootstrap-option[data-selected="true"]{border-color:rgba(21,158,153,.58);box-shadow:0 0 0 3px rgba(21,158,153,.10),0 10px 22px rgba(45,75,95,.08)}.assistant-bootstrap-option:disabled{cursor:not-allowed}.assistant-bootstrap-option strong{display:block;color:var(--ink);font-size:12px}.assistant-bootstrap-option span{display:block;margin-top:3px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap-option:before{content:"";display:block;width:8px;height:8px;margin-bottom:7px;border-radius:50%;background:var(--option-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--option-color) 10%,transparent)}
-.assistant-plan{display:none;gap:10px;padding:12px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-plan-list{display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid rgba(214,226,234,.72);border-radius:7px;background:rgba(255,255,255,.78);font-size:12px;color:var(--ink)}.assistant-confirm input{width:16px;height:16px;accent-color:var(--sea)}.assistant-start{min-height:34px;padding:0 12px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760}.assistant-start:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
+.assistant-plan{display:none;gap:14px;padding:14px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-overlay[data-assistant-stage="plan"] .assistant-paths,.assistant-overlay[data-assistant-stage="plan"] .assistant-provider-step,.assistant-overlay[data-assistant-stage="plan"] .assistant-existing-step{display:none}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-review-summary{display:grid;gap:16px}.assistant-review-identity{display:grid;grid-template-columns:42px minmax(0,1fr);column-gap:12px;align-items:center;padding:4px 1px 15px;border-bottom:1px solid rgba(210,226,234,.88)}.assistant-review-identity>.ico{grid-row:1/3;width:38px;height:38px;color:var(--sun)}.assistant-review-identity label{display:grid;gap:2px}.assistant-review-identity label span{font-size:10px;color:var(--muted)}.assistant-review-identity input{width:100%;min-width:0;height:38px;padding:0;border:0;border-bottom:1px solid transparent;background:transparent;color:var(--ink);font-family:Georgia,"Times New Roman",serif;font-size:28px;letter-spacing:0;outline:0}.assistant-review-identity input:focus{border-bottom-color:rgba(31,127,181,.36)}.assistant-review-identity>span{grid-column:2;color:var(--muted);font-size:12px}.assistant-review-rows{display:grid}.assistant-review-row{display:grid;grid-template-columns:28px minmax(0,1fr);align-items:center;gap:11px;min-height:58px;border-bottom:1px solid rgba(210,226,234,.78)}.assistant-review-row:last-child{border-bottom:0}.assistant-review-row>.ico{width:22px;height:22px;color:#315d7c}.assistant-review-row>span{display:flex;align-items:center;justify-content:space-between;gap:18px;min-width:0}.assistant-review-row strong{font-size:13px}.assistant-review-row small{min-width:0;color:var(--ink);font-size:12px;text-align:right;overflow-wrap:anywhere}.assistant-review-details{border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.assistant-review-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:46px;padding:0 4px;color:var(--ink);font-size:13px;font-weight:720;cursor:pointer;list-style:none}.assistant-review-details>summary::-webkit-details-marker{display:none}.assistant-review-details>summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-review-details[open]>summary .ico{transform:rotate(180deg)}.assistant-review-technical{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:4px 0 12px}.assistant-provider-readiness{grid-column:1/-1;display:grid;grid-template-columns:10px minmax(0,1fr);align-items:center;gap:8px;min-height:36px;padding:8px 10px;border:1px solid rgba(210,226,234,.78);border-radius:7px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-provider-readiness i{width:9px;height:9px;border-radius:50%;background:var(--wait);box-shadow:0 0 0 4px rgba(214,155,49,.10)}.assistant-provider-readiness[data-state="ready"] i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.10)}.assistant-provider-readiness[data-state="blocked"] i{background:var(--down);box-shadow:0 0 0 4px rgba(191,58,53,.10)}.assistant-plan-list{grid-column:1/-1;display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{grid-column:1/-1;display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 2px 0;font-size:12px;color:var(--ink)}.assistant-confirm>label{display:flex;align-items:center;gap:9px;min-width:0}.assistant-confirm input{flex:0 0 auto;width:16px;height:16px;accent-color:var(--sea)}.assistant-confirm-actions{display:flex;align-items:center;gap:8px}.assistant-back{min-height:34px;padding:0 10px;border:0;background:transparent;color:#315d7c;font:inherit;font-size:12px;font-weight:720;cursor:pointer}.assistant-start{min-height:36px;padding:0 14px;border:1px solid #c98316;border-radius:7px;background:#e4a42f;color:#15324a;font:inherit;font-size:12px;font-weight:780;cursor:pointer}.assistant-start:disabled{cursor:not-allowed;border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
 .assistant-plan-field{display:grid;gap:5px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-plan-field span{color:var(--muted);font-size:11px;font-weight:650}.assistant-plan-field input{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-plan-field input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
 .assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
 .assistant-created{display:grid;gap:20px;padding:12px 2px 2px}.assistant-created[hidden]{display:none}.assistant-overlay[data-provider-created="true"] .assistant-sheet{width:min(720px,100%)}.assistant-overlay[data-provider-created="true"] .assistant-paths,.assistant-overlay[data-provider-created="true"] .assistant-provider-step,.assistant-overlay[data-provider-created="true"] .assistant-existing-step{display:none}.assistant-overlay[data-provider-created="true"] .assistant-plan{display:grid}.assistant-overlay[data-provider-created="true"] .assistant-plan>:not(.assistant-created){display:none}.assistant-overlay[data-provider-created="true"] .assistant-created{display:grid}.assistant-overlay[data-provider-created="true"] .assistant-next{display:none}.assistant-created h3{margin:0;font-family:Georgia,serif;font-size:28px;font-weight:500;color:var(--ink);letter-spacing:0}.assistant-created-summary{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(0,1fr);align-items:center;gap:14px}.assistant-created-fact{display:flex;align-items:center;min-width:0;gap:10px;color:var(--ink)}.assistant-created-fact+.assistant-created-fact{padding-left:14px;border-left:1px solid rgba(210,226,234,.9)}.assistant-created-fact .ico{width:24px;height:24px;color:#53718a;flex:0 0 auto}.assistant-created-host .ico{width:34px;height:34px;color:#2d668e}.assistant-created-fact strong{overflow:hidden;text-overflow:ellipsis;font-size:18px;white-space:nowrap}.assistant-created-fact span{overflow:hidden;text-overflow:ellipsis;font-size:13px;white-space:nowrap}.assistant-created-ready::before{content:"";width:12px;height:12px;border-radius:50%;background:var(--live);box-shadow:0 0 0 5px rgba(21,158,153,.11);flex:0 0 auto}.assistant-created-progress{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;margin-top:2px}.assistant-created-step{position:relative;display:grid;gap:7px;padding-top:30px;color:var(--muted);font-size:12px}.assistant-created-step::before{content:"";position:absolute;top:9px;left:0;right:0;height:2px;background:#dce7ec}.assistant-created-step:first-child::before{left:12px}.assistant-created-step:last-child::before{right:calc(100% - 12px)}.assistant-created-step i{position:absolute;z-index:1;top:1px;left:0;width:20px;height:20px;border:2px solid #c8d6de;border-radius:50%;background:#fff}.assistant-created-step[data-state="done"]{color:var(--live)}.assistant-created-step[data-state="done"]::before{background:var(--live)}.assistant-created-step[data-state="done"] i{border-color:var(--live);background:var(--live);box-shadow:inset 0 0 0 5px #fff}.assistant-created-step[data-state="current"]{color:var(--ink);font-weight:760}.assistant-created-step[data-state="current"] i{border-color:var(--live);box-shadow:inset 0 0 0 5px #fff,0 0 0 5px rgba(21,158,153,.09);background:var(--live)}.assistant-created-actions{display:flex;align-items:center;gap:16px}.assistant-finish{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-height:40px;padding:0 16px;border:1px solid #c98316;border-radius:7px;background:#e4a42f;color:#15324a;font:inherit;font-size:13px;font-weight:780;cursor:pointer}.assistant-finish .ico{width:17px;height:17px}.assistant-later{border:0;background:transparent;color:#315d7c;font:inherit;font-size:12px;text-decoration:underline;text-underline-offset:3px;cursor:pointer}.assistant-created details{border-top:1px solid rgba(210,226,234,.9);padding-top:12px}.assistant-created details summary{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:38px;padding:0 10px;border:1px solid rgba(210,226,234,.9);border-radius:7px;background:rgba(255,255,255,.76);color:var(--ink);font-size:12px;font-weight:720;cursor:pointer;list-style:none}.assistant-created details summary::-webkit-details-marker{display:none}.assistant-created details summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-created details[open] summary .ico{transform:rotate(180deg)}.assistant-created-advanced{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 2px 0}.assistant-created-advanced div{min-width:0}.assistant-created-advanced dt{font-size:10px;color:var(--muted)}.assistant-created-advanced dd{margin:2px 0 0;overflow-wrap:anywhere;font-size:11px;color:var(--ink)}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
 .assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
+.assistant-close .ico{width:16px;height:16px}.assistant-overlay[data-assistant-stage="plan"] .assistant-next{display:none}.assistant-overlay[data-assistant-stage="plan"]:not([data-assistant-job-id]) .assistant-progress{display:none}.assistant-overlay[data-assistant-stage="plan"][data-assistant-selected-path="new"] .assistant-plan{padding:0;border:0;background:transparent}.assistant-overlay[data-assistant-stage="plan"][data-assistant-selected-path="new"] .assistant-plan>.assistant-plan-head{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-review-summary{display:none}
+.assistant-review-technical>.assistant-plan-field{padding:2px 0;border:0;background:transparent}.assistant-start{display:inline-flex;align-items:center;justify-content:center;gap:8px}.assistant-start .ico{width:15px;height:15px}
 body[data-assistant-open="true"]{overflow:hidden}
-@media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths,.assistant-providers,.assistant-preflight-form,.assistant-preflight-facts,.assistant-checks,.assistant-bootstrap{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}.assistant-facts{grid-template-columns:1fr}.assistant-template{grid-template-columns:1fr}.assistant-template em{white-space:normal}.assistant-result-head{display:grid}.assistant-result-head span{text-align:left}}
+@media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths,.assistant-providers,.assistant-preflight-form,.assistant-preflight-facts,.assistant-checks,.assistant-bootstrap,.assistant-review-technical{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}.assistant-facts{grid-template-columns:1fr}.assistant-template{grid-template-columns:1fr}.assistant-template em{white-space:normal}.assistant-result-head{display:grid}.assistant-result-head span{text-align:left}.assistant-review-row>span{display:grid;gap:3px}.assistant-review-row small{text-align:left}.assistant-confirm{grid-template-columns:1fr}.assistant-confirm-actions{justify-content:flex-end}.assistant-start{flex:1}.assistant-review-identity input{font-size:24px}}
 @media (max-width:640px){.assistant-created-summary{grid-template-columns:1fr}.assistant-created-fact+.assistant-created-fact{padding:10px 0 0;border-top:1px solid rgba(210,226,234,.9);border-left:0}.assistant-created-actions{align-items:stretch;flex-direction:column}.assistant-finish{width:100%}.assistant-created-advanced{grid-template-columns:1fr}}
 .map-main{width:min(1380px,100%)}
 .map-main[data-map-view="maximized"]{width:100%}
@@ -3735,6 +3918,8 @@ function syncAssistantNext(overlay){
     if(title)title.textContent='Next step';
     if(copy)copy.textContent='Choose a path to preview the next step. No changes have been started.';
   }
+  updateAssistantReview(overlay);
+  syncAssistantStart(overlay);
 }
 function provisioningJobTerminal(state){
   return ['complete','failed','cleanup-needed'].includes(state||'');
@@ -3801,6 +3986,151 @@ function currentSetupIntentSummary(overlay){
     setupIntentChoice(overlay,'location_intent','auto'),
     setupIntentChoice(overlay,'access_intent','operator-only')
   );
+}
+const SETUP_TEMPLATE_REVIEW={
+  'hetzner-small-nixos':'Small NixOS',
+  'hetzner-lab':'Lab NixOS',
+  'bring-own-plan':'Custom NixOS'
+};
+function assistantReviewValue(overlay,selector,fallback=''){
+  return (overlay.querySelector(selector)?.value||fallback).trim();
+}
+function assistantStartLabel(start){
+  return start?.querySelector('[data-assistant-start-label]')?.textContent||start?.textContent||'';
+}
+function setAssistantStartLabel(start,label){
+  const node=start?.querySelector('[data-assistant-start-label]');
+  if(node)node.textContent=label;
+  else if(start)start.textContent=label;
+}
+function updateAssistantReview(overlay){
+  if(!overlay||overlay.dataset.providerCreated==='true')return;
+  const state=assistantState(overlay);
+  const reviewing=state.stage==='plan';
+  const title=overlay.querySelector('#setup-assistant-title');
+  const copy=title?.parentElement?.querySelector('p');
+  const details=overlay.querySelector('[data-assistant-review-details]');
+  const confirmCopy=overlay.querySelector('[data-assistant-confirm-copy]');
+  const start=overlay.querySelector('[data-assistant-start]');
+  if(reviewing&&state.path==='new'){
+    if(title)title.textContent='Review server';
+    if(copy)copy.textContent='Nothing has been created yet.';
+    if(confirmCopy)confirmCopy.textContent='I understand this creates a paid cloud server.';
+    if(assistantStartLabel(start)!=='Starting setup')setAssistantStartLabel(start,'Create server');
+    const location=assistantReviewValue(overlay,'[data-new-location]','fsn1');
+    const serverType=assistantReviewValue(overlay,'[data-new-server-type]','cx22');
+    const template=SETUP_TEMPLATE_REVIEW[state.template]||'NixOS server';
+    const provider=overlay.querySelector('[data-review-provider]');
+    const server=overlay.querySelector('[data-review-server]');
+    const setup=overlay.querySelector('[data-review-setup]');
+    const after=overlay.querySelector('[data-review-after]');
+    if(provider)provider.textContent=`Hetzner Cloud · ${providerLocationLabel(location)}`;
+    if(server)server.textContent=`${template} · ${serverType.toUpperCase()}`;
+    if(setup)setup.textContent='NixOS + Pharos';
+    if(after){
+      const backup=BACKUP_INTENT_COPY[setupIntentChoice(overlay,'backup_intent','deferred')]?.[0]||'backup decision pending';
+      const locationIntent=LOCATION_INTENT_COPY[setupIntentChoice(overlay,'location_intent','auto')]?.[0]||'auto location';
+      const access=ACCESS_INTENT_COPY[setupIntentChoice(overlay,'access_intent','operator-only')]?.[0]||'operator only';
+      after.textContent=[backup,locationIntent,access]
+        .map(value=>value.charAt(0).toUpperCase()+value.slice(1))
+        .join(' · ');
+    }
+  }else if(reviewing&&state.path==='existing'){
+    if(title)title.textContent='Review setup';
+    if(copy)copy.textContent='No host changes have been started yet.';
+    if(confirmCopy)confirmCopy.textContent='I reviewed this setup path.';
+    if(assistantStartLabel(start)!=='Starting setup')setAssistantStartLabel(start,'Record setup path');
+    if(details)details.open=true;
+  }else{
+    if(title)title.textContent='Add a server';
+    if(copy)copy.textContent='Choose what you want to add. Nothing changes until you confirm.';
+  }
+}
+function providerPlanResourceTitle(resource){
+  return String(resource?.key||'provider resource').replace(/_/g,' ').replace(/\b\w/g,letter=>letter.toUpperCase());
+}
+function renderProviderPlanReview(overlay,payload){
+  const plan=payload?.plan||null;
+  const runtime=payload?.runtime||null;
+  overlay.pharosProviderPlan=plan;
+  overlay.pharosProviderRuntime=runtime;
+  const sshKey=overlay.querySelector('[data-new-ssh-key]');
+  if(sshKey){
+    sshKey.placeholder=runtime?.default_ssh_key_configured?'configured default':'existing key name';
+  }
+  const list=overlay.querySelector('[data-provider-plan-resources]');
+  if(list&&plan){
+    list.replaceChildren();
+    (Array.isArray(plan.resources)?plan.resources:[]).filter(resource=>resource?.required).forEach(resource=>{
+      const row=document.createElement('div');
+      row.className='assistant-plan-row';
+      const copy=document.createElement('span');
+      const title=document.createElement('strong');
+      title.textContent=providerPlanResourceTitle(resource);
+      const detail=document.createElement('span');
+      detail.textContent=resource.detail||'Required before server creation.';
+      copy.append(title,detail);
+      const status=document.createElement('em');
+      status.className='assistant-plan-chip';
+      status.textContent='required';
+      row.append(copy,status);
+      list.append(row);
+    });
+  }
+  updateProviderReadiness(overlay);
+}
+function updateProviderReadiness(overlay){
+  const runtime=overlay?.pharosProviderRuntime||null;
+  const readiness=overlay?.querySelector('[data-provider-readiness]');
+  const sshKey=assistantReviewValue(overlay,'[data-new-ssh-key]');
+  const keyReady=Boolean(runtime?.default_ssh_key_configured||sshKey);
+  const ready=Boolean(runtime?.provider_ready&&keyReady);
+  if(readiness){
+    readiness.dataset.state=ready?'ready':'blocked';
+    const message=readiness.querySelector('span');
+    if(message){
+      message.textContent=ready
+        ? 'Provider connection, SSH public key, and firewall are ready.'
+        : runtime?.message||'Provider readiness could not be verified.';
+    }
+  }
+  const details=overlay?.querySelector('[data-assistant-review-details]');
+  if(runtime&&!ready&&details)details.open=true;
+  syncAssistantStart(overlay);
+}
+function syncAssistantStart(overlay){
+  const state=assistantState(overlay);
+  const start=overlay.querySelector('[data-assistant-start]');
+  const confirmed=Boolean(overlay.querySelector('[data-assistant-confirm]')?.checked);
+  if(!start)return;
+  if(state.path==='new'){
+    const runtime=overlay.pharosProviderRuntime||null;
+    const keyReady=Boolean(runtime?.default_ssh_key_configured||assistantReviewValue(overlay,'[data-new-ssh-key]'));
+    const inputsReady=[
+      '[data-new-host-name]',
+      '[data-new-role]',
+      '[data-new-location]',
+      '[data-new-server-type]',
+      '[data-new-image]'
+    ].every(selector=>Boolean(assistantReviewValue(overlay,selector)));
+    start.disabled=!(confirmed&&runtime?.provider_ready&&keyReady&&inputsReady);
+  }else{
+    start.disabled=!confirmed;
+  }
+}
+async function loadProviderPlanReview(overlay){
+  const state=assistantState(overlay);
+  if(state.path!=='new'||state.provider!=='hetzner-cloud'||!state.template)return;
+  overlay.pharosProviderRuntime=null;
+  updateProviderReadiness(overlay);
+  const params=new URLSearchParams({provider:state.provider,template:state.template});
+  const response=await fetch(`/setup/provider-plan.json?${params.toString()}`,{
+    headers:{'accept':'application/json'},
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'provider plan could not be loaded');
+  renderProviderPlanReview(overlay,payload);
 }
 function provisioningIntentMessage(job){
   const intent=job?.setup_intent;
@@ -4133,6 +4463,7 @@ async function startProvisioningJob(overlay,start){
   body.access_intent=setupIntentChoice(overlay,'access_intent','operator-only');
   if(state.path==='new'){
     const hostName=(overlay.querySelector('[data-new-host-name]')?.value||'').trim();
+    const role=(overlay.querySelector('[data-new-role]')?.value||'server').trim()||'server';
     const location=(overlay.querySelector('[data-new-location]')?.value||'').trim();
     const serverType=(overlay.querySelector('[data-new-server-type]')?.value||'').trim();
     const image=(overlay.querySelector('[data-new-image]')?.value||'').trim();
@@ -4142,10 +4473,12 @@ async function startProvisioningJob(overlay,start){
       if(!location)throw new Error('Enter a Hetzner location first.');
       if(!serverType)throw new Error('Enter a Hetzner server type first.');
       if(!image)throw new Error('Enter a Hetzner image first.');
-      if(!sshKey)throw new Error('Enter a Hetzner SSH key reference first.');
+      if(!sshKey&&!overlay.pharosProviderRuntime?.default_ssh_key_configured){
+        throw new Error('Enter an existing Hetzner SSH public-key name first.');
+      }
     }
     body.host_name=hostName;
-    body.role='server';
+    body.role=role;
     body.is_nix=state.provider==='hetzner-cloud';
     body.heartbeat_interval_secs=60;
     if(location)body.location=location;
@@ -4178,7 +4511,7 @@ async function startProvisioningJob(overlay,start){
     }
     body.apply=true;
   }
-  start.textContent='Starting setup';
+  setAssistantStartLabel(start,'Starting setup');
   start.disabled=true;
   const response=await fetch('/setup/provisioning-jobs',{
     method:'POST',
@@ -4189,7 +4522,7 @@ async function startProvisioningJob(overlay,start){
   const payload=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(payload.error||'setup job could not be started');
   renderProvisioningJob(overlay,payload.job);
-  start.textContent='Setup job recorded';
+  setAssistantStartLabel(start,'Setup job recorded');
   if(payload.job?.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
 }
 function setAssistantTemplate(template,write=true){
@@ -4242,10 +4575,21 @@ function setAssistantPath(path,write=true){
     overlay.dataset.assistantStage='';
     overlay.dataset.existingBootstrapMethod='';
     overlay.pharosExistingPreflight=null;
+    overlay.pharosProviderPlan=null;
+    overlay.pharosProviderRuntime=null;
+    const reviewDetails=overlay.querySelector('[data-assistant-review-details]');
+    if(reviewDetails)reviewDetails.open=false;
   }
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>{
     btn.setAttribute('aria-pressed',String(btn.dataset.assistantPath===safePath));
   });
+  if(safePath!==previousPath){
+    const backupValue=safePath==='new'?'enroll-later':'deferred';
+    const backup=overlay.querySelector(`input[name="backup_intent"][value="${backupValue}"]`);
+    if(backup)backup.checked=true;
+    const confirm=overlay.querySelector('[data-assistant-confirm]');
+    if(confirm)confirm.checked=false;
+  }
   if(safePath==='new'){
     setAssistantProvider(assistantProvider(overlay.dataset.assistantSelectedProvider||'')||'hetzner-cloud',false);
   }else if(safePath==='existing'){
@@ -4299,6 +4643,9 @@ function restoreAssistantFromUrl(){
     setAssistantTemplate(params.get(ASSISTANT_TEMPLATE_PARAM),false);
     overlay.dataset.assistantStage=assistantStage(params.get(ASSISTANT_STAGE_PARAM));
     syncAssistantNext(overlay);
+    if(overlay.dataset.assistantStage==='plan'){
+      loadProviderPlanReview(overlay).catch(()=>updateProviderReadiness(overlay));
+    }
   }
 }
 function initSetupAssistant(){
@@ -4332,11 +4679,34 @@ function initSetupAssistant(){
     }
   });
   overlay.querySelector('[data-assistant-confirm]')?.addEventListener('change',event=>{
-    const start=overlay.querySelector('[data-assistant-start]');
-    if(start)start.disabled=!event.currentTarget.checked;
+    syncAssistantStart(overlay);
   });
   overlay.querySelectorAll('input[name="backup_intent"],input[name="location_intent"],input[name="access_intent"]').forEach(input=>{
-    input.addEventListener('change',()=>syncAssistantNext(overlay));
+    input.addEventListener('change',()=>{
+      syncAssistantNext(overlay);
+      updateAssistantReview(overlay);
+    });
+  });
+  overlay.querySelectorAll('[data-new-host-name],[data-new-role],[data-new-location],[data-new-server-type],[data-new-image],[data-new-ssh-key]').forEach(input=>{
+    input.addEventListener('input',()=>{
+      updateAssistantReview(overlay);
+      updateProviderReadiness(overlay);
+    });
+  });
+  overlay.querySelector('[data-assistant-back]')?.addEventListener('click',()=>{
+    overlay.dataset.assistantStage='';
+    const confirm=overlay.querySelector('[data-assistant-confirm]');
+    if(confirm)confirm.checked=false;
+    const details=overlay.querySelector('[data-assistant-review-details]');
+    if(details)details.open=false;
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'');
+    syncAssistantNext(overlay);
+    if(state.path==='new'){
+      overlay.querySelector(`[data-assistant-template="${state.template}"]`)?.focus();
+    }else{
+      overlay.querySelector('[data-preflight-result]')?.scrollIntoView({block:'nearest'});
+    }
   });
   overlay.querySelector('[data-assistant-finish]')?.addEventListener('click',()=>{
     const details=overlay.querySelector('[data-created-advanced]');
@@ -4354,14 +4724,23 @@ function initSetupAssistant(){
     try{
       await startProvisioningJob(overlay,start);
     }catch(error){
-      start.textContent='Start setup';
-      start.disabled=false;
+      updateAssistantReview(overlay);
+      syncAssistantStart(overlay);
       if(title)title.textContent='Setup could not start';
       if(copy)copy.textContent=error.message||'The setup job could not be created.';
     }
   });
   overlay.querySelector('[data-assistant-continue]')?.addEventListener('click',event=>{
     if(event.currentTarget.disabled)return;
+    const before=assistantState(overlay);
+    if(before.path==='new'&&before.provider==='manual-import'){
+      setAssistantPath('existing',false);
+      const state=assistantState(overlay);
+      writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
+      syncAssistantNext(overlay);
+      overlay.querySelector('[data-preflight-host-name]')?.focus();
+      return;
+    }
     overlay.dataset.assistantStage='plan';
     if(assistantState(overlay).path==='existing'){
       const start=overlay.querySelector('[data-assistant-start]');
@@ -4369,8 +4748,14 @@ function initSetupAssistant(){
       if(confirm)confirm.checked=true;
       if(start){
         start.disabled=false;
-        start.textContent='Record setup path';
+        setAssistantStartLabel(start,'Record setup path');
       }
+      const details=overlay.querySelector('[data-assistant-review-details]');
+      if(details)details.open=true;
+    }else{
+      const confirm=overlay.querySelector('[data-assistant-confirm]');
+      if(confirm)confirm.checked=false;
+      loadProviderPlanReview(overlay).catch(()=>updateProviderReadiness(overlay));
     }
     const state=assistantState(overlay);
     writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
@@ -4896,7 +5281,14 @@ async fn setup_provider_plan_json(
         Ok(plan) => (
             StatusCode::OK,
             no_store_headers(),
-            Json(json!({ "plan": plan })),
+            Json(json!({
+                "plan": plan,
+                "runtime": if query.provider == "hetzner-cloud" {
+                    Some(hetzner_runtime_readiness(&state.provider_runtime.hetzner_cloud))
+                } else {
+                    None
+                }
+            })),
         ),
         Err(error) => (
             StatusCode::BAD_REQUEST,
@@ -7777,6 +8169,13 @@ fn setup_assistant() -> String {
         server = icons::SERVER
     )
     .replace(
+        r#"<button class="assistant-close" type="button" data-assistant-close>Close</button>"#,
+        &format!(
+            r#"<button class="assistant-close" type="button" data-assistant-close title="Close" aria-label="Close">{}</button>"#,
+            icons::X
+        ),
+    )
+    .replace(
         r#"<div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states">"#,
         &format!(
             r#"<div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><section class="assistant-created" data-assistant-created hidden aria-live="polite"><h3>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready"><span>Ready for setup</span></div></div><div class="assistant-created-progress" aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions"><button class="assistant-finish" type="button" data-assistant-finish>View setup steps {arrow}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><details data-created-advanced><summary>Advanced details {chevron}</summary><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></details></section><div class="assistant-progress" aria-label="provisioning progress states">"#,
@@ -7792,7 +8191,13 @@ fn setup_assistant() -> String {
     )
     .replace(
         r#"<div class="assistant-plan-list">"#,
-        r#"<label class="assistant-plan-field"><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01"></label><label class="assistant-plan-field"><span>Location</span><input data-new-location autocomplete="off" value="fsn1" placeholder="fsn1"></label><label class="assistant-plan-field"><span>Server type</span><input data-new-server-type autocomplete="off" value="cx22" placeholder="cx22"></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH key reference</span><input data-new-ssh-key autocomplete="off" placeholder="pharos-bootstrap-key"></label><div class="assistant-plan-list">"#,
+        &format!(
+            r#"<section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud · Falkenstein</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Small NixOS · CX22</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><details class="assistant-review-details" data-assistant-review-details><summary>Technical details {chevron}</summary><div class="assistant-review-technical"><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span></div><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><input data-new-location autocomplete="off" value="fsn1" placeholder="fsn1"></label><label class="assistant-plan-field"><span>Server type</span><input data-new-server-type autocomplete="off" value="cx22" placeholder="cx22"></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public-key name</span><input data-new-ssh-key autocomplete="off" placeholder="existing key name"></label><div class="assistant-plan-list" data-provider-plan-resources>"#,
+            server = icons::SERVER,
+            setup = icons::SLIDERS,
+            after = icons::SHIELD_CHECK,
+            chevron = icons::CHEVRON_DOWN,
+        ),
     )
     .replace(
         r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
@@ -7800,7 +8205,18 @@ fn setup_assistant() -> String {
     )
     .replace(
         r#"</div></div><label class="assistant-confirm">"#,
-        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div><label class="assistant-confirm">"#,
+        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div></details></div><label class="assistant-confirm">"#,
+    )
+    .replace(
+        r#"</div><div class="assistant-setup-intent""#,
+        r#"</div></div><div class="assistant-setup-intent""#,
+    )
+    .replace(
+        r#"<label class="assistant-confirm"><input type="checkbox" data-assistant-confirm><span>I understand this may create provider resources.</span><button class="assistant-start" type="button" data-assistant-start disabled>Start setup</button></label>"#,
+        &format!(
+            r#"<div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I understand this creates a paid cloud server.</span></label><div class="assistant-confirm-actions"><button class="assistant-back" type="button" data-assistant-back>Back</button><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Create server</span>{}</button></div></div>"#,
+            icons::ARROW_RIGHT
+        ),
     )
     .replace(
         r#"<button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button>"#,
@@ -13187,6 +13603,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Hetzner Cloud"));
         assert!(empty.contains("Manual / existing provider"));
         assert!(empty.contains(r#"data-new-host-name"#));
+        assert!(empty.contains(r#"data-new-role"#));
         assert!(empty.contains(r#"data-new-location"#));
         assert!(empty.contains(r#"data-new-server-type"#));
         assert!(empty.contains(r#"data-new-image"#));
@@ -13215,6 +13632,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("data-assistant-template=\"gcp-free-tier-lab\""));
         assert!(empty.contains("No provider resources are created here."));
         assert!(empty.contains("Review plan"));
+        assert!(empty.contains(r#"data-assistant-review"#));
+        assert!(empty.contains(r#"data-review-provider"#));
+        assert!(empty.contains(r#"data-review-server"#));
+        assert!(empty.contains(r#"data-review-setup"#));
+        assert!(empty.contains(r#"data-review-after"#));
+        assert!(empty.contains(r#"data-provider-readiness"#));
+        assert!(empty.contains(r#"data-provider-plan-resources"#));
         assert!(empty.contains("Provider resources"));
         assert!(empty.contains("SSH and bootstrap"));
         assert!(empty.contains("Beacon registration"));
@@ -13228,7 +13652,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"name="access_intent" value="operator-only""#));
         assert!(empty.contains(r#"name="access_intent" value="limited-users""#));
         assert!(empty.contains("No secrets stored"));
-        assert!(empty.contains("I understand this may create provider resources."));
+        assert!(empty.contains("I understand this creates a paid cloud server."));
+        assert!(empty.contains(r#"data-assistant-back"#));
+        assert!(empty.contains("Create server"));
         assert!(empty.contains("data-assistant-job"));
         assert!(empty.contains(r#"data-assistant-created"#));
         assert!(empty.contains("Server created"));
@@ -13889,6 +14315,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                     "PHAROS_HCLOUD_API_TOKEN",
                 )),
                 execute_enabled: true,
+                firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
                 ..HetznerCloudRuntimeConfig::default()
             },
             ..ProviderRuntimeConfig::default()
@@ -13898,7 +14325,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("missing inputs record safe failure");
         assert!(missing_inputs.progress[1]
             .message
-            .contains("needs host, location, server type, image, and SSH key reference"));
+            .contains("needs host, location, server type, image"));
 
         request.host_name = Some("hcloud-lab-1".to_string());
         request.location = Some("fsn1".to_string());
@@ -13928,28 +14355,77 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!json.to_ascii_lowercase().contains("token="));
     }
 
-    async fn hcloud_mock_server(status: &str, body: &'static str) -> String {
+    #[derive(Clone, Debug)]
+    struct RecordedHcloudRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    async fn hcloud_mock_server(
+        server_status: &str,
+        server_body: &'static str,
+        firewall_available: bool,
+    ) -> (String, Arc<Mutex<Vec<RecordedHcloudRequest>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind hcloud mock");
         let addr = listener.local_addr().expect("mock address");
-        let status = status.to_string();
+        let server_status = server_status.to_string();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept hcloud request");
-            let mut buf = vec![0; 4096];
-            let _ = stream.read(&mut buf).await;
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("write hcloud response");
+            for _ in 0..3 {
+                let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_secs(2), listener.accept()).await
+                else {
+                    break;
+                };
+                let mut buf = vec![0; 8192];
+                let size = stream.read(&mut buf).await.expect("read hcloud request");
+                let request = String::from_utf8_lossy(&buf[..size]);
+                let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+                let mut request_line = head.lines().next().unwrap_or_default().split_whitespace();
+                let method = request_line.next().unwrap_or_default().to_string();
+                let path = request_line.next().unwrap_or_default().to_string();
+                recorded
+                    .lock()
+                    .expect("hcloud request lock")
+                    .push(RecordedHcloudRequest {
+                        method,
+                        path: path.clone(),
+                        body: body.to_string(),
+                    });
+                let (status, response_body) = if path.starts_with("/ssh_keys?") {
+                    (
+                        "200 OK",
+                        r#"{"ssh_keys":[{"id":101,"name":"pharos-bootstrap-key"}]}"#,
+                    )
+                } else if path.starts_with("/firewalls?") {
+                    if firewall_available {
+                        (
+                            "200 OK",
+                            r#"{"firewalls":[{"id":202,"name":"pharos-bootstrap-firewall"}]}"#,
+                        )
+                    } else {
+                        ("200 OK", r#"{"firewalls":[]}"#)
+                    }
+                } else {
+                    (server_status.as_str(), server_body)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write hcloud response");
+            }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), requests)
     }
 
     fn hcloud_apply_request(host_name: &str) -> ProvisioningJobStartRequest {
@@ -13990,6 +14466,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             hetzner_cloud: HetznerCloudRuntimeConfig {
                 credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
                 execute_enabled: true,
+                default_ssh_key_ref: None,
+                firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
                 api_base_url,
                 request_timeout: Duration::from_secs(2),
             },
@@ -14000,9 +14478,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[tokio::test]
     async fn hetzner_executor_success_persists_waiting_for_heartbeat() {
-        let api = hcloud_mock_server(
+        let (api, requests) = hcloud_mock_server(
             "201 Created",
             r#"{"server":{"id":4242,"name":"hcloud-lab-3","public_net":{"ipv4":{"ip":"192.0.2.42"}}}}"#,
+            true,
         )
         .await;
         let (state, token_path) = test_hcloud_state(api);
@@ -14041,6 +14520,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             handoff.command_ref.as_deref(),
             Some("scripts/bootstrap-pharos-nixos-anywhere.sh")
         );
+        let requests = requests.lock().expect("hcloud requests");
+        let create = requests
+            .iter()
+            .find(|request| request.method == "POST" && request.path == "/servers")
+            .expect("server create request recorded");
+        let payload: serde_json::Value =
+            serde_json::from_str(&create.body).expect("create payload parses");
+        assert_eq!(payload["ssh_keys"], json!([101]));
+        assert_eq!(payload["firewalls"], json!([{ "firewall": 202 }]));
+        assert!(!create.body.contains("test-hcloud-token"));
         assert_eq!(
             state
                 .provisioning_jobs
@@ -14058,9 +14547,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[tokio::test]
     async fn hetzner_executor_without_public_ipv4_requires_cleanup_review() {
-        let api = hcloud_mock_server(
+        let (api, _) = hcloud_mock_server(
             "201 Created",
             r#"{"server":{"id":4243,"name":"hcloud-lab-5","public_net":{}}}"#,
+            true,
         )
         .await;
         let (state, token_path) = test_hcloud_state(api);
@@ -14094,8 +14584,46 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn hetzner_executor_refuses_create_without_reviewed_firewall() {
+        let (api, requests) = hcloud_mock_server(
+            "201 Created",
+            r#"{"server":{"id":4244,"name":"must-not-exist"}}"#,
+            false,
+        )
+        .await;
+        let (state, token_path) = test_hcloud_state(api);
+        let request = hcloud_apply_request("hcloud-lab-6");
+
+        let job = state
+            .provisioning_jobs
+            .start(&request, 1_700_000_011, &state.provider_runtime)
+            .expect("hetzner job starts");
+        let job = execute_hetzner_setup_job(&state, &request, job).await;
+
+        assert_eq!(job.state, ProvisioningJobState::Failed);
+        assert!(job.provider_resources.is_empty());
+        assert!(job
+            .progress
+            .last()
+            .expect("safe failure progress")
+            .message
+            .contains("firewall was not found"));
+        assert!(!requests
+            .lock()
+            .expect("hcloud requests")
+            .iter()
+            .any(|request| request.method == "POST"));
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
     async fn hetzner_executor_failure_persists_cleanup_guidance() {
-        let api = hcloud_mock_server("500 Internal Server Error", r#"{"error":"temporary"}"#).await;
+        let (api, _) = hcloud_mock_server(
+            "500 Internal Server Error",
+            r#"{"error":"temporary"}"#,
+            true,
+        )
+        .await;
         let (state, token_path) = test_hcloud_state(api);
         let request = hcloud_apply_request("hcloud-lab-4");
 
@@ -14895,7 +15423,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(plan
             .resources
             .iter()
-            .any(|resource| resource.key == "firewall" && resource.required));
+            .any(|resource| resource.key == "firewall"
+                && resource.required
+                && resource.detail.contains("refuses to create")));
         assert!(plan
             .resources
             .iter()
@@ -14913,7 +15443,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(plan
             .handoffs
             .iter()
-            .any(|handoff| handoff.key == "provider_executor" && handoff.target == "PHAROS-97"));
+            .any(|handoff| handoff.key == "provider_executor"
+                && handoff.target == "Hetzner Cloud executor"));
         let json = serde_json::to_string(&plan).expect("plan serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
@@ -14921,6 +15452,35 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             setup_provider_plan("hetzner-cloud", "manual-import").err(),
             Some(ProvisioningJobStartError::UnsupportedTemplate)
         );
+    }
+
+    #[test]
+    fn hetzner_runtime_readiness_exposes_only_safe_capabilities() {
+        let blocked = hetzner_runtime_readiness(&HetznerCloudRuntimeConfig::default());
+        assert!(!blocked.provider_ready);
+        assert!(!blocked.ready_with_defaults);
+        assert!(blocked.message.contains("administrator setup"));
+
+        let token_path = std::env::temp_dir().join(format!(
+            "pharos-runtime-readiness-token-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::write(&token_path, "test-provider-token").expect("write provider token fixture");
+        let ready = hetzner_runtime_readiness(&HetznerCloudRuntimeConfig {
+            credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
+            execute_enabled: true,
+            default_ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
+            firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
+            ..HetznerCloudRuntimeConfig::default()
+        });
+        assert!(ready.provider_ready);
+        assert!(ready.ready_with_defaults);
+        let json = serde_json::to_string(&ready).expect("runtime readiness serializes");
+        assert!(!json.contains("pharos-bootstrap-key"));
+        assert!(!json.contains("pharos-bootstrap-firewall"));
+        assert!(!json.contains("test-provider-token"));
+        let _ = std::fs::remove_file(token_path);
     }
 
     #[test]
