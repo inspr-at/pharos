@@ -161,17 +161,36 @@ beacon with a native systemd service:
 
   services.pharos-beacon = {
     enable = true;
-    tokenFile = "/run/agenix/pharos-beacon-token";
+    tokenFile = "/etc/pharos/pharos-beacon.token";
     nixcfgDir = "/home/mba/Code/nixcfg";
   };
 }
 ```
 
-`tokenFile` should be produced by agenix or another runtime secret source and
-contain only the raw token. `tokenEnvironmentFile` is still supported when an env
-file with `PHAROS_TOKEN=...` is more practical. During the temporary PHAROS-37
-rollout, `allowLegacyReports = true` can run the service without a token, but
-that should not be used for final production enforcement.
+For first installation onto an existing machine, run the helper from a Linux
+host with Nix and `nixos-anywhere` installed:
+
+```bash
+scripts/bootstrap-pharos-nixos-anywhere.sh \
+  --flake /path/to/nixcfg#host-name \
+  --target root@host-name \
+  --token-file /private/runtime/pharos-beacon.token \
+  --known-hosts /private/runtime/known_hosts \
+  --identity /private/runtime/id_ed25519
+```
+
+The helper validates private-file permissions and strict SSH trust, preserves
+the target host keys, copies the token with `nixos-anywhere --extra-files`, and
+waits for `pharos-beacon.service`. The raw token is not a command argument and
+never enters Nix evaluation or the Nix store. The target configuration must
+import `nixosModules.pharos-beacon` and use the shown first-bootstrap token path.
+After the first heartbeat, migrate that file to an agenix- or Janus-managed
+runtime path and update `tokenFile` declaratively.
+
+`tokenEnvironmentFile` remains supported when a root-owned env file containing
+`PHAROS_TOKEN=...` is more practical. `allowLegacyReports = true` exists only
+for controlled migrations and must not be used with strict production report
+ingestion.
 
 ### Portable non-Nix beacon
 
@@ -236,8 +255,8 @@ rejecting an explicitly wrong bearer token. Set
 per-host token; by default that becomes true when `PHAROS_REGISTRATION_TOKEN`
 is configured or a Janus hash file is configured.
 
-Production is still rolling toward strict token-only report ingestion. Do not
-enable strict mode until every deployed beacon has a per-host `PHAROS_TOKEN` and
+Production uses strict token-only report ingestion. Before enabling the same
+policy in another deployment, ensure every beacon has a per-host token and
 pharosd has either persisted local hashes or a Janus-managed hash file for those
 hosts.
 

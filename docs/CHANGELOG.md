@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## 0.1.13 - 2026-07-10
+
+- Added a guarded Linux-side `nixos-anywhere` helper for the existing-host NixOS path, using strict SSH trust, preserved host keys, and post-install service verification.
+- Passed the one-time beacon token through a private `--extra-files` tree instead of command arguments or Nix evaluation, keeping it out of the Nix store.
+- Linked NixOS setup jobs to the concrete helper and first-bootstrap token path, with a follow-up migration to agenix or Janus after the first heartbeat.
+- Added a CI dry-run contract for the helper and refreshed the README to reflect production strict-token ingestion.
+
 ## 0.1.12 - 2026-07-10
 
 - Added an opt-in, fail-closed native systemd executor for existing-host onboarding after successful SSH/preflight review.

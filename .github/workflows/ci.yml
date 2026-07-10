@@ -26,7 +26,26 @@ jobs:
       - name: dependency audit
         run: cargo deny check
       - name: shell syntax
-        run: bash -n scripts/install-pharos-beacon-systemd.sh
+        run: bash -n scripts/install-pharos-beacon-systemd.sh scripts/bootstrap-pharos-nixos-anywhere.sh
+      - name: nixos-anywhere handoff dry run
+        run: |
+          work="$(mktemp -d)"
+          cleanup() {
+            find "$work" -type f -delete 2>/dev/null || true
+            find "$work" -depth -type d -exec rmdir '{}' \; 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          printf 'pharos_test_token\n' >"$work/token"
+          chmod 0600 "$work/token"
+          printf 'test-host-key\n' >"$work/known_hosts"
+          chmod 0644 "$work/known_hosts"
+          output="$(scripts/bootstrap-pharos-nixos-anywhere.sh \
+            --flake '.#test-host' \
+            --target root@test-host \
+            --token-file "$work/token" \
+            --known-hosts "$work/known_hosts" \
+            --dry-run)"
+          test "$output" = $'nixos_bootstrap_dry_run=ok\ntoken_transport=extra-files\nhost_key_policy=strict-preserved'
       - name: self-host compose syntax
         run: |
           PHAROS_OIDC_ISSUER=https://issuer.example \

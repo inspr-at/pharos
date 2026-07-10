@@ -1369,19 +1369,19 @@ fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<Pro
     match method {
         BootstrapMethod::NixosAnywhere => {
             let mut next_steps = vec![
-                "Prepare the target flake/module so services.pharos-beacon reads a runtime credential file.".to_string(),
-                "Run the NixOS bootstrap only after SSH, privilege, disk, and rollback checks pass.".to_string(),
-                "Wait for the first heartbeat before marking onboarding complete.".to_string(),
+                "Prepare the target flake so services.pharos-beacon imports the Pharos module and reads /etc/pharos/pharos-beacon.token for first bootstrap.".to_string(),
+                "From a Linux executor, run scripts/bootstrap-pharos-nixos-anywhere.sh with a private token file and pinned SSH known-hosts file.".to_string(),
+                "Wait for the first heartbeat, then migrate the bootstrap token file to the target's long-term agenix or Janus runtime secret path.".to_string(),
             ];
             next_steps.extend(backup_steps);
             Some(ProvisioningHandoff {
                 method,
                 status: "runtime-credential-required".to_string(),
                 title: "NixOS bootstrap handoff".to_string(),
-                summary: "Declarative bootstrap is selected; Pharos prepared the non-secret handoff and is waiting for a runtime credential file plus the first heartbeat.".to_string(),
-                token_policy: "Beacon credentials must be installed through a runtime file or secret manager reference, never as a command-line value.".to_string(),
-                secret_target: Some("/run/agenix/pharos-beacon-token".to_string()),
-                command_ref: Some("nixos-anywhere plus services.pharos-beacon".to_string()),
+                summary: "Declarative bootstrap is selected; the helper copies the token through nixos-anywhere extra-files and Pharos waits for the first heartbeat.".to_string(),
+                token_policy: "The helper accepts a private token file path and copies its value outside Nix evaluation; raw credentials never enter command arguments or the Nix store.".to_string(),
+                secret_target: Some("/etc/pharos/pharos-beacon.token".to_string()),
+                command_ref: Some("scripts/bootstrap-pharos-nixos-anywhere.sh".to_string()),
                 next_steps,
             })
         }
@@ -14480,6 +14480,17 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let handoff = job.handoff.as_ref().expect("nixos handoff");
         assert_eq!(handoff.method, BootstrapMethod::NixosAnywhere);
         assert_eq!(handoff.status, "runtime-credential-required");
+        assert_eq!(
+            handoff.secret_target.as_deref(),
+            Some("/etc/pharos/pharos-beacon.token")
+        );
+        assert_eq!(
+            handoff.command_ref.as_deref(),
+            Some("scripts/bootstrap-pharos-nixos-anywhere.sh")
+        );
+        assert!(handoff
+            .token_policy
+            .contains("never enter command arguments or the Nix store"));
         assert!(handoff
             .next_steps
             .iter()
