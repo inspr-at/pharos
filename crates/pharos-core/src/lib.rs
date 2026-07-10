@@ -1025,6 +1025,54 @@ impl ExistingHostSetupContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningProviderResource {
+    pub provider: String,
+    pub kind: String,
+    pub provider_id: String,
+    pub name: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshAccessIntent>,
+}
+
+impl ProvisioningProviderResource {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        for value in [
+            self.provider.as_str(),
+            self.kind.as_str(),
+            self.provider_id.as_str(),
+            self.name.as_str(),
+            self.state.as_str(),
+        ] {
+            if !safe_provisioning_text(value) {
+                return Err(ServerLifecycleContractError::InvalidProviderResource);
+            }
+        }
+        if self
+            .location
+            .as_deref()
+            .is_some_and(|value| !safe_provisioning_text(value))
+        {
+            return Err(ServerLifecycleContractError::InvalidProviderResource);
+        }
+        if let Some(ssh) = &self.ssh {
+            ssh.validate_contract()?;
+            for value in [ssh.user.as_deref(), ssh.host.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if !safe_preflight_text(value) {
+                    return Err(ServerLifecycleContractError::InvalidProviderResource);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningJob {
     #[serde(default = "default_provisioning_job_schema")]
     pub schema: String,
@@ -1052,6 +1100,8 @@ pub struct ProvisioningJob {
     pub setup_intent: Option<ProvisioningSetupIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_proposal: Option<ProvisioningBackupProposal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_resources: Vec<ProvisioningProviderResource>,
     #[serde(default)]
     pub progress: Vec<ProvisioningProgressEntry>,
 }
@@ -1087,6 +1137,9 @@ impl ProvisioningJob {
         }
         if let Some(backup_proposal) = &self.backup_proposal {
             backup_proposal.validate_contract()?;
+        }
+        for resource in &self.provider_resources {
+            resource.validate_contract()?;
         }
         for entry in &self.progress {
             entry.validate_contract()?;
@@ -1140,6 +1193,7 @@ pub enum ServerLifecycleContractError {
     InvalidHandoff,
     InvalidExistingHostContext,
     InvalidBackupProposal,
+    InvalidProviderResource,
     EmptyJobId,
     EmptyProvider,
     EmptyTemplate,
@@ -1180,6 +1234,9 @@ impl std::fmt::Display for ServerLifecycleContractError {
             }
             Self::InvalidBackupProposal => {
                 write!(f, "backup proposal must be plain non-secret text")
+            }
+            Self::InvalidProviderResource => {
+                write!(f, "provider resource must be plain non-secret text")
             }
             Self::EmptyJobId => write!(f, "provisioning job id is required"),
             Self::EmptyProvider => write!(f, "provisioning provider is required"),
@@ -2416,6 +2473,20 @@ mod tests {
                 access: AccessSetupIntent::LimitedUsers,
             }),
             backup_proposal: None,
+            provider_resources: vec![ProvisioningProviderResource {
+                provider: "hetzner-cloud".to_string(),
+                kind: "server".to_string(),
+                provider_id: "4242".to_string(),
+                name: "hcloud-lab-1".to_string(),
+                state: "created".to_string(),
+                location: Some("fsn1".to_string()),
+                ssh: Some(SshAccessIntent {
+                    route: SshRoute::Direct,
+                    user: Some("root".to_string()),
+                    host: Some("192.0.2.10".to_string()),
+                    port: Some(22),
+                }),
+            }],
             progress: vec![entry],
         };
         job.validate_contract().expect("job contract is valid");
@@ -2482,6 +2553,18 @@ mod tests {
         assert_eq!(
             secret_handoff.validate_contract(),
             Err(ServerLifecycleContractError::InvalidHandoff)
+        );
+
+        let secret_resource = ProvisioningJob {
+            provider_resources: vec![ProvisioningProviderResource {
+                provider_id: "token=raw-value".to_string(),
+                ..job.provider_resources[0].clone()
+            }],
+            ..job.clone()
+        };
+        assert_eq!(
+            secret_resource.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidProviderResource)
         );
 
         let empty_provider = ProvisioningJob {

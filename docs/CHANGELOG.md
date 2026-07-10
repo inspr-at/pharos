@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## 0.1.14 - 2026-07-10
+
+- Persist the created Hetzner server, provider location, and validated public SSH destination on the tracked setup job.
+- Add a protected NixOS bootstrap handoff that keeps beacon credentials out of job data, command arguments, and Nix evaluation.
+- Replace the completed provider form with a focused server-created screen that leads from creation through Pharos install to the first heartbeat.
+- Fail closed on unsupported provider inputs and require cleanup review when a server exists but no usable public IPv4 address is returned.
+
 ## 0.1.13 - 2026-07-10
 
 - Added a guarded Linux-side `nixos-anywhere` helper for the existing-host NixOS path, using strict SSH trust, preserved host keys, and post-install service verification.
