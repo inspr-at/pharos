@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.18 - 2026-07-10
+
+- Move release history into a body-level portal above Fleet cards, map controls, tables, and every other page surface.
+- Initialize release history from the shared sidebar on every route, with working close-button, backdrop, Escape, focus restoration, and scroll locking behavior.
+
 ## 0.1.17 - 2026-07-10
 
 - Add an auth-guarded, explicitly confirmed cleanup endpoint that can delete only the single validated Hetzner server persisted on an eligible setup job.
