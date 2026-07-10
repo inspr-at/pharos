@@ -91,12 +91,19 @@ contents or pull-request write permission:
 ```bash
 export PHAROS_NIXCFG_DISPATCH_ENABLED=1
 export PHAROS_NIXCFG_DISPATCH_TOKEN_FILE=/run/pharos/nixcfg-dispatch-token
+export PHAROS_HOST_PREFERENCES_PATH=/nixcfg/modules/pharos-host-preferences.json
 ```
 
 Mount the token as a private, read-only runtime file; never place its value in
 Compose, an environment variable, logs, or the host store. pharosd calls only
 the fixed workflow-dispatch endpoint. The workflow owns validation, commit,
 pull request, checks, and ordinary merge; pharosd has no git or merge logic.
+
+Mount nixcfg's complete host-preference registry read-only at
+`PHAROS_HOST_PREFERENCES_PATH`. Pharos validates the exact registry contract
+and treats it as declared state; a loaded host manifest remains the fallback
+when no registry entry exists. The registry never becomes applied state by
+itself.
 
 An accepted dispatch means only that the request reached GitHub. It does not
 mean the workflow merged or that a host rebuilt. Fleet therefore keeps three

@@ -215,6 +215,13 @@ pub(crate) async fn page(
         })
         .cloned()
         .collect();
+    let declared_preferences: BTreeMap<_, _> = state
+        .manifests
+        .declared_preferences()
+        .iter()
+        .filter(|(host, _)| access.allows_host(host))
+        .map(|(host, preferences)| (host.clone(), preferences.clone()))
+        .collect();
     let runtime_hosts: Vec<_> = state
         .store
         .list()
@@ -223,6 +230,7 @@ pub(crate) async fn page(
         .collect();
     Html(render_page(
         &manifests,
+        &declared_preferences,
         &runtime_hosts,
         query.host.as_deref(),
         &user_label,
@@ -244,12 +252,14 @@ pub(crate) async fn palette_proposal(
             Json(json!({ "error": "Agora access is not granted for this host" })),
         );
     }
-    let Some(manifest) = find_manifest(state.manifests.manifests(), &query.host) else {
+    let manifest = find_manifest(state.manifests.manifests(), &query.host);
+    let declared = state.manifests.declared_preferences_for(&query.host);
+    if manifest.is_none() && declared.is_none() {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "host is not declared in the manifest registry" })),
+            Json(json!({ "error": "host is not present in declared settings" })),
         );
-    };
+    }
 
     let proposed = match normalize_hex_color(&query.accent) {
         Ok(color) => color,
@@ -258,7 +268,12 @@ pub(crate) async fn palette_proposal(
         }
     };
 
-    match build_palette_proposal(manifest, &proposed) {
+    let proposal = if let Some(manifest) = manifest {
+        build_palette_proposal(manifest, declared, &proposed)
+    } else {
+        build_registry_palette_proposal(&query.host, declared.expect("checked above"), &proposed)
+    };
+    match proposal {
         Ok(proposal) => (
             StatusCode::OK,
             Json(serde_json::to_value(proposal).expect("proposal serializes")),
@@ -288,6 +303,7 @@ pub(crate) async fn request_host_preferences(
     let canonical_host = manifest
         .map(|manifest| manifest.host.name.as_str())
         .unwrap_or(host_name);
+    let declared_preferences = state.manifests.declared_preferences_for(canonical_host);
     let Some(runtime_host) = state
         .store
         .list()
@@ -308,8 +324,9 @@ pub(crate) async fn request_host_preferences(
             }
         };
     } else {
-        request.preferences.accent = manifest
-            .and_then(|manifest| manifest.host.preferences.accent.clone())
+        request.preferences.accent = declared_preferences
+            .and_then(|preferences| preferences.accent.clone())
+            .or_else(|| manifest.and_then(|manifest| manifest.host.preferences.accent.clone()))
             .or_else(|| runtime_host.preferences.accent.clone())
             .or_else(|| {
                 manifest
@@ -373,7 +390,8 @@ pub(crate) async fn request_host_preferences(
                     "delivery": delivery,
                     "request_id": dispatch_request_id,
                     "applied": host.preferences,
-                    "declared": manifest.map(|manifest| &manifest.host.preferences),
+                    "declared": declared_preferences
+                        .or_else(|| manifest.map(|manifest| &manifest.host.preferences)),
                     "requested": host.requested_preferences,
                 })),
             )
@@ -426,12 +444,13 @@ pub(crate) async fn location_proposal(
 
 fn render_page(
     manifests: &[HostManifest],
+    declared_preferences: &BTreeMap<String, HostPreferences>,
     runtime_hosts: &[Host],
     requested_host: Option<&str>,
     user_label: &str,
     logout_enabled: bool,
 ) -> String {
-    let mut hosts = host_views(manifests, runtime_hosts);
+    let mut hosts = host_views(manifests, declared_preferences, runtime_hosts);
     let requested_host = requested_host
         .map(str::trim)
         .filter(|requested| !requested.is_empty());
@@ -451,6 +470,7 @@ fn render_page(
                 false,
                 false,
                 HostPreferences::default(),
+                None,
                 None,
             ));
             hosts.len() - 1
@@ -774,7 +794,11 @@ fn preset_buttons(current: &str) -> String {
         .collect()
 }
 
-fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHostView> {
+fn host_views(
+    manifests: &[HostManifest],
+    declared_preferences: &BTreeMap<String, HostPreferences>,
+    runtime_hosts: &[Host],
+) -> Vec<AgoraHostView> {
     let runtime_by_name: BTreeMap<&str, &Host> = runtime_hosts
         .iter()
         .map(|host| (host.name.as_str(), host))
@@ -790,6 +814,7 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
                 host.is_nix,
                 true,
                 host.preferences.clone(),
+                declared_preferences.get(&host.name).cloned(),
                 host.requested_preferences.clone(),
             ),
         );
@@ -807,9 +832,11 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
             .or_else(|| runtime.map(|host| host.role.clone()))
             .unwrap_or_else(|| "host".to_string());
         let palette = manifest.palette.as_ref();
-        let accent = manifest
-            .host
-            .preferences
+        let declared = declared_preferences
+            .get(&manifest.host.name)
+            .cloned()
+            .unwrap_or_else(|| manifest.host.preferences.clone());
+        let accent = declared
             .accent
             .clone()
             .or_else(|| palette.and_then(palette_accent));
@@ -839,10 +866,24 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
                 target_path: TARGET_PATH.to_string(),
                 target_attribute: format!("hosts.{}", manifest.host.name),
                 preferences,
-                declared_preferences: Some(manifest.host.preferences.clone()),
+                declared_preferences: Some(declared),
                 requested_preferences,
             },
         );
+    }
+
+    for (host, declared) in declared_preferences {
+        views.entry(host.clone()).or_insert_with(|| {
+            setup_host_view(
+                host,
+                declared.kind.label(),
+                true,
+                false,
+                HostPreferences::default(),
+                Some(declared.clone()),
+                None,
+            )
+        });
     }
 
     views.into_values().collect()
@@ -854,6 +895,7 @@ fn setup_host_view(
     is_nix: bool,
     has_reported: bool,
     preferences: HostPreferences,
+    declared_preferences: Option<HostPreferences>,
     requested_preferences: Option<HostPreferences>,
 ) -> AgoraHostView {
     let slug = name
@@ -871,13 +913,16 @@ fn setup_host_view(
         slug,
         role: role.to_string(),
         is_nix,
-        declared_accent: DEFAULT_ACCENT.to_string(),
+        declared_accent: declared_preferences
+            .as_ref()
+            .and_then(|preferences| preferences.accent.clone())
+            .unwrap_or_else(|| DEFAULT_ACCENT.to_string()),
         has_reported,
-        settings_ready: false,
+        settings_ready: declared_preferences.is_some(),
         target_path: TARGET_PATH.to_string(),
         target_attribute: format!("hosts.{name}"),
         preferences,
-        declared_preferences: None,
+        declared_preferences,
         requested_preferences,
     }
 }
@@ -954,21 +999,55 @@ fn parse_location_mode(value: &str) -> Result<ManifestLocationMode, &'static str
 
 fn build_palette_proposal(
     manifest: &HostManifest,
+    declared: Option<&HostPreferences>,
     proposed: &str,
 ) -> Result<PaletteProposal, &'static str> {
     let palette = manifest.palette.as_ref();
-    let Some(current) = manifest
-        .host
-        .preferences
-        .accent
-        .clone()
-        .or_else(|| palette.and_then(palette_accent))
+    let Some(current) = declared
+        .and_then(|preferences| preferences.accent.clone())
+        .or_else(|| {
+            manifest
+                .host
+                .preferences
+                .accent
+                .clone()
+                .or_else(|| palette.and_then(palette_accent))
+        })
     else {
         return Err("host has no declared accent");
     };
+    build_palette_proposal_parts(
+        &manifest.host.name,
+        &manifest.slug,
+        palette
+            .map(|palette| palette.name.clone())
+            .unwrap_or_else(|| format!("custom-{}", manifest.slug)),
+        current,
+        proposed,
+    )
+}
+
+fn build_registry_palette_proposal(
+    host: &str,
+    declared: &HostPreferences,
+    proposed: &str,
+) -> Result<PaletteProposal, &'static str> {
+    let Some(current) = declared.accent.clone() else {
+        return Err("host has no declared accent");
+    };
+    build_palette_proposal_parts(host, host, format!("custom-{host}"), current, proposed)
+}
+
+fn build_palette_proposal_parts(
+    host: &str,
+    slug: &str,
+    palette: String,
+    current: String,
+    proposed: &str,
+) -> Result<PaletteProposal, &'static str> {
     let normalized = normalize_hex_color(proposed)?;
-    let attribute = format!("hosts.{}.accent", manifest.host.name);
-    let patch = render_palette_patch(TARGET_PATH, &manifest.host.name, &current, &normalized);
+    let attribute = format!("hosts.{host}.accent");
+    let patch = render_palette_patch(TARGET_PATH, host, &current, &normalized);
     Ok(PaletteProposal {
         schema: "inspr.pharos.agora.palette-proposal.v1",
         status: if current == normalized {
@@ -976,8 +1055,8 @@ fn build_palette_proposal(
         } else {
             "draft"
         },
-        host: manifest.host.name.clone(),
-        slug: manifest.slug.clone(),
+        host: host.to_string(),
+        slug: slug.to_string(),
         change: ProposalChange {
             setting: "host.preferences.accent",
             declared: current,
@@ -986,9 +1065,7 @@ fn build_palette_proposal(
         target: ProposalTarget {
             repo: "nixcfg",
             path: TARGET_PATH,
-            palette: palette
-                .map(|palette| palette.name.clone())
-                .unwrap_or_else(|| format!("custom-{}", manifest.slug)),
+            palette,
             attribute,
         },
         janus: ProposalJanus {
@@ -1175,9 +1252,9 @@ fn escape_nix_string(value: &str) -> String {
 mod tests {
     use super::*;
     use pharos_core::{
-        Host, ManifestHost, ManifestLocationMode, ManifestPalette, ManifestPolicy, NixFreshness,
-        PrivilegedActionMode, PrivilegedActions, RuntimeStateOwner, HOST_MANIFEST_SCHEMA,
-        HOST_MANIFEST_VERSION,
+        Host, HostAlertPreferences, HostKind, ManifestHost, ManifestLocationMode, ManifestPalette,
+        ManifestPolicy, NixFreshness, PrivilegedActionMode, PrivilegedActions, RuntimeStateOwner,
+        HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
     };
 
     fn manifest() -> HostManifest {
@@ -1253,7 +1330,7 @@ mod tests {
 
     #[test]
     fn palette_proposal_generates_reviewable_nixcfg_patch() {
-        let proposal = build_palette_proposal(&manifest(), "#48b8a8").expect("proposal");
+        let proposal = build_palette_proposal(&manifest(), None, "#48b8a8").expect("proposal");
 
         assert_eq!(proposal.schema, "inspr.pharos.agora.palette-proposal.v1");
         assert_eq!(proposal.status, "draft");
@@ -1270,6 +1347,35 @@ mod tests {
             .patch
             .value
             .contains("+    \"accent\": \"#48b8a8\""));
+    }
+
+    #[test]
+    fn registry_only_declaration_drives_settings_and_review() {
+        let declared = HostPreferences {
+            accent: Some("#9868d0".to_string()),
+            kind: HostKind::Workstation,
+            alerts: HostAlertPreferences::default(),
+        };
+        let declarations = BTreeMap::from([("gpc0".to_string(), declared.clone())]);
+        let runtime = runtime_host("gpc0");
+
+        let views = host_views(&[], &declarations, std::slice::from_ref(&runtime));
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].declared_preferences.as_ref(), Some(&declared));
+        assert!(views[0].settings_ready);
+
+        let html = render_page(&[], &declarations, &[runtime], Some("gpc0"), "markus", true);
+        assert!(html.contains(r#"data-host="gpc0" data-ready="true""#));
+        assert!(html.contains("Change declared. Waiting for the host."));
+        assert!(!html.contains("Prepare host settings"));
+
+        let proposal = build_registry_palette_proposal("gpc0", &declared, "#48b8a8")
+            .expect("registry proposal");
+        assert_eq!(proposal.target.attribute, "hosts.gpc0.accent");
+        assert!(proposal
+            .patch
+            .value
+            .contains("-    \"accent\": \"#9868d0\""));
     }
 
     #[test]
@@ -1334,7 +1440,14 @@ mod tests {
     #[test]
     fn settings_page_uses_shared_shell_and_simple_color_task() {
         let runtime = runtime_host("hsb8");
-        let html = render_page(&[manifest()], &[runtime], None, "markus", true);
+        let html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime],
+            None,
+            "markus",
+            true,
+        );
 
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains(r#"<aside class="sidebar" aria-label="primary navigation""#));
@@ -1385,7 +1498,14 @@ mod tests {
                 .insert("primary".to_string(), "#48b8a8".to_string());
         }
 
-        let html = render_page(&[other, manifest()], &[], Some("hsb8"), "markus", true);
+        let html = render_page(
+            &[other, manifest()],
+            &BTreeMap::new(),
+            &[],
+            Some("hsb8"),
+            "markus",
+            true,
+        );
 
         assert!(html.contains(r#"<option value="hsb8" selected>"#));
         assert!(!html.contains(r#"<option value="csb1" selected>"#));
@@ -1395,7 +1515,7 @@ mod tests {
 
     #[test]
     fn settings_page_keeps_shared_shell_empty_state() {
-        let html = render_page(&[], &[], None, "markus", true);
+        let html = render_page(&[], &BTreeMap::new(), &[], None, "markus", true);
 
         assert!(html.contains(r#"<div class="brand"><h1>Host settings</h1>"#));
         assert!(html.contains(r#"href="/agora" aria-current="page""#));
@@ -1409,7 +1529,14 @@ mod tests {
     #[test]
     fn runtime_host_without_declared_settings_gets_setup_flow() {
         let runtime = runtime_host("csb0");
-        let html = render_page(&[manifest()], &[runtime], Some("csb0"), "markus", true);
+        let html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime],
+            Some("csb0"),
+            "markus",
+            true,
+        );
 
         assert!(html.contains("Prepare host settings"));
         assert!(html.contains("Saving creates a pending request for csb0"));
@@ -1448,7 +1575,14 @@ mod tests {
 
     #[test]
     fn unknown_requested_host_gets_setup_placeholder() {
-        let html = render_page(&[manifest()], &[], Some("csb0"), "markus", true);
+        let html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[],
+            Some("csb0"),
+            "markus",
+            true,
+        );
 
         assert!(html.contains("Waiting for first report"));
         assert!(html.contains("csb0 must report once before settings can be requested"));

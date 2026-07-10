@@ -7173,12 +7173,20 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let access = access_for_headers(&state.auth, &headers);
     let runtime_hosts = filter_hosts_by_access(state.store.list(), &access);
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    no_store_json(hosts_payload(runtime_hosts, &manifests, now))
+    let declared_preferences =
+        filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
+    no_store_json(hosts_payload(
+        runtime_hosts,
+        &manifests,
+        &declared_preferences,
+        now,
+    ))
 }
 
 fn hosts_payload(
     runtime_hosts: Vec<Host>,
     manifests: &[HostManifest],
+    declared_preferences: &BTreeMap<String, HostPreferences>,
     now: i64,
 ) -> serde_json::Value {
     let manifests = manifest_by_host(manifests);
@@ -7186,7 +7194,10 @@ fn hosts_payload(
         .into_iter()
         .map(|h| {
             let manifest = manifests.get(h.name.as_str()).copied();
-            let declared_preferences = manifest.map(|manifest| manifest.host.preferences.clone());
+            let declared_preferences = declared_preferences
+                .get(&h.name)
+                .cloned()
+                .or_else(|| manifest.map(|manifest| manifest.host.preferences.clone()));
             let preferences_state = host_preferences_state(
                 &h.preferences,
                 declared_preferences.as_ref(),
@@ -7389,6 +7400,17 @@ fn filter_manifests_by_access(
         .collect()
 }
 
+fn filter_declared_preferences_by_access(
+    preferences: &BTreeMap<String, HostPreferences>,
+    access: &AccessGrant,
+) -> BTreeMap<String, HostPreferences> {
+    preferences
+        .iter()
+        .filter(|(host, _)| access.allows_host(host))
+        .map(|(host, preferences)| (host.clone(), preferences.clone()))
+        .collect()
+}
+
 fn filter_jobs_by_access(jobs: Vec<ProvisioningJob>, access: &AccessGrant) -> Vec<ProvisioningJob> {
     jobs.into_iter()
         .filter(|job| {
@@ -7433,10 +7455,13 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
     let hosts = filter_hosts_by_access(all_hosts, &access);
     let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
+    let declared_preferences =
+        filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
     no_store_html(render_home(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
+            declared_preferences: Some(&declared_preferences),
         },
         &self_host(),
         now_unix(),
@@ -7513,6 +7538,7 @@ async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl 
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
+            declared_preferences: None,
         },
         &self_host(),
         now,
@@ -7556,6 +7582,7 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
+            declared_preferences: None,
         },
         &self_host(),
         now,
@@ -8834,6 +8861,7 @@ struct ShellContext<'a> {
 struct RuntimeSnapshot<'a> {
     hosts: &'a [Host],
     jobs: &'a [ProvisioningJob],
+    declared_preferences: Option<&'a BTreeMap<String, HostPreferences>>,
 }
 
 fn search_box(placeholder: &str) -> String {
@@ -12307,7 +12335,10 @@ fn render_home(
             String::new()
         };
         let manifest = manifests_by_host.get(h.name.as_str()).copied();
-        let declared_preferences = manifest.map(|manifest| &manifest.host.preferences);
+        let declared_preferences = runtime
+            .declared_preferences
+            .and_then(|preferences| preferences.get(&h.name))
+            .or_else(|| manifest.map(|manifest| &manifest.host.preferences));
         let settings_state = host_preferences_state(
             &h.preferences,
             declared_preferences,
@@ -12842,7 +12873,11 @@ mod tests {
     }
 
     fn runtime<'a>(hosts: &'a [Host], jobs: &'a [ProvisioningJob]) -> RuntimeSnapshot<'a> {
-        RuntimeSnapshot { hosts, jobs }
+        RuntimeSnapshot {
+            hosts,
+            jobs,
+            declared_preferences: None,
+        }
     }
 
     fn shell(user_label: &str, logout_enabled: bool) -> ShellContext<'_> {
@@ -13434,7 +13469,7 @@ mod tests {
             requested_preferences: None,
         };
 
-        let payload = hosts_payload(vec![host], &[], 1000);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), 1000);
 
         assert_eq!(payload["as_of"], 1000);
         assert_eq!(
@@ -13896,7 +13931,7 @@ mod tests {
         );
         assert!(fleet.contains("down, backup, Nix freshness muted"));
         assert!(fleet.contains(r#"class="mute-note""#));
-        let applied_payload = hosts_payload(vec![host.clone()], &[], 1000);
+        let applied_payload = hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), 1000);
         assert_eq!(
             applied_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             true
@@ -13934,7 +13969,7 @@ mod tests {
         );
         assert!(pending_fleet.contains(r#"class="mute-note" data-mute-note title="" hidden"#));
         assert!(!pending_fleet.contains("down, backup, Nix freshness muted"));
-        let pending_payload = hosts_payload(vec![host], &[], 1000);
+        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), 1000);
         assert_eq!(
             pending_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             false
@@ -14723,6 +14758,41 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(applied.contains(r#"data-settings-state="applied""#));
         assert!(applied.contains(r#"style="--host-color:#48b8a8""#));
         assert!(!applied.contains(r#"aria-label="change waiting for poseidon""#));
+    }
+
+    #[test]
+    fn registry_only_declaration_is_not_rendered_as_applied() {
+        let host = host_with_backups("gpc0", 970, vec![]);
+        let declared = HostPreferences {
+            accent: Some("#9868d0".to_string()),
+            kind: pharos_core::HostKind::Workstation,
+            alerts: Default::default(),
+        };
+        let declarations = BTreeMap::from([("gpc0".to_string(), declared.clone())]);
+        let hosts = [host.clone()];
+        let html = render_home(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &[],
+                declared_preferences: Some(&declarations),
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+
+        assert!(html.contains(r#"data-settings-state="declared_not_applied""#));
+        assert!(html.contains(r#"style="--pending-color:#9868d0""#));
+        assert!(!html.contains(r#"--host-color:#9868d0""#));
+
+        let payload = hosts_payload(vec![host], &[], &declarations, 1000);
+        assert_eq!(payload["hosts"][0]["declared_preferences"], json!(declared));
+        assert_eq!(
+            payload["hosts"][0]["preferences_state"],
+            "declared_not_applied"
+        );
     }
 
     #[test]

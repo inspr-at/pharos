@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.22 - 2026-07-10
+
+- Load nixcfg's exact all-host preference registry as the authoritative declared-settings layer, with generated host manifests as fallback.
+- Show registry-only declarations for every permitted host in Fleet and Agora while keeping beacon reports as the sole source of applied state.
+- Keep the merge-to-host-rebuild boundary explicit: reading a merged declaration never triggers or implies deployment.
+
 ## 0.1.21 - 2026-07-10
 
 - Dispatch Nix host color, host type, and alert preferences through nixcfg's fixed guarded workflow using an opt-in, file-only Actions credential; Pharos never writes git or deploys a host.
