@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use pharos_core::{
-    Host, HostRegistration, HostReport, InboundRttObservation, NixFreshness, UnixSeconds,
+    Host, HostPreferences, HostRegistration, HostReport, InboundRttObservation, NixFreshness,
+    UnixSeconds,
 };
 
 const HEARTBEAT_RETENTION_SECS: UnixSeconds = 24 * 3600;
@@ -88,6 +89,8 @@ impl Store {
                 backup_observations: existing
                     .map(|h| h.backup_observations.clone())
                     .unwrap_or_default(),
+                preferences: existing.map(|h| h.preferences.clone()).unwrap_or_default(),
+                requested_preferences: existing.and_then(|h| h.requested_preferences.clone()),
             };
             map.insert(registration.name, host.clone());
             host
@@ -113,6 +116,28 @@ impl Store {
             .and_then(|h| h.token_hash.clone())
     }
 
+    pub fn request_preferences(
+        &self,
+        host_name: &str,
+        requested: HostPreferences,
+    ) -> Result<Host, &'static str> {
+        requested
+            .validate_contract()
+            .map_err(|_| "invalid host preferences")?;
+        let host = {
+            let mut map = self.hosts.write().expect("store lock");
+            let host = map.get_mut(host_name).ok_or("host not found")?;
+            host.requested_preferences = if host.preferences == requested {
+                None
+            } else {
+                Some(requested)
+            };
+            host.clone()
+        };
+        self.persist();
+        Ok(host)
+    }
+
     /// Upsert from a beacon report. `now` is the **server** receive time — the
     /// agent never asserts its own liveness (PHAROS-9).
     pub fn record(&self, report: HostReport, now: UnixSeconds) {
@@ -131,6 +156,9 @@ impl Store {
                 millis,
                 observed_at: now,
             });
+            let requested_preferences = existing
+                .and_then(|host| host.requested_preferences.clone())
+                .filter(|requested| requested != &report.preferences);
             map.insert(
                 report.name.clone(),
                 Host {
@@ -147,6 +175,8 @@ impl Store {
                     freshness: report.freshness,
                     service_observations: report.service_observations,
                     backup_observations: report.backup_observations,
+                    preferences: report.preferences,
+                    requested_preferences,
                 },
             );
         }
@@ -244,6 +274,7 @@ mod tests {
                     backup_observations: vec![],
                     inbound_rtt_ms: None,
                     location: None,
+                    preferences: Default::default(),
                 },
                 now,
             );
@@ -299,6 +330,7 @@ mod tests {
                 backup_observations: vec![backup.clone()],
                 inbound_rtt_ms: Some(37),
                 location: None,
+                preferences: Default::default(),
             },
             120,
         );
@@ -340,6 +372,7 @@ mod tests {
                 backup_observations: vec![],
                 inbound_rtt_ms: None,
                 location: None,
+                preferences: Default::default(),
             },
             150,
         );
@@ -349,5 +382,90 @@ mod tests {
         assert_eq!(updated.last_seen, Some(150));
         assert!(updated.inbound_rtt.is_none());
         assert!(updated.backup_observations.is_empty());
+    }
+
+    #[test]
+    fn preference_request_persists_until_matching_host_report_applies_it() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-host-preferences-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let report = |preferences: HostPreferences| HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
+            name: "athena".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            heartbeat_interval_secs: 60,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            service_observations: vec![],
+            backup_observations: vec![],
+            inbound_rtt_ms: None,
+            location: None,
+            preferences,
+        };
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            alerts: pharos_core::HostAlertPreferences {
+                suppress_down: true,
+                suppress_backup: false,
+                suppress_nix_freshness: true,
+            },
+            ..Default::default()
+        };
+
+        let store = Store::new(Some(path.clone()));
+        store.record(report(HostPreferences::default()), 100);
+        let queued = store
+            .request_preferences("athena", requested.clone())
+            .expect("request queued");
+        assert_eq!(queued.preferences, HostPreferences::default());
+        assert_eq!(queued.requested_preferences.as_ref(), Some(&requested));
+        drop(store);
+
+        let reloaded = Store::new(Some(path.clone()));
+        assert_eq!(
+            reloaded.list()[0].requested_preferences.as_ref(),
+            Some(&requested)
+        );
+
+        reloaded.record(report(HostPreferences::default()), 160);
+        assert_eq!(
+            reloaded.list()[0].requested_preferences.as_ref(),
+            Some(&requested),
+            "an old host report must not acknowledge a pending request"
+        );
+
+        reloaded.record(report(requested.clone()), 220);
+        let applied = reloaded.list().pop().expect("host remains");
+        assert_eq!(applied.preferences, requested);
+        assert!(applied.requested_preferences.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn preference_request_rejects_invalid_or_unknown_host_state() {
+        let store = Store::new(None);
+        let malformed = HostPreferences {
+            accent: Some("orange".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            store.request_preferences("missing", HostPreferences::default()),
+            Err("host not found")
+        );
+        assert_eq!(
+            store.request_preferences("missing", malformed),
+            Err("invalid host preferences")
+        );
     }
 }

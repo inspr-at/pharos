@@ -25,6 +25,60 @@ pub struct InboundRttObservation {
     pub observed_at: UnixSeconds,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    #[default]
+    Server,
+    Workstation,
+}
+
+impl HostKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Workstation => "workstation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostAlertPreferences {
+    #[serde(default)]
+    pub suppress_down: bool,
+    #[serde(default)]
+    pub suppress_backup: bool,
+    #[serde(default)]
+    pub suppress_nix_freshness: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostPreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default)]
+    pub kind: HostKind,
+    #[serde(default)]
+    pub alerts: HostAlertPreferences,
+}
+
+impl HostPreferences {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if let Some(accent) = self.accent.as_deref() {
+            let bytes = accent.as_bytes();
+            if bytes.len() != 7
+                || bytes.first() != Some(&b'#')
+                || !bytes[1..].iter().all(u8::is_ascii_hexdigit)
+            {
+                return Err("host preference accent must be a six-digit hex color".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A managed host as seen by the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Host {
@@ -62,6 +116,14 @@ pub struct Host {
     /// Declared backup intent and enrollment policy are modeled elsewhere.
     #[serde(default)]
     pub backup_observations: Vec<BackupObservation>,
+    /// Last host-reported preferences. Alert behavior may use only this applied
+    /// state, never an unacknowledged UI request.
+    #[serde(default)]
+    pub preferences: HostPreferences,
+    /// Operator intent waiting for the host-owned declarative mechanism to
+    /// apply and report it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_preferences: Option<HostPreferences>,
 }
 
 /// Nix freshness for a host (PHAROS-15): what it is "missing".
@@ -1354,6 +1416,11 @@ pub struct HostReport {
     pub inbound_rtt_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<HostLocation>,
+    /// Host-owned preferences loaded and applied by the beacon. Pending
+    /// operator requests are delivered separately and do not appear here until
+    /// the host accepts them.
+    #[serde(default)]
+    pub preferences: HostPreferences,
 }
 
 impl HostReport {
@@ -1379,6 +1446,7 @@ impl HostReport {
         for observation in &self.backup_observations {
             observation.validate_contract()?;
         }
+        self.preferences.validate_contract()?;
         if let Some(location) = &self.location {
             location.validate_contract()?;
             if location.manual_override {
@@ -1700,6 +1768,10 @@ impl HostManifest {
         if self.host.name.trim().is_empty() {
             return Err(ManifestContractError::EmptyHostName);
         }
+        self.host
+            .preferences
+            .validate_contract()
+            .map_err(ManifestContractError::InvalidHostPreferences)?;
         if let Some(location) = &self.host.location {
             location
                 .validate_contract()
@@ -1762,6 +1834,8 @@ pub struct ManifestHost {
     pub ip: Option<String>,
     #[serde(default)]
     pub site: Option<String>,
+    #[serde(default)]
+    pub preferences: HostPreferences,
     #[serde(default, rename = "locationMode")]
     pub location_mode: ManifestLocationMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2003,6 +2077,7 @@ pub enum ManifestContractError {
     UnsupportedVersion { expected: u16, actual: u16 },
     EmptySlug,
     EmptyHostName,
+    InvalidHostPreferences(String),
     InvalidHostLocation(String),
     ManifestEmbedsRuntimeState,
     UndefinedWing { service: String, wing: String },
@@ -2026,6 +2101,9 @@ impl std::fmt::Display for ManifestContractError {
             }
             Self::EmptySlug => write!(f, "manifest slug is empty"),
             Self::EmptyHostName => write!(f, "manifest host.name is empty"),
+            Self::InvalidHostPreferences(error) => {
+                write!(f, "invalid host preferences: {error}")
+            }
             Self::InvalidHostLocation(error) => write!(f, "invalid host location: {error}"),
             Self::ManifestEmbedsRuntimeState => {
                 write!(f, "manifest policy.declaredOnly must be true")
@@ -2103,6 +2181,8 @@ mod tests {
         assert!(host.location.is_none());
         assert!(host.service_observations.is_empty());
         assert!(host.backup_observations.is_empty());
+        assert_eq!(host.preferences, HostPreferences::default());
+        assert!(host.requested_preferences.is_none());
     }
 
     #[test]
@@ -2114,6 +2194,7 @@ mod tests {
         assert!(legacy.location.is_none());
         assert!(legacy.inbound_rtt_ms.is_none());
         assert!(legacy.backup_observations.is_empty());
+        assert_eq!(legacy.preferences, HostPreferences::default());
         legacy.validate_contract().expect("legacy report valid");
 
         let runtime = HostReport {
@@ -2157,6 +2238,42 @@ mod tests {
             ..legacy
         };
         assert!(declared_runtime.validate_contract().is_err());
+    }
+
+    #[test]
+    fn host_preferences_are_typed_validated_and_backward_compatible_with_old_reports() {
+        let preferences: HostPreferences = serde_json::from_value(serde_json::json!({
+            "accent": "#48b8a8",
+            "kind": "workstation",
+            "alerts": {
+                "suppress_down": true,
+                "suppress_backup": false,
+                "suppress_nix_freshness": true
+            }
+        }))
+        .expect("typed preferences parse");
+        preferences.validate_contract().expect("valid preferences");
+        assert_eq!(preferences.kind, HostKind::Workstation);
+        assert!(preferences.alerts.suppress_down);
+        assert!(preferences.alerts.suppress_nix_freshness);
+
+        let malformed = HostPreferences {
+            accent: Some("orange".to_string()),
+            ..Default::default()
+        };
+        assert!(malformed.validate_contract().is_err());
+        assert!(
+            serde_json::from_value::<HostPreferences>(serde_json::json!({
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<HostPreferences>(serde_json::json!({
+                "alerts": { "unexpected": true }
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2230,6 +2347,7 @@ mod tests {
             backup_observations: vec![observation.clone()],
             inbound_rtt_ms: None,
             location: None,
+            preferences: Default::default(),
         };
         report
             .validate_contract()
@@ -2401,6 +2519,8 @@ mod tests {
                 commits_behind: Some(0),
             })],
             backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
 
         let observed = ServerObservedState::from_host(&host, 1_020);

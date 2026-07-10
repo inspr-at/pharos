@@ -38,8 +38,8 @@ use pharos_core::{
     BootstrapMethod, ExistingHostBootstrapOption, ExistingHostPreflightCheck,
     ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
     ExistingHostPreflightSummary, ExistingHostSetupContext, Host, HostLocation, HostLocationSource,
-    HostManifest, HostRegistration, HostRegistrationResponse, HostReport, Liveness,
-    LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
+    HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse, HostReport,
+    Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
     ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningBackupProposal,
     ProvisioningBackupProposalKind, ProvisioningBackupSecretFile, ProvisioningHandoff,
     ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningProviderResource,
@@ -3311,6 +3311,7 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .reason:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--reason-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--reason-color) 12%,transparent)}
 .reason.ok{--reason-color:var(--live)}.reason.warn{--reason-color:var(--stale)}.reason.down{--reason-color:var(--down)}.reason.wait{--reason-color:var(--wait)}.reason.self{--reason-color:var(--sun)}
 .reason span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mute-note{display:flex;align-items:center;gap:6px;min-height:18px;margin:-7px 0 9px;color:#7b6b56;font-size:11px}.mute-note[hidden]{display:none}.mute-note .ico{width:13px;height:13px;color:var(--sun)}.mute-note span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.list .mute-note{margin:4px 0 0}
 .fresh{min-height:52px;margin:4px 0 11px;font-size:13px;line-height:1.45;color:var(--ink)}
 .fresh-row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:10px;min-height:23px;border-bottom:1px solid rgba(214,226,234,.58)}
 .fresh-row:last-child{border-bottom:0}
@@ -3722,6 +3723,22 @@ function setReason(surface,reason){
   el.className='reason '+reason.level;
   const text=el.querySelector('span');
   if(text)text.textContent=reason.label;
+}
+function mutedInfo(preferences){
+  const alerts=preferences?.alerts||{};
+  const labels=[];
+  if(alerts.suppress_down)labels.push('down');
+  if(alerts.suppress_backup)labels.push('backup');
+  if(alerts.suppress_nix_freshness)labels.push('Nix freshness');
+  return {label:labels.length?labels.join(', ')+' muted':'',search:labels.length?'muted alert preferences '+labels.join(' '):''};
+}
+function updateMuted(surface,info){
+  const el=surface.querySelector('[data-mute-note]');
+  if(!el)return;
+  el.hidden=!info.label;
+  el.title=info.label;
+  const text=el.querySelector('span');
+  if(text)text.textContent=info.label;
 }
 function markHtml(beats,interval,windowDef=signalWindow){
   const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
@@ -5217,12 +5234,14 @@ async function refresh(reason='manual'){
         card.dataset.live=live;
         const attention=h.attention||attentionFor(h.liveness,h.freshness);
         const backup=backupInfo(h,now);
+        const muted=mutedInfo(h.preferences);
         card.dataset.sev=String(attention.rank ?? sevFor(live));
         card.dataset.last=h.last_seen ?? 0;
-        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')).toLowerCase().trim();
+        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+muted.search).toLowerCase().trim();
         const word=card.querySelector('[data-status-word]');
         if(word)word.textContent=words[h.liveness]||h.liveness;
         setReason(card,attention);
+        updateMuted(card,muted);
         const fresh=card.querySelector('[data-fresh]');
         if(fresh)fresh.innerHTML=freshHtml(h.freshness);
         updateBackup(card,backup);
@@ -7102,7 +7121,12 @@ fn hosts_payload(
         .map(|h| {
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
             let freshness_tldr = h.freshness.tldr();
-            let attention = attention_reason(live, &h.freshness, &h.service_observations);
+            let attention = attention_reason(
+                live,
+                &h.freshness,
+                &h.service_observations,
+                &h.preferences,
+            );
             let location = resolve_host_location(
                 Some(&h),
                 manifests.get(h.name.as_str()).copied(),
@@ -7113,6 +7137,7 @@ fn hosts_payload(
                 "name": h.name,
                 "role": h.role,
                 "is_nix": h.is_nix,
+                "preferences": h.preferences,
                 "report_version": h.report_version,
                 "last_seen": h.last_seen,
                 "heartbeat_log": h.heartbeat_log,
@@ -7646,6 +7671,7 @@ fn freshness_attention_reason(freshness: &NixFreshness) -> Option<AttentionReaso
 
 fn service_observation_attention_reason(
     observations: &[ServiceObservation],
+    suppress_nix_freshness: bool,
 ) -> Option<AttentionReason> {
     if observations.is_empty() {
         return None;
@@ -7653,6 +7679,7 @@ fn service_observation_attention_reason(
 
     let warnings = observations
         .iter()
+        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
         .filter(|obs| obs.state == ServiceObservationState::Warning)
         .count();
     if warnings > 0 {
@@ -7668,6 +7695,7 @@ fn service_observation_attention_reason(
 
     let stale = observations
         .iter()
+        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
         .filter(|obs| obs.state == ServiceObservationState::Stale)
         .count();
     if stale > 0 {
@@ -7680,6 +7708,7 @@ fn service_observation_attention_reason(
 
     let unknown = observations
         .iter()
+        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
         .filter(|obs| obs.state == ServiceObservationState::Unknown)
         .count();
     if unknown > 0 {
@@ -8487,9 +8516,10 @@ fn attention_reason(
     live: Liveness,
     freshness: &NixFreshness,
     observations: &[ServiceObservation],
+    preferences: &HostPreferences,
 ) -> AttentionReason {
     match live {
-        Liveness::Down => AttentionReason {
+        Liveness::Down if !preferences.alerts.suppress_down => AttentionReason {
             label: "silent heartbeat".to_string(),
             level: "down",
             rank: 0,
@@ -8504,10 +8534,22 @@ fn attention_reason(
             level: "wait",
             rank: 2,
         },
-        Liveness::Live => freshness_attention_reason(freshness)
-            .or_else(|| service_observation_attention_reason(observations))
+        Liveness::Down | Liveness::Live => (!preferences.alerts.suppress_nix_freshness)
+            .then(|| freshness_attention_reason(freshness))
+            .flatten()
+            .or_else(|| {
+                service_observation_attention_reason(
+                    observations,
+                    preferences.alerts.suppress_nix_freshness,
+                )
+            })
             .unwrap_or_else(|| AttentionReason {
-                label: "all clear".to_string(),
+                label: if live == Liveness::Down {
+                    "down alerts muted"
+                } else {
+                    "all clear"
+                }
+                .to_string(),
                 level: "ok",
                 rank: 4,
             }),
@@ -8519,6 +8561,30 @@ fn reason_markup(reason: &AttentionReason) -> String {
         r#"<div class="reason {}" data-reason><span>{}</span></div>"#,
         html_escape(reason.level),
         html_escape(&reason.label)
+    )
+}
+
+fn muted_preferences_markup(preferences: &HostPreferences) -> String {
+    let mut muted = Vec::new();
+    if preferences.alerts.suppress_down {
+        muted.push("down");
+    }
+    if preferences.alerts.suppress_backup {
+        muted.push("backup");
+    }
+    if preferences.alerts.suppress_nix_freshness {
+        muted.push("Nix freshness");
+    }
+    let label = if muted.is_empty() {
+        String::new()
+    } else {
+        format!("{} muted", muted.join(", "))
+    };
+    format!(
+        r#"<div class="mute-note" data-mute-note title="{label}"{hidden}>{icon}<span>{label}</span></div>"#,
+        label = html_escape(&label),
+        hidden = if label.is_empty() { " hidden" } else { "" },
+        icon = icons::BELL_OFF,
     )
 }
 
@@ -8641,7 +8707,7 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Host settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
@@ -9843,7 +9909,12 @@ fn map_hosts(
             let attention = if host.name == self_name {
                 self_attention_reason()
             } else {
-                attention_reason(live, &host.freshness, &host.service_observations)
+                attention_reason(
+                    live,
+                    &host.freshness,
+                    &host.service_observations,
+                    &host.preferences,
+                )
             };
             let site = resolve_host_location(
                 Some(host),
@@ -10358,7 +10429,7 @@ fn alert_items(
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
         match live {
-            Liveness::Down => alerts.push(AlertItem {
+            Liveness::Down if !host.preferences.alerts.suppress_down => alerts.push(AlertItem {
                 level: "critical",
                 host: host.name.clone(),
                 role: host.role.clone(),
@@ -10370,6 +10441,7 @@ fn alert_items(
                 next_action: "Check host power, network, and pharos-beacon.".to_string(),
                 sort_time: host.last_seen.unwrap_or(now),
             }),
+            Liveness::Down => {}
             Liveness::Stale => alerts.push(AlertItem {
                 level: "warning",
                 host: host.name.clone(),
@@ -10395,18 +10467,20 @@ fn alert_items(
             Liveness::Live => {}
         }
 
-        if let Some((level, issue, action)) = freshness_alert(&host.freshness) {
-            alerts.push(AlertItem {
-                level,
-                host: host.name.clone(),
-                role: host.role.clone(),
-                issue,
-                detail: "Nix freshness differs from the preferred declared state.".to_string(),
-                source: "freshness",
-                seen: seen_label(host.last_seen, now),
-                next_action: action,
-                sort_time: host.last_seen.unwrap_or(now),
-            });
+        if !host.preferences.alerts.suppress_nix_freshness {
+            if let Some((level, issue, action)) = freshness_alert(&host.freshness) {
+                alerts.push(AlertItem {
+                    level,
+                    host: host.name.clone(),
+                    role: host.role.clone(),
+                    issue,
+                    detail: "Nix freshness differs from the preferred declared state.".to_string(),
+                    source: "freshness",
+                    seen: seen_label(host.last_seen, now),
+                    next_action: action,
+                    sort_time: host.last_seen.unwrap_or(now),
+                });
+            }
         }
 
         for observation in &host.service_observations {
@@ -10415,17 +10489,19 @@ fn alert_items(
             }
         }
 
-        for observation in &host.backup_observations {
-            if let Some(alert) = backup_alert(host, observation, now) {
-                alerts.push(alert);
+        if !host.preferences.alerts.suppress_backup {
+            for observation in &host.backup_observations {
+                if let Some(alert) = backup_alert(host, observation, now) {
+                    alerts.push(alert);
+                }
+                if let Some(alert) = backup_validation_alert(host, observation, now) {
+                    alerts.push(alert);
+                }
             }
-            if let Some(alert) = backup_validation_alert(host, observation, now) {
-                alerts.push(alert);
-            }
-        }
 
-        if let Some(alert) = protection_onboarding_alert(host, jobs, now) {
-            alerts.push(alert);
+            if let Some(alert) = protection_onboarding_alert(host, jobs, now) {
+                alerts.push(alert);
+            }
         }
     }
 
@@ -11034,15 +11110,18 @@ fn activity_events(
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
         match live {
-            Liveness::Down => events.push(ActivityEvent::new(
-                now,
-                host.name.clone(),
-                "critical",
-                "heartbeat",
-                "No heartbeat received",
-                format!("Last report was {}", seen_label(host.last_seen, now)),
-                "heartbeat",
-            )),
+            Liveness::Down if !host.preferences.alerts.suppress_down => {
+                events.push(ActivityEvent::new(
+                    now,
+                    host.name.clone(),
+                    "critical",
+                    "heartbeat",
+                    "No heartbeat received",
+                    format!("Last report was {}", seen_label(host.last_seen, now)),
+                    "heartbeat",
+                ))
+            }
+            Liveness::Down => {}
             Liveness::Stale => events.push(ActivityEvent::new(
                 now,
                 host.name.clone(),
@@ -11077,16 +11156,18 @@ fn activity_events(
             ));
         }
 
-        if let Some((level, issue, _action)) = freshness_alert(&host.freshness) {
-            events.push(ActivityEvent::new(
-                host.last_seen.unwrap_or(now),
-                host.name.clone(),
-                level,
-                "freshness",
-                "Freshness drift detected",
-                issue,
-                "freshness",
-            ));
+        if !host.preferences.alerts.suppress_nix_freshness {
+            if let Some((level, issue, _action)) = freshness_alert(&host.freshness) {
+                events.push(ActivityEvent::new(
+                    host.last_seen.unwrap_or(now),
+                    host.name.clone(),
+                    level,
+                    "freshness",
+                    "Freshness drift detected",
+                    issue,
+                    "freshness",
+                ));
+            }
         }
 
         for observation in &host.service_observations {
@@ -11122,11 +11203,13 @@ fn activity_events(
             }
         }
 
-        for observation in &host.backup_observations {
-            push_backup_activity_events(&mut events, host, observation, now);
-        }
+        if !host.preferences.alerts.suppress_backup {
+            for observation in &host.backup_observations {
+                push_backup_activity_events(&mut events, host, observation, now);
+            }
 
-        push_protection_onboarding_activity(&mut events, host, jobs, now);
+            push_protection_onboarding_activity(&mut events, host, jobs, now);
+        }
     }
 
     for (host, probes) in server_probes {
@@ -11997,7 +12080,8 @@ fn render_home(
     let mut sorted: Vec<&Host> = hosts.iter().collect();
     sorted.sort_by_key(|h| {
         let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        let rank = attention_reason(live, &h.freshness, &h.service_observations).rank;
+        let rank =
+            attention_reason(live, &h.freshness, &h.service_observations, &h.preferences).rank;
         (rank, h.name.clone())
     });
 
@@ -12016,8 +12100,10 @@ fn render_home(
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
         let fresh = freshness_markup(&h.freshness);
-        let attention = attention_reason(live, &h.freshness, &h.service_observations);
+        let attention =
+            attention_reason(live, &h.freshness, &h.service_observations, &h.preferences);
         let reason = reason_markup(&attention);
+        let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
         let backup_card = backup_card_markup(&backup, "");
         let backup_list = backup_card_markup(&backup, "backup-list");
@@ -12042,6 +12128,12 @@ fn render_home(
         }
         if let Some(status) = &protection {
             search_parts.push(status.search_text().to_lowercase());
+        }
+        if h.preferences.alerts.suppress_down
+            || h.preferences.alerts.suppress_backup
+            || h.preferences.alerts.suppress_nix_freshness
+        {
+            search_parts.push("muted alert preferences".to_string());
         }
         let search = html_escape(&search_parts.join(" "));
         let sort_name = html_escape(&h.name.to_lowercase());
@@ -12109,12 +12201,12 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}<div class="fresh" data-fresh>{fresh}</div>{backup_card}{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{settings_action}</div></header>{reason}{muted}<div class="fresh" data-fresh>{fresh}</div>{backup_card}{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}</td><td>{backup_list}{protection_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}{muted}</td><td>{backup_list}{protection_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -12187,6 +12279,10 @@ async fn main() {
         .route(
             "/agora/proposals/host-palette.json",
             get(agora::palette_proposal),
+        )
+        .route(
+            "/agora/requests/host-preferences.json",
+            post(agora::request_host_preferences),
         )
         .route(
             "/agora/proposals/host-location.json",
@@ -12541,6 +12637,8 @@ mod tests {
             freshness: NixFreshness::default(),
             service_observations: vec![],
             backup_observations,
+            preferences: Default::default(),
+            requested_preferences: None,
         }
     }
 
@@ -12791,6 +12889,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "hades".to_string(),
@@ -12810,6 +12910,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "poseidon".to_string(),
@@ -12829,6 +12931,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
         ];
 
@@ -12937,6 +13041,8 @@ mod tests {
             },
             service_observations: vec![],
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
 
         let html = render_home(
@@ -12975,6 +13081,8 @@ mod tests {
             },
             service_observations: vec![],
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
 
         let html = render_backups(
@@ -13094,6 +13202,8 @@ mod tests {
             },
             service_observations: vec![],
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
 
         let payload = hosts_payload(vec![host], &[], 1000);
@@ -13158,6 +13268,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![failed_backup],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "poseidon".to_string(),
@@ -13176,6 +13288,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![stale_validation],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "athena".to_string(),
@@ -13207,6 +13321,8 @@ mod tests {
                     },
                 ],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "hermes".to_string(),
@@ -13226,6 +13342,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -13336,6 +13454,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![healthy_backup],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "athena".to_string(),
@@ -13373,6 +13493,8 @@ mod tests {
                     },
                 ],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "hades".to_string(),
@@ -13391,6 +13513,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -13462,6 +13586,137 @@ mod tests {
     }
 
     #[test]
+    fn applied_alert_preferences_filter_monitoring_and_pending_requests_do_not() {
+        let mut failed_backup = backup_observation(BackupPostureState::Failed);
+        failed_backup.summary = "backup command failed".to_string();
+        failed_backup.last_attempt_at = Some(900);
+        failed_backup.last_attempt_state = Some(pharos_core::BackupRunState::Failed);
+        failed_backup.last_success_at = None;
+        failed_backup.restore_validation = None;
+        let suppressed = HostPreferences {
+            alerts: pharos_core::HostAlertPreferences {
+                suppress_down: true,
+                suppress_backup: true,
+                suppress_nix_freshness: true,
+            },
+            ..Default::default()
+        };
+        let mut host = Host {
+            name: "athena".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(500),
+            heartbeat_log: vec![380, 440, 500],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(31),
+                commits_behind: Some(2),
+            },
+            service_observations: vec![ServiceObservation {
+                id: "nginx".to_string(),
+                label: "nginx".to_string(),
+                state: ServiceObservationState::Warning,
+                summary: "response is slow".to_string(),
+            }],
+            backup_observations: vec![failed_backup],
+            preferences: suppressed.clone(),
+            requested_preferences: None,
+        };
+
+        let alerts = alert_items(
+            &[host.clone()],
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(alerts.iter().any(|alert| alert.issue == "nginx: warning"));
+        assert!(!alerts.iter().any(|alert| alert.source == "heartbeat"));
+        assert!(!alerts.iter().any(|alert| alert.source == "freshness"));
+        assert!(!alerts.iter().any(|alert| alert.source == "backup"));
+
+        let events = activity_events(
+            &[host.clone()],
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(events.iter().any(|event| event.title == "nginx warning"));
+        assert!(!events
+            .iter()
+            .any(|event| event.title == "No heartbeat received"));
+        assert!(!events.iter().any(|event| event.kind == "freshness"));
+        assert!(!events.iter().any(|event| event.kind == "backup"));
+
+        let fleet = render_home(
+            runtime(std::slice::from_ref(&host), &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(fleet.contains("down, backup, Nix freshness muted"));
+        assert!(fleet.contains(r#"class="mute-note""#));
+        let applied_payload = hosts_payload(vec![host.clone()], &[], 1000);
+        assert_eq!(
+            applied_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
+            true
+        );
+        assert!(applied_payload["hosts"][0]
+            .get("requested_preferences")
+            .is_none());
+
+        host.preferences = HostPreferences::default();
+        host.requested_preferences = Some(suppressed);
+        let pending_alerts = alert_items(
+            &[host.clone()],
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(pending_alerts
+            .iter()
+            .any(|alert| alert.source == "heartbeat"));
+        assert!(pending_alerts
+            .iter()
+            .any(|alert| alert.source == "freshness"));
+        assert!(pending_alerts.iter().any(|alert| alert.source == "backup"));
+
+        let pending_fleet = render_home(
+            runtime(std::slice::from_ref(&host), &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(pending_fleet.contains(r#"class="mute-note" data-mute-note title="" hidden"#));
+        assert!(!pending_fleet.contains("down, backup, Nix freshness muted"));
+        let pending_payload = hosts_payload(vec![host], &[], 1000);
+        assert_eq!(
+            pending_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
+            false
+        );
+        assert!(pending_payload["hosts"][0]
+            .get("requested_preferences")
+            .is_none());
+    }
+
+    #[test]
     fn render_home_sorts_self_host_like_any_other_host() {
         fn host(name: &str) -> Host {
             Host {
@@ -13481,6 +13736,8 @@ mod tests {
                 },
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             }
         }
 
@@ -13519,6 +13776,8 @@ mod tests {
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "csb0".to_string(),
@@ -13547,6 +13806,8 @@ mod tests {
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "hsb8".to_string(),
@@ -13562,6 +13823,8 @@ mod tests {
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "dsc0".to_string(),
@@ -13577,6 +13840,8 @@ mod tests {
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
             Host {
                 name: "new-host".to_string(),
@@ -13592,6 +13857,8 @@ mod tests {
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -13803,6 +14070,8 @@ mod tests {
             freshness: NixFreshness::default(),
             service_observations: vec![],
             backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
         let mut manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -13913,6 +14182,8 @@ mod tests {
             freshness: NixFreshness::default(),
             service_observations: vec![],
             backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
 
         let payload = declared_hosts_payload(
@@ -13955,6 +14226,8 @@ mod tests {
                 freshness: NixFreshness::default(),
                 service_observations: vec![],
                 backup_observations: vec![],
+                preferences: Default::default(),
+                requested_preferences: None,
             }
         }
 
@@ -14157,6 +14430,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             },
             service_observations: vec![],
             backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
         let manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -14300,6 +14575,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             },
             service_observations: vec![],
             backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
         let lone = render_home(
             runtime(&[host], &[]),
@@ -14559,6 +14836,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             },
             service_observations: vec![],
             backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
 
         let html = render_home(
@@ -14628,6 +14907,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 commits_behind: Some(1),
             })],
             backup_observations: vec![backup_observation(BackupPostureState::Warning)],
+            preferences: Default::default(),
+            requested_preferences: None,
         };
 
         let payload = declared_hosts_payload(
@@ -15525,6 +15806,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             freshness: NixFreshness::default(),
             service_observations: vec![],
             backup_observations,
+            preferences: Default::default(),
+            requested_preferences: None,
         }
     }
 
@@ -16524,6 +16807,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             backup_observations: vec![],
             inbound_rtt_ms: None,
             location: None,
+            preferences: Default::default(),
         }
     }
 

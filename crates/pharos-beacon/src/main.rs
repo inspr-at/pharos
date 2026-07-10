@@ -1057,6 +1057,7 @@ fn main() {
             backup_observations,
             inbound_rtt_ms: last_report_rtt_ms,
             location,
+            preferences: Default::default(),
         };
         let body = serde_json::to_string(&report).expect("serialize report");
         let mut request = ureq::post(&endpoint).set("Content-Type", "application/json");

@@ -1,7 +1,7 @@
-//! Host color settings surface.
+//! Per-host settings surface.
 //!
-//! This stays proposal-only: Pharos can explain the declarative nixcfg change,
-//! but it must not write nixcfg or mutate a host from here.
+//! Operator changes are persisted as pending requests. Applied state remains
+//! host-owned and changes only after a host reports the accepted preferences.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::Json;
 use pharos_core::{
-    liveness, Host, HostLocation, HostLocationSource, HostManifest, Liveness, ManifestLocationMode,
+    Host, HostLocation, HostLocationSource, HostManifest, HostPreferences, ManifestLocationMode,
     ManifestPalette,
 };
 use serde::{Deserialize, Serialize};
@@ -26,106 +26,41 @@ const TARGET_PATH: &str = "modules/uzumaki/theme/theme-palettes.nix";
 const LOCATION_TARGET_PATH: &str = "modules/uzumaki/hosts/host-settings.nix";
 
 const AGORA_CSS: &str = r#"<style>
-.settings-main{width:min(1180px,100%)}
-.settings-ia{display:flex;align-items:center;gap:9px;margin:0 0 18px;padding:7px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.68);box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(10px)}
-.settings-tab{display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:0 13px;border:1px solid transparent;border-radius:7px;color:var(--muted);font-weight:720;font-size:13px;text-decoration:none}
-.settings-tab[aria-current="page"]{border-color:rgba(210,226,234,.92);background:#fff;color:#0f4f80;box-shadow:0 7px 16px rgba(45,75,95,.05)}
-.settings-workspace{display:grid;grid-template-columns:minmax(320px,390px) minmax(0,1fr);gap:18px;align-items:start}
-.settings-host-table{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
-.settings-host-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:18px 18px 12px;border-bottom:1px solid rgba(214,226,234,.72)}
-.settings-host-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:23px;font-weight:500;color:#12304b;letter-spacing:0}
-.settings-host-head span{display:grid;place-items:center;min-width:28px;height:28px;border-radius:999px;background:#e8f6fb;color:#0f4f80;font-size:13px;font-weight:760}
-.settings-search{padding:12px 14px;border-bottom:1px solid rgba(214,226,234,.72)}
-.settings-search input{width:100%;height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:620;padding:0 12px;outline:none}
-.settings-search input::placeholder{color:#7c8fa3}
-.settings-host-list{display:grid;padding:8px}
-.settings-host-row{display:grid;grid-template-columns:11px minmax(0,1fr) 34px auto;align-items:center;gap:10px;min-height:58px;padding:8px 9px;border:1px solid transparent;border-radius:8px;color:var(--ink);text-decoration:none}
-.settings-host-row[hidden]{display:none}
-.settings-host-row:hover{background:rgba(247,252,253,.86);border-color:rgba(210,226,234,.74)}
-.settings-host-row[aria-current="true"]{background:linear-gradient(90deg,color-mix(in srgb,var(--row-color) 10%,#fff),rgba(255,255,255,.92));border-color:color-mix(in srgb,var(--row-color) 42%,rgba(210,226,234,.86));box-shadow:inset 3px 0 0 var(--row-color)}
-.settings-host-state{width:9px;height:9px;border-radius:50%;background:var(--row-state);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-state) 13%,transparent)}
-.settings-host-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:760}
-.settings-host-role{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px;margin-top:2px}
-.settings-host-color{width:25px;height:25px;border:3px solid var(--row-color);border-radius:50%;background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--row-color) 10%,#f5fbfc));box-shadow:0 0 0 5px color-mix(in srgb,var(--row-color) 12%,transparent),0 0 16px color-mix(in srgb,var(--row-color) 16%,transparent)}
-.settings-host-ready{padding:4px 8px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:760;white-space:nowrap}
-.settings-host-row[data-ready="true"] .settings-host-ready{color:var(--live)}
-.settings-empty-hosts{display:none;padding:14px 18px;color:var(--muted);font-size:13px}
-.settings-detail{min-width:0}
-.settings-panel{overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 16px 38px rgba(54,88,108,.08)}
-.settings-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:22px 24px;border-bottom:1px solid rgba(214,226,234,.72)}
-.settings-kicker{display:block;margin-bottom:5px;color:var(--sun);font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:720}
-.settings-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;letter-spacing:0;color:#12304b}
-.settings-panel p{margin:5px 0 0;color:var(--muted);font-size:13px}
-.settings-state{display:flex;align-items:center;gap:8px;min-height:30px;border:1px solid rgba(210,226,234,.92);border-radius:999px;background:#fff;padding:5px 10px;color:var(--muted);font-size:12px;font-weight:700;white-space:nowrap}
-.settings-state[data-ready="true"]{color:var(--live)}
-.color-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:0}
-.color-editor{padding:24px;border-right:1px solid rgba(214,226,234,.72)}
-.preview-zone{padding:24px;background:linear-gradient(180deg,rgba(247,252,253,.72),rgba(255,255,255,.78))}
-.setup-banner{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 18px;padding:12px 14px;border:1px solid rgba(214,155,49,.28);border-radius:8px;background:linear-gradient(90deg,rgba(255,247,232,.88),rgba(255,255,255,.72));color:var(--ink)}
-.setup-banner strong{display:block;font-size:13px}
-.setup-banner span{display:block;color:var(--muted);font-size:12px}
-.color-controls{display:grid;grid-template-columns:126px minmax(0,1fr);gap:18px;align-items:start}
-.color-well-wrap{display:grid;justify-items:center;gap:10px}
-.color-well{width:112px;height:112px;border-radius:50%;border:0;background:var(--picked-color);box-shadow:0 0 0 9px color-mix(in srgb,var(--picked-color) 14%,transparent),0 16px 34px color-mix(in srgb,var(--picked-color) 22%,transparent);cursor:pointer}
-.color-well::-webkit-color-swatch-wrapper{padding:0}.color-well::-webkit-color-swatch{border:0;border-radius:50%}
-.color-well-label{color:var(--muted);font-size:12px}
-.color-fields{display:grid;gap:14px;align-content:start}
-.field label{display:block;margin-bottom:6px;color:var(--muted);font-size:12px;font-weight:650}
-.hex-input{width:100%;height:40px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:700;padding:0 12px;text-transform:uppercase;outline:none}
+.settings-main{width:min(1280px,100%)}
 .preset-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .preset{width:28px;height:28px;border:1px solid rgba(210,226,234,.92);border-radius:50%;background:var(--preset-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--preset-color) 10%,transparent);cursor:pointer}
 .preset:hover,.preset:focus-visible{outline:0;box-shadow:0 0 0 5px color-mix(in srgb,var(--preset-color) 18%,transparent),0 7px 16px rgba(45,75,95,.08)}
 .primary-action{min-height:42px;border:1px solid #17304a;border-radius:7px;background:#17304a;color:#fff;font:inherit;font-weight:720;cursor:pointer;padding:0 16px}
-.primary-action:hover{background:#10273d}
-.primary-action:disabled{opacity:.58;cursor:not-allowed}
-.preview-card{position:relative;min-height:248px;display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.86);border-radius:8px;background:rgba(255,255,255,.92);box-shadow:0 14px 32px rgba(45,75,95,.08);padding:16px;overflow:hidden}
-.preview-card:before{content:"";position:absolute;inset:-84px -74px auto auto;width:190px;height:190px;background:radial-gradient(circle,color-mix(in srgb,var(--picked-color) 22%,transparent),rgba(21,158,153,.08) 42%,transparent 70%);pointer-events:none}
-.preview-host{position:relative;display:flex;align-items:flex-start;gap:10px}
-.preview-badge{display:grid;place-items:center;width:34px;height:34px;border:3px solid var(--picked-color);border-radius:50%;color:var(--accent);background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--picked-color) 8%,#f5fbfc));box-shadow:0 0 0 6px color-mix(in srgb,var(--picked-color) 14%,transparent),0 0 20px color-mix(in srgb,var(--picked-color) 20%,transparent)}
-.preview-badge .ico{width:17px;height:17px}
-.preview-name{font-weight:760;font-size:17px;line-height:1.2;color:var(--ink)}
-.preview-role{margin-top:2px;color:var(--muted);font-size:12px}
-.preview-line{height:1px;margin:18px 0;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent)}
-.preview-reason{display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;gap:8px;color:var(--muted);font-size:12px}
-.preview-reason:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--picked-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--picked-color) 12%,transparent)}
-.preview-meta{margin-top:auto;display:grid;gap:9px;color:var(--muted);font-size:12px}
-.preview-meta div{display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid rgba(214,226,234,.58);padding-bottom:6px}
-.preview-meta div:last-child{border-bottom:0;padding-bottom:0}
-.preview-meta strong{color:var(--ink)}
-.advanced{border-top:1px solid rgba(214,226,234,.72);background:rgba(255,255,255,.82)}
-.advanced details{padding:0}
-.advanced summary{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:48px;padding:0 24px;cursor:pointer;font-weight:720;color:var(--ink);list-style:none}
-.advanced summary::-webkit-details-marker{display:none}
-.advanced summary:after{content:"";width:8px;height:8px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:rotate(45deg)}
-.advanced details[open] summary:after{transform:rotate(225deg)}
-.advanced-body{display:grid;gap:12px;padding:0 24px 22px}
-.review-note{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}
-.review-note:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.12)}
-.advanced-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.advanced-meta div{min-width:0;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:#fff;padding:9px 10px}
-.advanced-meta span{display:block;color:var(--muted);font-size:11px;font-weight:650}
-.advanced-meta strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-size:12px}
+.primary-action:hover{background:#10273d}.primary-action:disabled{opacity:.58;cursor:not-allowed}
 .review-output{min-height:180px;max-height:360px;overflow:auto;margin:0;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:#10202d;color:#dce9ef;padding:13px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
-.empty-settings{padding:34px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 16px 38px rgba(54,88,108,.08)}
-.empty-settings h2{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500}
-.empty-settings p{margin:0;color:var(--muted)}
-.location-panel{margin-top:18px}
-.location-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:0}
-.location-editor{padding:24px;border-right:1px solid rgba(214,226,234,.72)}
-.location-mode-row{display:grid;grid-template-columns:210px minmax(0,1fr);gap:16px;align-items:end}
-.location-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:16px}
-.plain-select{width:100%;height:40px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:700;padding:0 12px;outline:none}
-.location-input{width:100%;height:40px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:650;padding:0 12px;outline:none}
-.location-mode-copy{color:var(--muted);font-size:13px;line-height:1.45}
-.location-preview{display:grid;align-content:start;gap:14px;min-height:190px}
-.location-pin{width:64px;height:64px;border:3px solid color-mix(in srgb,var(--picked-color) 78%,#fff);border-radius:50%;background:radial-gradient(circle at 42% 38%,#fff 0 18%,color-mix(in srgb,var(--picked-color) 22%,#eef9fa) 20% 100%);box-shadow:0 0 0 8px color-mix(in srgb,var(--picked-color) 12%,transparent),0 18px 34px color-mix(in srgb,var(--picked-color) 16%,transparent)}
-.location-preview strong{display:block;color:var(--ink);font-size:15px}
-.location-preview span{display:block;margin-top:3px;color:var(--muted);font-size:12px}
-.location-action-row{display:flex;justify-content:flex-end;margin-top:16px}
-@media (max-width:980px){.settings-workspace{grid-template-columns:1fr}.settings-host-table{order:1}.settings-detail{order:2}}
-@media (max-width:900px){.color-layout,.color-controls{grid-template-columns:1fr}.color-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}.preview-zone{padding:20px}.setup-banner{align-items:flex-start;flex-direction:column}}
-@media (max-width:900px){.location-layout,.location-mode-row,.location-fields{grid-template-columns:1fr}.location-editor{border-right:0;border-bottom:1px solid rgba(214,226,234,.72)}}
-@media (max-width:640px){.advanced-meta{grid-template-columns:1fr}}
+.empty-settings{padding:34px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.86)}
+.empty-settings h2{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500}.empty-settings p{margin:0;color:var(--muted)}
+.host-settings-toolbar{min-height:58px;padding:9px 12px}
+.host-picker{width:100%;display:grid;grid-template-columns:52px minmax(0,1fr);align-items:center;gap:12px;color:var(--ink);font-size:12px;font-weight:720}
+.host-picker-control{position:relative;display:grid;grid-template-columns:36px minmax(0,1fr) 18px;align-items:center;gap:10px;min-width:0;height:40px;padding:0 11px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink)}
+.host-picker-badge{display:grid;place-items:center;width:26px;height:26px;border:2px solid var(--picker-color);border-radius:50%;background:#fff;color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--picker-color) 11%,transparent)}
+.host-picker-badge .ico{width:14px;height:14px}
+.host-picker-control select{position:absolute;inset:0;width:100%;height:100%;appearance:none;border:0;background:transparent;color:transparent;cursor:pointer;outline:0}
+.host-picker-control select option{color:var(--ink);background:#fff}
+.host-picker-copy{min-width:0;pointer-events:none}.host-picker-copy strong,.host-picker-copy span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.host-picker-copy strong{font-size:14px}.host-picker-copy span{margin-top:1px;color:var(--muted);font-size:11px;font-weight:520}
+.host-picker-control>.ico{width:16px;height:16px;color:var(--muted);pointer-events:none}
+.host-picker-control:focus-within{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
+.host-settings-surface{width:min(840px,100%);margin:26px auto 0;color:var(--ink)}
+.host-settings-identity{display:flex;align-items:center;gap:16px;padding:0 14px 22px;border-bottom:1px solid rgba(210,226,234,.86)}
+.host-settings-badge{display:grid;place-items:center;flex:0 0 auto;width:48px;height:48px;border:3px solid var(--picked-color);border-radius:50%;background:#fff;color:var(--accent);box-shadow:0 0 0 7px color-mix(in srgb,var(--picked-color) 13%,transparent),0 0 22px color-mix(in srgb,var(--picked-color) 18%,transparent)}
+.host-settings-badge .ico{width:23px;height:23px}.host-settings-identity h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;letter-spacing:0}.host-settings-identity p{margin:3px 0 0;color:var(--muted);font-size:12px}
+.host-color-task{padding:28px 14px 30px}.host-color-task h3{margin:0;font-size:16px}.host-color-task>p{margin:5px 0 0;color:var(--muted);font-size:13px}
+.host-color-choice{display:flex;align-items:center;flex-wrap:wrap;gap:15px;margin-top:20px}.host-color-well{width:48px;height:48px;flex:0 0 auto;padding:0;border:0;border-radius:50%;background:var(--picked-color);box-shadow:0 0 0 6px color-mix(in srgb,var(--picked-color) 12%,transparent),0 9px 22px color-mix(in srgb,var(--picked-color) 18%,transparent);cursor:pointer}.host-color-well::-webkit-color-swatch-wrapper{padding:0}.host-color-well::-webkit-color-swatch{border:0;border-radius:50%}
+.host-color-choice .preset-row{gap:13px}.host-color-choice .preset{width:31px;height:31px;box-shadow:0 0 0 3px color-mix(in srgb,var(--preset-color) 9%,transparent)}.host-color-choice .preset[aria-pressed="true"]{box-shadow:0 0 0 3px #fff,0 0 0 5px color-mix(in srgb,var(--preset-color) 58%,transparent)}
+.host-color-actions{display:flex;align-items:center;gap:12px;margin-top:22px}.host-color-actions .primary-action{min-width:126px}.settings-status{min-width:0;color:var(--muted);font-size:12px}.settings-status[data-state="pending"]{color:#9a5b00}.settings-status[data-state="applied"]{color:var(--live)}.settings-status[data-state="error"]{color:var(--down)}
+.host-setup-note{margin-top:18px;padding:10px 12px;border-left:3px solid var(--sun);background:rgba(255,248,234,.62);color:var(--muted);font-size:12px}.host-setup-note strong{display:block;margin-bottom:2px;color:var(--ink)}
+.settings-disclosures{border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.settings-disclosure+.settings-disclosure{border-top:1px solid rgba(210,226,234,.86)}
+.settings-disclosure>summary{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;min-height:58px;padding:0 14px;list-style:none;cursor:pointer}.settings-disclosure>summary::-webkit-details-marker{display:none}.settings-disclosure-title,.settings-disclosure-meta{display:flex;align-items:center;gap:10px;min-width:0}.settings-disclosure-title>.ico{width:17px;height:17px;color:#315d7c}.settings-disclosure-title strong{font-size:13px}.settings-disclosure-meta{color:var(--muted);font-size:12px}.settings-disclosure-meta>.ico{width:15px;height:15px;transition:transform .16s ease}.settings-disclosure[open] .settings-disclosure-meta>.ico{transform:rotate(180deg)}
+.settings-disclosure-body{padding:0 14px 20px}.preference-list{display:grid}.preference-row{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:54px;border-top:1px solid rgba(214,226,234,.62)}.preference-row:first-child{border-top:0}.preference-row strong{display:block;font-size:13px}.preference-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px}.preference-switch{position:relative;flex:0 0 auto;width:38px;height:22px}.preference-switch input{position:absolute;opacity:0;pointer-events:none}.preference-switch i{position:absolute;inset:0;border:1px solid rgba(137,151,163,.38);border-radius:999px;background:#edf2f4;transition:.16s}.preference-switch i:after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(45,75,95,.18);transition:.16s}.preference-switch input:checked+i{border-color:rgba(37,132,95,.36);background:rgba(37,132,95,.78)}.preference-switch input:checked+i:after{transform:translateX(16px)}.preference-switch input:focus-visible+i{outline:2px solid rgba(31,127,181,.42);outline-offset:2px}
+.preference-actions{display:flex;align-items:center;gap:12px;margin-top:14px}.preference-actions .primary-action{min-height:38px;background:#fff;color:var(--ink)}.preference-actions .primary-action:hover{background:#f4fafb}
+.host-advanced{display:grid;gap:12px}.host-advanced-note{margin:0;color:var(--muted);font-size:12px}.host-advanced-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.host-advanced-meta div{min-width:0;padding:9px 10px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,252,253,.72)}.host-advanced-meta span,.host-advanced-meta strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.host-advanced-meta span{color:var(--muted);font-size:10px}.host-advanced-meta strong{margin-top:2px;font-size:11px}.host-advanced .review-output{min-height:120px;max-height:260px}
+.empty-settings{width:min(840px,100%);margin:26px auto 0;box-shadow:none}
+@media (max-width:640px){.host-picker{grid-template-columns:1fr;gap:6px}.host-settings-surface{margin-top:18px}.host-settings-identity,.host-color-task,.settings-disclosure>summary,.settings-disclosure-body{padding-left:4px;padding-right:4px}.host-color-choice{gap:13px}.host-color-actions,.preference-actions{align-items:stretch;flex-direction:column}.host-color-actions .primary-action,.preference-actions .primary-action{width:100%}.host-advanced-meta{grid-template-columns:1fr}}
 </style>"#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,24 +68,14 @@ struct AgoraHostView {
     name: String,
     slug: String,
     role: String,
-    palette_name: String,
+    is_nix: bool,
     declared_accent: String,
-    runtime_accent: String,
-    liveness: String,
-    state_color: String,
+    has_reported: bool,
     settings_ready: bool,
-    freshness_tldr: String,
-    services_count: usize,
     target_path: String,
     target_attribute: String,
-    janus_required: bool,
-    janus_mode: String,
-    location_mode: ManifestLocationMode,
-    location_label: String,
-    location_latitude: String,
-    location_longitude: String,
-    location_target_path: String,
-    location_target_attribute: String,
+    preferences: HostPreferences,
+    requested_preferences: Option<HostPreferences>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -171,6 +96,13 @@ pub(crate) struct LocationProposalQuery {
     label: Option<String>,
     latitude: Option<String>,
     longitude: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostPreferencesRequest {
+    host: String,
+    preferences: HostPreferences,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,8 +193,8 @@ pub(crate) async fn page(
         })
     {
         return Html(crate::render_no_access_page(
-            "Settings",
-            "Host preferences",
+            "Host settings",
+            "Color and alerts per host",
             ShellContext {
                 user_label: &user_label,
                 logout_enabled: state.auth.is_some(),
@@ -331,6 +263,65 @@ pub(crate) async fn palette_proposal(
     }
 }
 
+pub(crate) async fn request_host_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut request): Json<HostPreferencesRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let access = access_for_headers(&state.auth, &headers);
+    let host_name = request.host.trim();
+    if host_name.is_empty()
+        || !access.can_agora()
+        || !access_allows_host_request(&access, state.manifests.manifests(), host_name)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Host settings access is not granted for this host" })),
+        );
+    }
+
+    if let Some(accent) = request.preferences.accent.as_deref() {
+        request.preferences.accent = match normalize_hex_color(accent) {
+            Ok(accent) => Some(accent),
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+            }
+        };
+    }
+    if let Err(error) = request.preferences.validate_contract() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
+
+    match state
+        .store
+        .request_preferences(host_name, request.preferences)
+    {
+        Ok(host) => {
+            let status = if host.requested_preferences.is_some() {
+                "pending_host"
+            } else {
+                "applied"
+            };
+            let delivery = if host.is_nix { "nixcfg" } else { "beacon_pull" };
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": status,
+                    "host": host.name,
+                    "delivery": delivery,
+                    "applied": host.preferences,
+                    "requested": host.requested_preferences,
+                })),
+            )
+        }
+        Err("host not found") => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "The host must report once before settings can be requested" })),
+        ),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    }
+}
+
 pub(crate) async fn location_proposal(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -393,7 +384,14 @@ fn render_page(
     let selected_index = match (selected_index, requested_host) {
         (Some(index), _) => index,
         (None, Some(requested)) => {
-            hosts.push(setup_host_view(requested, "host", None, None));
+            hosts.push(setup_host_view(
+                requested,
+                "host",
+                false,
+                false,
+                HostPreferences::default(),
+                None,
+            ));
             hosts.len() - 1
         }
         (None, None) => 0,
@@ -401,11 +399,15 @@ fn render_page(
 
     let head = crate::head_with_extra(AGORA_CSS);
     let sidebar = crate::sidebar(user_label, logout_enabled, "settings");
-    let as_of = crate::clock_label(crate::now_unix());
 
     if hosts.is_empty() {
         return format!(
-            r#"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host preferences</p></div><div class="asof">as of {as_of}</div></div><section class="settings-ia" aria-label="settings sections"><span class="settings-tab" aria-current="page">Host colors</span></section><section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#
+            r#"{head}{sidebar}<main class="settings-main">{header}<section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#,
+            header = crate::page_header(
+                "Host settings",
+                "Color and alerts per host",
+                crate::now_unix()
+            ),
         );
     }
 
@@ -418,223 +420,270 @@ fn render_page(
     };
 
     format!(
-        r##"{head}{sidebar}<main class="settings-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Settings</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Host preferences</p></div><div class="asof">as of {as_of}</div></div><section class="settings-ia" aria-label="settings sections"><span class="settings-tab" aria-current="page">Host colors</span></section><section class="settings-workspace">{host_table}<div class="settings-detail">{content}</div></section></main><script>
-const settingsSearch=document.querySelector('[data-settings-search]');
-settingsSearch?.addEventListener('input',()=>{{
-  const q=settingsSearch.value.trim().toLowerCase();
-  let visible=0;
-  document.querySelectorAll('[data-settings-host]').forEach(row=>{{
-    const match=!q || (row.dataset.search||'').includes(q);
-    row.hidden=!match;
-    if(match)visible+=1;
-  }});
-  const empty=document.querySelector('[data-settings-empty]');
-  if(empty)empty.style.display=visible?'none':'block';
+        r##"{head}{sidebar}<main class="settings-main">{header}{host_table}{content}</main><script>
+document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{{
+  window.location.assign('/agora?host='+encodeURIComponent(event.target.value));
 }});
 const root=document.querySelector('[data-color-root]');
 if(root){{
   const color=root.querySelector('[data-color]');
-  const hex=root.querySelector('[data-hex]');
   const output=root.querySelector('[data-review-output]');
-  const advanced=root.querySelector('[data-advanced]');
-  const setupPlan=root.querySelector('[data-setup-plan]');
-  function validHex(value){{return /^#[0-9a-fA-F]{{6}}$/.test(value)}}
+  const status=root.querySelector('[data-settings-status]');
+  const alertSummary=root.querySelector('[data-alert-summary]');
+  const down=root.querySelector('[data-alert-down]');
+  const backup=root.querySelector('[data-alert-backup]');
+  const nix=root.querySelector('[data-alert-nix]');
+  function setStatus(state,text){{if(!status)return;status.dataset.state=state;status.textContent=text}}
+  function setPressed(value){{root.querySelectorAll('[data-preset]').forEach(button=>button.setAttribute('aria-pressed',String((button.dataset.preset||'').toLowerCase()===value.toLowerCase())))}}
   function setPicked(value){{
     let next=String(value||'').trim();
     if(!next.startsWith('#'))next='#'+next;
     next=next.slice(0,7);
-    if(hex)hex.value=next.toUpperCase();
-    if(validHex(next)){{
+    if(/^#[0-9a-fA-F]{{6}}$/.test(next)){{
       root.style.setProperty('--picked-color',next);
       if(color)color.value=next;
+      setPressed(next);
     }}
   }}
-  color?.addEventListener('input',event=>setPicked(event.target.value));
-  hex?.addEventListener('input',event=>setPicked(event.target.value));
-  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>setPicked(button.dataset.preset)));
-  root.querySelector('[data-review]')?.addEventListener('click',async()=>{{
-    if(!output)return;
-    if(advanced)advanced.open=true;
-    output.textContent='Preparing review...';
+  function updateAlertSummary(){{
+    const enabled=[down,backup,nix].filter(input=>input?.checked).length;
+    if(alertSummary)alertSummary.textContent=enabled+' on';
+  }}
+  function requestedPreferences(){{
+    return {{
+      accent:color?.value||null,
+      kind:root.dataset.kind||'server',
+      alerts:{{
+        suppress_down:!down?.checked,
+        suppress_backup:!backup?.checked,
+        suppress_nix_freshness:!nix?.checked,
+      }},
+    }};
+  }}
+  async function loadReview(){{
+    if(!output||root.dataset.ready!=='true')return;
+    output.textContent='Preparing declarative details...';
     try{{
-      const res=await fetch('/agora/proposals/host-palette.json?host='+encodeURIComponent(root.dataset.host)+'&accent='+encodeURIComponent(hex.value),{{headers:{{Accept:'application/json'}}}});
+      const res=await fetch('/agora/proposals/host-palette.json?host='+encodeURIComponent(root.dataset.host)+'&accent='+encodeURIComponent(color.value),{{headers:{{Accept:'application/json'}}}});
       const data=await res.json();
-      output.textContent=res.ok?data.patch.value:(data.error||'review failed');
-    }}catch(_){{output.textContent='review failed'}}
-  }});
-  root.querySelector('[data-prepare]')?.addEventListener('click',()=>{{
-    if(advanced)advanced.open=true;
-    if(output){{
-      const plan=(setupPlan?.textContent||'').replaceAll('__ACCENT__',hex?.value||'{accent}');
-      output.textContent=plan;
-    }}
-  }});
+      output.textContent=res.ok?data.patch.value:(data.error||'Details unavailable');
+    }}catch(_){{output.textContent='Details unavailable'}}
+  }}
+  async function savePreferences(button){{
+    button.disabled=true;
+    setStatus('pending','Saving request...');
+    try{{
+      const res=await fetch('/agora/requests/host-preferences.json',{{
+        method:'POST',
+        headers:{{Accept:'application/json','Content-Type':'application/json'}},
+        body:JSON.stringify({{host:root.dataset.host,preferences:requestedPreferences()}}),
+      }});
+      const data=await res.json();
+      if(!res.ok)throw new Error(data.error||'Request failed');
+      if(data.status==='applied')setStatus('applied','Already active on this host.');
+      else setStatus('pending',data.delivery==='nixcfg'?'Saved. Waiting for nixcfg delivery.':'Saved. Waiting for the host.');
+      await loadReview();
+    }}catch(error){{setStatus('error',error.message||'Request failed')}}
+    finally{{button.disabled=false}}
+  }}
+  color?.addEventListener('input',event=>setPicked(event.target.value));
+  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>setPicked(button.dataset.preset)));
+  root.querySelector('[data-save-color]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
+  root.querySelector('[data-save-alerts]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
+  [down,backup,nix].forEach(input=>input?.addEventListener('change',updateAlertSummary));
+  setPicked(color?.value||'{accent}');
+  updateAlertSummary();
 }}
 </script></div></body></html>"##,
+        header = crate::page_header(
+            "Host settings",
+            "Color and alerts per host",
+            crate::now_unix()
+        ),
         host_table = host_table,
         accent = html_escape(&selected.declared_accent)
     )
 }
 
 fn render_ready_content(host: &AgoraHostView) -> String {
-    render_color_panel(
-        host,
-        None,
-        "Review color change",
-        r#"<span class="review-note">Pharos only prepares a review. Applying it still happens in nixcfg.</span>"#,
-        "No color change reviewed yet.",
-        true,
-    )
+    render_color_panel(host, true)
 }
 
 fn render_setup_content(host: &AgoraHostView) -> String {
-    let banner = format!(
-        r#"<div class="setup-banner"><div><strong>Color settings are not prepared yet</strong><span>{name} can be prepared first, then normal color reviews are available.</span></div><button class="primary-action" type="button" data-prepare>Prepare color settings</button></div>"#,
-        name = html_escape(&host.name)
-    );
-    let plan = setup_plan(host).replace(&host.declared_accent, "__ACCENT__");
-    render_color_panel(
-        host,
-        Some(&banner),
-        "Prepare color settings",
-        r#"<span class="review-note">This prepares the declarative setup path; Pharos does not deploy it directly.</span>"#,
-        &plan,
-        false,
-    )
+    render_color_panel(host, false)
 }
 
 fn render_host_table(hosts: &[AgoraHostView], selected_index: usize) -> String {
-    let rows = hosts
+    let options = hosts
         .iter()
         .enumerate()
         .map(|(idx, host)| render_host_row(host, idx == selected_index))
         .collect::<String>();
+    let selected = &hosts[selected_index];
+    let accent = selected
+        .requested_preferences
+        .as_ref()
+        .and_then(|preferences| preferences.accent.as_deref())
+        .or(selected.preferences.accent.as_deref())
+        .unwrap_or(&selected.declared_accent);
+    let badge = if selected.is_nix {
+        crate::icons::SNOWFLAKE
+    } else {
+        crate::icons::SERVER
+    };
     format!(
-        r#"<section class="settings-host-table" aria-label="host color settings"><header class="settings-host-head"><div><h2>Host colors</h2></div><span>{count}</span></header><div class="settings-search"><input data-settings-search type="search" placeholder="Search hosts..." aria-label="Search hosts"></div><div class="settings-host-list">{rows}</div><div class="settings-empty-hosts" data-settings-empty>No matching hosts.</div></section>"#,
-        count = hosts.len(),
-        rows = rows,
+        r#"<section class="toolbar host-settings-toolbar" aria-label="host settings controls"><label class="host-picker"><span>Host</span><span class="host-picker-control" style="--picker-color:{accent}"><span class="host-picker-badge">{badge}</span><span class="host-picker-copy"><strong>{name}</strong><span>{role}</span></span>{chevron}<select data-host-picker aria-label="Choose host">{options}</select></span></label></section>"#,
+        accent = html_escape(accent),
+        badge = badge,
+        name = html_escape(&selected.name),
+        role = html_escape(&selected.role),
+        chevron = crate::icons::CHEVRON_DOWN,
+        options = options,
     )
 }
 
 fn render_host_row(host: &AgoraHostView, selected: bool) -> String {
-    let href = format!("/agora?host={}", query_escape(&host.name));
-    let current = if selected {
-        r#" aria-current="true""#
-    } else {
-        ""
-    };
-    let ready = if host.settings_ready { "true" } else { "false" };
-    let status = if host.settings_ready {
-        "Ready"
-    } else {
-        "Setup"
-    };
-    let search = format!(
-        "{} {} {} {}",
-        host.name, host.slug, host.role, host.liveness
-    )
-    .to_ascii_lowercase();
+    let current = if selected { " selected" } else { "" };
     format!(
-        r#"<a class="settings-host-row" href="{href}" data-settings-host data-ready="{ready}" data-search="{search}" style="--row-color:{accent};--row-state:{state}"{current}><span class="settings-host-state" aria-hidden="true"></span><span><span class="settings-host-name">{name}</span><span class="settings-host-role">{role}</span></span><span class="settings-host-color" aria-hidden="true"></span><span class="settings-host-ready">{status}</span></a>"#,
-        href = html_escape(&href),
-        ready = ready,
-        search = html_escape(&search),
-        accent = html_escape(&host.declared_accent),
-        state = html_escape(&host.state_color),
+        r#"<option value="{name}"{current}>{name} - {role}</option>"#,
         current = current,
         name = html_escape(&host.name),
         role = html_escape(&host.role),
-        status = status,
     )
 }
 
-fn render_color_panel(
-    host: &AgoraHostView,
-    banner: Option<&str>,
-    primary_label: &str,
-    review_note: &str,
-    review_output: &str,
-    ready: bool,
-) -> String {
-    let presets = preset_buttons(&host.declared_accent);
-    let action = if ready {
+fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
+    let shown_preferences = host
+        .requested_preferences
+        .as_ref()
+        .unwrap_or(&host.preferences);
+    let accent = shown_preferences
+        .accent
+        .as_deref()
+        .unwrap_or(&host.declared_accent);
+    let presets = preset_buttons(accent);
+    let setup_note = if ready {
+        String::new()
+    } else if host.has_reported {
         format!(
-            r#"<button class="primary-action" type="button" data-review>{}</button>"#,
-            html_escape(primary_label)
+            r#"<div class="host-setup-note"><strong>Prepare host settings</strong>Saving creates a pending request for {name}. It becomes active only after the host applies and reports it.</div>"#,
+            name = html_escape(&host.name)
         )
     } else {
-        String::new()
+        format!(
+            r#"<div class="host-setup-note"><strong>Waiting for first report</strong>{name} must report once before settings can be requested.</div>"#,
+            name = html_escape(&host.name)
+        )
     };
-    let setup_template = if ready {
-        String::new()
+    let enabled_alerts = [
+        !shown_preferences.alerts.suppress_down,
+        !shown_preferences.alerts.suppress_backup,
+        !shown_preferences.alerts.suppress_nix_freshness,
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count();
+    let pending = host.requested_preferences.is_some();
+    let pending_copy = if pending {
+        if host.is_nix {
+            "Saved. Waiting for nixcfg delivery."
+        } else {
+            "Saved. Waiting for the host."
+        }
     } else {
-        format!(
-            r#"<template data-setup-plan>{}</template>"#,
-            html_escape(review_output)
-        )
+        ""
+    };
+    let status_state = if pending { "pending" } else { "idle" };
+    let role_copy = if host
+        .role
+        .eq_ignore_ascii_case(shown_preferences.kind.label())
+    {
+        host.role.clone()
+    } else {
+        format!("{} - {}", host.role, shown_preferences.kind.label())
+    };
+    let badge = if host.is_nix {
+        crate::icons::SNOWFLAKE
+    } else {
+        crate::icons::SERVER
+    };
+    let checked = |enabled: bool| if enabled { " checked" } else { "" };
+    let advanced_note = if ready {
+        "Declared details stay separate from the host-reported applied state.".to_string()
+    } else if !host.has_reported {
+        "Settings become available after the first host report.".to_string()
+    } else if host.is_nix {
+        "The pending request is delivered through nixcfg and becomes active only after the host reports it.".to_string()
+    } else {
+        "The pending request is pulled by pharos-beacon and becomes active only after the host reports it.".to_string()
     };
     format!(
-        r##"<section class="settings-panel" data-color-root data-host="{host_name}" data-ready="{ready}" style="--picked-color:{accent}"><header class="settings-panel-head"><div><span class="settings-kicker">{slug}</span><h2>{host_name}</h2><p>{copy}</p></div><span class="settings-state" data-ready="{ready}">{state}</span></header><div class="color-layout"><section class="color-editor">{banner}<div class="color-controls"><div class="color-well-wrap"><input class="color-well" data-color type="color" value="{accent}" aria-label="Host color"><span class="color-well-label">{accent_upper}</span></div><div class="color-fields"><div class="field"><label for="accent-hex">Color code</label><input class="hex-input" id="accent-hex" data-hex maxlength="7" spellcheck="false" value="{accent_upper}"></div><div class="preset-row" aria-label="preset colors">{presets}</div>{action}</div></div></section><aside class="preview-zone"><article class="preview-card" aria-label="host card preview"><div class="preview-host"><span class="preview-badge">{badge}</span><div><div class="preview-name">{host_name}</div><div class="preview-role">{role}</div></div></div><div class="preview-line"></div><div class="preview-reason"><span>{reason}</span></div><div class="preview-meta"><div><span>Flake.lock age</span><strong>{freshness}</strong></div><div><span>Settings</span><strong>{settings}</strong></div></div></article></aside></div><section class="advanced"><details data-advanced><summary>Advanced review</summary><div class="advanced-body">{review_note}<div class="advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre>{setup_template}</div></details></section></section>"##,
+        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-kind="{kind}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><button class="primary-action" type="button" data-save-color{disabled}>{color_action}</button><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span>Warn when this host stops reporting.</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div><div class="preference-actions"><button class="primary-action" type="button" data-save-alerts{disabled}>Save alert preferences</button></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section></section>"##,
         host_name = html_escape(&host.name),
-        slug = html_escape(&host.slug),
-        role = html_escape(&host.role),
-        accent = html_escape(&host.declared_accent),
-        accent_upper = html_escape(&host.declared_accent.to_ascii_uppercase()),
-        copy = if ready {
-            "Change the color used for this host across Pharos."
-        } else {
-            "Choose the first color and prepare this host."
-        },
-        state = if ready { "Ready" } else { "Needs setup" },
-        banner = banner.unwrap_or(""),
+        ready = if ready { "true" } else { "false" },
+        has_reported = if host.has_reported { "true" } else { "false" },
+        disabled = if host.has_reported { "" } else { " disabled" },
+        kind = shown_preferences.kind.label(),
+        role = html_escape(&role_copy),
+        accent = html_escape(accent),
+        badge = badge,
+        setup_note = setup_note,
         presets = presets,
-        action = action,
-        badge = crate::icons::SNOWFLAKE,
-        reason = if ready { "color ready" } else { "setup needed" },
-        freshness = html_escape(&host.freshness_tldr),
-        settings = if ready { "prepared" } else { "not prepared" },
+        color_action = if ready {
+            "Save color"
+        } else if host.has_reported {
+            "Prepare host settings"
+        } else {
+            "Waiting for host"
+        },
+        status_state = status_state,
+        pending_copy = html_escape(pending_copy),
+        bell = crate::icons::BELL,
+        enabled_alerts = enabled_alerts,
+        chevron = crate::icons::CHEVRON_DOWN,
+        down_checked = checked(!shown_preferences.alerts.suppress_down),
+        backup_checked = checked(!shown_preferences.alerts.suppress_backup),
+        nix_checked = checked(!shown_preferences.alerts.suppress_nix_freshness),
+        sliders = crate::icons::SLIDERS,
+        advanced_note = html_escape(&advanced_note),
         target_path = html_escape(&host.target_path),
         target_attribute = html_escape(&host.target_attribute),
-        review_note = review_note,
         initial_output = if ready {
-            html_escape(review_output)
+            "No declarative details loaded yet."
         } else {
-            "No setup reviewed yet.".to_string()
+            "Host preparation has not been delivered yet."
         },
-        setup_template = setup_template,
     )
 }
 
 fn preset_buttons(current: &str) -> String {
-    let mut colors = vec![
+    let colors = vec![
         current.to_string(),
-        "#48b8a8".to_string(),
         "#1f7fb5".to_string(),
         "#25845f".to_string(),
+        "#48b8a8".to_string(),
+        "#d45d5d".to_string(),
         "#d69b31".to_string(),
-        "#b66d94".to_string(),
     ];
-    colors.sort();
-    colors.dedup();
-    colors
+    colors.into_iter().fold(Vec::new(), |mut unique, color| {
+        if !unique.iter().any(|existing| existing == &color) {
+            unique.push(color);
+        }
+        unique
+    })
         .into_iter()
-        .take(6)
         .map(|color| {
+            let pressed = if color.eq_ignore_ascii_case(current) {
+                "true"
+            } else {
+                "false"
+            };
             format!(
-                r#"<button class="preset" type="button" data-preset="{color}" title="{color}" aria-label="Use {color}" style="--preset-color:{color}"></button>"#,
+                r#"<button class="preset" type="button" data-preset="{color}" title="Use {color}" aria-label="Use {color}" aria-pressed="{pressed}" style="--preset-color:{color}"></button>"#,
                 color = html_escape(&color)
             )
         })
         .collect()
-}
-
-fn setup_plan(host: &AgoraHostView) -> String {
-    format!(
-        "Prepare color settings for {name}\n\n1. Add {name} to the nixcfg host settings registry.\n2. Create palette {palette} with accent {accent}.\n3. Export the updated host manifest so Pharos can review future color changes.\n4. Run nixcfg QA, backup, deploy, and verify Pharos after the host reports again.",
-        name = host.name,
-        palette = host.palette_name,
-        accent = host.declared_accent
-    )
 }
 
 fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHostView> {
@@ -650,12 +699,10 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
             setup_host_view(
                 &host.name,
                 &host.role,
-                Some(liveness(
-                    host.last_seen,
-                    host.heartbeat_interval_secs,
-                    crate::now_unix(),
-                )),
-                Some(host.freshness.tldr()),
+                host.is_nix,
+                true,
+                host.preferences.clone(),
+                host.requested_preferences.clone(),
             ),
         );
     }
@@ -665,24 +712,12 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
             .get(manifest.host.name.as_str())
             .copied()
             .or_else(|| runtime_by_name.get(manifest.slug.as_str()).copied());
-        let live = runtime
-            .map(|host| {
-                liveness(
-                    host.last_seen,
-                    host.heartbeat_interval_secs,
-                    crate::now_unix(),
-                )
-            })
-            .unwrap_or(Liveness::AwaitingFirstHeartbeat);
         let role = manifest
             .host
             .role
             .clone()
             .or_else(|| runtime.map(|host| host.role.clone()))
             .unwrap_or_else(|| "host".to_string());
-        let freshness_tldr = runtime
-            .map(|host| host.freshness.tldr())
-            .unwrap_or_else(|| "not observed".to_string());
         let palette = manifest.palette.as_ref();
         let accent = palette.and_then(palette_accent);
         let settings_ready = accent.is_some();
@@ -690,38 +725,31 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
         let palette_name = palette
             .map(|palette| palette.name.clone())
             .unwrap_or_else(|| format!("custom-{}", manifest.slug));
-        let location = manifest.host.location.as_ref();
+        let preferences = runtime
+            .map(|host| host.preferences.clone())
+            .unwrap_or_else(|| manifest.host.preferences.clone());
+        let requested_preferences = runtime.and_then(|host| host.requested_preferences.clone());
+        let is_nix = runtime.map(|host| host.is_nix).unwrap_or_else(|| {
+            manifest
+                .host
+                .os
+                .as_deref()
+                .is_some_and(|os| os.eq_ignore_ascii_case("nixos"))
+        });
         views.insert(
             manifest.host.name.clone(),
             AgoraHostView {
                 name: manifest.host.name.clone(),
                 slug: manifest.slug.clone(),
                 role,
-                palette_name: palette_name.clone(),
-                declared_accent: declared_accent.clone(),
-                runtime_accent: declared_accent,
-                liveness: live_key(live).to_string(),
-                state_color: state_color(live).to_string(),
+                is_nix,
+                declared_accent,
+                has_reported: runtime.is_some(),
                 settings_ready,
-                freshness_tldr,
-                services_count: manifest.services.len(),
                 target_path: TARGET_PATH.to_string(),
                 target_attribute: format!("palettes.{palette_name}.gradient.primary"),
-                janus_required: manifest.policy.privileged_actions.janus_required,
-                janus_mode: format!("{:?}", manifest.policy.privileged_actions.mode)
-                    .to_ascii_lowercase(),
-                location_mode: manifest.host.location_mode,
-                location_label: location
-                    .and_then(|location| location.label.clone())
-                    .unwrap_or_default(),
-                location_latitude: location
-                    .map(|location| format_coordinate(location.latitude))
-                    .unwrap_or_default(),
-                location_longitude: location
-                    .map(|location| format_coordinate(location.longitude))
-                    .unwrap_or_default(),
-                location_target_path: LOCATION_TARGET_PATH.to_string(),
-                location_target_attribute: format!("hosts.{}.location", manifest.slug),
+                preferences,
+                requested_preferences,
             },
         );
     }
@@ -732,10 +760,11 @@ fn host_views(manifests: &[HostManifest], runtime_hosts: &[Host]) -> Vec<AgoraHo
 fn setup_host_view(
     name: &str,
     role: &str,
-    live: Option<Liveness>,
-    freshness_tldr: Option<String>,
+    is_nix: bool,
+    has_reported: bool,
+    preferences: HostPreferences,
+    requested_preferences: Option<HostPreferences>,
 ) -> AgoraHostView {
-    let live = live.unwrap_or(Liveness::AwaitingFirstHeartbeat);
     let slug = name
         .chars()
         .map(|ch| {
@@ -751,24 +780,14 @@ fn setup_host_view(
         name: name.to_string(),
         slug,
         role: role.to_string(),
-        palette_name: palette_name.clone(),
+        is_nix,
         declared_accent: DEFAULT_ACCENT.to_string(),
-        runtime_accent: DEFAULT_ACCENT.to_string(),
-        liveness: live_key(live).to_string(),
-        state_color: state_color(live).to_string(),
+        has_reported,
         settings_ready: false,
-        freshness_tldr: freshness_tldr.unwrap_or_else(|| "not observed".to_string()),
-        services_count: 0,
         target_path: TARGET_PATH.to_string(),
         target_attribute: format!("palettes.{palette_name}.gradient.primary"),
-        janus_required: false,
-        janus_mode: "none".to_string(),
-        location_mode: ManifestLocationMode::Auto,
-        location_label: String::new(),
-        location_latitude: String::new(),
-        location_longitude: String::new(),
-        location_target_path: LOCATION_TARGET_PATH.to_string(),
-        location_target_attribute: format!("hosts.{name}.location"),
+        preferences,
+        requested_preferences,
     }
 }
 
@@ -817,18 +836,6 @@ fn format_coordinate(value: f64) -> String {
         text.pop();
     }
     text
-}
-
-fn query_escape(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                char::from(byte).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
 
 fn location_mode_key(mode: ManifestLocationMode) -> &'static str {
@@ -1082,24 +1089,6 @@ fn escape_nix_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn live_key(live: Liveness) -> &'static str {
-    match live {
-        Liveness::Live => "live",
-        Liveness::Stale => "stale",
-        Liveness::Down => "down",
-        Liveness::AwaitingFirstHeartbeat => "awaiting_first_heartbeat",
-    }
-}
-
-fn state_color(live: Liveness) -> &'static str {
-    match live {
-        Liveness::Live => "var(--live)",
-        Liveness::Stale => "var(--stale)",
-        Liveness::Down => "var(--down)",
-        Liveness::AwaitingFirstHeartbeat => "var(--wait)",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,6 +1112,7 @@ mod tests {
                 fqdn: Some("hsb8.lan".to_string()),
                 ip: Some("192.168.1.100".to_string()),
                 site: None,
+                preferences: Default::default(),
                 location_mode: ManifestLocationMode::Auto,
                 location: None,
                 title: None,
@@ -1174,6 +1164,8 @@ mod tests {
             },
             service_observations: vec![],
             backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
         }
     }
 
@@ -1272,22 +1264,30 @@ mod tests {
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains(r#"<aside class="sidebar" aria-label="primary navigation""#));
         assert!(html.contains(r#"href="/agora" aria-current="page""#));
-        assert!(html.contains("<h1>Settings</h1>"));
-        assert!(html.contains("Host preferences"));
-        assert!(html.contains("settings-workspace"));
-        assert!(html.contains("settings-host-table"));
-        assert!(html.contains("Host colors"));
-        assert!(html.contains(r#"placeholder="Search hosts...""#));
-        assert!(html.contains(r#"data-settings-host"#));
-        assert!(html.contains("Review color change"));
-        assert!(html.contains("Advanced review"));
-        assert!(html.contains("preview-card"));
+        assert!(html.contains(r#"<div class="top">"#));
+        assert!(html.contains(r#"<div class="brand"><h1>Host settings</h1>"#));
+        assert!(html.contains("Color and alerts per host"));
+        assert!(html.contains(r#"class="asof" data-as-of"#));
+        assert!(html.contains(r#"<select data-host-picker aria-label="Choose host">"#));
+        assert!(html.contains(r#"<option value="hsb8" selected>"#));
+        assert_eq!(html.matches(r#"type="color""#).count(), 1);
+        assert!(html.contains("Save color"));
+        assert!(html.contains("Alert preferences"));
+        assert!(html.contains("Down alerts"));
+        assert!(html.contains("Backup warnings"));
+        assert!(html.contains("Nix freshness warnings"));
+        assert_eq!(html.matches(r#"class="preference-switch""#).count(), 3);
+        assert!(html.contains(r#"<details class="settings-disclosure" data-advanced>"#));
+        assert!(!html.contains(r#"<details class="settings-disclosure" open"#));
         assert!(html.contains("palettes.custom-hsb8.gradient.primary"));
-        assert!(!html.contains("Host location"));
-        assert!(!html.contains("Review location change"));
-        assert!(!html.contains("Use detected"));
-        assert!(!html.contains("Manual fallback"));
-        assert!(!html.contains("host-select"));
+        assert!(!html.contains(r#"class="settings-ia""#));
+        assert!(!html.contains(r#"class="settings-workspace""#));
+        assert!(!html.contains(r#"class="settings-host-table""#));
+        assert!(!html.contains(r#"class="preview-card""#));
+        assert!(!html.contains("data-hex"));
+        assert!(!html.contains("Color code"));
+        assert!(!html.contains("Advanced review"));
+        assert!(!html.contains("Host colors</"));
         assert!(!html.contains(r#"class="rail""#));
         assert!(!html.contains("Services</button>"));
         assert!(!html.contains("Access</button>"));
@@ -1310,10 +1310,23 @@ mod tests {
 
         let html = render_page(&[other, manifest()], &[], Some("hsb8"), "markus", true);
 
-        assert!(html.contains(r#"href="/agora?host=hsb8""#));
-        assert!(html.contains(r#"aria-current="true"><span class="settings-host-state""#));
+        assert!(html.contains(r#"<option value="hsb8" selected>"#));
+        assert!(!html.contains(r#"<option value="csb1" selected>"#));
         assert!(html.contains(r#"data-host="hsb8""#));
-        assert!(html.contains("#E09051"));
+        assert!(html.contains("--picked-color:#e09051"));
+    }
+
+    #[test]
+    fn settings_page_keeps_shared_shell_empty_state() {
+        let html = render_page(&[], &[], None, "markus", true);
+
+        assert!(html.contains(r#"<div class="brand"><h1>Host settings</h1>"#));
+        assert!(html.contains(r#"href="/agora" aria-current="page""#));
+        assert!(html.contains(r#"<section class="empty-settings">"#));
+        assert!(html.contains("No hosts yet"));
+        assert!(html.contains("Once a host reports to Pharos"));
+        assert!(!html.contains("data-host-picker"));
+        assert!(!html.contains("data-color-root"));
     }
 
     #[test]
@@ -1321,14 +1334,14 @@ mod tests {
         let runtime = runtime_host("csb0");
         let html = render_page(&[manifest()], &[runtime], Some("csb0"), "markus", true);
 
-        assert!(html.contains("Color settings are not prepared yet"));
-        assert!(html.contains("Prepare color settings"));
-        assert!(html.contains("Prepare color settings for csb0"));
-        assert!(html.contains(r#"href="/agora?host=csb0""#));
+        assert!(html.contains("Prepare host settings"));
+        assert!(html.contains("Saving creates a pending request for csb0"));
+        assert!(html.contains(r#"<option value="csb0" selected>"#));
         assert!(html.contains(r#"data-ready="false""#));
-        assert!(html.contains(r#"<span class="settings-host-ready">Setup</span>"#));
+        assert!(html.contains(r#"data-host-reported="true""#));
         assert!(html.contains(r#"data-host="csb0""#));
-        assert!(!html.contains("Settings unavailable"));
+        assert!(!html.contains("must report once"));
+        assert!(!html.contains(r#"data-save-color disabled"#));
     }
 
     #[test]
@@ -1360,12 +1373,45 @@ mod tests {
     fn unknown_requested_host_gets_setup_placeholder() {
         let html = render_page(&[manifest()], &[], Some("csb0"), "markus", true);
 
-        assert!(html.contains("Color settings are not prepared yet"));
-        assert!(html.contains("Prepare color settings for csb0"));
-        assert!(html.contains(r#"href="/agora?host=csb0""#));
-        assert!(html.contains(r#"<span class="settings-host-name">csb0</span>"#));
-        assert!(html.contains(r#"<span class="settings-host-role">host</span>"#));
-        assert!(!html.contains("Pharos will not show or edit another host"));
+        assert!(html.contains("Waiting for first report"));
+        assert!(html.contains("csb0 must report once before settings can be requested"));
+        assert!(html.contains(r#"<option value="csb0" selected>"#));
+        assert!(html.contains(r#"data-host-reported="false""#));
+        assert!(html.contains(r#"data-save-color disabled"#));
+        assert!(html.contains("Waiting for host"));
+    }
+
+    #[test]
+    fn host_preferences_request_rejects_unknown_fields() {
+        let valid: HostPreferencesRequest = serde_json::from_value(json!({
+            "host": "hsb8",
+            "preferences": {
+                "accent": "#48b8a8",
+                "kind": "server",
+                "alerts": {
+                    "suppress_down": false,
+                    "suppress_backup": true,
+                    "suppress_nix_freshness": false
+                }
+            }
+        }))
+        .expect("known request fields parse");
+        assert_eq!(valid.host, "hsb8");
+        assert!(valid.preferences.alerts.suppress_backup);
+
+        assert!(serde_json::from_value::<HostPreferencesRequest>(json!({
+            "host": "hsb8",
+            "preferences": {},
+            "unexpected": true
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<HostPreferencesRequest>(json!({
+            "host": "hsb8",
+            "preferences": {
+                "alerts": { "unexpected": true }
+            }
+        }))
+        .is_err());
     }
 
     #[test]

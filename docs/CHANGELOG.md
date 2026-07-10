@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## 0.1.19 - 2026-07-10
+
+- Replace the dense Agora mini-app with shared Pharos navigation, one host selector, one color task, and collapsed declarative details that also work on narrow screens.
+- Add host-owned color and alert preference requests with explicit pending-versus-applied state; monitoring changes only after the host reports the applied preference.
+- Let applied host preferences mute down, backup, or Nix-freshness attention in Fleet, Alerts, and Activity while keeping a visible muted marker on Fleet cards and rows.
+- Keep Fleet mute markers synchronized through the existing background refresh without exposing pending requests or credential material.
+
 ## 0.1.18 - 2026-07-10
 
 - Move release history into a body-level portal above Fleet cards, map controls, tables, and every other page surface.
