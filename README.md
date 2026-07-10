@@ -199,8 +199,11 @@ scripts/bootstrap-pharos-nixos-anywhere.sh \
 The helper validates private-file permissions and strict SSH trust, preserves
 the target host keys, copies the token with `nixos-anywhere --extra-files`, and
 waits for `pharos-beacon.service`. The raw token is not a command argument and
-never enters Nix evaluation or the Nix store. The target configuration must
-import `nixosModules.pharos-beacon` and use the shown first-bootstrap token path.
+never enters Nix evaluation or the Nix store. The module loads the root-only
+source file through a per-service systemd credential, so the unprivileged
+beacon can read its private copy without weakening the source permissions. The
+target configuration must import `nixosModules.pharos-beacon` and use the shown
+first-bootstrap token path.
 After the first heartbeat, migrate that file to an agenix- or Janus-managed
 runtime path and update `tokenFile` declaratively.
 

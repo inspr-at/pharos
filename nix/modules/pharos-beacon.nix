@@ -22,10 +22,10 @@ let
   // lib.optionalAttrs (cfg.nixcfgDir != null) {
     NIXCFG_DIR = cfg.nixcfgDir;
   }
+  // cfg.extraEnvironment
   // lib.optionalAttrs (cfg.tokenFile != null) {
-    PHAROS_TOKEN_FILE = cfg.tokenFile;
-  }
-  // cfg.extraEnvironment;
+    PHAROS_TOKEN_FILE = "%d/pharos-token";
+  };
 in
 {
   options.services.pharos-beacon = {
@@ -180,6 +180,9 @@ in
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
         SystemCallArchitectures = "native";
+      }
+      // lib.optionalAttrs (cfg.tokenFile != null) {
+        LoadCredential = "pharos-token:${cfg.tokenFile}";
       }
       // lib.optionalAttrs (cfg.tokenEnvironmentFile != null) {
         EnvironmentFile = cfg.tokenEnvironmentFile;

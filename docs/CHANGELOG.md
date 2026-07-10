@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.16 - 2026-07-10
+
+- Deliver NixOS beacon token files through a per-service systemd credential so the root-only source remains protected while the unprivileged beacon can authenticate.
+- Add a KVM-backed NixOS integration check that performs runtime registration and waits for a real authenticated first heartbeat in Pharos.
+- Keep test-only Nix files out of the Rust package source closure so integration fixture changes reuse unchanged application packages.
+
 ## 0.1.15 - 2026-07-10
 
 - Reworked new-server review into a focused, imagegen-designed summary with server, setup, and post-setup intent visible while technical provider details stay collapsed.
