@@ -141,6 +141,15 @@ firewall is unavailable, setup fails before creating a server. Keep the token
 mount in a private Compose override or orchestrator secret; never place the raw
 value in Compose, an env file, or the setup UI.
 
+Before the first heartbeat, the tracked setup can be reopened from its fleet
+card. **Recovery options** can remove only that job's single persisted Hetzner
+server after explicit confirmation. The same operation is available as
+`POST /setup/provisioning-jobs/{id}/cleanup` with `{"confirm":true}`. A proven
+delete or provider `404` becomes an idempotent rolled-back outcome; network,
+unexpected success, and error responses remain `cleanup-needed` so an operator
+can verify the provider console before retrying. The API token is never returned
+in job or cleanup responses.
+
 Existing-host native systemd execution is deliberately off by default. The
 assistant still provides a reviewable manual handoff without it. To enable the
 executor, mount a private SSH identity and a pinned `known_hosts` file

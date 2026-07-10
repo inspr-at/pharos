@@ -43,9 +43,10 @@ use pharos_core::{
     ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningBackupProposal,
     ProvisioningBackupProposalKind, ProvisioningBackupSecretFile, ProvisioningHandoff,
     ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningProviderResource,
-    ProvisioningSetupIntent, SecretOwner, ServiceObservation, ServiceObservationState,
-    SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION,
-    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    ProvisioningSetupIntent, ProvisioningTerminalOutcome, SecretOwner, ServiceObservation,
+    ServiceObservationState, SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -96,6 +97,7 @@ impl FromRef<AppState> for Arc<ManifestRegistry> {
 struct ProvisioningJobStore {
     path: Option<PathBuf>,
     jobs: RwLock<BTreeMap<String, ProvisioningJob>>,
+    cleanup_claims: Mutex<BTreeSet<String>>,
     counter: AtomicU64,
 }
 
@@ -115,6 +117,7 @@ impl ProvisioningJobStore {
         Self {
             path,
             jobs: RwLock::new(jobs),
+            cleanup_claims: Mutex::new(BTreeSet::new()),
             counter: AtomicU64::new(1),
         }
     }
@@ -164,6 +167,7 @@ impl ProvisioningJobStore {
             heartbeat_interval_secs: request.heartbeat_interval_secs.filter(|value| *value > 0),
             existing_host_context,
             state,
+            terminal_outcome: None,
             created_at: now,
             updated_at: now,
             handoff,
@@ -222,6 +226,104 @@ impl ProvisioningJobStore {
         drop(jobs);
         self.persist();
         Some(job)
+    }
+
+    fn claim_provider_cleanup(&self, id: &str) -> bool {
+        self.cleanup_claims
+            .lock()
+            .expect("provider cleanup claim lock")
+            .insert(id.to_string())
+    }
+
+    fn release_provider_cleanup(&self, id: &str) {
+        self.cleanup_claims
+            .lock()
+            .expect("provider cleanup claim lock")
+            .remove(id);
+    }
+
+    fn begin_provider_cleanup(
+        &self,
+        id: &str,
+        provider_id: &str,
+        now: i64,
+    ) -> Option<ProvisioningJob> {
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let current = jobs.get(id)?.clone();
+        if !matches!(
+            current.state,
+            ProvisioningJobState::WaitingForHeartbeat | ProvisioningJobState::CleanupNeeded
+        ) {
+            return None;
+        }
+        let matching: Vec<&ProvisioningProviderResource> = current
+            .provider_resources
+            .iter()
+            .filter(|resource| {
+                resource.provider == "hetzner-cloud"
+                    && resource.kind == "server"
+                    && resource.provider_id == provider_id
+                    && matches!(
+                        resource.state.as_str(),
+                        "created" | "created-address-pending"
+                    )
+            })
+            .collect();
+        if current.provider_resources.len() != 1 || matching.len() != 1 {
+            return None;
+        }
+
+        let mut updated = current;
+        updated.state = ProvisioningJobState::CleanupNeeded;
+        updated.terminal_outcome = None;
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::CleanupNeeded,
+            message:
+                "Confirmed provider cleanup started; waiting for Hetzner Cloud to prove deletion."
+                    .to_string(),
+            observed_at: now,
+        });
+        updated.validate_contract().ok()?;
+        jobs.insert(id.to_string(), updated.clone());
+        drop(jobs);
+        self.persist();
+        Some(updated)
+    }
+
+    fn complete_provider_cleanup(
+        &self,
+        id: &str,
+        resource: ProvisioningProviderResource,
+        handoff: ProvisioningHandoff,
+        now: i64,
+    ) -> Option<ProvisioningJob> {
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let current = jobs.get(id)?.clone();
+        if current.state != ProvisioningJobState::CleanupNeeded {
+            return None;
+        }
+        let mut updated = current;
+        updated.state = ProvisioningJobState::Complete;
+        updated.terminal_outcome = Some(ProvisioningTerminalOutcome::RolledBack);
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Complete,
+            message:
+                "Tracked Hetzner server deleted; setup ended without an active provider resource."
+                    .to_string(),
+            observed_at: now,
+        });
+        updated
+            .provider_resources
+            .retain(|existing| existing.provider_id != resource.provider_id);
+        updated.provider_resources.push(resource);
+        updated.handoff = Some(handoff);
+        updated.validate_contract().ok()?;
+        jobs.insert(id.to_string(), updated.clone());
+        drop(jobs);
+        self.persist();
+        Some(updated)
     }
 
     fn transition_existing_host(
@@ -346,6 +448,12 @@ struct ProvisioningJobStartRequest {
     preflight_summary: Option<ExistingHostPreflightSummary>,
     #[serde(default)]
     preflight_checks: Vec<ExistingHostPreflightCheck>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProvisioningCleanupRequest {
+    #[serde(default)]
+    confirm: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1087,6 +1195,183 @@ async fn create_hetzner_server(
         .await
         .map(|payload| payload.server)
         .map_err(|_| HetznerExecutionError::InvalidResponse)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HetznerDeleteResult {
+    Deleted,
+    AlreadyAbsent,
+}
+
+async fn delete_hetzner_server(
+    provider_id: u64,
+    config: &HetznerCloudRuntimeConfig,
+) -> Result<HetznerDeleteResult, HetznerExecutionError> {
+    let token = config.api_token()?;
+    let client = reqwest::Client::builder()
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|_| HetznerExecutionError::ClientUnavailable)?;
+    let endpoint = format!(
+        "{}/servers/{provider_id}",
+        config.api_base_url.trim_end_matches('/')
+    );
+    let response = client
+        .delete(endpoint)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|_| HetznerExecutionError::RequestFailed)?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(HetznerDeleteResult::AlreadyAbsent);
+    }
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(HetznerDeleteResult::Deleted);
+    }
+    if response.status().is_success() {
+        return Err(HetznerExecutionError::InvalidResponse);
+    }
+    Err(HetznerExecutionError::HttpStatus(
+        response.status().as_u16(),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisioningCleanupError {
+    UnsupportedJob,
+    CleanupNotAllowed,
+    ResourceMissing,
+    ResourceAmbiguous,
+    ResourceInvalid,
+    RuntimeDisabled,
+    ProviderUnavailable,
+    ProviderUncertain,
+    CleanupInProgress,
+    PersistenceFailed,
+}
+
+impl ProvisioningCleanupError {
+    fn status_code(self) -> StatusCode {
+        match self {
+            Self::UnsupportedJob | Self::ResourceInvalid => StatusCode::BAD_REQUEST,
+            Self::CleanupNotAllowed
+            | Self::ResourceMissing
+            | Self::ResourceAmbiguous
+            | Self::CleanupInProgress => StatusCode::CONFLICT,
+            Self::RuntimeDisabled | Self::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ProviderUncertain => StatusCode::BAD_GATEWAY,
+            Self::PersistenceFailed => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn safe_message(self) -> &'static str {
+        match self {
+            Self::UnsupportedJob => {
+                "Cleanup is available only for a tracked Hetzner Cloud setup job."
+            }
+            Self::CleanupNotAllowed => {
+                "This setup job is no longer eligible for provider cleanup."
+            }
+            Self::ResourceMissing => {
+                "The setup job has no tracked Hetzner server to delete."
+            }
+            Self::ResourceAmbiguous => {
+                "The setup job does not identify exactly one provider server; no deletion was attempted."
+            }
+            Self::ResourceInvalid => {
+                "The tracked provider server is not valid for guarded cleanup; no deletion was attempted."
+            }
+            Self::RuntimeDisabled => {
+                "Hetzner Cloud execution is disabled; no deletion was attempted."
+            }
+            Self::ProviderUnavailable => {
+                "Hetzner Cloud cleanup is unavailable; the server remains tracked for recovery."
+            }
+            Self::ProviderUncertain => {
+                "Hetzner Cloud did not prove deletion; cleanup is still required."
+            }
+            Self::CleanupInProgress => {
+                "Cleanup is already running for this setup job."
+            }
+            Self::PersistenceFailed => {
+                "Provider cleanup could not be recorded safely; review the tracked job before retrying."
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProvisioningCleanupFailure {
+    error: ProvisioningCleanupError,
+    job: Option<ProvisioningJob>,
+}
+
+impl ProvisioningCleanupFailure {
+    fn new(error: ProvisioningCleanupError, job: Option<ProvisioningJob>) -> Self {
+        Self { error, job }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HetznerCleanupTarget {
+    provider_id: u64,
+    resource: ProvisioningProviderResource,
+    already_deleted: bool,
+}
+
+fn hetzner_cleanup_target(
+    job: &ProvisioningJob,
+) -> Result<HetznerCleanupTarget, ProvisioningCleanupError> {
+    if job.provider != "hetzner-cloud" {
+        return Err(ProvisioningCleanupError::UnsupportedJob);
+    }
+    if job.provider_resources.is_empty() {
+        return Err(ProvisioningCleanupError::ResourceMissing);
+    }
+    if job.provider_resources.len() != 1 {
+        return Err(ProvisioningCleanupError::ResourceAmbiguous);
+    }
+    let resource = job
+        .provider_resources
+        .first()
+        .cloned()
+        .ok_or(ProvisioningCleanupError::ResourceMissing)?;
+    if resource.provider != "hetzner-cloud" || resource.kind != "server" {
+        return Err(ProvisioningCleanupError::ResourceInvalid);
+    }
+    let provider_id = resource
+        .provider_id
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(ProvisioningCleanupError::ResourceInvalid)?;
+    if resource.state == "deleted"
+        && job.state == ProvisioningJobState::Complete
+        && job.terminal_outcome == Some(ProvisioningTerminalOutcome::RolledBack)
+    {
+        return Ok(HetznerCleanupTarget {
+            provider_id,
+            resource,
+            already_deleted: true,
+        });
+    }
+    if !matches!(
+        job.state,
+        ProvisioningJobState::WaitingForHeartbeat | ProvisioningJobState::CleanupNeeded
+    ) {
+        return Err(ProvisioningCleanupError::CleanupNotAllowed);
+    }
+    if !matches!(
+        resource.state.as_str(),
+        "created" | "created-address-pending"
+    ) {
+        return Err(ProvisioningCleanupError::ResourceInvalid);
+    }
+    Ok(HetznerCleanupTarget {
+        provider_id,
+        resource,
+        already_deleted: false,
+    })
 }
 
 fn provisioning_job_progress(
@@ -3005,7 +3290,7 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .onboard-foot{display:flex;align-items:center;gap:8px;color:#0f4f80;font-size:12px;font-weight:760}.onboard-foot:after{content:"";width:24px;height:1px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.60),transparent)}
 [data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
 .card.light{border-color:rgba(214,155,49,.28);box-shadow:0 14px 32px rgba(45,75,95,.08),inset 0 0 0 1px rgba(214,155,49,.08)}
-.pharos-mark{position:absolute;right:10px;top:7px;z-index:0;display:grid;place-items:center;width:58px;height:58px;color:rgba(214,155,49,.14);pointer-events:none}
+.pharos-mark{position:absolute;left:50%;top:7px;transform:translateX(-50%);z-index:0;display:grid;place-items:center;width:58px;height:58px;color:rgba(214,155,49,.14);pointer-events:none}
 .pharos-mark .ico{width:50px;height:50px;stroke-width:1.35}
 .card-head{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
 .card-actions{position:relative;z-index:2;display:flex;align-items:center;gap:5px;flex:0 0 auto}
@@ -3206,7 +3491,7 @@ main[data-view="list"] .list-wrap{display:block}
 .assistant-plan{display:none;gap:14px;padding:14px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-overlay[data-assistant-stage="plan"] .assistant-paths,.assistant-overlay[data-assistant-stage="plan"] .assistant-provider-step,.assistant-overlay[data-assistant-stage="plan"] .assistant-existing-step{display:none}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-review-summary{display:grid;gap:16px}.assistant-review-identity{display:grid;grid-template-columns:42px minmax(0,1fr);column-gap:12px;align-items:center;padding:4px 1px 15px;border-bottom:1px solid rgba(210,226,234,.88)}.assistant-review-identity>.ico{grid-row:1/3;width:38px;height:38px;color:var(--sun)}.assistant-review-identity label{display:grid;gap:2px}.assistant-review-identity label span{font-size:10px;color:var(--muted)}.assistant-review-identity input{width:100%;min-width:0;height:38px;padding:0;border:0;border-bottom:1px solid transparent;background:transparent;color:var(--ink);font-family:Georgia,"Times New Roman",serif;font-size:28px;letter-spacing:0;outline:0}.assistant-review-identity input:focus{border-bottom-color:rgba(31,127,181,.36)}.assistant-review-identity>span{grid-column:2;color:var(--muted);font-size:12px}.assistant-review-rows{display:grid}.assistant-review-row{display:grid;grid-template-columns:28px minmax(0,1fr);align-items:center;gap:11px;min-height:58px;border-bottom:1px solid rgba(210,226,234,.78)}.assistant-review-row:last-child{border-bottom:0}.assistant-review-row>.ico{width:22px;height:22px;color:#315d7c}.assistant-review-row>span{display:flex;align-items:center;justify-content:space-between;gap:18px;min-width:0}.assistant-review-row strong{font-size:13px}.assistant-review-row small{min-width:0;color:var(--ink);font-size:12px;text-align:right;overflow-wrap:anywhere}.assistant-review-details{border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.assistant-review-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:46px;padding:0 4px;color:var(--ink);font-size:13px;font-weight:720;cursor:pointer;list-style:none}.assistant-review-details>summary::-webkit-details-marker{display:none}.assistant-review-details>summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-review-details[open]>summary .ico{transform:rotate(180deg)}.assistant-review-technical{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:4px 0 12px}.assistant-provider-readiness{grid-column:1/-1;display:grid;grid-template-columns:10px minmax(0,1fr);align-items:center;gap:8px;min-height:36px;padding:8px 10px;border:1px solid rgba(210,226,234,.78);border-radius:7px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-provider-readiness i{width:9px;height:9px;border-radius:50%;background:var(--wait);box-shadow:0 0 0 4px rgba(214,155,49,.10)}.assistant-provider-readiness[data-state="ready"] i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.10)}.assistant-provider-readiness[data-state="blocked"] i{background:var(--down);box-shadow:0 0 0 4px rgba(191,58,53,.10)}.assistant-plan-list{grid-column:1/-1;display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{grid-column:1/-1;display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 2px 0;font-size:12px;color:var(--ink)}.assistant-confirm>label{display:flex;align-items:center;gap:9px;min-width:0}.assistant-confirm input{flex:0 0 auto;width:16px;height:16px;accent-color:var(--sea)}.assistant-confirm-actions{display:flex;align-items:center;gap:8px}.assistant-back{min-height:34px;padding:0 10px;border:0;background:transparent;color:#315d7c;font:inherit;font-size:12px;font-weight:720;cursor:pointer}.assistant-start{min-height:36px;padding:0 14px;border:1px solid #c98316;border-radius:7px;background:#e4a42f;color:#15324a;font:inherit;font-size:12px;font-weight:780;cursor:pointer}.assistant-start:disabled{cursor:not-allowed;border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
 .assistant-plan-field{display:grid;gap:5px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-plan-field span{color:var(--muted);font-size:11px;font-weight:650}.assistant-plan-field input{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-plan-field input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
 .assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
-.assistant-created{display:grid;gap:20px;padding:12px 2px 2px}.assistant-created[hidden]{display:none}.assistant-overlay[data-provider-created="true"] .assistant-sheet{width:min(720px,100%)}.assistant-overlay[data-provider-created="true"] .assistant-paths,.assistant-overlay[data-provider-created="true"] .assistant-provider-step,.assistant-overlay[data-provider-created="true"] .assistant-existing-step{display:none}.assistant-overlay[data-provider-created="true"] .assistant-plan{display:grid}.assistant-overlay[data-provider-created="true"] .assistant-plan>:not(.assistant-created){display:none}.assistant-overlay[data-provider-created="true"] .assistant-created{display:grid}.assistant-overlay[data-provider-created="true"] .assistant-next{display:none}.assistant-created h3{margin:0;font-family:Georgia,serif;font-size:28px;font-weight:500;color:var(--ink);letter-spacing:0}.assistant-created-summary{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(0,1fr);align-items:center;gap:14px}.assistant-created-fact{display:flex;align-items:center;min-width:0;gap:10px;color:var(--ink)}.assistant-created-fact+.assistant-created-fact{padding-left:14px;border-left:1px solid rgba(210,226,234,.9)}.assistant-created-fact .ico{width:24px;height:24px;color:#53718a;flex:0 0 auto}.assistant-created-host .ico{width:34px;height:34px;color:#2d668e}.assistant-created-fact strong{overflow:hidden;text-overflow:ellipsis;font-size:18px;white-space:nowrap}.assistant-created-fact span{overflow:hidden;text-overflow:ellipsis;font-size:13px;white-space:nowrap}.assistant-created-ready::before{content:"";width:12px;height:12px;border-radius:50%;background:var(--live);box-shadow:0 0 0 5px rgba(21,158,153,.11);flex:0 0 auto}.assistant-created-progress{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;margin-top:2px}.assistant-created-step{position:relative;display:grid;gap:7px;padding-top:30px;color:var(--muted);font-size:12px}.assistant-created-step::before{content:"";position:absolute;top:9px;left:0;right:0;height:2px;background:#dce7ec}.assistant-created-step:first-child::before{left:12px}.assistant-created-step:last-child::before{right:calc(100% - 12px)}.assistant-created-step i{position:absolute;z-index:1;top:1px;left:0;width:20px;height:20px;border:2px solid #c8d6de;border-radius:50%;background:#fff}.assistant-created-step[data-state="done"]{color:var(--live)}.assistant-created-step[data-state="done"]::before{background:var(--live)}.assistant-created-step[data-state="done"] i{border-color:var(--live);background:var(--live);box-shadow:inset 0 0 0 5px #fff}.assistant-created-step[data-state="current"]{color:var(--ink);font-weight:760}.assistant-created-step[data-state="current"] i{border-color:var(--live);box-shadow:inset 0 0 0 5px #fff,0 0 0 5px rgba(21,158,153,.09);background:var(--live)}.assistant-created-actions{display:flex;align-items:center;gap:16px}.assistant-finish{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-height:40px;padding:0 16px;border:1px solid #c98316;border-radius:7px;background:#e4a42f;color:#15324a;font:inherit;font-size:13px;font-weight:780;cursor:pointer}.assistant-finish .ico{width:17px;height:17px}.assistant-later{border:0;background:transparent;color:#315d7c;font:inherit;font-size:12px;text-decoration:underline;text-underline-offset:3px;cursor:pointer}.assistant-created details{border-top:1px solid rgba(210,226,234,.9);padding-top:12px}.assistant-created details summary{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:38px;padding:0 10px;border:1px solid rgba(210,226,234,.9);border-radius:7px;background:rgba(255,255,255,.76);color:var(--ink);font-size:12px;font-weight:720;cursor:pointer;list-style:none}.assistant-created details summary::-webkit-details-marker{display:none}.assistant-created details summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-created details[open] summary .ico{transform:rotate(180deg)}.assistant-created-advanced{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 2px 0}.assistant-created-advanced div{min-width:0}.assistant-created-advanced dt{font-size:10px;color:var(--muted)}.assistant-created-advanced dd{margin:2px 0 0;overflow-wrap:anywhere;font-size:11px;color:var(--ink)}
+.assistant-created{display:grid;gap:20px;padding:12px 2px 2px}.assistant-created[hidden]{display:none}.assistant-overlay[data-provider-created="true"] .assistant-sheet{width:min(560px,100%)}.assistant-overlay[data-provider-created="true"] .assistant-body>:not(.assistant-created){display:none}.assistant-overlay[data-provider-created="true"] .assistant-created{display:grid}.assistant-created h3{margin:0;font-family:Georgia,serif;font-size:28px;font-weight:500;color:var(--ink);letter-spacing:0}.assistant-created-summary{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(0,1fr);align-items:center;gap:14px}.assistant-created-fact{display:flex;align-items:center;min-width:0;gap:10px;color:var(--ink)}.assistant-created-fact+.assistant-created-fact{padding-left:14px;border-left:1px solid rgba(210,226,234,.9)}.assistant-created-fact .ico{width:24px;height:24px;color:#53718a;flex:0 0 auto}.assistant-created-host .ico{width:34px;height:34px;color:#2d668e}.assistant-created-fact strong{overflow:hidden;text-overflow:ellipsis;font-size:18px;white-space:nowrap}.assistant-created-fact span{overflow:hidden;text-overflow:ellipsis;font-size:13px;white-space:nowrap}.assistant-created-ready::before{content:"";width:12px;height:12px;border-radius:50%;background:var(--live);box-shadow:0 0 0 5px rgba(21,158,153,.11);flex:0 0 auto}.assistant-created-progress{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;margin-top:2px}.assistant-created-step{position:relative;display:grid;gap:7px;padding-top:30px;color:var(--muted);font-size:12px}.assistant-created-step::before{content:"";position:absolute;top:9px;left:0;right:0;height:2px;background:#dce7ec}.assistant-created-step:first-child::before{left:12px}.assistant-created-step:last-child::before{right:calc(100% - 12px)}.assistant-created-step i{position:absolute;z-index:1;top:1px;left:0;width:20px;height:20px;border:2px solid #c8d6de;border-radius:50%;background:#fff}.assistant-created-step[data-state="done"]{color:var(--live)}.assistant-created-step[data-state="done"]::before{background:var(--live)}.assistant-created-step[data-state="done"] i{border-color:var(--live);background:var(--live);box-shadow:inset 0 0 0 5px #fff}.assistant-created-step[data-state="current"]{color:var(--ink);font-weight:760}.assistant-created-step[data-state="current"] i{border-color:var(--live);box-shadow:inset 0 0 0 5px #fff,0 0 0 5px rgba(21,158,153,.09);background:var(--live)}.assistant-created-actions{display:flex;align-items:center;gap:16px}.assistant-finish{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-height:40px;padding:0 16px;border:1px solid #c98316;border-radius:7px;background:#e4a42f;color:#15324a;font:inherit;font-size:13px;font-weight:780;cursor:pointer}.assistant-finish .ico{width:17px;height:17px}.assistant-later{border:0;background:transparent;color:#315d7c;font:inherit;font-size:12px;text-decoration:underline;text-underline-offset:3px;cursor:pointer}.assistant-created details{border-top:1px solid rgba(210,226,234,.9);padding-top:12px}.assistant-created details summary{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:38px;padding:0 10px;border:1px solid rgba(210,226,234,.9);border-radius:7px;background:rgba(255,255,255,.76);color:var(--ink);font-size:12px;font-weight:720;cursor:pointer;list-style:none}.assistant-created details summary::-webkit-details-marker{display:none}.assistant-created details summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-created details[open] summary .ico{transform:rotate(180deg)}.assistant-created-advanced{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 2px 0}.assistant-created-advanced div{min-width:0}.assistant-created-advanced dt{font-size:10px;color:var(--muted)}.assistant-created-advanced dd{margin:2px 0 0;overflow-wrap:anywhere;font-size:11px;color:var(--ink)}
 .assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
 .assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
 .assistant-close .ico{width:16px;height:16px}.assistant-overlay[data-assistant-stage="plan"] .assistant-next{display:none}.assistant-overlay[data-assistant-stage="plan"]:not([data-assistant-job-id]) .assistant-progress{display:none}.assistant-overlay[data-assistant-stage="plan"][data-assistant-selected-path="new"] .assistant-plan{padding:0;border:0;background:transparent}.assistant-overlay[data-assistant-stage="plan"][data-assistant-selected-path="new"] .assistant-plan>.assistant-plan-head{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-review-summary{display:none}
@@ -3301,7 +3586,16 @@ body[data-assistant-open="true"]{overflow:hidden}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
 @media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-primary{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
-.assistant-created-guidance{margin:10px 2px 0;color:var(--muted);font-size:11px;line-height:1.45}
+.assistant-created-setup{display:grid;gap:10px;padding:13px 14px;border:1px solid rgba(210,226,234,.84);border-radius:8px;background:rgba(247,252,253,.82)}
+.assistant-created-setup h4{margin:0;color:var(--ink);font-size:14px}.assistant-created-setup ol{display:grid;gap:7px;margin:0;padding-left:20px;color:#315d7c;font-size:12px;line-height:1.4}.assistant-created-setup li::marker{color:var(--sea);font-weight:760}
+.assistant-created-guidance{margin:0;color:var(--muted);font-size:11px;line-height:1.45}
+.assistant-created-danger{display:grid;gap:12px;margin-top:10px;padding:14px;border:1px solid rgba(191,58,53,.28);border-radius:8px;background:linear-gradient(135deg,rgba(255,249,248,.96),rgba(255,238,235,.72))}
+.assistant-created-danger-head{display:flex;align-items:flex-start;gap:10px}.assistant-created-danger-head>.ico{flex:0 0 auto;width:20px;height:20px;margin-top:1px;color:var(--down)}.assistant-created-danger-head strong{display:block;color:#7f2926;font-size:13px}.assistant-created-danger-head p{margin:3px 0 0;color:#765b59;font-size:11px;line-height:1.4}
+.assistant-delete-confirm{display:flex;align-items:flex-start;gap:9px;color:#604f4d;font-size:11px;line-height:1.4;cursor:pointer}.assistant-delete-confirm input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:var(--down)}
+.assistant-delete-actions{display:flex;align-items:center;gap:11px;min-height:38px}.assistant-delete{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:38px;padding:0 13px;border:1px solid var(--down);border-radius:7px;background:#fff;color:#a1322e;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-delete .ico{width:15px;height:15px}.assistant-delete:hover:not(:disabled),.assistant-delete:focus-visible:not(:disabled){background:rgba(255,232,229,.78);box-shadow:0 0 0 3px rgba(191,58,53,.08);outline:0}.assistant-delete:disabled{cursor:not-allowed;border-color:rgba(191,58,53,.20);color:rgba(161,50,46,.42);background:rgba(255,255,255,.58)}.assistant-delete-actions span{min-width:0;color:#765b59;font-size:11px;line-height:1.35}
+.assistant-created[data-state="deleted"] .assistant-created-ready::before{background:var(--wait);box-shadow:0 0 0 5px rgba(137,151,163,.10)}.assistant-created[data-state="deleted"] .assistant-created-host .ico{color:#6d8293}
+.assistant-overlay[data-provider-created="true"] .assistant-next,.assistant-overlay[data-provider-created="true"] .assistant-created>h3{display:none}
+@media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -3821,6 +4115,7 @@ const ASSISTANT_PATH_PARAM='setup_path';
 const ASSISTANT_PROVIDER_PARAM='setup_provider';
 const ASSISTANT_TEMPLATE_PARAM='setup_template';
 const ASSISTANT_STAGE_PARAM='setup_stage';
+const ASSISTANT_JOB_PARAM='setup_job';
 const ASSISTANT_TEMPLATE_PROVIDERS={
 	  'hetzner-small-nixos':'hetzner-cloud',
 	  'hetzner-lab':'hetzner-cloud',
@@ -3875,6 +4170,7 @@ function writeAssistantUrl(open,path='',provider='',template='',stage=''){
     params.delete(ASSISTANT_PROVIDER_PARAM);
     params.delete(ASSISTANT_TEMPLATE_PARAM);
     params.delete(ASSISTANT_STAGE_PARAM);
+    params.delete(ASSISTANT_JOB_PARAM);
   }
   const query=params.toString();
   history.replaceState(null,'',location.pathname+(query?'?'+query:''));
@@ -4186,14 +4482,22 @@ function renderProviderCreatedResult(overlay,job){
   if(!overlay||!result)return false;
   const resource=primaryProviderResource(job);
   const handoff=job?.handoff;
-  const visible=Boolean(
-    resource&&
-    handoff?.status==='provider-created-bootstrap-required'&&
-    ['bootstrapping','waiting-for-heartbeat'].includes(job?.state)
+  const deleted=Boolean(
+    resource?.state==='deleted'&&
+    handoff?.status==='provider-resource-deleted'&&
+    job?.state==='complete'&&
+    job?.terminal_outcome==='rolled-back'
+  );
+  const activeResource=Boolean(
+    resource&&['created','created-address-pending'].includes(resource.state)
+  );
+  const visible=deleted||Boolean(
+    activeResource&&['bootstrapping','waiting-for-heartbeat','cleanup-needed'].includes(job?.state)
   );
   if(!visible){
     const wasVisible=overlay.dataset.providerCreated==='true';
     delete overlay.dataset.providerCreated;
+    overlay.pharosProvisioningJob=null;
     result.hidden=true;
     if(wasVisible){
       const headTitle=overlay.querySelector('#setup-assistant-title');
@@ -4204,24 +4508,64 @@ function renderProviderCreatedResult(overlay,job){
     return false;
   }
   overlay.dataset.providerCreated='true';
+  overlay.pharosProvisioningJob=job;
   result.hidden=false;
+  result.dataset.state=deleted?'deleted':'active';
+  const cleanupNeeded=!deleted&&job?.state==='cleanup-needed';
+  const viewTitle=deleted?'Server deleted':cleanupNeeded?'Server needs attention':'Server created';
   const headTitle=overlay.querySelector('#setup-assistant-title');
   const headCopy=headTitle?.parentElement?.querySelector('p');
-  if(headTitle)headTitle.textContent='Setup assistant';
-  if(headCopy)headCopy.textContent='Your server exists. Connect it to Pharos.';
+  if(headTitle)headTitle.textContent=viewTitle;
+  if(headCopy)headCopy.textContent=deleted?'The provider resource is no longer active.':cleanupNeeded?'Review recovery before making another provider change.':'Install Pharos to finish setup.';
+  const setupReady=!cleanupNeeded&&handoff?.status==='provider-created-bootstrap-required';
+  const title=result.querySelector('[data-created-title]');
+  const ready=result.querySelector('[data-created-ready-text]');
+  if(title)title.textContent=viewTitle;
+  if(ready)ready.textContent=deleted?'Removed':cleanupNeeded?'Recovery required':'Ready for setup';
+  const progress=result.querySelector('[data-created-progress]');
+  const actions=result.querySelector('[data-created-actions]');
+  const setup=result.querySelector('[data-created-setup]');
+  const recovery=result.querySelector('[data-created-recovery]');
+  if(progress)progress.hidden=deleted||cleanupNeeded;
+  if(actions)actions.hidden=deleted||!setupReady;
+  if(recovery)recovery.hidden=deleted;
+  const viewKey=`${job?.id||''}:${deleted?'deleted':job?.state||'active'}`;
+  const viewChanged=result.dataset.jobViewKey!==viewKey;
+  result.dataset.jobViewKey=viewKey;
+  if(viewChanged){
+    if(setup)setup.hidden=true;
+    if(recovery)recovery.open=cleanupNeeded;
+    const confirm=result.querySelector('[data-created-delete-confirm]');
+    const remove=result.querySelector('[data-created-delete]');
+    const status=result.querySelector('[data-created-delete-status]');
+    if(confirm)confirm.checked=false;
+    if(remove)remove.disabled=true;
+    if(status)status.textContent='';
+  }
   const values={
     '[data-created-host]':resource.name||job.host_name||'new server',
     '[data-created-location]':providerLocationLabel(resource.location),
-    '[data-created-resource]':`Hetzner server ${resource.provider_id||'created'}`,
-    '[data-created-ssh]':providerSshLabel(resource),
-    '[data-created-secret]':handoff.secret_target||'private runtime file',
-    '[data-created-command]':handoff.command_ref||'prepared bootstrap handoff',
-    '[data-created-guidance]':handoff.summary||'Finish the protected bootstrap, then wait for the first heartbeat.'
+    '[data-created-resource]':`Hetzner server ${resource.provider_id||'created'}${deleted?' · deleted':''}`,
+    '[data-created-ssh]':deleted?'No active destination':providerSshLabel(resource),
+    '[data-created-secret]':deleted?'Not applicable':handoff?.secret_target||'private runtime file',
+    '[data-created-command]':deleted?'Not applicable':handoff?.command_ref||'prepared bootstrap handoff',
+    '[data-created-guidance]':handoff?.summary||'Review recovery before making another provider change.'
   };
   Object.entries(values).forEach(([selector,value])=>{
     const node=result.querySelector(selector);
     if(node)node.textContent=value;
   });
+  const nextSteps=result.querySelector('[data-created-next-steps]');
+  if(nextSteps){
+    nextSteps.replaceChildren();
+    const steps=Array.isArray(handoff?.next_steps)?handoff.next_steps:[];
+    steps.forEach(step=>{
+      const item=document.createElement('li');
+      item.textContent=step;
+      nextSteps.append(item);
+    });
+    nextSteps.hidden=steps.length===0;
+  }
   result.scrollIntoView({block:'nearest'});
   return true;
 }
@@ -4241,7 +4585,8 @@ function renderProvisioningJob(overlay,job){
   const existingContext=provisioningExistingContextMessage(job);
   const fullMessage=[handoff||message,existingContext,setupIntent,backupProposal].filter(Boolean).join(' ');
   const providerCreated=renderProviderCreatedResult(overlay,job);
-  if(title)title.textContent=job.state==='failed'?'Setup did not start':`Setup ${label}`;
+  const rolledBack=job.state==='complete'&&job.terminal_outcome==='rolled-back';
+  if(title)title.textContent=rolledBack?'Setup rolled back':job.state==='failed'?'Setup did not start':`Setup ${label}`;
   if(copy)copy.textContent=fullMessage;
   if(jobBox){
     jobBox.hidden=false;
@@ -4441,6 +4786,26 @@ async function fetchProvisioningJob(id){
   if(!response.ok)throw new Error(payload.error||'setup job could not be loaded');
   return payload.job;
 }
+async function deleteTrackedProviderServer(overlay,button){
+  const job=overlay?.pharosProvisioningJob;
+  if(!job?.id)throw new Error('The tracked setup job is not available.');
+  const confirm=overlay.querySelector('[data-created-delete-confirm]');
+  const status=overlay.querySelector('[data-created-delete-status]');
+  if(!confirm?.checked)throw new Error('Confirm permanent deletion first.');
+  button.disabled=true;
+  button.setAttribute('aria-busy','true');
+  if(status)status.textContent='Deleting the tracked server…';
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/cleanup`,{
+    method:'POST',
+    headers:{'content-type':'application/json','accept':'application/json'},
+    body:JSON.stringify({confirm:true}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(payload.job)renderProvisioningJob(overlay,payload.job);
+  if(!response.ok)throw new Error(payload.error||'Provider deletion could not be confirmed.');
+  return payload.cleanup||{};
+}
 function scheduleProvisioningPoll(overlay,id){
   if(!id)return;
   window.clearTimeout(window.pharosAssistantJobTimer);
@@ -4612,6 +4977,7 @@ function setAssistantOpen(open,write=true){
   document.body.dataset.assistantOpen=open?'true':'false';
   if(!open){
     delete overlay.dataset.providerCreated;
+    overlay.pharosProvisioningJob=null;
     const created=overlay.querySelector('[data-assistant-created]');
     if(created)created.hidden=true;
     const headTitle=overlay.querySelector('#setup-assistant-title');
@@ -4634,6 +5000,19 @@ function restoreAssistantFromUrl(){
   setAssistantOpen(open,false);
   if(!open){
     setAssistantPath('',false);
+    return;
+  }
+  const jobId=(params.get(ASSISTANT_JOB_PARAM)||'').trim();
+  if(jobId&&jobId.length<=128){
+    fetchProvisioningJob(jobId).then(job=>{
+      renderProvisioningJob(overlay,job);
+      if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,job.id);
+    }).catch(error=>{
+      const title=overlay.querySelector('[data-assistant-next-title]');
+      const copy=overlay.querySelector('[data-assistant-next-copy]');
+      if(title)title.textContent='Setup job unavailable';
+      if(copy)copy.textContent=error.message||'The tracked setup job could not be loaded.';
+    });
     return;
   }
   const path=assistantPath(params.get(ASSISTANT_PATH_PARAM));
@@ -4709,10 +5088,28 @@ function initSetupAssistant(){
     }
   });
   overlay.querySelector('[data-assistant-finish]')?.addEventListener('click',()=>{
-    const details=overlay.querySelector('[data-created-advanced]');
-    if(details){
-      details.open=true;
-      details.querySelector('summary')?.focus();
+    const setup=overlay.querySelector('[data-created-setup]');
+    if(setup){
+      setup.hidden=false;
+      setup.scrollIntoView({block:'nearest'});
+    }
+  });
+  overlay.querySelector('[data-created-delete-confirm]')?.addEventListener('change',event=>{
+    const remove=overlay.querySelector('[data-created-delete]');
+    if(remove)remove.disabled=!event.currentTarget.checked;
+  });
+  overlay.querySelector('[data-created-delete]')?.addEventListener('click',async event=>{
+    const button=event.currentTarget;
+    const status=overlay.querySelector('[data-created-delete-status]');
+    try{
+      await deleteTrackedProviderServer(overlay,button);
+    }catch(error){
+      if(status)status.textContent=error.message||'Provider deletion could not be confirmed.';
+    }finally{
+      button.removeAttribute('aria-busy');
+      const deleted=overlay.pharosProvisioningJob?.terminal_outcome==='rolled-back';
+      const confirm=overlay.querySelector('[data-created-delete-confirm]');
+      button.disabled=deleted||!confirm?.checked;
     }
   });
   overlay.querySelector('[data-assistant-later]')?.addEventListener('click',()=>setAssistantOpen(false));
@@ -5578,6 +5975,113 @@ fn hetzner_bootstrap_handoff(
     })
 }
 
+fn provider_deleted_handoff(resource: &ProvisioningProviderResource) -> ProvisioningHandoff {
+    ProvisioningHandoff {
+        method: BootstrapMethod::Deferred,
+        status: "provider-resource-deleted".to_string(),
+        title: "Server deleted".to_string(),
+        summary: format!(
+            "{} was removed from Hetzner Cloud and is no longer an active provider resource.",
+            resource.name
+        ),
+        token_policy: "No credential handoff remains because the provider resource was deleted."
+            .to_string(),
+        secret_target: None,
+        command_ref: None,
+        next_steps: vec![
+            "Start a new setup only when the provider plan and bootstrap path are ready."
+                .to_string(),
+        ],
+    }
+}
+
+async fn execute_hetzner_cleanup_job(
+    state: &AppState,
+    job: ProvisioningJob,
+) -> Result<(ProvisioningJob, bool), ProvisioningCleanupFailure> {
+    let target = hetzner_cleanup_target(&job)
+        .map_err(|error| ProvisioningCleanupFailure::new(error, Some(job.clone())))?;
+    if target.already_deleted {
+        return Ok((job, true));
+    }
+    if !state.provider_runtime.hetzner_cloud.execute_enabled {
+        return Err(ProvisioningCleanupFailure::new(
+            ProvisioningCleanupError::RuntimeDisabled,
+            Some(job),
+        ));
+    }
+    if !state.provisioning_jobs.claim_provider_cleanup(&job.id) {
+        return Err(ProvisioningCleanupFailure::new(
+            ProvisioningCleanupError::CleanupInProgress,
+            state.provisioning_jobs.get(&job.id),
+        ));
+    }
+
+    let started = match state.provisioning_jobs.begin_provider_cleanup(
+        &job.id,
+        &target.resource.provider_id,
+        now_unix(),
+    ) {
+        Some(started) => started,
+        None => {
+            state.provisioning_jobs.release_provider_cleanup(&job.id);
+            return Err(ProvisioningCleanupFailure::new(
+                ProvisioningCleanupError::CleanupNotAllowed,
+                state.provisioning_jobs.get(&job.id),
+            ));
+        }
+    };
+
+    let provider_result =
+        delete_hetzner_server(target.provider_id, &state.provider_runtime.hetzner_cloud).await;
+    let outcome = match provider_result {
+        Ok(delete_result) => {
+            let mut deleted_resource = target.resource;
+            deleted_resource.state = "deleted".to_string();
+            deleted_resource.ssh = None;
+            let handoff = provider_deleted_handoff(&deleted_resource);
+            state
+                .provisioning_jobs
+                .complete_provider_cleanup(&job.id, deleted_resource, handoff, now_unix())
+                .map(|job| (job, delete_result == HetznerDeleteResult::AlreadyAbsent))
+                .ok_or_else(|| {
+                    ProvisioningCleanupFailure::new(
+                        ProvisioningCleanupError::PersistenceFailed,
+                        state.provisioning_jobs.get(&job.id),
+                    )
+                })
+        }
+        Err(error) => {
+            let cleanup_error = match &error {
+                HetznerExecutionError::CredentialUnavailable
+                | HetznerExecutionError::ClientUnavailable => {
+                    ProvisioningCleanupError::ProviderUnavailable
+                }
+                _ => ProvisioningCleanupError::ProviderUncertain,
+            };
+            let message = format!(
+                "{}. Cleanup remains required because deletion was not proven; verify Hetzner Cloud before retrying.",
+                error.safe_message()
+            );
+            let persisted = state
+                .provisioning_jobs
+                .append_progress(
+                    &job.id,
+                    ProvisioningJobState::CleanupNeeded,
+                    message,
+                    now_unix(),
+                )
+                .unwrap_or(started);
+            Err(ProvisioningCleanupFailure::new(
+                cleanup_error,
+                Some(persisted),
+            ))
+        }
+    };
+    state.provisioning_jobs.release_provider_cleanup(&job.id);
+    outcome
+}
+
 async fn execute_hetzner_setup_job(
     state: &AppState,
     request: &ProvisioningJobStartRequest,
@@ -5685,6 +6189,62 @@ async fn provisioning_job_json(
             StatusCode::NOT_FOUND,
             no_store_headers(),
             Json(json!({ "error": "provisioning job not found" })),
+        ),
+    }
+}
+
+async fn cleanup_provisioning_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProvisioningCleanupRequest>,
+) -> impl IntoResponse {
+    if !access_for_headers(&state.auth, &headers).can_agora() {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(json!({ "error": "Agora access is not granted for this account" })),
+        );
+    }
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": "Explicit cleanup confirmation is required." })),
+        );
+    }
+    reconcile_provisioning_jobs_with_runtime(
+        &state.provisioning_jobs,
+        &state.store.list(),
+        now_unix(),
+    );
+    let Some(job) = state.provisioning_jobs.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            no_store_headers(),
+            Json(json!({ "error": "Provisioning job not found." })),
+        );
+    };
+
+    match execute_hetzner_cleanup_job(&state, job).await {
+        Ok((job, already_absent)) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({
+                "job": job,
+                "cleanup": {
+                    "state": "deleted",
+                    "already_absent": already_absent
+                }
+            })),
+        ),
+        Err(failure) => (
+            failure.error.status_code(),
+            no_store_headers(),
+            Json(json!({
+                "error": failure.error.safe_message(),
+                "job": failure.job
+            })),
         ),
     }
 }
@@ -7453,7 +8013,8 @@ fn protection_setup_job_for_host<'a>(
             !matches!(
                 job.state,
                 ProvisioningJobState::Failed | ProvisioningJobState::CleanupNeeded
-            ) && provisioning_job_host_name(job).is_some_and(|name| name == host_name)
+            ) && !provisioning_job_rolled_back(job)
+                && provisioning_job_host_name(job).is_some_and(|name| name == host_name)
         })
         .max_by_key(|job| job.updated_at)
 }
@@ -8068,7 +8629,7 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div>{release_dialog}</aside>"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
@@ -8178,11 +8739,13 @@ fn setup_assistant() -> String {
     .replace(
         r#"<div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states">"#,
         &format!(
-            r#"<div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><section class="assistant-created" data-assistant-created hidden aria-live="polite"><h3>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready"><span>Ready for setup</span></div></div><div class="assistant-created-progress" aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions"><button class="assistant-finish" type="button" data-assistant-finish>View setup steps {arrow}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><details data-created-advanced><summary>Advanced details {chevron}</summary><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></details></section><div class="assistant-progress" aria-label="provisioning progress states">"#,
+            r#"<div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><section class="assistant-created" data-assistant-created data-state="active" hidden aria-live="polite"><h3 data-created-title>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready" data-created-ready><span data-created-ready-text>Ready for setup</span></div></div><div class="assistant-created-progress" data-created-progress aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions" data-created-actions><button class="assistant-finish" type="button" data-assistant-finish>Continue setup {arrow}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><section class="assistant-created-setup" data-created-setup hidden><h4>Finish installation</h4><ol data-created-next-steps></ol><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></section><details data-created-recovery><summary>Recovery options {chevron}</summary><section class="assistant-created-danger" data-created-danger><div class="assistant-created-danger-head">{warning}<div><strong>Delete this server</strong><p>Removes the paid Hetzner server. This cannot be undone.</p></div></div><label class="assistant-delete-confirm"><input type="checkbox" data-created-delete-confirm><span>I understand this permanently deletes the server.</span></label><div class="assistant-delete-actions"><button class="assistant-delete" type="button" data-created-delete disabled>{trash} Delete server</button><span data-created-delete-status role="status" aria-live="polite"></span></div></section></details></section><div class="assistant-progress" aria-label="provisioning progress states">"#,
             server = icons::SERVER,
             map_pin = icons::MAP_PIN,
             arrow = icons::ARROW_RIGHT,
             chevron = icons::CHEVRON_DOWN,
+            warning = icons::TRIANGLE_ALERT,
+            trash = icons::TRASH_2,
         ),
     )
     .replace(
@@ -8257,6 +8820,11 @@ fn provisioning_job_host_name(job: &ProvisioningJob) -> Option<&str> {
         .filter(|host| !host.is_empty())
 }
 
+fn provisioning_job_rolled_back(job: &ProvisioningJob) -> bool {
+    job.state == ProvisioningJobState::Complete
+        && job.terminal_outcome == Some(ProvisioningTerminalOutcome::RolledBack)
+}
+
 fn provisioning_job_role(job: &ProvisioningJob) -> &str {
     job.role
         .as_deref()
@@ -8273,6 +8841,7 @@ fn provisioning_job_visible_in_fleet(job: &ProvisioningJob) -> bool {
             | ProvisioningJobState::Bootstrapping
             | ProvisioningJobState::WaitingForHeartbeat
             | ProvisioningJobState::BackupPending
+            | ProvisioningJobState::CleanupNeeded
     )
 }
 
@@ -8292,6 +8861,9 @@ fn provisioning_job_fleet_status(
     job: &ProvisioningJob,
     now: i64,
 ) -> (&'static str, &'static str, &'static str, u8, String) {
+    if provisioning_job_rolled_back(job) {
+        return ("unknown", "clear", "ok", 4, "setup rolled back".to_string());
+    }
     if provisioning_job_first_heartbeat_overdue(job, now) {
         return (
             "stale",
@@ -8502,9 +9074,10 @@ fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
     };
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
     format!(
-        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="settings-card" href="/?setup=add-server" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server">Continue setup</a></div></article>"#,
+        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div></article>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
+        job_id = html_escape(&job.id),
         settings = icons::SLIDERS,
         reason = html_escape(&reason),
         detail = html_escape(&detail),
@@ -8538,9 +9111,10 @@ fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
     let status_icon = status_icon_stack();
     format!(
-        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {reason}">{status_icon}<span class="word" data-status-word>{reason}</span></span></td><td><div class="reason {reason_level}" data-reason><span>{reason}</span></div></td><td><span class="setup-chip backup">{backup}</span></td><td><span class="setup-chip location">{location}</span></td><td><span>{started}</span></td><td><span>{job_state}</span></td><td><a class="setup-action" href="/?setup=add-server">Continue</a></td></tr>"#,
+        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {reason}">{status_icon}<span class="word" data-status-word>{reason}</span></span></td><td><div class="reason {reason_level}" data-reason><span>{reason}</span></div></td><td><span class="setup-chip backup">{backup}</span></td><td><span class="setup-chip location">{location}</span></td><td><span>{started}</span></td><td><span>{job_state}</span></td><td><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a></td></tr>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
+        job_id = html_escape(&job.id),
         reason = html_escape(&reason),
         backup = html_escape(intent.backup_label()),
         location = html_escape(intent.location_label()),
@@ -10431,7 +11005,13 @@ fn activity_events(
                 host.to_string(),
                 level,
                 "setup",
-                format!("Setup {}", entry.state.label()),
+                if provisioning_job_rolled_back(job)
+                    && entry.state == ProvisioningJobState::Complete
+                {
+                    "Setup rolled back".to_string()
+                } else {
+                    format!("Setup {}", entry.state.label())
+                },
                 entry.message.clone(),
                 "setup",
             ));
@@ -11604,6 +12184,10 @@ async fn main() {
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
         .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
         .route(
+            "/setup/provisioning-jobs/{id}/cleanup",
+            post(cleanup_provisioning_job),
+        )
+        .route(
             "/setup/existing-host/preflight",
             post(existing_host_preflight_json),
         )
@@ -11826,6 +12410,7 @@ mod tests {
             heartbeat_interval_secs: Some(60),
             existing_host_context: None,
             state,
+            terminal_outcome: None,
             created_at,
             updated_at,
             handoff: None,
@@ -13659,9 +14244,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"data-assistant-created"#));
         assert!(empty.contains("Server created"));
         assert!(empty.contains("Ready for setup"));
-        assert!(empty.contains("View setup steps"));
+        assert!(empty.contains("Continue setup"));
         assert!(empty.contains("Do this later"));
-        assert!(empty.contains("Advanced details"));
+        assert!(empty.contains("Recovery options"));
+        assert!(empty.contains("Delete this server"));
+        assert!(empty.contains(r#"data-created-delete-confirm"#));
+        assert!(empty.contains(r#"data-created-delete"#));
+        assert!(empty.contains(r#"data-created-delete-status"#));
         assert!(empty.contains(r#"data-created-resource"#));
         assert!(empty.contains(r#"data-created-ssh"#));
         assert!(empty.contains("data-progress-state=\"failed\""));
@@ -13734,6 +14323,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains("manual location"));
         assert!(html.contains("limited users"));
         assert!(html.contains("Continue setup"));
+        assert!(html.contains(r#"setup=add-server&amp;setup_job=setup-1000-test"#));
         assert!(html.contains(r#"data-host-surface="setup""#));
         assert!(html.contains(r#"<tr class="setup-row""#));
     }
@@ -14474,6 +15064,252 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ..ProviderRuntimeConfig::default()
         };
         (state, token_path)
+    }
+
+    fn tracked_hcloud_cleanup_job(state: &AppState, provider_id: &str) -> ProvisioningJob {
+        let request = hcloud_apply_request("hcloud-cleanup-test");
+        let job = state
+            .provisioning_jobs
+            .start(&request, 1_700_000_020, &state.provider_runtime)
+            .expect("tracked Hetzner job starts");
+        let resource = ProvisioningProviderResource {
+            provider: "hetzner-cloud".to_string(),
+            kind: "server".to_string(),
+            provider_id: provider_id.to_string(),
+            name: "hcloud-cleanup-test".to_string(),
+            state: "created".to_string(),
+            location: Some("fsn1".to_string()),
+            ssh: Some(SshAccessIntent {
+                route: SshRoute::Direct,
+                user: Some("root".to_string()),
+                host: Some("192.0.2.42".to_string()),
+                port: Some(22),
+            }),
+        };
+        let handoff = hetzner_bootstrap_handoff(&resource).expect("bootstrap handoff");
+        state
+            .provisioning_jobs
+            .transition_provider_resource(
+                &job.id,
+                ProvisioningJobState::WaitingForHeartbeat,
+                "Server created and tracked for cleanup testing.",
+                resource,
+                Some(handoff),
+                1_700_000_021,
+            )
+            .expect("tracked resource persisted")
+    }
+
+    #[tokio::test]
+    async fn hetzner_cleanup_deletes_once_and_replays_without_provider_request() {
+        let (api, requests) = hcloud_mock_server("204 No Content", "", true).await;
+        let (state, token_path) = test_hcloud_state(api);
+        let job = tracked_hcloud_cleanup_job(&state, "4242");
+
+        let (deleted, already_absent) = execute_hetzner_cleanup_job(&state, job)
+            .await
+            .expect("cleanup succeeds");
+        assert!(!already_absent);
+        assert_eq!(deleted.state, ProvisioningJobState::Complete);
+        assert_eq!(
+            deleted.terminal_outcome,
+            Some(ProvisioningTerminalOutcome::RolledBack)
+        );
+        let resource = deleted
+            .provider_resources
+            .first()
+            .expect("deleted resource remains tracked");
+        assert_eq!(resource.state, "deleted");
+        assert!(resource.ssh.is_none());
+        assert_eq!(
+            deleted
+                .handoff
+                .as_ref()
+                .map(|handoff| handoff.status.as_str()),
+            Some("provider-resource-deleted")
+        );
+        {
+            let recorded = requests.lock().expect("hcloud requests");
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].method, "DELETE");
+            assert_eq!(recorded[0].path, "/servers/4242");
+            assert!(recorded[0].body.is_empty());
+        }
+
+        let (replayed, replay_already_absent) =
+            execute_hetzner_cleanup_job(&state, deleted.clone())
+                .await
+                .expect("cleanup replay is idempotent");
+        assert!(replay_already_absent);
+        assert_eq!(replayed, deleted);
+        assert_eq!(requests.lock().expect("hcloud requests").len(), 1);
+
+        let json = serde_json::to_string(&deleted).expect("cleanup job serializes");
+        assert!(!json.contains("test-hcloud-token"));
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn hetzner_cleanup_accepts_provider_already_absent() {
+        let (api, requests) =
+            hcloud_mock_server("404 Not Found", r#"{"error":"not_found"}"#, true).await;
+        let (state, token_path) = test_hcloud_state(api);
+        let job = tracked_hcloud_cleanup_job(&state, "4243");
+
+        let (deleted, already_absent) = execute_hetzner_cleanup_job(&state, job)
+            .await
+            .expect("provider absence is a proven cleanup result");
+        assert!(already_absent);
+        assert_eq!(deleted.state, ProvisioningJobState::Complete);
+        assert_eq!(deleted.provider_resources[0].state, "deleted");
+        assert_eq!(requests.lock().expect("hcloud requests").len(), 1);
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn hetzner_cleanup_uncertain_results_remain_recoverable() {
+        for (status, body) in [
+            ("500 Internal Server Error", r#"{"error":"temporary"}"#),
+            ("200 OK", r#"{"unexpected":true}"#),
+        ] {
+            let (api, requests) = hcloud_mock_server(status, body, true).await;
+            let (state, token_path) = test_hcloud_state(api);
+            let job = tracked_hcloud_cleanup_job(&state, "4244");
+            let failure = execute_hetzner_cleanup_job(&state, job)
+                .await
+                .expect_err("uncertain response fails closed");
+
+            assert_eq!(failure.error, ProvisioningCleanupError::ProviderUncertain);
+            let persisted = failure.job.expect("cleanup-needed job returned");
+            assert_eq!(persisted.state, ProvisioningJobState::CleanupNeeded);
+            assert_eq!(persisted.provider_resources[0].state, "created");
+            assert!(persisted
+                .progress
+                .last()
+                .expect("safe recovery progress")
+                .message
+                .contains("deletion was not proven"));
+            assert_eq!(requests.lock().expect("hcloud requests").len(), 1);
+            let json = serde_json::to_string(&persisted).expect("job serializes");
+            assert!(!json.contains("test-hcloud-token"));
+            assert!(!json.to_ascii_lowercase().contains("bearer "));
+            assert!(!json.to_ascii_lowercase().contains("token="));
+            let _ = std::fs::remove_file(token_path);
+        }
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reserve unavailable provider address");
+        let address = listener.local_addr().expect("provider address");
+        drop(listener);
+        let (state, token_path) = test_hcloud_state(format!("http://{address}"));
+        let job = tracked_hcloud_cleanup_job(&state, "4245");
+        let failure = execute_hetzner_cleanup_job(&state, job)
+            .await
+            .expect_err("network uncertainty fails closed");
+        assert_eq!(failure.error, ProvisioningCleanupError::ProviderUncertain);
+        assert_eq!(
+            failure.job.expect("persisted job").state,
+            ProvisioningJobState::CleanupNeeded
+        );
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn hetzner_cleanup_rejects_ambiguous_or_disabled_jobs_without_request() {
+        let (api, requests) = hcloud_mock_server("204 No Content", "", true).await;
+        let (mut state, token_path) = test_hcloud_state(api);
+        let job = tracked_hcloud_cleanup_job(&state, "4246");
+        state.provider_runtime.hetzner_cloud.execute_enabled = false;
+        let disabled = execute_hetzner_cleanup_job(&state, job)
+            .await
+            .expect_err("disabled runtime fails closed");
+        assert_eq!(disabled.error, ProvisioningCleanupError::RuntimeDisabled);
+        assert!(requests.lock().expect("hcloud requests").is_empty());
+
+        state.provider_runtime.hetzner_cloud.execute_enabled = true;
+        let job = tracked_hcloud_cleanup_job(&state, "4247");
+        let second = ProvisioningProviderResource {
+            provider_id: "4248".to_string(),
+            name: "unexpected-second-server".to_string(),
+            ..job.provider_resources[0].clone()
+        };
+        let ambiguous = state
+            .provisioning_jobs
+            .transition_provider_resource(
+                &job.id,
+                ProvisioningJobState::WaitingForHeartbeat,
+                "A second resource was recorded for fail-closed testing.",
+                second,
+                None,
+                1_700_000_022,
+            )
+            .expect("ambiguous test job persists");
+        let failure = execute_hetzner_cleanup_job(&state, ambiguous)
+            .await
+            .expect_err("ambiguous resources fail closed");
+        assert_eq!(failure.error, ProvisioningCleanupError::ResourceAmbiguous);
+        assert!(requests.lock().expect("hcloud requests").is_empty());
+
+        let invalid = tracked_hcloud_cleanup_job(&state, "not-a-number");
+        let failure = execute_hetzner_cleanup_job(&state, invalid)
+            .await
+            .expect_err("non-numeric provider id fails closed");
+        assert_eq!(failure.error, ProvisioningCleanupError::ResourceInvalid);
+
+        let mut unproven_deleted = tracked_hcloud_cleanup_job(&state, "4249");
+        unproven_deleted.provider_resources[0].state = "deleted".to_string();
+        let failure = execute_hetzner_cleanup_job(&state, unproven_deleted)
+            .await
+            .expect_err("unproven deleted state fails closed");
+        assert_eq!(failure.error, ProvisioningCleanupError::ResourceInvalid);
+        assert!(requests.lock().expect("hcloud requests").is_empty());
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn cleanup_endpoint_requires_explicit_confirmation() {
+        let state = report_test_state(false);
+        let response = cleanup_provisioning_job(
+            State(state),
+            HeaderMap::new(),
+            AxumPath("missing-job".to_string()),
+            Json(ProvisioningCleanupRequest { confirm: false }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cleanup_endpoint_deletes_confirmed_tracked_resource() {
+        let (api, requests) = hcloud_mock_server("204 No Content", "", true).await;
+        let (state, token_path) = test_hcloud_state(api);
+        let job = tracked_hcloud_cleanup_job(&state, "4250");
+        let response = cleanup_provisioning_job(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath(job.id.clone()),
+            Json(ProvisioningCleanupRequest { confirm: true }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let persisted = state
+            .provisioning_jobs
+            .get(&job.id)
+            .expect("cleanup endpoint persists job");
+        assert_eq!(persisted.state, ProvisioningJobState::Complete);
+        assert_eq!(
+            persisted.terminal_outcome,
+            Some(ProvisioningTerminalOutcome::RolledBack)
+        );
+        assert_eq!(persisted.provider_resources[0].state, "deleted");
+        assert_eq!(requests.lock().expect("hcloud requests").len(), 1);
+        let _ = std::fs::remove_file(token_path);
     }
 
     #[tokio::test]

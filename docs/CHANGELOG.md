@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## 0.1.17 - 2026-07-10
+
+- Add an auth-guarded, explicitly confirmed cleanup endpoint that can delete only the single validated Hetzner server persisted on an eligible setup job.
+- Persist proven deletion as an idempotent, rollback-compatible terminal outcome while uncertain provider results remain cleanup-needed with safe recovery guidance.
+- Replace the provider-created result with the imagegen-designed focused flow: one primary setup action, collapsed recovery options, confirmation-gated deletion, and clear deleted state.
+- Keep pending and cleanup-needed setup jobs reopenable from fleet cards and rows after a browser restart.
+
 ## 0.1.16 - 2026-07-10
 
 - Deliver NixOS beacon token files through a per-service systemd credential so the root-only source remains protected while the unprivileged beacon can authenticate.

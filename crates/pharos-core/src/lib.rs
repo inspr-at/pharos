@@ -724,6 +724,16 @@ impl ProvisioningJobState {
     }
 }
 
+/// Why a provisioning job reached its terminal `Complete` state. This is an
+/// additive field so older Pharos rollback images can still read newer job
+/// stores and safely ignore the richer outcome.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvisioningTerminalOutcome {
+    Provisioned,
+    RolledBack,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackupSetupIntent {
@@ -1092,6 +1102,8 @@ pub struct ProvisioningJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing_host_context: Option<ExistingHostSetupContext>,
     pub state: ProvisioningJobState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<ProvisioningTerminalOutcome>,
     pub created_at: UnixSeconds,
     pub updated_at: UnixSeconds,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2454,6 +2466,7 @@ mod tests {
             heartbeat_interval_secs: Some(60),
             existing_host_context: None,
             state: ProvisioningJobState::Planning,
+            terminal_outcome: None,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
             handoff: Some(ProvisioningHandoff {
@@ -2490,6 +2503,23 @@ mod tests {
             progress: vec![entry],
         };
         job.validate_contract().expect("job contract is valid");
+        let active_json = serde_json::to_string(&job).expect("active job serializes");
+        assert!(!active_json.contains("terminal_outcome"));
+
+        let mut rolled_back = job.clone();
+        rolled_back.state = ProvisioningJobState::Complete;
+        rolled_back.terminal_outcome = Some(ProvisioningTerminalOutcome::RolledBack);
+        let rolled_back_json =
+            serde_json::to_string(&rolled_back).expect("rolled-back job serializes");
+        assert!(rolled_back_json.contains(r#""terminal_outcome":"rolled-back""#));
+        #[derive(Deserialize)]
+        struct LegacyProvisioningJobView {
+            state: ProvisioningJobState,
+        }
+        let legacy_view: LegacyProvisioningJobView =
+            serde_json::from_str(&rolled_back_json).expect("legacy view ignores additive outcome");
+        assert_eq!(legacy_view.state, ProvisioningJobState::Complete);
+
         let setup_intent = job.setup_intent.as_ref().expect("setup intent");
         assert_eq!(setup_intent.backup_label(), "managed elsewhere");
         assert_eq!(
