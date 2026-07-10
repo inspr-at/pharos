@@ -27,6 +27,14 @@ jobs:
         run: cargo deny check
       - name: shell syntax
         run: bash -n scripts/install-pharos-beacon-systemd.sh
+      - name: self-host compose syntax
+        run: |
+          PHAROS_OIDC_ISSUER=https://issuer.example \
+          PHAROS_OIDC_CLIENT_ID=pharos \
+          PHAROS_OIDC_REDIRECT_URI=https://pharos.example/auth/callback \
+          PHAROS_ALLOWED_OPERATORS=alice \
+          PHAROS_REGISTRATION_TOKEN=placeholder \
+          docker compose -f docker-compose.selfhost.yml config >/dev/null
       - name: build
         run: cargo build --all --locked
       - name: test

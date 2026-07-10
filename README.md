@@ -97,6 +97,33 @@ The optional `pharos-beacon` profile reports to the local `pharosd` service.
 For strict-token local tests, register a host and provide `PHAROS_TOKEN` from an
 untracked local environment; never commit token values.
 
+### Self-Host Docker Compose
+
+`docker-compose.selfhost.yml` is the reusable self-host control-plane template.
+It runs the released GHCR image, persists `/data/pharos.json`, requires OIDC for
+human routes, requires an operator allowlist, and keeps beacon ingestion
+strict-token gated from first start. Keep all runtime values in your shell, host
+secret manager, or orchestrator. Do not commit a populated env file.
+
+Minimum first-run values:
+
+```bash
+export PHAROS_OIDC_ISSUER=https://issuer.example
+export PHAROS_OIDC_CLIENT_ID=pharos
+export PHAROS_OIDC_REDIRECT_URI=https://pharos.example/auth/callback
+export PHAROS_ALLOWED_OPERATORS=alice
+read -rsp 'Pharos registration token: ' PHAROS_REGISTRATION_TOKEN; echo
+export PHAROS_REGISTRATION_TOKEN
+export PHAROS_BIND=127.0.0.1:8080
+docker compose -f docker-compose.selfhost.yml config
+docker compose -f docker-compose.selfhost.yml up -d
+```
+
+Put a reverse proxy or tailnet endpoint in front of `PHAROS_BIND`; expose only
+HTTPS to users. The registration token is only for initial beacon registration.
+After moving to Janus sidecars, set `PHAROS_BEACON_TOKEN_MODE=janus` and provide
+the private hash sidecar mount/env from your secret-rendering system.
+
 ### Native NixOS beacon
 
 The flake exports a package and NixOS module for replacing the interim Docker

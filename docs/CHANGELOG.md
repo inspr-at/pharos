@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.11 - 2026-07-10
+
+- Added a separate self-host Docker Compose template for running the released Pharos image outside the Markus-owned nixcfg deployment.
+- Documented the minimum self-host runtime environment, OIDC/operator gate, strict beacon token gate, and first-run config validation.
+- Kept committed self-host config value-free: runtime tokens and tenant-specific values stay in the operator environment or secret manager.
+
 ## 0.1.10 - 2026-07-10
 
 - Added access intent to setup jobs so new-host and existing-host onboarding record who should see the host after first heartbeat.

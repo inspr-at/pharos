@@ -1,0 +1,41 @@
+# Self-host Pharos control plane template.
+#
+# This is intentionally separate from docker-compose.yml, which is only for
+# local development. Keep runtime values in your shell, host secret manager, or
+# orchestrator. Do not commit raw registration tokens or OIDC callback values
+# that are tenant-specific.
+
+name: pharos-selfhost
+
+services:
+  pharosd:
+    image: ghcr.io/markus-barta/pharos/pharosd:${PHAROS_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      PHAROS_ADDR: 0.0.0.0:8080
+      PHAROS_DB: /data/pharos.json
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Human routes. Pharos uses public-client OIDC with PKCE.
+      PHAROS_OIDC_ISSUER: ${PHAROS_OIDC_ISSUER:?set PHAROS_OIDC_ISSUER}
+      PHAROS_OIDC_CLIENT_ID: ${PHAROS_OIDC_CLIENT_ID:?set PHAROS_OIDC_CLIENT_ID}
+      PHAROS_OIDC_REDIRECT_URI: ${PHAROS_OIDC_REDIRECT_URI:?set PHAROS_OIDC_REDIRECT_URI}
+      PHAROS_ALLOWED_OPERATORS: ${PHAROS_ALLOWED_OPERATORS:?set PHAROS_ALLOWED_OPERATORS}
+
+      # Machine routes. The value must come from runtime environment, not git.
+      PHAROS_REGISTRATION_TOKEN: ${PHAROS_REGISTRATION_TOKEN:?set PHAROS_REGISTRATION_TOKEN}
+      PHAROS_REQUIRE_BEACON_TOKEN: "1"
+      PHAROS_BEACON_TOKEN_MODE: ${PHAROS_BEACON_TOKEN_MODE:-local}
+
+      # Optional declared-host manifest paths, for example:
+      # PHAROS_MANIFEST_PATHS=/manifests/host-a.json:/manifests/host-b.json
+      PHAROS_MANIFEST_PATHS: ${PHAROS_MANIFEST_PATHS:-}
+    ports:
+      - "${PHAROS_BIND:-127.0.0.1:8080}:8080"
+    volumes:
+      - pharos_data:/data
+      # Optional manifest mount for declared hosts:
+      # - ./manifests:/manifests:ro
+
+volumes:
+  pharos_data: {}
