@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.24 - 2026-07-12
+
+- Keep Backup and Settings as centered icon-only host-card actions at rest, with smooth label disclosure on hover and keyboard focus while preserving state tint and pending-change affordances.
+- Keep the Settings glyph stable when a change is waiting, remove the duplicate pending marker, and make the single plain-language waiting line open the correct host settings directly.
+- Start the heartbeat pulse inside the visible history, just before its oldest mark, and emphasize the segment leading to the current heartbeat without clipping the card.
+
 ## 0.1.23 - 2026-07-11
 
 - Add a versioned, sanitized kernel-posture report that compares the running kernel with the current NixOS generation without transmitting store paths or opaque identifiers.
