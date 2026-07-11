@@ -84,9 +84,12 @@ PHAROS_MANIFEST_PATHS=/etc/hostdash-config/hsb8.json cargo run -p pharosd
 
 Agora can request the fixed `inspr.pharos.host-preferences.v1` preference set
 through nixcfg's guarded `pharos-host-settings.yml` workflow. This integration
-is off by default. Enable it only with a fine-grained GitHub token that has
-**Actions: write** for the `markus-barta/nixcfg` repository and no repository
-contents or pull-request write permission:
+is off by default. The current production exception uses a dedicated classic
+GitHub PAT with no configured expiration and only the top-level `repo` scope.
+GitHub requires that broad scope to dispatch a workflow in a private repository
+with a classic PAT, so never reuse this credential for interactive Git, pull
+requests, merges, or another service. Replace it with Janus-brokered GitHub App
+installation tokens when JANUS-275 lands:
 
 ```bash
 export PHAROS_NIXCFG_DISPATCH_ENABLED=1
@@ -96,8 +99,11 @@ export PHAROS_HOST_PREFERENCES_PATH=/nixcfg/modules/pharos-host-preferences.json
 
 Mount the token as a private, read-only runtime file; never place its value in
 Compose, an environment variable, logs, or the host store. pharosd calls only
-the fixed workflow-dispatch endpoint. The workflow owns validation, commit,
-pull request, checks, and ordinary merge; pharosd has no git or merge logic.
+the fixed workflow-dispatch endpoint. The workflow's scoped `GITHUB_TOKEN` owns
+validation, commit, pull request, checks, and ordinary merge; pharosd has no git
+or merge logic. Treat the classic PAT as a temporary, explicitly reviewed
+privilege exception even though Pharos deliberately uses only the narrow API
+operation.
 
 Mount nixcfg's complete host-preference registry read-only at
 `PHAROS_HOST_PREFERENCES_PATH`. Pharos validates the exact registry contract
