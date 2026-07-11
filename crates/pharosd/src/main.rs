@@ -40,14 +40,14 @@ use pharos_core::{
     ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
     ExistingHostPreflightSummary, ExistingHostSetupContext, Host, HostLocation, HostLocationSource,
     HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse, HostReport,
-    Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
-    ManifestStatusSource, NixFreshness, PreflightCheckState, ProvisioningBackupProposal,
-    ProvisioningBackupProposalKind, ProvisioningBackupSecretFile, ProvisioningHandoff,
-    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningProviderResource,
-    ProvisioningSetupIntent, ProvisioningTerminalOutcome, SecretOwner, ServiceObservation,
-    ServiceObservationState, SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
-    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
-    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    KernelPosture, KernelPostureState, Liveness, LocationSetupIntent, ManifestLocationMode,
+    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
+    ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
+    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
+    ProvisioningProviderResource, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
+    SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
+    EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
+    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3283,7 +3283,7 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .search input{width:100%;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px 0 32px;outline:none}
 .search input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:18px}
-.card{--state:var(--wait);position:relative;min-height:264px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:hidden}
+.card{--state:var(--wait);position:relative;min-height:264px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:visible}
 .card:before{content:"";position:absolute;left:16px;right:16px;top:58px;height:1px;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent);pointer-events:none}
 .onboard-tile{appearance:none;position:relative;min-height:264px;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px;border:1px dashed rgba(214,155,49,.48);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.82),rgba(240,250,250,.74));box-shadow:0 14px 32px rgba(45,75,95,.05),inset 0 0 0 1px rgba(255,255,255,.52);color:var(--ink);text-align:left;cursor:pointer;overflow:hidden}
 .onboard-tile:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 72% 22%,rgba(214,155,49,.12),transparent 34%),linear-gradient(160deg,transparent 48%,rgba(21,158,153,.08));pointer-events:none}
@@ -3313,7 +3313,11 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .reason{--reason-color:var(--muted);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;gap:8px;min-height:22px;margin:-2px 0 10px;color:var(--muted);font-size:12px;line-height:1.25}
 .reason:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--reason-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--reason-color) 12%,transparent)}
 .reason.ok{--reason-color:var(--live)}.reason.warn{--reason-color:var(--stale)}.reason.down{--reason-color:var(--down)}.reason.wait{--reason-color:var(--wait)}.reason.self{--reason-color:var(--sun)}
-.reason span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reason[hidden]{display:none}.reason span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kernel-slot{position:relative;z-index:20;min-height:20px;margin:-4px 0 9px}.kernel-slot[hidden]{display:none}
+.kernel-posture{position:relative;color:#9a5b00;font-size:11px}.kernel-posture summary{display:inline-flex;align-items:center;gap:6px;min-height:20px;list-style:none;color:#9a5b00;font-weight:760;cursor:pointer}.kernel-posture summary::-webkit-details-marker{display:none}.kernel-posture summary .ico{width:13px;height:13px;transition:transform .18s ease}.kernel-posture[open] summary .ico{transform:rotate(35deg)}.kernel-posture summary:hover,.kernel-posture summary:focus-visible{color:#734500;outline:0;text-decoration:underline;text-underline-offset:3px}
+.kernel-detail{position:absolute;left:0;top:calc(100% + 7px);z-index:80;width:min(272px,calc(100vw - 44px));padding:12px 13px;border:1px solid rgba(214,155,49,.42);border-radius:7px;background:#fffdf8;box-shadow:0 18px 38px rgba(71,74,65,.16),0 0 0 4px rgba(214,155,49,.06);color:var(--ink);font-size:11px;line-height:1.4}.kernel-detail:before{content:"";position:absolute;left:13px;top:-5px;width:8px;height:8px;border-left:1px solid rgba(214,155,49,.42);border-top:1px solid rgba(214,155,49,.42);background:#fffdf8;transform:rotate(45deg)}.kernel-detail>strong{display:block;margin:0 0 5px;color:#8b5700;font-size:12px}.kernel-detail p{margin:0 0 9px;color:#435e74}.kernel-detail dl{display:grid;gap:4px;margin:0 0 9px}.kernel-detail dl div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.kernel-detail dt{color:var(--muted)}.kernel-detail dd{margin:0;color:var(--ink);font-weight:720}.kernel-detail .kernel-boundary{margin:0;padding-top:7px;border-top:1px solid rgba(214,226,234,.74);color:var(--muted)}
+.card:has(.kernel-posture[open]){z-index:60}.list tr:has(.kernel-posture[open]){position:relative;z-index:60}.list .kernel-slot{min-width:118px;margin:0}.list .kernel-detail{left:auto;right:0}
 .mute-note{display:flex;align-items:center;gap:6px;min-height:18px;margin:-7px 0 9px;color:#7b6b56;font-size:11px}.mute-note[hidden]{display:none}.mute-note .ico{width:13px;height:13px;color:var(--sun)}.mute-note span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.list .mute-note{margin:4px 0 0}
 .fresh{min-height:52px;margin:4px 0 11px;font-size:13px;line-height:1.45;color:var(--ink)}
 .fresh-row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:10px;min-height:23px;border-bottom:1px solid rgba(214,226,234,.58)}
@@ -3680,6 +3684,35 @@ function freshHtml(f){
   const commits=freshValue(f.commits_behind,'0');
   if(age.klass==='warn')age.value=age.value+'d';
   return freshRow('Flake.lock age',age.value,age.klass)+freshRow('Commits behind',commits.value,commits.klass);
+}
+function kernelNeedsRestart(kernel){
+  return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
+}
+function kernelSearch(kernel){
+  return kernelNeedsRestart(kernel)?'restart needed kernel reboot required '+kernel.running_version+' '+kernel.expected_version:'';
+}
+function updateKernel(surface,host){
+  const slot=surface.querySelector('[data-kernel-slot]');
+  if(!slot)return;
+  const required=kernelNeedsRestart(host.kernel);
+  slot.hidden=!required;
+  const reason=surface.querySelector('[data-reason]');
+  if(reason)reason.hidden=required;
+  const details=slot.querySelector('[data-kernel-posture]');
+  if(!required){
+    if(details)details.open=false;
+    return;
+  }
+  const healthy=host.liveness==='live';
+  const explanation=healthy
+    ? String(host.name||'This host')+' is healthy. A newer system kernel is ready for its next planned restart.'
+    : String(host.name||'This host')+' has a newer system kernel ready for its next planned restart.';
+  const explanationNode=slot.querySelector('[data-kernel-explanation]');
+  const running=slot.querySelector('[data-kernel-running]');
+  const expected=slot.querySelector('[data-kernel-expected]');
+  if(explanationNode)explanationNode.textContent=explanation;
+  if(running)running.textContent=host.kernel.running_version;
+  if(expected)expected.textContent=host.kernel.expected_version;
 }
 function freshnessAttention(f){
   if(!f||f.applicable===false)return null;
@@ -5302,10 +5335,11 @@ async function refresh(reason='manual'){
         const muted=mutedInfo(h.preferences);
         card.dataset.sev=String(attention.rank ?? sevFor(live));
         card.dataset.last=h.last_seen ?? 0;
-        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+muted.search).toLowerCase().trim();
+        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+kernelSearch(h.kernel)+' '+muted.search).toLowerCase().trim();
         const word=card.querySelector('[data-status-word]');
         if(word)word.textContent=words[h.liveness]||h.liveness;
         setReason(card,attention);
+        updateKernel(card,h);
         updateMuted(card,muted);
         updatePreferenceState(card,h);
         const fresh=card.querySelector('[data-fresh]');
@@ -7208,6 +7242,7 @@ fn hosts_payload(
             let attention = attention_reason(
                 live,
                 &h.freshness,
+                h.kernel.as_ref(),
                 &h.service_observations,
                 &h.preferences,
             );
@@ -7234,6 +7269,7 @@ fn hosts_payload(
                 "location": location_payload(&location),
                 "freshness": h.freshness,
                 "freshness_tldr": freshness_tldr,
+                "kernel": h.kernel,
                 "service_observations": h.service_observations,
                 "service_observations_summary": service_observations_summary(&h.service_observations),
                 "backup_observations": h.backup_observations,
@@ -7332,6 +7368,7 @@ fn runtime_overlay(
             "location": location_payload(&location),
             "freshness": null,
             "freshness_tldr": null,
+            "kernel": null,
             "service_observations": [],
             "service_observations_summary": service_observations_summary(&[]),
             "backup_observations": [],
@@ -7352,6 +7389,7 @@ fn runtime_overlay(
         "location": location_payload(&location),
         "freshness": host.freshness,
         "freshness_tldr": host.freshness.tldr(),
+        "kernel": host.kernel,
         "service_observations": host.service_observations,
         "service_observations_summary": service_observations_summary(&host.service_observations),
         "backup_observations": host.backup_observations,
@@ -7707,6 +7745,43 @@ fn freshness_markup(freshness: &NixFreshness) -> String {
         "{}{}",
         freshness_row("Flake.lock age", &age, age_class),
         freshness_row("Commits behind", &commits, commits_class)
+    )
+}
+
+fn kernel_reboot_required(kernel: Option<&KernelPosture>) -> Option<&KernelPosture> {
+    kernel.filter(|posture| posture.state == KernelPostureState::RebootRequired)
+}
+
+fn kernel_posture_markup(kernel: Option<&KernelPosture>, host: &str, live: Liveness) -> String {
+    let reboot = kernel_reboot_required(kernel);
+    let explanation = reboot
+        .map(|_| {
+            if live == Liveness::Live {
+                format!(
+                    "{} is healthy. A newer system kernel is ready for its next planned restart.",
+                    host
+                )
+            } else {
+                format!(
+                    "{} has a newer system kernel ready for its next planned restart.",
+                    host
+                )
+            }
+        })
+        .unwrap_or_default();
+    let running = reboot
+        .and_then(|posture| posture.running_version.as_deref())
+        .unwrap_or_default();
+    let expected = reboot
+        .and_then(|posture| posture.expected_version.as_deref())
+        .unwrap_or_default();
+    let hidden = if reboot.is_none() { " hidden" } else { "" };
+    format!(
+        r#"<div class="kernel-slot" data-kernel-slot{hidden}><details class="kernel-posture" data-kernel-posture><summary>{icon}<span>Restart needed</span></summary><div class="kernel-detail"><strong>Restart needed</strong><p data-kernel-explanation>{explanation}</p><dl><div><dt>Running</dt><dd data-kernel-running>{running}</dd></div><div><dt>Ready after restart</dt><dd data-kernel-expected>{expected}</dd></div></dl><p class="kernel-boundary">Pharos will not restart this host.</p></div></details></div>"#,
+        icon = icons::REFRESH_CW,
+        explanation = html_escape(&explanation),
+        running = html_escape(running),
+        expected = html_escape(expected),
     )
 }
 
@@ -8622,6 +8697,7 @@ fn service_probe_id(service: &ManifestService) -> String {
 fn attention_reason(
     live: Liveness,
     freshness: &NixFreshness,
+    kernel: Option<&KernelPosture>,
     observations: &[ServiceObservation],
     preferences: &HostPreferences,
 ) -> AttentionReason {
@@ -8641,9 +8717,17 @@ fn attention_reason(
             level: "wait",
             rank: 2,
         },
-        Liveness::Down | Liveness::Live => (!preferences.alerts.suppress_nix_freshness)
-            .then(|| freshness_attention_reason(freshness))
-            .flatten()
+        Liveness::Down | Liveness::Live => kernel_reboot_required(kernel)
+            .map(|_| AttentionReason {
+                label: "restart needed".to_string(),
+                level: "warn",
+                rank: 2,
+            })
+            .or_else(|| {
+                (!preferences.alerts.suppress_nix_freshness)
+                    .then(|| freshness_attention_reason(freshness))
+                    .flatten()
+            })
             .or_else(|| {
                 service_observation_attention_reason(
                     observations,
@@ -8663,11 +8747,12 @@ fn attention_reason(
     }
 }
 
-fn reason_markup(reason: &AttentionReason) -> String {
+fn reason_markup(reason: &AttentionReason, hidden: bool) -> String {
+    let hidden = if hidden { " hidden" } else { "" };
     format!(
-        r#"<div class="reason {}" data-reason><span>{}</span></div>"#,
+        r#"<div class="reason {}" data-reason{hidden}><span>{}</span></div>"#,
         html_escape(reason.level),
-        html_escape(&reason.label)
+        html_escape(&reason.label),
     )
 }
 
@@ -10084,6 +10169,7 @@ fn map_hosts(
                 attention_reason(
                     live,
                     &host.freshness,
+                    host.kernel.as_ref(),
                     &host.service_observations,
                     &host.preferences,
                 )
@@ -10287,6 +10373,28 @@ fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str, String, St
         ));
     }
     None
+}
+
+fn kernel_alert(host: &Host, now: i64) -> Option<AlertItem> {
+    let kernel = kernel_reboot_required(host.kernel.as_ref())?;
+    let running = kernel.running_version.as_deref()?;
+    let expected = kernel.expected_version.as_deref()?;
+    Some(AlertItem {
+        level: "warning",
+        host: host.name.clone(),
+        role: host.role.clone(),
+        issue: "Restart needed".to_string(),
+        detail: format!(
+            "Running kernel {running}; kernel {expected} is ready after the next planned restart."
+        ),
+        source: "kernel",
+        seen: format!(
+            "{} ago",
+            duration_label(now.saturating_sub(kernel.observed_at))
+        ),
+        next_action: "Plan a controlled restart when the host's workload allows it.".to_string(),
+        sort_time: kernel.observed_at,
+    })
 }
 
 fn service_alert(host: &Host, observation: &ServiceObservation, now: i64) -> Option<AlertItem> {
@@ -10655,6 +10763,10 @@ fn alert_items(
             }
         }
 
+        if let Some(alert) = kernel_alert(host, now) {
+            alerts.push(alert);
+        }
+
         for observation in &host.service_observations {
             if let Some(alert) = service_alert(host, observation, now) {
                 alerts.push(alert);
@@ -10837,7 +10949,7 @@ fn render_alert_row(group: &AlertGroup) -> String {
 
 fn render_alert_rows(groups: &[AlertGroup]) -> String {
     if groups.is_empty() {
-        return r#"<section class="ops-empty"><h2>All clear</h2><p>No host, backup, freshness, service, probe, or manifest alert needs attention right now.</p></section>"#.to_string();
+        return r#"<section class="ops-empty"><h2>All clear</h2><p>No host, backup, freshness, kernel, service, probe, or manifest alert needs attention right now.</p></section>"#.to_string();
     }
     groups.iter().map(render_alert_row).collect()
 }
@@ -10885,7 +10997,7 @@ fn render_alerts(
     let groups = alert_groups(&alerts);
     let rows = render_alert_rows(&groups);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, backup, freshness, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, backup, freshness, kernel, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "alerts"),
         header = page_header("Alerts", "Needs attention", now),
         summary = ops_summary_metrics(&alerts, runtime.hosts),
@@ -11352,6 +11464,25 @@ fn activity_events(
             }
         }
 
+        if let Some(kernel) = kernel_reboot_required(host.kernel.as_ref()) {
+            if let (Some(running), Some(expected)) = (
+                kernel.running_version.as_deref(),
+                kernel.expected_version.as_deref(),
+            ) {
+                events.push(ActivityEvent::new(
+                    kernel.observed_at,
+                    host.name.clone(),
+                    "warning",
+                    "kernel",
+                    "Restart needed",
+                    format!(
+                        "Running kernel {running}; kernel {expected} is ready after restart. Pharos will not restart this host."
+                    ),
+                    "kernel",
+                ));
+            }
+        }
+
         for observation in &host.service_observations {
             if is_nix_freshness_observation(observation) {
                 continue;
@@ -11433,8 +11564,9 @@ fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
     let service = activity_source_count(events, "service");
     let backup = activity_source_count(events, "backup");
     let setup = activity_source_count(events, "setup");
+    let kernel = activity_source_count(events, "kernel");
     format!(
-        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="setup" aria-pressed="false"><b>{setup}</b><span>setup</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
+        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="setup" aria-pressed="false"><b>{setup}</b><span>setup</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="kernel" aria-pressed="false"><b>{kernel}</b><span>kernel</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
         total = events.len()
     )
 }
@@ -11451,12 +11583,13 @@ fn activity_filter_bar(events: &[ActivityEvent]) -> String {
         .filter(|event| event.level == "warning")
         .count();
     format!(
-        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="setup" data-ops-filter="setup" aria-pressed="false">Setup {setup}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
+        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="setup" data-ops-filter="setup" aria-pressed="false">Setup {setup}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="kernel" data-ops-filter="kernel" aria-pressed="false">Kernel {kernel}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
         total = events.len(),
         heartbeat = activity_source_count(events, "heartbeat"),
         freshness = activity_source_count(events, "freshness"),
         service = activity_source_count(events, "service"),
         backup = activity_source_count(events, "backup"),
+        kernel = activity_source_count(events, "kernel"),
     )
 }
 
@@ -11483,7 +11616,7 @@ fn render_activity_row(event: &ActivityEvent) -> String {
 
 fn activity_rows(events: &[ActivityEvent]) -> String {
     if events.is_empty() {
-        return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, backup changes, freshness changes, service observations, and config events here.</p></section>"#.to_string();
+        return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, backup changes, freshness changes, kernel posture, service observations, and config events here.</p></section>"#.to_string();
     }
     events.iter().take(80).map(render_activity_row).collect()
 }
@@ -11512,7 +11645,7 @@ fn render_activity(
     );
     let rows = activity_rows(&events);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
         header = page_header("Activity", "Operational timeline", now),
         summary = activity_summary_metrics(&events),
@@ -12262,8 +12395,14 @@ fn render_home(
     let mut sorted: Vec<&Host> = hosts.iter().collect();
     sorted.sort_by_key(|h| {
         let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        let rank =
-            attention_reason(live, &h.freshness, &h.service_observations, &h.preferences).rank;
+        let rank = attention_reason(
+            live,
+            &h.freshness,
+            h.kernel.as_ref(),
+            &h.service_observations,
+            &h.preferences,
+        )
+        .rank;
         (rank, h.name.clone())
     });
 
@@ -12282,9 +12421,18 @@ fn render_home(
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
         let fresh = freshness_markup(&h.freshness);
-        let attention =
-            attention_reason(live, &h.freshness, &h.service_observations, &h.preferences);
-        let reason = reason_markup(&attention);
+        let attention = attention_reason(
+            live,
+            &h.freshness,
+            h.kernel.as_ref(),
+            &h.service_observations,
+            &h.preferences,
+        );
+        let reason = reason_markup(
+            &attention,
+            kernel_reboot_required(h.kernel.as_ref()).is_some(),
+        );
+        let kernel = kernel_posture_markup(h.kernel.as_ref(), &h.name, live);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
         let backup_chip = backup_chip_markup(&backup, &h.name);
@@ -12310,6 +12458,9 @@ fn render_home(
         }
         if let Some(status) = &protection {
             search_parts.push(status.search_text().to_lowercase());
+        }
+        if kernel_reboot_required(h.kernel.as_ref()).is_some() {
+            search_parts.push("restart needed kernel reboot required".to_string());
         }
         if h.preferences.alerts.suppress_down
             || h.preferences.alerts.suppress_backup
@@ -12429,12 +12580,12 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{settings_action}</div></header>{settings_note}{reason}{muted}<div class="fresh" data-fresh>{fresh}</div>{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{settings_action}</div></header>{settings_note}{reason}{kernel}{muted}<div class="fresh" data-fresh>{fresh}</div>{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}{muted}</td><td>{backup_list}{protection_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}{kernel}{muted}</td><td>{backup_list}{protection_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -12865,11 +13016,21 @@ mod tests {
             inbound_rtt: None,
             location: None,
             freshness: NixFreshness::default(),
+            kernel: None,
             service_observations: vec![],
             backup_observations,
             preferences: Default::default(),
             requested_preferences: None,
         }
+    }
+
+    fn reboot_required_kernel(observed_at: i64) -> KernelPosture {
+        KernelPosture::observed(
+            true,
+            Some("6.18.26".to_string()),
+            Some("7.0.14".to_string()),
+            observed_at,
+        )
     }
 
     fn runtime<'a>(hosts: &'a [Host], jobs: &'a [ProvisioningJob]) -> RuntimeSnapshot<'a> {
@@ -13121,6 +13282,7 @@ mod tests {
                     applicable: true,
                     ..Default::default()
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -13142,6 +13304,7 @@ mod tests {
                     flake_lock_age_days: Some(1),
                     commits_behind: Some(3),
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -13163,6 +13326,7 @@ mod tests {
                     flake_lock_age_days: Some(1),
                     commits_behind: Some(3),
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -13273,6 +13437,7 @@ mod tests {
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
             preferences: Default::default(),
@@ -13338,6 +13503,7 @@ mod tests {
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
             preferences: Default::default(),
@@ -13463,6 +13629,7 @@ mod tests {
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
             preferences: Default::default(),
@@ -13493,6 +13660,80 @@ mod tests {
             1
         );
         assert!(!payload.to_string().contains("not-rendered-token-hash"));
+    }
+
+    #[test]
+    fn hosts_payload_and_fleet_expose_only_actionable_kernel_posture() {
+        let mut staged = host_with_backups("csb0", 970, vec![]);
+        staged.kernel = Some(reboot_required_kernel(965));
+
+        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), 1000);
+        assert_eq!(payload["hosts"][0]["kernel"]["state"], "reboot_required");
+        assert_eq!(payload["hosts"][0]["kernel"]["running_version"], "6.18.26");
+        assert_eq!(payload["hosts"][0]["kernel"]["expected_version"], "7.0.14");
+        assert_eq!(payload["hosts"][0]["attention"]["label"], "restart needed");
+        assert_eq!(payload["hosts"][0]["attention"]["rank"], 2);
+
+        let html = render_home(
+            runtime(&[staged], &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(html.contains(r#"<div class="kernel-slot" data-kernel-slot><details"#));
+        assert!(html.contains("Restart needed"));
+        assert!(html.contains("csb0 is healthy"));
+        assert!(html.contains("Ready after restart"));
+        assert!(html.contains("Pharos will not restart this host."));
+        assert!(html.contains("restart needed kernel reboot required"));
+
+        let mut current = host_with_backups("hsb0", 970, vec![]);
+        current.kernel = Some(KernelPosture::observed(
+            true,
+            Some("7.0.14".to_string()),
+            Some("7.0.14".to_string()),
+            965,
+        ));
+        let current_html = render_home(
+            runtime(&[current], &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(current_html.contains(r#"data-kernel-slot hidden"#));
+    }
+
+    #[test]
+    fn pending_kernel_restart_is_one_warning_and_one_activity_event() {
+        let mut host = host_with_backups("csb0", 970, vec![]);
+        host.kernel = Some(reboot_required_kernel(965));
+        let hosts = [host];
+        let probes = BTreeMap::new();
+
+        let alerts = alert_items(&hosts, &[], "csb1", 1000, &[], &[], &probes);
+        let kernel_alerts = alerts
+            .iter()
+            .filter(|alert| alert.source == "kernel")
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_alerts.len(), 1);
+        assert_eq!(kernel_alerts[0].level, "warning");
+        assert_eq!(kernel_alerts[0].issue, "Restart needed");
+        assert!(!alerts.iter().any(|alert| {
+            alert.host == "csb0" && alert.source == "heartbeat" && alert.level == "critical"
+        }));
+
+        let events = activity_events(&hosts, &[], "csb1", 1000, &[], &[], &probes);
+        let kernel_events = events
+            .iter()
+            .filter(|event| event.source == "kernel")
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_events.len(), 1);
+        assert_eq!(kernel_events[0].level, "warning");
+        assert_eq!(kernel_events[0].title, "Restart needed");
     }
 
     #[test]
@@ -13529,6 +13770,7 @@ mod tests {
                     applicable: true,
                     ..Default::default()
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![failed_backup],
                 preferences: Default::default(),
@@ -13549,6 +13791,7 @@ mod tests {
                     applicable: true,
                     ..Default::default()
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![stale_validation],
                 preferences: Default::default(),
@@ -13570,6 +13813,7 @@ mod tests {
                     flake_lock_age_days: Some(2),
                     commits_behind: Some(3),
                 },
+                kernel: None,
                 service_observations: vec![
                     ServiceObservation::nix_freshness(&NixFreshness {
                         applicable: true,
@@ -13603,6 +13847,7 @@ mod tests {
                     flake_lock_age_days: Some(2),
                     commits_behind: Some(3),
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -13715,6 +13960,7 @@ mod tests {
                     flake_lock_age_days: Some(0),
                     commits_behind: Some(0),
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![healthy_backup],
                 preferences: Default::default(),
@@ -13736,6 +13982,7 @@ mod tests {
                     flake_lock_age_days: Some(4),
                     commits_behind: Some(1),
                 },
+                kernel: None,
                 service_observations: vec![
                     ServiceObservation::nix_freshness(&NixFreshness {
                         applicable: true,
@@ -13774,6 +14021,7 @@ mod tests {
                     applicable: true,
                     ..Default::default()
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -13880,6 +14128,7 @@ mod tests {
                 flake_lock_age_days: Some(31),
                 commits_behind: Some(2),
             },
+            kernel: None,
             service_observations: vec![ServiceObservation {
                 id: "nginx".to_string(),
                 label: "nginx".to_string(),
@@ -14002,6 +14251,7 @@ mod tests {
                     applicable: false,
                     ..Default::default()
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -14042,6 +14292,7 @@ mod tests {
                 inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -14072,6 +14323,7 @@ mod tests {
                     label: Some("Runtime wifi".to_string()),
                 }),
                 freshness: NixFreshness::default(),
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -14089,6 +14341,7 @@ mod tests {
                 inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -14106,6 +14359,7 @@ mod tests {
                 inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -14123,6 +14377,7 @@ mod tests {
                 inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -14336,6 +14591,7 @@ mod tests {
                 "Runtime wifi",
             )),
             freshness: NixFreshness::default(),
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -14448,6 +14704,7 @@ mod tests {
                 label: Some("Vienna area".to_string()),
             }),
             freshness: NixFreshness::default(),
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -14492,6 +14749,7 @@ mod tests {
                 inbound_rtt: None,
                 location: None,
                 freshness: NixFreshness::default(),
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 preferences: Default::default(),
@@ -14696,6 +14954,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -14902,6 +15161,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -15163,6 +15423,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -15230,6 +15491,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(1),
             },
+            kernel: None,
             service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
                 applicable: true,
                 flake_lock_age_days: Some(0),
@@ -16133,6 +16395,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             inbound_rtt: None,
             location: None,
             freshness: NixFreshness::default(),
+            kernel: None,
             service_observations: vec![],
             backup_observations,
             preferences: Default::default(),
@@ -17133,6 +17396,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             inbound_rtt_ms: None,

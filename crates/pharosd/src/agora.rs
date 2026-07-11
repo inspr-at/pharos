@@ -1321,6 +1321,7 @@ mod tests {
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(0),
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             preferences: Default::default(),

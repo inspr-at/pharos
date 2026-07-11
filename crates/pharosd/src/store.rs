@@ -83,6 +83,7 @@ impl Store {
                         applicable: registration.is_nix,
                         ..Default::default()
                     }),
+                kernel: existing.and_then(|h| h.kernel.clone()),
                 service_observations: existing
                     .map(|h| h.service_observations.clone())
                     .unwrap_or_default(),
@@ -173,6 +174,7 @@ impl Store {
                     inbound_rtt,
                     location: report.location,
                     freshness: report.freshness,
+                    kernel: report.kernel,
                     service_observations: report.service_observations,
                     backup_observations: report.backup_observations,
                     preferences: report.preferences,
@@ -226,7 +228,7 @@ mod tests {
     use super::*;
     use pharos_core::{
         BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
-        NixFreshness, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+        KernelPosture, KernelPostureState, NixFreshness, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
     };
 
     fn backup_observation(state: BackupPostureState) -> BackupObservation {
@@ -270,6 +272,7 @@ mod tests {
                         applicable: true,
                         ..Default::default()
                     },
+                    kernel: None,
                     service_observations: vec![],
                     backup_observations: vec![],
                     inbound_rtt_ms: None,
@@ -320,6 +323,12 @@ mod tests {
                     flake_lock_age_days: Some(1),
                     commits_behind: Some(0),
                 },
+                kernel: Some(KernelPosture::observed(
+                    true,
+                    Some("6.18.26".to_string()),
+                    Some("7.0.14".to_string()),
+                    120,
+                )),
                 service_observations: vec![pharos_core::ServiceObservation::nix_freshness(
                     &NixFreshness {
                         applicable: true,
@@ -351,6 +360,10 @@ mod tests {
         assert_eq!(host.heartbeat_interval_secs, Some(30));
         assert_eq!(host.inbound_rtt.expect("rtt kept").millis, 37);
         assert_eq!(host.freshness.flake_lock_age_days, Some(1));
+        assert_eq!(
+            host.kernel.as_ref().map(|kernel| kernel.state),
+            Some(KernelPostureState::RebootRequired)
+        );
         assert_eq!(host.backup_observations, vec![backup]);
         assert!(store.has_token("athena"));
         assert_eq!(store.token_hash_for("athena").as_deref(), Some("hash"));
@@ -368,6 +381,7 @@ mod tests {
                     flake_lock_age_days: Some(0),
                     commits_behind: Some(0),
                 },
+                kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
                 inbound_rtt_ms: None,
@@ -405,6 +419,7 @@ mod tests {
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![],
             inbound_rtt_ms: None,

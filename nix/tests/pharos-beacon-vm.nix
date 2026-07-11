@@ -62,6 +62,12 @@ let
       | ${pkgs.jq}/bin/jq -e 'any(.hosts[]?;
           .name == "vm-beacon"
           and (.last_seen | type == "number")
+          and .kernel.schema == "inspr.pharos.kernel-posture.v1"
+          and .kernel.version == 1
+          and .kernel.state == "current"
+          and (.kernel.running_version | type == "string" and length > 0)
+          and (.kernel.expected_version | type == "string" and length > 0)
+          and (.kernel.observed_at | type == "number")
           and .preferences.accent == "#48b8a8"
           and .preferences.kind == "workstation"
           and .preferences.alerts.suppress_down == true

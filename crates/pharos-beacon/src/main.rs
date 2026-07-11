@@ -12,14 +12,15 @@
 //!      PHAROS_BACKUP_MODE (auto/off/restic/status-file/command).
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
     BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
     HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
-    NixFreshness, ServiceObservation, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_INBOUND_RTT_MS,
+    KernelPosture, NixFreshness, ServiceObservation, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+    MAX_INBOUND_RTT_MS,
 };
 
 fn now_unix() -> i64 {
@@ -97,6 +98,67 @@ fn nixcfg_dir() -> Option<String> {
     .into_iter()
     .find(|d| Path::new(&format!("{d}/flake.lock")).exists())
     .map(String::from)
+}
+
+fn kernel_running_path() -> PathBuf {
+    env_value("PHAROS_RUNNING_KERNEL_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/proc/sys/kernel/osrelease"))
+}
+
+fn kernel_expected_modules_dir() -> PathBuf {
+    if let Some(path) = env_value("PHAROS_CURRENT_KERNEL_MODULES_DIR") {
+        return PathBuf::from(path);
+    }
+    [
+        "/host/run/current-system/kernel-modules/lib/modules",
+        "/run/current-system/kernel-modules/lib/modules",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_dir())
+    .unwrap_or_else(|| PathBuf::from("/run/current-system/kernel-modules/lib/modules"))
+}
+
+fn read_running_kernel(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_single_kernel_module_version(path: &Path) -> Option<String> {
+    let mut entries = std::fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned());
+    let version = entries.next()?;
+    entries.next().is_none().then_some(version)
+}
+
+fn collect_kernel_posture_at(
+    is_nix: bool,
+    observed_at: i64,
+    running_path: &Path,
+    expected_modules_dir: &Path,
+) -> KernelPosture {
+    KernelPosture::observed(
+        is_nix,
+        read_running_kernel(running_path),
+        is_nix
+            .then(|| read_single_kernel_module_version(expected_modules_dir))
+            .flatten(),
+        observed_at,
+    )
+}
+
+fn collect_kernel_posture(is_nix: bool, observed_at: i64) -> KernelPosture {
+    collect_kernel_posture_at(
+        is_nix,
+        observed_at,
+        &kernel_running_path(),
+        &kernel_expected_modules_dir(),
+    )
 }
 
 /// Days since the newest input in flake.lock (i.e. since the last `nix flake
@@ -1077,6 +1139,7 @@ fn main() {
         };
         let service_observations = vec![ServiceObservation::nix_freshness(&freshness)];
         let observed_at = now_unix();
+        let kernel = collect_kernel_posture(is_nix, observed_at);
         let location = collect_location(observed_at);
         let backup_observations = collect_backup_observations(observed_at);
         let report = HostReport {
@@ -1087,6 +1150,7 @@ fn main() {
             is_nix,
             heartbeat_interval_secs: beat,
             freshness,
+            kernel: Some(kernel),
             service_observations,
             backup_observations,
             inbound_rtt_ms: last_report_rtt_ms,
@@ -1132,6 +1196,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kernel_fixture(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pharos-kernel-{}-{nonce}-{label}",
+            std::process::id()
+        ))
+    }
+
+    fn write_kernel_fixture(root: &Path, running: &str, expected: &[&str]) -> (PathBuf, PathBuf) {
+        let running_path = root.join("osrelease");
+        let expected_path = root.join("modules");
+        std::fs::create_dir_all(&expected_path).expect("create module fixture");
+        std::fs::write(&running_path, running).expect("write running version");
+        for version in expected {
+            std::fs::create_dir(expected_path.join(version)).expect("create version fixture");
+        }
+        (running_path, expected_path)
+    }
 
     #[test]
     fn beacon_reads_exact_nixcfg_host_preferences_schema() {
@@ -1195,6 +1281,64 @@ mod tests {
             report_rtt_millis(Duration::from_millis(MAX_INBOUND_RTT_MS + 1)),
             MAX_INBOUND_RTT_MS
         );
+    }
+
+    #[test]
+    fn kernel_collector_reports_current_and_staged_versions() {
+        let current_root = kernel_fixture("current");
+        let (running, expected) =
+            write_kernel_fixture(&current_root, "7.0.14-nixos\n", &["7.0.14"]);
+        let current = collect_kernel_posture_at(true, 100, &running, &expected);
+        assert_eq!(current.state, pharos_core::KernelPostureState::Current);
+        assert_eq!(current.running_version.as_deref(), Some("7.0.14-nixos"));
+        assert_eq!(current.expected_version.as_deref(), Some("7.0.14"));
+        current.validate_contract().expect("current posture valid");
+        std::fs::remove_dir_all(current_root).expect("remove current fixture");
+
+        let staged_root = kernel_fixture("staged");
+        let (running, expected) = write_kernel_fixture(&staged_root, "6.18.26\n", &["7.0.14"]);
+        let staged = collect_kernel_posture_at(true, 200, &running, &expected);
+        assert_eq!(
+            staged.state,
+            pharos_core::KernelPostureState::RebootRequired
+        );
+        staged.validate_contract().expect("staged posture valid");
+        std::fs::remove_dir_all(staged_root).expect("remove staged fixture");
+    }
+
+    #[test]
+    fn kernel_collector_fails_multiple_missing_and_malformed_versions_safe() {
+        let root = kernel_fixture("unknown");
+        let (running, expected) = write_kernel_fixture(&root, "7.0.14\n", &["7.0.14", "7.1.0"]);
+        let multiple = collect_kernel_posture_at(true, 300, &running, &expected);
+        assert_eq!(multiple.state, pharos_core::KernelPostureState::Unknown);
+        assert!(multiple.expected_version.is_none());
+
+        let missing = collect_kernel_posture_at(true, 301, &running, &root.join("missing"));
+        assert_eq!(missing.state, pharos_core::KernelPostureState::Unknown);
+
+        std::fs::write(&running, "/nix/store/not-a-version\n").expect("write malformed version");
+        let malformed = collect_kernel_posture_at(true, 302, &running, &expected);
+        assert_eq!(malformed.state, pharos_core::KernelPostureState::Unknown);
+        assert!(malformed.running_version.is_none());
+        std::fs::remove_dir_all(root).expect("remove unknown fixture");
+    }
+
+    #[test]
+    fn kernel_collector_marks_non_nix_hosts_not_applicable() {
+        let posture = collect_kernel_posture_at(
+            false,
+            400,
+            Path::new("/path/that/does/not/exist"),
+            Path::new("/another/missing/path"),
+        );
+
+        assert_eq!(
+            posture.state,
+            pharos_core::KernelPostureState::NotApplicable
+        );
+        assert!(posture.expected_version.is_none());
+        posture.validate_contract().expect("non-Nix posture valid");
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.23 - 2026-07-11
+
+- Add a versioned, sanitized kernel-posture report that compares the running kernel with the current NixOS generation without transmitting store paths or opaque identifiers.
+- Show only actionable pending-restart state in Fleet, with a plain-language running-versus-ready disclosure and one warning in Alerts and Activity.
+- Fail missing, malformed, inaccessible, or ambiguous kernel observations safely to unknown, cover the native NixOS path in KVM, and never reboot a host automatically.
+
 ## 0.1.22 - 2026-07-10
 
 - Load nixcfg's exact all-host preference registry as the authoritative declared-settings layer, with generated host manifests as fallback.

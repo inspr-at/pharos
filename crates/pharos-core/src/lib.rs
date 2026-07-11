@@ -163,6 +163,10 @@ pub struct Host {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<HostLocation>,
     pub freshness: NixFreshness,
+    /// Latest sanitized kernel posture reported by the beacon. Older beacons
+    /// and persisted host records omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<KernelPosture>,
     /// Non-secret service facts from the latest beacon report. Runtime only;
     /// declared service intent stays in the manifest.
     #[serde(default)]
@@ -216,6 +220,149 @@ impl NixFreshness {
             parts.join(" · ")
         }
     }
+}
+
+pub const KERNEL_POSTURE_SCHEMA: &str = "inspr.pharos.kernel-posture.v1";
+pub const KERNEL_POSTURE_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelPostureState {
+    Current,
+    RebootRequired,
+    Unknown,
+    NotApplicable,
+}
+
+impl KernelPostureState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::RebootRequired => "reboot required",
+            Self::Unknown => "unknown",
+            Self::NotApplicable => "not applicable",
+        }
+    }
+}
+
+/// Sanitized kernel posture from a beacon. Version strings are deliberately
+/// narrow and may never carry paths, derivation identifiers, or free-form
+/// command output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KernelPosture {
+    pub schema: String,
+    pub version: u16,
+    pub state: KernelPostureState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    pub observed_at: UnixSeconds,
+}
+
+impl KernelPosture {
+    /// Construct posture from raw observations without retaining malformed
+    /// version strings. Nix hosts need two semantic versions for a decisive
+    /// state; incomplete observations remain unknown.
+    pub fn observed(
+        is_nix: bool,
+        running_version: Option<String>,
+        expected_version: Option<String>,
+        observed_at: UnixSeconds,
+    ) -> Self {
+        let running_version = running_version.filter(|value| safe_kernel_version(value));
+        let expected_version = expected_version.filter(|value| safe_kernel_version(value));
+        let state = if !is_nix {
+            KernelPostureState::NotApplicable
+        } else {
+            match (
+                running_version.as_deref().and_then(kernel_semantic_version),
+                expected_version
+                    .as_deref()
+                    .and_then(kernel_semantic_version),
+            ) {
+                (Some(running), Some(expected)) if running == expected => {
+                    KernelPostureState::Current
+                }
+                (Some(_), Some(_)) => KernelPostureState::RebootRequired,
+                _ => KernelPostureState::Unknown,
+            }
+        };
+        Self {
+            schema: KERNEL_POSTURE_SCHEMA.to_string(),
+            version: KERNEL_POSTURE_VERSION,
+            state,
+            running_version,
+            expected_version: is_nix.then_some(expected_version).flatten(),
+            observed_at,
+        }
+    }
+
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.schema != KERNEL_POSTURE_SCHEMA {
+            return Err("unsupported kernel posture schema".to_string());
+        }
+        if self.version != KERNEL_POSTURE_VERSION {
+            return Err("unsupported kernel posture version".to_string());
+        }
+        if self.observed_at < 0 {
+            return Err("kernel posture observed_at must be non-negative".to_string());
+        }
+        for value in self
+            .running_version
+            .as_deref()
+            .into_iter()
+            .chain(self.expected_version.as_deref())
+        {
+            if !safe_kernel_version(value) {
+                return Err("kernel version must be sanitized".to_string());
+            }
+        }
+
+        let semantic = (
+            self.running_version
+                .as_deref()
+                .and_then(kernel_semantic_version),
+            self.expected_version
+                .as_deref()
+                .and_then(kernel_semantic_version),
+        );
+        match self.state {
+            KernelPostureState::Current if semantic.0.is_some() && semantic.0 == semantic.1 => {}
+            KernelPostureState::RebootRequired
+                if semantic.0.is_some() && semantic.1.is_some() && semantic.0 != semantic.1 => {}
+            KernelPostureState::Unknown if semantic.0.is_none() || semantic.1.is_none() => {}
+            KernelPostureState::NotApplicable if self.expected_version.is_none() => {}
+            _ => return Err("kernel posture state does not match its versions".to_string()),
+        }
+        Ok(())
+    }
+}
+
+fn safe_kernel_version(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && value.trim() == value
+        && bytes.first().is_some_and(u8::is_ascii_digit)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+        && kernel_semantic_version(value).is_some()
+}
+
+fn kernel_semantic_version(value: &str) -> Option<(u64, u64, u64)> {
+    let core = value.split(['-', '_', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1461,6 +1608,8 @@ pub struct HostReport {
     pub is_nix: bool,
     pub heartbeat_interval_secs: u64,
     pub freshness: NixFreshness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<KernelPosture>,
     #[serde(default)]
     pub service_observations: Vec<ServiceObservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1497,6 +1646,9 @@ impl HostReport {
             .is_some_and(|millis| millis > MAX_INBOUND_RTT_MS)
         {
             return Err(format!("inbound_rtt_ms must be <= {}", MAX_INBOUND_RTT_MS));
+        }
+        if let Some(kernel) = &self.kernel {
+            kernel.validate_contract()?;
         }
         for observation in &self.backup_observations {
             observation.validate_contract()?;
@@ -2212,6 +2364,80 @@ mod tests {
     }
 
     #[test]
+    fn kernel_posture_derives_current_from_semantic_versions() {
+        let posture = KernelPosture::observed(
+            true,
+            Some("7.0.14-nixos".to_string()),
+            Some("7.0.14".to_string()),
+            1_700_000_000,
+        );
+
+        assert_eq!(posture.state, KernelPostureState::Current);
+        posture.validate_contract().expect("current posture valid");
+    }
+
+    #[test]
+    fn kernel_posture_derives_reboot_required_from_staged_kernel() {
+        let posture = KernelPosture::observed(
+            true,
+            Some("6.18.26".to_string()),
+            Some("7.0.14".to_string()),
+            1_700_000_000,
+        );
+
+        assert_eq!(posture.state, KernelPostureState::RebootRequired);
+        posture
+            .validate_contract()
+            .expect("reboot-required posture valid");
+    }
+
+    #[test]
+    fn kernel_posture_fails_incomplete_or_malformed_observations_safe() {
+        let missing =
+            KernelPosture::observed(true, Some("7.0.14".to_string()), None, 1_700_000_000);
+        assert_eq!(missing.state, KernelPostureState::Unknown);
+        missing.validate_contract().expect("unknown posture valid");
+
+        let malformed = KernelPosture::observed(
+            true,
+            Some("/nix/store/opaque-kernel".to_string()),
+            Some("also invalid".to_string()),
+            1_700_000_000,
+        );
+        assert_eq!(malformed.state, KernelPostureState::Unknown);
+        assert!(malformed.running_version.is_none());
+        assert!(malformed.expected_version.is_none());
+        malformed
+            .validate_contract()
+            .expect("sanitized unknown posture valid");
+
+        let ambiguous = KernelPosture::observed(
+            true,
+            Some("7.0.14.1".to_string()),
+            Some("7.0.14".to_string()),
+            1_700_000_000,
+        );
+        assert_eq!(ambiguous.state, KernelPostureState::Unknown);
+        assert!(ambiguous.running_version.is_none());
+    }
+
+    #[test]
+    fn kernel_posture_rejects_state_version_mismatch() {
+        let mut posture = KernelPosture::observed(
+            true,
+            Some("6.18.26".to_string()),
+            Some("7.0.14".to_string()),
+            1_700_000_000,
+        );
+        posture.state = KernelPostureState::Current;
+
+        assert_eq!(
+            posture.validate_contract(),
+            Err("kernel posture state does not match its versions".to_string())
+        );
+    }
+
+    #[test]
     fn liveness_thresholds() {
         assert_eq!(
             liveness(None, Some(60), 1000),
@@ -2234,6 +2460,7 @@ mod tests {
         assert!(host.heartbeat_log.is_empty());
         assert!(host.inbound_rtt.is_none());
         assert!(host.location.is_none());
+        assert!(host.kernel.is_none());
         assert!(host.service_observations.is_empty());
         assert!(host.backup_observations.is_empty());
         assert_eq!(host.preferences, HostPreferences::default());
@@ -2248,6 +2475,7 @@ mod tests {
         .expect("deserialize legacy report");
         assert!(legacy.location.is_none());
         assert!(legacy.inbound_rtt_ms.is_none());
+        assert!(legacy.kernel.is_none());
         assert!(legacy.backup_observations.is_empty());
         assert_eq!(legacy.preferences, HostPreferences::default());
         legacy.validate_contract().expect("legacy report valid");
@@ -2433,6 +2661,7 @@ mod tests {
                 applicable: true,
                 ..Default::default()
             },
+            kernel: None,
             service_observations: vec![],
             backup_observations: vec![observation.clone()],
             inbound_rtt_ms: None,
@@ -2603,6 +2832,7 @@ mod tests {
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(0),
             },
+            kernel: None,
             service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
                 applicable: true,
                 flake_lock_age_days: Some(0),
