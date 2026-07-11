@@ -3325,7 +3325,11 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .fresh-row span{color:var(--muted);font-size:12px}
 .fresh-row strong{font-size:12px;font-weight:650;color:var(--ink)}
 .fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
-.backup-chip{--backup-color:var(--wait);display:inline-flex;align-items:center;justify-content:center;gap:5px;height:25px;min-width:68px;margin:0;padding:0 8px;border:1px solid color-mix(in srgb,var(--backup-color) 38%,rgba(210,226,234,.82));border-radius:999px;background:color-mix(in srgb,var(--backup-color) 9%,rgba(255,255,255,.94));color:var(--backup-color);font-size:11px;font-weight:760;line-height:1;text-decoration:none;white-space:nowrap;box-shadow:0 5px 12px color-mix(in srgb,var(--backup-color) 7%,transparent);transition:background-color .16s ease,border-color .16s ease,box-shadow .16s ease,transform .16s ease}
+.header-chip{position:relative;appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:0;width:25px;height:25px;min-width:25px;margin:0;padding:0;border:1px solid rgba(210,226,234,.76);border-radius:999px;background:rgba(255,255,255,.58);font-size:11px;font-weight:760;line-height:1;text-decoration:none;white-space:nowrap;box-sizing:border-box;overflow:visible;transition:width .2s cubic-bezier(.2,.75,.3,1),padding .2s cubic-bezier(.2,.75,.3,1),gap .2s ease,background-color .16s ease,border-color .16s ease,box-shadow .16s ease,transform .16s ease}
+.header-chip:hover,.header-chip:focus-visible{width:86px;padding:0 8px;gap:5px;transform:translateY(-1px);outline:0}
+.header-chip-label{display:block;max-width:0;opacity:0;overflow:hidden;color:inherit;line-height:1;transform:translateX(-3px);transition:max-width .2s cubic-bezier(.2,.75,.3,1),opacity .14s ease,transform .2s ease}
+.header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1;transform:translateX(0)}
+.backup-chip{--backup-color:var(--wait);border-color:color-mix(in srgb,var(--backup-color) 38%,rgba(210,226,234,.82));background:color-mix(in srgb,var(--backup-color) 9%,rgba(255,255,255,.94));color:var(--backup-color);box-shadow:0 5px 12px color-mix(in srgb,var(--backup-color) 7%,transparent)}
 .backup-chip.clear{--backup-color:var(--live)}.backup-chip.warning{--backup-color:var(--stale)}.backup-chip.critical{--backup-color:var(--down)}.backup-chip.watch{--backup-color:var(--wait)}
 .backup-chip:hover{background:color-mix(in srgb,var(--backup-color) 14%,white);border-color:color-mix(in srgb,var(--backup-color) 55%,rgba(210,226,234,.82));box-shadow:0 7px 16px color-mix(in srgb,var(--backup-color) 12%,transparent);transform:translateY(-1px)}
 .backup-chip:focus-visible{outline:2px solid color-mix(in srgb,var(--backup-color) 34%,transparent);outline-offset:2px}
@@ -3367,30 +3371,25 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 .drag-handle .ico{width:13px;height:13px}
 .card[data-dragging="true"]{z-index:20;transform:scale(1.015);box-shadow:0 20px 44px rgba(45,75,95,.18);cursor:grabbing}
 .grid[data-freeform-dragging="true"] .card:not([data-dragging]){transition:transform .12s ease,box-shadow .12s ease}
-.settings-card{position:relative;display:inline-grid;grid-auto-flow:column;place-items:center;width:25px;height:25px;margin:0;border:0;border-radius:50%;background:transparent;color:var(--accent);text-decoration:none;box-shadow:none}
+.settings-card{color:var(--accent);box-shadow:none}
 .settings-card:hover{background:rgba(223,241,249,.78);box-shadow:0 7px 16px rgba(45,75,95,.08);transform:translateY(-1px)}
+.settings-card:focus-visible{outline:2px solid rgba(31,127,181,.24);outline-offset:2px}
 .settings-card.unavailable{--host-color:#aebac3;color:var(--muted);opacity:.72;box-shadow:none}
 .settings-card.unavailable:hover{background:rgba(241,247,250,.92);box-shadow:0 7px 16px rgba(45,75,95,.05);opacity:1}
 .settings-card.unavailable .settings-icon{color:var(--muted)}
-.settings-icon{display:grid;place-items:center;width:25px;height:25px;border:1px solid rgba(210,226,234,.76);border-radius:50%;background:rgba(255,255,255,.58);color:inherit}
+.settings-icon{display:grid;place-items:center;width:13px;height:13px;flex:0 0 13px;color:inherit}
 .settings-icon .ico{width:13px;height:13px}
-.settings-wait-icon,.settings-copy,.settings-swatch{display:none}
-.settings-card[data-settings-state="request_pending"],.settings-card[data-settings-state="declared_not_applied"]{color:#9a5b00;background:rgba(255,248,234,.82);box-shadow:0 0 0 3px rgba(214,155,49,.08)}
+.settings-swatch{display:none}
+.settings-card[data-settings-state="request_pending"],.settings-card[data-settings-state="declared_not_applied"]{color:#9a5b00;border-color:rgba(214,155,49,.34);background:rgba(255,248,234,.82);box-shadow:0 0 0 3px rgba(214,155,49,.08)}
 .settings-card[data-settings-state="request_pending"]:hover,.settings-card[data-settings-state="declared_not_applied"]:hover{background:rgba(255,245,222,.96);box-shadow:0 7px 16px rgba(178,106,0,.10)}
-.settings-card[data-settings-state="request_pending"] .settings-icon,.settings-card[data-settings-state="declared_not_applied"] .settings-icon{border-color:rgba(214,155,49,.34);background:transparent}
-.settings-card[data-settings-state="request_pending"] .settings-default-icon,.settings-card[data-settings-state="declared_not_applied"] .settings-default-icon{display:none}
-.settings-card[data-settings-state="request_pending"] .settings-wait-icon,.settings-card[data-settings-state="declared_not_applied"] .settings-wait-icon{display:grid}
 .settings-card[data-settings-state="request_pending"] .settings-swatch,.settings-card[data-settings-state="declared_not_applied"] .settings-swatch{display:block;position:absolute;right:-1px;bottom:-1px;width:7px;height:7px;border:1px solid #fff;border-radius:50%;background:var(--pending-color,var(--sun));box-shadow:0 0 0 2px color-mix(in srgb,var(--pending-color,var(--sun)) 12%,transparent)}
-.settings-wait-note{display:flex;align-items:center;gap:6px;min-height:18px;margin:-6px 0 8px;color:#8b620f;font-size:11px;font-weight:680}.settings-wait-note[hidden]{display:none}.settings-wait-note .ico{width:13px;height:13px}.settings-wait-note .settings-swatch{display:block;width:7px;height:7px;flex:0 0 auto;border-radius:50%;background:var(--pending-color,var(--sun));box-shadow:0 0 0 3px color-mix(in srgb,var(--pending-color,var(--sun)) 12%,transparent)}
-.list .settings-card[data-settings-state="request_pending"],.list .settings-card[data-settings-state="declared_not_applied"]{width:auto;grid-template-columns:23px auto;gap:4px;padding:0 8px 0 1px;border:1px solid rgba(214,155,49,.34);border-radius:999px}
-.list .settings-card[data-settings-state="request_pending"] .settings-copy,.list .settings-card[data-settings-state="declared_not_applied"] .settings-copy{display:inline;max-width:92px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:720;line-height:1}
-.list .settings-card[data-settings-state="request_pending"] .settings-swatch,.list .settings-card[data-settings-state="declared_not_applied"] .settings-swatch{position:static;border:0}
-.beat{--beat-color:var(--state);--now-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
+.settings-wait-note{display:flex;align-items:center;gap:6px;width:max-content;max-width:100%;min-height:18px;margin:-6px 0 8px;color:#8b620f;font-size:11px;font-weight:680;text-decoration:none;cursor:pointer}.settings-wait-note[hidden]{display:none}.settings-wait-note .ico{width:13px;height:13px;flex:0 0 13px}.settings-wait-note:hover,.settings-wait-note:focus-visible{color:#734500;text-decoration:underline;text-underline-offset:3px;outline:0}
+.beat{--beat-color:var(--state);--now-x:0%;--history-start-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
 .beat-stage{position:relative;height:50px;overflow:visible}
 .beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
-.beat-fill{position:absolute;left:0;top:22px;width:var(--now-x);height:2px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.18),var(--fill-color));transition:background-color .2s ease}
+.beat-fill{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:22px;z-index:2;height:2px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.12),var(--fill-color));transition:background-color .2s ease}
 .beat-now{position:absolute;left:var(--now-x);top:23px;z-index:8;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle,#fff 0 29%,var(--fill-color) 32% 62%,transparent 64%);box-shadow:0 0 0 5px color-mix(in srgb,var(--fill-color) 12%,transparent),0 0 14px color-mix(in srgb,var(--fill-color) 26%,transparent);transform:translate(-50%,-50%);pointer-events:none}
-.beat-current{position:absolute;top:22px;left:calc(var(--now-x) - 22%);width:22%;height:3px;border-radius:999px;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--fill-color) 34%,transparent),transparent);animation:tide 2.8s linear infinite;opacity:.8}
+.beat-current{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:21px;z-index:6;height:4px;border-radius:999px;background:linear-gradient(90deg,transparent 0,color-mix(in srgb,var(--fill-color) 30%,transparent) 16%,color-mix(in srgb,var(--fill-color) 64%,transparent) 72%,var(--fill-color) 100%);background-size:150% 100%;animation:tide 2.8s linear infinite;opacity:.86;pointer-events:none}
 .beat-marks{position:absolute;inset:0}
 .beat-mark{--mark-color:var(--sea);position:absolute;left:var(--mark-x);top:23px;z-index:4;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
 .beat-mark[data-history-level="late"]{--mark-color:var(--sun)}.beat-mark[data-history-level="stale"]{--mark-color:var(--stale)}.beat-mark[data-history-level="down"]{--mark-color:var(--down)}.beat-mark[data-history-level="first"]{--mark-color:var(--wait)}
@@ -3404,7 +3403,7 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 .beat-zones span{position:absolute;bottom:0;white-space:nowrap}.beat-zones span:first-child{left:0}.beat-zones span:nth-child(2){left:var(--expect-x);transform:translateX(-50%)}.beat-zones span:nth-child(3){right:0;color:var(--stale)}
 .beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="lit"]{--beat-color:var(--sun)}
 @keyframes beat-hit{0%{opacity:.9;transform:translate(-50%,-50%) scale(.55);box-shadow:0 0 0 0 color-mix(in srgb,currentColor 28%,transparent)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4);box-shadow:0 0 0 12px transparent}}
-@keyframes tide{from{transform:translateX(-16%)}to{transform:translateX(42%)}}
+@keyframes tide{from{background-position:100% 0}to{background-position:0 0}}
 .list-wrap{display:none}
 main[data-view="list"] .grid{display:none}
 main[data-view="list"] .list-wrap{display:block}
@@ -3414,7 +3413,7 @@ main[data-view="list"] .list-wrap{display:block}
 .list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:8px 0 0 8px}
 .list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
-.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .card-tools{margin:0}.list .settings-card{margin:0}.list .settings-icon{width:25px;height:25px}
+.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .card-tools{margin:0}.list .settings-card{margin:0}.list .settings-icon{width:13px;height:13px}
 .list tr.onboard-row td{border:1px dashed rgba(214,155,49,.42);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.86),rgba(240,250,250,.72));box-shadow:0 10px 24px rgba(45,75,95,.05)}
 .onboard-row button{appearance:none;width:100%;display:flex;align-items:center;gap:12px;border:0;background:transparent;color:var(--ink);font:inherit;text-align:left;cursor:pointer}.onboard-row button:hover strong,.onboard-row button:focus-visible strong{color:#0f4f80}.onboard-row button:focus-visible{outline:0}
 .onboard-row .onboard-mark{width:32px;height:32px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.onboard-row .onboard-mark .ico{width:16px;height:16px}.onboard-row strong{display:block;font-size:13px}.onboard-row span:last-child{display:block;color:var(--muted);font-size:12px}
@@ -3764,7 +3763,8 @@ function updateBackup(surface,info){
   if(el.classList.contains('backup-chip')){
     const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
     const host=surface.dataset.host||'';
-    el.className='backup-chip '+info.level;
+    el.classList.remove('clear','watch','warning','critical');
+    el.classList.add(info.level);
     el.dataset.backupState=info.state;
     el.dataset.backupLevel=info.level;
     el.dataset.backupGlyph=glyph;
@@ -3825,8 +3825,6 @@ function updatePreferenceState(surface,host){
   const title=label?label+' for '+name:'Open host settings for '+name;
   if(link){
     link.dataset.settingsState=state;
-    const copy=link.querySelector('[data-settings-copy]');
-    if(copy)copy.textContent=label;
     link.title=title;
     link.setAttribute('aria-label',title);
   }
@@ -3850,6 +3848,11 @@ function markHtml(beats,interval,windowDef=signalWindow){
     const title=info.label+' · '+info.detail;
     return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
+}
+function syncHistoryStart(beat){
+  const first=beat.querySelector('.beat-mark');
+  const start=first?.style.getPropertyValue('--mark-x').trim()||'0%';
+  beat.style.setProperty('--history-start-x',start);
 }
 function signalInfo(beats,last,interval,now,windowDef=signalWindow){
   const cadence=Math.max(1,Number(interval)||60);
@@ -3930,6 +3933,7 @@ function setBeatHistory(beat,beats,interval){
   const marks=beat.querySelector('.beat-marks');
   if(marks){
     marks.innerHTML=markHtml(all,cadence,signalWindow);
+    syncHistoryStart(beat);
     bindHistoryHints(marks);
   }
 }
@@ -8171,7 +8175,7 @@ fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
     let title = format!("Backup: {} - {}", summary.label, summary.detail);
     let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
     format!(
-        r#"<a class="backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span>Backup</span></a>"#,
+        r#"<a class="header-chip backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
         level = html_escape(summary.level),
         host_query = html_escape(&url_query_escape(host)),
         state = html_escape(summary.state),
@@ -9346,7 +9350,7 @@ fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
     };
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
     format!(
-        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div></article>"#,
+        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="header-chip settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div></article>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
         job_id = html_escape(&job.id),
@@ -12237,19 +12241,24 @@ fn heartbeat_history(log: &[i64], idx: usize, interval: i64) -> (&'static str, S
     )
 }
 
-fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> String {
+fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (String, f64) {
     if log.len() < 2 {
-        return String::new();
+        return (String::new(), 0.0);
     }
 
     let interval = interval.max(1);
     let step = HEARTBEAT_EXPECT_X / HEARTBEAT_HISTORY_DOTS.max(1) as f64;
     let newest_x = HEARTBEAT_EXPECT_X - step;
     let view = heartbeat_history_view(log, window_secs);
+    let view_start = view.start;
+    let view_span = view.span;
+    let mark_x = |idx: usize| {
+        (((log[idx] - view_start).max(0) as f64 / view_span as f64) * newest_x).clamp(0.0, newest_x)
+    };
+    let history_start_x = view.visible.first().map(|idx| mark_x(*idx)).unwrap_or(0.0);
     let mut marks = String::new();
     for idx in view.visible {
-        let x = (((log[idx] - view.start).max(0) as f64 / view.span as f64) * newest_x)
-            .clamp(0.0, newest_x);
+        let x = mark_x(idx);
         let (level, label, detail) = heartbeat_history(log, idx, interval);
         let title = format!("{label} · {detail}");
         marks.push_str(&format!(
@@ -12260,7 +12269,7 @@ fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> String {
             title = html_escape(&title)
         ));
     }
-    marks
+    (marks, history_start_x)
 }
 
 fn heartbeat_x(age: i64, interval: i64) -> f64 {
@@ -12300,7 +12309,8 @@ fn heartbeat_card(
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let marks = heartbeat_marks(&all_beats, interval, SIGNAL_DEFAULT_WINDOW_SECS);
+    let (marks, history_start_x) =
+        heartbeat_marks(&all_beats, interval, SIGNAL_DEFAULT_WINDOW_SECS);
     let (last_attr, next_at_attr, beat_state, now_x, fill_color, expect_fill, target_ring) =
         match last_seen {
             Some(last) => {
@@ -12360,7 +12370,7 @@ fn heartbeat_card(
         };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window}" style="--now-x:{now_x:.2}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span data-history-window-label>{history_window}</span><span>expected</span><span>late</span></span></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window}" style="--now-x:{now_x:.2}%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span data-history-window-label>{history_window}</span><span>expected</span><span>late</span></span></div></div>"#,
         count = visible_beats.len(),
         history_window = html_escape(SIGNAL_DEFAULT_WINDOW_LABEL)
     )
@@ -12538,15 +12548,14 @@ fn render_home(
             format!("{settings_state_label} for {name}")
         };
         let settings_action = format!(
-            r#"<a class="settings-card" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"><span class="settings-icon"><span class="settings-default-icon">{settings_icon}</span><span class="settings-wait-icon">{wait_icon}</span></span><span class="settings-copy" data-settings-copy>{settings_state_label}</span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
+            r#"<a class="header-chip settings-card" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"><span class="settings-icon">{settings_icon}</span><span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
             settings_icon = icons::SLIDERS,
-            wait_icon = icons::CLOCK_3,
             settings_title = html_escape(&settings_title),
-            settings_state_label = html_escape(settings_state_label),
         );
         let settings_note = format!(
-            r#"<div class="settings-wait-note" data-settings-note data-settings-state="{settings_state_key}"{settings_note_hidden}>{wait_icon}<span data-settings-note-copy>{settings_state_label}</span><span class="settings-swatch" aria-hidden="true"></span></div>"#,
+            r#"<a class="settings-wait-note" data-settings-note data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"{settings_note_hidden}>{wait_icon}<span data-settings-note-copy>{settings_state_label}</span></a>"#,
             wait_icon = icons::CLOCK_3,
+            settings_title = html_escape(&settings_title),
             settings_state_label = html_escape(settings_state_label),
             settings_note_hidden = if settings_state == HostPreferencesState::Applied {
                 " hidden"
@@ -13410,7 +13419,13 @@ mod tests {
         assert!(html.contains("beat-fill"));
         assert!(html.contains("beat-now"));
         assert!(html.contains("beat-current"));
+        assert!(html.contains(r#"--history-start-x:29.3%"#));
         assert!(html.contains("beat-zones"));
+        assert!(HEAD.contains("left:max(0px,calc(var(--pulse-left) - 4px))"));
+        assert!(HEAD.contains("top:21px;z-index:6;height:4px"));
+        assert!(HEAD.contains(
+            "@keyframes tide{from{background-position:100% 0}to{background-position:0 0}}"
+        ));
         assert!(html.contains("nix drift: 1d"));
         assert!(html.contains("3 commits"));
         assert!(html.contains(r#"data-search="poseidon nixos host flake.lock 1d old · 3 commits behind nixcfg nix drift: 1d · 3 commits""#));
@@ -13454,7 +13469,7 @@ mod tests {
         );
 
         assert!(html.contains(r#"data-backup-state="healthy""#));
-        assert!(html.contains(r#"class="backup-chip clear""#));
+        assert!(html.contains(r#"class="header-chip backup-chip clear""#));
         assert!(html.contains(r#"href="/backups?host=athena""#));
         assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
         assert!(
@@ -13479,11 +13494,21 @@ mod tests {
         for (state, level, glyph) in cases {
             let summary = backup_ui_summary(&[backup_observation(state)], 1_700_000_120);
             let html = backup_chip_markup(&summary, "athena");
-            assert!(html.contains(&format!(r#"class="backup-chip {level}""#)));
+            assert!(html.contains(&format!(r#"class="header-chip backup-chip {level}""#)));
             assert!(html.contains(&format!(r#"data-backup-glyph="{glyph}""#)));
             assert!(html.contains(r#"href="/backups?host=athena""#));
-            assert!(html.contains(">Backup</span></a>"));
+            assert!(html.contains(
+                r#"<span class="header-chip-label" aria-hidden="true">Backup</span></a>"#
+            ));
         }
+    }
+
+    #[test]
+    fn fleet_header_chips_are_icon_only_until_hover_or_focus() {
+        assert!(HEAD.contains(".header-chip{position:relative;appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:0;width:25px;height:25px"));
+        assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
+        assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
+        assert!(HEAD.contains(".header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1"));
     }
 
     #[test]
@@ -14859,8 +14884,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn heartbeat_history_uses_outcome_slots_before_expected_marker() {
-        let marks = heartbeat_marks(&[100, 160, 220, 340], 60, SIGNAL_DEFAULT_WINDOW_SECS);
+        let (marks, history_start_x) =
+            heartbeat_marks(&[100, 160, 220, 340], 60, SIGNAL_DEFAULT_WINDOW_SECS);
 
+        assert!((history_start_x - 14.7).abs() < 0.1);
         assert!(!marks.contains(r#"data-history-level="first""#));
         assert!(marks.contains(r#"data-history-level="ok""#));
         assert!(marks.contains(r#"data-history-level="late""#));
@@ -14872,7 +14899,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn first_heartbeat_without_previous_sample_has_no_history_dot() {
-        assert!(heartbeat_marks(&[100], 60, SIGNAL_DEFAULT_WINDOW_SECS).is_empty());
+        let (marks, history_start_x) = heartbeat_marks(&[100], 60, SIGNAL_DEFAULT_WINDOW_SECS);
+        assert!(marks.is_empty());
+        assert_eq!(history_start_x, 0.0);
     }
 
     #[test]
@@ -14999,6 +15028,20 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"data-settings-state="declared_not_applied""#));
         assert!(html.contains(r#"aria-label="change waiting for poseidon""#));
         assert!(html.contains(r#"style="--pending-color:#48b8a8""#));
+        assert!(html.contains(
+            r#"<a class="header-chip settings-card" data-settings-state="declared_not_applied""#
+        ));
+        assert!(html.contains(
+            r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
+        ));
+        assert!(html.contains(
+            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" href="/agora?host=poseidon" title="change waiting for poseidon" aria-label="change waiting for poseidon"><svg"#
+        ));
+        assert!(html.contains(r#"<span data-settings-note-copy>change waiting</span></a>"#));
+        assert!(!html.contains(
+            r#"<span data-settings-note-copy>change waiting</span><span class="settings-swatch""#
+        ));
+        assert!(!html.contains(r#"class="settings-wait-icon""#));
         assert!(!html.contains(r#"--host-color:#48b8a8""#));
         assert!(html.contains(r#"<div class="card-actions"><button class="drag-handle" type="button" data-drag-handle title="Move poseidon" aria-label="Move poseidon""#));
         assert!(html.contains(r#"<div class="card-tools"><span class="signal" data-signal"#));
