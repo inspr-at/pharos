@@ -3391,7 +3391,7 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 .beat-now{position:absolute;left:var(--now-x);top:23px;z-index:8;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle,#fff 0 29%,var(--fill-color) 32% 62%,transparent 64%);box-shadow:0 0 0 5px color-mix(in srgb,var(--fill-color) 12%,transparent),0 0 14px color-mix(in srgb,var(--fill-color) 26%,transparent);transform:translate(-50%,-50%);pointer-events:none}
 .beat-current{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:21px;z-index:6;height:4px;border-radius:999px;background:linear-gradient(90deg,transparent 0,color-mix(in srgb,var(--fill-color) 30%,transparent) 16%,color-mix(in srgb,var(--fill-color) 64%,transparent) 72%,var(--fill-color) 100%);background-size:150% 100%;animation:tide 2.8s linear infinite;opacity:.86;pointer-events:none}
 .beat-marks{position:absolute;inset:0}
-.beat-mark{--mark-color:var(--sea);position:absolute;left:var(--mark-x);top:23px;z-index:4;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
+.beat-mark{--mark-color:var(--sea);position:absolute;left:clamp(4px,var(--mark-x),calc(100% - 4px));top:23px;z-index:4;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
 .beat-mark[data-history-level="late"]{--mark-color:var(--sun)}.beat-mark[data-history-level="stale"]{--mark-color:var(--stale)}.beat-mark[data-history-level="down"]{--mark-color:var(--down)}.beat-mark[data-history-level="first"]{--mark-color:var(--wait)}
 .beat-mark:hover,.beat-mark:focus-visible{opacity:1;box-shadow:0 0 0 5px color-mix(in srgb,var(--mark-color) 18%,transparent),0 0 14px color-mix(in srgb,var(--mark-color) 24%,transparent);outline:0}
 .beat[data-count="0"] .beat-mark{display:none}
@@ -13422,6 +13422,7 @@ mod tests {
         assert!(html.contains(r#"--history-start-x:29.3%"#));
         assert!(html.contains("beat-zones"));
         assert!(HEAD.contains("left:max(0px,calc(var(--pulse-left) - 4px))"));
+        assert!(HEAD.contains("left:clamp(4px,var(--mark-x),calc(100% - 4px))"));
         assert!(HEAD.contains("top:21px;z-index:6;height:4px"));
         assert!(HEAD.contains(
             "@keyframes tide{from{background-position:100% 0}to{background-position:0 0}}"

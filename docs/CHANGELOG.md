@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.25 - 2026-07-12
+
+- Keep the oldest visible heartbeat centered four pixels inside the timeline so the pulse fade always begins inside the card and retains its requested four-pixel lead-in, including full-window histories.
+
 ## 0.1.24 - 2026-07-12
 
 - Keep Backup and Settings as centered icon-only host-card actions at rest, with smooth label disclosure on hover and keyboard focus while preserving state tint and pending-change affordances.
