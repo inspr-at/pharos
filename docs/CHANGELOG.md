@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.26 - 2026-07-12
+
+- Rebuild Fleet's list mode as a compact six-column counterpart to the grid cards, with shared host identity, attention, freshness, heartbeat signal, Backup, and Settings components.
+- Keep rows at a stable scanning height while Backup and Settings disclose labels on hover or focus, and replace wrapped last-seen sentences with compact values that still reveal historic heartbeat detail.
+- Preserve sorting, search, summary filters, signal-window controls, setup/onboarding rows, live refresh, and narrow-screen use with horizontal overflow contained inside the list surface.
+
 ## 0.1.25 - 2026-07-12
 
 - Keep the oldest visible heartbeat centered four pixels inside the timeline so the pulse fade always begins inside the card and retains its requested four-pixel lead-in, including full-window histories.

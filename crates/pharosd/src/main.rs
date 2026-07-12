@@ -3307,9 +3307,6 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .signal-window{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11px;font-weight:700;padding:0 1px;cursor:pointer}
 .signal-window:hover{color:var(--ink);text-decoration:underline;text-underline-offset:2px}.signal-window:focus-visible{outline:2px solid color-mix(in srgb,var(--signal-color) 34%,transparent);outline-offset:2px;border-radius:4px}
 .signal-orb{width:12px;height:12px;border-radius:50%;background:radial-gradient(circle,#fff 0 28%,var(--signal-color) 33% 63%,transparent 66%);box-shadow:0 0 0 4px color-mix(in srgb,var(--signal-color) 12%,transparent),0 0 12px color-mix(in srgb,var(--signal-color) 18%,transparent);opacity:.92}
-.status-pill{display:inline-flex;align-items:center;gap:6px;min-height:25px;max-width:150px;flex-shrink:0;padding:4px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--state) 24%,transparent);background:color-mix(in srgb,var(--state) 10%,white);color:var(--state);font-size:12px;white-space:nowrap}
-.status-pill .ico{width:14px;height:14px}.word{color:inherit;overflow:hidden;text-overflow:ellipsis}
-.state-icon{display:none}[data-live="live"] .state-icon.live,[data-live="stale"] .state-icon.stale,[data-live="down"] .state-icon.down,[data-live="awaiting_first_heartbeat"] .state-icon.awaiting{display:inline-block}
 .reason{--reason-color:var(--muted);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;gap:8px;min-height:22px;margin:-2px 0 10px;color:var(--muted);font-size:12px;line-height:1.25}
 .reason:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--reason-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--reason-color) 12%,transparent)}
 .reason.ok{--reason-color:var(--live)}.reason.warn{--reason-color:var(--stale)}.reason.down{--reason-color:var(--down)}.reason.wait{--reason-color:var(--wait)}.reason.self{--reason-color:var(--sun)}
@@ -3335,14 +3332,6 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .backup-chip:focus-visible{outline:2px solid color-mix(in srgb,var(--backup-color) 34%,transparent);outline-offset:2px}
 .backup-chip-glyphs{display:grid;place-items:center;width:13px;height:13px;flex:0 0 13px}.backup-chip-glyph{display:none;place-items:center;width:13px;height:13px}.backup-chip-glyph .ico{width:13px;height:13px;stroke-width:2.15}
 .backup-chip[data-backup-glyph="check"] .backup-chip-glyph.check,.backup-chip[data-backup-glyph="question"] .backup-chip-glyph.question,.backup-chip[data-backup-glyph="alert"] .backup-chip-glyph.alert,.backup-chip[data-backup-glyph="x"] .backup-chip-glyph.x{display:grid}
-.backup-mini{--backup-color:var(--wait);display:grid;grid-template-columns:8px minmax(0,1fr);align-items:center;column-gap:8px;min-height:32px;margin:-1px 0 10px;padding:7px 8px;border:1px solid color-mix(in srgb,var(--backup-color) 20%,rgba(210,226,234,.82));border-radius:7px;background:linear-gradient(135deg,rgba(255,255,255,.78),color-mix(in srgb,var(--backup-color) 6%,white));color:var(--ink)}
-.backup-mini:before{content:"";grid-row:1/3;width:8px;height:8px;border-radius:50%;background:var(--backup-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--backup-color) 10%,transparent)}
-.backup-mini strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;color:var(--ink)}
-.backup-mini span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;line-height:1.2}
-.backup-mini.clear{--backup-color:var(--live)}.backup-mini.warning{--backup-color:var(--stale)}.backup-mini.critical{--backup-color:var(--down)}.backup-mini.watch{--backup-color:var(--wait)}
-.backup-list{min-width:150px;margin:0}
-.backup-list span{font-size:11px}
-.backup-list strong{font-size:12px}
 .protection-onboard{--protect-color:var(--wait);display:grid;grid-template-columns:8px minmax(0,1fr);align-items:center;column-gap:8px;min-height:30px;margin:-3px 0 10px;padding:7px 8px;border:1px solid color-mix(in srgb,var(--protect-color) 18%,rgba(210,226,234,.82));border-radius:7px;background:linear-gradient(135deg,rgba(255,255,255,.76),color-mix(in srgb,var(--protect-color) 5%,white));color:var(--ink)}
 .protection-onboard:before{content:"";grid-row:1/3;width:8px;height:8px;border-radius:50%;background:var(--protect-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--protect-color) 10%,transparent)}
 .protection-onboard strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;color:var(--ink)}
@@ -3407,13 +3396,27 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 .list-wrap{display:none}
 main[data-view="list"] .grid{display:none}
 main[data-view="list"] .list-wrap{display:block}
-.list{width:100%;border-collapse:separate;border-spacing:0 8px}
-.list th{padding:0 12px 6px;text-align:left;color:var(--muted);font-size:11px;font-weight:600}
-.list td{padding:12px;background:rgba(255,255,255,.88);border-top:1px solid rgba(211,225,233,.86);border-bottom:1px solid rgba(211,225,233,.86);vertical-align:middle}
-.list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:8px 0 0 8px}
-.list td:last-child{border-right:1px solid rgba(211,225,233,.86);border-radius:0 8px 8px 0}
+.list{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 6px}
+.list col.host-col{width:18%}.list col.attention-col{width:20%}.list col.freshness-col{width:15%}.list col.seen-col{width:10%}.list col.heartbeat-col{width:27%}.list col.actions-col{width:10%}
+.list th{padding:0 12px 7px;text-align:left;color:var(--muted);font-size:11px;font-weight:650;white-space:nowrap}
+.list th:last-child{text-align:right}
+.list td{height:84px;padding:10px 12px;background:rgba(255,255,255,.88);border-top:1px solid rgba(211,225,233,.86);border-bottom:1px solid rgba(211,225,233,.86);vertical-align:middle;transition:background-color .16s ease,border-color .16s ease,box-shadow .16s ease}
+.list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:7px 0 0 7px}
+.list td:last-child{overflow:visible;border-right:1px solid rgba(211,225,233,.86);border-radius:0 7px 7px 0}
+.list tbody tr:not(.onboard-row):hover td{background:rgba(255,255,255,.96);border-color:rgba(188,211,222,.92);box-shadow:0 10px 24px rgba(54,88,108,.035)}
 .list tr.light td{border-color:rgba(214,155,49,.34)}
-.list .host{min-width:210px}.list .reason{min-width:150px;margin:0}.list .fresh{min-height:0;margin:0;white-space:nowrap}.list .fresh-row{min-height:20px}.list .status-pill{max-width:120px}.list .beat{width:230px;margin:0}.list .card-tools{margin:0}.list .settings-card{margin:0}.list .settings-icon{width:13px;height:13px}
+.list tr:has(.header-chip:hover),.list tr:has(.header-chip:focus-visible){position:relative;z-index:40}
+.list .host{min-width:0}.list .nix{width:34px;height:34px;flex:0 0 34px}.list .name{font-size:15px}.list .role{font-size:11px}
+.list-attention{display:grid;align-content:center;gap:3px;min-width:0;min-height:44px}
+.list-attention .settings-wait-note{min-height:18px;margin:0;font-size:11px}
+.list-attention .reason{min-width:0;min-height:18px;margin:0;font-size:11px}
+.list-attention .kernel-slot{min-width:0;min-height:18px;margin:0}.list-attention .kernel-posture summary{min-height:18px}
+.list-attention .mute-note{min-height:18px;margin:0}.list-attention .protection-list{min-width:0;margin:2px 0 0;padding:5px 7px}
+.list .fresh{min-height:0;margin:0;white-space:normal}.list .fresh-row{min-height:20px}.list .fresh-row span,.list .fresh-row strong{font-size:11px}
+.list-seen{display:grid;align-content:center;gap:2px;min-height:44px;white-space:nowrap}.list-seen [data-seen]{color:var(--ink);font-size:12px;font-weight:650}.list-seen-detail{display:none;color:var(--muted);font-size:10px}.list tr[data-history-hint="true"] .list-seen-detail{display:block}
+.list-heartbeat{display:grid;grid-template-columns:minmax(170px,1fr) auto;align-items:center;gap:10px;min-width:0}.list-heartbeat .beat{min-width:0;width:auto;margin:0}.list-heartbeat .signal{justify-self:end}
+.list-actions{position:relative;z-index:10;display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:58px}.list-actions .header-chip{flex:0 0 auto;margin:0}.list .settings-icon{width:13px;height:13px}
+.list-setup-intent{display:flex;flex-wrap:wrap;gap:5px}.list-setup-intent .setup-chip{min-height:23px;padding:3px 7px;font-size:10px}.list-setup-state{display:inline-flex;align-items:center;min-height:25px;color:var(--muted);font-size:11px;font-weight:720}
 .list tr.onboard-row td{border:1px dashed rgba(214,155,49,.42);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.86),rgba(240,250,250,.72));box-shadow:0 10px 24px rgba(45,75,95,.05)}
 .onboard-row button{appearance:none;width:100%;display:flex;align-items:center;gap:12px;border:0;background:transparent;color:var(--ink);font:inherit;text-align:left;cursor:pointer}.onboard-row button:hover strong,.onboard-row button:focus-visible strong{color:#0f4f80}.onboard-row button:focus-visible{outline:0}
 .onboard-row .onboard-mark{width:32px;height:32px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.onboard-row .onboard-mark .ico{width:16px;height:16px}.onboard-row strong{display:block;font-size:13px}.onboard-row span:last-child{display:block;color:var(--muted);font-size:12px}
@@ -3771,16 +3774,7 @@ function updateBackup(surface,info){
     el.href='/backups?host='+encodeURIComponent(host);
     el.title='Backup: '+info.label+' - '+info.detail;
     el.setAttribute('aria-label','Backup for '+host+': '+info.label+', '+info.detail);
-    return;
   }
-  const list=el.classList.contains('backup-list');
-  el.className='backup-mini'+(list?' backup-list':'')+' '+info.level;
-  el.dataset.backupState=info.state;
-  el.title='Backup: '+info.label+' - '+info.detail;
-  const label=el.querySelector('strong');
-  const detail=el.querySelector('span');
-  if(label)label.textContent=info.label;
-  if(detail)detail.textContent=info.detail;
 }
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
@@ -3894,19 +3888,19 @@ function updateSignal(surface,info){
   }
 }
 function setHistoryHint(mark,show){
-  const card=mark.closest('.card');
-  if(!card)return;
-  const seen=card.querySelector('[data-seen]');
-  const asof=card.querySelector('[data-card-asof]');
-  if(!seen||!asof)return;
+  const surface=mark.closest('[data-host]');
+  if(!surface)return;
+  const seen=surface.querySelector('[data-seen]');
+  const asof=surface.querySelector('[data-card-asof]');
+  if(!seen)return;
   if(show){
-    card.dataset.historyHint='true';
+    surface.dataset.historyHint='true';
     seen.textContent=mark.dataset.historyLabel||'historic heartbeat';
-    asof.textContent=mark.dataset.historyDetail||'';
+    if(asof)asof.textContent=mark.dataset.historyDetail||'';
   }else{
-    delete card.dataset.historyHint;
+    delete surface.dataset.historyHint;
     seen.textContent=seen.dataset.defaultText||seen.textContent;
-    asof.textContent=asof.dataset.defaultText||asof.textContent;
+    if(asof)asof.textContent=asof.dataset.defaultText||asof.textContent;
   }
 }
 function bindHistoryHints(root=document){
@@ -4003,7 +3997,8 @@ function frame(){
 function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
   if(!seen)return;
-  const text=last==null?'never seen':'last seen '+dur(now-last)+' ago';
+  const compact=seen.hasAttribute('data-seen-compact');
+  const text=last==null?(compact?'never':'never seen'):(compact?dur(now-last)+' ago':'last seen '+dur(now-last)+' ago');
   seen.dataset.defaultText=text;
   if(card.dataset.historyHint!=='true')seen.textContent=text;
 }
@@ -8189,17 +8184,6 @@ fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
     )
 }
 
-fn backup_list_markup(summary: &BackupUiSummary) -> String {
-    format!(
-        r#"<div class="backup-mini backup-list {level}" data-backup-state="{state}" title="{title}"><strong>{label}</strong><span>{detail}</span></div>"#,
-        level = html_escape(summary.level),
-        state = html_escape(summary.state),
-        title = html_escape(&format!("Backup: {} - {}", summary.label, summary.detail)),
-        label = html_escape(&summary.label),
-        detail = html_escape(&summary.detail)
-    )
-}
-
 fn backup_search_text(summary: &BackupUiSummary) -> Option<String> {
     (summary.total > 0).then(|| {
         format!(
@@ -8793,23 +8777,6 @@ fn live_key(live: Liveness) -> &'static str {
     }
 }
 
-fn icon_with_class(svg: &str, class: &str) -> String {
-    svg.replacen("class=\"ico\"", &format!("class=\"ico {class}\""), 1)
-}
-
-fn status_icon_stack() -> String {
-    format!(
-        "{}{}{}{}",
-        icon_with_class(icons::status_svg(Liveness::Live), "state-icon live"),
-        icon_with_class(icons::status_svg(Liveness::Stale), "state-icon stale"),
-        icon_with_class(icons::status_svg(Liveness::Down), "state-icon down"),
-        icon_with_class(
-            icons::status_svg(Liveness::AwaitingFirstHeartbeat),
-            "state-icon awaiting"
-        )
-    )
-}
-
 fn duration_label(seconds: i64) -> String {
     let seconds = seconds.max(0);
     if seconds < 60 {
@@ -8994,7 +8961,7 @@ fn onboard_tile() -> String {
 
 fn onboard_row() -> String {
     format!(
-        r#"<tr class="onboard-row" data-sev="9" data-sort-name="zzzz-onboard" data-last="0"><td colspan="7"><button type="button" data-onboard-open aria-label="Add server"><span class="onboard-mark">{icon}</span><span><strong>Add server</strong><span>Provision a new host or onboard an existing one.</span></span></button></td></tr>"#,
+        r#"<tr class="onboard-row" data-sev="9" data-sort-name="zzzz-onboard" data-last="0"><td colspan="6"><button type="button" data-onboard-open aria-label="Add server"><span class="onboard-mark">{icon}</span><span><strong>Add server</strong><span>Provision a new host or onboard an existing one.</span></span></button></td></tr>"#,
         icon = icons::PLUS
     )
 }
@@ -9385,9 +9352,8 @@ fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
         setup_intent_search_text(&intent).to_lowercase()
     ));
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
-    let status_icon = status_icon_stack();
     format!(
-        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {reason}">{status_icon}<span class="word" data-status-word>{reason}</span></span></td><td><div class="reason {reason_level}" data-reason><span>{reason}</span></div></td><td><span class="setup-chip backup">{backup}</span></td><td><span class="setup-chip location">{location}</span></td><td><span>{started}</span></td><td><span>{job_state}</span></td><td><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a></td></tr>"#,
+        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a></div></td></tr>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
         job_id = html_escape(&job.id),
@@ -12421,7 +12387,6 @@ fn render_home(
     for h in sorted {
         let is_self = h.name == self_name;
         let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        let (_color, word) = live.badge();
         let nix_icon = if h.is_nix {
             icons::SNOWFLAKE
         } else {
@@ -12446,7 +12411,6 @@ fn render_home(
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
         let backup_chip = backup_chip_markup(&backup, &h.name);
-        let backup_list = backup_list_markup(&backup);
         let protection = protection_onboarding_status(h, runtime.jobs, now);
         let protection_card = protection
             .as_ref()
@@ -12484,6 +12448,10 @@ fn render_home(
         let seen = match h.last_seen {
             Some(t) => format!("last seen {} ago", duration_label(now - t)),
             None => "never seen".to_string(),
+        };
+        let seen_compact = match h.last_seen {
+            Some(t) => format!("{} ago", duration_label(now - t)),
+            None => "never".to_string(),
         };
         let light_cls = if is_self { " light" } else { "" };
         let self_attr = if is_self { r#" data-self="true""# } else { "" };
@@ -12567,8 +12535,6 @@ fn render_home(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
         );
-        let status_word = word;
-        let status_icon = status_icon_stack();
         let heartbeat = heartbeat_card(
             h.last_seen,
             &h.heartbeat_log,
@@ -12594,8 +12560,9 @@ fn render_home(
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><span class="status-pill" aria-label="status: {status_word}">{status_icon}<span class="word" data-status-word>{status_word}</span></span></td><td>{reason}{kernel}{muted}</td><td>{backup_list}{protection_list}</td><td><div class="fresh" data-fresh>{fresh}</div></td><td><span data-seen>{seen}</span></td><td>{heartbeat}</td><td>{settings_action}</td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{settings_note}{reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}</div></td></tr>"#,
             live_key = live_key(live),
+            as_of = clock_label(now),
         ));
     }
     for job in setup_jobs {
@@ -12619,7 +12586,7 @@ fn render_home(
     };
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><thead><tr><th>Host</th><th>Status</th><th>Attention</th><th>Backup</th><th>Freshness</th><th>Last seen</th><th>Heartbeat</th><th>Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{FOOT}",
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
@@ -13385,9 +13352,15 @@ mod tests {
         assert!(html.contains(r#"data-self="true""#));
         assert!(html.contains(r#"class="pharos-mark""#));
         assert!(!html.contains("the light is lit"));
-        assert!(html.contains(r#"<th>Attention</th>"#));
-        assert!(html.contains(r#"<th>Backup</th>"#));
-        assert!(html.contains(r#"<th>Actions</th>"#));
+        assert!(html.contains(r#"<col class="heartbeat-col">"#));
+        assert!(html.contains(r#"<th scope="col">Attention</th>"#));
+        assert!(html.contains(r#"<th scope="col">Actions</th>"#));
+        assert!(!html.contains("status-pill"));
+        assert!(!html.contains(r#"<th scope="col">Backup</th>"#));
+        assert!(html.contains(r#"class="list-heartbeat""#));
+        assert!(html.contains(r#"data-seen data-seen-compact"#));
+        assert!(html.contains(r#"class="list-actions""#));
+        assert!(html.contains("seen.hasAttribute('data-seen-compact')"));
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains("No settings yet"));
         assert!(!html.contains("Not set up yet"));
@@ -13433,7 +13406,7 @@ mod tests {
         assert!(html.contains(r#"data-host="poseidon" data-live="live" data-sev="3""#));
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
-        assert!(html.contains("state-icon stale"));
+        assert!(!html.contains(r#"<th scope="col">Status</th>"#));
     }
 
     #[test]
@@ -13470,15 +13443,20 @@ mod tests {
         );
 
         assert!(html.contains(r#"data-backup-state="healthy""#));
-        assert!(html.contains(r#"class="header-chip backup-chip clear""#));
+        assert_eq!(
+            html.matches(r#"class="header-chip backup-chip clear""#)
+                .count(),
+            2
+        );
         assert!(html.contains(r#"href="/backups?host=athena""#));
         assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
         assert!(
             html.contains(r#"aria-label="Backup for athena: Protected, last success 2m 00s ago""#)
         );
-        assert!(html.contains(">Protected<"));
-        assert!(html.contains("last success 2m 00s ago"));
-        assert!(html.contains(r#"class="backup-mini backup-list clear""#));
+        assert!(!html.contains(r#"class="backup-mini backup-list clear""#));
+        assert!(
+            html.contains(r#"<div class="list-actions"><a class="header-chip backup-chip clear""#)
+        );
         assert!(html.contains("off-box repository"));
         assert!(!html.contains("restic-main-repository"));
     }
@@ -15260,6 +15238,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"setup=add-server&amp;setup_job=setup-1000-test"#));
         assert!(html.contains(r#"data-host-surface="setup""#));
         assert!(html.contains(r#"<tr class="setup-row""#));
+        assert!(html.contains(r#"class="list-setup-intent""#));
+        assert!(html.contains(r#"class="list-setup-state""#));
+        assert!(html.contains(r#"colspan="6""#));
     }
 
     #[test]
