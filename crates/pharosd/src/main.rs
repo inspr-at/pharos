@@ -3873,6 +3873,18 @@ function renderHostActionJob(job,message){
     if(removeName)removeName.textContent=hostActionContext.host;
     if(attended)attended.hidden=false;
     if(primary){primary.hidden=false;primary.textContent='Apply update and restart';primary.disabled=!hostActionConfirmationReady()}
+  }else if(job.state==='failed'&&job.retryable===true){
+    hostActionContext.stage='retry';
+    if(copy)copy.textContent='The review stopped safely before any live change. Retry only after the reported cause has been corrected.';
+    if(infoTitle)infoTitle.textContent='Nothing changed on the host';
+    if(infoCopy)infoCopy.textContent='Retry creates a new audited review and keeps this failed attempt in the action history.';
+    if(primary){primary.hidden=false;primary.textContent='Retry guarded review';primary.disabled=false}
+  }else if(job.state==='failed'){
+    hostActionContext.stage='failed';
+    if(copy)copy.textContent='This failure happened after the review gate and cannot be retried automatically.';
+    if(infoTitle)infoTitle.textContent='Manual recovery required';
+    if(infoCopy)infoCopy.textContent='Inspect the host and rollback posture before starting another live workflow.';
+    if(primary)primary.hidden=true;
   }else{
     if(confirm)confirm.hidden=true;
     if(attended)attended.hidden=true;
@@ -3906,6 +3918,7 @@ async function submitHostAction(){
     let result;
     if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
     else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
+    else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
     else if(action==='remove')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/remove',{confirmation:host});
     else return;
@@ -6263,6 +6276,33 @@ fn host_janus_actions_ready(state: &AppState, host: &str) -> bool {
     })
 }
 
+fn update_restart_target_error(state: &AppState, host: &str) -> Option<(StatusCode, &'static str)> {
+    let Some(runtime) = state.store.get(host) else {
+        return Some((StatusCode::NOT_FOUND, "Host is not reporting to Pharos"));
+    };
+    if !runtime.is_nix {
+        return Some((
+            StatusCode::CONFLICT,
+            "Guarded system updates are available only for Nix hosts",
+        ));
+    }
+    if !host_janus_actions_ready(state, host) {
+        return Some((
+            StatusCode::CONFLICT,
+            "This host is not prepared for target-local Janus actions yet",
+        ));
+    }
+    if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
+        && runtime.freshness.commits_behind.unwrap_or(0) == 0
+    {
+        return Some((
+            StatusCode::CONFLICT,
+            "No pending system update or restart is currently reported for this host",
+        ));
+    }
+    None
+}
+
 async fn request_system_update(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6320,28 +6360,8 @@ async fn request_update_restart_review(
             "Guarded host action access is not granted",
         );
     }
-    let Some(runtime) = state.store.get(&host) else {
-        return action_error(StatusCode::NOT_FOUND, "Host is not reporting to Pharos");
-    };
-    if !runtime.is_nix {
-        return action_error(
-            StatusCode::CONFLICT,
-            "Guarded system updates are available only for Nix hosts",
-        );
-    }
-    if !host_janus_actions_ready(&state, &host) {
-        return action_error(
-            StatusCode::CONFLICT,
-            "This host is not prepared for target-local Janus actions yet",
-        );
-    }
-    if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
-        && runtime.freshness.commits_behind.unwrap_or(0) == 0
-    {
-        return action_error(
-            StatusCode::CONFLICT,
-            "No pending system update or restart is currently reported for this host",
-        );
+    if let Some((status, message)) = update_restart_target_error(&state, &host) {
+        return action_error(status, message);
     }
     let actor = action_actor(&state.auth, &headers);
     match state
@@ -6356,9 +6376,73 @@ async fn request_update_restart_review(
             StatusCode::CONFLICT,
             "A guarded update workflow is already active for this host",
         ),
+        Err(HostActionStoreError::FailedJobRequiresRetry) => action_error(
+            StatusCode::CONFLICT,
+            "The latest guarded review failed; retry that recorded attempt",
+        ),
+        Err(HostActionStoreError::BlockedByFleetGate) => action_error(
+            StatusCode::CONFLICT,
+            "Another host update workflow must finish or be resolved first",
+        ),
         Err(_) => action_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "The guarded review could not be recorded",
+        ),
+    }
+}
+
+async fn retry_update_restart_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&existing.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded host action access is not granted",
+        );
+    }
+    if let Some((status, message)) = update_restart_target_error(&state, &existing.host) {
+        return action_error(status, message);
+    }
+    let actor = action_actor(&state.auth, &headers);
+    match state
+        .host_actions
+        .retry_update_review(&id, &existing.host, &actor, now_unix())
+    {
+        Ok(job) => {
+            tracing::info!(host = %job.host, actor = %actor, ticket = "PHAROS-126", "failed guarded host review retried");
+            action_response(StatusCode::ACCEPTED, &job)
+        }
+        Err(HostActionStoreError::InvalidTransition) => action_error(
+            StatusCode::CONFLICT,
+            "Only the latest pre-confirmation review failure can be retried",
+        ),
+        Err(HostActionStoreError::ActiveJob) => action_error(
+            StatusCode::CONFLICT,
+            "A guarded update workflow is already active for this host",
+        ),
+        Err(HostActionStoreError::BlockedByFleetGate) => action_error(
+            StatusCode::CONFLICT,
+            "Another host update workflow must finish or be resolved first",
+        ),
+        Err(HostActionStoreError::NotFound) => {
+            action_error(StatusCode::NOT_FOUND, "Guarded action was not found")
+        }
+        Err(HostActionStoreError::WrongHost) => action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded action does not belong to this host",
+        ),
+        Err(_) => action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The guarded retry could not be recorded",
         ),
     }
 }
@@ -6598,9 +6682,11 @@ async fn claim_host_action(
     match state.host_actions.claim(&host, now_unix()) {
         Ok(Some(lease)) => (StatusCode::OK, Json(lease)).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(HostActionStoreError::BlockedByFailure) => (
+        Err(HostActionStoreError::BlockedByFleetGate) => (
             StatusCode::CONFLICT,
-            Json(json!({ "error": "Another host failure must be resolved first" })),
+            Json(
+                json!({ "error": "Another host update workflow must finish or be resolved first" }),
+            ),
         )
             .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -13886,6 +13972,10 @@ async fn main() {
         )
         .route("/host-actions/jobs/{id}", get(host_action_job_json))
         .route(
+            "/host-actions/jobs/{id}/retry",
+            post(retry_update_restart_review),
+        )
+        .route(
             "/host-actions/jobs/{id}/confirm",
             post(confirm_update_restart),
         )
@@ -14819,6 +14909,10 @@ mod tests {
         assert!(html.contains("event.key==='ArrowDown'"));
         assert!(html.contains("event.key==='Escape'"));
         assert!(html.contains("X-Pharos-Action"));
+        assert!(html.contains("Retry guarded review"));
+        assert!(html.contains(
+            "'/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry'"
+        ));
     }
 
     #[test]
@@ -18971,6 +19065,96 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(payload["job"]["state"], "queued_apply");
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[tokio::test]
+    async fn failed_guarded_review_requires_explicit_linked_retry() {
+        let (state, manifest_path) = state_with_janus_manifest("hsb8", "action-token");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let failed_id = payload["job"]["id"].as_str().expect("job id").to_string();
+        assert_eq!(
+            claim_host_action(
+                State(state.clone()),
+                bearer_headers("action-token"),
+                Json(AgentActionClaimRequest {
+                    host: "hsb8".to_string(),
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            record_host_action_result(
+                State(state.clone()),
+                bearer_headers("action-token"),
+                AxumPath(failed_id.clone()),
+                Json(AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: host_actions::AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let (status, Json(payload)) = request_update_restart_review(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("retry")));
+
+        let (status, Json(payload)) = retry_update_restart_review(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(failed_id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "queued_review");
+        assert_eq!(payload["job"]["retry_of"], failed_id);
+        assert_eq!(payload["job"]["retryable"], false);
+        assert_eq!(
+            state
+                .host_actions
+                .get(&failed_id)
+                .expect("failed attempt retained")
+                .state,
+            HostActionState::Failed
+        );
+        let latest = state
+            .host_actions
+            .latest_for_host("hsb8")
+            .expect("retry is latest");
+        assert_eq!(latest.id, payload["job"]["id"]);
+        assert_eq!(
+            claim_host_action(
+                State(state.clone()),
+                bearer_headers("action-token"),
+                Json(AgentActionClaimRequest {
+                    host: "hsb8".to_string(),
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
         let _ = std::fs::remove_file(manifest_path);
     }
 

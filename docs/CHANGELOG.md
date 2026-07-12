@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.28 - 2026-07-12
+
+- Let operators retry the latest failed pre-change host review from the existing action dialog after its cause is corrected, while preserving the failed attempt and linking the new review to it.
+- Keep retries fail-closed: only review failures before confirmation are retryable; failures after confirmation require manual recovery and cannot silently start another live change.
+- Make each host's latest guarded attempt control the fleet gate, validate retry relationships in durable state, and prevent bypassing a recorded failure with an unrelated new review.
+
 ## 0.1.27 - 2026-07-12
 
 - Add one shared, accessible per-host Actions menu to Fleet cards and rows, with pending-change review, safe technical details, and contextual controls that appear only when their guarded backend is prepared.

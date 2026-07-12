@@ -103,6 +103,8 @@ pub(crate) struct HostActionJob {
     pub(crate) state: HostActionState,
     pub(crate) requested_by: String,
     pub(crate) ticket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_of: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
     pub(crate) confirmed_at: Option<i64>,
@@ -121,6 +123,8 @@ impl HostActionJob {
             && valid_host_name(&self.host)
             && safe_actor(&self.requested_by)
             && valid_ticket(&self.ticket)
+            && self.retry_of.as_deref().is_none_or(safe_action_id)
+            && self.retry_of.as_ref().is_none_or(|id| id != &self.id)
             && self.created_at > 0
             && self.updated_at >= self.created_at
             && self.plan.as_ref().is_none_or(HostActionPlan::validate)
@@ -132,10 +136,20 @@ impl HostActionJob {
             kind: self.kind,
             state: self.state,
             ticket: self.ticket.clone(),
+            retry_of: self.retry_of.clone(),
+            retryable: self.review_retryable(),
             updated_at: self.updated_at,
             plan: self.plan.clone(),
             result: self.result.clone(),
         }
+    }
+
+    fn review_retryable(&self) -> bool {
+        self.kind == HostActionKind::UpdateRestart
+            && self.state == HostActionState::Failed
+            && self.confirmed_at.is_none()
+            && self.plan.is_none()
+            && self.result.is_none()
     }
 }
 
@@ -145,9 +159,26 @@ pub(crate) struct HostActionSummary {
     pub(crate) kind: HostActionKind,
     pub(crate) state: HostActionState,
     pub(crate) ticket: String,
+    pub(crate) retry_of: Option<String>,
+    pub(crate) retryable: bool,
     pub(crate) updated_at: i64,
     pub(crate) plan: Option<HostActionPlan>,
     pub(crate) result: Option<HostActionResult>,
+}
+
+fn valid_action_jobs(jobs: &BTreeMap<String, HostActionJob>) -> bool {
+    jobs.values().all(|job| {
+        job.validate()
+            && job.retry_of.as_ref().is_none_or(|retry_of| {
+                jobs.get(retry_of).is_some_and(|failed| {
+                    failed.host == job.host
+                        && failed.kind == HostActionKind::UpdateRestart
+                        && failed.state == HostActionState::Failed
+                        && job.kind == HostActionKind::UpdateRestart
+                        && failed.created_at <= job.created_at
+                })
+            })
+    })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -189,12 +220,13 @@ pub(crate) struct AgentActionResultRequest {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HostActionStoreError {
     ActiveJob,
+    FailedJobRequiresRetry,
     InvalidJob,
     NotFound,
     WrongHost,
     InvalidTransition,
     ReviewFailed,
-    BlockedByFailure,
+    BlockedByFleetGate,
     Persistence,
 }
 
@@ -221,11 +253,13 @@ impl HostActionStore {
             .map(|jobs| {
                 let jobs: Vec<HostActionJob> = serde_json::from_slice(&jobs)
                     .unwrap_or_else(|_| panic!("guarded host action state is malformed"));
+                let jobs: BTreeMap<_, _> =
+                    jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
                 assert!(
-                    jobs.iter().all(HostActionJob::validate),
+                    valid_action_jobs(&jobs),
                     "guarded host action state failed validation"
                 );
-                jobs.into_iter().map(|job| (job.id.clone(), job)).collect()
+                jobs
             })
             .unwrap_or_default();
         Self {
@@ -278,6 +312,7 @@ impl HostActionStore {
             state: proposal.state,
             requested_by: proposal.actor.to_string(),
             ticket: proposal.ticket.to_string(),
+            retry_of: None,
             created_at: proposal.now,
             updated_at: proposal.now,
             confirmed_at: None,
@@ -312,18 +347,47 @@ impl HostActionStore {
         actor: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        if self.has_active(host, HostActionKind::UpdateRestart) {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        if Self::has_active(&jobs, host, HostActionKind::UpdateRestart) {
             return Err(HostActionStoreError::ActiveJob);
         }
-        self.record_proposal(NewHostAction {
-            id: action_id("update-restart", host, now),
-            host,
-            kind: HostActionKind::UpdateRestart,
-            actor,
-            ticket: "PHAROS-126",
-            state: HostActionState::QueuedReview,
-            now,
-        })
+        if Self::latest_update_for(&jobs, host)
+            .is_some_and(|job| job.state == HostActionState::Failed)
+        {
+            return Err(HostActionStoreError::FailedJobRequiresRetry);
+        }
+        if Self::blocked_by_other_update(&jobs, host) {
+            return Err(HostActionStoreError::BlockedByFleetGate);
+        }
+        let job = Self::new_update_review(host, actor, now, None);
+        self.insert_locked(&mut jobs, job)
+    }
+
+    pub(crate) fn retry_update_review(
+        &self,
+        id: &str,
+        host: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let existing = jobs.get(id).ok_or(HostActionStoreError::NotFound)?;
+        if existing.host != host {
+            return Err(HostActionStoreError::WrongHost);
+        }
+        if !existing.review_retryable()
+            || Self::latest_update_for(&jobs, host).is_none_or(|job| job.id != id)
+        {
+            return Err(HostActionStoreError::InvalidTransition);
+        }
+        if Self::has_active(&jobs, host, HostActionKind::UpdateRestart) {
+            return Err(HostActionStoreError::ActiveJob);
+        }
+        if Self::blocked_by_other_update(&jobs, host) {
+            return Err(HostActionStoreError::BlockedByFleetGate);
+        }
+        let job = Self::new_update_review(host, actor, now, Some(id.to_string()));
+        self.insert_locked(&mut jobs, job)
     }
 
     pub(crate) fn create_removal(
@@ -334,7 +398,11 @@ impl HostActionStore {
         declaration_pending: bool,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        if self.has_active(host, HostActionKind::RemoveHost) {
+        if Self::has_active(
+            &self.jobs.read().expect("host action store lock"),
+            host,
+            HostActionKind::RemoveHost,
+        ) {
             return Err(HostActionStoreError::ActiveJob);
         }
         self.record_proposal(NewHostAction {
@@ -392,10 +460,10 @@ impl HostActionStore {
         host: &str,
         now: i64,
     ) -> Result<Option<AgentActionLease>, HostActionStoreError> {
-        if self.blocked_by_other_failure(host) {
-            return Err(HostActionStoreError::BlockedByFailure);
-        }
         let mut jobs = self.jobs.write().expect("host action store lock");
+        if Self::blocked_by_other_update(&jobs, host) {
+            return Err(HostActionStoreError::BlockedByFleetGate);
+        }
         let candidate = jobs
             .values_mut()
             .filter(|job| job.host == host && job.kind == HostActionKind::UpdateRestart)
@@ -543,36 +611,96 @@ impl HostActionStore {
         Ok(Some(updated))
     }
 
-    fn has_active(&self, host: &str, kind: HostActionKind) -> bool {
-        self.jobs
-            .read()
-            .expect("host action store lock")
-            .values()
+    fn new_update_review(
+        host: &str,
+        actor: &str,
+        now: i64,
+        retry_of: Option<String>,
+    ) -> HostActionJob {
+        HostActionJob {
+            schema: ACTION_SCHEMA.to_string(),
+            version: ACTION_VERSION,
+            id: action_id("update-restart", host, now),
+            host: host.to_string(),
+            kind: HostActionKind::UpdateRestart,
+            state: HostActionState::QueuedReview,
+            requested_by: actor.to_string(),
+            ticket: "PHAROS-126".to_string(),
+            retry_of,
+            created_at: now,
+            updated_at: now,
+            confirmed_at: None,
+            plan: None,
+            result: None,
+            lease_phase: None,
+            lease_until: None,
+        }
+    }
+
+    fn has_active(
+        jobs: &BTreeMap<String, HostActionJob>,
+        host: &str,
+        kind: HostActionKind,
+    ) -> bool {
+        jobs.values()
             .any(|job| job.host == host && job.kind == kind && !job.state.is_terminal())
     }
 
-    fn blocked_by_other_failure(&self, host: &str) -> bool {
-        self.jobs
-            .read()
-            .expect("host action store lock")
-            .values()
-            .any(|job| {
-                job.kind == HostActionKind::UpdateRestart
-                    && job.state == HostActionState::Failed
-                    && job.host != host
+    fn latest_update_for<'a>(
+        jobs: &'a BTreeMap<String, HostActionJob>,
+        host: &str,
+    ) -> Option<&'a HostActionJob> {
+        jobs.values()
+            .filter(|job| job.kind == HostActionKind::UpdateRestart && job.host == host)
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.updated_at.cmp(&right.updated_at))
+                    .then_with(|| left.id.cmp(&right.id))
             })
     }
 
+    fn blocked_by_other_update(jobs: &BTreeMap<String, HostActionJob>, host: &str) -> bool {
+        let mut latest_by_host: BTreeMap<&str, &HostActionJob> = BTreeMap::new();
+        for job in jobs
+            .values()
+            .filter(|job| job.kind == HostActionKind::UpdateRestart)
+        {
+            let replace = latest_by_host.get(job.host.as_str()).is_none_or(|current| {
+                (job.created_at, job.updated_at, &job.id)
+                    > (current.created_at, current.updated_at, &current.id)
+            });
+            if replace {
+                latest_by_host.insert(job.host.as_str(), job);
+            }
+        }
+        latest_by_host
+            .values()
+            .any(|job| job.host != host && job.state != HostActionState::Succeeded)
+    }
+
     fn insert(&self, job: HostActionJob) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        self.insert_locked(&mut jobs, job)
+    }
+
+    fn insert_locked(
+        &self,
+        jobs: &mut BTreeMap<String, HostActionJob>,
+        job: HostActionJob,
+    ) -> Result<HostActionJob, HostActionStoreError> {
         if !job.validate() {
             return Err(HostActionStoreError::InvalidJob);
         }
-        let mut jobs = self.jobs.write().expect("host action store lock");
         if jobs.contains_key(&job.id) {
             return Err(HostActionStoreError::ActiveJob);
         }
         jobs.insert(job.id.clone(), job.clone());
-        if let Err(error) = self.persist_jobs(&jobs) {
+        if !valid_action_jobs(jobs) {
+            jobs.remove(&job.id);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(jobs) {
             jobs.remove(&job.id);
             return Err(error);
         }
@@ -886,6 +1014,158 @@ mod tests {
             store.claim("hsb8", 104).expect("claim").unwrap().phase,
             AgentActionPhase::Apply
         );
+    }
+
+    #[test]
+    fn failed_review_requires_linked_retry_and_latest_attempt_controls_fleet_gate() {
+        let store = HostActionStore::new(None);
+        let failed = store
+            .create_update_review("hsb8", "markus", 100)
+            .expect("job created");
+        store.claim("hsb8", 101).expect("claim").expect("lease");
+        let failed_result = store
+            .record_agent_result(
+                &failed.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                102,
+            )
+            .expect("failure stored");
+        assert_eq!(failed_result.state, HostActionState::Failed);
+        assert!(failed_result.summary().retryable);
+        assert_eq!(
+            store.create_update_review("hsb8", "markus", 103),
+            Err(HostActionStoreError::FailedJobRequiresRetry)
+        );
+        assert_eq!(
+            store.create_update_review("csb0", "markus", 103),
+            Err(HostActionStoreError::BlockedByFleetGate)
+        );
+
+        let retry = store
+            .retry_update_review(&failed.id, "hsb8", "markus", 104)
+            .expect("retry created");
+        assert_ne!(retry.id, failed.id);
+        assert_eq!(retry.retry_of.as_deref(), Some(failed.id.as_str()));
+        assert_eq!(store.latest_for_host("hsb8").expect("latest").id, retry.id);
+        assert_eq!(
+            store.create_update_review("csb0", "markus", 104),
+            Err(HostActionStoreError::BlockedByFleetGate)
+        );
+
+        let lease = store.claim("hsb8", 105).expect("claim").expect("lease");
+        assert_eq!(lease.id, retry.id);
+        store
+            .record_agent_result(
+                &retry.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                106,
+            )
+            .expect("review stored");
+        store
+            .confirm_update(&retry.id, "hsb8", 107)
+            .expect("confirmed");
+        store.claim("hsb8", 108).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &retry.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: true,
+                        kernel_verified: true,
+                        rollback_available: true,
+                    }),
+                },
+                109,
+            )
+            .expect("success stored");
+        assert!(store.create_update_review("csb0", "markus", 110).is_ok());
+        assert_eq!(
+            store
+                .get(&failed.id)
+                .expect("failed attempt retained")
+                .state,
+            HostActionState::Failed
+        );
+    }
+
+    #[test]
+    fn post_confirmation_failure_is_not_automatically_retryable() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "markus", 200)
+            .expect("job created");
+        store.claim("hsb8", 201).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                202,
+            )
+            .expect("review stored");
+        store
+            .confirm_update(&job.id, "hsb8", 203)
+            .expect("confirmed");
+        store.claim("hsb8", 204).expect("claim").expect("lease");
+        let failed = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                205,
+            )
+            .expect("failure stored");
+        assert!(!failed.summary().retryable);
+        assert_eq!(
+            store.retry_update_review(&job.id, "hsb8", "markus", 206),
+            Err(HostActionStoreError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn retry_link_must_reference_failed_same_host_attempt() {
+        let retry = HostActionStore::new_update_review(
+            "hsb8",
+            "markus",
+            300,
+            Some("action-update-restart-csb0-200-1".to_string()),
+        );
+        let mut jobs = BTreeMap::new();
+        jobs.insert(retry.id.clone(), retry);
+        assert!(!valid_action_jobs(&jobs));
     }
 
     #[test]
