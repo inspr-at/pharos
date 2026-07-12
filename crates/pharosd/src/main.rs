@@ -10,6 +10,7 @@
 
 mod agora;
 mod auth;
+mod host_actions;
 mod icons;
 mod manifests;
 mod nixcfg_dispatch;
@@ -42,12 +43,12 @@ use pharos_core::{
     HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse, HostReport,
     KernelPosture, KernelPostureState, Liveness, LocationSetupIntent, ManifestLocationMode,
     ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
-    ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
-    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
-    ProvisioningProviderResource, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
-    SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
-    EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
-    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    PrivilegedActionMode, ProvisioningBackupProposal, ProvisioningBackupProposalKind,
+    ProvisioningBackupSecretFile, ProvisioningHandoff, ProvisioningJob, ProvisioningJobState,
+    ProvisioningProgressEntry, ProvisioningProviderResource, ProvisioningSetupIntent,
+    ProvisioningTerminalOutcome, SecretOwner, ServiceObservation, ServiceObservationState,
+    SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION,
+    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -58,6 +59,10 @@ use tokio::time::{timeout, Duration, MissedTickBehavior};
 use url::Url;
 
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthState};
+use crate::host_actions::{
+    AgentActionOutcome, AgentActionResultRequest, HostActionJob, HostActionKind, HostActionState,
+    HostActionStore, HostActionStoreError, RetiredHost, RetiredHostStore,
+};
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::nixcfg_dispatch::NixcfgDispatch;
 use crate::store::Store;
@@ -77,6 +82,8 @@ struct AppState {
     beacon_auth: BeaconAuth,
     provider_runtime: ProviderRuntimeConfig,
     nixcfg_dispatch: NixcfgDispatch,
+    host_actions: Arc<HostActionStore>,
+    retired_hosts: Arc<RetiredHostStore>,
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -3372,7 +3379,11 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 .settings-card[data-settings-state="request_pending"],.settings-card[data-settings-state="declared_not_applied"]{color:#9a5b00;border-color:rgba(214,155,49,.34);background:rgba(255,248,234,.82);box-shadow:0 0 0 3px rgba(214,155,49,.08)}
 .settings-card[data-settings-state="request_pending"]:hover,.settings-card[data-settings-state="declared_not_applied"]:hover{background:rgba(255,245,222,.96);box-shadow:0 7px 16px rgba(178,106,0,.10)}
 .settings-card[data-settings-state="request_pending"] .settings-swatch,.settings-card[data-settings-state="declared_not_applied"] .settings-swatch{display:block;position:absolute;right:-1px;bottom:-1px;width:7px;height:7px;border:1px solid #fff;border-radius:50%;background:var(--pending-color,var(--sun));box-shadow:0 0 0 2px color-mix(in srgb,var(--pending-color,var(--sun)) 12%,transparent)}
+.host-actions{position:relative;display:inline-flex;flex:0 0 auto}.host-actions-trigger{color:#4c6780;box-shadow:none}.host-actions-trigger:hover{border-color:rgba(31,127,181,.30);background:rgba(241,248,250,.92);color:var(--accent);box-shadow:0 7px 16px rgba(45,75,95,.08)}.host-actions-trigger:focus-visible{outline:2px solid rgba(31,127,181,.24);outline-offset:2px}.host-actions-trigger .ico{width:13px;height:13px}.host-action-dot{display:block;position:absolute;right:-1px;bottom:-1px;width:7px;height:7px;border:1px solid #fff;border-radius:50%;background:var(--sun);box-shadow:0 0 0 2px rgba(214,155,49,.10)}.host-action-dot[hidden]{display:none}
+.host-actions-menu{position:fixed;z-index:5800;width:min(280px,calc(100vw - 24px));padding:7px;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 20px 48px rgba(45,75,95,.20);color:var(--ink);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}.host-actions-menu[hidden]{display:none}.host-actions-title{display:block;padding:6px 8px 8px;color:#294761;font-size:12px;font-weight:780}.host-actions-separator{height:1px;margin:5px 2px;background:rgba(214,226,234,.78)}.host-action-item{appearance:none;width:100%;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;column-gap:9px;min-height:47px;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:#294761;font:inherit;text-align:left;text-decoration:none;cursor:pointer}.host-action-item[hidden]{display:none}.host-action-item:hover,.host-action-item:focus-visible{background:rgba(223,241,249,.62);color:#0f4f80;outline:0}.host-action-item>.ico{grid-row:1/3;width:16px;height:16px;justify-self:center}.host-action-item strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.25}.host-action-item span{display:block;min-width:0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:10px;line-height:1.25}.host-action-item.restart{color:#9a5b00}.host-action-item.restart:hover,.host-action-item.restart:focus-visible{background:rgba(255,245,222,.86);color:#7b4900}.host-action-item.remove{color:#a1322e}.host-action-item.remove:hover,.host-action-item.remove:focus-visible{background:rgba(255,232,229,.66);color:#842824}.host-actions-safety{display:flex;align-items:center;gap:8px;min-height:34px;padding:7px 8px 3px;color:var(--muted);font-size:10px}.host-actions-safety .ico{width:14px;height:14px;color:#4c6780}.card:has(.host-actions-menu:not([hidden])),.list tr:has(.host-actions-menu:not([hidden])){z-index:90}.card:has(.host-actions-menu:not([hidden])) .card-head{z-index:100}
+body[data-host-action-dialog-open="true"]{overflow:hidden}.host-action-overlay{position:fixed;inset:0;z-index:6100;display:grid;place-items:center;padding:24px;background:rgba(20,48,75,.28);-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px)}.host-action-overlay[hidden]{display:none}.host-action-backdrop{position:absolute;inset:0}.host-action-dialog{position:relative;width:min(470px,calc(100vw - 28px));max-height:calc(100vh - 40px);display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 26px 78px rgba(32,61,82,.28);overflow:hidden}.host-action-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 21px 15px;border-bottom:1px solid rgba(214,226,234,.72)}.host-action-heading{display:flex;align-items:center;gap:10px;min-width:0}.host-action-heading>[data-action-icon]{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;color:var(--accent)}.host-action-heading>[data-action-icon][hidden]{display:none}.host-action-heading>[data-action-icon] .ico{width:20px;height:20px}.host-action-dialog[data-action="remove"] .host-action-heading>[data-action-icon]{color:var(--down)}.host-action-heading h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;line-height:1.2;color:#12304b}.host-action-dialog-close{appearance:none;display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);cursor:pointer}.host-action-dialog-close:hover,.host-action-dialog-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}.host-action-dialog-close .ico{width:15px;height:15px}.host-action-dialog-body{padding:17px 21px 19px;overflow:auto}.host-action-dialog-body>p{margin:0 0 14px;color:#435e74;font-size:13px;line-height:1.5}.host-action-info{display:grid;grid-template-columns:20px minmax(0,1fr);gap:9px;padding:11px 12px;border:1px solid rgba(188,211,222,.82);border-radius:7px;background:rgba(247,251,252,.82)}.host-action-info[hidden]{display:none}.host-action-info>.ico{grid-row:1/3;width:17px;height:17px;margin-top:1px;color:#4c6780}.host-action-info strong{font-size:12px}.host-action-info span{color:var(--muted);font-size:11px;line-height:1.35}.host-action-facts{display:grid;gap:0;margin:14px 0 0;border-top:1px solid rgba(214,226,234,.72)}.host-action-fact{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;min-height:38px;align-items:center;border-bottom:1px solid rgba(214,226,234,.58);font-size:12px}.host-action-fact[hidden]{display:none}.host-action-fact span{color:var(--muted)}.host-action-fact strong{max-width:260px;overflow-wrap:anywhere;color:var(--ink);font-weight:720;text-align:right}.host-action-technical{margin:14px 0 0;padding:12px;border:1px solid rgba(188,211,222,.72);border-radius:7px;background:#f8fbfc;color:#294761;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.host-action-technical[hidden]{display:none}.host-remove-confirm{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-confirm[hidden]{display:none}.host-remove-confirm input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-confirm input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}.host-attended-confirm{display:flex;align-items:flex-start;gap:9px;margin-top:12px;padding:10px 11px;border:1px solid rgba(214,155,49,.24);border-radius:7px;background:rgba(255,248,234,.64);color:#6e5527;font-size:11px;line-height:1.4;cursor:pointer}.host-attended-confirm[hidden]{display:none}.host-attended-confirm input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:#9a5b00}.host-action-dialog-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 21px;border-top:1px solid rgba(214,226,234,.72);background:rgba(250,252,253,.78)}.host-action-safe-note{display:flex;align-items:center;gap:7px;min-width:0;color:var(--muted);font-size:10px}.host-action-safe-note .ico{width:14px;height:14px;flex:0 0 auto;color:#4c6780}.host-action-dialog-buttons{display:flex;align-items:center;gap:8px;margin-left:auto}.host-action-dialog-button{appearance:none;min-height:36px;padding:0 13px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:#294761;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.host-action-dialog-button[hidden]{display:none}.host-action-dialog-button:hover,.host-action-dialog-button:focus-visible{background:rgba(223,241,249,.66);outline:0}.host-action-dialog-button.primary{border-color:#12304b;background:#12304b;color:#fff}.host-action-dialog-button.danger{border-color:var(--down);background:var(--down);color:#fff}.host-action-dialog-button:disabled{cursor:not-allowed;border-color:rgba(137,151,163,.18);background:rgba(137,151,163,.12);color:rgba(100,119,138,.55)}.host-action-status{margin:12px 0 0;color:var(--muted);font-size:11px}.host-action-status:empty{display:none}
 .settings-wait-note{display:flex;align-items:center;gap:6px;width:max-content;max-width:100%;min-height:18px;margin:-6px 0 8px;color:#8b620f;font-size:11px;font-weight:680;text-decoration:none;cursor:pointer}.settings-wait-note[hidden]{display:none}.settings-wait-note .ico{width:13px;height:13px;flex:0 0 13px}.settings-wait-note:hover,.settings-wait-note:focus-visible{color:#734500;text-decoration:underline;text-underline-offset:3px;outline:0}
+.host-action-note{appearance:none;padding:0;border:0;background:transparent;font:inherit}.host-action-note[data-action-level="critical"]{color:var(--down)}.host-action-note[data-action-level="clear"]{color:var(--live)}
 .beat{--beat-color:var(--state);--now-x:0%;--history-start-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
 .beat-stage{position:relative;height:50px;overflow:visible}
 .beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
@@ -3415,7 +3426,7 @@ main[data-view="list"] .list-wrap{display:block}
 .list .fresh{min-height:0;margin:0;white-space:normal}.list .fresh-row{min-height:20px}.list .fresh-row span,.list .fresh-row strong{font-size:11px}
 .list-seen{display:grid;align-content:center;gap:2px;min-height:44px;white-space:nowrap}.list-seen [data-seen]{color:var(--ink);font-size:12px;font-weight:650}.list-seen-detail{display:none;color:var(--muted);font-size:10px}.list tr[data-history-hint="true"] .list-seen-detail{display:block}
 .list-heartbeat{display:grid;grid-template-columns:minmax(170px,1fr) auto;align-items:center;gap:10px;min-width:0}.list-heartbeat .beat{min-width:0;width:auto;margin:0}.list-heartbeat .signal{justify-self:end}
-.list-actions{position:relative;z-index:10;display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:58px}.list-actions .header-chip{flex:0 0 auto;margin:0}.list .settings-icon{width:13px;height:13px}
+.list-actions{position:relative;z-index:10;display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:89px}.list-actions .header-chip{flex:0 0 auto;margin:0}.list .settings-icon{width:13px;height:13px}
 .list-setup-intent{display:flex;flex-wrap:wrap;gap:5px}.list-setup-intent .setup-chip{min-height:23px;padding:3px 7px;font-size:10px}.list-setup-state{display:inline-flex;align-items:center;min-height:25px;color:var(--muted);font-size:11px;font-weight:720}
 .list tr.onboard-row td{border:1px dashed rgba(214,155,49,.42);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.86),rgba(240,250,250,.72));box-shadow:0 10px 24px rgba(45,75,95,.05)}
 .onboard-row button{appearance:none;width:100%;display:flex;align-items:center;gap:12px;border:0;background:transparent;color:var(--ink);font:inherit;text-align:left;cursor:pointer}.onboard-row button:hover strong,.onboard-row button:focus-visible strong{color:#0f4f80}.onboard-row button:focus-visible{outline:0}
@@ -3622,7 +3633,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .assistant-delete-actions{display:flex;align-items:center;gap:11px;min-height:38px}.assistant-delete{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:38px;padding:0 13px;border:1px solid var(--down);border-radius:7px;background:#fff;color:#a1322e;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-delete .ico{width:15px;height:15px}.assistant-delete:hover:not(:disabled),.assistant-delete:focus-visible:not(:disabled){background:rgba(255,232,229,.78);box-shadow:0 0 0 3px rgba(191,58,53,.08);outline:0}.assistant-delete:disabled{cursor:not-allowed;border-color:rgba(191,58,53,.20);color:rgba(161,50,46,.42);background:rgba(255,255,255,.58)}.assistant-delete-actions span{min-width:0;color:#765b59;font-size:11px;line-height:1.35}
 .assistant-created[data-state="deleted"] .assistant-created-ready::before{background:var(--wait);box-shadow:0 0 0 5px rgba(137,151,163,.10)}.assistant-created[data-state="deleted"] .assistant-created-host .ico{color:#6d8293}
 .assistant-overlay[data-provider-created="true"] .assistant-next,.assistant-overlay[data-provider-created="true"] .assistant-created>h3{display:none}
-@media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}}
+@media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}.host-action-overlay{padding:10px}.host-action-dialog{width:100%;max-height:calc(100vh - 20px)}.host-action-dialog-head,.host-action-dialog-body{padding-left:16px;padding-right:16px}.host-action-dialog-foot{align-items:stretch;flex-direction:column;padding-left:16px;padding-right:16px}.host-action-dialog-buttons{width:100%;margin-left:0}.host-action-dialog-button{flex:1}.host-action-safe-note{justify-content:center}.host-action-fact strong{max-width:55vw}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -3643,6 +3654,379 @@ function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
 function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(name+'='))?.split('=').slice(1).join('=')||''}
 function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
 function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host-surface="runtime"]')).filter(el=>el.dataset.host===name)}
+let openHostActionsRoot=null;
+let hostActionContext=null;
+let hostActionReturnFocus=null;
+let hostActionPollTimer=null;
+function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
+function closeHostActions(root=openHostActionsRoot,restore=false){
+  if(!root)return;
+  const trigger=root.querySelector('[data-host-actions-trigger]');
+  const menu=root.querySelector('[data-host-actions-menu]');
+  if(menu){menu.hidden=true;menu.style.removeProperty('left');menu.style.removeProperty('top')}
+  if(trigger)trigger.setAttribute('aria-expanded','false');
+  if(openHostActionsRoot===root)openHostActionsRoot=null;
+  if(restore)trigger?.focus();
+}
+function positionHostActions(root){
+  const trigger=root.querySelector('[data-host-actions-trigger]');
+  const menu=root.querySelector('[data-host-actions-menu]');
+  if(!trigger||!menu||menu.hidden)return;
+  const anchor=trigger.getBoundingClientRect();
+  const box=menu.getBoundingClientRect();
+  const margin=12;
+  const left=Math.max(margin,Math.min(window.innerWidth-box.width-margin,anchor.right-box.width));
+  const below=anchor.bottom+7;
+  const above=anchor.top-box.height-7;
+  const top=below+box.height<=window.innerHeight-margin?below:Math.max(margin,above);
+  menu.style.left=left+'px';
+  menu.style.top=top+'px';
+}
+function openHostActions(root){
+  if(openHostActionsRoot&&openHostActionsRoot!==root)closeHostActions(openHostActionsRoot);
+  const trigger=root.querySelector('[data-host-actions-trigger]');
+  const menu=root.querySelector('[data-host-actions-menu]');
+  if(!trigger||!menu)return;
+  const opening=menu.hidden;
+  if(!opening){closeHostActions(root,true);return}
+  menu.hidden=false;
+  trigger.setAttribute('aria-expanded','true');
+  openHostActionsRoot=root;
+  positionHostActions(root);
+  visibleHostActionItems(menu)[0]?.focus();
+}
+function setHostActionFact(name,value,visible=true){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const row=overlay?.querySelector('[data-host-action-fact-row="'+name+'"]');
+  const target=overlay?.querySelector('[data-host-action-fact="'+name+'"]');
+  if(row)row.hidden=!visible;
+  if(target)target.textContent=value||'not reported';
+}
+function hostActionTechnicalText(root){
+  const surface=root.closest('[data-host-surface="runtime"]');
+  const live=surface?.dataset.live||'unknown';
+  const kernel=root.dataset.kernelState==='reboot_required'
+    ? root.dataset.kernelRunning+' running; '+root.dataset.kernelExpected+' expected'
+    : root.dataset.kernelState.replaceAll('_',' ');
+  return [
+    'Host: '+root.dataset.host,
+    'Role: '+root.dataset.role,
+    'System: '+(root.dataset.isNix==='true'?'Nix':'non-Nix'),
+    'Live state: '+live.replaceAll('_',' '),
+    'Declared: '+(root.dataset.declared==='true'?'yes':'no'),
+    'Privileged actions: '+(root.dataset.janusReady==='true'?'Janus guarded':'not prepared'),
+    'Settings: '+root.dataset.settingsState.replaceAll('_',' '),
+    'Backup: '+root.dataset.backupLabel,
+    'Kernel: '+kernel
+  ].join('\n');
+}
+function closeHostActionDialog(restore=true){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  if(!overlay||overlay.hidden)return;
+  if(hostActionPollTimer!=null){clearTimeout(hostActionPollTimer);hostActionPollTimer=null}
+  overlay.hidden=true;
+  document.body.removeAttribute('data-host-action-dialog-open');
+  const input=overlay.querySelector('[data-host-remove-input]');
+  if(input)input.value='';
+  const attended=overlay.querySelector('[data-host-attended-input]');
+  if(attended)attended.checked=false;
+  hostActionContext=null;
+  if(restore)hostActionReturnFocus?.focus();
+  hostActionReturnFocus=null;
+}
+function openHostActionDialog(action,root,returnFocus){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const dialog=overlay?.querySelector('[data-host-action-dialog]');
+  if(!overlay||!dialog)return;
+  closeHostActions(root);
+  hostActionContext={action,root,host:root.dataset.host};
+  hostActionReturnFocus=returnFocus||root.querySelector('[data-host-actions-trigger]');
+  dialog.dataset.action=action;
+  dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{icon.hidden=icon.dataset.actionIcon!==action});
+  const title=dialog.querySelector('[data-host-action-title]');
+  const copy=dialog.querySelector('[data-host-action-copy]');
+  const infoTitle=dialog.querySelector('[data-host-action-info-title]');
+  const infoCopy=dialog.querySelector('[data-host-action-info-copy]');
+  const primary=dialog.querySelector('[data-host-action-primary]');
+  const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
+  const confirm=dialog.querySelector('[data-host-remove-confirm]');
+  const removeName=dialog.querySelector('[data-host-remove-name]');
+  const input=dialog.querySelector('[data-host-remove-input]');
+  const attendedConfirm=dialog.querySelector('[data-host-attended-confirm]');
+  const attendedInput=dialog.querySelector('[data-host-attended-input]');
+  const technical=dialog.querySelector('[data-host-action-technical]');
+  const facts=dialog.querySelector('[data-host-action-facts]');
+  const status=dialog.querySelector('[data-host-action-status]');
+  if(status)status.textContent='';
+  if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
+  if(cancel)cancel.textContent='Cancel';
+  if(confirm)confirm.hidden=true;
+  if(attendedConfirm)attendedConfirm.hidden=true;
+  if(input)input.value='';
+  if(attendedInput)attendedInput.checked=false;
+  if(technical)technical.hidden=true;
+  if(facts)facts.hidden=false;
+  setHostActionFact('host',root.dataset.host,true);
+  setHostActionFact('state',(root.closest('[data-host-surface="runtime"]')?.dataset.live||'unknown').replaceAll('_',' '),true);
+  setHostActionFact('backup',root.dataset.backupLabel,true);
+  setHostActionFact('kernel',root.dataset.kernelState==='reboot_required'?root.dataset.kernelRunning+' → '+root.dataset.kernelExpected:root.dataset.kernelState.replaceAll('_',' '),true);
+  if(action==='system-update'){
+    title.textContent='Check for system updates';
+    copy.textContent='Prepare an isolated nixcfg proposal and validate every configured host. Nothing is merged or deployed.';
+    infoTitle.textContent='Fleet-wide review';
+    infoCopy.textContent='A shared flake update can affect every Nix host, even when launched from '+root.dataset.host+'.';
+    setHostActionFact('scope','all configured Nix hosts',true);
+    primary.textContent='Create update review';
+  }else if(action==='update-restart'){
+    title.textContent='Apply update and restart '+root.dataset.host;
+    copy.textContent='First prepare a target-local review. The final switch remains blocked until backup, validation, Janus authorization, and attended confirmation pass.';
+    infoTitle.textContent='No immediate restart';
+    infoCopy.textContent='This step only prepares the guarded plan. You confirm again immediately before any live change.';
+    setHostActionFact('scope',root.dataset.host+' only',true);
+    primary.textContent='Prepare guarded review';
+  }else if(action==='technical'){
+    title.textContent=root.dataset.host+' technical details';
+    copy.textContent='Sanitized runtime and declaration facts used by Pharos. Credentials, store paths, and opaque identifiers are excluded.';
+    infoTitle.textContent='Safe details only';
+    infoCopy.textContent='These values are observational and do not grant access to the host.';
+    setHostActionFact('scope','',false);
+    if(facts)facts.hidden=true;
+    if(technical){technical.hidden=false;technical.textContent=hostActionTechnicalText(root)}
+    if(primary)primary.hidden=true;
+    if(cancel)cancel.textContent='Close';
+  }else if(action==='remove'){
+    if(root.dataset.retired==='true'){
+      title.textContent='Removal pending for '+root.dataset.host;
+      copy.textContent='Pharos has revoked this host’s reporting access. The server and its data remain untouched while declarative cleanup is reviewed and applied.';
+      infoTitle.textContent='Beacon access revoked';
+      infoCopy.textContent='The host remains visible so this unfinished removal cannot be mistaken for completion.';
+      setHostActionFact('scope','Waiting for nixcfg removal',true);
+      if(primary)primary.hidden=true;
+      if(cancel)cancel.textContent='Close';
+      if(status)status.textContent='Removal is still pending.';
+    }else{
+    title.textContent='Remove '+root.dataset.host+' from Pharos?';
+    copy.textContent='Pharos will stop managing and accepting reports from this host. The server, disks, services, and application data stay untouched.';
+    infoTitle.textContent=root.dataset.declared==='true'?'Declarative removal review required':'Runtime-only removal';
+    infoCopy.textContent=root.dataset.declared==='true'
+      ?'A nixcfg proposal must remove the declaration. Until it is applied, Pharos keeps the removal visibly pending.'
+      :'The runtime registration and beacon access will be revoked after confirmation.';
+    setHostActionFact('scope','Pharos registration only',true);
+    if(confirm)confirm.hidden=false;
+    if(removeName)removeName.textContent=root.dataset.host;
+    if(primary){primary.textContent='Remove host';primary.classList.add('danger');primary.disabled=true}
+    }
+  }
+  overlay.hidden=false;
+  document.body.dataset.hostActionDialogOpen='true';
+  requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
+  if(action==='update-restart'&&root.dataset.actionJobId)pollHostActionJob(root.dataset.actionJobId,true);
+}
+async function requestHostAction(path,body){
+  const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},body:JSON.stringify(body||{})});
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'The guarded action could not be requested.');
+  return payload;
+}
+function hostActionStateLabel(state){
+  return ({proposal_requested:'review requested',queued_review:'review queued',reviewing:'reviewing on host',awaiting_confirmation:'ready for confirmation',queued_apply:'confirmed',applying:'applying on host',rebooting:'restarting and verifying',removal_pending:'removal pending',succeeded:'completed',failed:'failed'})[state]||String(state||'recorded').replaceAll('_',' ');
+}
+function hostActionConfirmationReady(){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const input=overlay?.querySelector('[data-host-remove-input]');
+  const attended=overlay?.querySelector('[data-host-attended-input]');
+  return input?.value===hostActionContext?.host&&attended?.checked===true;
+}
+function scheduleHostActionPoll(id,delay=2000){
+  if(hostActionPollTimer!=null)clearTimeout(hostActionPollTimer);
+  hostActionPollTimer=setTimeout(()=>pollHostActionJob(id,false),delay);
+}
+function renderHostActionJob(job,message){
+  if(!hostActionContext||!job)return;
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const primary=overlay?.querySelector('[data-host-action-primary]');
+  const status=overlay?.querySelector('[data-host-action-status]');
+  const copy=overlay?.querySelector('[data-host-action-copy]');
+  const infoTitle=overlay?.querySelector('[data-host-action-info-title]');
+  const infoCopy=overlay?.querySelector('[data-host-action-info-copy]');
+  const confirm=overlay?.querySelector('[data-host-remove-confirm]');
+  const removeName=overlay?.querySelector('[data-host-remove-name]');
+  const attended=overlay?.querySelector('[data-host-attended-confirm]');
+  hostActionContext.jobId=job.id;
+  hostActionContext.root.dataset.actionJobId=job.id;
+  hostActionContext.root.dataset.actionKind=job.kind;
+  hostActionContext.root.dataset.actionState=job.state;
+  setHostActionFact('state',hostActionStateLabel(job.state),true);
+  if(status)status.textContent=message||hostActionStateLabel(job.state)+'.';
+  if(job.plan){
+    const areas=Array.isArray(job.plan.changed_areas)?job.plan.changed_areas.join(', '):'';
+    setHostActionFact('backup',job.plan.backup_ready?'ready for live gate':'not ready',true);
+    setHostActionFact('kernel',(job.plan.running_kernel||'not reported')+' → '+(job.plan.expected_kernel||'not reported'),true);
+    setHostActionFact('scope',String(job.plan.changed_file_count||0)+' changed files'+(areas?' · '+areas:''),true);
+  }
+  if(job.state==='awaiting_confirmation'){
+    hostActionContext.stage='confirm';
+    if(copy)copy.textContent='The target-local review passed. Confirm only while the host or recovery console is attended.';
+    if(infoTitle)infoTitle.textContent='Final live-change gate';
+    if(infoCopy)infoCopy.textContent='A fresh validated backup and Janus permit are still enforced immediately before switch and restart.';
+    if(confirm)confirm.hidden=false;
+    if(removeName)removeName.textContent=hostActionContext.host;
+    if(attended)attended.hidden=false;
+    if(primary){primary.hidden=false;primary.textContent='Apply update and restart';primary.disabled=!hostActionConfirmationReady()}
+  }else{
+    if(confirm)confirm.hidden=true;
+    if(attended)attended.hidden=true;
+    if(primary)primary.hidden=true;
+  }
+  if(['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))scheduleHostActionPoll(job.id,job.state==='rebooting'?5000:2000);
+}
+async function pollHostActionJob(id,immediate=false){
+  if(!hostActionContext||hostActionContext.jobId&&hostActionContext.jobId!==id)return;
+  try{
+    const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{credentials:'same-origin',cache:'no-store'});
+    const payload=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(payload.error||'Could not refresh guarded action state.');
+    renderHostActionJob(payload.job,payload.message);
+  }catch(error){
+    const status=document.querySelector('[data-host-action-status]');
+    if(status)status.textContent=error instanceof Error?error.message:'Could not refresh guarded action state.';
+    if(!immediate)scheduleHostActionPoll(id,5000);
+  }
+}
+async function submitHostAction(){
+  if(!hostActionContext)return;
+  const {action,root,host}=hostActionContext;
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const primary=overlay?.querySelector('[data-host-action-primary]');
+  const status=overlay?.querySelector('[data-host-action-status]');
+  if(!primary||!status)return;
+  primary.disabled=true;
+  status.textContent='Requesting a guarded review…';
+  try{
+    let result;
+    if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
+    else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
+    else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
+    else if(action==='remove')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/remove',{confirmation:host});
+    else return;
+    status.textContent=result.message||'Request recorded.';
+    if(action==='remove')setTimeout(()=>location.reload(),700);
+    else if(action==='update-restart')renderHostActionJob(result.job,result.message);
+    else primary.hidden=true;
+  }catch(error){
+    status.textContent=error instanceof Error?error.message:'The guarded action could not be requested.';
+    primary.disabled=false;
+  }
+}
+function updateHostActionState(surface,host,backup){
+  const root=surface.querySelector('[data-host-actions]');
+  if(!root)return;
+  const state=String(host.preferences_state||'applied');
+  const kernel=host.kernel||{};
+  const kernelState=String(kernel.state||'unknown');
+  const commitsBehind=Number(host.freshness?.commits_behind||0);
+  const canManage=root.dataset.canManage==='true';
+  const systemUpdateAvailable=root.dataset.systemUpdateAvailable==='true';
+  const hostRemovalAvailable=root.dataset.hostRemovalAvailable==='true';
+  const job=host.host_action||null;
+  const retirement=host.retirement||null;
+  root.dataset.settingsState=state;
+  root.dataset.kernelState=kernelState;
+  root.dataset.kernelRunning=String(kernel.running_version||'not reported');
+  root.dataset.kernelExpected=String(kernel.expected_version||'not reported');
+  root.dataset.retired=retirement?.pending===true?'true':'false';
+  if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(job.kind||'');root.dataset.actionState=String(job.state||'')}
+  else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
+  if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
+  const review=root.querySelector('[data-host-action="review-pending"]');
+  const update=root.querySelector('[data-host-action="system-update"]');
+  const restart=root.querySelector('[data-host-action="update-restart"]');
+  const remove=root.querySelector('[data-host-action="remove"]');
+  const primarySeparator=root.querySelector('[data-primary-separator]');
+  const removeSeparator=root.querySelector('[data-remove-separator]');
+  if(review)review.hidden=state==='applied';
+  const updateJobActive=job?.kind==='update_restart'&&!['succeeded'].includes(job.state);
+  const updatePending=kernelState==='reboot_required'||commitsBehind>0;
+  root.dataset.updatePending=updatePending?'true':'false';
+  const retired=retirement?.pending===true;
+  if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
+  if(restart){
+    restart.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&(updatePending||updateJobActive));
+    const strong=restart.querySelector('strong');
+    if(strong)strong.textContent=updateJobActive?'Continue update workflow':'Apply update and restart';
+  }
+  if(remove)remove.hidden=!hostRemovalAvailable||!canManage||retired;
+  if(primarySeparator)primarySeparator.hidden=[review,update,restart].every(item=>!item||item.hidden);
+  if(removeSeparator)removeSeparator.hidden=!hostRemovalAvailable||!canManage||retired;
+  const note=surface.querySelector('[data-host-action-note]');
+  const noteCopy=note?.querySelector('[data-host-action-note-copy]');
+  if(note){
+    const show=retired||(job&&!['succeeded'].includes(job.state));
+    note.hidden=!show;
+    note.dataset.actionLevel=job?.state==='failed'?'critical':job?.state==='succeeded'?'clear':'warning';
+    if(noteCopy)noteCopy.textContent=retired?'removal pending':hostActionStateLabel(job?.state);
+  }
+  const dot=root.querySelector('[data-host-action-dot]');
+  if(dot)dot.hidden=state==='applied'&&kernelState!=='reboot_required'&&!retired&&!(job&&!['succeeded'].includes(job.state));
+  if(openHostActionsRoot===root)positionHostActions(root);
+}
+function initHostActions(){
+  document.addEventListener('click',event=>{
+    const trigger=event.target.closest('[data-host-actions-trigger]');
+    if(trigger){event.preventDefault();openHostActions(trigger.closest('[data-host-actions]'));return}
+    const actionNote=event.target.closest('[data-host-action-note]');
+    if(actionNote){
+      event.preventDefault();
+      const surface=actionNote.closest('[data-host-surface="runtime"]');
+      const root=surface?.querySelector('[data-host-actions]');
+      if(root)openHostActionDialog(root.dataset.retired==='true'?'remove':'update-restart',root,actionNote);
+      return;
+    }
+    const actionItem=event.target.closest('[data-host-action]');
+    if(actionItem&&actionItem.closest('[data-host-actions-menu]')&&!actionItem.matches('a')){
+      event.preventDefault();
+      const root=actionItem.closest('[data-host-actions]');
+      openHostActionDialog(actionItem.dataset.hostAction,root,actionItem);
+      return;
+    }
+    if(event.target.closest('[data-host-action-close]')){event.preventDefault();closeHostActionDialog();return}
+    if(openHostActionsRoot&&!event.target.closest('[data-host-actions]'))closeHostActions(openHostActionsRoot);
+  });
+  document.addEventListener('keydown',event=>{
+    const overlay=document.querySelector('[data-host-action-overlay]');
+    if(overlay&&!overlay.hidden){
+      if(event.key==='Escape'){event.preventDefault();closeHostActionDialog();return}
+      if(event.key==='Tab'){
+        const focusable=Array.from(overlay.querySelectorAll('button:not([hidden]):not(:disabled),input:not([hidden]):not(:disabled)')).filter(el=>el.offsetParent!==null);
+        if(focusable.length){const first=focusable[0],last=focusable[focusable.length-1];if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}}
+      }
+      return;
+    }
+    if(!openHostActionsRoot)return;
+    const menu=openHostActionsRoot.querySelector('[data-host-actions-menu]');
+    const items=visibleHostActionItems(menu);
+    const index=items.indexOf(document.activeElement);
+    if(event.key==='Escape'){event.preventDefault();closeHostActions(openHostActionsRoot,true)}
+    else if(event.key==='ArrowDown'){event.preventDefault();items[(index+1+items.length)%items.length]?.focus()}
+    else if(event.key==='ArrowUp'){event.preventDefault();items[(index-1+items.length)%items.length]?.focus()}
+    else if(event.key==='Home'){event.preventDefault();items[0]?.focus()}
+    else if(event.key==='End'){event.preventDefault();items[items.length-1]?.focus()}
+    else if(event.key==='Tab')closeHostActions(openHostActionsRoot);
+  });
+  document.querySelector('[data-host-remove-input]')?.addEventListener('input',event=>{
+    const primary=document.querySelector('[data-host-action-primary]');
+    if(!primary||!hostActionContext)return;
+    if(hostActionContext.action==='remove')primary.disabled=event.target.value!==hostActionContext.host;
+    else if(hostActionContext.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
+  });
+  document.querySelector('[data-host-attended-input]')?.addEventListener('change',()=>{
+    const primary=document.querySelector('[data-host-action-primary]');
+    if(primary&&hostActionContext?.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
+  });
+  document.querySelector('[data-host-action-primary]')?.addEventListener('click',submitHostAction);
+  window.addEventListener('resize',()=>closeHostActions(openHostActionsRoot));
+  window.addEventListener('scroll',()=>closeHostActions(openHostActionsRoot),true);
+}
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
 function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
 function historyWindowMeta(samples,windowDef){
@@ -5284,6 +5668,7 @@ function initControls(){
   document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
   bindFreeformDrag();
+  initHostActions();
   initSetupAssistant();
 }
 const REFRESH_MS=10000;
@@ -5341,6 +5726,7 @@ async function refresh(reason='manual'){
         updateKernel(card,h);
         updateMuted(card,muted);
         updatePreferenceState(card,h);
+        updateHostActionState(card,h,backup);
         const fresh=card.querySelector('[data-fresh]');
         if(fresh)fresh.innerHTML=freshHtml(h.freshness);
         updateBackup(card,backup);
@@ -5772,6 +6158,518 @@ const RELEASE_HISTORY_PORTAL: &str = r#"<script>
   script?.remove();
 })();
 </script>"#;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemUpdateActionRequest {
+    host: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmHostActionRequest {
+    confirmation: String,
+    attended: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveHostActionRequest {
+    confirmation: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentActionClaimRequest {
+    host: String,
+}
+
+fn action_request_header(headers: &HeaderMap) -> bool {
+    headers
+        .get("X-Pharos-Action")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1")
+}
+
+fn action_actor(auth: &AuthState, headers: &HeaderMap) -> String {
+    let raw = sidebar_user_label(auth, headers);
+    let actor: String = raw
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect();
+    if actor.is_empty() {
+        "operator".to_string()
+    } else {
+        actor
+    }
+}
+
+fn action_error(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(json!({ "error": message })))
+}
+
+fn action_message(job: &HostActionJob) -> &'static str {
+    match job.state {
+        HostActionState::ProposalRequested => {
+            "Update review requested. No branch has been merged and no host has changed."
+        }
+        HostActionState::QueuedReview => "Guarded host review queued. No live change has started.",
+        HostActionState::Reviewing => "The host is preparing a read-only review.",
+        HostActionState::AwaitingConfirmation => {
+            "Review passed. Explicit attended confirmation is still required."
+        }
+        HostActionState::QueuedApply => "Confirmed and waiting for the target-local agent.",
+        HostActionState::Applying => "The target-local Janus workflow is running.",
+        HostActionState::Rebooting => "The host is restarting; Pharos is waiting for verification.",
+        HostActionState::RemovalPending => {
+            "Beacon access is revoked; declarative removal is waiting for review and apply."
+        }
+        HostActionState::Succeeded => "The guarded action completed and was recorded.",
+        HostActionState::Failed => {
+            "The guarded action stopped. Resolve this failure before continuing to another host."
+        }
+    }
+}
+
+fn action_response(
+    status: StatusCode,
+    job: &HostActionJob,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(json!({
+            "message": action_message(job),
+            "job": job.summary(),
+        })),
+    )
+}
+
+fn host_is_declared(state: &AppState, host: &str) -> bool {
+    state
+        .manifests
+        .manifests()
+        .iter()
+        .any(|manifest| manifest.host.name == host || manifest.slug == host)
+        || state.manifests.declared_preferences_for(host).is_some()
+}
+
+fn host_janus_actions_ready(state: &AppState, host: &str) -> bool {
+    state.manifests.manifests().iter().any(|manifest| {
+        (manifest.host.name == host || manifest.slug == host)
+            && manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
+            && manifest.policy.privileged_actions.janus_required
+    })
+}
+
+async fn request_system_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SystemUpdateActionRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let access = access_for_headers(&state.auth, &headers);
+    let host = request.host.trim();
+    if !action_request_header(&headers) || !access.can_manage_fleet() || !access.allows_host(host) {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Fleet update review access is not granted",
+        );
+    }
+    let Some(runtime) = state.store.get(host) else {
+        return action_error(StatusCode::NOT_FOUND, "Host is not reporting to Pharos");
+    };
+    if !runtime.is_nix {
+        return action_error(
+            StatusCode::CONFLICT,
+            "System update proposals are available only for declared Nix hosts",
+        );
+    }
+    let actor = action_actor(&state.auth, &headers);
+    let request_id = match state.nixcfg_dispatch.dispatch_system_update(host).await {
+        Ok(request_id) => request_id,
+        Err(error) => return action_error(StatusCode::BAD_GATEWAY, error.safe_message()),
+    };
+    let job =
+        match state
+            .host_actions
+            .create_system_update_proposal(request_id, host, &actor, now_unix())
+        {
+            Ok(job) => job,
+            Err(_) => {
+                return action_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The update workflow was reached, but local review tracking could not be recorded",
+            );
+            }
+        };
+    tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-125", "system update review requested");
+    action_response(StatusCode::ACCEPTED, &job)
+}
+
+async fn request_update_restart_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(host): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers) || !access.can_manage_fleet() || !access.allows_host(&host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded host action access is not granted",
+        );
+    }
+    let Some(runtime) = state.store.get(&host) else {
+        return action_error(StatusCode::NOT_FOUND, "Host is not reporting to Pharos");
+    };
+    if !runtime.is_nix {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Guarded system updates are available only for Nix hosts",
+        );
+    }
+    if !host_janus_actions_ready(&state, &host) {
+        return action_error(
+            StatusCode::CONFLICT,
+            "This host is not prepared for target-local Janus actions yet",
+        );
+    }
+    if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
+        && runtime.freshness.commits_behind.unwrap_or(0) == 0
+    {
+        return action_error(
+            StatusCode::CONFLICT,
+            "No pending system update or restart is currently reported for this host",
+        );
+    }
+    let actor = action_actor(&state.auth, &headers);
+    match state
+        .host_actions
+        .create_update_review(&host, &actor, now_unix())
+    {
+        Ok(job) => {
+            tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-126", "guarded host review queued");
+            action_response(StatusCode::ACCEPTED, &job)
+        }
+        Err(HostActionStoreError::ActiveJob) => action_error(
+            StatusCode::CONFLICT,
+            "A guarded update workflow is already active for this host",
+        ),
+        Err(_) => action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The guarded review could not be recorded",
+        ),
+    }
+}
+
+async fn host_action_job_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(job) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.can_agora() || !access.allows_host(&job.host) {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded action access is not granted",
+        );
+    }
+    action_response(StatusCode::OK, &job)
+}
+
+async fn confirm_update_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ConfirmHostActionRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&existing.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded host action access is not granted",
+        );
+    }
+    if request.confirmation != existing.host || !request.attended {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "Type the exact host name and confirm that the host is attended",
+        );
+    }
+    match state
+        .host_actions
+        .confirm_update(&id, &existing.host, now_unix())
+    {
+        Ok(job) => {
+            tracing::info!(host = %job.host, ticket = "PHAROS-126", "guarded host update confirmed");
+            action_response(StatusCode::ACCEPTED, &job)
+        }
+        Err(HostActionStoreError::ReviewFailed) => action_error(
+            StatusCode::CONFLICT,
+            "Backup and validation gates have not all passed",
+        ),
+        Err(HostActionStoreError::InvalidTransition) => action_error(
+            StatusCode::CONFLICT,
+            "This workflow is not waiting for confirmation",
+        ),
+        Err(_) => action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The confirmation could not be recorded",
+        ),
+    }
+}
+
+async fn request_host_removal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(host): AxumPath<String>,
+    Json(request): Json<RemoveHostActionRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers) || !access.can_manage_fleet() || !access.allows_host(&host)
+    {
+        return action_error(StatusCode::FORBIDDEN, "Host removal access is not granted");
+    }
+    if request.confirmation != host {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "Type the exact host name to confirm",
+        );
+    }
+    if state.retired_hosts.is_retired(&host) {
+        return action_error(StatusCode::CONFLICT, "This host is already being removed");
+    }
+    if state.store.get(&host).is_none() && !host_is_declared(&state, &host) {
+        return action_error(StatusCode::NOT_FOUND, "Host is not managed by Pharos");
+    }
+    let actor = action_actor(&state.auth, &headers);
+    let declared = host_is_declared(&state, &host);
+    let dispatch_id = if declared {
+        match state.nixcfg_dispatch.dispatch_host_removal(&host).await {
+            Ok(request_id) => Some(request_id),
+            Err(error) => return action_error(StatusCode::BAD_GATEWAY, error.safe_message()),
+        }
+    } else {
+        None
+    };
+    let job =
+        match state
+            .host_actions
+            .create_removal(&host, &actor, dispatch_id, declared, now_unix())
+        {
+            Ok(job) => job,
+            Err(HostActionStoreError::ActiveJob) => {
+                return action_error(
+                    StatusCode::CONFLICT,
+                    "A removal workflow is already active for this host",
+                );
+            }
+            Err(_) => {
+                return action_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The removal workflow could not be recorded",
+                );
+            }
+        };
+    if state
+        .retired_hosts
+        .retire(RetiredHost {
+            host: host.clone(),
+            requested_by: actor.clone(),
+            removal_job_id: job.id.clone(),
+            declaration_pending: declared,
+            retired_at: now_unix(),
+        })
+        .is_err()
+    {
+        return action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Beacon revocation could not be persisted",
+        );
+    }
+    if !declared {
+        state.store.remove(&host);
+    }
+    tracing::info!(host = %host, actor = %actor, declared = declared, ticket = "PHAROS-127", "host removal requested and beacon access revoked");
+    action_response(StatusCode::ACCEPTED, &job)
+}
+
+async fn allow_host_reonboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(host): AxumPath<String>,
+    Json(request): Json<RemoveHostActionRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers) || !access.can_manage_fleet() || !access.allows_host(&host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Host re-onboarding access is not granted",
+        );
+    }
+    if request.confirmation != host {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "Type the exact host name to confirm",
+        );
+    }
+    match state.retired_hosts.clear(&host) {
+        Ok(true) => {}
+        Ok(false) => return action_error(StatusCode::NOT_FOUND, "Host is not retired"),
+        Err(_) => {
+            return action_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The re-onboarding approval could not be durably recorded",
+            );
+        }
+    }
+    tracing::info!(host = %host, actor = %action_actor(&state.auth, &headers), ticket = "PHAROS-127", "host re-onboarding allowed");
+    (
+        StatusCode::OK,
+        Json(json!({
+            "message": "Retirement cleared. Re-onboarding still requires a valid managed beacon credential."
+        })),
+    )
+}
+
+fn reconcile_completed_removals(state: &AppState, now: i64) {
+    for retired in state.retired_hosts.list() {
+        if !retired.declaration_pending {
+            state.store.remove(&retired.host);
+            continue;
+        }
+        if host_is_declared(state, &retired.host) {
+            continue;
+        }
+        state.store.remove(&retired.host);
+        match state
+            .host_actions
+            .complete_removal(&retired.removal_job_id, now)
+        {
+            Ok(Some(_)) => {
+                tracing::info!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciled");
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciliation could not be persisted");
+            }
+        }
+    }
+}
+
+fn agent_authorized(state: &AppState, headers: &HeaderMap, host: &str) -> Result<(), StatusCode> {
+    if state.retired_hosts.is_retired(host) {
+        return Err(StatusCode::GONE);
+    }
+    let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    match state
+        .beacon_auth
+        .report_token_status(&state.store, host, token)
+    {
+        ReportTokenAuth::Allowed => Ok(()),
+        ReportTokenAuth::Denied => Err(StatusCode::UNAUTHORIZED),
+        ReportTokenAuth::Unavailable(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn claim_host_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AgentActionClaimRequest>,
+) -> axum::response::Response {
+    let host = request.host.trim().to_string();
+    if !valid_action_host_name(&host) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(status) = agent_authorized(&state, &headers, &host) {
+        return status.into_response();
+    }
+    match state.host_actions.claim(&host, now_unix()) {
+        Ok(Some(lease)) => (StatusCode::OK, Json(lease)).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(HostActionStoreError::BlockedByFailure) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "Another host failure must be resolved first" })),
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn record_host_action_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<AgentActionResultRequest>,
+) -> axum::response::Response {
+    let host = request.host.trim().to_string();
+    if !valid_action_host_name(&host) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(status) = agent_authorized(&state, &headers, &host) {
+        return status.into_response();
+    }
+    let Some(job) = state.host_actions.get(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if job.host != host {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if request.outcome == AgentActionOutcome::Succeeded
+        && matches!(
+            request.phase,
+            host_actions::AgentActionPhase::Apply | host_actions::AgentActionPhase::Resume
+        )
+    {
+        let runtime_verified = state.store.get(&host).is_some_and(|runtime| {
+            runtime.last_seen.is_some_and(|seen| {
+                seen >= job.confirmed_at.unwrap_or(job.created_at)
+                    && runtime
+                        .kernel
+                        .as_ref()
+                        .is_some_and(|kernel| kernel.state == KernelPostureState::Current)
+            })
+        });
+        if !runtime_verified {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "Waiting for a fresh heartbeat with the expected kernel" })),
+            )
+                .into_response();
+        }
+    }
+    match state
+        .host_actions
+        .record_agent_result(&id, &host, request, now_unix())
+    {
+        Ok(job) => action_response(StatusCode::OK, &job).into_response(),
+        Err(HostActionStoreError::InvalidJob) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        Err(HostActionStoreError::InvalidTransition) => StatusCode::CONFLICT.into_response(),
+        Err(HostActionStoreError::WrongHost) => StatusCode::FORBIDDEN.into_response(),
+        Err(HostActionStoreError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn valid_action_host_name(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
 
 async fn healthz() -> &'static str {
     "ok"
@@ -7105,6 +8003,10 @@ async fn report(
     headers: HeaderMap,
     Json(rep): Json<HostReport>,
 ) -> StatusCode {
+    if state.retired_hosts.is_retired(&rep.name) {
+        tracing::warn!(host = %rep.name, "report rejected: host retired from Pharos");
+        return StatusCode::GONE;
+    }
     if let Err(error) = rep.validate_contract() {
         tracing::warn!(
             host = %rep.name,
@@ -7155,6 +8057,14 @@ async fn register(
     headers: HeaderMap,
     Json(registration): Json<HostRegistration>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if state.retired_hosts.is_retired(&registration.name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "host was removed; clear the retirement through explicit re-onboarding first"
+            })),
+        );
+    }
     match state.beacon_auth.registration_status(&headers) {
         RegistrationAuth::Allowed => {}
         RegistrationAuth::Disabled => {
@@ -7208,12 +8118,32 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    no_store_json(hosts_payload(
-        runtime_hosts,
-        &manifests,
-        &declared_preferences,
-        now,
-    ))
+    let mut payload = hosts_payload(runtime_hosts, &manifests, &declared_preferences, now);
+    if let Some(hosts) = payload
+        .get_mut("hosts")
+        .and_then(|hosts| hosts.as_array_mut())
+    {
+        for host in hosts {
+            let Some(name) = host
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if let Some(action) = state.host_actions.latest_for_host(&name) {
+                host["host_action"] = serde_json::to_value(action.summary()).unwrap_or_default();
+            }
+            if let Some(retired) = state.retired_hosts.get(&name) {
+                host["retirement"] = json!({
+                    "pending": true,
+                    "declaration_pending": retired.declaration_pending,
+                    "retired_at": retired.retired_at,
+                });
+            }
+        }
+    }
+    no_store_json(payload)
 }
 
 fn hosts_payload(
@@ -7494,7 +8424,7 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    no_store_html(render_home(
+    no_store_html(render_home_with_capabilities(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
@@ -7507,7 +8437,12 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
             user_label: &user_label,
             logout_enabled: state.auth.is_some(),
         },
-        access.can_agora(),
+        FleetCapabilities {
+            can_onboard: access.can_agora(),
+            can_manage_fleet: access.can_manage_fleet(),
+            system_update_available: state.nixcfg_dispatch.system_update_available(),
+            host_removal_available: state.nixcfg_dispatch.host_removal_available(),
+        },
     ))
 }
 
@@ -7615,7 +8550,13 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
     } else {
         &[]
     };
-    no_store_html(render_activity(
+    let action_jobs: Vec<_> = state
+        .host_actions
+        .list()
+        .into_iter()
+        .filter(|job| access.allows_host(&job.host))
+        .collect();
+    no_store_html(render_activity_with_actions(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
@@ -7623,9 +8564,12 @@ async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> imp
         },
         &self_host(),
         now,
-        &manifests,
-        load_errors,
-        &probes,
+        ActivitySources {
+            manifests: &manifests,
+            load_errors,
+            server_probes: &probes,
+            action_jobs: &action_jobs,
+        },
         ShellContext {
             user_label: &user_label,
             logout_enabled: state.auth.is_some(),
@@ -8181,6 +9125,111 @@ fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
         question = icons::SHIELD_QUESTION,
         alert = icons::SHIELD_ALERT,
         x = icons::SHIELD_X,
+    )
+}
+
+fn host_actions_markup(host: &Host, context: HostActionRenderContext<'_>) -> String {
+    let capabilities = context.capabilities;
+    let name = html_escape(&host.name);
+    let role = html_escape(&host.role);
+    let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
+    let title = html_escape(&format!("Actions for {}", host.name));
+    let settings_href = html_escape(context.settings_href);
+    let review_hidden = if context.settings_state == HostPreferencesState::Applied {
+        " hidden"
+    } else {
+        ""
+    };
+    let update_hidden =
+        if host.is_nix && capabilities.can_manage_fleet && capabilities.system_update_available {
+            ""
+        } else {
+            " hidden"
+        };
+    let janus_ready = context.manifest.is_some_and(|manifest| {
+        manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
+            && manifest.policy.privileged_actions.janus_required
+    });
+    let reboot = kernel_reboot_required(host.kernel.as_ref());
+    let update_pending = reboot.is_some() || host.freshness.commits_behind.unwrap_or(0) > 0;
+    let restart_hidden =
+        if host.is_nix && capabilities.can_manage_fleet && janus_ready && update_pending {
+            ""
+        } else {
+            " hidden"
+        };
+    let remove_hidden = if capabilities.can_manage_fleet && capabilities.host_removal_available {
+        ""
+    } else {
+        " hidden"
+    };
+    let primary_separator_hidden =
+        if review_hidden.is_empty() || update_hidden.is_empty() || restart_hidden.is_empty() {
+            ""
+        } else {
+            " hidden"
+        };
+    let dot_hidden = if context.settings_state != HostPreferencesState::Applied || reboot.is_some()
+    {
+        ""
+    } else {
+        " hidden"
+    };
+    let kernel_state = host
+        .kernel
+        .as_ref()
+        .map(|kernel| match kernel.state {
+            KernelPostureState::Current => "current",
+            KernelPostureState::RebootRequired => "reboot_required",
+            KernelPostureState::Unknown => "unknown",
+            KernelPostureState::NotApplicable => "not_applicable",
+        })
+        .unwrap_or("unknown");
+    let running_kernel = host
+        .kernel
+        .as_ref()
+        .and_then(|kernel| kernel.running_version.as_deref())
+        .unwrap_or("not reported");
+    let expected_kernel = host
+        .kernel
+        .as_ref()
+        .and_then(|kernel| kernel.expected_version.as_deref())
+        .unwrap_or("not reported");
+
+    format!(
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-settings-href="{settings_href}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong><a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending" href="{settings_href}"{review_hidden}>{clock}<span><strong>Review pending change</strong><span>See what is waiting for this host</span></span></a><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        is_nix = host.is_nix,
+        declared = context.declared,
+        janus_ready = janus_ready,
+        can_manage_fleet = capabilities.can_manage_fleet,
+        system_update_available = capabilities.system_update_available,
+        host_removal_available = capabilities.host_removal_available,
+        update_pending = update_pending,
+        settings_state = context.settings_state.key(),
+        backup_state = html_escape(context.backup.state),
+        backup_label = html_escape(&context.backup.label),
+        kernel_state = html_escape(kernel_state),
+        running_kernel = html_escape(running_kernel),
+        expected_kernel = html_escape(expected_kernel),
+        ellipsis = icons::ELLIPSIS,
+        clock = icons::CLOCK_3,
+        package = icons::PACKAGE_SEARCH,
+        power = icons::POWER,
+        file = icons::FILE_TEXT,
+        trash = icons::TRASH_2,
+        shield = icons::SHIELD_CHECK,
+    )
+}
+
+fn host_action_dialog() -> String {
+    format!(
+        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button" type="button" data-host-action-close>Cancel</button><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button></span></footer></section></section>"#,
+        package = icons::PACKAGE_SEARCH,
+        power = icons::POWER,
+        file = icons::FILE_TEXT,
+        trash = icons::TRASH_2,
+        close = icons::X,
+        shield = icons::SHIELD_CHECK,
     )
 }
 
@@ -8918,6 +9967,32 @@ struct RuntimeSnapshot<'a> {
     hosts: &'a [Host],
     jobs: &'a [ProvisioningJob],
     declared_preferences: Option<&'a BTreeMap<String, HostPreferences>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FleetCapabilities {
+    can_onboard: bool,
+    can_manage_fleet: bool,
+    system_update_available: bool,
+    host_removal_available: bool,
+}
+
+struct HostActionRenderContext<'a> {
+    manifest: Option<&'a HostManifest>,
+    declared: bool,
+    settings_state: HostPreferencesState,
+    settings_href: &'a str,
+    backup: &'a BackupUiSummary,
+    surface: &'a str,
+    capabilities: FleetCapabilities,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActivitySources<'a> {
+    manifests: &'a [HostManifest],
+    load_errors: &'a [ManifestLoadIssue],
+    server_probes: &'a BTreeMap<String, Vec<ServerProbeObservation>>,
+    action_jobs: &'a [HostActionJob],
 }
 
 fn search_box(placeholder: &str) -> String {
@@ -11290,14 +12365,19 @@ fn push_backup_activity_events(
 }
 
 fn activity_events(
-    hosts: &[Host],
-    jobs: &[ProvisioningJob],
+    runtime: RuntimeSnapshot<'_>,
     _self_name: &str,
     now: i64,
-    manifests: &[HostManifest],
-    load_errors: &[ManifestLoadIssue],
-    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
+    sources: ActivitySources<'_>,
 ) -> Vec<ActivityEvent> {
+    let hosts = runtime.hosts;
+    let jobs = runtime.jobs;
+    let ActivitySources {
+        manifests,
+        load_errors,
+        server_probes,
+        action_jobs,
+    } = sources;
     let mut events = Vec::new();
     let runtime_names: BTreeSet<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
 
@@ -11310,6 +12390,55 @@ fn activity_events(
             "Manifest load failed",
             format!("{} - {}", issue.path, issue.error),
             "config",
+        ));
+    }
+
+    for job in action_jobs {
+        let (level, title) = match (job.kind, job.state) {
+            (HostActionKind::SystemUpdateProposal, HostActionState::ProposalRequested) => {
+                ("info", "System update review requested")
+            }
+            (HostActionKind::UpdateRestart, HostActionState::QueuedReview) => {
+                ("watch", "Guarded update review queued")
+            }
+            (HostActionKind::UpdateRestart, HostActionState::Reviewing) => {
+                ("watch", "Guarded update review running")
+            }
+            (HostActionKind::UpdateRestart, HostActionState::AwaitingConfirmation) => {
+                ("watch", "Update review ready for confirmation")
+            }
+            (HostActionKind::UpdateRestart, HostActionState::QueuedApply) => {
+                ("warning", "Update and restart confirmed")
+            }
+            (HostActionKind::UpdateRestart, HostActionState::Applying) => {
+                ("warning", "Target-local update running")
+            }
+            (HostActionKind::UpdateRestart, HostActionState::Rebooting) => {
+                ("warning", "Host restart in progress")
+            }
+            (HostActionKind::RemoveHost, HostActionState::RemovalPending) => {
+                ("warning", "Host removal pending")
+            }
+            (HostActionKind::RemoveHost, HostActionState::Succeeded) => {
+                ("recovery", "Host removed from Pharos")
+            }
+            (_, HostActionState::Succeeded) => ("recovery", "Guarded host action completed"),
+            (_, HostActionState::Failed) => ("critical", "Guarded host action failed"),
+            _ => ("info", "Host action recorded"),
+        };
+        events.push(ActivityEvent::new(
+            job.updated_at,
+            job.host.clone(),
+            level,
+            "action",
+            title,
+            format!(
+                "{} · requested by {}. {}",
+                job.ticket,
+                job.requested_by,
+                action_message(job)
+            ),
+            "guarded action",
         ));
     }
 
@@ -11535,8 +12664,9 @@ fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
     let backup = activity_source_count(events, "backup");
     let setup = activity_source_count(events, "setup");
     let kernel = activity_source_count(events, "kernel");
+    let actions = activity_source_count(events, "action");
     format!(
-        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="setup" aria-pressed="false"><b>{setup}</b><span>setup</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="kernel" aria-pressed="false"><b>{kernel}</b><span>kernel</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
+        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="setup" aria-pressed="false"><b>{setup}</b><span>setup</span></button><button class="ops-metric warning" type="button" data-ops-filter="action" aria-pressed="false"><b>{actions}</b><span>actions</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="kernel" aria-pressed="false"><b>{kernel}</b><span>kernel</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
         total = events.len()
     )
 }
@@ -11544,6 +12674,7 @@ fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
 fn activity_filter_bar(events: &[ActivityEvent]) -> String {
     let config = activity_source_count(events, "config");
     let setup = activity_source_count(events, "setup");
+    let actions = activity_source_count(events, "action");
     let critical = events
         .iter()
         .filter(|event| event.level == "critical")
@@ -11553,7 +12684,7 @@ fn activity_filter_bar(events: &[ActivityEvent]) -> String {
         .filter(|event| event.level == "warning")
         .count();
     format!(
-        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="setup" data-ops-filter="setup" aria-pressed="false">Setup {setup}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="kernel" data-ops-filter="kernel" aria-pressed="false">Kernel {kernel}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
+        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="setup" data-ops-filter="setup" aria-pressed="false">Setup {setup}</button><button class="activity-filter warning" type="button" data-activity-filter="action" data-ops-filter="action" aria-pressed="false">Actions {actions}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="kernel" data-ops-filter="kernel" aria-pressed="false">Kernel {kernel}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
         total = events.len(),
         heartbeat = activity_source_count(events, "heartbeat"),
         freshness = activity_source_count(events, "freshness"),
@@ -11595,6 +12726,7 @@ fn activity_script() -> &'static str {
     ops_script()
 }
 
+#[cfg(test)]
 fn render_activity(
     runtime: RuntimeSnapshot<'_>,
     self_name: &str,
@@ -11604,18 +12736,31 @@ fn render_activity(
     server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
     shell: ShellContext<'_>,
 ) -> String {
-    let events = activity_events(
-        runtime.hosts,
-        runtime.jobs,
+    render_activity_with_actions(
+        runtime,
         self_name,
         now,
-        manifests,
-        load_errors,
-        server_probes,
-    );
+        ActivitySources {
+            manifests,
+            load_errors,
+            server_probes,
+            action_jobs: &[],
+        },
+        shell,
+    )
+}
+
+fn render_activity_with_actions(
+    runtime: RuntimeSnapshot<'_>,
+    self_name: &str,
+    now: i64,
+    sources: ActivitySources<'_>,
+    shell: ShellContext<'_>,
+) -> String {
+    let events = activity_events(runtime, self_name, now, sources);
     let rows = activity_rows(&events);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, and config signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Activity is derived from current retained Pharos state. It is not an audit log yet; it shows the recent operational picture Pharos can prove now.</div></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
         header = page_header("Activity", "Operational timeline", now),
         summary = activity_summary_metrics(&events),
@@ -12342,6 +13487,7 @@ fn heartbeat_card(
     )
 }
 
+#[cfg(test)]
 fn render_home(
     runtime: RuntimeSnapshot<'_>,
     self_name: &str,
@@ -12350,6 +13496,30 @@ fn render_home(
     shell: ShellContext<'_>,
     can_onboard: bool,
 ) -> String {
+    render_home_with_capabilities(
+        runtime,
+        self_name,
+        now,
+        manifests,
+        shell,
+        FleetCapabilities {
+            can_onboard,
+            can_manage_fleet: can_onboard,
+            system_update_available: true,
+            host_removal_available: true,
+        },
+    )
+}
+
+fn render_home_with_capabilities(
+    runtime: RuntimeSnapshot<'_>,
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    shell: ShellContext<'_>,
+    capabilities: FleetCapabilities,
+) -> String {
+    let can_onboard = capabilities.can_onboard;
     let hosts = runtime.hosts;
     let setup_jobs = pending_setup_jobs(runtime.hosts, runtime.jobs);
     if runtime.hosts.is_empty() && setup_jobs.is_empty() {
@@ -12479,7 +13649,8 @@ fn render_home(
             search_parts.push(settings_state_label.to_string());
         }
         let search = html_escape(&search_parts.join(" "));
-        let settings_href = html_escape(&format!("/agora?host={}", url_query_escape(&h.name)));
+        let settings_href_raw = format!("/agora?host={}", url_query_escape(&h.name));
+        let settings_href = html_escape(&settings_href_raw);
         let settings_color = h
             .preferences
             .accent
@@ -12520,6 +13691,39 @@ fn render_home(
             settings_icon = icons::SLIDERS,
             settings_title = html_escape(&settings_title),
         );
+        let declared = manifest.is_some() || declared_preferences.is_some();
+        let card_host_actions = if can_onboard {
+            host_actions_markup(
+                h,
+                HostActionRenderContext {
+                    manifest,
+                    declared,
+                    settings_state,
+                    settings_href: &settings_href_raw,
+                    backup: &backup,
+                    surface: "card",
+                    capabilities,
+                },
+            )
+        } else {
+            String::new()
+        };
+        let row_host_actions = if can_onboard {
+            host_actions_markup(
+                h,
+                HostActionRenderContext {
+                    manifest,
+                    declared,
+                    settings_state,
+                    settings_href: &settings_href_raw,
+                    backup: &backup,
+                    surface: "row",
+                    capabilities,
+                },
+            )
+        } else {
+            String::new()
+        };
         let settings_note = format!(
             r#"<a class="settings-wait-note" data-settings-note data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"{settings_note_hidden}>{wait_icon}<span data-settings-note-copy>{settings_state_label}</span></a>"#,
             wait_icon = icons::CLOCK_3,
@@ -12530,6 +13734,10 @@ fn render_home(
             } else {
                 ""
             },
+        );
+        let action_note = format!(
+            r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note hidden>{icon}<span data-host-action-note-copy></span></button>"#,
+            icon = icons::HISTORY,
         );
         let drag_action = format!(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
@@ -12555,12 +13763,12 @@ fn render_home(
         ));
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{settings_action}</div></header>{settings_note}{reason}{kernel}{muted}<div class="fresh" data-fresh>{fresh}</div>{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{settings_action}{card_host_actions}</div></header>{settings_note}{action_note}{reason}{kernel}{muted}<div class="fresh" data-fresh>{fresh}</div>{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
             live_key = live_key(live),
             as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{settings_note}{reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{settings_note}{action_note}{reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
             live_key = live_key(live),
             as_of = clock_label(now),
         ));
@@ -12584,14 +13792,20 @@ fn render_home(
     } else {
         String::new()
     };
+    let action_dialog = if can_onboard {
+        host_action_dialog()
+    } else {
+        String::new()
+    };
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{action_dialog}{FOOT}",
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar(),
-        assistant = assistant
+        assistant = assistant,
+        action_dialog = action_dialog,
     )
 }
 
@@ -12605,8 +13819,12 @@ async fn main() {
 
     let host_store_path = std::env::var("PHAROS_DB").ok().map(PathBuf::from);
     let provisioning_job_store_path = provisioning_jobs_path(host_store_path.as_deref());
+    let host_action_store_path = HostActionStore::path_for(host_store_path.as_deref());
+    let retired_host_store_path = RetiredHostStore::path_for(host_store_path.as_deref());
     let store = Arc::new(Store::new(host_store_path));
     let provisioning_jobs = Arc::new(ProvisioningJobStore::new(provisioning_job_store_path));
+    let host_actions = Arc::new(HostActionStore::new(host_action_store_path));
+    let retired_hosts = Arc::new(RetiredHostStore::new(retired_host_store_path));
     let manifests = Arc::new(ManifestRegistry::from_env());
     let auth = Auth::from_env().await;
     let beacon_auth = BeaconAuth::from_env();
@@ -12621,7 +13839,10 @@ async fn main() {
         beacon_auth,
         provider_runtime,
         nixcfg_dispatch,
+        host_actions,
+        retired_hosts,
     };
+    reconcile_completed_removals(&state, now_unix());
     spawn_alert_loop(state.clone(), alert_notifier);
 
     let app = Router::new()
@@ -12658,6 +13879,21 @@ async fn main() {
             post(existing_host_preflight_json),
         )
         .route("/declared-hosts.json", get(declared_hosts_json))
+        .route("/host-actions/system-update", post(request_system_update))
+        .route(
+            "/host-actions/{host}/update-restart/review",
+            post(request_update_restart_review),
+        )
+        .route("/host-actions/jobs/{id}", get(host_action_job_json))
+        .route(
+            "/host-actions/jobs/{id}/confirm",
+            post(confirm_update_restart),
+        )
+        .route("/host-actions/{host}/remove", post(request_host_removal))
+        .route(
+            "/host-actions/{host}/allow-reonboarding",
+            post(allow_host_reonboarding),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         // Machine/public routes: beacon ingestion, local registration, health,
         // version, static assets, and the auth flow.
@@ -12671,6 +13907,11 @@ async fn main() {
         )
         .route("/register", post(register))
         .route("/report", post(report))
+        .route("/agent/actions/claim", post(claim_host_action))
+        .route(
+            "/agent/actions/{id}/result",
+            post(record_host_action_result),
+        )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/logout", get(auth::logout))
@@ -13022,6 +14263,26 @@ mod tests {
             user_label,
             logout_enabled,
         }
+    }
+
+    fn test_manifest(name: &str, janus_ready: bool) -> HostManifest {
+        serde_json::from_value(json!({
+            "schema": "inspr.hostdash.config.v1",
+            "version": 1,
+            "slug": name,
+            "host": { "name": name },
+            "wings": [],
+            "services": [],
+            "policy": {
+                "declaredOnly": true,
+                "runtimeStateOwner": "pharos",
+                "privilegedActions": {
+                    "mode": if janus_ready { "janus" } else { "none" },
+                    "janusRequired": janus_ready
+                }
+            }
+        }))
+        .expect("test manifest parses")
     }
 
     #[test]
@@ -13491,6 +14752,136 @@ mod tests {
     }
 
     #[test]
+    fn fleet_host_actions_share_contextual_grid_and_list_markup() {
+        let mut host = host_with_backups("hsb8", 1_700_000_100, vec![]);
+        host.kernel = Some(reboot_required_kernel(1_700_000_100));
+        host.requested_preferences = Some(HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        });
+        let manifests = vec![test_manifest("hsb8", true)];
+        let html = render_home_with_capabilities(
+            runtime(&[host], &[]),
+            "csb1",
+            1_700_000_120,
+            &manifests,
+            shell("markus", true),
+            FleetCapabilities {
+                can_onboard: true,
+                can_manage_fleet: true,
+                system_update_available: true,
+                host_removal_available: true,
+            },
+        );
+
+        assert_eq!(
+            html.matches(r#"class="header-chip host-actions-trigger""#)
+                .count(),
+            2
+        );
+        assert!(html.contains(r#"id="host-actions-hsb8-card" role="menu""#));
+        assert!(html.contains(r#"id="host-actions-hsb8-row" role="menu""#));
+        assert_eq!(
+            html.matches(
+                r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending""#
+            )
+            .count(),
+            2
+        );
+        assert_eq!(
+            html.matches(
+                r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update""#
+            )
+            .count(),
+            2
+        );
+        assert_eq!(
+            html.matches(
+                r#"<button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart""#
+            )
+            .count(),
+            2
+        );
+        assert_eq!(
+            html.matches(
+                r#"<button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove""#
+            )
+            .count(),
+            2
+        );
+        assert_eq!(
+            html.matches(r#"<section class="host-action-overlay""#)
+                .count(),
+            1
+        );
+        assert!(html.contains("Privileged changes always open a review first"));
+        assert!(html.contains("function initHostActions()"));
+        assert!(html.contains("event.key==='ArrowDown'"));
+        assert!(html.contains("event.key==='Escape'"));
+        assert!(html.contains("X-Pharos-Action"));
+    }
+
+    #[test]
+    fn fleet_host_actions_fail_closed_without_fleet_or_janus_capability() {
+        let mut host = host_with_backups("hsb8", 1_700_000_100, vec![]);
+        host.kernel = Some(reboot_required_kernel(1_700_000_100));
+        let manifest = test_manifest("hsb8", false);
+        let backup = backup_ui_summary(&host.backup_observations, 1_700_000_120);
+        let markup = host_actions_markup(
+            &host,
+            HostActionRenderContext {
+                manifest: Some(&manifest),
+                declared: true,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: false,
+                    system_update_available: true,
+                    host_removal_available: true,
+                },
+            },
+        );
+
+        assert!(markup.contains(r#"data-can-manage="false""#));
+        assert!(markup.contains(r#"data-host-action="system-update" hidden"#));
+        assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
+        assert!(markup.contains(r#"data-host-action="remove" hidden"#));
+        assert!(markup.contains(r#"data-host-action="technical""#));
+
+        let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
+        pending_update.freshness.commits_behind = Some(2);
+        pending_update.kernel = Some(KernelPosture::observed(
+            true,
+            Some("7.0.14".to_string()),
+            Some("7.0.14".to_string()),
+            1_700_000_100,
+        ));
+        let ready_manifest = test_manifest("hsb8", true);
+        let pending_markup = host_actions_markup(
+            &pending_update,
+            HostActionRenderContext {
+                manifest: Some(&ready_manifest),
+                declared: true,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: true,
+                    host_removal_available: true,
+                },
+            },
+        );
+        assert!(pending_markup.contains(r#"data-update-pending="true""#));
+        assert!(pending_markup.contains(r#"data-host-action="update-restart"><svg"#));
+    }
+
+    #[test]
     fn render_backups_shows_first_class_backup_page() {
         let host = Host {
             name: "athena".to_string(),
@@ -13730,7 +15121,17 @@ mod tests {
             alert.host == "csb0" && alert.source == "heartbeat" && alert.level == "critical"
         }));
 
-        let events = activity_events(&hosts, &[], "csb1", 1000, &[], &[], &probes);
+        let events = activity_events(
+            runtime(&hosts, &[]),
+            "csb1",
+            1000,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &probes,
+                action_jobs: &[],
+            },
+        );
         let kernel_events = events
             .iter()
             .filter(|event| event.source == "kernel")
@@ -14060,13 +15461,24 @@ mod tests {
             }],
         );
 
-        let html = render_activity(
+        let action = HostActionStore::new(None)
+            .create_system_update_proposal(
+                "update-review-athena-995".to_string(),
+                "athena",
+                "markus",
+                995,
+            )
+            .expect("safe action event");
+        let html = render_activity_with_actions(
             runtime(&hosts, &[]),
             "csb1",
             1000,
-            std::slice::from_ref(&manifest),
-            &[],
-            &probes,
+            ActivitySources {
+                manifests: std::slice::from_ref(&manifest),
+                load_errors: &[],
+                server_probes: &probes,
+                action_jobs: &[action],
+            },
             shell("markus", true),
         );
 
@@ -14088,6 +15500,10 @@ mod tests {
         assert!(html.contains("Declared host manifest loaded"));
         assert!(html.contains(r#"data-activity-filter="heartbeat""#));
         assert!(html.contains(r#"data-activity-filter="backup""#));
+        assert!(html.contains(r#"data-activity-filter="action""#));
+        assert!(html.contains("System update review requested"));
+        assert!(html.contains("PHAROS-125"));
+        assert!(html.contains("requested by markus"));
         assert!(html.contains(r#"data-ops-filter="backup""#));
         assert!(html.contains(r#"data-ops-filter="heartbeat""#));
         assert!(html.contains(r#"placeholder="Search hosts...""#));
@@ -14095,7 +15511,8 @@ mod tests {
         assert!(html.contains(r#"<button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true""#));
         assert!(html.contains(r#"data-activity-filter="critical""#));
         assert!(html.contains("const filterOk=active==='all'"));
-        assert!(html.contains("Activity is derived from current retained Pharos state."));
+        assert!(html.contains("Guarded action requests and results are persisted."));
+        assert!(html.contains("Other operational events are derived"));
         assert!(!html.contains("restic-main-repository"));
         assert!(!html.contains("not-rendered-token-hash"));
     }
@@ -14159,13 +15576,15 @@ mod tests {
         assert!(!alerts.iter().any(|alert| alert.source == "backup"));
 
         let events = activity_events(
-            &[host.clone()],
-            &[],
+            runtime(std::slice::from_ref(&host), &[]),
             "csb1",
             1000,
-            &[],
-            &[],
-            &BTreeMap::new(),
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
         );
         assert!(events.iter().any(|event| event.title == "nginx warning"));
         assert!(!events
@@ -17349,6 +18768,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             beacon_auth,
             provider_runtime: ProviderRuntimeConfig::default(),
             nixcfg_dispatch: NixcfgDispatch::disabled(),
+            host_actions: Arc::new(HostActionStore::new(None)),
+            retired_hosts: Arc::new(RetiredHostStore::new(None)),
         }
     }
 
@@ -17450,6 +18871,167 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 .expect("valid bearer header"),
         );
         headers
+    }
+
+    fn action_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pharos-Action", axum::http::HeaderValue::from_static("1"));
+        headers
+    }
+
+    fn state_with_janus_manifest(host: &str, token: &str) -> (AppState, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-action-manifest-{}-{}-{}.json",
+            std::process::id(),
+            host,
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&test_manifest(host, true)).expect("manifest serializes"),
+        )
+        .expect("write action manifest");
+        let mut state = report_test_state(true);
+        state.manifests = Arc::new(ManifestRegistry::from_paths(vec![path.clone()]));
+        register_test_token(&state, host, token);
+        let mut report = test_report(host);
+        report.kernel = Some(reboot_required_kernel(now_unix()));
+        report.freshness.commits_behind = Some(1);
+        state.store.record(report, now_unix());
+        (state, path)
+    }
+
+    #[tokio::test]
+    async fn guarded_update_endpoint_requires_host_review_and_attended_confirmation() {
+        let (state, manifest_path) = state_with_janus_manifest("hsb8", "action-token");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = payload["job"]["id"].as_str().expect("job id").to_string();
+
+        let claim = claim_host_action(
+            State(state.clone()),
+            bearer_headers("action-token"),
+            Json(AgentActionClaimRequest {
+                host: "hsb8".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(claim.status(), StatusCode::OK);
+
+        let result = record_host_action_result(
+            State(state.clone()),
+            bearer_headers("action-token"),
+            AxumPath(id.clone()),
+            Json(AgentActionResultRequest {
+                host: "hsb8".to_string(),
+                phase: host_actions::AgentActionPhase::Review,
+                outcome: AgentActionOutcome::Succeeded,
+                plan: Some(host_actions::HostActionPlan {
+                    changed_file_count: 2,
+                    changed_areas: vec!["flake.lock".to_string(), "hosts".to_string()],
+                    all_host_eval_passed: true,
+                    target_build_passed: true,
+                    backup_ready: true,
+                    running_kernel: Some("6.18.26".to_string()),
+                    expected_kernel: Some("7.0.14".to_string()),
+                    restart_required: true,
+                }),
+                result: None,
+            }),
+        )
+        .await;
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let (status, _) = confirm_update_restart(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(id.clone()),
+            Json(ConfirmHostActionRequest {
+                confirmation: "hsb8".to_string(),
+                attended: false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, Json(payload)) = confirm_update_restart(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(id),
+            Json(ConfirmHostActionRequest {
+                confirmation: "hsb8".to_string(),
+                attended: true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "queued_apply");
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[tokio::test]
+    async fn runtime_host_removal_revokes_reports_and_reonboarding_is_explicit() {
+        let state = report_test_state(true);
+        register_test_token(&state, "ares", "remove-token");
+        state.store.record(test_report("ares"), now_unix());
+
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("ares".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "wrong".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!state.retired_hosts.is_retired("ares"));
+
+        let (status, Json(payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("ares".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "ares".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "succeeded");
+        assert!(state.retired_hosts.is_retired("ares"));
+        assert!(state.store.get("ares").is_none());
+
+        let report_status = report(
+            State(state.clone()),
+            bearer_headers("remove-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+        assert_eq!(report_status, StatusCode::GONE);
+
+        let (status, _) = allow_host_reonboarding(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("ares".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "ares".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        register_test_token(&state, "ares", "new-token");
+        let report_status = report(
+            State(state.clone()),
+            bearer_headers("new-token"),
+            Json(test_report("ares")),
+        )
+        .await;
+        assert_eq!(report_status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

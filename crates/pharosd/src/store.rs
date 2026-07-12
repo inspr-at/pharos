@@ -56,6 +56,18 @@ impl Store {
             .collect()
     }
 
+    pub fn get(&self, host: &str) -> Option<Host> {
+        self.hosts.read().expect("store lock").get(host).cloned()
+    }
+
+    pub fn remove(&self, host: &str) -> Option<Host> {
+        let removed = self.hosts.write().expect("store lock").remove(host);
+        if removed.is_some() {
+            self.persist();
+        }
+        removed
+    }
+
     /// Register or rotate a host token. Existing heartbeat/report data is kept
     /// so manual rotation does not make a live host look new again.
     pub fn register(&self, registration: HostRegistration, token_hash: String) -> Host {

@@ -113,6 +113,10 @@ impl AccessGrant {
         self.agora
     }
 
+    pub fn can_manage_fleet(&self) -> bool {
+        self.agora && self.all_hosts
+    }
+
     pub fn is_empty(&self) -> bool {
         !self.all_hosts && self.hosts.is_empty() && !self.agora
     }

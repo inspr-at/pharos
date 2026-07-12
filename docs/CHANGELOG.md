@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.27 - 2026-07-12
+
+- Add one shared, accessible per-host Actions menu to Fleet cards and rows, with pending-change review, safe technical details, and contextual controls that appear only when their guarded backend is prepared.
+- Add review-only fleet update dispatch, target-local update/restart jobs with exact leased phases and attended confirmation, and typed host removal that revokes reports without deleting the server or its data.
+- Persist guarded actions and retired-host tombstones transactionally, expose sanitized progress in Fleet and Activity, and fail closed when authorization, backup, validation, persistence, or fresh post-restart kernel evidence is missing.
+
 ## 0.1.26 - 2026-07-12
 
 - Rebuild Fleet's list mode as a compact six-column counterpart to the grid cards, with shared host identity, attention, freshness, heartbeat signal, Backup, and Settings components.

@@ -1,7 +1,7 @@
-//! Narrow GitHub Actions dispatch client for declarative host preferences.
+//! Narrow GitHub Actions dispatch client for fixed nixcfg review workflows.
 //!
-//! Pharos may trigger exactly one nixcfg workflow. Commit, pull-request,
-//! merge, and deployment behavior remains owned by that workflow.
+//! Pharos may trigger only the compile-time allowlist below. Branch, pull-request,
+//! merge, and deployment behavior remains owned by each review workflow.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,10 @@ use serde::Serialize;
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const DISPATCH_PATH: &str =
     "/repos/markus-barta/nixcfg/actions/workflows/pharos-host-settings.yml/dispatches";
+const SYSTEM_UPDATE_DISPATCH_PATH: &str =
+    "/repos/markus-barta/nixcfg/actions/workflows/pharos-system-update.yml/dispatches";
+const HOST_REMOVAL_DISPATCH_PATH: &str =
+    "/repos/markus-barta/nixcfg/actions/workflows/pharos-host-removal.yml/dispatches";
 const WORKFLOW_REF: &str = "main";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -21,6 +25,8 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]
 pub(crate) struct NixcfgDispatch {
     enabled: bool,
+    system_update_enabled: bool,
+    host_removal_enabled: bool,
     token_file: Option<PathBuf>,
     api_base: String,
     client: reqwest::Client,
@@ -42,14 +48,32 @@ impl NixcfgDispatch {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        Self::new(enabled, token_file, GITHUB_API_BASE.to_string())
+        let system_update_enabled = std::env::var("PHAROS_SYSTEM_UPDATE_DISPATCH_ENABLED")
+            .ok()
+            .is_some_and(|value| enabled_value(&value));
+        let host_removal_enabled = std::env::var("PHAROS_HOST_REMOVAL_DISPATCH_ENABLED")
+            .ok()
+            .is_some_and(|value| enabled_value(&value));
+        Self::new(
+            enabled,
+            system_update_enabled,
+            host_removal_enabled,
+            token_file,
+            GITHUB_API_BASE.to_string(),
+        )
     }
 
     pub(crate) fn disabled() -> Self {
-        Self::new(false, None, GITHUB_API_BASE.to_string())
+        Self::new(false, false, false, None, GITHUB_API_BASE.to_string())
     }
 
-    fn new(enabled: bool, token_file: Option<PathBuf>, api_base: String) -> Self {
+    fn new(
+        enabled: bool,
+        system_update_enabled: bool,
+        host_removal_enabled: bool,
+        token_file: Option<PathBuf>,
+        api_base: String,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -57,6 +81,8 @@ impl NixcfgDispatch {
             .unwrap_or_default();
         Self {
             enabled,
+            system_update_enabled,
+            host_removal_enabled,
             token_file,
             api_base,
             client,
@@ -81,8 +107,7 @@ impl NixcfgDispatch {
             .accent
             .as_deref()
             .ok_or(NixcfgDispatchError::InvalidPreferences)?;
-        let token = self.read_token()?;
-        let request_id = request_id(host);
+        let request_id = request_id("settings", host);
         let request = WorkflowDispatchRequest {
             git_ref: WORKFLOW_REF,
             inputs: WorkflowDispatchInputs {
@@ -95,25 +120,71 @@ impl NixcfgDispatch {
                 request_id: &request_id,
             },
         };
+        self.send(DISPATCH_PATH, &request).await?;
+        Ok(request_id)
+    }
+
+    pub(crate) async fn dispatch_system_update(
+        &self,
+        source_host: &str,
+    ) -> Result<String, NixcfgDispatchError> {
+        if !self.system_update_available() {
+            return Err(NixcfgDispatchError::Disabled);
+        }
+        if !valid_host_name(source_host) {
+            return Err(NixcfgDispatchError::InvalidHost);
+        }
+        let request_id = request_id("system-update", source_host);
+        let request = SystemUpdateDispatchRequest {
+            git_ref: WORKFLOW_REF,
+            inputs: SystemUpdateDispatchInputs {
+                source_host,
+                request_id: &request_id,
+            },
+        };
+        self.send(SYSTEM_UPDATE_DISPATCH_PATH, &request).await?;
+        Ok(request_id)
+    }
+
+    pub(crate) async fn dispatch_host_removal(
+        &self,
+        host: &str,
+    ) -> Result<String, NixcfgDispatchError> {
+        if !self.host_removal_available() {
+            return Err(NixcfgDispatchError::Disabled);
+        }
+        if !valid_host_name(host) {
+            return Err(NixcfgDispatchError::InvalidHost);
+        }
+        let request_id = request_id("host-removal", host);
+        let request = HostRemovalDispatchRequest {
+            git_ref: WORKFLOW_REF,
+            inputs: HostRemovalDispatchInputs {
+                host,
+                request_id: &request_id,
+            },
+        };
+        self.send(HOST_REMOVAL_DISPATCH_PATH, &request).await?;
+        Ok(request_id)
+    }
+
+    async fn send<T: Serialize>(&self, path: &str, request: &T) -> Result<(), NixcfgDispatchError> {
+        let token = self.read_token()?;
         let response = self
             .client
-            .post(format!(
-                "{}{}",
-                self.api_base.trim_end_matches('/'),
-                DISPATCH_PATH
-            ))
+            .post(format!("{}{}", self.api_base.trim_end_matches('/'), path))
             .header(ACCEPT, "application/vnd.github+json")
             .header(USER_AGENT, "pharosd")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .bearer_auth(token)
-            .json(&request)
+            .json(request)
             .send()
             .await
             .map_err(|_| NixcfgDispatchError::RequestFailed)?;
         if response.status() != reqwest::StatusCode::NO_CONTENT {
             return Err(NixcfgDispatchError::Rejected(response.status().as_u16()));
         }
-        Ok(request_id)
+        Ok(())
     }
 
     fn read_token(&self) -> Result<String, NixcfgDispatchError> {
@@ -128,9 +199,17 @@ impl NixcfgDispatch {
             .ok_or(NixcfgDispatchError::CredentialUnavailable)
     }
 
+    pub(crate) fn system_update_available(&self) -> bool {
+        self.enabled && self.system_update_enabled
+    }
+
+    pub(crate) fn host_removal_available(&self) -> bool {
+        self.enabled && self.host_removal_enabled
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(token_file: Option<PathBuf>, api_base: String) -> Self {
-        Self::new(true, token_file, api_base)
+        Self::new(true, true, true, token_file, api_base)
     }
 }
 
@@ -181,6 +260,32 @@ struct WorkflowDispatchInputs<'a> {
     request_id: &'a str,
 }
 
+#[derive(Serialize)]
+struct SystemUpdateDispatchRequest<'a> {
+    #[serde(rename = "ref")]
+    git_ref: &'static str,
+    inputs: SystemUpdateDispatchInputs<'a>,
+}
+
+#[derive(Serialize)]
+struct SystemUpdateDispatchInputs<'a> {
+    source_host: &'a str,
+    request_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct HostRemovalDispatchRequest<'a> {
+    #[serde(rename = "ref")]
+    git_ref: &'static str,
+    inputs: HostRemovalDispatchInputs<'a>,
+}
+
+#[derive(Serialize)]
+struct HostRemovalDispatchInputs<'a> {
+    host: &'a str,
+    request_id: &'a str,
+}
+
 fn enabled_value(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -197,13 +302,13 @@ fn valid_host_name(host: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
-fn request_id(host: &str) -> String {
+fn request_id(action: &str, host: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("pharos-{host}-{now}-{counter}")
+    format!("pharos-{action}-{host}-{now}-{counter}")
 }
 
 #[cfg(test)]
@@ -321,6 +426,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_update_dispatch_is_fixed_and_review_correlated() {
+        let token_path = token_file();
+        let (base, request) = mock_github(204);
+        let client = NixcfgDispatch::for_test(Some(token_path.clone()), base);
+
+        let request_id = client
+            .dispatch_system_update("hsb8")
+            .await
+            .expect("dispatch accepted");
+        let raw = request.recv().expect("request captured");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("request body");
+        assert!(head.starts_with(&format!("POST {SYSTEM_UPDATE_DISPATCH_PATH} HTTP/1.1")));
+        let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+        assert_eq!(payload["ref"], WORKFLOW_REF);
+        assert_eq!(payload["inputs"]["source_host"], "hsb8");
+        assert_eq!(payload["inputs"]["request_id"], request_id);
+        assert!(request_id.starts_with("pharos-system-update-hsb8-"));
+
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn host_removal_dispatch_is_fixed_and_host_scoped() {
+        let token_path = token_file();
+        let (base, request) = mock_github(204);
+        let client = NixcfgDispatch::for_test(Some(token_path.clone()), base);
+
+        let request_id = client
+            .dispatch_host_removal("hsb8")
+            .await
+            .expect("dispatch accepted");
+        let raw = request.recv().expect("request captured");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("request body");
+        assert!(head.starts_with(&format!("POST {HOST_REMOVAL_DISPATCH_PATH} HTTP/1.1")));
+        let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+        assert_eq!(payload["ref"], WORKFLOW_REF);
+        assert_eq!(payload["inputs"]["host"], "hsb8");
+        assert_eq!(payload["inputs"]["request_id"], request_id);
+        assert!(request_id.starts_with("pharos-host-removal-hsb8-"));
+
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
     async fn missing_credential_and_workflow_rejection_fail_safely() {
         let unavailable = NixcfgDispatch::for_test(None, "http://127.0.0.1:9".to_string());
         assert_eq!(
@@ -330,6 +479,14 @@ mod tests {
         assert_eq!(
             unavailable.dispatch("gpc0", &preferences()).await,
             Err(NixcfgDispatchError::CredentialUnavailable)
+        );
+        assert_eq!(
+            unavailable.dispatch_system_update("../gpc0").await,
+            Err(NixcfgDispatchError::InvalidHost)
+        );
+        assert_eq!(
+            unavailable.dispatch_host_removal("../gpc0").await,
+            Err(NixcfgDispatchError::InvalidHost)
         );
 
         let token_path = token_file();
