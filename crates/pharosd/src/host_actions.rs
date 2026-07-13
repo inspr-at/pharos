@@ -457,6 +457,7 @@ impl HostActionJob {
             && self.recovery_started_at.is_none_or(|_| {
                 self.kind == HostActionKind::UpdateRestart && self.confirmed_at.is_some()
             })
+            && self.lease_state_valid()
             && match self.kind {
                 HostActionKind::RemoveHost => self
                     .removal_plan
@@ -466,6 +467,24 @@ impl HostActionJob {
                     self.removal_plan.is_none()
                 }
             }
+    }
+
+    fn lease_state_valid(&self) -> bool {
+        let active_deadline = self
+            .lease_until
+            .is_some_and(|until| until > self.updated_at);
+        match self.state {
+            HostActionState::Reviewing => {
+                self.lease_phase == Some(AgentActionPhase::Review) && active_deadline
+            }
+            HostActionState::Applying => {
+                matches!(
+                    self.lease_phase,
+                    Some(AgentActionPhase::Apply | AgentActionPhase::Resume)
+                ) && active_deadline
+            }
+            _ => self.lease_phase.is_none() && self.lease_until.is_none(),
+        }
     }
 
     pub(crate) fn summary(&self) -> HostActionSummary {
@@ -2252,13 +2271,13 @@ impl HostActionStore {
                     HostActionState::Reviewing
                         if job.lease_until.is_some_and(|until| until <= now) =>
                     {
-                        Some(AgentActionPhase::Review)
+                        job.lease_phase
                     }
                     HostActionState::QueuedApply => Some(AgentActionPhase::Apply),
                     HostActionState::Applying
                         if job.lease_until.is_some_and(|until| until <= now) =>
                     {
-                        Some(AgentActionPhase::Apply)
+                        job.lease_phase
                     }
                     HostActionState::Rebooting => Some(AgentActionPhase::Resume),
                     _ => None,
@@ -2433,6 +2452,10 @@ impl HostActionStore {
             );
             (previous, job.clone())
         };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
         if let Err(error) = self.persist_jobs(&jobs) {
             jobs.insert(id.to_string(), previous);
             return Err(error);
@@ -2907,6 +2930,204 @@ mod tests {
             expected_kernel: Some("7.0.14".to_string()),
             restart_required: true,
         }
+    }
+
+    fn rebooting_update(store: &HostActionStore, started_at: i64) -> HostActionJob {
+        let job = store
+            .create_update_review("hsb8", "markus", started_at)
+            .expect("job created");
+        let review = store
+            .claim("hsb8", started_at + 1)
+            .expect("review claim")
+            .expect("review lease");
+        assert_eq!(review.phase, AgentActionPhase::Review);
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                started_at + 2,
+            )
+            .expect("review stored");
+        store
+            .confirm_update(&job.id, "hsb8", "markus", started_at + 3)
+            .expect("update confirmed");
+        let apply = store
+            .claim("hsb8", started_at + 4)
+            .expect("apply claim")
+            .expect("apply lease");
+        assert_eq!(apply.phase, AgentActionPhase::Apply);
+        let rebooting = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Rebooting,
+                    plan: None,
+                    result: None,
+                },
+                started_at + 5,
+            )
+            .expect("rebooting state stored");
+        assert_eq!(rebooting.state, HostActionState::Rebooting);
+        rebooting
+    }
+
+    #[test]
+    fn duplicate_resume_polls_receive_one_lease() {
+        let store = std::sync::Arc::new(HostActionStore::new(None));
+        let job = rebooting_update(&store, 100);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.claim("hsb8", 106).expect("resume poll")
+            }));
+        }
+        barrier.wait();
+
+        let leases: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().expect("poll joined"))
+            .collect();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].id, job.id);
+        assert_eq!(leases[0].phase, AgentActionPhase::Resume);
+        assert!(store.claim("hsb8", 107).expect("duplicate poll").is_none());
+    }
+
+    #[test]
+    fn expired_resume_lease_remains_resume_instead_of_replaying_apply() {
+        let store = HostActionStore::new(None);
+        let job = rebooting_update(&store, 200);
+        let first = store
+            .claim("hsb8", 206)
+            .expect("resume claim")
+            .expect("resume lease");
+        assert_eq!(first.id, job.id);
+        assert_eq!(first.phase, AgentActionPhase::Resume);
+        assert!(store.claim("hsb8", 207).expect("active lease").is_none());
+
+        let reclaimed = store
+            .claim("hsb8", 206 + LEASE_SECS)
+            .expect("expired lease reclaimed")
+            .expect("replacement lease");
+        assert_eq!(reclaimed.id, job.id);
+        assert_eq!(reclaimed.phase, AgentActionPhase::Resume);
+    }
+
+    #[test]
+    fn resume_timeout_and_lease_phase_survive_store_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-resume-lease-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let job = {
+            let store = HostActionStore::new(Some(path.clone()));
+            let job = rebooting_update(&store, 300);
+            let lease = store
+                .claim("hsb8", 306)
+                .expect("resume claim")
+                .expect("resume lease");
+            assert_eq!(lease.phase, AgentActionPhase::Resume);
+            job
+        };
+
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        assert!(reloaded
+            .claim("hsb8", 307)
+            .expect("pre-expiry poll")
+            .is_none());
+        let reclaimed = reloaded
+            .claim("hsb8", 306 + LEASE_SECS)
+            .expect("post-reload claim")
+            .expect("expired resume lease");
+        assert_eq!(reclaimed.id, job.id);
+        assert_eq!(reclaimed.phase, AgentActionPhase::Resume);
+
+        let failed = reloaded
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Resume,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: false,
+                        kernel_verified: false,
+                        rollback_available: false,
+                        failure_gate: Some(HostActionFailureGate::BootChange),
+                        recovery_mode: None,
+                    }),
+                },
+                306 + LEASE_SECS + 1,
+            )
+            .expect("timeout persisted");
+        assert_eq!(failed.state, HostActionState::Failed);
+        assert_eq!(
+            failed.latest_failure_gate(),
+            Some(HostActionFailureGate::BootChange)
+        );
+        assert!(failed.recoverable());
+        assert_eq!(
+            failed
+                .summary()
+                .workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "host-return")
+                .expect("host-return step")
+                .state,
+            WorkflowStepState::ActionRequired
+        );
+
+        let terminal = HostActionStore::new(Some(path.clone()));
+        let persisted = terminal.get(&job.id).expect("failed action reloaded");
+        assert_eq!(persisted.state, HostActionState::Failed);
+        assert!(persisted
+            .events
+            .iter()
+            .any(|event| event.kind == HostActionEventKind::ApplyRebooting));
+        assert!(persisted.events.iter().any(|event| {
+            event.kind == HostActionEventKind::ApplyFailed
+                && event.failure_gate == Some(HostActionFailureGate::BootChange)
+        }));
+        assert!(terminal
+            .claim("hsb8", 306 + LEASE_SECS + 2)
+            .expect("terminal poll")
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_active_states_require_a_matching_lease_phase_and_deadline() {
+        let store = HostActionStore::new(None);
+        let mut job = rebooting_update(&store, 400);
+        job.state = HostActionState::Applying;
+        job.lease_phase = Some(AgentActionPhase::Resume);
+        job.lease_until = None;
+        assert!(!job.validate());
+
+        job.state = HostActionState::Rebooting;
+        job.lease_until = Some(job.updated_at + LEASE_SECS);
+        assert!(!job.validate());
     }
 
     #[test]
