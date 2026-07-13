@@ -130,6 +130,78 @@ pub(crate) enum HostActionEventKind {
     RemovalCompleted,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostActionFailureGate {
+    Input,
+    Preflight,
+    Approval,
+    Permit,
+    ManagedRun,
+    ManagedRunContract,
+    ReviewBinding,
+    AllHostEvaluation,
+    TargetBuild,
+    BackupReadiness,
+    FreshBackup,
+    Switch,
+    RebootSchedule,
+    BootChange,
+    SystemIdentity,
+    RevisionIdentity,
+    Kernel,
+    Rollback,
+    Storage,
+    FailedUnits,
+    RequiredServices,
+    Heartbeat,
+}
+
+impl HostActionFailureGate {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Input => "request validation",
+            Self::Preflight => "target preflight",
+            Self::Approval => "guarded approval",
+            Self::Permit => "one-time permit",
+            Self::ManagedRun => "target-local execution",
+            Self::ManagedRunContract => "target result contract",
+            Self::ReviewBinding => "review binding",
+            Self::AllHostEvaluation => "all-host validation",
+            Self::TargetBuild => "target build",
+            Self::BackupReadiness => "backup readiness",
+            Self::FreshBackup => "fresh backup",
+            Self::Switch => "reviewed system switch",
+            Self::RebootSchedule => "restart scheduling",
+            Self::BootChange => "host restart evidence",
+            Self::SystemIdentity => "running system verification",
+            Self::RevisionIdentity => "deployed revision verification",
+            Self::Kernel => "kernel verification",
+            Self::Rollback => "rollback posture",
+            Self::Storage => "storage health",
+            Self::FailedUnits => "system service health",
+            Self::RequiredServices => "required services",
+            Self::Heartbeat => "fresh heartbeat",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostActionRecoveryMode {
+    ExactReviewedSystem,
+    TrustedDescendant,
+}
+
+impl HostActionRecoveryMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExactReviewedSystem => "exact reviewed system verified",
+            Self::TrustedDescendant => "newer trusted deployment verified",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HostActionEvent {
@@ -139,6 +211,10 @@ pub(crate) struct HostActionEvent {
     pub(crate) kind: HostActionEventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_gate: Option<HostActionFailureGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_mode: Option<HostActionRecoveryMode>,
 }
 
 impl HostActionEvent {
@@ -146,6 +222,17 @@ impl HostActionEvent {
         self.at >= job.created_at
             && self.at <= job.updated_at
             && self.actor.as_deref().is_none_or(safe_actor)
+            && self.failure_gate.is_none_or(|_| {
+                matches!(
+                    self.kind,
+                    HostActionEventKind::ReviewFailed
+                        | HostActionEventKind::ApplyFailed
+                        | HostActionEventKind::RecoveryFailed
+                )
+            })
+            && self
+                .recovery_mode
+                .is_none_or(|_| self.kind == HostActionEventKind::RecoveryPassed)
     }
 }
 
@@ -301,6 +388,10 @@ pub(crate) struct HostActionResult {
     pub(crate) reboot_observed: bool,
     pub(crate) kernel_verified: bool,
     pub(crate) rollback_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_gate: Option<HostActionFailureGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_mode: Option<HostActionRecoveryMode>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -400,13 +491,49 @@ impl HostActionJob {
         kind: HostActionEventKind,
         actor: Option<&str>,
     ) {
+        self.record_event_with_evidence(now, source, kind, actor, None, None);
+    }
+
+    fn record_event_with_evidence(
+        &mut self,
+        now: i64,
+        source: HostActionEventSource,
+        kind: HostActionEventKind,
+        actor: Option<&str>,
+        failure_gate: Option<HostActionFailureGate>,
+        recovery_mode: Option<HostActionRecoveryMode>,
+    ) {
         self.events.push(HostActionEvent {
             at: now,
             state: self.state,
             source,
             kind,
             actor: actor.map(str::to_string),
+            failure_gate,
+            recovery_mode,
         });
+    }
+
+    fn latest_failure_gate(&self) -> Option<HostActionFailureGate> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    HostActionEventKind::ReviewFailed
+                        | HostActionEventKind::ApplyFailed
+                        | HostActionEventKind::RecoveryFailed
+                )
+            })
+            .and_then(|event| event.failure_gate)
+    }
+
+    fn recovery_mode(&self) -> Option<HostActionRecoveryMode> {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| event.recovery_mode)
     }
 
     pub(crate) fn recoverable(&self) -> bool {
@@ -442,7 +569,7 @@ impl HostActionJob {
                 at: event.at,
                 state: event.state,
                 source: event.source,
-                label: event_label(event.kind).to_string(),
+                label: event_label(event),
                 actor: event.actor.clone(),
             })
             .collect();
@@ -573,8 +700,14 @@ impl HostActionJob {
                 if self.recovery_started_at.is_some() {
                     evidence.push(workflow_evidence(
                         "Recovery mode",
-                        "verify existing result; no second switch or restart",
+                        self.recovery_mode().map_or(
+                            "verify existing result; no second switch or restart",
+                            HostActionRecoveryMode::label,
+                        ),
                     ));
+                }
+                if let Some(gate) = self.latest_failure_gate() {
+                    evidence.push(workflow_evidence("Stopped at", gate.label()));
                 }
             }
             HostWorkflowKind::RemoveHost => {
@@ -800,6 +933,7 @@ impl HostActionJob {
         let recovered = recovery && self.state == HostActionState::Succeeded;
         let preconfirm_failed = self.state == HostActionState::Failed && !confirmed;
         let recovery_failed = recovery && self.state == HostActionState::Failed;
+        let failure_gate = self.latest_failure_gate();
         let primary_action = match self.state {
             HostActionState::AwaitingConfirmation => Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Confirm,
@@ -892,6 +1026,19 @@ impl HostActionJob {
                 "warning",
             ),
         };
+        let guidance = if recovery_failed {
+            failure_gate.map_or_else(
+                || guidance.to_string(),
+                |gate| {
+                    format!(
+                        "Recovery stopped at {}. The recorded failure remains available for another guarded check.",
+                        gate.label()
+                    )
+                },
+            )
+        } else {
+            guidance.to_string()
+        };
 
         let review_state = match self.state {
             HostActionState::QueuedReview => WorkflowStepState::Waiting,
@@ -943,16 +1090,23 @@ impl HostActionJob {
                 _ => WorkflowStepState::Queued,
             }
         };
-        let verify_state = if recovered {
-            WorkflowStepState::Recovered
+        let (host_return_state, runtime_state, heartbeat_state) = if recovered {
+            (
+                WorkflowStepState::Recovered,
+                WorkflowStepState::Recovered,
+                WorkflowStepState::Recovered,
+            )
+        } else if recovery_failed {
+            recovery_failure_states(failure_gate)
         } else {
-            match self.state {
+            let state = match self.state {
                 HostActionState::Succeeded => WorkflowStepState::Passed,
                 HostActionState::Rebooting if !recovery => WorkflowStepState::Waiting,
                 HostActionState::Failed if confirmed => WorkflowStepState::ActionRequired,
                 HostActionState::Failed => WorkflowStepState::Skipped,
                 _ => WorkflowStepState::Queued,
-            }
+            };
+            (state, state, state)
         };
         let recovery_state = if !recovery {
             None
@@ -1019,22 +1173,34 @@ impl HostActionJob {
                 "host-return",
                 "VERIFY",
                 "Wait for the host",
-                verify_state,
-                "A fresh report must arrive after the live gate.",
+                host_return_state,
+                verification_step_detail(
+                    host_return_state,
+                    failure_gate,
+                    "A fresh report must arrive after the live gate.",
+                ),
             ),
             workflow_step(
                 "runtime",
                 "VERIFY",
                 "Check kernel, services, and rollback posture",
-                verify_state,
-                "Verification uses current target-local and heartbeat evidence.",
+                runtime_state,
+                verification_step_detail(
+                    runtime_state,
+                    failure_gate,
+                    "Verification uses current target-local and heartbeat evidence.",
+                ),
             ),
             workflow_step(
                 "heartbeat",
                 "VERIFY",
                 "Receive a fresh heartbeat",
-                verify_state,
-                "The reported runtime must match the expected system state.",
+                heartbeat_state,
+                verification_step_detail(
+                    heartbeat_state,
+                    failure_gate,
+                    "The reported runtime must match the expected system state.",
+                ),
             ),
         ];
         if let Some(state) = recovery_state {
@@ -1063,7 +1229,7 @@ impl HostActionJob {
         ));
         (
             format!("Update {}", self.host),
-            guidance.to_string(),
+            guidance,
             status_label.to_string(),
             status_level,
             primary_action,
@@ -1188,6 +1354,57 @@ fn workflow_step(
     }
 }
 
+fn recovery_failure_states(
+    gate: Option<HostActionFailureGate>,
+) -> (WorkflowStepState, WorkflowStepState, WorkflowStepState) {
+    match gate {
+        Some(HostActionFailureGate::BootChange) => (
+            WorkflowStepState::Failed,
+            WorkflowStepState::ActionRequired,
+            WorkflowStepState::ActionRequired,
+        ),
+        Some(
+            HostActionFailureGate::SystemIdentity
+            | HostActionFailureGate::RevisionIdentity
+            | HostActionFailureGate::Kernel
+            | HostActionFailureGate::Rollback
+            | HostActionFailureGate::Storage
+            | HostActionFailureGate::FailedUnits
+            | HostActionFailureGate::RequiredServices,
+        ) => (
+            WorkflowStepState::Passed,
+            WorkflowStepState::Failed,
+            WorkflowStepState::ActionRequired,
+        ),
+        Some(HostActionFailureGate::Heartbeat) => (
+            WorkflowStepState::Passed,
+            WorkflowStepState::Passed,
+            WorkflowStepState::Failed,
+        ),
+        _ => (
+            WorkflowStepState::ActionRequired,
+            WorkflowStepState::ActionRequired,
+            WorkflowStepState::ActionRequired,
+        ),
+    }
+}
+
+fn verification_step_detail(
+    state: WorkflowStepState,
+    gate: Option<HostActionFailureGate>,
+    default: &'static str,
+) -> String {
+    match (state, gate) {
+        (WorkflowStepState::Failed, Some(gate)) => {
+            format!("Recovery stopped at {}.", gate.label())
+        }
+        (WorkflowStepState::ActionRequired, Some(gate)) => {
+            format!("Not completed after {} stopped.", gate.label())
+        }
+        _ => default.to_string(),
+    }
+}
+
 fn workflow_evidence(label: impl Into<String>, value: impl Into<String>) -> HostWorkflowEvidence {
     HostWorkflowEvidence {
         label: label.into(),
@@ -1228,8 +1445,8 @@ fn workflow_current_step(steps: &[HostWorkflowStep]) -> Option<String> {
     })
 }
 
-fn event_label(kind: HostActionEventKind) -> &'static str {
-    match kind {
+fn event_label(event: &HostActionEvent) -> String {
+    let mut label = match event.kind {
         HostActionEventKind::Requested => "Workflow requested",
         HostActionEventKind::StateRecovered => "Existing workflow state loaded",
         HostActionEventKind::DispatchAccepted => "Guarded dispatch accepted",
@@ -1254,6 +1471,16 @@ fn event_label(kind: HostActionEventKind) -> &'static str {
         HostActionEventKind::RemovalFailed => "Host removal stopped",
         HostActionEventKind::RemovalCompleted => "Host retirement completed",
     }
+    .to_string();
+    if let Some(gate) = event.failure_gate {
+        label.push_str(" at ");
+        label.push_str(gate.label());
+    }
+    if let Some(mode) = event.recovery_mode {
+        label.push_str(": ");
+        label.push_str(mode.label());
+    }
+    label
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1375,6 +1602,8 @@ impl HostActionStore {
                             source: HostActionEventSource::Pharos,
                             kind,
                             actor: None,
+                            failure_gate: None,
+                            recovery_mode: None,
                         });
                     }
                 }
@@ -2102,9 +2331,20 @@ impl HostActionStore {
             let previous = job.clone();
             let recovery =
                 job.recovery_started_at.is_some() && request.phase == AgentActionPhase::Resume;
+            let failure_gate = request
+                .result
+                .as_ref()
+                .and_then(|result| result.failure_gate);
+            let recovery_mode = request
+                .result
+                .as_ref()
+                .and_then(|result| result.recovery_mode);
             let event_kind;
             match (request.phase, request.outcome) {
                 (AgentActionPhase::Review, AgentActionOutcome::Succeeded) => {
+                    if request.result.is_some() {
+                        return Err(HostActionStoreError::InvalidJob);
+                    }
                     let plan = request.plan.ok_or(HostActionStoreError::InvalidJob)?;
                     if !plan.validate() {
                         return Err(HostActionStoreError::InvalidJob);
@@ -2114,6 +2354,9 @@ impl HostActionStore {
                     event_kind = HostActionEventKind::ReviewPassed;
                 }
                 (AgentActionPhase::Review, AgentActionOutcome::Failed) => {
+                    if recovery_mode.is_some() {
+                        return Err(HostActionStoreError::InvalidJob);
+                    }
                     job.state = HostActionState::Failed;
                     event_kind = HostActionEventKind::ReviewFailed;
                 }
@@ -2121,6 +2364,9 @@ impl HostActionStore {
                     AgentActionPhase::Apply | AgentActionPhase::Resume,
                     AgentActionOutcome::Rebooting,
                 ) => {
+                    if request.result.is_some() {
+                        return Err(HostActionStoreError::InvalidJob);
+                    }
                     job.state = HostActionState::Rebooting;
                     event_kind = if recovery {
                         HostActionEventKind::RecoveryRebooting
@@ -2138,6 +2384,8 @@ impl HostActionStore {
                         && result.reboot_observed
                         && result.kernel_verified
                         && result.rollback_available)
+                        || result.failure_gate.is_some()
+                        || (!recovery && result.recovery_mode.is_some())
                     {
                         return Err(HostActionStoreError::InvalidJob);
                     }
@@ -2150,6 +2398,9 @@ impl HostActionStore {
                     };
                 }
                 (_, AgentActionOutcome::Failed) => {
+                    if recovery_mode.is_some() {
+                        return Err(HostActionStoreError::InvalidJob);
+                    }
                     job.state = HostActionState::Failed;
                     event_kind = if recovery {
                         HostActionEventKind::RecoveryFailed
@@ -2164,7 +2415,22 @@ impl HostActionStore {
             job.updated_at = now;
             job.lease_phase = None;
             job.lease_until = None;
-            job.record_event(now, HostActionEventSource::HostAgent, event_kind, None);
+            let event_failed = matches!(
+                event_kind,
+                HostActionEventKind::ReviewFailed
+                    | HostActionEventKind::ApplyFailed
+                    | HostActionEventKind::RecoveryFailed
+            );
+            job.record_event_with_evidence(
+                now,
+                HostActionEventSource::HostAgent,
+                event_kind,
+                None,
+                event_failed.then_some(failure_gate).flatten(),
+                (event_kind == HostActionEventKind::RecoveryPassed)
+                    .then_some(recovery_mode)
+                    .flatten(),
+            );
             (previous, job.clone())
         };
         if let Err(error) = self.persist_jobs(&jobs) {
@@ -2754,6 +3020,8 @@ mod tests {
                         reboot_observed: true,
                         kernel_verified: true,
                         rollback_available: true,
+                        failure_gate: None,
+                        recovery_mode: None,
                     }),
                 },
                 109,
@@ -2883,6 +3151,8 @@ mod tests {
                         reboot_observed: true,
                         kernel_verified: true,
                         rollback_available: true,
+                        failure_gate: None,
+                        recovery_mode: Some(HostActionRecoveryMode::TrustedDescendant),
                     }),
                 },
                 308,
@@ -2895,15 +3165,149 @@ mod tests {
             .events
             .iter()
             .any(|event| event.label == "Live workflow stopped"));
-        assert!(workflow
-            .events
-            .iter()
-            .any(|event| event.label == "Recovery verification passed"));
+        assert!(workflow.events.iter().any(|event| event.label
+            == "Recovery verification passed: newer trusted deployment verified"));
+        assert!(workflow.evidence.iter().any(|fact| {
+            fact.label == "Recovery mode" && fact.value == "newer trusted deployment verified"
+        }));
         assert!(workflow
             .steps
             .iter()
             .any(|step| { step.key == "recovery" && step.state == WorkflowStepState::Recovered }));
         assert!(store.create_update_review("csb0", "markus", 309).is_ok());
+    }
+
+    #[test]
+    fn failed_recovery_persists_the_exact_safe_gate() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "markus", 320)
+            .expect("job created");
+        store.claim("hsb8", 321).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                322,
+            )
+            .expect("review stored");
+        store
+            .confirm_update(&job.id, "hsb8", "markus", 323)
+            .expect("confirmed");
+        store.claim("hsb8", 324).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                325,
+            )
+            .expect("live failure stored");
+        store
+            .queue_recovery(&job.id, "hsb8", "markus", 326)
+            .expect("recovery queued");
+        store.claim("hsb8", 327).expect("claim").expect("lease");
+
+        let failed = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Resume,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: true,
+                        kernel_verified: false,
+                        rollback_available: true,
+                        failure_gate: Some(HostActionFailureGate::RevisionIdentity),
+                        recovery_mode: None,
+                    }),
+                },
+                328,
+            )
+            .expect("recovery failure stored");
+
+        assert!(failed.recoverable());
+        let workflow = failed.summary().workflow;
+        assert!(workflow.guidance.contains("deployed revision verification"));
+        assert!(workflow.events.iter().any(|event| {
+            event.label == "Recovery verification stopped at deployed revision verification"
+        }));
+        assert!(workflow.evidence.iter().any(|fact| {
+            fact.label == "Stopped at" && fact.value == "deployed revision verification"
+        }));
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "host-return")
+                .expect("host return step")
+                .state,
+            WorkflowStepState::Passed
+        );
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "runtime")
+                .expect("runtime step")
+                .state,
+            WorkflowStepState::Failed
+        );
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "heartbeat")
+                .expect("heartbeat step")
+                .state,
+            WorkflowStepState::ActionRequired
+        );
+    }
+
+    #[test]
+    fn untyped_recovery_failure_does_not_inherit_an_older_apply_gate() {
+        let store = HostActionStore::new(None);
+        let mut job = store
+            .create_update_review("hsb8", "markus", 340)
+            .expect("job created");
+        job.events.push(HostActionEvent {
+            at: 341,
+            state: HostActionState::Failed,
+            source: HostActionEventSource::HostAgent,
+            kind: HostActionEventKind::ApplyFailed,
+            actor: None,
+            failure_gate: Some(HostActionFailureGate::Switch),
+            recovery_mode: None,
+        });
+        job.events.push(HostActionEvent {
+            at: 342,
+            state: HostActionState::Failed,
+            source: HostActionEventSource::HostAgent,
+            kind: HostActionEventKind::RecoveryFailed,
+            actor: None,
+            failure_gate: None,
+            recovery_mode: None,
+        });
+
+        assert_eq!(job.latest_failure_gate(), None);
     }
 
     #[test]

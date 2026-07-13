@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.31 - 2026-07-13
+
+- Persist a typed, value-free failure gate for guarded host actions so recovery shows the exact verification stage that stopped without exposing command output, machine paths, or opaque identifiers.
+- Distinguish recovery of the exact reviewed system from verification of a newer trusted deployment while preserving the original failure and preventing a second switch or restart.
+- Show a lightweight activity indicator only on the checklist step that is currently running, expose its busy state to assistive technology, and honor reduced-motion preferences.
+
 ## 0.1.30 - 2026-07-13
 
 - Add one persisted, plain-language execution checklist for host settings, fleet update proposals, guarded update/restart, host removal, and recovery, with clear waiting, confirmation, action-required, completed, stopped, and recovered states.
