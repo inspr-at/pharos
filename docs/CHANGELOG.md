@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.34 - 2026-07-13
+
+- Keep the running workflow step visibly active with a low-frequency stepped indicator that avoids continuous full-dialog compositing and honors reduced-motion preferences.
+- Use one replaceable timer and one abortable request for Fleet and Host Settings workflow polling, with bounded retry delays and cleanup on close or navigation.
+- Pause workflow polling and animation while hidden or offline, then refresh once immediately when the page becomes visible, focused, or connected again.
+
 ## 0.1.33 - 2026-07-13
 
 - Add safe run, host, timing, duration, and execution-location metadata to the shared persisted checklist used by settings, update review, apply/restart, removal, and recovery workflows.

@@ -592,12 +592,21 @@ document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{
   window.location.assign('/agora?host='+encodeURIComponent(event.target.value));
 }});
 const root=document.querySelector('[data-color-root]');
-const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:''}};
-function stopSettingsWorkflowPoll(){{
+const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:'',failures:0}};
+function setSettingsWorkflowSuspended(suspended){{
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  if(overlay)overlay.dataset.suspended=suspended?'true':'false';
+}}
+function pauseSettingsWorkflowPoll(){{
   if(settingsWorkflow.timer!=null)clearTimeout(settingsWorkflow.timer);
   settingsWorkflow.timer=null;
   settingsWorkflow.controller?.abort();
   settingsWorkflow.controller=null;
+  setSettingsWorkflowSuspended(true);
+}}
+function stopSettingsWorkflowPoll(){{
+  pauseSettingsWorkflowPoll();
+  settingsWorkflow.failures=0;
 }}
 function closeSettingsWorkflow(){{
   stopSettingsWorkflowPoll();
@@ -607,11 +616,17 @@ function closeSettingsWorkflow(){{
   if(overlay)overlay.hidden=true;
   document.body.removeAttribute('data-host-action-dialog-open');
 }}
-function scheduleSettingsWorkflowPoll(id){{
-  stopSettingsWorkflowPoll();
+function scheduleSettingsWorkflowPoll(id,delay=10000){{
+  if(settingsWorkflow.timer!=null)clearTimeout(settingsWorkflow.timer);
+  settingsWorkflow.timer=null;
   settingsWorkflow.id=id;
-  if(document.hidden||!navigator.onLine)return;
-  settingsWorkflow.timer=setTimeout(()=>pollSettingsWorkflow(id),10000);
+  const suspended=document.hidden||!navigator.onLine;
+  setSettingsWorkflowSuspended(suspended);
+  if(suspended)return;
+  settingsWorkflow.timer=setTimeout(()=>{{
+    settingsWorkflow.timer=null;
+    pollSettingsWorkflow(id);
+  }},delay);
 }}
 function renderSettingsWorkflow(data){{
   const job=data?.job;
@@ -647,22 +662,30 @@ function renderSettingsWorkflow(data){{
   document.body.dataset.hostActionDialogOpen='true';
   settingsWorkflow.id=job.id;
   settingsWorkflow.lastRevision=[job.id,job.state,job.updated_at].join(':');
-  if(!['succeeded','failed'].includes(job.state))scheduleSettingsWorkflowPoll(job.id);
+  if(!['succeeded','failed','cancelled'].includes(job.state))scheduleSettingsWorkflowPoll(job.id);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
 }}
 async function pollSettingsWorkflow(id){{
-  if(document.hidden||!navigator.onLine||settingsWorkflow.id!==id)return;
+  settingsWorkflow.timer=null;
+  if(settingsWorkflow.id!==id)return;
+  if(document.hidden||!navigator.onLine){{setSettingsWorkflowSuspended(true);return}}
+  setSettingsWorkflowSuspended(false);
+  settingsWorkflow.controller?.abort();
   const controller=new AbortController();
   settingsWorkflow.controller=controller;
   try{{
     const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{{credentials:'same-origin',cache:'no-store',signal:controller.signal}});
     const data=await response.json().catch(()=>({{}}));
     if(!response.ok)throw new Error(data.error||'Could not refresh the settings workflow.');
+    settingsWorkflow.failures=0;
     const revision=[data.job?.id,data.job?.state,data.job?.updated_at].join(':');
     if(revision!==settingsWorkflow.lastRevision)renderSettingsWorkflow(data);
     else scheduleSettingsWorkflowPoll(id);
   }}catch(error){{
-    if(error?.name!=='AbortError')scheduleSettingsWorkflowPoll(id);
+    if(error?.name!=='AbortError'){{
+      settingsWorkflow.failures=Math.min(settingsWorkflow.failures+1,3);
+      scheduleSettingsWorkflowPoll(id,Math.min(60000,10000*(2**settingsWorkflow.failures)));
+    }}
   }}finally{{
     if(settingsWorkflow.controller===controller)settingsWorkflow.controller=null;
   }}
@@ -671,8 +694,14 @@ document.querySelector('[data-host-action-overlay]')?.addEventListener('click',e
   if(event.target.closest('[data-host-action-close]')){{event.preventDefault();closeSettingsWorkflow()}}
 }});
 document.addEventListener('keydown',event=>{{if(event.key==='Escape'&&settingsWorkflow.id){{event.preventDefault();closeSettingsWorkflow()}}}});
-document.addEventListener('visibilitychange',()=>{{if(!document.hidden&&settingsWorkflow.id)pollSettingsWorkflow(settingsWorkflow.id)}});
-window.addEventListener('online',()=>{{if(settingsWorkflow.id)pollSettingsWorkflow(settingsWorkflow.id)}});
+document.addEventListener('visibilitychange',()=>{{
+  if(document.hidden){{pauseSettingsWorkflowPoll();return}}
+  if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0);
+}});
+window.addEventListener('focus',()=>{{if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)}});
+window.addEventListener('online',()=>{{if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)}});
+window.addEventListener('offline',()=>{{pauseSettingsWorkflowPoll()}});
+window.addEventListener('pagehide',stopSettingsWorkflowPoll);
 if(root){{
   const color=root.querySelector('[data-color]');
   const output=root.querySelector('[data-review-output]');
@@ -1652,6 +1681,32 @@ mod tests {
         assert!(!html.contains("Services</button>"));
         assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
+    }
+
+    #[test]
+    fn settings_workflow_poll_pauses_and_resumes_without_multiplying() {
+        let html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime_host("hsb8")],
+            Some("hsb8"),
+            "markus",
+            true,
+        );
+
+        assert!(html.contains("function pauseSettingsWorkflowPoll()"));
+        assert!(html.contains("function stopSettingsWorkflowPoll()"));
+        assert!(html.contains("function scheduleSettingsWorkflowPoll(id,delay=10000)"));
+        assert!(html.contains("settingsWorkflow.timer=null;\n    pollSettingsWorkflow(id);"));
+        assert!(html.contains("if(document.hidden){pauseSettingsWorkflowPoll();return}"));
+        assert!(html.contains(
+            "window.addEventListener('focus',()=>{if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)})"
+        ));
+        assert!(
+            html.contains("window.addEventListener('offline',()=>{pauseSettingsWorkflowPoll()})")
+        );
+        assert!(html.contains("window.addEventListener('pagehide',stopSettingsWorkflowPoll)"));
+        assert!(!html.contains("setInterval("));
     }
 
     #[test]

@@ -3387,6 +3387,8 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 body[data-host-action-dialog-open="true"]{overflow:hidden}.host-action-overlay{position:fixed;inset:0;z-index:6100;display:grid;place-items:center;padding:24px;background:rgba(20,48,75,.28);-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px)}.host-action-overlay[hidden]{display:none}.host-action-backdrop{position:absolute;inset:0}.host-action-dialog{position:relative;width:min(470px,calc(100vw - 28px));max-height:calc(100vh - 40px);display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 26px 78px rgba(32,61,82,.28);overflow:hidden}.host-action-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 21px 15px;border-bottom:1px solid rgba(214,226,234,.72)}.host-action-heading{display:flex;align-items:center;gap:10px;min-width:0}.host-action-heading>[data-action-icon]{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;color:var(--accent)}.host-action-heading>[data-action-icon][hidden]{display:none}.host-action-heading>[data-action-icon] .ico{width:20px;height:20px}.host-action-dialog[data-action="remove"] .host-action-heading>[data-action-icon]{color:var(--down)}.host-action-heading h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;line-height:1.2;color:#12304b}.host-action-dialog-close{appearance:none;display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);cursor:pointer}.host-action-dialog-close:hover,.host-action-dialog-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}.host-action-dialog-close .ico{width:15px;height:15px}.host-action-dialog-body{padding:17px 21px 19px;overflow:auto}.host-action-dialog-body>p{margin:0 0 14px;color:#435e74;font-size:13px;line-height:1.5}.host-action-info{display:grid;grid-template-columns:20px minmax(0,1fr);gap:9px;padding:11px 12px;border:1px solid rgba(188,211,222,.82);border-radius:7px;background:rgba(247,251,252,.82)}.host-action-info[hidden]{display:none}.host-action-info>.ico{grid-row:1/3;width:17px;height:17px;margin-top:1px;color:#4c6780}.host-action-info strong{font-size:12px}.host-action-info span{color:var(--muted);font-size:11px;line-height:1.35}.host-action-facts{display:grid;gap:0;margin:14px 0 0;border-top:1px solid rgba(214,226,234,.72)}.host-action-fact{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;min-height:38px;align-items:center;border-bottom:1px solid rgba(214,226,234,.58);font-size:12px}.host-action-fact[hidden]{display:none}.host-action-fact span{color:var(--muted)}.host-action-fact strong{max-width:260px;overflow-wrap:anywhere;color:var(--ink);font-weight:720;text-align:right}.host-action-technical{margin:14px 0 0;padding:12px;border:1px solid rgba(188,211,222,.72);border-radius:7px;background:#f8fbfc;color:#294761;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.host-action-technical[hidden]{display:none}.host-remove-confirm{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-confirm[hidden]{display:none}.host-remove-confirm input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-confirm input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}.host-attended-confirm{display:flex;align-items:flex-start;gap:9px;margin-top:12px;padding:10px 11px;border:1px solid rgba(214,155,49,.24);border-radius:7px;background:rgba(255,248,234,.64);color:#6e5527;font-size:11px;line-height:1.4;cursor:pointer}.host-attended-confirm[hidden]{display:none}.host-attended-confirm input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:#9a5b00}.host-action-dialog-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 21px;border-top:1px solid rgba(214,226,234,.72);background:rgba(250,252,253,.78)}.host-action-safe-note{display:flex;align-items:center;gap:7px;min-width:0;color:var(--muted);font-size:10px}.host-action-safe-note .ico{width:14px;height:14px;flex:0 0 auto;color:#4c6780}.host-action-dialog-buttons{display:flex;align-items:center;gap:8px;margin-left:auto}.host-action-dialog-button{appearance:none;min-height:36px;padding:0 13px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:#294761;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.host-action-dialog-button[hidden]{display:none}.host-action-dialog-button:hover,.host-action-dialog-button:focus-visible{background:rgba(223,241,249,.66);outline:0}.host-action-dialog-button.primary{border-color:#12304b;background:#12304b;color:#fff}.host-action-dialog-button.danger{border-color:var(--down);background:var(--down);color:#fff}.host-action-dialog-button:disabled{cursor:not-allowed;border-color:rgba(137,151,163,.18);background:rgba(137,151,163,.12);color:rgba(100,119,138,.55)}.host-action-status{margin:12px 0 0;color:var(--muted);font-size:11px}.host-action-status:empty{display:none}
 .host-action-dialog[data-workflow="true"]{width:min(760px,calc(100vw - 28px))}.host-workflow[hidden]{display:none}.host-workflow{margin-top:15px}.host-workflow-summary{border-top:1px solid rgba(214,226,234,.72)}.host-workflow-group{display:grid;grid-template-columns:88px minmax(0,1fr);border-bottom:1px solid rgba(214,226,234,.72)}.host-workflow-group h3{margin:0;padding:13px 10px 0 0;color:#48657d;font-size:10px;line-height:1.3;font-weight:760;letter-spacing:0}.host-workflow-steps{min-width:0}.host-workflow-step{display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:start;gap:9px;min-height:45px;padding:9px 0;border-top:1px solid rgba(214,226,234,.50)}.host-workflow-step:first-child{border-top:0}.host-workflow-step[data-current="true"]{margin:0 -9px;padding-left:9px;padding-right:9px;background:rgba(255,248,234,.62)}.host-workflow-marker{position:relative;display:grid;place-items:center;width:17px;height:17px;margin-top:1px;border:1.5px solid #91a3b1;border-radius:50%;color:#fff}.host-workflow-marker:after{font-size:10px;font-weight:800;line-height:1}.host-workflow-step[data-step-state="passed"] .host-workflow-marker,.host-workflow-step[data-step-state="recovered"] .host-workflow-marker{border-color:var(--live);background:var(--live)}.host-workflow-step[data-step-state="passed"] .host-workflow-marker:after,.host-workflow-step[data-step-state="recovered"] .host-workflow-marker:after{content:"\2713"}.host-workflow-step[data-step-state="recovered"] .host-workflow-marker{box-shadow:0 0 0 4px rgba(37,132,95,.10)}.host-workflow-step[data-step-state="running"] .host-workflow-marker{border-color:rgba(50,167,164,.24);background:#fff;box-shadow:0 0 0 4px rgba(50,167,164,.10)}.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{content:"";position:absolute;inset:-3px;border:2px solid rgba(50,167,164,.18);border-top-color:var(--sea);border-right-color:var(--sea);border-radius:50%;animation:host-workflow-spin .8s linear infinite;will-change:transform}.host-workflow-step[data-step-state="running"] .host-workflow-marker:after{content:"";width:5px;height:5px;border-radius:50%;background:var(--sea)}.host-workflow-step[data-step-state="waiting"] .host-workflow-marker,.host-workflow-step[data-step-state="queued"] .host-workflow-marker{border-color:#91a3b1;background:#fff}.host-workflow-step[data-step-state="waiting"] .host-workflow-marker:after{content:"";width:5px;height:5px;border-radius:50%;background:#91a3b1}.host-workflow-step[data-step-state="confirmation_required"] .host-workflow-marker,.host-workflow-step[data-step-state="action_required"] .host-workflow-marker{border-color:var(--stale);background:#fff;box-shadow:0 0 0 4px rgba(214,155,49,.10)}.host-workflow-step[data-step-state="failed"] .host-workflow-marker{border-color:var(--down);background:var(--down)}.host-workflow-step[data-step-state="failed"] .host-workflow-marker:after{content:"!"}.host-workflow-step[data-step-state="skipped"] .host-workflow-marker,.host-workflow-step[data-step-state="cancelled"] .host-workflow-marker{border-color:#c7d2d9;background:#edf2f4}.host-workflow-step-copy{min-width:0}.host-workflow-step-copy strong,.host-workflow-step-copy span{display:block}.host-workflow-step-copy strong{color:var(--ink);font-size:12px;line-height:1.35}.host-workflow-step-copy span{margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35}.host-workflow-step-state{padding-top:1px;color:var(--muted);font-size:10px;line-height:1.3;text-align:right;white-space:nowrap}.host-workflow-step[data-step-state="passed"] .host-workflow-step-state,.host-workflow-step[data-step-state="recovered"] .host-workflow-step-state{color:var(--live)}.host-workflow-step[data-step-state="confirmation_required"] .host-workflow-step-state,.host-workflow-step[data-step-state="action_required"] .host-workflow-step-state{color:#9a5b00;font-weight:720}.host-workflow-step[data-step-state="failed"] .host-workflow-step-state{color:var(--down);font-weight:720}.host-workflow-advanced{border-bottom:1px solid rgba(214,226,234,.72)}.host-workflow-advanced summary{padding:11px 0;color:#294761;font-size:11px;font-weight:720;cursor:pointer}.host-workflow-advanced>div{padding:0 0 12px}.host-workflow-advanced p{margin:0 0 8px;color:var(--muted);font-size:10px;line-height:1.4}.host-workflow-advanced ol{display:grid;gap:7px;margin:0;padding:0;list-style:none}.host-workflow-advanced li{display:grid;grid-template-columns:64px minmax(0,1fr);gap:9px;color:#294761;font-size:10px}.host-workflow-advanced time{color:var(--muted);font-variant-numeric:tabular-nums}.host-workflow-advanced li span,.host-workflow-advanced li strong,.host-workflow-advanced li small{display:block}.host-workflow-advanced li small{margin-top:1px;color:var(--muted)}.host-workflow-persisted{position:relative;margin:10px 0 0!important;padding-left:20px;color:var(--muted)!important;font-size:10px!important}.host-workflow-persisted:before{content:"i";position:absolute;left:0;top:0;display:grid;place-items:center;width:13px;height:13px;border:1px solid #7890a2;border-radius:50%;color:#526e83;font-size:9px;font-weight:800}
 @keyframes host-workflow-spin{to{transform:rotate(1turn)}}
+.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation-duration:3.2s;animation-timing-function:steps(4,end)}
+.host-action-overlay[data-suspended="true"] .host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation-play-state:paused}
 .host-workflow-meta{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:10px}.host-workflow-meta strong{color:#294761;font-weight:720}.host-workflow-step-state{display:grid;justify-items:end}.host-workflow-step-state small{margin-top:2px;color:#48657d;font-size:9px;font-weight:650}
 .host-workflow-evidence{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(0,1.3fr);margin:10px 0 13px;border-top:1px solid rgba(214,226,234,.58);font-size:10px}.host-workflow-evidence dt,.host-workflow-evidence dd{min-width:0;margin:0;padding:6px 0;border-bottom:1px solid rgba(214,226,234,.45)}.host-workflow-evidence dt{padding-right:10px;color:var(--muted)}.host-workflow-evidence dd{color:#294761;font-weight:680;overflow-wrap:anywhere}
 .settings-wait-note{display:flex;align-items:center;gap:6px;width:max-content;max-width:100%;min-height:18px;margin:-6px 0 8px;color:#8b620f;font-size:11px;font-weight:680;text-decoration:none;cursor:pointer}.settings-wait-note[hidden]{display:none}.settings-wait-note .ico{width:13px;height:13px;flex:0 0 13px}.settings-wait-note:hover,.settings-wait-note:focus-visible{color:#734500;text-decoration:underline;text-underline-offset:3px;outline:0}
@@ -3668,11 +3670,19 @@ let openHostActionsRoot=null;
 let hostActionContext=null;
 let hostActionReturnFocus=null;
 const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:''};
-function stopHostActionPoll(){
+function setHostActionPollSuspended(suspended){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  if(overlay)overlay.dataset.suspended=suspended?'true':'false';
+}
+function pauseHostActionPoll(){
   if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
   hostActionPoll.timer=null;
   hostActionPoll.controller?.abort();
   hostActionPoll.controller=null;
+  setHostActionPollSuspended(true);
+}
+function stopHostActionPoll(){
+  pauseHostActionPoll();
   hostActionPoll.id=null;
   hostActionPoll.failures=0;
   hostActionPoll.lastRevision='';
@@ -3924,8 +3934,13 @@ function scheduleHostActionPoll(id,delay=2000){
   if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
   hostActionPoll.timer=null;
   hostActionPoll.id=id;
-  if(document.hidden||!navigator.onLine||!hostActionContext)return;
-  hostActionPoll.timer=setTimeout(()=>pollHostActionJob(id,false),delay);
+  const suspended=document.hidden||!navigator.onLine||!hostActionContext;
+  setHostActionPollSuspended(suspended);
+  if(suspended)return;
+  hostActionPoll.timer=setTimeout(()=>{
+    hostActionPoll.timer=null;
+    pollHostActionJob(id,false);
+  },delay);
 }
 function hostActionPollDelay(job){
   const kind=job?.workflow?.kind;
@@ -3991,7 +4006,9 @@ function renderHostActionJob(job,message,workflowHtml){
 }
 async function pollHostActionJob(id,immediate=false){
   if(!hostActionContext||hostActionContext.jobId&&hostActionContext.jobId!==id)return;
-  if(document.hidden||!navigator.onLine){hostActionPoll.id=id;return}
+  hostActionPoll.timer=null;
+  if(document.hidden||!navigator.onLine){hostActionPoll.id=id;setHostActionPollSuspended(true);return}
+  setHostActionPollSuspended(false);
   hostActionPoll.controller?.abort();
   const controller=new AbortController();
   hostActionPoll.controller=controller;
@@ -4180,17 +4197,21 @@ function initHostActions(){
   document.querySelector('[data-host-action-cancel]')?.addEventListener('click',submitHostActionCancellation);
   document.querySelector('[data-host-action-primary]')?.addEventListener('click',submitHostAction);
   document.addEventListener('visibilitychange',()=>{
-    if(!document.hidden&&hostActionContext?.jobId)pollHostActionJob(hostActionContext.jobId,true);
+    if(document.hidden){pauseHostActionPoll();return}
+    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
+  });
+  window.addEventListener('focus',()=>{
+    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
   });
   window.addEventListener('online',()=>{
-    if(hostActionContext?.jobId)pollHostActionJob(hostActionContext.jobId,true);
+    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
   });
   window.addEventListener('offline',()=>{
-    if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
-    hostActionPoll.timer=null;
+    pauseHostActionPoll();
     const status=document.querySelector('[data-host-action-status]');
     if(status&&hostActionContext)status.textContent='Offline. The saved workflow will refresh when connectivity returns.';
   });
+  window.addEventListener('pagehide',stopHostActionPoll);
   window.addEventListener('resize',()=>closeHostActions(openHostActionsRoot));
   window.addEventListener('scroll',()=>closeHostActions(openHostActionsRoot),true);
 }
@@ -15655,6 +15676,29 @@ mod tests {
         ));
         assert!(html.contains(r#"data-host-action-cancel hidden"#));
         assert!(html.contains("openRequestedWorkflow()"));
+    }
+
+    #[test]
+    fn host_action_dialog_uses_one_suspendable_poll_lifecycle() {
+        assert!(FOOT.contains("function pauseHostActionPoll()"));
+        assert!(FOOT.contains("function stopHostActionPoll()"));
+        assert!(FOOT.contains("function scheduleHostActionPoll(id,delay=2000)"));
+        assert!(FOOT.contains("hostActionPoll.timer=null;\n    pollHostActionJob(id,false);"));
+        assert!(FOOT.contains("if(document.hidden){pauseHostActionPoll();return}"));
+        assert!(FOOT.contains(
+            "window.addEventListener('focus',()=>{\n    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);"
+        ));
+        assert!(
+            FOOT.contains("window.addEventListener('offline',()=>{\n    pauseHostActionPoll();")
+        );
+        assert!(FOOT.contains("window.addEventListener('pagehide',stopHostActionPoll)"));
+        assert!(FOOT.contains("stopHostActionPoll();\n  closeHostActions(root);"));
+        assert!(FOOT.contains("stopHostActionPoll();\n  if(overlay.hidden)return;"));
+        assert!(!FOOT.contains("setInterval("));
+        assert!(HEAD.contains("animation-duration:3.2s;animation-timing-function:steps(4,end)"));
+        assert!(HEAD.contains(
+            ".host-action-overlay[data-suspended=\"true\"] .host-workflow-step[data-step-state=\"running\"] .host-workflow-marker:before{animation-play-state:paused}"
+        ));
     }
 
     #[test]
