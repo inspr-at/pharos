@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.33 - 2026-07-13
+
+- Add safe run, host, timing, duration, and execution-location metadata to the shared persisted checklist used by settings, update review, apply/restart, removal, and recovery workflows.
+- Allow operators to cancel an update review only before attended confirmation, persist the cancellation, release host and fleet gates, and reject late target-agent results without authorizing a live change.
+- Link guarded-action Activity rows to their exact saved workflow, reopen the same run after refresh, and expose the single running step with accessible busy and current-step semantics.
+
 ## 0.1.32 - 2026-07-13
 
 - Preserve the exact guarded-action lease phase across Pharos restarts and lease expiry so post-reboot verification can never be replayed as a second apply.
