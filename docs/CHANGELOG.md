@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.32 - 2026-07-13
+
+- Preserve the exact guarded-action lease phase across Pharos restarts and lease expiry so post-reboot verification can never be replayed as a second apply.
+- Allow only one poller to claim a resumed action, reject inconsistent persisted lease state, and retain typed timeout plus original apply-failure evidence through store reloads.
+
 ## 0.1.31 - 2026-07-13
 
 - Persist a typed, value-free failure gate for guarded host actions so recovery shows the exact verification stage that stopped without exposing command output, machine paths, or opaque identifiers.
