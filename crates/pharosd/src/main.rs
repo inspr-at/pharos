@@ -61,7 +61,8 @@ use url::Url;
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthState};
 use crate::host_actions::{
     AgentActionOutcome, AgentActionResultRequest, HostActionJob, HostActionKind, HostActionState,
-    HostActionStore, HostActionStoreError, RetiredHost, RetiredHostStore,
+    HostActionStore, HostActionStoreError, HostRemovalPlan, HostRetirementDisposition, RetiredHost,
+    RetiredHostStore,
 };
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::nixcfg_dispatch::NixcfgDispatch;
@@ -3383,6 +3384,7 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 .host-actions-menu{position:fixed;z-index:5800;width:min(280px,calc(100vw - 24px));padding:7px;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 20px 48px rgba(45,75,95,.20);color:var(--ink);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}.host-actions-menu[hidden]{display:none}.host-actions-title{display:block;padding:6px 8px 8px;color:#294761;font-size:12px;font-weight:780}.host-actions-separator{height:1px;margin:5px 2px;background:rgba(214,226,234,.78)}.host-action-item{appearance:none;width:100%;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;column-gap:9px;min-height:47px;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:#294761;font:inherit;text-align:left;text-decoration:none;cursor:pointer}.host-action-item[hidden]{display:none}.host-action-item:hover,.host-action-item:focus-visible{background:rgba(223,241,249,.62);color:#0f4f80;outline:0}.host-action-item>.ico{grid-row:1/3;width:16px;height:16px;justify-self:center}.host-action-item strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.25}.host-action-item span{display:block;min-width:0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:10px;line-height:1.25}.host-action-item.restart{color:#9a5b00}.host-action-item.restart:hover,.host-action-item.restart:focus-visible{background:rgba(255,245,222,.86);color:#7b4900}.host-action-item.remove{color:#a1322e}.host-action-item.remove:hover,.host-action-item.remove:focus-visible{background:rgba(255,232,229,.66);color:#842824}.host-actions-safety{display:flex;align-items:center;gap:8px;min-height:34px;padding:7px 8px 3px;color:var(--muted);font-size:10px}.host-actions-safety .ico{width:14px;height:14px;color:#4c6780}.card:has(.host-actions-menu:not([hidden])),.list tr:has(.host-actions-menu:not([hidden])){z-index:90}.card:has(.host-actions-menu:not([hidden])) .card-head{z-index:100}
 body[data-host-action-dialog-open="true"]{overflow:hidden}.host-action-overlay{position:fixed;inset:0;z-index:6100;display:grid;place-items:center;padding:24px;background:rgba(20,48,75,.28);-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px)}.host-action-overlay[hidden]{display:none}.host-action-backdrop{position:absolute;inset:0}.host-action-dialog{position:relative;width:min(470px,calc(100vw - 28px));max-height:calc(100vh - 40px);display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 26px 78px rgba(32,61,82,.28);overflow:hidden}.host-action-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 21px 15px;border-bottom:1px solid rgba(214,226,234,.72)}.host-action-heading{display:flex;align-items:center;gap:10px;min-width:0}.host-action-heading>[data-action-icon]{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;color:var(--accent)}.host-action-heading>[data-action-icon][hidden]{display:none}.host-action-heading>[data-action-icon] .ico{width:20px;height:20px}.host-action-dialog[data-action="remove"] .host-action-heading>[data-action-icon]{color:var(--down)}.host-action-heading h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;line-height:1.2;color:#12304b}.host-action-dialog-close{appearance:none;display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);cursor:pointer}.host-action-dialog-close:hover,.host-action-dialog-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}.host-action-dialog-close .ico{width:15px;height:15px}.host-action-dialog-body{padding:17px 21px 19px;overflow:auto}.host-action-dialog-body>p{margin:0 0 14px;color:#435e74;font-size:13px;line-height:1.5}.host-action-info{display:grid;grid-template-columns:20px minmax(0,1fr);gap:9px;padding:11px 12px;border:1px solid rgba(188,211,222,.82);border-radius:7px;background:rgba(247,251,252,.82)}.host-action-info[hidden]{display:none}.host-action-info>.ico{grid-row:1/3;width:17px;height:17px;margin-top:1px;color:#4c6780}.host-action-info strong{font-size:12px}.host-action-info span{color:var(--muted);font-size:11px;line-height:1.35}.host-action-facts{display:grid;gap:0;margin:14px 0 0;border-top:1px solid rgba(214,226,234,.72)}.host-action-fact{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;min-height:38px;align-items:center;border-bottom:1px solid rgba(214,226,234,.58);font-size:12px}.host-action-fact[hidden]{display:none}.host-action-fact span{color:var(--muted)}.host-action-fact strong{max-width:260px;overflow-wrap:anywhere;color:var(--ink);font-weight:720;text-align:right}.host-action-technical{margin:14px 0 0;padding:12px;border:1px solid rgba(188,211,222,.72);border-radius:7px;background:#f8fbfc;color:#294761;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.host-action-technical[hidden]{display:none}.host-remove-confirm{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-confirm[hidden]{display:none}.host-remove-confirm input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-confirm input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}.host-attended-confirm{display:flex;align-items:flex-start;gap:9px;margin-top:12px;padding:10px 11px;border:1px solid rgba(214,155,49,.24);border-radius:7px;background:rgba(255,248,234,.64);color:#6e5527;font-size:11px;line-height:1.4;cursor:pointer}.host-attended-confirm[hidden]{display:none}.host-attended-confirm input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:#9a5b00}.host-action-dialog-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 21px;border-top:1px solid rgba(214,226,234,.72);background:rgba(250,252,253,.78)}.host-action-safe-note{display:flex;align-items:center;gap:7px;min-width:0;color:var(--muted);font-size:10px}.host-action-safe-note .ico{width:14px;height:14px;flex:0 0 auto;color:#4c6780}.host-action-dialog-buttons{display:flex;align-items:center;gap:8px;margin-left:auto}.host-action-dialog-button{appearance:none;min-height:36px;padding:0 13px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:#294761;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.host-action-dialog-button[hidden]{display:none}.host-action-dialog-button:hover,.host-action-dialog-button:focus-visible{background:rgba(223,241,249,.66);outline:0}.host-action-dialog-button.primary{border-color:#12304b;background:#12304b;color:#fff}.host-action-dialog-button.danger{border-color:var(--down);background:var(--down);color:#fff}.host-action-dialog-button:disabled{cursor:not-allowed;border-color:rgba(137,151,163,.18);background:rgba(137,151,163,.12);color:rgba(100,119,138,.55)}.host-action-status{margin:12px 0 0;color:var(--muted);font-size:11px}.host-action-status:empty{display:none}
 .settings-wait-note{display:flex;align-items:center;gap:6px;width:max-content;max-width:100%;min-height:18px;margin:-6px 0 8px;color:#8b620f;font-size:11px;font-weight:680;text-decoration:none;cursor:pointer}.settings-wait-note[hidden]{display:none}.settings-wait-note .ico{width:13px;height:13px;flex:0 0 13px}.settings-wait-note:hover,.settings-wait-note:focus-visible{color:#734500;text-decoration:underline;text-underline-offset:3px;outline:0}
+.host-remove-disposition,.host-remove-successor{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-disposition[hidden],.host-remove-successor[hidden]{display:none}.host-remove-successor{margin-top:11px}.host-remove-successor small{color:var(--muted);font-size:10px;font-weight:500}.host-remove-disposition select,.host-remove-successor input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-disposition select:focus,.host-remove-successor input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}
 .host-action-note{appearance:none;padding:0;border:0;background:transparent;font:inherit}.host-action-note[data-action-level="critical"]{color:var(--down)}.host-action-note[data-action-level="clear"]{color:var(--live)}
 .beat{--beat-color:var(--state);--now-x:0%;--history-start-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
 .beat-stage{position:relative;height:50px;overflow:visible}
@@ -3728,6 +3730,10 @@ function closeHostActionDialog(restore=true){
   document.body.removeAttribute('data-host-action-dialog-open');
   const input=overlay.querySelector('[data-host-remove-input]');
   if(input)input.value='';
+  const disposition=overlay.querySelector('[data-host-remove-disposition]');
+  if(disposition)disposition.value='';
+  const successor=overlay.querySelector('[data-host-remove-successor-input]');
+  if(successor)successor.value='';
   const attended=overlay.querySelector('[data-host-attended-input]');
   if(attended)attended.checked=false;
   hostActionContext=null;
@@ -3752,6 +3758,10 @@ function openHostActionDialog(action,root,returnFocus){
   const confirm=dialog.querySelector('[data-host-remove-confirm]');
   const removeName=dialog.querySelector('[data-host-remove-name]');
   const input=dialog.querySelector('[data-host-remove-input]');
+  const dispositionField=dialog.querySelector('[data-host-remove-disposition-field]');
+  const disposition=dialog.querySelector('[data-host-remove-disposition]');
+  const successorField=dialog.querySelector('[data-host-remove-successor]');
+  const successorInput=dialog.querySelector('[data-host-remove-successor-input]');
   const attendedConfirm=dialog.querySelector('[data-host-attended-confirm]');
   const attendedInput=dialog.querySelector('[data-host-attended-input]');
   const technical=dialog.querySelector('[data-host-action-technical]');
@@ -3761,8 +3771,12 @@ function openHostActionDialog(action,root,returnFocus){
   if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
   if(cancel)cancel.textContent='Cancel';
   if(confirm)confirm.hidden=true;
+  if(dispositionField)dispositionField.hidden=true;
+  if(successorField)successorField.hidden=true;
   if(attendedConfirm)attendedConfirm.hidden=true;
   if(input)input.value='';
+  if(disposition)disposition.value='';
+  if(successorInput)successorInput.value='';
   if(attendedInput)attendedInput.checked=false;
   if(technical)technical.hidden=true;
   if(facts)facts.hidden=false;
@@ -3800,18 +3814,21 @@ function openHostActionDialog(action,root,returnFocus){
       copy.textContent='Pharos has revoked this host’s reporting access. The server and its data remain untouched while declarative cleanup is reviewed and applied.';
       infoTitle.textContent='Beacon access revoked';
       infoCopy.textContent='The host remains visible so this unfinished removal cannot be mistaken for completion.';
-      setHostActionFact('scope','Waiting for nixcfg removal',true);
+      const dispositionLabel={destroyed:'Host no longer exists',unmanaged:'Host remains unmanaged',rebuilt:'Replaced by '+root.dataset.retirementSuccessor}[root.dataset.retirementDisposition]||'Lifecycle recorded';
+      setHostActionFact('scope',dispositionLabel+' · waiting for nixcfg removal',true);
       if(primary)primary.hidden=true;
       if(cancel)cancel.textContent='Close';
       if(status)status.textContent='Removal is still pending.';
     }else{
     title.textContent='Remove '+root.dataset.host+' from Pharos?';
     copy.textContent='Pharos will stop managing and accepting reports from this host. The server, disks, services, and application data stay untouched.';
-    infoTitle.textContent=root.dataset.declared==='true'?'Declarative removal review required':'Runtime-only removal';
-    infoCopy.textContent=root.dataset.declared==='true'
+    const needsCleanup=root.dataset.declared==='true';
+    infoTitle.textContent=needsCleanup?'Nix cleanup review required':'Runtime-only removal';
+    infoCopy.textContent=needsCleanup
       ?'A nixcfg proposal must remove the declaration. Until it is applied, Pharos keeps the removal visibly pending.'
       :'The runtime registration and beacon access will be revoked after confirmation.';
-    setHostActionFact('scope','Pharos registration only',true);
+    setHostActionFact('scope',needsCleanup?'Pharos registration + nixcfg review':'Pharos registration only',true);
+    if(dispositionField)dispositionField.hidden=false;
     if(confirm)confirm.hidden=false;
     if(removeName)removeName.textContent=root.dataset.host;
     if(primary){primary.textContent='Remove host';primary.classList.add('danger');primary.disabled=true}
@@ -3831,9 +3848,37 @@ async function requestHostAction(path,body){
 function hostActionStateLabel(state){
   return ({proposal_requested:'review requested',queued_review:'review queued',reviewing:'reviewing on host',awaiting_confirmation:'ready for confirmation',queued_apply:'confirmed',applying:'applying on host',rebooting:'restarting and verifying',removal_pending:'removal pending',succeeded:'completed',failed:'failed'})[state]||String(state||'recorded').replaceAll('_',' ');
 }
+function updateHostRemovalForm(){
+  if(hostActionContext?.action!=='remove')return;
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const disposition=overlay?.querySelector('[data-host-remove-disposition]')?.value||'';
+  const successorField=overlay?.querySelector('[data-host-remove-successor]');
+  const successor=overlay?.querySelector('[data-host-remove-successor-input]');
+  const infoTitle=overlay?.querySelector('[data-host-action-info-title]');
+  const infoCopy=overlay?.querySelector('[data-host-action-info-copy]');
+  const primary=overlay?.querySelector('[data-host-action-primary]');
+  const rebuilt=disposition==='rebuilt';
+  if(successorField)successorField.hidden=!rebuilt;
+  if(!rebuilt&&successor)successor.value='';
+  const copy={
+    destroyed:['Host no longer exists','Pharos stops monitoring it and keeps a retirement record. The server provider and any disks are never touched.'],
+    unmanaged:['Host still exists','Pharos stops monitoring and managing it. The machine, services, disks, and application data remain unchanged.'],
+    rebuilt:['Host was replaced','The old record is retired and linked to an already onboarded successor. Nothing is deleted from either machine.']
+  }[disposition];
+  if(copy&&infoTitle)infoTitle.textContent=copy[0];
+  if(copy&&infoCopy)infoCopy.textContent=copy[1];
+  if(primary)primary.disabled=!hostActionConfirmationReady();
+}
 function hostActionConfirmationReady(){
   const overlay=document.querySelector('[data-host-action-overlay]');
   const input=overlay?.querySelector('[data-host-remove-input]');
+  if(hostActionContext?.action==='remove'){
+    const disposition=overlay?.querySelector('[data-host-remove-disposition]')?.value||'';
+    const successor=(overlay?.querySelector('[data-host-remove-successor-input]')?.value||'').trim();
+    return input?.value===hostActionContext.host
+      &&['destroyed','unmanaged','rebuilt'].includes(disposition)
+      &&(disposition!=='rebuilt'||(successor.length>0&&successor!==hostActionContext.host));
+  }
   const attended=overlay?.querySelector('[data-host-attended-input]');
   return input?.value===hostActionContext?.host&&attended?.checked===true;
 }
@@ -3913,14 +3958,18 @@ async function submitHostAction(){
   const status=overlay?.querySelector('[data-host-action-status]');
   if(!primary||!status)return;
   primary.disabled=true;
-  status.textContent='Requesting a guarded review…';
+  status.textContent=action==='remove'?'Recording retirement and revoking reports…':'Requesting a guarded review…';
   try{
     let result;
     if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
     else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
-    else if(action==='remove')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/remove',{confirmation:host});
+    else if(action==='remove'){
+      const disposition=overlay.querySelector('[data-host-remove-disposition]')?.value||'';
+      const successor=(overlay.querySelector('[data-host-remove-successor-input]')?.value||'').trim();
+      result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/remove',{confirmation:host,disposition,successor:successor||null});
+    }
     else return;
     status.textContent=result.message||'Request recorded.';
     if(action==='remove')setTimeout(()=>location.reload(),700);
@@ -3948,6 +3997,8 @@ function updateHostActionState(surface,host,backup){
   root.dataset.kernelRunning=String(kernel.running_version||'not reported');
   root.dataset.kernelExpected=String(kernel.expected_version||'not reported');
   root.dataset.retired=retirement?.pending===true?'true':'false';
+  root.dataset.retirementDisposition=String(retirement?.disposition||'');
+  root.dataset.retirementSuccessor=String(retirement?.successor||'');
   if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(job.kind||'');root.dataset.actionState=String(job.state||'')}
   else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
   if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
@@ -3962,15 +4013,16 @@ function updateHostActionState(surface,host,backup){
   const updatePending=kernelState==='reboot_required'||commitsBehind>0;
   root.dataset.updatePending=updatePending?'true':'false';
   const retired=retirement?.pending===true;
+  const removalReady=root.dataset.declared!=='true'||hostRemovalAvailable;
   if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
   if(restart){
     restart.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&(updatePending||updateJobActive));
     const strong=restart.querySelector('strong');
     if(strong)strong.textContent=updateJobActive?'Continue update workflow':'Apply update and restart';
   }
-  if(remove)remove.hidden=!hostRemovalAvailable||!canManage||retired;
+  if(remove)remove.hidden=!removalReady||!canManage||retired;
   if(primarySeparator)primarySeparator.hidden=[review,update,restart].every(item=>!item||item.hidden);
-  if(removeSeparator)removeSeparator.hidden=!hostRemovalAvailable||!canManage||retired;
+  if(removeSeparator)removeSeparator.hidden=!removalReady||!canManage||retired;
   const note=surface.querySelector('[data-host-action-note]');
   const noteCopy=note?.querySelector('[data-host-action-note-copy]');
   if(note){
@@ -4010,7 +4062,7 @@ function initHostActions(){
     if(overlay&&!overlay.hidden){
       if(event.key==='Escape'){event.preventDefault();closeHostActionDialog();return}
       if(event.key==='Tab'){
-        const focusable=Array.from(overlay.querySelectorAll('button:not([hidden]):not(:disabled),input:not([hidden]):not(:disabled)')).filter(el=>el.offsetParent!==null);
+        const focusable=Array.from(overlay.querySelectorAll('button:not([hidden]):not(:disabled),input:not([hidden]):not(:disabled),select:not([hidden]):not(:disabled)')).filter(el=>el.offsetParent!==null);
         if(focusable.length){const first=focusable[0],last=focusable[focusable.length-1];if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}}
       }
       return;
@@ -4029,9 +4081,11 @@ function initHostActions(){
   document.querySelector('[data-host-remove-input]')?.addEventListener('input',event=>{
     const primary=document.querySelector('[data-host-action-primary]');
     if(!primary||!hostActionContext)return;
-    if(hostActionContext.action==='remove')primary.disabled=event.target.value!==hostActionContext.host;
+    if(hostActionContext.action==='remove')primary.disabled=!hostActionConfirmationReady();
     else if(hostActionContext.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
   });
+  document.querySelector('[data-host-remove-disposition]')?.addEventListener('change',updateHostRemovalForm);
+  document.querySelector('[data-host-remove-successor-input]')?.addEventListener('input',updateHostRemovalForm);
   document.querySelector('[data-host-attended-input]')?.addEventListener('change',()=>{
     const primary=document.querySelector('[data-host-action-primary]');
     if(primary&&hostActionContext?.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
@@ -6189,6 +6243,15 @@ struct ConfirmHostActionRequest {
 #[serde(deny_unknown_fields)]
 struct RemoveHostActionRequest {
     confirmation: String,
+    disposition: HostRetirementDisposition,
+    #[serde(default)]
+    successor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmHostNameRequest {
+    confirmation: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6266,6 +6329,10 @@ fn host_is_declared(state: &AppState, host: &str) -> bool {
         .iter()
         .any(|manifest| manifest.host.name == host || manifest.slug == host)
         || state.manifests.declared_preferences_for(host).is_some()
+}
+
+fn host_needs_declaration_cleanup(state: &AppState, host: &str) -> bool {
+    host_is_declared(state, host)
 }
 
 fn host_janus_actions_ready(state: &AppState, host: &str) -> bool {
@@ -6536,42 +6603,85 @@ async fn request_host_removal(
     if state.store.get(&host).is_none() && !host_is_declared(&state, &host) {
         return action_error(StatusCode::NOT_FOUND, "Host is not managed by Pharos");
     }
+    let successor = request
+        .successor
+        .as_deref()
+        .map(str::trim)
+        .filter(|successor| !successor.is_empty())
+        .map(str::to_string);
+    let declaration_pending = host_needs_declaration_cleanup(&state, &host);
+    let removal_plan = HostRemovalPlan {
+        disposition: request.disposition,
+        successor,
+        declaration_pending,
+    };
+    if !removal_plan.validate(&host) {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "Choose what happened to the host; rebuilt hosts require a different valid successor",
+        );
+    }
+    if let Some(successor) = removal_plan.successor.as_deref() {
+        if state.retired_hosts.is_retired(successor) {
+            return action_error(
+                StatusCode::CONFLICT,
+                "The successor is retired and cannot take over this host",
+            );
+        }
+        if state.store.get(successor).is_none() && !host_is_declared(&state, successor) {
+            return action_error(
+                StatusCode::CONFLICT,
+                "Onboard the successor in Pharos before recording this replacement",
+            );
+        }
+    }
     let actor = action_actor(&state.auth, &headers);
-    let declared = host_is_declared(&state, &host);
-    let dispatch_id = if declared {
-        match state.nixcfg_dispatch.dispatch_host_removal(&host).await {
+    let dispatch_id = if declaration_pending {
+        match state
+            .nixcfg_dispatch
+            .dispatch_host_removal(
+                &host,
+                removal_plan.disposition.key(),
+                removal_plan.successor.as_deref(),
+            )
+            .await
+        {
             Ok(request_id) => Some(request_id),
             Err(error) => return action_error(StatusCode::BAD_GATEWAY, error.safe_message()),
         }
     } else {
         None
     };
-    let job =
-        match state
-            .host_actions
-            .create_removal(&host, &actor, dispatch_id, declared, now_unix())
-        {
-            Ok(job) => job,
-            Err(HostActionStoreError::ActiveJob) => {
-                return action_error(
-                    StatusCode::CONFLICT,
-                    "A removal workflow is already active for this host",
-                );
-            }
-            Err(_) => {
-                return action_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "The removal workflow could not be recorded",
-                );
-            }
-        };
+    let job = match state.host_actions.create_removal(
+        &host,
+        &actor,
+        dispatch_id,
+        removal_plan.clone(),
+        now_unix(),
+    ) {
+        Ok(job) => job,
+        Err(HostActionStoreError::ActiveJob) => {
+            return action_error(
+                StatusCode::CONFLICT,
+                "A removal workflow is already active for this host",
+            );
+        }
+        Err(_) => {
+            return action_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The removal workflow could not be recorded",
+            );
+        }
+    };
     if state
         .retired_hosts
         .retire(RetiredHost {
             host: host.clone(),
             requested_by: actor.clone(),
             removal_job_id: job.id.clone(),
-            declaration_pending: declared,
+            disposition: removal_plan.disposition,
+            successor: removal_plan.successor.clone(),
+            declaration_pending,
             retired_at: now_unix(),
         })
         .is_err()
@@ -6581,10 +6691,10 @@ async fn request_host_removal(
             "Beacon revocation could not be persisted",
         );
     }
-    if !declared {
+    if !declaration_pending {
         state.store.remove(&host);
     }
-    tracing::info!(host = %host, actor = %actor, declared = declared, ticket = "PHAROS-127", "host removal requested and beacon access revoked");
+    tracing::info!(host = %host, actor = %actor, declaration_pending, disposition = ?removal_plan.disposition, successor = ?removal_plan.successor, ticket = "PHAROS-127", "host removal requested and beacon access revoked");
     action_response(StatusCode::ACCEPTED, &job)
 }
 
@@ -6592,7 +6702,7 @@ async fn allow_host_reonboarding(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(host): AxumPath<String>,
-    Json(request): Json<RemoveHostActionRequest>,
+    Json(request): Json<ConfirmHostNameRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let access = access_for_headers(&state.auth, &headers);
     if !action_request_header(&headers) || !access.can_manage_fleet() || !access.allows_host(&host)
@@ -8223,6 +8333,8 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
             if let Some(retired) = state.retired_hosts.get(&name) {
                 host["retirement"] = json!({
                     "pending": true,
+                    "disposition": retired.disposition,
+                    "successor": retired.successor,
                     "declaration_pending": retired.declaration_pending,
                     "retired_at": retired.retired_at,
                 });
@@ -9244,7 +9356,9 @@ fn host_actions_markup(host: &Host, context: HostActionRenderContext<'_>) -> Str
         } else {
             " hidden"
         };
-    let remove_hidden = if capabilities.can_manage_fleet && capabilities.host_removal_available {
+    let remove_hidden = if capabilities.can_manage_fleet
+        && (!context.declared || capabilities.host_removal_available)
+    {
         ""
     } else {
         " hidden"
@@ -9309,7 +9423,7 @@ fn host_actions_markup(host: &Host, context: HostActionRenderContext<'_>) -> Str
 
 fn host_action_dialog() -> String {
     format!(
-        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button" type="button" data-host-action-close>Cancel</button><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button></span></footer></section></section>"#,
+        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button" type="button" data-host-action-close>Cancel</button><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button></span></footer></section></section>"#,
         package = icons::PACKAGE_SEARCH,
         power = icons::POWER,
         file = icons::FILE_TEXT,
@@ -12512,6 +12626,20 @@ fn activity_events(
             (_, HostActionState::Failed) => ("critical", "Guarded host action failed"),
             _ => ("info", "Host action recorded"),
         };
+        let removal_detail = job.removal_plan.as_ref().map(|plan| {
+            let disposition = plan.disposition.key();
+            let successor = plan
+                .successor
+                .as_deref()
+                .map(|successor| format!(" · successor {successor}"))
+                .unwrap_or_default();
+            let cleanup = if plan.declaration_pending {
+                " · nixcfg cleanup pending"
+            } else {
+                " · runtime registration only"
+            };
+            format!(" Disposition: {disposition}{successor}{cleanup}.")
+        });
         events.push(ActivityEvent::new(
             job.updated_at,
             job.host.clone(),
@@ -12519,10 +12647,11 @@ fn activity_events(
             "action",
             title,
             format!(
-                "{} · requested by {}. {}",
+                "{} · requested by {}. {}{}",
                 job.ticket,
                 job.requested_by,
-                action_message(job)
+                action_message(job),
+                removal_detail.as_deref().unwrap_or_default()
             ),
             "guarded action",
         ));
@@ -14910,6 +15039,12 @@ mod tests {
         assert!(html.contains("event.key==='Escape'"));
         assert!(html.contains("X-Pharos-Action"));
         assert!(html.contains("Retry guarded review"));
+        assert!(html.contains(r#"data-host-remove-disposition"#));
+        assert!(html.contains("It no longer exists"));
+        assert!(html.contains("It still exists; stop managing it"));
+        assert!(html.contains("It was replaced by another host"));
+        assert!(html.contains(r#"data-host-remove-successor-input"#));
+        assert!(html.contains("Onboard the successor in Pharos first"));
         assert!(html.contains(
             "'/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry'"
         ));
@@ -14944,6 +15079,26 @@ mod tests {
         assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
         assert!(markup.contains(r#"data-host-action="remove" hidden"#));
         assert!(markup.contains(r#"data-host-action="technical""#));
+
+        let runtime_only_markup = host_actions_markup(
+            &host,
+            HostActionRenderContext {
+                manifest: None,
+                declared: false,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: false,
+                    host_removal_available: false,
+                },
+            },
+        );
+        assert!(runtime_only_markup.contains(r#"data-host-action="remove"><svg"#));
+        assert!(runtime_only_markup.contains(r#"data-declared="false""#));
 
         let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
         pending_update.freshness.commits_behind = Some(2);
@@ -15609,6 +15764,46 @@ mod tests {
         assert!(html.contains("Other operational events are derived"));
         assert!(!html.contains("restic-main-repository"));
         assert!(!html.contains("not-rendered-token-hash"));
+    }
+
+    #[test]
+    fn removal_activity_records_lifecycle_intent_without_secret_material() {
+        let actions = HostActionStore::new(None);
+        actions
+            .create_removal(
+                "gpc0",
+                "markus",
+                None,
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Rebuilt,
+                    successor: Some("stm2607".to_string()),
+                    declaration_pending: true,
+                },
+                1_000,
+            )
+            .expect("removal action recorded");
+        let action_jobs = actions.list();
+        let events = activity_events(
+            runtime(&[], &[]),
+            "csb1",
+            1_000,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &action_jobs,
+            },
+        );
+
+        let event = events
+            .iter()
+            .find(|event| event.host == "gpc0" && event.kind == "action")
+            .expect("removal activity present");
+        assert!(event.detail.contains("Disposition: rebuilt"));
+        assert!(event.detail.contains("successor stm2607"));
+        assert!(event.detail.contains("nixcfg cleanup pending"));
+        assert!(!event.detail.to_ascii_lowercase().contains("token"));
+        assert!(!event.detail.to_ascii_lowercase().contains("secret"));
     }
 
     #[test]
@@ -19162,7 +19357,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     async fn runtime_host_removal_revokes_reports_and_reonboarding_is_explicit() {
         let state = report_test_state(true);
         register_test_token(&state, "ares", "remove-token");
-        state.store.record(test_report("ares"), now_unix());
+        let mut runtime_report = test_report("ares");
+        runtime_report.is_nix = false;
+        runtime_report.freshness.applicable = false;
+        state.store.record(runtime_report, now_unix());
 
         let (status, _) = request_host_removal(
             State(state.clone()),
@@ -19170,6 +19368,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             AxumPath("ares".to_string()),
             Json(RemoveHostActionRequest {
                 confirmation: "wrong".to_string(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
             }),
         )
         .await;
@@ -19182,12 +19382,18 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             AxumPath("ares".to_string()),
             Json(RemoveHostActionRequest {
                 confirmation: "ares".to_string(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
             }),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(payload["job"]["state"], "succeeded");
+        assert_eq!(payload["job"]["removal_plan"]["disposition"], "unmanaged");
         assert!(state.retired_hosts.is_retired("ares"));
+        let retirement = state.retired_hosts.get("ares").expect("retirement stored");
+        assert_eq!(retirement.disposition, HostRetirementDisposition::Unmanaged);
+        assert!(retirement.successor.is_none());
         assert!(state.store.get("ares").is_none());
 
         let report_status = report(
@@ -19202,7 +19408,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state.clone()),
             action_headers(),
             AxumPath("ares".to_string()),
-            Json(RemoveHostActionRequest {
+            Json(ConfirmHostNameRequest {
                 confirmation: "ares".to_string(),
             }),
         )
@@ -19216,6 +19422,106 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
         assert_eq!(report_status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rebuilt_host_requires_an_active_distinct_successor() {
+        let state = report_test_state(true);
+        for (host, token) in [("gpc0", "old-token"), ("stm2607", "successor-token")] {
+            register_test_token(&state, host, token);
+            let mut runtime_report = test_report(host);
+            runtime_report.is_nix = false;
+            runtime_report.freshness.applicable = false;
+            state.store.record(runtime_report, now_unix());
+        }
+
+        for successor in [None, Some("gpc0"), Some("not-onboarded")] {
+            let (status, _) = request_host_removal(
+                State(state.clone()),
+                action_headers(),
+                AxumPath("gpc0".to_string()),
+                Json(RemoveHostActionRequest {
+                    confirmation: "gpc0".to_string(),
+                    disposition: HostRetirementDisposition::Rebuilt,
+                    successor: successor.map(str::to_string),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+            ));
+            assert!(!state.retired_hosts.is_retired("gpc0"));
+        }
+
+        let (status, Json(payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("gpc0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "gpc0".to_string(),
+                disposition: HostRetirementDisposition::Rebuilt,
+                successor: Some("stm2607".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["removal_plan"]["disposition"], "rebuilt");
+        assert_eq!(payload["job"]["removal_plan"]["successor"], "stm2607");
+        let retirement = state.retired_hosts.get("gpc0").expect("retirement stored");
+        assert_eq!(retirement.disposition, HostRetirementDisposition::Rebuilt);
+        assert_eq!(retirement.successor.as_deref(), Some("stm2607"));
+        assert!(state.store.get("gpc0").is_none());
+        assert!(state.store.get("stm2607").is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_only_nix_host_removal_does_not_assume_declarative_ownership() {
+        let state = report_test_state(true);
+        register_test_token(&state, "gpc0", "remove-token");
+        state.store.record(test_report("gpc0"), now_unix());
+
+        let (status, Json(payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("gpc0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "gpc0".to_string(),
+                disposition: HostRetirementDisposition::Destroyed,
+                successor: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "succeeded");
+        assert_eq!(payload["job"]["removal_plan"]["declaration_pending"], false);
+        assert!(state.retired_hosts.is_retired("gpc0"));
+        assert!(state.store.get("gpc0").is_none());
+    }
+
+    #[tokio::test]
+    async fn declarative_host_removal_fails_closed_without_declarative_dispatch() {
+        let (state, manifest_path) = state_with_janus_manifest("gpc0", "remove-token");
+
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("gpc0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "gpc0".to_string(),
+                disposition: HostRetirementDisposition::Destroyed,
+                successor: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(!state.retired_hosts.is_retired("gpc0"));
+        assert!(state.store.get("gpc0").is_some());
+        assert!(state.host_actions.latest_for_host("gpc0").is_none());
+        let _ = std::fs::remove_file(manifest_path);
     }
 
     #[tokio::test]

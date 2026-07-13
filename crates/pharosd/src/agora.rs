@@ -351,9 +351,9 @@ pub(crate) async fn request_host_preferences(
                     NixcfgDispatchError::Disabled | NixcfgDispatchError::CredentialUnavailable => {
                         StatusCode::SERVICE_UNAVAILABLE
                     }
-                    NixcfgDispatchError::InvalidHost | NixcfgDispatchError::InvalidPreferences => {
-                        StatusCode::BAD_REQUEST
-                    }
+                    NixcfgDispatchError::InvalidHost
+                    | NixcfgDispatchError::InvalidPreferences
+                    | NixcfgDispatchError::InvalidRemovalIntent => StatusCode::BAD_REQUEST,
                     NixcfgDispatchError::RequestFailed | NixcfgDispatchError::Rejected(_) => {
                         StatusCode::BAD_GATEWAY
                     }

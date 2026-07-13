@@ -149,6 +149,8 @@ impl NixcfgDispatch {
     pub(crate) async fn dispatch_host_removal(
         &self,
         host: &str,
+        disposition: &str,
+        successor: Option<&str>,
     ) -> Result<String, NixcfgDispatchError> {
         if !self.host_removal_available() {
             return Err(NixcfgDispatchError::Disabled);
@@ -156,11 +158,16 @@ impl NixcfgDispatch {
         if !valid_host_name(host) {
             return Err(NixcfgDispatchError::InvalidHost);
         }
+        if !valid_removal_intent(host, disposition, successor) {
+            return Err(NixcfgDispatchError::InvalidRemovalIntent);
+        }
         let request_id = request_id("host-removal", host);
         let request = HostRemovalDispatchRequest {
             git_ref: WORKFLOW_REF,
             inputs: HostRemovalDispatchInputs {
                 host,
+                disposition,
+                successor: successor.unwrap_or_default(),
                 request_id: &request_id,
             },
         };
@@ -219,6 +226,7 @@ pub(crate) enum NixcfgDispatchError {
     CredentialUnavailable,
     InvalidHost,
     InvalidPreferences,
+    InvalidRemovalIntent,
     RequestFailed,
     Rejected(u16),
 }
@@ -232,6 +240,7 @@ impl NixcfgDispatchError {
             }
             Self::InvalidHost => "This host name cannot be used for declarative settings",
             Self::InvalidPreferences => "Host settings do not match the supported schema",
+            Self::InvalidRemovalIntent => "The host retirement details are invalid",
             Self::RequestFailed => {
                 "The declarative settings workflow could not be reached; no change was requested"
             }
@@ -283,6 +292,8 @@ struct HostRemovalDispatchRequest<'a> {
 #[derive(Serialize)]
 struct HostRemovalDispatchInputs<'a> {
     host: &'a str,
+    disposition: &'a str,
+    successor: &'a str,
     request_id: &'a str,
 }
 
@@ -300,6 +311,14 @@ fn valid_host_name(host: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn valid_removal_intent(host: &str, disposition: &str, successor: Option<&str>) -> bool {
+    match disposition {
+        "rebuilt" => successor.is_some_and(|value| valid_host_name(value) && value != host),
+        "destroyed" | "unmanaged" => successor.is_none(),
+        _ => false,
+    }
 }
 
 fn request_id(action: &str, host: &str) -> String {
@@ -454,7 +473,7 @@ mod tests {
         let client = NixcfgDispatch::for_test(Some(token_path.clone()), base);
 
         let request_id = client
-            .dispatch_host_removal("hsb8")
+            .dispatch_host_removal("hsb8", "rebuilt", Some("stm2607"))
             .await
             .expect("dispatch accepted");
         let raw = request.recv().expect("request captured");
@@ -463,6 +482,8 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
         assert_eq!(payload["ref"], WORKFLOW_REF);
         assert_eq!(payload["inputs"]["host"], "hsb8");
+        assert_eq!(payload["inputs"]["disposition"], "rebuilt");
+        assert_eq!(payload["inputs"]["successor"], "stm2607");
         assert_eq!(payload["inputs"]["request_id"], request_id);
         assert!(request_id.starts_with("pharos-host-removal-hsb8-"));
 
@@ -485,8 +506,22 @@ mod tests {
             Err(NixcfgDispatchError::InvalidHost)
         );
         assert_eq!(
-            unavailable.dispatch_host_removal("../gpc0").await,
+            unavailable
+                .dispatch_host_removal("../gpc0", "destroyed", None)
+                .await,
             Err(NixcfgDispatchError::InvalidHost)
+        );
+        assert_eq!(
+            unavailable
+                .dispatch_host_removal("gpc0", "rebuilt", None)
+                .await,
+            Err(NixcfgDispatchError::InvalidRemovalIntent)
+        );
+        assert_eq!(
+            unavailable
+                .dispatch_host_removal("gpc0", "unmanaged", Some("stm2607"))
+                .await,
+            Err(NixcfgDispatchError::InvalidRemovalIntent)
         );
 
         let token_path = token_file();

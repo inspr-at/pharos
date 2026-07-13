@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.29 - 2026-07-13
+
+- Ask what happened to a host before removal and record whether it was destroyed, left unmanaged, or rebuilt with an already onboarded successor.
+- Keep runtime-only removal local while declaratively managed hosts require a fixed, review-only nixcfg cleanup request; operating system type alone never implies nixcfg ownership.
+- Revoke reports through a durable retirement record, expose lifecycle intent in Activity and the fleet API, and migrate older removal records conservatively to unmanaged without exposing credential material.
+
 ## 0.1.28 - 2026-07-12
 
 - Let operators retry the latest failed pre-change host review from the existing action dialog after its cause is corrected, while preserving the failed attempt and linking the new review to it.

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 const ACTION_SCHEMA: &str = "inspr.pharos.host-action.v1";
 const ACTION_VERSION: u16 = 1;
 const RETIRED_SCHEMA: &str = "inspr.pharos.retired-hosts.v1";
-const RETIRED_VERSION: u16 = 1;
+const RETIRED_VERSION: u16 = 2;
 const LEASE_SECS: i64 = 180;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -27,6 +27,34 @@ pub(crate) enum HostActionKind {
     SystemUpdateProposal,
     UpdateRestart,
     RemoveHost,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostRetirementDisposition {
+    Destroyed,
+    #[default]
+    Unmanaged,
+    Rebuilt,
+}
+
+impl HostRetirementDisposition {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Destroyed => "destroyed",
+            Self::Unmanaged => "unmanaged",
+            Self::Rebuilt => "rebuilt",
+        }
+    }
+
+    fn validates_successor(self, host: &str, successor: Option<&str>) -> bool {
+        match self {
+            Self::Rebuilt => {
+                successor.is_some_and(|successor| valid_host_name(successor) && successor != host)
+            }
+            Self::Destroyed | Self::Unmanaged => successor.is_none(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -85,6 +113,22 @@ impl HostActionPlan {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct HostRemovalPlan {
+    pub(crate) disposition: HostRetirementDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) successor: Option<String>,
+    pub(crate) declaration_pending: bool,
+}
+
+impl HostRemovalPlan {
+    pub(crate) fn validate(&self, host: &str) -> bool {
+        self.disposition
+            .validates_successor(host, self.successor.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct HostActionResult {
     pub(crate) backup_validated: bool,
     pub(crate) switch_passed: bool,
@@ -109,6 +153,8 @@ pub(crate) struct HostActionJob {
     pub(crate) updated_at: i64,
     pub(crate) confirmed_at: Option<i64>,
     pub(crate) plan: Option<HostActionPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) removal_plan: Option<HostRemovalPlan>,
     pub(crate) result: Option<HostActionResult>,
     #[serde(default)]
     lease_phase: Option<AgentActionPhase>,
@@ -128,6 +174,15 @@ impl HostActionJob {
             && self.created_at > 0
             && self.updated_at >= self.created_at
             && self.plan.as_ref().is_none_or(HostActionPlan::validate)
+            && match self.kind {
+                HostActionKind::RemoveHost => self
+                    .removal_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.validate(&self.host)),
+                HostActionKind::SystemUpdateProposal | HostActionKind::UpdateRestart => {
+                    self.removal_plan.is_none()
+                }
+            }
     }
 
     pub(crate) fn summary(&self) -> HostActionSummary {
@@ -140,6 +195,7 @@ impl HostActionJob {
             retryable: self.review_retryable(),
             updated_at: self.updated_at,
             plan: self.plan.clone(),
+            removal_plan: self.removal_plan.clone(),
             result: self.result.clone(),
         }
     }
@@ -163,6 +219,7 @@ pub(crate) struct HostActionSummary {
     pub(crate) retryable: bool,
     pub(crate) updated_at: i64,
     pub(crate) plan: Option<HostActionPlan>,
+    pub(crate) removal_plan: Option<HostRemovalPlan>,
     pub(crate) result: Option<HostActionResult>,
 }
 
@@ -242,6 +299,7 @@ struct NewHostAction<'a> {
     actor: &'a str,
     ticket: &'a str,
     state: HostActionState,
+    removal_plan: Option<HostRemovalPlan>,
     now: i64,
 }
 
@@ -251,8 +309,17 @@ impl HostActionStore {
             .as_ref()
             .and_then(|path| read_persisted_state(path, "guarded host action"))
             .map(|jobs| {
-                let jobs: Vec<HostActionJob> = serde_json::from_slice(&jobs)
+                let mut jobs: Vec<HostActionJob> = serde_json::from_slice(&jobs)
                     .unwrap_or_else(|_| panic!("guarded host action state is malformed"));
+                for job in &mut jobs {
+                    if job.kind == HostActionKind::RemoveHost && job.removal_plan.is_none() {
+                        job.removal_plan = Some(HostRemovalPlan {
+                            disposition: HostRetirementDisposition::Unmanaged,
+                            successor: None,
+                            declaration_pending: job.state == HostActionState::RemovalPending,
+                        });
+                    }
+                }
                 let jobs: BTreeMap<_, _> =
                     jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
                 assert!(
@@ -317,6 +384,7 @@ impl HostActionStore {
             updated_at: proposal.now,
             confirmed_at: None,
             plan: None,
+            removal_plan: proposal.removal_plan,
             result: None,
             lease_phase: None,
             lease_until: None,
@@ -337,6 +405,7 @@ impl HostActionStore {
             actor,
             ticket: "PHAROS-125",
             state: HostActionState::ProposalRequested,
+            removal_plan: None,
             now,
         })
     }
@@ -395,7 +464,7 @@ impl HostActionStore {
         host: &str,
         actor: &str,
         dispatch_id: Option<String>,
-        declaration_pending: bool,
+        removal_plan: HostRemovalPlan,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         if Self::has_active(
@@ -411,11 +480,12 @@ impl HostActionStore {
             kind: HostActionKind::RemoveHost,
             actor,
             ticket: "PHAROS-127",
-            state: if declaration_pending {
+            state: if removal_plan.declaration_pending {
                 HostActionState::RemovalPending
             } else {
                 HostActionState::Succeeded
             },
+            removal_plan: Some(removal_plan),
             now,
         })
     }
@@ -631,6 +701,7 @@ impl HostActionStore {
             updated_at: now,
             confirmed_at: None,
             plan: None,
+            removal_plan: None,
             result: None,
             lease_phase: None,
             lease_until: None,
@@ -724,6 +795,10 @@ pub(crate) struct RetiredHost {
     pub(crate) host: String,
     pub(crate) requested_by: String,
     pub(crate) removal_job_id: String,
+    #[serde(default)]
+    pub(crate) disposition: HostRetirementDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) successor: Option<String>,
     pub(crate) declaration_pending: bool,
     pub(crate) retired_at: i64,
 }
@@ -733,6 +808,9 @@ impl RetiredHost {
         valid_host_name(&self.host)
             && safe_actor(&self.requested_by)
             && safe_action_id(&self.removal_job_id)
+            && self
+                .disposition
+                .validates_successor(&self.host, self.successor.as_deref())
             && self.retired_at > 0
     }
 }
@@ -758,7 +836,7 @@ impl RetiredHostStore {
                 let document: RetiredHostDocument = serde_json::from_slice(&bytes)
                     .unwrap_or_else(|_| panic!("retired host state is malformed"));
                 assert!(
-                    document.schema == RETIRED_SCHEMA && document.version == RETIRED_VERSION,
+                    document.schema == RETIRED_SCHEMA && matches!(document.version, 1 | 2),
                     "retired host state has an unsupported schema"
                 );
                 assert!(
@@ -1156,6 +1234,88 @@ mod tests {
     }
 
     #[test]
+    fn removal_plan_records_lifecycle_and_rejects_invalid_lineage() {
+        let store = HostActionStore::new(None);
+        let removal = store
+            .create_removal(
+                "gpc0",
+                "markus",
+                None,
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Rebuilt,
+                    successor: Some("stm2607".to_string()),
+                    declaration_pending: true,
+                },
+                100,
+            )
+            .expect("removal recorded");
+        assert_eq!(removal.state, HostActionState::RemovalPending);
+        let plan = removal
+            .summary()
+            .removal_plan
+            .expect("removal plan exposed");
+        assert_eq!(plan.disposition, HostRetirementDisposition::Rebuilt);
+        assert_eq!(plan.successor.as_deref(), Some("stm2607"));
+        assert!(plan.declaration_pending);
+
+        assert_eq!(
+            store.create_removal(
+                "hsb8",
+                "markus",
+                None,
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Rebuilt,
+                    successor: None,
+                    declaration_pending: true,
+                },
+                101,
+            ),
+            Err(HostActionStoreError::InvalidJob)
+        );
+    }
+
+    #[test]
+    fn legacy_removal_jobs_migrate_to_conservative_lifecycle_intent() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-legacy-removal-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let document = serde_json::json!([{
+            "schema": ACTION_SCHEMA,
+            "version": ACTION_VERSION,
+            "id": "action-remove-host-hsb8-100-1",
+            "host": "hsb8",
+            "kind": "remove_host",
+            "state": "removal_pending",
+            "requested_by": "markus",
+            "ticket": "PHAROS-127",
+            "created_at": 100,
+            "updated_at": 100,
+            "confirmed_at": null,
+            "plan": null,
+            "result": null,
+            "lease_phase": null,
+            "lease_until": null
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("legacy removal JSON"),
+        )
+        .expect("legacy removal state written");
+
+        let store = HostActionStore::new(Some(path.clone()));
+        let plan = store
+            .latest_for_host("hsb8")
+            .and_then(|job| job.removal_plan)
+            .expect("legacy removal plan migrated");
+        assert_eq!(plan.disposition, HostRetirementDisposition::Unmanaged);
+        assert!(plan.successor.is_none());
+        assert!(plan.declaration_pending);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn retry_link_must_reference_failed_same_host_attempt() {
         let retry = HostActionStore::new_update_review(
             "hsb8",
@@ -1222,17 +1382,75 @@ mod tests {
                 host: "hsb8".to_string(),
                 requested_by: "markus".to_string(),
                 removal_job_id: "action-remove-host-hsb8-100-1".to_string(),
+                disposition: HostRetirementDisposition::Rebuilt,
+                successor: Some("stm2607".to_string()),
                 declaration_pending: true,
                 retired_at: 100,
             })
             .expect("retired");
         let reloaded = RetiredHostStore::new(Some(path.clone()));
         assert!(reloaded.is_retired("hsb8"));
+        let retirement = reloaded.get("hsb8").expect("retirement reloaded");
+        assert_eq!(retirement.disposition, HostRetirementDisposition::Rebuilt);
+        assert_eq!(retirement.successor.as_deref(), Some("stm2607"));
         let raw = std::fs::read_to_string(&path).expect("retired state readable");
+        let document: serde_json::Value =
+            serde_json::from_str(&raw).expect("retired state is valid JSON");
+        assert_eq!(document["version"], RETIRED_VERSION);
         assert!(!raw.to_ascii_lowercase().contains("token"));
         assert!(!raw.to_ascii_lowercase().contains("secret"));
         assert!(reloaded.clear("hsb8").expect("retirement cleared"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_retirement_state_migrates_to_unmanaged() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-legacy-retired-hosts-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let document = serde_json::json!({
+            "schema": RETIRED_SCHEMA,
+            "version": 1,
+            "hosts": [{
+                "host": "hsb8",
+                "requested_by": "markus",
+                "removal_job_id": "action-remove-host-hsb8-100-1",
+                "declaration_pending": true,
+                "retired_at": 100
+            }]
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("legacy retirement JSON"),
+        )
+        .expect("legacy retirement state written");
+
+        let store = RetiredHostStore::new(Some(path.clone()));
+        let retirement = store.get("hsb8").expect("legacy retirement migrated");
+        assert_eq!(retirement.disposition, HostRetirementDisposition::Unmanaged);
+        assert!(retirement.successor.is_none());
+        assert!(retirement.declaration_pending);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retirement_rejects_successor_for_non_rebuilt_hosts() {
+        let store = RetiredHostStore::new(None);
+        assert_eq!(
+            store.retire(RetiredHost {
+                host: "hsb8".to_string(),
+                requested_by: "markus".to_string(),
+                removal_job_id: "action-remove-host-hsb8-100-1".to_string(),
+                disposition: HostRetirementDisposition::Destroyed,
+                successor: Some("stm2607".to_string()),
+                declaration_pending: true,
+                retired_at: 100,
+            }),
+            Err(HostActionStoreError::InvalidJob)
+        );
+        assert!(!store.is_retired("hsb8"));
     }
 
     #[test]
@@ -1257,6 +1475,8 @@ mod tests {
                 host: "hsb8".to_string(),
                 requested_by: "markus".to_string(),
                 removal_job_id: "action-remove-host-hsb8-100-1".to_string(),
+                disposition: HostRetirementDisposition::Destroyed,
+                successor: None,
                 declaration_pending: true,
                 retired_at: 100,
             }),

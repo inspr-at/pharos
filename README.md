@@ -95,6 +95,8 @@ installation tokens when JANUS-275 lands:
 export PHAROS_NIXCFG_DISPATCH_ENABLED=1
 export PHAROS_NIXCFG_DISPATCH_TOKEN_FILE=/run/pharos/nixcfg-dispatch-token
 export PHAROS_HOST_PREFERENCES_PATH=/nixcfg/modules/pharos-host-preferences.json
+# Enable only after the fixed review-only removal workflow is installed.
+export PHAROS_HOST_REMOVAL_DISPATCH_ENABLED=1
 ```
 
 Mount the token as a private, read-only runtime file; never place its value in
@@ -118,6 +120,14 @@ from the nixcfg-generated manifest, and the last preference set reported by
 the beacon. A declared change remains **change waiting** until the host's own
 later rebuild applies it and the beacon reports the matching value. Pharos does
 not trigger that rebuild or any fleet-wide deployment.
+
+Host removal uses the same narrow dispatch credential but a separate opt-in
+workflow. Runtime-only hosts are retired directly in Pharos. A host present in
+the complete preference registry or a generated manifest remains visibly
+pending while nixcfg prepares a review-only cleanup proposal. Pharos records
+whether the old host was destroyed, left unmanaged, or rebuilt; rebuilt hosts
+must name a different successor that is already onboarded. No removal action
+deletes a server, provider resource, disk, service, or application data.
 
 After a NixOS generation owns the declaration, point the beacon at that
 generation's registry with
