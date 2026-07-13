@@ -60,8 +60,9 @@ use url::Url;
 
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthState};
 use crate::host_actions::{
-    AgentActionOutcome, AgentActionResultRequest, HostActionJob, HostActionKind, HostActionState,
-    HostActionStore, HostActionStoreError, HostRemovalPlan, HostRetirementDisposition, RetiredHost,
+    AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
+    HostActionState, HostActionStore, HostActionStoreError, HostRemovalPlan,
+    HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
     RetiredHostStore,
 };
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
@@ -3383,6 +3384,8 @@ main[data-arrange="freeform"] .drag-handle{display:grid}
 .host-actions{position:relative;display:inline-flex;flex:0 0 auto}.host-actions-trigger{color:#4c6780;box-shadow:none}.host-actions-trigger:hover{border-color:rgba(31,127,181,.30);background:rgba(241,248,250,.92);color:var(--accent);box-shadow:0 7px 16px rgba(45,75,95,.08)}.host-actions-trigger:focus-visible{outline:2px solid rgba(31,127,181,.24);outline-offset:2px}.host-actions-trigger .ico{width:13px;height:13px}.host-action-dot{display:block;position:absolute;right:-1px;bottom:-1px;width:7px;height:7px;border:1px solid #fff;border-radius:50%;background:var(--sun);box-shadow:0 0 0 2px rgba(214,155,49,.10)}.host-action-dot[hidden]{display:none}
 .host-actions-menu{position:fixed;z-index:5800;width:min(280px,calc(100vw - 24px));padding:7px;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 20px 48px rgba(45,75,95,.20);color:var(--ink);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}.host-actions-menu[hidden]{display:none}.host-actions-title{display:block;padding:6px 8px 8px;color:#294761;font-size:12px;font-weight:780}.host-actions-separator{height:1px;margin:5px 2px;background:rgba(214,226,234,.78)}.host-action-item{appearance:none;width:100%;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;column-gap:9px;min-height:47px;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:#294761;font:inherit;text-align:left;text-decoration:none;cursor:pointer}.host-action-item[hidden]{display:none}.host-action-item:hover,.host-action-item:focus-visible{background:rgba(223,241,249,.62);color:#0f4f80;outline:0}.host-action-item>.ico{grid-row:1/3;width:16px;height:16px;justify-self:center}.host-action-item strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.25}.host-action-item span{display:block;min-width:0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:10px;line-height:1.25}.host-action-item.restart{color:#9a5b00}.host-action-item.restart:hover,.host-action-item.restart:focus-visible{background:rgba(255,245,222,.86);color:#7b4900}.host-action-item.remove{color:#a1322e}.host-action-item.remove:hover,.host-action-item.remove:focus-visible{background:rgba(255,232,229,.66);color:#842824}.host-actions-safety{display:flex;align-items:center;gap:8px;min-height:34px;padding:7px 8px 3px;color:var(--muted);font-size:10px}.host-actions-safety .ico{width:14px;height:14px;color:#4c6780}.card:has(.host-actions-menu:not([hidden])),.list tr:has(.host-actions-menu:not([hidden])){z-index:90}.card:has(.host-actions-menu:not([hidden])) .card-head{z-index:100}
 body[data-host-action-dialog-open="true"]{overflow:hidden}.host-action-overlay{position:fixed;inset:0;z-index:6100;display:grid;place-items:center;padding:24px;background:rgba(20,48,75,.28);-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px)}.host-action-overlay[hidden]{display:none}.host-action-backdrop{position:absolute;inset:0}.host-action-dialog{position:relative;width:min(470px,calc(100vw - 28px));max-height:calc(100vh - 40px);display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 26px 78px rgba(32,61,82,.28);overflow:hidden}.host-action-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 21px 15px;border-bottom:1px solid rgba(214,226,234,.72)}.host-action-heading{display:flex;align-items:center;gap:10px;min-width:0}.host-action-heading>[data-action-icon]{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;color:var(--accent)}.host-action-heading>[data-action-icon][hidden]{display:none}.host-action-heading>[data-action-icon] .ico{width:20px;height:20px}.host-action-dialog[data-action="remove"] .host-action-heading>[data-action-icon]{color:var(--down)}.host-action-heading h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;line-height:1.2;color:#12304b}.host-action-dialog-close{appearance:none;display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);cursor:pointer}.host-action-dialog-close:hover,.host-action-dialog-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}.host-action-dialog-close .ico{width:15px;height:15px}.host-action-dialog-body{padding:17px 21px 19px;overflow:auto}.host-action-dialog-body>p{margin:0 0 14px;color:#435e74;font-size:13px;line-height:1.5}.host-action-info{display:grid;grid-template-columns:20px minmax(0,1fr);gap:9px;padding:11px 12px;border:1px solid rgba(188,211,222,.82);border-radius:7px;background:rgba(247,251,252,.82)}.host-action-info[hidden]{display:none}.host-action-info>.ico{grid-row:1/3;width:17px;height:17px;margin-top:1px;color:#4c6780}.host-action-info strong{font-size:12px}.host-action-info span{color:var(--muted);font-size:11px;line-height:1.35}.host-action-facts{display:grid;gap:0;margin:14px 0 0;border-top:1px solid rgba(214,226,234,.72)}.host-action-fact{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;min-height:38px;align-items:center;border-bottom:1px solid rgba(214,226,234,.58);font-size:12px}.host-action-fact[hidden]{display:none}.host-action-fact span{color:var(--muted)}.host-action-fact strong{max-width:260px;overflow-wrap:anywhere;color:var(--ink);font-weight:720;text-align:right}.host-action-technical{margin:14px 0 0;padding:12px;border:1px solid rgba(188,211,222,.72);border-radius:7px;background:#f8fbfc;color:#294761;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.host-action-technical[hidden]{display:none}.host-remove-confirm{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-confirm[hidden]{display:none}.host-remove-confirm input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-confirm input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}.host-attended-confirm{display:flex;align-items:flex-start;gap:9px;margin-top:12px;padding:10px 11px;border:1px solid rgba(214,155,49,.24);border-radius:7px;background:rgba(255,248,234,.64);color:#6e5527;font-size:11px;line-height:1.4;cursor:pointer}.host-attended-confirm[hidden]{display:none}.host-attended-confirm input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:#9a5b00}.host-action-dialog-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 21px;border-top:1px solid rgba(214,226,234,.72);background:rgba(250,252,253,.78)}.host-action-safe-note{display:flex;align-items:center;gap:7px;min-width:0;color:var(--muted);font-size:10px}.host-action-safe-note .ico{width:14px;height:14px;flex:0 0 auto;color:#4c6780}.host-action-dialog-buttons{display:flex;align-items:center;gap:8px;margin-left:auto}.host-action-dialog-button{appearance:none;min-height:36px;padding:0 13px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:#294761;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.host-action-dialog-button[hidden]{display:none}.host-action-dialog-button:hover,.host-action-dialog-button:focus-visible{background:rgba(223,241,249,.66);outline:0}.host-action-dialog-button.primary{border-color:#12304b;background:#12304b;color:#fff}.host-action-dialog-button.danger{border-color:var(--down);background:var(--down);color:#fff}.host-action-dialog-button:disabled{cursor:not-allowed;border-color:rgba(137,151,163,.18);background:rgba(137,151,163,.12);color:rgba(100,119,138,.55)}.host-action-status{margin:12px 0 0;color:var(--muted);font-size:11px}.host-action-status:empty{display:none}
+.host-action-dialog[data-workflow="true"]{width:min(760px,calc(100vw - 28px))}.host-workflow[hidden]{display:none}.host-workflow{margin-top:15px}.host-workflow-summary{border-top:1px solid rgba(214,226,234,.72)}.host-workflow-group{display:grid;grid-template-columns:88px minmax(0,1fr);border-bottom:1px solid rgba(214,226,234,.72)}.host-workflow-group h3{margin:0;padding:13px 10px 0 0;color:#48657d;font-size:10px;line-height:1.3;font-weight:760;letter-spacing:0}.host-workflow-steps{min-width:0}.host-workflow-step{display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:start;gap:9px;min-height:45px;padding:9px 0;border-top:1px solid rgba(214,226,234,.50)}.host-workflow-step:first-child{border-top:0}.host-workflow-step[data-current="true"]{margin:0 -9px;padding-left:9px;padding-right:9px;background:rgba(255,248,234,.62)}.host-workflow-marker{position:relative;display:grid;place-items:center;width:17px;height:17px;margin-top:1px;border:1.5px solid #91a3b1;border-radius:50%;color:#fff}.host-workflow-marker:after{font-size:10px;font-weight:800;line-height:1}.host-workflow-step[data-step-state="passed"] .host-workflow-marker,.host-workflow-step[data-step-state="recovered"] .host-workflow-marker{border-color:var(--live);background:var(--live)}.host-workflow-step[data-step-state="passed"] .host-workflow-marker:after,.host-workflow-step[data-step-state="recovered"] .host-workflow-marker:after{content:"\2713"}.host-workflow-step[data-step-state="recovered"] .host-workflow-marker{box-shadow:0 0 0 4px rgba(37,132,95,.10)}.host-workflow-step[data-step-state="running"] .host-workflow-marker{border-color:var(--sea);box-shadow:inset 0 0 0 4px #fff;background:var(--sea)}.host-workflow-step[data-step-state="waiting"] .host-workflow-marker,.host-workflow-step[data-step-state="queued"] .host-workflow-marker{border-color:#91a3b1;background:#fff}.host-workflow-step[data-step-state="waiting"] .host-workflow-marker:after{content:"";width:5px;height:5px;border-radius:50%;background:#91a3b1}.host-workflow-step[data-step-state="confirmation_required"] .host-workflow-marker,.host-workflow-step[data-step-state="action_required"] .host-workflow-marker{border-color:var(--stale);background:#fff;box-shadow:0 0 0 4px rgba(214,155,49,.10)}.host-workflow-step[data-step-state="failed"] .host-workflow-marker{border-color:var(--down);background:var(--down)}.host-workflow-step[data-step-state="failed"] .host-workflow-marker:after{content:"!"}.host-workflow-step[data-step-state="skipped"] .host-workflow-marker,.host-workflow-step[data-step-state="cancelled"] .host-workflow-marker{border-color:#c7d2d9;background:#edf2f4}.host-workflow-step-copy{min-width:0}.host-workflow-step-copy strong,.host-workflow-step-copy span{display:block}.host-workflow-step-copy strong{color:var(--ink);font-size:12px;line-height:1.35}.host-workflow-step-copy span{margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35}.host-workflow-step-state{padding-top:1px;color:var(--muted);font-size:10px;line-height:1.3;text-align:right;white-space:nowrap}.host-workflow-step[data-step-state="passed"] .host-workflow-step-state,.host-workflow-step[data-step-state="recovered"] .host-workflow-step-state{color:var(--live)}.host-workflow-step[data-step-state="confirmation_required"] .host-workflow-step-state,.host-workflow-step[data-step-state="action_required"] .host-workflow-step-state{color:#9a5b00;font-weight:720}.host-workflow-step[data-step-state="failed"] .host-workflow-step-state{color:var(--down);font-weight:720}.host-workflow-advanced{border-bottom:1px solid rgba(214,226,234,.72)}.host-workflow-advanced summary{padding:11px 0;color:#294761;font-size:11px;font-weight:720;cursor:pointer}.host-workflow-advanced>div{padding:0 0 12px}.host-workflow-advanced p{margin:0 0 8px;color:var(--muted);font-size:10px;line-height:1.4}.host-workflow-advanced ol{display:grid;gap:7px;margin:0;padding:0;list-style:none}.host-workflow-advanced li{display:grid;grid-template-columns:64px minmax(0,1fr);gap:9px;color:#294761;font-size:10px}.host-workflow-advanced time{color:var(--muted);font-variant-numeric:tabular-nums}.host-workflow-advanced li span,.host-workflow-advanced li strong,.host-workflow-advanced li small{display:block}.host-workflow-advanced li small{margin-top:1px;color:var(--muted)}.host-workflow-persisted{position:relative;margin:10px 0 0!important;padding-left:20px;color:var(--muted)!important;font-size:10px!important}.host-workflow-persisted:before{content:"i";position:absolute;left:0;top:0;display:grid;place-items:center;width:13px;height:13px;border:1px solid #7890a2;border-radius:50%;color:#526e83;font-size:9px;font-weight:800}
+.host-workflow-evidence{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(0,1.3fr);margin:10px 0 13px;border-top:1px solid rgba(214,226,234,.58);font-size:10px}.host-workflow-evidence dt,.host-workflow-evidence dd{min-width:0;margin:0;padding:6px 0;border-bottom:1px solid rgba(214,226,234,.45)}.host-workflow-evidence dt{padding-right:10px;color:var(--muted)}.host-workflow-evidence dd{color:#294761;font-weight:680;overflow-wrap:anywhere}
 .settings-wait-note{display:flex;align-items:center;gap:6px;width:max-content;max-width:100%;min-height:18px;margin:-6px 0 8px;color:#8b620f;font-size:11px;font-weight:680;text-decoration:none;cursor:pointer}.settings-wait-note[hidden]{display:none}.settings-wait-note .ico{width:13px;height:13px;flex:0 0 13px}.settings-wait-note:hover,.settings-wait-note:focus-visible{color:#734500;text-decoration:underline;text-underline-offset:3px;outline:0}
 .host-remove-disposition,.host-remove-successor{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-disposition[hidden],.host-remove-successor[hidden]{display:none}.host-remove-successor{margin-top:11px}.host-remove-successor small{color:var(--muted);font-size:10px;font-weight:500}.host-remove-disposition select,.host-remove-successor input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-disposition select:focus,.host-remove-successor input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}
 .host-action-note{appearance:none;padding:0;border:0;background:transparent;font:inherit}.host-action-note[data-action-level="critical"]{color:var(--down)}.host-action-note[data-action-level="clear"]{color:var(--live)}
@@ -3391,7 +3394,7 @@ body[data-host-action-dialog-open="true"]{overflow:hidden}.host-action-overlay{p
 .beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
 .beat-fill{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:22px;z-index:2;height:2px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.12),var(--fill-color));transition:background-color .2s ease}
 .beat-now{position:absolute;left:var(--now-x);top:23px;z-index:8;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle,#fff 0 29%,var(--fill-color) 32% 62%,transparent 64%);box-shadow:0 0 0 5px color-mix(in srgb,var(--fill-color) 12%,transparent),0 0 14px color-mix(in srgb,var(--fill-color) 26%,transparent);transform:translate(-50%,-50%);pointer-events:none}
-.beat-current{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:21px;z-index:6;height:4px;border-radius:999px;background:linear-gradient(90deg,transparent 0,color-mix(in srgb,var(--fill-color) 30%,transparent) 16%,color-mix(in srgb,var(--fill-color) 64%,transparent) 72%,var(--fill-color) 100%);background-size:150% 100%;animation:tide 2.8s linear infinite;opacity:.86;pointer-events:none}
+.beat-current{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:21px;z-index:6;height:4px;border-radius:999px;background:linear-gradient(90deg,transparent 0,color-mix(in srgb,var(--fill-color) 30%,transparent) 16%,color-mix(in srgb,var(--fill-color) 64%,transparent) 72%,var(--fill-color) 100%);opacity:.86;pointer-events:none}
 .beat-marks{position:absolute;inset:0}
 .beat-mark{--mark-color:var(--sea);position:absolute;left:clamp(4px,var(--mark-x),calc(100% - 4px));top:23px;z-index:4;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
 .beat-mark[data-history-level="late"]{--mark-color:var(--sun)}.beat-mark[data-history-level="stale"]{--mark-color:var(--stale)}.beat-mark[data-history-level="down"]{--mark-color:var(--down)}.beat-mark[data-history-level="first"]{--mark-color:var(--wait)}
@@ -3635,7 +3638,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .assistant-delete-actions{display:flex;align-items:center;gap:11px;min-height:38px}.assistant-delete{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:38px;padding:0 13px;border:1px solid var(--down);border-radius:7px;background:#fff;color:#a1322e;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-delete .ico{width:15px;height:15px}.assistant-delete:hover:not(:disabled),.assistant-delete:focus-visible:not(:disabled){background:rgba(255,232,229,.78);box-shadow:0 0 0 3px rgba(191,58,53,.08);outline:0}.assistant-delete:disabled{cursor:not-allowed;border-color:rgba(191,58,53,.20);color:rgba(161,50,46,.42);background:rgba(255,255,255,.58)}.assistant-delete-actions span{min-width:0;color:#765b59;font-size:11px;line-height:1.35}
 .assistant-created[data-state="deleted"] .assistant-created-ready::before{background:var(--wait);box-shadow:0 0 0 5px rgba(137,151,163,.10)}.assistant-created[data-state="deleted"] .assistant-created-host .ico{color:#6d8293}
 .assistant-overlay[data-provider-created="true"] .assistant-next,.assistant-overlay[data-provider-created="true"] .assistant-created>h3{display:none}
-@media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}.host-action-overlay{padding:10px}.host-action-dialog{width:100%;max-height:calc(100vh - 20px)}.host-action-dialog-head,.host-action-dialog-body{padding-left:16px;padding-right:16px}.host-action-dialog-foot{align-items:stretch;flex-direction:column;padding-left:16px;padding-right:16px}.host-action-dialog-buttons{width:100%;margin-left:0}.host-action-dialog-button{flex:1}.host-action-safe-note{justify-content:center}.host-action-fact strong{max-width:55vw}}
+@media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}.host-action-overlay{padding:10px}.host-action-dialog{width:100%;max-height:calc(100vh - 20px)}.host-action-dialog-head,.host-action-dialog-body{padding-left:16px;padding-right:16px}.host-action-dialog-foot{align-items:stretch;flex-direction:column;padding-left:16px;padding-right:16px}.host-action-dialog-buttons{width:100%;margin-left:0}.host-action-dialog-button{flex:1}.host-action-safe-note{justify-content:center}.host-action-fact strong{max-width:55vw}.host-workflow-group{grid-template-columns:1fr}.host-workflow-group h3{padding:11px 0 3px}.host-workflow-step{grid-template-columns:18px minmax(0,1fr)}.host-workflow-step-state{grid-column:2;text-align:left}.host-workflow-step[data-current="true"]{margin:0 -6px;padding-left:6px;padding-right:6px}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -3659,7 +3662,16 @@ function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-h
 let openHostActionsRoot=null;
 let hostActionContext=null;
 let hostActionReturnFocus=null;
-let hostActionPollTimer=null;
+const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:''};
+function stopHostActionPoll(){
+  if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+  hostActionPoll.timer=null;
+  hostActionPoll.controller?.abort();
+  hostActionPoll.controller=null;
+  hostActionPoll.id=null;
+  hostActionPoll.failures=0;
+  hostActionPoll.lastRevision='';
+}
 function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
 function closeHostActions(root=openHostActionsRoot,restore=false){
   if(!root)return;
@@ -3724,10 +3736,13 @@ function hostActionTechnicalText(root){
 }
 function closeHostActionDialog(restore=true){
   const overlay=document.querySelector('[data-host-action-overlay]');
-  if(!overlay||overlay.hidden)return;
-  if(hostActionPollTimer!=null){clearTimeout(hostActionPollTimer);hostActionPollTimer=null}
+  if(!overlay)return;
+  stopHostActionPoll();
+  if(overlay.hidden)return;
   overlay.hidden=true;
   document.body.removeAttribute('data-host-action-dialog-open');
+  resumeBeatClock();
+  resumeRefresh('dialog-close');
   const input=overlay.querySelector('[data-host-remove-input]');
   if(input)input.value='';
   const disposition=overlay.querySelector('[data-host-remove-disposition]');
@@ -3744,6 +3759,7 @@ function openHostActionDialog(action,root,returnFocus){
   const overlay=document.querySelector('[data-host-action-overlay]');
   const dialog=overlay?.querySelector('[data-host-action-dialog]');
   if(!overlay||!dialog)return;
+  stopHostActionPoll();
   closeHostActions(root);
   hostActionContext={action,root,host:root.dataset.host};
   hostActionReturnFocus=returnFocus||root.querySelector('[data-host-actions-trigger]');
@@ -3766,7 +3782,9 @@ function openHostActionDialog(action,root,returnFocus){
   const attendedInput=dialog.querySelector('[data-host-attended-input]');
   const technical=dialog.querySelector('[data-host-action-technical]');
   const facts=dialog.querySelector('[data-host-action-facts]');
+  const workflow=dialog.querySelector('[data-host-workflow]');
   const status=dialog.querySelector('[data-host-action-status]');
+  dialog.dataset.workflow='false';
   if(status)status.textContent='';
   if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
   if(cancel)cancel.textContent='Cancel';
@@ -3779,6 +3797,7 @@ function openHostActionDialog(action,root,returnFocus){
   if(successorInput)successorInput.value='';
   if(attendedInput)attendedInput.checked=false;
   if(technical)technical.hidden=true;
+  if(workflow){workflow.hidden=true;workflow.replaceChildren()}
   if(facts)facts.hidden=false;
   setHostActionFact('host',root.dataset.host,true);
   setHostActionFact('state',(root.closest('[data-host-surface="runtime"]')?.dataset.live||'unknown').replaceAll('_',' '),true);
@@ -3806,6 +3825,13 @@ function openHostActionDialog(action,root,returnFocus){
     setHostActionFact('scope','',false);
     if(facts)facts.hidden=true;
     if(technical){technical.hidden=false;technical.textContent=hostActionTechnicalText(root)}
+    if(primary)primary.hidden=true;
+    if(cancel)cancel.textContent='Close';
+  }else if(action==='workflow'){
+    title.textContent=root.dataset.host+' workflow';
+    copy.textContent='Loading the saved execution checklist...';
+    if(infoTitle)infoTitle.textContent='Saved workflow';
+    if(infoCopy)infoCopy.textContent='The current state comes from the persisted server record.';
     if(primary)primary.hidden=true;
     if(cancel)cancel.textContent='Close';
   }else if(action==='remove'){
@@ -3836,13 +3862,18 @@ function openHostActionDialog(action,root,returnFocus){
   }
   overlay.hidden=false;
   document.body.dataset.hostActionDialogOpen='true';
+  stopBeatClock();
+  scheduleRefresh(HIDDEN_REFRESH_MS);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
-  if(action==='update-restart'&&root.dataset.actionJobId)pollHostActionJob(root.dataset.actionJobId,true);
+  const storedKind=root.dataset.actionKind;
+  const storedMatches=action==='workflow'
+    ||(action==='update-restart'&&storedKind==='update_restart');
+  if(action!=='technical'&&root.dataset.actionJobId&&storedMatches)pollHostActionJob(root.dataset.actionJobId,true);
 }
 async function requestHostAction(path,body){
   const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},body:JSON.stringify(body||{})});
   const payload=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(payload.error||'The guarded action could not be requested.');
+  if(!response.ok&&!payload.job)throw new Error(payload.error||payload.message||'The guarded action could not be requested.');
   return payload;
 }
 function hostActionStateLabel(state){
@@ -3883,71 +3914,94 @@ function hostActionConfirmationReady(){
   return input?.value===hostActionContext?.host&&attended?.checked===true;
 }
 function scheduleHostActionPoll(id,delay=2000){
-  if(hostActionPollTimer!=null)clearTimeout(hostActionPollTimer);
-  hostActionPollTimer=setTimeout(()=>pollHostActionJob(id,false),delay);
+  if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+  hostActionPoll.timer=null;
+  hostActionPoll.id=id;
+  if(document.hidden||!navigator.onLine||!hostActionContext)return;
+  hostActionPoll.timer=setTimeout(()=>pollHostActionJob(id,false),delay);
 }
-function renderHostActionJob(job,message){
+function hostActionPollDelay(job){
+  const kind=job?.workflow?.kind;
+  if(kind==='settings_change'||kind==='remove_host')return 10000;
+  return job?.state==='rebooting'?5000:2000;
+}
+function renderHostActionJob(job,message,workflowHtml){
   if(!hostActionContext||!job)return;
   const overlay=document.querySelector('[data-host-action-overlay]');
+  const dialog=overlay?.querySelector('[data-host-action-dialog]');
   const primary=overlay?.querySelector('[data-host-action-primary]');
+  const cancel=overlay?.querySelector('.host-action-dialog-buttons [data-host-action-close]');
   const status=overlay?.querySelector('[data-host-action-status]');
   const copy=overlay?.querySelector('[data-host-action-copy]');
-  const infoTitle=overlay?.querySelector('[data-host-action-info-title]');
-  const infoCopy=overlay?.querySelector('[data-host-action-info-copy]');
+  const title=overlay?.querySelector('[data-host-action-title]');
+  const info=overlay?.querySelector('[data-host-action-info]');
+  const facts=overlay?.querySelector('[data-host-action-facts]');
+  const workflowRoot=overlay?.querySelector('[data-host-workflow]');
+  const safeNote=overlay?.querySelector('[data-host-action-safe-note]');
   const confirm=overlay?.querySelector('[data-host-remove-confirm]');
   const removeName=overlay?.querySelector('[data-host-remove-name]');
   const attended=overlay?.querySelector('[data-host-attended-confirm]');
+  const workflow=job.workflow||{};
+  const workflowKind=String(workflow.kind||job.kind||'');
+  const primaryAction=workflow.primary_action||null;
   hostActionContext.jobId=job.id;
+  hostActionContext.action=workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':workflowKind==='system_update_proposal'?'system-update':'workflow';
   hostActionContext.root.dataset.actionJobId=job.id;
-  hostActionContext.root.dataset.actionKind=job.kind;
+  hostActionContext.root.dataset.actionKind=workflowKind;
   hostActionContext.root.dataset.actionState=job.state;
-  setHostActionFact('state',hostActionStateLabel(job.state),true);
-  if(status)status.textContent=message||hostActionStateLabel(job.state)+'.';
-  if(job.plan){
-    const areas=Array.isArray(job.plan.changed_areas)?job.plan.changed_areas.join(', '):'';
-    setHostActionFact('backup',job.plan.backup_ready?'ready for live gate':'not ready',true);
-    setHostActionFact('kernel',(job.plan.running_kernel||'not reported')+' → '+(job.plan.expected_kernel||'not reported'),true);
-    setHostActionFact('scope',String(job.plan.changed_file_count||0)+' changed files'+(areas?' · '+areas:''),true);
+  hostActionPoll.lastRevision=[job.id,job.state,job.updated_at].join(':');
+  if(dialog){dialog.dataset.workflow='true';dialog.dataset.action=workflowKind.replaceAll('_','-')}
+  dialog?.querySelectorAll('[data-action-icon]').forEach(icon=>{
+    const iconKind=workflowKind==='settings_change'?'settings-change':workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':'system-update';
+    icon.hidden=icon.dataset.actionIcon!==iconKind;
+  });
+  if(title)title.textContent=workflow.title||hostActionContext.host+' workflow';
+  if(copy)copy.textContent=workflow.guidance||message||hostActionStateLabel(job.state)+'.';
+  if(info)info.hidden=true;
+  if(facts)facts.hidden=true;
+  if(workflowRoot){workflowRoot.hidden=false;workflowRoot.innerHTML=workflowHtml||''}
+  if(safeNote)safeNote.textContent='Persisted and reviewable';
+  if(status)status.textContent=message||'';
+  if(cancel)cancel.textContent='Close';
+  if(confirm)confirm.hidden=primaryAction?.kind!=='confirm';
+  if(attended)attended.hidden=primaryAction?.kind!=='confirm';
+  if(removeName)removeName.textContent=hostActionContext.host;
+  hostActionContext.stage=primaryAction?.kind||'observe';
+  if(primaryAction&&primary){
+    primary.hidden=false;
+    primary.classList.remove('danger');
+    primary.textContent=primaryAction.label||'Continue';
+    primary.disabled=primaryAction.kind==='confirm'?!hostActionConfirmationReady():false;
+  }else if(primary){
+    primary.hidden=true;
   }
-  if(job.state==='awaiting_confirmation'){
-    hostActionContext.stage='confirm';
-    if(copy)copy.textContent='The target-local review passed. Confirm only while the host or recovery console is attended.';
-    if(infoTitle)infoTitle.textContent='Final live-change gate';
-    if(infoCopy)infoCopy.textContent='A fresh validated backup and Janus permit are still enforced immediately before switch and restart.';
-    if(confirm)confirm.hidden=false;
-    if(removeName)removeName.textContent=hostActionContext.host;
-    if(attended)attended.hidden=false;
-    if(primary){primary.hidden=false;primary.textContent='Apply update and restart';primary.disabled=!hostActionConfirmationReady()}
-  }else if(job.state==='failed'&&job.retryable===true){
-    hostActionContext.stage='retry';
-    if(copy)copy.textContent='The review stopped safely before any live change. Retry only after the reported cause has been corrected.';
-    if(infoTitle)infoTitle.textContent='Nothing changed on the host';
-    if(infoCopy)infoCopy.textContent='Retry creates a new audited review and keeps this failed attempt in the action history.';
-    if(primary){primary.hidden=false;primary.textContent='Retry guarded review';primary.disabled=false}
-  }else if(job.state==='failed'){
-    hostActionContext.stage='failed';
-    if(copy)copy.textContent='This failure happened after the review gate and cannot be retried automatically.';
-    if(infoTitle)infoTitle.textContent='Manual recovery required';
-    if(infoCopy)infoCopy.textContent='Inspect the host and rollback posture before starting another live workflow.';
-    if(primary)primary.hidden=true;
-  }else{
-    if(confirm)confirm.hidden=true;
-    if(attended)attended.hidden=true;
-    if(primary)primary.hidden=true;
-  }
-  if(['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))scheduleHostActionPoll(job.id,job.state==='rebooting'?5000:2000);
+  const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
+    ||(workflowKind==='settings_change'&&!['succeeded','failed'].includes(job.state))
+    ||(workflowKind==='remove_host'&&job.state==='removal_pending');
+  if(active)scheduleHostActionPoll(job.id,hostActionPollDelay(job));
 }
 async function pollHostActionJob(id,immediate=false){
   if(!hostActionContext||hostActionContext.jobId&&hostActionContext.jobId!==id)return;
+  if(document.hidden||!navigator.onLine){hostActionPoll.id=id;return}
+  hostActionPoll.controller?.abort();
+  const controller=new AbortController();
+  hostActionPoll.controller=controller;
   try{
-    const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{credentials:'same-origin',cache:'no-store'});
+    const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{credentials:'same-origin',cache:'no-store',signal:controller.signal});
     const payload=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(payload.error||'Could not refresh guarded action state.');
-    renderHostActionJob(payload.job,payload.message);
+    hostActionPoll.failures=0;
+    const revision=[payload.job?.id,payload.job?.state,payload.job?.updated_at].join(':');
+    if(immediate||revision!==hostActionPoll.lastRevision)renderHostActionJob(payload.job,payload.message,payload.workflow_html);
+    else scheduleHostActionPoll(id,hostActionPollDelay(payload.job));
   }catch(error){
+    if(error?.name==='AbortError')return;
     const status=document.querySelector('[data-host-action-status]');
     if(status)status.textContent=error instanceof Error?error.message:'Could not refresh guarded action state.';
-    if(!immediate)scheduleHostActionPoll(id,5000);
+    hostActionPoll.failures=Math.min(hostActionPoll.failures+1,4);
+    scheduleHostActionPoll(id,Math.min(30000,3000*(2**hostActionPoll.failures)));
+  }finally{
+    if(hostActionPoll.controller===controller)hostActionPoll.controller=null;
   }
 }
 async function submitHostAction(){
@@ -3958,12 +4012,16 @@ async function submitHostAction(){
   const status=overlay?.querySelector('[data-host-action-status]');
   if(!primary||!status)return;
   primary.disabled=true;
-  status.textContent=action==='remove'?'Recording retirement and revoking reports…':'Requesting a guarded review…';
+  status.textContent=action==='remove'?'Recording retirement and revoking reports…'
+    :hostActionContext.stage==='recover'?'Queueing target-local recovery checks…'
+    :hostActionContext.stage==='confirm'?'Recording attended confirmation…'
+    :'Requesting a guarded review…';
   try{
     let result;
     if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
     else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
+    else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
     else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
     else if(action==='remove'){
       const disposition=overlay.querySelector('[data-host-remove-disposition]')?.value||'';
@@ -3972,8 +4030,7 @@ async function submitHostAction(){
     }
     else return;
     status.textContent=result.message||'Request recorded.';
-    if(action==='remove')setTimeout(()=>location.reload(),700);
-    else if(action==='update-restart')renderHostActionJob(result.job,result.message);
+    if(result?.job)renderHostActionJob(result.job,result.message,result.workflow_html);
     else primary.hidden=true;
   }catch(error){
     status.textContent=error instanceof Error?error.message:'The guarded action could not be requested.';
@@ -3991,6 +4048,7 @@ function updateHostActionState(surface,host,backup){
   const systemUpdateAvailable=root.dataset.systemUpdateAvailable==='true';
   const hostRemovalAvailable=root.dataset.hostRemovalAvailable==='true';
   const job=host.host_action||null;
+  const workflow=job?.workflow||null;
   const retirement=host.retirement||null;
   root.dataset.settingsState=state;
   root.dataset.kernelState=kernelState;
@@ -3999,7 +4057,7 @@ function updateHostActionState(surface,host,backup){
   root.dataset.retired=retirement?.pending===true?'true':'false';
   root.dataset.retirementDisposition=String(retirement?.disposition||'');
   root.dataset.retirementSuccessor=String(retirement?.successor||'');
-  if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(job.kind||'');root.dataset.actionState=String(job.state||'')}
+  if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(workflow?.kind||job.kind||'');root.dataset.actionState=String(job.state||'')}
   else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
   if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
   const review=root.querySelector('[data-host-action="review-pending"]');
@@ -4009,7 +4067,7 @@ function updateHostActionState(surface,host,backup){
   const primarySeparator=root.querySelector('[data-primary-separator]');
   const removeSeparator=root.querySelector('[data-remove-separator]');
   if(review)review.hidden=state==='applied';
-  const updateJobActive=job?.kind==='update_restart'&&!['succeeded'].includes(job.state);
+  const updateJobActive=workflow?.kind==='update_restart'&&job.state!=='succeeded';
   const updatePending=kernelState==='reboot_required'||commitsBehind>0;
   root.dataset.updatePending=updatePending?'true':'false';
   const retired=retirement?.pending===true;
@@ -4028,8 +4086,8 @@ function updateHostActionState(surface,host,backup){
   if(note){
     const show=retired||(job&&!['succeeded'].includes(job.state));
     note.hidden=!show;
-    note.dataset.actionLevel=job?.state==='failed'?'critical':job?.state==='succeeded'?'clear':'warning';
-    if(noteCopy)noteCopy.textContent=retired?'removal pending':hostActionStateLabel(job?.state);
+    note.dataset.actionLevel=retired?'warning':String(workflow?.status_level||'warning');
+    if(noteCopy)noteCopy.textContent=retired?'removal pending':String(workflow?.status_label||hostActionStateLabel(job?.state));
   }
   const dot=root.querySelector('[data-host-action-dot]');
   if(dot)dot.hidden=state==='applied'&&kernelState!=='reboot_required'&&!retired&&!(job&&!['succeeded'].includes(job.state));
@@ -4044,7 +4102,11 @@ function initHostActions(){
       event.preventDefault();
       const surface=actionNote.closest('[data-host-surface="runtime"]');
       const root=surface?.querySelector('[data-host-actions]');
-      if(root)openHostActionDialog(root.dataset.retired==='true'?'remove':'update-restart',root,actionNote);
+      if(root){
+        const kind=root.dataset.actionKind;
+        const action=kind==='update_restart'?'update-restart':'workflow';
+        openHostActionDialog(action,root,actionNote);
+      }
       return;
     }
     const actionItem=event.target.closest('[data-host-action]');
@@ -4091,6 +4153,18 @@ function initHostActions(){
     if(primary&&hostActionContext?.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
   });
   document.querySelector('[data-host-action-primary]')?.addEventListener('click',submitHostAction);
+  document.addEventListener('visibilitychange',()=>{
+    if(!document.hidden&&hostActionContext?.jobId)pollHostActionJob(hostActionContext.jobId,true);
+  });
+  window.addEventListener('online',()=>{
+    if(hostActionContext?.jobId)pollHostActionJob(hostActionContext.jobId,true);
+  });
+  window.addEventListener('offline',()=>{
+    if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+    hostActionPoll.timer=null;
+    const status=document.querySelector('[data-host-action-status]');
+    if(status&&hostActionContext)status.textContent='Offline. The saved workflow will refresh when connectivity returns.';
+  });
   window.addEventListener('resize',()=>closeHostActions(openHostActionsRoot));
   window.addEventListener('scroll',()=>closeHostActions(openHostActionsRoot),true);
 }
@@ -4438,12 +4512,23 @@ function updateBeatClock(beat,now){
   }
   updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now));
 }
+let beatClockTimer=null;
+function stopBeatClock(){
+  if(beatClockTimer!=null)clearTimeout(beatClockTimer);
+  beatClockTimer=null;
+}
 function frame(){
+  stopBeatClock();
+  if(document.hidden||document.body.dataset.hostActionDialogOpen==='true')return;
   const now=Date.now()/1000;
   document.querySelectorAll('.beat').forEach(beat=>{
     updateBeatClock(beat,now);
   });
-  requestAnimationFrame(frame);
+  beatClockTimer=setTimeout(frame,1000);
+}
+function resumeBeatClock(){
+  stopBeatClock();
+  if(!document.hidden&&document.body.dataset.hostActionDialogOpen!=='true')frame();
 }
 function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
@@ -5753,7 +5838,7 @@ function clearRefreshTimer(){
   }
 }
 function nextRefreshDelay(){
-  return document.hidden?HIDDEN_REFRESH_MS:REFRESH_MS;
+  return document.hidden||document.body.dataset.hostActionDialogOpen==='true'?HIDDEN_REFRESH_MS:REFRESH_MS;
 }
 function scheduleRefresh(delay=nextRefreshDelay()){
   clearRefreshTimer();
@@ -5846,14 +5931,14 @@ function resumeRefresh(reason){
   }
   refresh(reason);
 }
-document.addEventListener('visibilitychange',()=>resumeRefresh('visible'));
-window.addEventListener('focus',()=>resumeRefresh('focus'));
+document.addEventListener('visibilitychange',()=>{resumeRefresh('visible');resumeBeatClock()});
+window.addEventListener('focus',()=>{resumeRefresh('focus');resumeBeatClock()});
 window.addEventListener('pageshow',()=>resumeRefresh('pageshow'));
 window.addEventListener('online',()=>resumeRefresh('online'));
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
 initControls();
-requestAnimationFrame(frame);
+resumeBeatClock();
 scheduleRefresh(3000);
 </script></body></html>"#;
 
@@ -6267,7 +6352,7 @@ fn action_request_header(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value == "1")
 }
 
-fn action_actor(auth: &AuthState, headers: &HeaderMap) -> String {
+pub(crate) fn action_actor(auth: &AuthState, headers: &HeaderMap) -> String {
     let raw = sidebar_user_label(auth, headers);
     let actor: String = raw
         .trim()
@@ -6287,6 +6372,37 @@ fn action_error(status: StatusCode, message: &str) -> (StatusCode, Json<serde_js
 }
 
 fn action_message(job: &HostActionJob) -> &'static str {
+    if job.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange {
+        return match job.state {
+            HostActionState::Succeeded => "The host reported the requested settings.",
+            HostActionState::Failed => "The settings request stopped and was recorded.",
+            _ => "The settings request is saved and waiting for the host.",
+        };
+    }
+    if job.workflow_kind() == host_actions::HostWorkflowKind::RemoveHost {
+        return match job.state {
+            HostActionState::ProposalRequested => {
+                "The retirement intent is saved while Pharos finishes the guarded handoff."
+            }
+            HostActionState::RemovalPending => {
+                "Beacon access is revoked; declarative removal is waiting for review and apply."
+            }
+            HostActionState::Succeeded => "The host retirement completed and was recorded.",
+            HostActionState::Failed => "The removal request stopped safely and remains recorded.",
+            _ => "The host retirement workflow is recorded.",
+        };
+    }
+    if job.recovery_started_at.is_some() {
+        return match job.state {
+            HostActionState::Applying => "The target-local recovery checks are running.",
+            HostActionState::Rebooting => "Recovery checks are queued for the target-local agent.",
+            HostActionState::Succeeded => {
+                "Current host evidence passed and the workflow was recovered."
+            }
+            HostActionState::Failed => "Recovery verification stopped and remains recorded.",
+            _ => "The recovery branch is recorded.",
+        };
+    }
     match job.state {
         HostActionState::ProposalRequested => {
             "Update review requested. No branch has been merged and no host has changed."
@@ -6303,9 +6419,10 @@ fn action_message(job: &HostActionJob) -> &'static str {
             "Beacon access is revoked; declarative removal is waiting for review and apply."
         }
         HostActionState::Succeeded => "The guarded action completed and was recorded.",
-        HostActionState::Failed => {
-            "The guarded action stopped. Resolve this failure before continuing to another host."
+        HostActionState::Failed if job.recoverable() => {
+            "The live workflow stopped. Reconcile this saved run with current host evidence before continuing."
         }
+        HostActionState::Failed => "The guarded action stopped safely and remains recorded.",
     }
 }
 
@@ -6313,13 +6430,118 @@ fn action_response(
     status: StatusCode,
     job: &HostActionJob,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    action_response_with_message(status, job, action_message(job))
+}
+
+fn action_response_with_message(
+    status: StatusCode,
+    job: &HostActionJob,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let summary = job.summary();
+    let workflow_html = host_workflow_markup(&summary.workflow);
     (
         status,
         Json(json!({
-            "message": action_message(job),
-            "job": job.summary(),
+            "message": message,
+            "job": summary,
+            "workflow_html": workflow_html,
         })),
     )
+}
+
+pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
+    let mut groups = String::new();
+    let mut current_group = "";
+    for (index, step) in workflow.steps.iter().enumerate() {
+        if step.group != current_group {
+            if !current_group.is_empty() {
+                groups.push_str("</div></section>");
+            }
+            current_group = &step.group;
+            groups.push_str(&format!(
+                r#"<section class="host-workflow-group"><h3>{}</h3><div class="host-workflow-steps">"#,
+                html_escape(current_group)
+            ));
+        }
+        groups.push_str(&format!(
+            r#"<div class="host-workflow-step" data-step-state="{state}" data-current="{current}"><span class="host-workflow-marker" aria-hidden="true"></span><span class="host-workflow-step-copy"><strong>{number}. {label}</strong><span>{detail}</span></span><span class="host-workflow-step-state">{state_label}</span></div>"#,
+            state = step.state.key(),
+            current = workflow.current_step.as_deref() == Some(step.key.as_str()),
+            number = index + 1,
+            label = html_escape(&step.label),
+            detail = html_escape(&step.detail),
+            state_label = workflow_step_state_label(step.state.key()),
+        ));
+    }
+    if !current_group.is_empty() {
+        groups.push_str("</div></section>");
+    }
+
+    let evidence = workflow
+        .evidence
+        .iter()
+        .map(|fact| {
+            format!(
+                "<dt>{}</dt><dd>{}</dd>",
+                html_escape(&fact.label),
+                html_escape(&fact.value)
+            )
+        })
+        .collect::<String>();
+    let events = workflow
+        .events
+        .iter()
+        .rev()
+        .map(|event| {
+            let source = match event.source {
+                HostActionEventSource::Operator => "operator",
+                HostActionEventSource::HostAgent => "host agent",
+                HostActionEventSource::Beacon => "heartbeat",
+                HostActionEventSource::Pharos => "Pharos",
+            };
+            let actor = event
+                .actor
+                .as_deref()
+                .map(|actor| format!(" · {}", html_escape(actor)))
+                .unwrap_or_default();
+            format!(
+                r#"<li><time>{}</time><span><strong>{}</strong><small>{source}{actor}</small></span></li>"#,
+                clock_label(event.at),
+                html_escape(&event.label),
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}">{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, paths, opaque identifiers, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
+        kind = workflow_kind_key(workflow.kind),
+        status = html_escape(&workflow.status_label),
+    )
+}
+
+fn workflow_kind_key(kind: host_actions::HostWorkflowKind) -> &'static str {
+    match kind {
+        host_actions::HostWorkflowKind::SettingsChange => "settings_change",
+        host_actions::HostWorkflowKind::SystemUpdateProposal => "system_update_proposal",
+        host_actions::HostWorkflowKind::UpdateRestart => "update_restart",
+        host_actions::HostWorkflowKind::RemoveHost => "remove_host",
+    }
+}
+
+fn workflow_step_state_label(state: &str) -> &'static str {
+    match state {
+        "queued" => "queued",
+        "running" => "in progress",
+        "waiting" => "waiting",
+        "confirmation_required" => "confirmation required",
+        "action_required" => "action required",
+        "passed" => "complete",
+        "failed" => "stopped",
+        "skipped" => "not required",
+        "recovered" => "recovered",
+        "cancelled" => "cancelled",
+        _ => "recorded",
+    }
 }
 
 fn host_is_declared(state: &AppState, host: &str) -> bool {
@@ -6393,23 +6615,43 @@ async fn request_system_update(
         );
     }
     let actor = action_actor(&state.auth, &headers);
-    let request_id = match state.nixcfg_dispatch.dispatch_system_update(host).await {
-        Ok(request_id) => request_id,
-        Err(error) => return action_error(StatusCode::BAD_GATEWAY, error.safe_message()),
-    };
-    let job =
-        match state
-            .host_actions
-            .create_system_update_proposal(request_id, host, &actor, now_unix())
-        {
-            Ok(job) => job,
-            Err(_) => {
-                return action_error(
+    let now = now_unix();
+    let workflow = match state
+        .host_actions
+        .begin_system_update_proposal(host, &actor, now)
+    {
+        Ok(workflow) => workflow,
+        Err(_) => {
+            return action_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "The update workflow was reached, but local review tracking could not be recorded",
+                "The update review checklist could not be recorded",
             );
-            }
-        };
+        }
+    };
+    if let Err(error) = state.nixcfg_dispatch.dispatch_system_update(host).await {
+        let failed = state
+            .host_actions
+            .fail_system_update_proposal(&workflow.id, now_unix())
+            .unwrap_or(workflow);
+        return action_response_with_message(
+            StatusCode::BAD_GATEWAY,
+            &failed,
+            error.safe_message(),
+        );
+    }
+    let job = match state
+        .host_actions
+        .accept_system_update_proposal(&workflow.id, now_unix())
+    {
+        Ok(job) => job,
+        Err(_) => {
+            return action_response_with_message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &workflow,
+                "The update request was sent, but its saved checklist could not be updated",
+            );
+        }
+    };
     tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-125", "system update review requested");
     action_response(StatusCode::ACCEPTED, &job)
 }
@@ -6514,6 +6756,82 @@ async fn retry_update_restart_review(
     }
 }
 
+async fn recover_update_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&existing.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded recovery access is not granted",
+        );
+    }
+    let Some(runtime) = state.store.get(&existing.host) else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The host is not reporting; inspect it before starting recovery checks",
+        );
+    };
+    if liveness(
+        runtime.last_seen,
+        runtime.heartbeat_interval_secs,
+        now_unix(),
+    ) != Liveness::Live
+    {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Wait for a fresh live heartbeat before starting recovery checks",
+        );
+    }
+    if !runtime
+        .kernel
+        .as_ref()
+        .is_some_and(|kernel| kernel.state == KernelPostureState::Current)
+    {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The host has not reported the expected current kernel",
+        );
+    }
+    let actor = action_actor(&state.auth, &headers);
+    match state
+        .host_actions
+        .queue_recovery(&id, &existing.host, &actor, now_unix())
+    {
+        Ok(job) => {
+            tracing::info!(host = %job.host, actor = %actor, ticket = "PHAROS-131", "guarded host workflow recovery queued");
+            action_response(StatusCode::ACCEPTED, &job)
+        }
+        Err(HostActionStoreError::InvalidTransition) => action_error(
+            StatusCode::CONFLICT,
+            "Only the latest failed post-confirmation workflow can enter recovery",
+        ),
+        Err(HostActionStoreError::BlockedByFleetGate) => action_error(
+            StatusCode::CONFLICT,
+            "Resolve the earlier host workflow before starting this recovery",
+        ),
+        Err(HostActionStoreError::WrongHost) => action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded action does not belong to this host",
+        ),
+        Err(HostActionStoreError::NotFound) => {
+            action_error(StatusCode::NOT_FOUND, "Guarded action was not found")
+        }
+        Err(_) => action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The recovery branch could not be recorded",
+        ),
+    }
+}
+
 async fn host_action_job_json(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6557,9 +6875,10 @@ async fn confirm_update_restart(
             "Type the exact host name and confirm that the host is attended",
         );
     }
+    let actor = action_actor(&state.auth, &headers);
     match state
         .host_actions
-        .confirm_update(&id, &existing.host, now_unix())
+        .confirm_update(&id, &existing.host, &actor, now_unix())
     {
         Ok(job) => {
             tracing::info!(host = %job.host, ticket = "PHAROS-126", "guarded host update confirmed");
@@ -6636,29 +6955,11 @@ async fn request_host_removal(
         }
     }
     let actor = action_actor(&state.auth, &headers);
-    let dispatch_id = if declaration_pending {
-        match state
-            .nixcfg_dispatch
-            .dispatch_host_removal(
-                &host,
-                removal_plan.disposition.key(),
-                removal_plan.successor.as_deref(),
-            )
-            .await
-        {
-            Ok(request_id) => Some(request_id),
-            Err(error) => return action_error(StatusCode::BAD_GATEWAY, error.safe_message()),
-        }
-    } else {
-        None
-    };
-    let job = match state.host_actions.create_removal(
-        &host,
-        &actor,
-        dispatch_id,
-        removal_plan.clone(),
-        now_unix(),
-    ) {
+    let now = now_unix();
+    let workflow = match state
+        .host_actions
+        .begin_removal(&host, &actor, removal_plan.clone(), now)
+    {
         Ok(job) => job,
         Err(HostActionStoreError::ActiveJob) => {
             return action_error(
@@ -6673,24 +6974,64 @@ async fn request_host_removal(
             );
         }
     };
+    if declaration_pending {
+        if let Err(error) = state
+            .nixcfg_dispatch
+            .dispatch_host_removal(
+                &host,
+                removal_plan.disposition.key(),
+                removal_plan.successor.as_deref(),
+            )
+            .await
+        {
+            let failed = state
+                .host_actions
+                .fail_removal(&workflow.id, now_unix())
+                .unwrap_or(workflow);
+            return action_response_with_message(
+                StatusCode::BAD_GATEWAY,
+                &failed,
+                error.safe_message(),
+            );
+        }
+    }
     if state
         .retired_hosts
         .retire(RetiredHost {
             host: host.clone(),
             requested_by: actor.clone(),
-            removal_job_id: job.id.clone(),
+            removal_job_id: workflow.id.clone(),
             disposition: removal_plan.disposition,
             successor: removal_plan.successor.clone(),
             declaration_pending,
-            retired_at: now_unix(),
+            retired_at: now,
         })
         .is_err()
     {
-        return action_error(
+        let failed = state
+            .host_actions
+            .fail_removal(&workflow.id, now_unix())
+            .unwrap_or(workflow);
+        return action_response_with_message(
             StatusCode::INTERNAL_SERVER_ERROR,
+            &failed,
             "Beacon revocation could not be persisted",
         );
     }
+    let job = match state
+        .host_actions
+        .mark_removal_access_revoked(&workflow.id, now_unix())
+    {
+        Ok(job) => job,
+        Err(_) => {
+            let current = state.host_actions.get(&workflow.id).unwrap_or(workflow);
+            return action_response_with_message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &current,
+                "Beacon access was revoked, but the saved checklist still needs reconciliation",
+            );
+        }
+    };
     if !declaration_pending {
         state.store.remove(&host);
     }
@@ -6739,6 +7080,14 @@ async fn allow_host_reonboarding(
 
 fn reconcile_completed_removals(state: &AppState, now: i64) {
     for retired in state.retired_hosts.list() {
+        if state
+            .host_actions
+            .mark_removal_access_revoked(&retired.removal_job_id, now)
+            .is_err()
+        {
+            tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "retired host checklist reconciliation could not be persisted");
+            continue;
+        }
         if !retired.declaration_pending {
             state.store.remove(&retired.host);
             continue;
@@ -8242,7 +8591,25 @@ async fn report(
         );
     }
     tracing::info!(host = %rep.name, "report received");
-    state.store.record(rep, now_unix());
+    let host_name = rep.name.clone();
+    let settings_applied = state
+        .store
+        .get(&host_name)
+        .and_then(|host| host.requested_preferences)
+        .is_some_and(|requested| requested == rep.preferences);
+    let now = now_unix();
+    state.store.record(rep, now);
+    if settings_applied {
+        match state.host_actions.complete_settings_change(&host_name, now) {
+            Ok(Some(_)) => {
+                tracing::info!(host = %host_name, ticket = "PHAROS-129", "host settings workflow completed");
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(host = %host_name, ticket = "PHAROS-129", "host settings applied but workflow completion could not be persisted");
+            }
+        }
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -8327,7 +8694,7 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
             else {
                 continue;
             };
-            if let Some(action) = state.host_actions.latest_for_host(&name) {
+            if let Some(action) = state.host_actions.most_relevant_for_host(&name) {
                 host["host_action"] = serde_json::to_value(action.summary()).unwrap_or_default();
             }
             if let Some(retired) = state.retired_hosts.get(&name) {
@@ -9421,11 +9788,12 @@ fn host_actions_markup(host: &Host, context: HostActionRenderContext<'_>) -> Str
     )
 }
 
-fn host_action_dialog() -> String {
+pub(crate) fn host_action_dialog() -> String {
     format!(
-        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button" type="button" data-host-action-close>Cancel</button><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button></span></footer></section></section>"#,
+        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="settings-change" hidden>{sliders}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><div class="host-workflow" data-host-workflow hidden></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button" type="button" data-host-action-close>Cancel</button><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button></span></footer></section></section>"#,
         package = icons::PACKAGE_SEARCH,
         power = icons::POWER,
+        sliders = icons::SLIDERS,
         file = icons::FILE_TEXT,
         trash = icons::TRASH_2,
         close = icons::X,
@@ -12594,36 +12962,86 @@ fn activity_events(
     }
 
     for job in action_jobs {
-        let (level, title) = match (job.kind, job.state) {
-            (HostActionKind::SystemUpdateProposal, HostActionState::ProposalRequested) => {
+        let (level, title) = match (job.workflow_kind(), job.state) {
+            (HostWorkflowKind::SettingsChange, HostActionState::ProposalRequested) => {
+                ("watch", "Host settings change waiting")
+            }
+            (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => {
+                ("recovery", "Host settings applied")
+            }
+            (HostWorkflowKind::SettingsChange, HostActionState::Failed) => {
+                ("warning", "Host settings request stopped")
+            }
+            (HostWorkflowKind::SystemUpdateProposal, HostActionState::ProposalRequested) => {
                 ("info", "System update review requested")
             }
-            (HostActionKind::UpdateRestart, HostActionState::QueuedReview) => {
+            (HostWorkflowKind::SystemUpdateProposal, HostActionState::Succeeded) => {
+                ("recovery", "System update review completed")
+            }
+            (HostWorkflowKind::SystemUpdateProposal, HostActionState::Failed) => {
+                ("warning", "System update review stopped")
+            }
+            (HostWorkflowKind::UpdateRestart, HostActionState::QueuedReview) => {
                 ("watch", "Guarded update review queued")
             }
-            (HostActionKind::UpdateRestart, HostActionState::Reviewing) => {
+            (HostWorkflowKind::UpdateRestart, HostActionState::Reviewing) => {
                 ("watch", "Guarded update review running")
             }
-            (HostActionKind::UpdateRestart, HostActionState::AwaitingConfirmation) => {
+            (HostWorkflowKind::UpdateRestart, HostActionState::AwaitingConfirmation) => {
                 ("watch", "Update review ready for confirmation")
             }
-            (HostActionKind::UpdateRestart, HostActionState::QueuedApply) => {
+            (HostWorkflowKind::UpdateRestart, HostActionState::QueuedApply) => {
                 ("warning", "Update and restart confirmed")
             }
-            (HostActionKind::UpdateRestart, HostActionState::Applying) => {
+            (HostWorkflowKind::UpdateRestart, HostActionState::Applying)
+                if job.recovery_started_at.is_some() =>
+            {
+                ("warning", "Recovery verification running")
+            }
+            (HostWorkflowKind::UpdateRestart, HostActionState::Applying) => {
                 ("warning", "Target-local update running")
             }
-            (HostActionKind::UpdateRestart, HostActionState::Rebooting) => {
+            (HostWorkflowKind::UpdateRestart, HostActionState::Rebooting)
+                if job.recovery_started_at.is_some() =>
+            {
+                ("warning", "Recovery verification queued")
+            }
+            (HostWorkflowKind::UpdateRestart, HostActionState::Rebooting) => {
                 ("warning", "Host restart in progress")
             }
-            (HostActionKind::RemoveHost, HostActionState::RemovalPending) => {
+            (HostWorkflowKind::UpdateRestart, HostActionState::Succeeded)
+                if job.recovery_started_at.is_some() =>
+            {
+                ("recovery", "Guarded update recovered and verified")
+            }
+            (HostWorkflowKind::UpdateRestart, HostActionState::Succeeded) => {
+                ("recovery", "Guarded host update completed")
+            }
+            (HostWorkflowKind::UpdateRestart, HostActionState::Failed)
+                if job.recovery_started_at.is_some() =>
+            {
+                ("warning", "Recovery verification needs attention")
+            }
+            (HostWorkflowKind::UpdateRestart, HostActionState::Failed)
+                if job.confirmed_at.is_none() =>
+            {
+                ("warning", "Guarded update review stopped")
+            }
+            (HostWorkflowKind::UpdateRestart, HostActionState::Failed) => {
+                ("warning", "Guarded update needs verification")
+            }
+            (HostWorkflowKind::RemoveHost, HostActionState::ProposalRequested) => {
+                ("watch", "Host removal preparing")
+            }
+            (HostWorkflowKind::RemoveHost, HostActionState::RemovalPending) => {
                 ("warning", "Host removal pending")
             }
-            (HostActionKind::RemoveHost, HostActionState::Succeeded) => {
+            (HostWorkflowKind::RemoveHost, HostActionState::Succeeded) => {
                 ("recovery", "Host removed from Pharos")
             }
-            (_, HostActionState::Succeeded) => ("recovery", "Guarded host action completed"),
-            (_, HostActionState::Failed) => ("critical", "Guarded host action failed"),
+            (HostWorkflowKind::RemoveHost, HostActionState::Failed) => {
+                ("warning", "Host removal stopped")
+            }
             _ => ("info", "Host action recorded"),
         };
         let removal_detail = job.removal_plan.as_ref().map(|plan| {
@@ -14108,6 +14526,10 @@ async fn main() {
             "/host-actions/jobs/{id}/confirm",
             post(confirm_update_restart),
         )
+        .route(
+            "/host-actions/jobs/{id}/recover",
+            post(recover_update_restart),
+        )
         .route("/host-actions/{host}/remove", post(request_host_removal))
         .route(
             "/host-actions/{host}/allow-reonboarding",
@@ -15038,7 +15460,16 @@ mod tests {
         assert!(html.contains("event.key==='ArrowDown'"));
         assert!(html.contains("event.key==='Escape'"));
         assert!(html.contains("X-Pharos-Action"));
-        assert!(html.contains("Retry guarded review"));
+        assert!(html.contains("workflow.primary_action"));
+        assert!(html.contains(
+            "'/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover'"
+        ));
+        assert!(html.contains("new AbortController()"));
+        assert!(html.contains("if(!response.ok&&!payload.job)"));
+        assert!(html.contains("document.addEventListener('visibilitychange'"));
+        assert!(html.contains("const storedMatches=action==='workflow'"));
+        assert!(!html.contains("action==='system-update'&&storedKind"));
+        assert!(html.contains("const action=kind==='update_restart'?'update-restart':'workflow'"));
         assert!(html.contains(r#"data-host-remove-disposition"#));
         assert!(html.contains("It no longer exists"));
         assert!(html.contains("It still exists; stop managing it"));
@@ -15048,6 +15479,52 @@ mod tests {
         assert!(html.contains(
             "'/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry'"
         ));
+    }
+
+    #[test]
+    fn workflow_markup_excludes_opaque_job_identity_and_command_evidence() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "markus", 1_700_000_100)
+            .expect("workflow created");
+        store
+            .claim("hsb8", 1_700_000_101)
+            .expect("workflow claim")
+            .expect("review lease");
+        let reviewed = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: host_actions::AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(host_actions::HostActionPlan {
+                        changed_file_count: 3,
+                        changed_areas: vec!["automation".to_string(), "nixcfg".to_string()],
+                        all_host_eval_passed: true,
+                        target_build_passed: true,
+                        backup_ready: true,
+                        running_kernel: Some("7.0.13".to_string()),
+                        expected_kernel: Some("7.0.14".to_string()),
+                        restart_required: true,
+                    }),
+                    result: None,
+                },
+                1_700_000_102,
+            )
+            .expect("review evidence recorded");
+        let html = host_workflow_markup(&reviewed.summary().workflow);
+
+        assert!(html.contains("Sanitized plan evidence and workflow history"));
+        assert!(html.contains("Changed files"));
+        assert!(html.contains("automation, nixcfg"));
+        assert!(html.contains("7.0.13"));
+        assert!(html.contains("7.0.14"));
+        assert!(html.contains("command output are excluded"));
+        assert!(html.contains("This run is saved and resumes after refresh or restart"));
+        assert!(!html.contains(&job.id));
+        assert!(!html.contains("/nix/store/"));
     }
 
     #[test]
@@ -15804,6 +16281,33 @@ mod tests {
         assert!(event.detail.contains("nixcfg cleanup pending"));
         assert!(!event.detail.to_ascii_lowercase().contains("token"));
         assert!(!event.detail.to_ascii_lowercase().contains("secret"));
+    }
+
+    #[test]
+    fn settings_activity_uses_the_workflow_kind_not_the_storage_compatibility_kind() {
+        let actions = HostActionStore::new(None);
+        actions
+            .begin_settings_change("athena", "markus", 1_000)
+            .expect("settings workflow recorded");
+        let action_jobs = actions.list();
+        let events = activity_events(
+            runtime(&[], &[]),
+            "csb1",
+            1_000,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &action_jobs,
+            },
+        );
+
+        let event = events
+            .iter()
+            .find(|event| event.host == "athena" && event.kind == "action")
+            .expect("settings activity present");
+        assert_eq!(event.title, "Host settings change waiting");
+        assert!(!event.title.contains("System update"));
     }
 
     #[test]
@@ -19505,7 +20009,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     async fn declarative_host_removal_fails_closed_without_declarative_dispatch() {
         let (state, manifest_path) = state_with_janus_manifest("gpc0", "remove-token");
 
-        let (status, _) = request_host_removal(
+        let (status, Json(payload)) = request_host_removal(
             State(state.clone()),
             action_headers(),
             AxumPath("gpc0".to_string()),
@@ -19520,8 +20024,39 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(!state.retired_hosts.is_retired("gpc0"));
         assert!(state.store.get("gpc0").is_some());
-        assert!(state.host_actions.latest_for_host("gpc0").is_none());
+        let failed = state
+            .host_actions
+            .latest_for_host("gpc0")
+            .expect("failed removal checklist retained");
+        assert_eq!(failed.state, HostActionState::Failed);
+        assert_eq!(payload["job"]["workflow"]["kind"], "remove_host");
+        assert_eq!(payload["job"]["workflow"]["current_step"], "revoke");
         let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_dispatch_failure_keeps_a_persisted_checklist() {
+        let state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state.store.record(test_report("gpc0"), now_unix());
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers(),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let failed = state
+            .host_actions
+            .latest_for_host("gpc0")
+            .expect("failed update proposal checklist retained");
+        assert_eq!(failed.state, HostActionState::Failed);
+        assert_eq!(payload["job"]["workflow"]["kind"], "system_update_proposal");
+        assert_eq!(payload["job"]["workflow"]["current_step"], "request");
     }
 
     #[tokio::test]

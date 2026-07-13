@@ -18,6 +18,7 @@ use serde_json::json;
 
 use crate::{
     auth::{access_for_headers, AccessGrant},
+    host_actions::HostActionStoreError,
     html_escape,
     nixcfg_dispatch::NixcfgDispatchError,
     AppState, ShellContext,
@@ -339,6 +340,29 @@ pub(crate) async fn request_host_preferences(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
     }
 
+    let now = crate::now_unix();
+    let actor = crate::action_actor(&state.auth, &headers);
+    let workflow = match state
+        .host_actions
+        .begin_settings_change(canonical_host, &actor, now)
+    {
+        Ok(workflow) => workflow,
+        Err(HostActionStoreError::ActiveJob) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "A settings change is already waiting for this host"
+                })),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "The settings workflow could not be recorded" })),
+            );
+        }
+    };
+
     let dispatch_request_id = if runtime_host.is_nix {
         match state
             .nixcfg_dispatch
@@ -347,6 +371,10 @@ pub(crate) async fn request_host_preferences(
         {
             Ok(request_id) => Some(request_id),
             Err(error) => {
+                let failed = state
+                    .host_actions
+                    .fail_settings_change(&workflow.id, crate::now_unix())
+                    .ok();
                 let status = match &error {
                     NixcfgDispatchError::Disabled | NixcfgDispatchError::CredentialUnavailable => {
                         StatusCode::SERVICE_UNAVAILABLE
@@ -358,7 +386,16 @@ pub(crate) async fn request_host_preferences(
                         StatusCode::BAD_GATEWAY
                     }
                 };
-                return (status, Json(json!({ "error": error.safe_message() })));
+                return (
+                    status,
+                    Json(json!({
+                        "error": error.safe_message(),
+                        "job": failed.as_ref().map(|job| job.summary()),
+                        "workflow_html": failed
+                            .as_ref()
+                            .map(|job| crate::host_workflow_markup(&job.summary().workflow)),
+                    })),
+                );
             }
         }
     } else {
@@ -370,6 +407,39 @@ pub(crate) async fn request_host_preferences(
         .request_preferences(canonical_host, request.preferences)
     {
         Ok(host) => {
+            let accepted = match state
+                .host_actions
+                .accept_settings_change(&workflow.id, crate::now_unix())
+            {
+                Ok(workflow) => workflow,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            json!({ "error": "The settings request was sent, but its checklist could not be updated" }),
+                        ),
+                    );
+                }
+            };
+            let workflow = if host.requested_preferences.is_none() {
+                match state
+                    .host_actions
+                    .complete_settings_change(canonical_host, crate::now_unix())
+                {
+                    Ok(Some(workflow)) => workflow,
+                    Ok(None) => accepted,
+                    Err(_) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "The applied settings could not be recorded" })),
+                        );
+                    }
+                }
+            } else {
+                accepted
+            };
+            let summary = workflow.summary();
+            let workflow_html = crate::host_workflow_markup(&summary.workflow);
             let status = if dispatch_request_id.is_some() {
                 "dispatch_accepted"
             } else if host.requested_preferences.is_some() {
@@ -388,16 +458,32 @@ pub(crate) async fn request_host_preferences(
                     "status": status,
                     "host": host.name,
                     "delivery": delivery,
-                    "request_id": dispatch_request_id,
                     "applied": host.preferences,
                     "declared": declared_preferences
                         .or_else(|| manifest.map(|manifest| &manifest.host.preferences)),
                     "requested": host.requested_preferences,
+                    "job": summary,
+                    "workflow_html": workflow_html,
                 })),
             )
         }
         Err("host not found") => unreachable!("runtime host checked before workflow dispatch"),
-        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+        Err(error) => {
+            let failed = state
+                .host_actions
+                .fail_settings_change(&workflow.id, crate::now_unix())
+                .ok();
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": error,
+                    "job": failed.as_ref().map(|job| job.summary()),
+                    "workflow_html": failed
+                        .as_ref()
+                        .map(|job| crate::host_workflow_markup(&job.summary().workflow)),
+                })),
+            )
+        }
     }
 }
 
@@ -501,11 +587,92 @@ fn render_page(
     };
 
     format!(
-        r##"{head}{sidebar}<main class="settings-main">{header}{host_table}{content}</main><script>
+        r##"{head}{sidebar}<main class="settings-main">{header}{host_table}{content}</main>{action_dialog}<script>
 document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{{
   window.location.assign('/agora?host='+encodeURIComponent(event.target.value));
 }});
 const root=document.querySelector('[data-color-root]');
+const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:''}};
+function stopSettingsWorkflowPoll(){{
+  if(settingsWorkflow.timer!=null)clearTimeout(settingsWorkflow.timer);
+  settingsWorkflow.timer=null;
+  settingsWorkflow.controller?.abort();
+  settingsWorkflow.controller=null;
+}}
+function closeSettingsWorkflow(){{
+  stopSettingsWorkflowPoll();
+  settingsWorkflow.id=null;
+  settingsWorkflow.lastRevision='';
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  if(overlay)overlay.hidden=true;
+  document.body.removeAttribute('data-host-action-dialog-open');
+}}
+function scheduleSettingsWorkflowPoll(id){{
+  stopSettingsWorkflowPoll();
+  settingsWorkflow.id=id;
+  if(document.hidden||!navigator.onLine)return;
+  settingsWorkflow.timer=setTimeout(()=>pollSettingsWorkflow(id),10000);
+}}
+function renderSettingsWorkflow(data){{
+  const job=data?.job;
+  if(!job)return;
+  const workflow=job.workflow||{{}};
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const dialog=overlay?.querySelector('[data-host-action-dialog]');
+  if(!overlay||!dialog)return;
+  dialog.dataset.workflow='true';
+  dialog.dataset.action='settings-change';
+  dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{{icon.hidden=icon.dataset.actionIcon!=='settings-change'}});
+  const title=dialog.querySelector('[data-host-action-title]');
+  const copy=dialog.querySelector('[data-host-action-copy]');
+  if(title)title.textContent=workflow.title||'Host settings';
+  if(copy)copy.textContent=workflow.guidance||data.message||'The settings workflow is recorded.';
+  const info=dialog.querySelector('[data-host-action-info]');
+  const facts=dialog.querySelector('[data-host-action-facts]');
+  const technical=dialog.querySelector('[data-host-action-technical]');
+  const checklist=dialog.querySelector('[data-host-workflow]');
+  const primary=dialog.querySelector('[data-host-action-primary]');
+  const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
+  const status=dialog.querySelector('[data-host-action-status]');
+  const safe=dialog.querySelector('[data-host-action-safe-note]');
+  if(info)info.hidden=true;
+  if(facts)facts.hidden=true;
+  if(technical)technical.hidden=true;
+  if(checklist){{checklist.hidden=false;checklist.innerHTML=data.workflow_html||''}}
+  if(primary)primary.hidden=true;
+  if(cancel)cancel.textContent='Close';
+  if(status)status.textContent=data.message||'';
+  if(safe)safe.textContent='Persisted and reviewable';
+  overlay.hidden=false;
+  document.body.dataset.hostActionDialogOpen='true';
+  settingsWorkflow.id=job.id;
+  settingsWorkflow.lastRevision=[job.id,job.state,job.updated_at].join(':');
+  if(!['succeeded','failed'].includes(job.state))scheduleSettingsWorkflowPoll(job.id);
+  requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
+}}
+async function pollSettingsWorkflow(id){{
+  if(document.hidden||!navigator.onLine||settingsWorkflow.id!==id)return;
+  const controller=new AbortController();
+  settingsWorkflow.controller=controller;
+  try{{
+    const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{{credentials:'same-origin',cache:'no-store',signal:controller.signal}});
+    const data=await response.json().catch(()=>({{}}));
+    if(!response.ok)throw new Error(data.error||'Could not refresh the settings workflow.');
+    const revision=[data.job?.id,data.job?.state,data.job?.updated_at].join(':');
+    if(revision!==settingsWorkflow.lastRevision)renderSettingsWorkflow(data);
+    else scheduleSettingsWorkflowPoll(id);
+  }}catch(error){{
+    if(error?.name!=='AbortError')scheduleSettingsWorkflowPoll(id);
+  }}finally{{
+    if(settingsWorkflow.controller===controller)settingsWorkflow.controller=null;
+  }}
+}}
+document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
+  if(event.target.closest('[data-host-action-close]')){{event.preventDefault();closeSettingsWorkflow()}}
+}});
+document.addEventListener('keydown',event=>{{if(event.key==='Escape'&&settingsWorkflow.id){{event.preventDefault();closeSettingsWorkflow()}}}});
+document.addEventListener('visibilitychange',()=>{{if(!document.hidden&&settingsWorkflow.id)pollSettingsWorkflow(settingsWorkflow.id)}});
+window.addEventListener('online',()=>{{if(settingsWorkflow.id)pollSettingsWorkflow(settingsWorkflow.id)}});
 if(root){{
   const color=root.querySelector('[data-color]');
   const output=root.querySelector('[data-review-output]');
@@ -561,6 +728,7 @@ if(root){{
         body:JSON.stringify({{host:root.dataset.host,preferences:requestedPreferences()}}),
       }});
       const data=await res.json();
+      if(data.job)renderSettingsWorkflow(data);
       if(!res.ok)throw new Error(data.error||'Request failed');
       if(data.status==='applied')setStatus('applied','Already active on this host.');
       else if(data.status==='dispatch_accepted')setStatus('pending','Change requested. Validation is running.');
@@ -585,6 +753,7 @@ if(root){{
             crate::now_unix()
         ),
         host_table = host_table,
+        action_dialog = crate::host_action_dialog(),
         accent = html_escape(&selected.declared_accent)
     )
 }

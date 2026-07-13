@@ -18,6 +18,8 @@ const ACTION_VERSION: u16 = 1;
 const RETIRED_SCHEMA: &str = "inspr.pharos.retired-hosts.v1";
 const RETIRED_VERSION: u16 = 2;
 const LEASE_SECS: i64 = 180;
+const WORKFLOW_SCHEMA: &str = "inspr.pharos.host-workflow.v1";
+const WORKFLOW_VERSION: u16 = 1;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -27,6 +29,25 @@ pub(crate) enum HostActionKind {
     SystemUpdateProposal,
     UpdateRestart,
     RemoveHost,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostWorkflowKind {
+    SettingsChange,
+    SystemUpdateProposal,
+    UpdateRestart,
+    RemoveHost,
+}
+
+impl From<HostActionKind> for HostWorkflowKind {
+    fn from(kind: HostActionKind) -> Self {
+        match kind {
+            HostActionKind::SystemUpdateProposal => Self::SystemUpdateProposal,
+            HostActionKind::UpdateRestart => Self::UpdateRestart,
+            HostActionKind::RemoveHost => Self::RemoveHost,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,6 +91,151 @@ pub(crate) enum HostActionState {
     RemovalPending,
     Succeeded,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostActionEventSource {
+    Operator,
+    HostAgent,
+    Beacon,
+    Pharos,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostActionEventKind {
+    Requested,
+    StateRecovered,
+    DispatchAccepted,
+    DispatchFailed,
+    ReviewClaimed,
+    ReviewPassed,
+    ReviewFailed,
+    Confirmed,
+    ApplyClaimed,
+    ApplyRebooting,
+    ApplyPassed,
+    ApplyFailed,
+    RecoveryQueued,
+    RecoveryClaimed,
+    RecoveryRebooting,
+    RecoveryPassed,
+    RecoveryFailed,
+    SettingsRequestAccepted,
+    SettingsApplied,
+    SettingsFailed,
+    RemovalAccessRevoked,
+    RemovalFailed,
+    RemovalCompleted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostActionEvent {
+    pub(crate) at: i64,
+    pub(crate) state: HostActionState,
+    pub(crate) source: HostActionEventSource,
+    pub(crate) kind: HostActionEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) actor: Option<String>,
+}
+
+impl HostActionEvent {
+    fn validate(&self, job: &HostActionJob) -> bool {
+        self.at >= job.created_at
+            && self.at <= job.updated_at
+            && self.actor.as_deref().is_none_or(safe_actor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkflowStepState {
+    Queued,
+    Running,
+    Waiting,
+    ConfirmationRequired,
+    ActionRequired,
+    Passed,
+    Failed,
+    Skipped,
+    Recovered,
+    #[allow(dead_code)]
+    Cancelled,
+}
+
+impl WorkflowStepState {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::ConfirmationRequired => "confirmation_required",
+            Self::ActionRequired => "action_required",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Recovered => "recovered",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowStep {
+    pub(crate) key: String,
+    pub(crate) group: String,
+    pub(crate) label: String,
+    pub(crate) state: WorkflowStepState,
+    pub(crate) detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostWorkflowActionKind {
+    Confirm,
+    Retry,
+    Recover,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowAction {
+    pub(crate) kind: HostWorkflowActionKind,
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowEvent {
+    pub(crate) at: i64,
+    pub(crate) state: HostActionState,
+    pub(crate) source: HostActionEventSource,
+    pub(crate) label: String,
+    pub(crate) actor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowEvidence {
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowSummary {
+    pub(crate) schema: &'static str,
+    pub(crate) version: u16,
+    pub(crate) kind: HostWorkflowKind,
+    pub(crate) title: String,
+    pub(crate) guidance: String,
+    pub(crate) status_label: String,
+    pub(crate) status_level: &'static str,
+    pub(crate) current_step: Option<String>,
+    pub(crate) can_cancel: bool,
+    pub(crate) persisted: bool,
+    pub(crate) primary_action: Option<HostWorkflowAction>,
+    pub(crate) steps: Vec<HostWorkflowStep>,
+    pub(crate) evidence: Vec<HostWorkflowEvidence>,
+    pub(crate) events: Vec<HostWorkflowEvent>,
 }
 
 impl HostActionState {
@@ -144,6 +310,8 @@ pub(crate) struct HostActionJob {
     pub(crate) id: String,
     pub(crate) host: String,
     pub(crate) kind: HostActionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_kind: Option<HostWorkflowKind>,
     pub(crate) state: HostActionState,
     pub(crate) requested_by: String,
     pub(crate) ticket: String,
@@ -156,12 +324,20 @@ pub(crate) struct HostActionJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) removal_plan: Option<HostRemovalPlan>,
     pub(crate) result: Option<HostActionResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_started_at: Option<i64>,
+    #[serde(default)]
+    pub(crate) events: Vec<HostActionEvent>,
     #[serde(default)]
     lease_phase: Option<AgentActionPhase>,
     lease_until: Option<i64>,
 }
 
 impl HostActionJob {
+    pub(crate) fn workflow_kind(&self) -> HostWorkflowKind {
+        self.workflow_kind.unwrap_or_else(|| self.kind.into())
+    }
+
     fn validate(&self) -> bool {
         self.schema == ACTION_SCHEMA
             && self.version == ACTION_VERSION
@@ -173,7 +349,23 @@ impl HostActionJob {
             && self.retry_of.as_ref().is_none_or(|id| id != &self.id)
             && self.created_at > 0
             && self.updated_at >= self.created_at
+            && self
+                .recovery_started_at
+                .is_none_or(|at| at >= self.created_at && at <= self.updated_at)
+            && self.events.iter().all(|event| event.validate(self))
+            && self
+                .events
+                .windows(2)
+                .all(|events| events[0].at <= events[1].at)
             && self.plan.as_ref().is_none_or(HostActionPlan::validate)
+            && self.workflow_kind.is_none_or(|kind| {
+                kind == HostWorkflowKind::SettingsChange
+                    && self.kind == HostActionKind::SystemUpdateProposal
+                    && self.removal_plan.is_none()
+            })
+            && self.recovery_started_at.is_none_or(|_| {
+                self.kind == HostActionKind::UpdateRestart && self.confirmed_at.is_some()
+            })
             && match self.kind {
                 HostActionKind::RemoveHost => self
                     .removal_plan
@@ -197,7 +389,32 @@ impl HostActionJob {
             plan: self.plan.clone(),
             removal_plan: self.removal_plan.clone(),
             result: self.result.clone(),
+            workflow: self.workflow(),
         }
+    }
+
+    fn record_event(
+        &mut self,
+        now: i64,
+        source: HostActionEventSource,
+        kind: HostActionEventKind,
+        actor: Option<&str>,
+    ) {
+        self.events.push(HostActionEvent {
+            at: now,
+            state: self.state,
+            source,
+            kind,
+            actor: actor.map(str::to_string),
+        });
+    }
+
+    pub(crate) fn recoverable(&self) -> bool {
+        self.kind == HostActionKind::UpdateRestart
+            && self.state == HostActionState::Failed
+            && self.confirmed_at.is_some()
+            && self.plan.as_ref().is_some_and(HostActionPlan::ready)
+            && self.result.is_none()
     }
 
     fn review_retryable(&self) -> bool {
@@ -206,6 +423,836 @@ impl HostActionJob {
             && self.confirmed_at.is_none()
             && self.plan.is_none()
             && self.result.is_none()
+    }
+
+    fn workflow(&self) -> HostWorkflowSummary {
+        let kind = self.workflow_kind();
+        let (title, guidance, status_label, status_level, primary_action, steps) = match kind {
+            HostWorkflowKind::SettingsChange => self.settings_workflow(),
+            HostWorkflowKind::SystemUpdateProposal => self.system_update_workflow(),
+            HostWorkflowKind::UpdateRestart => self.update_restart_workflow(),
+            HostWorkflowKind::RemoveHost => self.removal_workflow(),
+        };
+        let current_step = workflow_current_step(&steps);
+        let evidence = self.workflow_evidence();
+        let events = self
+            .events
+            .iter()
+            .map(|event| HostWorkflowEvent {
+                at: event.at,
+                state: event.state,
+                source: event.source,
+                label: event_label(event.kind).to_string(),
+                actor: event.actor.clone(),
+            })
+            .collect();
+        HostWorkflowSummary {
+            schema: WORKFLOW_SCHEMA,
+            version: WORKFLOW_VERSION,
+            kind,
+            title,
+            guidance,
+            status_label,
+            status_level,
+            current_step,
+            can_cancel: false,
+            persisted: true,
+            primary_action,
+            steps,
+            evidence,
+            events,
+        }
+    }
+
+    fn workflow_evidence(&self) -> Vec<HostWorkflowEvidence> {
+        let mut evidence = vec![workflow_evidence("Tracking", self.ticket.clone())];
+        match self.workflow_kind() {
+            HostWorkflowKind::SettingsChange => {
+                let accepted = self
+                    .events
+                    .iter()
+                    .any(|event| event.kind == HostActionEventKind::SettingsRequestAccepted);
+                evidence.push(workflow_evidence(
+                    "Delivery",
+                    if self.state == HostActionState::Failed {
+                        "stopped"
+                    } else if accepted || self.state == HostActionState::Succeeded {
+                        "accepted"
+                    } else {
+                        "recording"
+                    },
+                ));
+                evidence.push(workflow_evidence(
+                    "Host report",
+                    if self.state == HostActionState::Succeeded {
+                        "requested settings observed"
+                    } else {
+                        "not observed yet"
+                    },
+                ));
+            }
+            HostWorkflowKind::SystemUpdateProposal => {
+                let accepted = self
+                    .events
+                    .iter()
+                    .any(|event| event.kind == HostActionEventKind::DispatchAccepted);
+                evidence.push(workflow_evidence(
+                    "Repository dispatch",
+                    if self.state == HostActionState::Failed {
+                        "stopped"
+                    } else if accepted {
+                        "accepted"
+                    } else {
+                        "recording"
+                    },
+                ));
+                evidence.push(workflow_evidence("Live host change", "not authorized"));
+            }
+            HostWorkflowKind::UpdateRestart => {
+                if let Some(plan) = &self.plan {
+                    evidence.extend([
+                        workflow_evidence("Changed files", plan.changed_file_count.to_string()),
+                        workflow_evidence(
+                            "Changed areas",
+                            if plan.changed_areas.is_empty() {
+                                "none".to_string()
+                            } else {
+                                plan.changed_areas.join(", ")
+                            },
+                        ),
+                        workflow_evidence(
+                            "All-host validation",
+                            evidence_result(plan.all_host_eval_passed),
+                        ),
+                        workflow_evidence(
+                            "Target build",
+                            evidence_result(plan.target_build_passed),
+                        ),
+                        workflow_evidence("Backup gate", evidence_ready(plan.backup_ready)),
+                        workflow_evidence(
+                            "Restart",
+                            if plan.restart_required {
+                                "required"
+                            } else {
+                                "not required"
+                            },
+                        ),
+                    ]);
+                    if let Some(version) = &plan.running_kernel {
+                        evidence.push(workflow_evidence("Running kernel", version.clone()));
+                    }
+                    if let Some(version) = &plan.expected_kernel {
+                        evidence.push(workflow_evidence("Expected kernel", version.clone()));
+                    }
+                }
+                if let Some(result) = &self.result {
+                    evidence.extend([
+                        workflow_evidence(
+                            "Backup validation",
+                            evidence_result(result.backup_validated),
+                        ),
+                        workflow_evidence("Reviewed switch", evidence_result(result.switch_passed)),
+                        workflow_evidence(
+                            "Restart observed",
+                            evidence_result(result.reboot_observed),
+                        ),
+                        workflow_evidence(
+                            "Kernel verification",
+                            evidence_result(result.kernel_verified),
+                        ),
+                        workflow_evidence(
+                            "Rollback posture",
+                            if result.rollback_available {
+                                "available"
+                            } else {
+                                "not available"
+                            },
+                        ),
+                    ]);
+                }
+                if self.recovery_started_at.is_some() {
+                    evidence.push(workflow_evidence(
+                        "Recovery mode",
+                        "verify existing result; no second switch or restart",
+                    ));
+                }
+            }
+            HostWorkflowKind::RemoveHost => {
+                if let Some(plan) = &self.removal_plan {
+                    evidence.push(workflow_evidence(
+                        "Host disposition",
+                        plan.disposition.key(),
+                    ));
+                    if let Some(successor) = &plan.successor {
+                        evidence.push(workflow_evidence("Successor", successor.clone()));
+                    }
+                    evidence.push(workflow_evidence(
+                        "Declarative cleanup",
+                        if plan.declaration_pending {
+                            "required"
+                        } else {
+                            "not required"
+                        },
+                    ));
+                }
+            }
+        }
+        evidence
+    }
+
+    fn settings_workflow(
+        &self,
+    ) -> (
+        String,
+        String,
+        String,
+        &'static str,
+        Option<HostWorkflowAction>,
+        Vec<HostWorkflowStep>,
+    ) {
+        let accepted = self
+            .events
+            .iter()
+            .any(|event| event.kind == HostActionEventKind::SettingsRequestAccepted);
+        let (guidance, status_label, status_level) = match self.state {
+            HostActionState::Succeeded => (
+                "The host reported the requested settings. The saved workflow is complete.",
+                "settings applied",
+                "clear",
+            ),
+            HostActionState::Failed => (
+                "The request stopped safely. Review the recorded event before trying again.",
+                "settings request stopped",
+                "warning",
+            ),
+            _ if accepted => (
+                "The request is saved. Pharos is waiting for the host to report the new settings.",
+                "change waiting",
+                "warning",
+            ),
+            _ => (
+                "Pharos is recording and sending the requested settings.",
+                "saving settings",
+                "warning",
+            ),
+        };
+        let request_state = match self.state {
+            HostActionState::Succeeded => WorkflowStepState::Passed,
+            HostActionState::Failed => WorkflowStepState::Failed,
+            _ if accepted => WorkflowStepState::Passed,
+            _ => WorkflowStepState::Running,
+        };
+        let wait_state = match self.state {
+            HostActionState::Succeeded => WorkflowStepState::Passed,
+            HostActionState::Failed => WorkflowStepState::Skipped,
+            _ if accepted => WorkflowStepState::Waiting,
+            _ => WorkflowStepState::Queued,
+        };
+        let record_state = match self.state {
+            HostActionState::Succeeded | HostActionState::Failed => WorkflowStepState::Passed,
+            _ => WorkflowStepState::Queued,
+        };
+        (
+            format!("Change {} settings", self.host),
+            guidance.to_string(),
+            status_label.to_string(),
+            status_level,
+            None,
+            vec![
+                workflow_step(
+                    "validate",
+                    "PREPARE",
+                    "Validate the selected settings",
+                    WorkflowStepState::Passed,
+                    "The values and host access passed validation.",
+                ),
+                workflow_step(
+                    "request",
+                    "SEND",
+                    "Send the change request",
+                    request_state,
+                    if self.state == HostActionState::Failed {
+                        "The delivery workflow did not accept the request."
+                    } else if accepted {
+                        "The durable delivery workflow accepted the request."
+                    } else {
+                        "Pharos is recording the delivery request."
+                    },
+                ),
+                workflow_step(
+                    "host",
+                    "APPLY",
+                    "Wait for the host",
+                    wait_state,
+                    "Applied state changes only after the host reports the requested values.",
+                ),
+                workflow_step(
+                    "record",
+                    "RECORD",
+                    "Save the result",
+                    record_state,
+                    "The run remains available after refresh or restart.",
+                ),
+            ],
+        )
+    }
+
+    fn system_update_workflow(
+        &self,
+    ) -> (
+        String,
+        String,
+        String,
+        &'static str,
+        Option<HostWorkflowAction>,
+        Vec<HostWorkflowStep>,
+    ) {
+        let failed = self.state == HostActionState::Failed;
+        let accepted = self
+            .events
+            .iter()
+            .any(|event| event.kind == HostActionEventKind::DispatchAccepted);
+        (
+            "Review system updates".to_string(),
+            if failed {
+                "The repository review request stopped. No host change was authorized."
+            } else {
+                "The proposal is saved outside the live-change path. Repository checks and review must finish before any host action."
+            }
+            .to_string(),
+            if failed {
+                "update review stopped"
+            } else {
+                "review requested"
+            }
+            .to_string(),
+            "warning",
+            None,
+            vec![
+                workflow_step(
+                    "request",
+                    "PREPARE",
+                    "Create an isolated update proposal",
+                    if failed {
+                        WorkflowStepState::Failed
+                    } else if accepted {
+                        WorkflowStepState::Passed
+                    } else {
+                        WorkflowStepState::Running
+                    },
+                    "This step cannot merge or deploy a host.",
+                ),
+                workflow_step(
+                    "validate",
+                    "VALIDATE",
+                    "Run repository and all-host checks",
+                    if failed {
+                        WorkflowStepState::Skipped
+                    } else if accepted {
+                        WorkflowStepState::Waiting
+                    } else {
+                        WorkflowStepState::Queued
+                    },
+                    "Completion is reported by the repository workflow.",
+                ),
+                workflow_step(
+                    "review",
+                    "APPROVE",
+                    "Review the proposal",
+                    if failed {
+                        WorkflowStepState::Skipped
+                    } else {
+                        WorkflowStepState::Queued
+                    },
+                    "A separate reviewed workflow is required before deployment.",
+                ),
+                workflow_step(
+                    "deploy",
+                    "APPLY",
+                    "Deploy hosts",
+                    WorkflowStepState::Skipped,
+                    "This proposal workflow never deploys hosts.",
+                ),
+                workflow_step(
+                    "record",
+                    "RECORD",
+                    "Save the request",
+                    WorkflowStepState::Passed,
+                    "The request remains available after refresh or restart.",
+                ),
+            ],
+        )
+    }
+
+    fn update_restart_workflow(
+        &self,
+    ) -> (
+        String,
+        String,
+        String,
+        &'static str,
+        Option<HostWorkflowAction>,
+        Vec<HostWorkflowStep>,
+    ) {
+        let plan = self.plan.as_ref();
+        let confirmed = self.confirmed_at.is_some();
+        let recovery = self.recovery_started_at.is_some();
+        let recovered = recovery && self.state == HostActionState::Succeeded;
+        let preconfirm_failed = self.state == HostActionState::Failed && !confirmed;
+        let recovery_failed = recovery && self.state == HostActionState::Failed;
+        let primary_action = match self.state {
+            HostActionState::AwaitingConfirmation => Some(HostWorkflowAction {
+                kind: HostWorkflowActionKind::Confirm,
+                label: "Confirm update".to_string(),
+            }),
+            HostActionState::Failed if self.review_retryable() => Some(HostWorkflowAction {
+                kind: HostWorkflowActionKind::Retry,
+                label: "Retry guarded review".to_string(),
+            }),
+            HostActionState::Failed if self.recoverable() => Some(HostWorkflowAction {
+                kind: HostWorkflowActionKind::Recover,
+                label: if recovery {
+                    "Run recovery checks again"
+                } else {
+                    "Run recovery checks"
+                }
+                .to_string(),
+            }),
+            _ => None,
+        };
+        let (guidance, status_label, status_level) = match self.state {
+            HostActionState::QueuedReview => (
+                "The request is saved. No live change has started.",
+                "review queued",
+                "warning",
+            ),
+            HostActionState::Reviewing => (
+                "The target-local agent is preparing a read-only plan and safety evidence.",
+                "preparing safe plan",
+                "warning",
+            ),
+            HostActionState::AwaitingConfirmation => (
+                "The review passed. Confirm only while the host or recovery console is attended.",
+                "ready for confirmation",
+                "warning",
+            ),
+            HostActionState::QueuedApply => (
+                "Confirmation is recorded. The target-local agent will continue one guarded step at a time.",
+                "waiting for host",
+                "warning",
+            ),
+            HostActionState::Applying if recovery => (
+                "The host agent is reconciling the recorded failure with current machine evidence.",
+                "recovery checks running",
+                "warning",
+            ),
+            HostActionState::Applying => (
+                "The guarded live workflow is running on the target host.",
+                "applying update",
+                "warning",
+            ),
+            HostActionState::Rebooting if recovery => (
+                "Recovery is queued for the target-local agent. No second switch or reboot was requested.",
+                "recovery queued",
+                "warning",
+            ),
+            HostActionState::Rebooting => (
+                "The host is restarting. Pharos is waiting for fresh runtime verification.",
+                "waiting for restart",
+                "warning",
+            ),
+            HostActionState::Succeeded if recovered => (
+                "Current host evidence passed and the original failure remains in the audit history.",
+                "recovered and verified",
+                "clear",
+            ),
+            HostActionState::Succeeded => (
+                "The guarded update completed and all required evidence was recorded.",
+                "update completed",
+                "clear",
+            ),
+            HostActionState::Failed if preconfirm_failed => (
+                "The read-only review stopped before any live change. Correct the cause, then retry this recorded run.",
+                "review stopped safely",
+                "warning",
+            ),
+            HostActionState::Failed if recovery_failed => (
+                "Recovery verification did not complete. Inspect the host evidence before trying the same recovery branch again.",
+                "recovery needs attention",
+                "warning",
+            ),
+            HostActionState::Failed => (
+                "The live run stopped, but this does not by itself mean the host is unhealthy. Reconcile it with current host evidence.",
+                "verification needed",
+                "warning",
+            ),
+            _ => (
+                "The guarded workflow is recorded.",
+                "workflow recorded",
+                "warning",
+            ),
+        };
+
+        let review_state = match self.state {
+            HostActionState::QueuedReview => WorkflowStepState::Waiting,
+            HostActionState::Reviewing => WorkflowStepState::Running,
+            HostActionState::Failed if !confirmed => WorkflowStepState::Failed,
+            _ if plan.is_some() => WorkflowStepState::Passed,
+            _ => WorkflowStepState::Queued,
+        };
+        let plan_step = |passed: Option<bool>| match passed {
+            Some(true) => WorkflowStepState::Passed,
+            Some(false) => WorkflowStepState::Failed,
+            None if preconfirm_failed => WorkflowStepState::Skipped,
+            None if self.state == HostActionState::Reviewing => WorkflowStepState::Waiting,
+            None => WorkflowStepState::Queued,
+        };
+        let confirmation_state = if confirmed {
+            WorkflowStepState::Passed
+        } else if self.state == HostActionState::AwaitingConfirmation {
+            WorkflowStepState::ConfirmationRequired
+        } else if preconfirm_failed {
+            WorkflowStepState::Skipped
+        } else {
+            WorkflowStepState::Queued
+        };
+        let apply_state = if recovered {
+            WorkflowStepState::Recovered
+        } else {
+            match self.state {
+                HostActionState::Applying if !recovery => WorkflowStepState::Running,
+                HostActionState::Rebooting if !recovery => WorkflowStepState::Passed,
+                HostActionState::Succeeded => WorkflowStepState::Passed,
+                HostActionState::Failed if confirmed => WorkflowStepState::Failed,
+                HostActionState::QueuedApply => WorkflowStepState::Waiting,
+                HostActionState::Failed => WorkflowStepState::Skipped,
+                _ => WorkflowStepState::Queued,
+            }
+        };
+        let restart_state = if plan.is_some_and(|plan| !plan.restart_required) {
+            WorkflowStepState::Skipped
+        } else if recovered {
+            WorkflowStepState::Recovered
+        } else {
+            match self.state {
+                HostActionState::Rebooting if !recovery => WorkflowStepState::Running,
+                HostActionState::Succeeded => WorkflowStepState::Passed,
+                HostActionState::Applying if !recovery => WorkflowStepState::Waiting,
+                HostActionState::Failed if confirmed => WorkflowStepState::Failed,
+                HostActionState::Failed => WorkflowStepState::Skipped,
+                _ => WorkflowStepState::Queued,
+            }
+        };
+        let verify_state = if recovered {
+            WorkflowStepState::Recovered
+        } else {
+            match self.state {
+                HostActionState::Succeeded => WorkflowStepState::Passed,
+                HostActionState::Rebooting if !recovery => WorkflowStepState::Waiting,
+                HostActionState::Failed if confirmed => WorkflowStepState::ActionRequired,
+                HostActionState::Failed => WorkflowStepState::Skipped,
+                _ => WorkflowStepState::Queued,
+            }
+        };
+        let recovery_state = if !recovery {
+            None
+        } else {
+            Some(match self.state {
+                HostActionState::Applying => WorkflowStepState::Running,
+                HostActionState::Rebooting => WorkflowStepState::Waiting,
+                HostActionState::Succeeded => WorkflowStepState::Recovered,
+                HostActionState::Failed => WorkflowStepState::Failed,
+                _ => WorkflowStepState::Queued,
+            })
+        };
+        let mut steps = vec![
+            workflow_step(
+                "review",
+                "PREPARE",
+                "Review the requested change",
+                review_state,
+                "The target-local agent reports only sanitized plan facts.",
+            ),
+            workflow_step(
+                "validate",
+                "PREPARE",
+                "Validate all configured hosts",
+                plan_step(plan.map(|plan| plan.all_host_eval_passed)),
+                "Shared configuration must evaluate before this host can continue.",
+            ),
+            workflow_step(
+                "build",
+                "PREPARE",
+                format!("Build {}", self.host),
+                plan_step(plan.map(|plan| plan.target_build_passed)),
+                "The target build must finish without changing the running host.",
+            ),
+            workflow_step(
+                "backup",
+                "PROTECT",
+                "Create and validate a fresh backup",
+                plan_step(plan.map(|plan| plan.backup_ready)),
+                "The live gate remains blocked until backup evidence is ready.",
+            ),
+            workflow_step(
+                "confirm",
+                "APPROVE",
+                "Confirm the live change",
+                confirmation_state,
+                "An attended operator must explicitly approve the switch.",
+            ),
+            workflow_step(
+                "apply",
+                "APPLY",
+                "Switch the reviewed configuration",
+                apply_state,
+                "Only the reviewed target-local workflow may perform this step.",
+            ),
+            workflow_step(
+                "restart",
+                "APPLY",
+                "Restart if required",
+                restart_state,
+                "Pharos waits for the original host to return before verification.",
+            ),
+            workflow_step(
+                "host-return",
+                "VERIFY",
+                "Wait for the host",
+                verify_state,
+                "A fresh report must arrive after the live gate.",
+            ),
+            workflow_step(
+                "runtime",
+                "VERIFY",
+                "Check kernel, services, and rollback posture",
+                verify_state,
+                "Verification uses current target-local and heartbeat evidence.",
+            ),
+            workflow_step(
+                "heartbeat",
+                "VERIFY",
+                "Receive a fresh heartbeat",
+                verify_state,
+                "The reported runtime must match the expected system state.",
+            ),
+        ];
+        if let Some(state) = recovery_state {
+            steps.push(workflow_step(
+                "recovery",
+                "RECOVER",
+                "Reconcile the failed run with current host evidence",
+                state,
+                "This branch verifies the existing result; it does not request a second switch or reboot.",
+            ));
+        }
+        steps.push(workflow_step(
+            "record",
+            "RECORD",
+            "Save the result",
+            if self.state.is_terminal() {
+                WorkflowStepState::Passed
+            } else {
+                WorkflowStepState::Queued
+            },
+            if self.state == HostActionState::Failed {
+                "The failure is retained and can be resolved by the same workflow."
+            } else {
+                "The run remains available after refresh or restart."
+            },
+        ));
+        (
+            format!("Update {}", self.host),
+            guidance.to_string(),
+            status_label.to_string(),
+            status_level,
+            primary_action,
+            steps,
+        )
+    }
+
+    fn removal_workflow(
+        &self,
+    ) -> (
+        String,
+        String,
+        String,
+        &'static str,
+        Option<HostWorkflowAction>,
+        Vec<HostWorkflowStep>,
+    ) {
+        let preparing = self.state == HostActionState::ProposalRequested;
+        let pending = self.state == HostActionState::RemovalPending;
+        let failed = self.state == HostActionState::Failed;
+        let declaration_pending = self
+            .removal_plan
+            .as_ref()
+            .is_some_and(|plan| plan.declaration_pending);
+        (
+            format!("Remove {} from Pharos", self.host),
+            if failed {
+                "The removal request stopped before Pharos could finish revoking this host. Review the saved failure before trying again."
+            } else if preparing {
+                "The retirement intent is saved. Pharos is finishing the guarded handoff before changing host visibility."
+            } else if pending {
+                "Reporting access is revoked. Pharos is waiting for the declared host entry to be reviewed and removed."
+            } else {
+                "The host retirement is complete. No server, disk, service, or application data was deleted."
+            }
+            .to_string(),
+            if failed {
+                "removal stopped"
+            } else if preparing {
+                "preparing removal"
+            } else if pending {
+                "removal pending"
+            } else {
+                "host retired"
+            }
+            .to_string(),
+            if preparing || pending || failed {
+                "warning"
+            } else {
+                "clear"
+            },
+            None,
+            vec![
+                workflow_step(
+                    "confirm",
+                    "APPROVE",
+                    "Confirm the retirement intent",
+                    WorkflowStepState::Passed,
+                    "The operator recorded what happened to the host.",
+                ),
+                workflow_step(
+                    "revoke",
+                    "PROTECT",
+                    "Revoke reporting access",
+                    if failed {
+                        WorkflowStepState::Failed
+                    } else if preparing {
+                        WorkflowStepState::Running
+                    } else {
+                        WorkflowStepState::Passed
+                    },
+                    "New heartbeats from the retired identity are rejected.",
+                ),
+                workflow_step(
+                    "declaration",
+                    "APPLY",
+                    "Remove the declarative host entry",
+                    if failed {
+                        WorkflowStepState::Skipped
+                    } else if preparing {
+                        WorkflowStepState::Queued
+                    } else if declaration_pending {
+                        if pending {
+                            WorkflowStepState::Waiting
+                        } else {
+                            WorkflowStepState::Passed
+                        }
+                    } else {
+                        WorkflowStepState::Skipped
+                    },
+                    if declaration_pending {
+                        "The repository workflow must finish before Pharos hides the host."
+                    } else {
+                        "This host had no declaration to remove."
+                    },
+                ),
+                workflow_step(
+                    "record",
+                    "RECORD",
+                    "Save the retirement record",
+                    WorkflowStepState::Passed,
+                    "The retirement remains auditable after the runtime record is removed.",
+                ),
+            ],
+        )
+    }
+}
+
+fn workflow_step(
+    key: impl Into<String>,
+    group: impl Into<String>,
+    label: impl Into<String>,
+    state: WorkflowStepState,
+    detail: impl Into<String>,
+) -> HostWorkflowStep {
+    HostWorkflowStep {
+        key: key.into(),
+        group: group.into(),
+        label: label.into(),
+        state,
+        detail: detail.into(),
+    }
+}
+
+fn workflow_evidence(label: impl Into<String>, value: impl Into<String>) -> HostWorkflowEvidence {
+    HostWorkflowEvidence {
+        label: label.into(),
+        value: value.into(),
+    }
+}
+
+fn evidence_result(passed: bool) -> &'static str {
+    if passed {
+        "passed"
+    } else {
+        "not passed"
+    }
+}
+
+fn evidence_ready(ready: bool) -> &'static str {
+    if ready {
+        "ready"
+    } else {
+        "not ready"
+    }
+}
+
+fn workflow_current_step(steps: &[HostWorkflowStep]) -> Option<String> {
+    const PRIORITY: [WorkflowStepState; 6] = [
+        WorkflowStepState::Running,
+        WorkflowStepState::ConfirmationRequired,
+        WorkflowStepState::ActionRequired,
+        WorkflowStepState::Waiting,
+        WorkflowStepState::Failed,
+        WorkflowStepState::Queued,
+    ];
+    PRIORITY.iter().find_map(|state| {
+        steps
+            .iter()
+            .find(|step| step.state == *state)
+            .map(|step| step.key.clone())
+    })
+}
+
+fn event_label(kind: HostActionEventKind) -> &'static str {
+    match kind {
+        HostActionEventKind::Requested => "Workflow requested",
+        HostActionEventKind::StateRecovered => "Existing workflow state loaded",
+        HostActionEventKind::DispatchAccepted => "Guarded dispatch accepted",
+        HostActionEventKind::DispatchFailed => "Guarded dispatch stopped",
+        HostActionEventKind::ReviewClaimed => "Host started the safe review",
+        HostActionEventKind::ReviewPassed => "Safe review passed",
+        HostActionEventKind::ReviewFailed => "Safe review stopped",
+        HostActionEventKind::Confirmed => "Live change confirmed",
+        HostActionEventKind::ApplyClaimed => "Host started the live workflow",
+        HostActionEventKind::ApplyRebooting => "Host restart reported",
+        HostActionEventKind::ApplyPassed => "Live workflow passed",
+        HostActionEventKind::ApplyFailed => "Live workflow stopped",
+        HostActionEventKind::RecoveryQueued => "Recovery verification queued",
+        HostActionEventKind::RecoveryClaimed => "Host started recovery verification",
+        HostActionEventKind::RecoveryRebooting => "Recovery is waiting for the host",
+        HostActionEventKind::RecoveryPassed => "Recovery verification passed",
+        HostActionEventKind::RecoveryFailed => "Recovery verification stopped",
+        HostActionEventKind::SettingsRequestAccepted => "Settings request accepted",
+        HostActionEventKind::SettingsApplied => "Host reported the requested settings",
+        HostActionEventKind::SettingsFailed => "Settings request stopped",
+        HostActionEventKind::RemovalAccessRevoked => "Host reporting access revoked",
+        HostActionEventKind::RemovalFailed => "Host removal stopped",
+        HostActionEventKind::RemovalCompleted => "Host retirement completed",
     }
 }
 
@@ -221,6 +1268,7 @@ pub(crate) struct HostActionSummary {
     pub(crate) plan: Option<HostActionPlan>,
     pub(crate) removal_plan: Option<HostRemovalPlan>,
     pub(crate) result: Option<HostActionResult>,
+    pub(crate) workflow: HostWorkflowSummary,
 }
 
 fn valid_action_jobs(jobs: &BTreeMap<String, HostActionJob>) -> bool {
@@ -319,6 +1367,16 @@ impl HostActionStore {
                             declaration_pending: job.state == HostActionState::RemovalPending,
                         });
                     }
+                    if job.events.is_empty() {
+                        let kind = legacy_state_event_kind(job);
+                        job.events.push(HostActionEvent {
+                            at: job.updated_at,
+                            state: job.state,
+                            source: HostActionEventSource::Pharos,
+                            kind,
+                            actor: None,
+                        });
+                    }
                 }
                 let jobs: BTreeMap<_, _> =
                     jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
@@ -356,6 +1414,7 @@ impl HostActionStore {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn latest_for_host(&self, host: &str) -> Option<HostActionJob> {
         self.jobs
             .read()
@@ -366,16 +1425,45 @@ impl HostActionStore {
             .cloned()
     }
 
+    pub(crate) fn most_relevant_for_host(&self, host: &str) -> Option<HostActionJob> {
+        let jobs = self.jobs.read().expect("host action store lock");
+        jobs.values()
+            .filter(|job| job.host == host)
+            .filter(|job| {
+                !jobs.values().any(|other| {
+                    other.host == host
+                        && other.workflow_kind() == job.workflow_kind()
+                        && (other.created_at, other.updated_at, &other.id)
+                            > (job.created_at, job.updated_at, &job.id)
+                })
+            })
+            .max_by_key(|job| {
+                let priority = match (job.workflow_kind(), job.state) {
+                    (HostWorkflowKind::RemoveHost, HostActionState::Succeeded) => 0,
+                    (HostWorkflowKind::RemoveHost, _) => 4,
+                    (HostWorkflowKind::UpdateRestart, HostActionState::Succeeded) => 0,
+                    (HostWorkflowKind::UpdateRestart, _) => 3,
+                    (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => 0,
+                    (HostWorkflowKind::SettingsChange, _) => 2,
+                    (HostWorkflowKind::SystemUpdateProposal, HostActionState::Succeeded) => 0,
+                    (HostWorkflowKind::SystemUpdateProposal, _) => 1,
+                };
+                (priority, job.updated_at, job.created_at)
+            })
+            .cloned()
+    }
+
     fn record_proposal(
         &self,
         proposal: NewHostAction<'_>,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        self.insert(HostActionJob {
+        let mut job = HostActionJob {
             schema: ACTION_SCHEMA.to_string(),
             version: ACTION_VERSION,
             id: proposal.id,
             host: proposal.host.to_string(),
             kind: proposal.kind,
+            workflow_kind: None,
             state: proposal.state,
             requested_by: proposal.actor.to_string(),
             ticket: proposal.ticket.to_string(),
@@ -386,9 +1474,18 @@ impl HostActionStore {
             plan: None,
             removal_plan: proposal.removal_plan,
             result: None,
+            recovery_started_at: None,
+            events: Vec::new(),
             lease_phase: None,
             lease_until: None,
-        })
+        };
+        job.record_event(
+            proposal.now,
+            HostActionEventSource::Operator,
+            HostActionEventKind::Requested,
+            Some(proposal.actor),
+        );
+        self.insert(job)
     }
 
     pub(crate) fn create_system_update_proposal(
@@ -408,6 +1505,73 @@ impl HostActionStore {
             removal_plan: None,
             now,
         })
+    }
+
+    pub(crate) fn begin_system_update_proposal(
+        &self,
+        host: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.create_system_update_proposal(action_id("system-update", host, now), host, actor, now)
+    }
+
+    pub(crate) fn accept_system_update_proposal(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.update_system_update_proposal(id, now, false)
+    }
+
+    pub(crate) fn fail_system_update_proposal(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.update_system_update_proposal(id, now, true)
+    }
+
+    fn update_system_update_proposal(
+        &self,
+        id: &str,
+        now: i64,
+        failed: bool,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.workflow_kind() != HostWorkflowKind::SystemUpdateProposal
+                || job.state != HostActionState::ProposalRequested
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            if failed {
+                job.state = HostActionState::Failed;
+            }
+            job.updated_at = now;
+            job.record_event(
+                now,
+                HostActionEventSource::Pharos,
+                if failed {
+                    HostActionEventKind::DispatchFailed
+                } else {
+                    HostActionEventKind::DispatchAccepted
+                },
+                None,
+            );
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
     }
 
     pub(crate) fn create_update_review(
@@ -459,6 +1623,7 @@ impl HostActionStore {
         self.insert_locked(&mut jobs, job)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_removal(
         &self,
         host: &str,
@@ -490,10 +1655,319 @@ impl HostActionStore {
         })
     }
 
+    pub(crate) fn begin_removal(
+        &self,
+        host: &str,
+        actor: &str,
+        removal_plan: HostRemovalPlan,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if Self::has_active(
+            &self.jobs.read().expect("host action store lock"),
+            host,
+            HostActionKind::RemoveHost,
+        ) {
+            return Err(HostActionStoreError::ActiveJob);
+        }
+        self.record_proposal(NewHostAction {
+            id: action_id("remove-host", host, now),
+            host,
+            kind: HostActionKind::RemoveHost,
+            actor,
+            ticket: "PHAROS-127",
+            state: HostActionState::ProposalRequested,
+            removal_plan: Some(removal_plan),
+            now,
+        })
+    }
+
+    pub(crate) fn mark_removal_access_revoked(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.kind != HostActionKind::RemoveHost {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            if matches!(
+                job.state,
+                HostActionState::RemovalPending | HostActionState::Succeeded
+            ) {
+                return Ok(job.clone());
+            }
+            if job.state != HostActionState::ProposalRequested {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            let declaration_pending = job
+                .removal_plan
+                .as_ref()
+                .is_some_and(|plan| plan.declaration_pending);
+            job.state = if declaration_pending {
+                HostActionState::RemovalPending
+            } else {
+                HostActionState::Succeeded
+            };
+            job.updated_at = now;
+            job.record_event(
+                now,
+                HostActionEventSource::Pharos,
+                HostActionEventKind::RemovalAccessRevoked,
+                None,
+            );
+            if !declaration_pending {
+                job.record_event(
+                    now,
+                    HostActionEventSource::Pharos,
+                    HostActionEventKind::RemovalCompleted,
+                    None,
+                );
+            }
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn fail_removal(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.kind != HostActionKind::RemoveHost
+                || job.state != HostActionState::ProposalRequested
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            job.state = HostActionState::Failed;
+            job.updated_at = now;
+            job.record_event(
+                now,
+                HostActionEventSource::Pharos,
+                HostActionEventKind::RemovalFailed,
+                None,
+            );
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn begin_settings_change(
+        &self,
+        host: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        if jobs.values().any(|job| {
+            job.host == host
+                && job.workflow_kind() == HostWorkflowKind::SettingsChange
+                && !job.state.is_terminal()
+        }) {
+            return Err(HostActionStoreError::ActiveJob);
+        }
+        let mut job = HostActionJob {
+            schema: ACTION_SCHEMA.to_string(),
+            version: ACTION_VERSION,
+            id: action_id("settings-change", host, now),
+            host: host.to_string(),
+            // Keep the persisted v1 action enum backward-readable. New clients
+            // use workflow_kind for the precise user-facing workflow.
+            kind: HostActionKind::SystemUpdateProposal,
+            workflow_kind: Some(HostWorkflowKind::SettingsChange),
+            state: HostActionState::ProposalRequested,
+            requested_by: actor.to_string(),
+            ticket: "PHAROS-129".to_string(),
+            retry_of: None,
+            created_at: now,
+            updated_at: now,
+            confirmed_at: None,
+            plan: None,
+            removal_plan: None,
+            result: None,
+            recovery_started_at: None,
+            events: Vec::new(),
+            lease_phase: None,
+            lease_until: None,
+        };
+        job.record_event(
+            now,
+            HostActionEventSource::Operator,
+            HostActionEventKind::Requested,
+            Some(actor),
+        );
+        self.insert_locked(&mut jobs, job)
+    }
+
+    pub(crate) fn accept_settings_change(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.update_settings_change(id, now, |job| {
+            job.record_event(
+                now,
+                HostActionEventSource::Pharos,
+                HostActionEventKind::SettingsRequestAccepted,
+                None,
+            );
+        })
+    }
+
+    pub(crate) fn fail_settings_change(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.update_settings_change(id, now, |job| {
+            job.state = HostActionState::Failed;
+            job.record_event(
+                now,
+                HostActionEventSource::Pharos,
+                HostActionEventKind::SettingsFailed,
+                None,
+            );
+        })
+    }
+
+    pub(crate) fn complete_settings_change(
+        &self,
+        host: &str,
+        now: i64,
+    ) -> Result<Option<HostActionJob>, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let Some(id) = jobs
+            .values()
+            .filter(|job| {
+                job.host == host
+                    && job.workflow_kind() == HostWorkflowKind::SettingsChange
+                    && job.state == HostActionState::ProposalRequested
+            })
+            .max_by_key(|job| (job.created_at, job.updated_at))
+            .map(|job| job.id.clone())
+        else {
+            return Ok(None);
+        };
+        let (previous, updated) = {
+            let job = jobs.get_mut(&id).expect("selected settings workflow");
+            let previous = job.clone();
+            job.state = HostActionState::Succeeded;
+            job.updated_at = now;
+            job.record_event(
+                now,
+                HostActionEventSource::Beacon,
+                HostActionEventKind::SettingsApplied,
+                None,
+            );
+            (previous, job.clone())
+        };
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id, previous);
+            return Err(error);
+        }
+        Ok(Some(updated))
+    }
+
+    fn update_settings_change(
+        &self,
+        id: &str,
+        now: i64,
+        update: impl FnOnce(&mut HostActionJob),
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.workflow_kind() != HostWorkflowKind::SettingsChange
+                || job.state != HostActionState::ProposalRequested
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            job.updated_at = now;
+            update(job);
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn queue_recovery(
+        &self,
+        id: &str,
+        host: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        if Self::blocked_by_other_update(&jobs, host) {
+            return Err(HostActionStoreError::BlockedByFleetGate);
+        }
+        if Self::latest_update_for(&jobs, host).is_none_or(|job| job.id != id) {
+            return Err(HostActionStoreError::InvalidTransition);
+        }
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.host != host {
+                return Err(HostActionStoreError::WrongHost);
+            }
+            if !job.recoverable() {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            job.state = HostActionState::Rebooting;
+            job.recovery_started_at.get_or_insert(now);
+            job.updated_at = now;
+            job.lease_phase = None;
+            job.lease_until = None;
+            job.record_event(
+                now,
+                HostActionEventSource::Operator,
+                HostActionEventKind::RecoveryQueued,
+                Some(actor),
+            );
+            (previous, job.clone())
+        };
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
     pub(crate) fn confirm_update(
         &self,
         id: &str,
         host: &str,
+        actor: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
@@ -516,6 +1990,12 @@ impl HostActionStore {
             job.updated_at = now;
             job.lease_phase = None;
             job.lease_until = None;
+            job.record_event(
+                now,
+                HostActionEventSource::Operator,
+                HostActionEventKind::Confirmed,
+                Some(actor),
+            );
             (previous, job.clone())
         };
         if let Err(error) = self.persist_jobs(&jobs) {
@@ -561,6 +2041,7 @@ impl HostActionStore {
             return Ok(None);
         };
         let previous = job.clone();
+        let recovery = job.recovery_started_at.is_some() && phase == AgentActionPhase::Resume;
         job.state = match phase {
             AgentActionPhase::Review => HostActionState::Reviewing,
             AgentActionPhase::Apply | AgentActionPhase::Resume => HostActionState::Applying,
@@ -568,6 +2049,18 @@ impl HostActionStore {
         job.updated_at = now;
         job.lease_phase = Some(phase);
         job.lease_until = Some(now.saturating_add(LEASE_SECS));
+        job.record_event(
+            now,
+            HostActionEventSource::HostAgent,
+            match (phase, recovery) {
+                (AgentActionPhase::Review, _) => HostActionEventKind::ReviewClaimed,
+                (AgentActionPhase::Resume, true) => HostActionEventKind::RecoveryClaimed,
+                (AgentActionPhase::Apply, _) | (AgentActionPhase::Resume, false) => {
+                    HostActionEventKind::ApplyClaimed
+                }
+            },
+            None,
+        );
         let lease = AgentActionLease {
             schema: "inspr.pharos.host-action-lease.v1",
             version: 1,
@@ -607,6 +2100,9 @@ impl HostActionStore {
                 return Err(HostActionStoreError::InvalidTransition);
             }
             let previous = job.clone();
+            let recovery =
+                job.recovery_started_at.is_some() && request.phase == AgentActionPhase::Resume;
+            let event_kind;
             match (request.phase, request.outcome) {
                 (AgentActionPhase::Review, AgentActionOutcome::Succeeded) => {
                     let plan = request.plan.ok_or(HostActionStoreError::InvalidJob)?;
@@ -615,15 +2111,22 @@ impl HostActionStore {
                     }
                     job.plan = Some(plan);
                     job.state = HostActionState::AwaitingConfirmation;
+                    event_kind = HostActionEventKind::ReviewPassed;
                 }
                 (AgentActionPhase::Review, AgentActionOutcome::Failed) => {
                     job.state = HostActionState::Failed;
+                    event_kind = HostActionEventKind::ReviewFailed;
                 }
                 (
                     AgentActionPhase::Apply | AgentActionPhase::Resume,
                     AgentActionOutcome::Rebooting,
                 ) => {
                     job.state = HostActionState::Rebooting;
+                    event_kind = if recovery {
+                        HostActionEventKind::RecoveryRebooting
+                    } else {
+                        HostActionEventKind::ApplyRebooting
+                    };
                 }
                 (
                     AgentActionPhase::Apply | AgentActionPhase::Resume,
@@ -640,15 +2143,28 @@ impl HostActionStore {
                     }
                     job.result = Some(result);
                     job.state = HostActionState::Succeeded;
+                    event_kind = if recovery {
+                        HostActionEventKind::RecoveryPassed
+                    } else {
+                        HostActionEventKind::ApplyPassed
+                    };
                 }
                 (_, AgentActionOutcome::Failed) => {
                     job.state = HostActionState::Failed;
+                    event_kind = if recovery {
+                        HostActionEventKind::RecoveryFailed
+                    } else if request.phase == AgentActionPhase::Review {
+                        HostActionEventKind::ReviewFailed
+                    } else {
+                        HostActionEventKind::ApplyFailed
+                    };
                 }
                 _ => return Err(HostActionStoreError::InvalidTransition),
             }
             job.updated_at = now;
             job.lease_phase = None;
             job.lease_until = None;
+            job.record_event(now, HostActionEventSource::HostAgent, event_kind, None);
             (previous, job.clone())
         };
         if let Err(error) = self.persist_jobs(&jobs) {
@@ -673,6 +2189,12 @@ impl HostActionStore {
         let previous = job.clone();
         job.state = HostActionState::Succeeded;
         job.updated_at = now;
+        job.record_event(
+            now,
+            HostActionEventSource::Pharos,
+            HostActionEventKind::RemovalCompleted,
+            None,
+        );
         let updated = job.clone();
         if let Err(error) = self.persist_jobs(&jobs) {
             jobs.insert(id.to_string(), previous);
@@ -687,12 +2209,13 @@ impl HostActionStore {
         now: i64,
         retry_of: Option<String>,
     ) -> HostActionJob {
-        HostActionJob {
+        let mut job = HostActionJob {
             schema: ACTION_SCHEMA.to_string(),
             version: ACTION_VERSION,
             id: action_id("update-restart", host, now),
             host: host.to_string(),
             kind: HostActionKind::UpdateRestart,
+            workflow_kind: None,
             state: HostActionState::QueuedReview,
             requested_by: actor.to_string(),
             ticket: "PHAROS-126".to_string(),
@@ -703,9 +2226,18 @@ impl HostActionStore {
             plan: None,
             removal_plan: None,
             result: None,
+            recovery_started_at: None,
+            events: Vec::new(),
             lease_phase: None,
             lease_until: None,
-        }
+        };
+        job.record_event(
+            now,
+            HostActionEventSource::Operator,
+            HostActionEventKind::Requested,
+            Some(actor),
+        );
+        job
     }
 
     fn has_active(
@@ -787,6 +2319,56 @@ impl HostActionStore {
         };
         let snapshot: Vec<_> = jobs.values().cloned().collect();
         persist_json(path, &snapshot)
+    }
+}
+
+fn legacy_state_event_kind(job: &HostActionJob) -> HostActionEventKind {
+    match (job.workflow_kind(), job.state) {
+        (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => {
+            HostActionEventKind::SettingsApplied
+        }
+        (HostWorkflowKind::SettingsChange, HostActionState::Failed) => {
+            HostActionEventKind::SettingsFailed
+        }
+        (HostWorkflowKind::SystemUpdateProposal, HostActionState::ProposalRequested) => {
+            HostActionEventKind::DispatchAccepted
+        }
+        (HostWorkflowKind::SystemUpdateProposal, HostActionState::Failed) => {
+            HostActionEventKind::DispatchFailed
+        }
+        (HostWorkflowKind::UpdateRestart, HostActionState::AwaitingConfirmation) => {
+            HostActionEventKind::ReviewPassed
+        }
+        (HostWorkflowKind::UpdateRestart, HostActionState::QueuedApply) => {
+            HostActionEventKind::Confirmed
+        }
+        (HostWorkflowKind::UpdateRestart, HostActionState::Applying) => {
+            HostActionEventKind::ApplyClaimed
+        }
+        (HostWorkflowKind::UpdateRestart, HostActionState::Rebooting) => {
+            HostActionEventKind::ApplyRebooting
+        }
+        (HostWorkflowKind::UpdateRestart, HostActionState::Succeeded) => {
+            HostActionEventKind::ApplyPassed
+        }
+        (HostWorkflowKind::UpdateRestart, HostActionState::Failed)
+            if job.confirmed_at.is_some() =>
+        {
+            HostActionEventKind::ApplyFailed
+        }
+        (HostWorkflowKind::UpdateRestart, HostActionState::Failed) => {
+            HostActionEventKind::ReviewFailed
+        }
+        (HostWorkflowKind::RemoveHost, HostActionState::RemovalPending) => {
+            HostActionEventKind::RemovalAccessRevoked
+        }
+        (HostWorkflowKind::RemoveHost, HostActionState::Succeeded) => {
+            HostActionEventKind::RemovalCompleted
+        }
+        (HostWorkflowKind::RemoveHost, HostActionState::Failed) => {
+            HostActionEventKind::RemovalFailed
+        }
+        _ => HostActionEventKind::StateRecovered,
     }
 }
 
@@ -1085,7 +2667,7 @@ mod tests {
             .expect("review stored");
         assert_eq!(reviewed.state, HostActionState::AwaitingConfirmation);
         let confirmed = store
-            .confirm_update(&job.id, "hsb8", 103)
+            .confirm_update(&job.id, "hsb8", "markus", 103)
             .expect("confirmed");
         assert_eq!(confirmed.state, HostActionState::QueuedApply);
         assert_eq!(
@@ -1154,7 +2736,7 @@ mod tests {
             )
             .expect("review stored");
         store
-            .confirm_update(&retry.id, "hsb8", 107)
+            .confirm_update(&retry.id, "hsb8", "markus", 107)
             .expect("confirmed");
         store.claim("hsb8", 108).expect("claim").expect("lease");
         store
@@ -1209,7 +2791,7 @@ mod tests {
             )
             .expect("review stored");
         store
-            .confirm_update(&job.id, "hsb8", 203)
+            .confirm_update(&job.id, "hsb8", "markus", 203)
             .expect("confirmed");
         store.claim("hsb8", 204).expect("claim").expect("lease");
         let failed = store
@@ -1234,13 +2816,215 @@ mod tests {
     }
 
     #[test]
+    fn failed_live_run_recovers_in_place_and_preserves_failure_history() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "markus", 300)
+            .expect("job created");
+        store.claim("hsb8", 301).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                302,
+            )
+            .expect("review stored");
+        store
+            .confirm_update(&job.id, "hsb8", "markus", 303)
+            .expect("confirmed");
+        store.claim("hsb8", 304).expect("claim").expect("lease");
+        let failed = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                305,
+            )
+            .expect("failure stored");
+        assert!(failed.recoverable());
+        assert_eq!(
+            failed.summary().workflow.status_label,
+            "verification needed"
+        );
+
+        let queued = store
+            .queue_recovery(&job.id, "hsb8", "markus", 306)
+            .expect("recovery queued");
+        assert_eq!(queued.state, HostActionState::Rebooting);
+        assert_eq!(
+            store.claim("hsb8", 307).expect("claim").unwrap().phase,
+            AgentActionPhase::Resume
+        );
+        let recovered = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Resume,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: true,
+                        kernel_verified: true,
+                        rollback_available: true,
+                    }),
+                },
+                308,
+            )
+            .expect("recovery stored");
+        let workflow = recovered.summary().workflow;
+        assert_eq!(recovered.state, HostActionState::Succeeded);
+        assert_eq!(workflow.status_label, "recovered and verified");
+        assert!(workflow
+            .events
+            .iter()
+            .any(|event| event.label == "Live workflow stopped"));
+        assert!(workflow
+            .events
+            .iter()
+            .any(|event| event.label == "Recovery verification passed"));
+        assert!(workflow
+            .steps
+            .iter()
+            .any(|step| { step.key == "recovery" && step.state == WorkflowStepState::Recovered }));
+        assert!(store.create_update_review("csb0", "markus", 309).is_ok());
+    }
+
+    #[test]
+    fn settings_change_uses_the_shared_persisted_workflow() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("hsb8", "markus", 400)
+            .expect("settings workflow created");
+        assert_eq!(job.workflow_kind(), HostWorkflowKind::SettingsChange);
+        assert_eq!(job.kind, HostActionKind::SystemUpdateProposal);
+        assert_eq!(
+            store.begin_settings_change("hsb8", "markus", 401),
+            Err(HostActionStoreError::ActiveJob)
+        );
+
+        let accepted = store
+            .accept_settings_change(&job.id, 402)
+            .expect("request accepted");
+        let wait = accepted
+            .summary()
+            .workflow
+            .steps
+            .into_iter()
+            .find(|step| step.key == "host")
+            .expect("host wait step");
+        assert_eq!(wait.state, WorkflowStepState::Waiting);
+
+        let completed = store
+            .complete_settings_change("hsb8", 403)
+            .expect("completion persisted")
+            .expect("workflow completed");
+        assert_eq!(completed.state, HostActionState::Succeeded);
+        assert_eq!(
+            completed.summary().workflow.status_label,
+            "settings applied"
+        );
+        assert_eq!(WorkflowStepState::Cancelled.key(), "cancelled");
+    }
+
+    #[test]
+    fn most_relevant_workflow_ignores_a_failure_superseded_by_success() {
+        let store = HostActionStore::new(None);
+        let failed = store
+            .begin_settings_change("hsb8", "markus", 410)
+            .expect("first settings workflow created");
+        store
+            .fail_settings_change(&failed.id, 411)
+            .expect("first settings workflow failed");
+
+        let retry = store
+            .begin_settings_change("hsb8", "markus", 412)
+            .expect("replacement settings workflow created");
+        store
+            .accept_settings_change(&retry.id, 413)
+            .expect("replacement settings workflow accepted");
+        store
+            .complete_settings_change("hsb8", 414)
+            .expect("replacement settings workflow persisted")
+            .expect("replacement settings workflow completed");
+
+        let relevant = store
+            .most_relevant_for_host("hsb8")
+            .expect("relevant settings workflow");
+        assert_eq!(relevant.id, retry.id);
+        assert_eq!(relevant.state, HostActionState::Succeeded);
+    }
+
+    #[test]
+    fn system_update_proposal_uses_the_shared_read_only_workflow() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_system_update_proposal("hsb8", "markus", 450)
+            .expect("proposal workflow created");
+        let preparing = job.summary().workflow;
+
+        assert_eq!(preparing.kind, HostWorkflowKind::SystemUpdateProposal);
+        assert_eq!(preparing.current_step.as_deref(), Some("request"));
+        assert_eq!(
+            preparing
+                .steps
+                .iter()
+                .find(|step| step.key == "request")
+                .expect("dispatch step")
+                .state,
+            WorkflowStepState::Running
+        );
+
+        let accepted = store
+            .accept_system_update_proposal(&job.id, 451)
+            .expect("proposal dispatch accepted");
+        let workflow = accepted.summary().workflow;
+
+        assert_eq!(workflow.kind, HostWorkflowKind::SystemUpdateProposal);
+        assert_eq!(workflow.status_label, "review requested");
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "validate")
+                .expect("validation step")
+                .state,
+            WorkflowStepState::Waiting
+        );
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "deploy")
+                .expect("deployment boundary")
+                .state,
+            WorkflowStepState::Skipped
+        );
+    }
+
+    #[test]
     fn removal_plan_records_lifecycle_and_rejects_invalid_lineage() {
         let store = HostActionStore::new(None);
-        let removal = store
-            .create_removal(
+        let started = store
+            .begin_removal(
                 "gpc0",
                 "markus",
-                None,
                 HostRemovalPlan {
                     disposition: HostRetirementDisposition::Rebuilt,
                     successor: Some("stm2607".to_string()),
@@ -1249,6 +3033,14 @@ mod tests {
                 100,
             )
             .expect("removal recorded");
+        assert_eq!(started.state, HostActionState::ProposalRequested);
+        assert_eq!(
+            started.summary().workflow.current_step.as_deref(),
+            Some("revoke")
+        );
+        let removal = store
+            .mark_removal_access_revoked(&started.id, 101)
+            .expect("reporting access revoked");
         assert_eq!(removal.state, HostActionState::RemovalPending);
         let plan = removal
             .summary()
@@ -1257,6 +3049,19 @@ mod tests {
         assert_eq!(plan.disposition, HostRetirementDisposition::Rebuilt);
         assert_eq!(plan.successor.as_deref(), Some("stm2607"));
         assert!(plan.declaration_pending);
+        let workflow = removal.summary().workflow;
+        assert_eq!(workflow.kind, HostWorkflowKind::RemoveHost);
+        assert_eq!(workflow.status_label, "removal pending");
+        assert_eq!(workflow.current_step.as_deref(), Some("declaration"));
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "declaration")
+                .expect("declaration cleanup step")
+                .state,
+            WorkflowStepState::Waiting
+        );
 
         assert_eq!(
             store.create_removal(
@@ -1268,7 +3073,7 @@ mod tests {
                     successor: None,
                     declaration_pending: true,
                 },
-                101,
+                102,
             ),
             Err(HostActionStoreError::InvalidJob)
         );
@@ -1312,6 +3117,57 @@ mod tests {
         assert_eq!(plan.disposition, HostRetirementDisposition::Unmanaged);
         assert!(plan.successor.is_none());
         assert!(plan.declaration_pending);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_post_confirmation_failure_keeps_its_failure_audit_event() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-legacy-update-failure-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let document = serde_json::json!([{
+            "schema": ACTION_SCHEMA,
+            "version": ACTION_VERSION,
+            "id": "action-update-restart-hsb8-100-1",
+            "host": "hsb8",
+            "kind": "update_restart",
+            "state": "failed",
+            "requested_by": "markus",
+            "ticket": "PHAROS-126",
+            "created_at": 100,
+            "updated_at": 110,
+            "confirmed_at": 105,
+            "plan": {
+                "changed_file_count": 3,
+                "changed_areas": ["flake.lock", "hosts"],
+                "all_host_eval_passed": true,
+                "target_build_passed": true,
+                "backup_ready": true,
+                "running_kernel": "6.18.26",
+                "expected_kernel": "7.0.14",
+                "restart_required": true
+            },
+            "result": null,
+            "lease_phase": null,
+            "lease_until": null
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("legacy update JSON"),
+        )
+        .expect("legacy update state written");
+
+        let store = HostActionStore::new(Some(path.clone()));
+        let job = store.latest_for_host("hsb8").expect("legacy update loaded");
+        assert_eq!(job.events[0].kind, HostActionEventKind::ApplyFailed);
+        assert!(job
+            .summary()
+            .workflow
+            .events
+            .iter()
+            .any(|event| event.label == "Live workflow stopped"));
         let _ = std::fs::remove_file(path);
     }
 

@@ -1,5 +1,13 @@
 # Pharos Changelog
 
+## 0.1.30 - 2026-07-13
+
+- Add one persisted, plain-language execution checklist for host settings, fleet update proposals, guarded update/restart, host removal, and recovery, with clear waiting, confirmation, action-required, completed, stopped, and recovered states.
+- Keep technical evidence in a sanitized Advanced history that excludes credentials, machine paths, opaque identifiers, and command output while preserving operator, host-agent, heartbeat, and Pharos audit events.
+- Reconcile post-confirmation failures in the original run using fresh live and current-kernel evidence; the target-local recovery branch verifies the existing result and never requests a second switch or reboot.
+- Record workflows before external dispatch so nixcfg rejection remains visible at the exact failed step, and pause expensive Fleet heartbeat work while dialogs or background tabs are inactive.
+- Resolve each workflow type from its newest run so a successful retry or recovery supersedes older failure state, and use the same workflow identity for accurate Activity labels.
+
 ## 0.1.29 - 2026-07-13
 
 - Ask what happened to a host before removal and record whether it was destroyed, left unmanaged, or rebuilt with an already onboarded successor.
