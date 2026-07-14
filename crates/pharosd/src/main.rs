@@ -40,16 +40,17 @@ use pharos_core::{
     liveness, AccessSetupIntent, BackupObservation, BackupPostureState, BackupSetupIntent,
     BootstrapMethod, ExistingHostBootstrapOption, ExistingHostPreflightCheck,
     ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
-    ExistingHostPreflightSummary, ExistingHostSetupContext, Host, HostLocation, HostLocationSource,
-    HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse, HostReport,
-    KernelPosture, KernelPostureState, Liveness, LocationSetupIntent, ManifestLocationMode,
-    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
-    PrivilegedActionMode, ProvisioningBackupProposal, ProvisioningBackupProposalKind,
-    ProvisioningBackupSecretFile, ProvisioningHandoff, ProvisioningJob, ProvisioningJobState,
-    ProvisioningProgressEntry, ProvisioningProviderResource, ProvisioningSetupIntent,
-    ProvisioningTerminalOutcome, SecretOwner, ServiceObservation, ServiceObservationState,
-    SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION,
-    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    ExistingHostPreflightSummary, ExistingHostSetupContext, Host, HostKind, HostLocation,
+    HostLocationSource, HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse,
+    HostReport, KernelPosture, KernelPostureState, Liveness, LocationSetupIntent,
+    ManifestLocationMode, ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness,
+    PreflightCheckState, PrivilegedActionMode, ProvisioningBackupProposal,
+    ProvisioningBackupProposalKind, ProvisioningBackupSecretFile, ProvisioningHandoff,
+    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningProviderResource,
+    ProvisioningSetupIntent, ProvisioningTerminalOutcome, SecretOwner, ServiceObservation,
+    ServiceObservationState, SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3186,6 +3187,9 @@ fn silent_beacon_alerts(hosts: &[Host], now: i64) -> Vec<SilentBeaconAlert> {
     let mut alerts = hosts
         .iter()
         .filter_map(|host| {
+            if host.preferences.suppresses_down_alerts() {
+                return None;
+            }
             let last_seen = host.last_seen?;
             if liveness(host.last_seen, host.heartbeat_interval_secs, now) != Liveness::Down {
                 return None;
@@ -4351,11 +4355,17 @@ function freshnessAttention(f){
   if(!hasAge||!hasCommits)return {label:'freshness unknown',level:'wait',rank:3};
   return null;
 }
-function attentionFor(live,f){
-  if(live==='down')return {label:'silent heartbeat',level:'down',rank:0};
+function downAlertsSuppressed(preferences){
+  return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
+}
+function attentionFor(live,f,preferences){
+  if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
   if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
   if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
-  return freshnessAttention(f)||{label:'all clear',level:'ok',rank:4};
+  const freshness=freshnessAttention(f);
+  if(freshness)return freshness;
+  if(live==='down')return {label:preferences?.kind==='workstation'?'offline as expected':'down alerts muted',level:'ok',rank:4};
+  return {label:'all clear',level:'ok',rank:4};
 }
 const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
 const BACKUP_LEVEL={failed:'critical',missing:'critical',stale:'warning',warning:'warning',unknown:'watch','not-configured':'watch',healthy:'clear'};
@@ -4407,10 +4417,15 @@ function setReason(surface,reason){
 function mutedInfo(preferences){
   const alerts=preferences?.alerts||{};
   const labels=[];
-  if(alerts.suppress_down)labels.push('down');
+  const workstation=preferences?.kind==='workstation';
+  if(!workstation&&alerts.suppress_down)labels.push('down');
   if(alerts.suppress_backup)labels.push('backup');
   if(alerts.suppress_nix_freshness)labels.push('Nix freshness');
-  return {label:labels.length?labels.join(', ')+' muted':'',search:labels.length?'muted alert preferences '+labels.join(' '):''};
+  const label=workstation
+    ? ['down alerts off for workstation',labels.length?labels.join(', ')+' muted':''].filter(Boolean).join(' · ')
+    : (labels.length?labels.join(', ')+' muted':'');
+  const search=label?(workstation?'workstation expected offline down alerts suppressed ':'muted alert preferences ')+label:'';
+  return {label,search};
 }
 function updateMuted(surface,info){
   const el=surface.querySelector('[data-mute-note]');
@@ -5963,7 +5978,7 @@ async function refresh(reason='manual'){
       for(const card of surfaces){
         const live=h.liveness;
         card.dataset.live=live;
-        const attention=h.attention||attentionFor(h.liveness,h.freshness);
+        const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences);
         const backup=backupInfo(h,now);
         const muted=mutedInfo(h.preferences);
         card.dataset.sev=String(attention.rank ?? sevFor(live));
@@ -10665,7 +10680,7 @@ fn attention_reason(
     preferences: &HostPreferences,
 ) -> AttentionReason {
     match live {
-        Liveness::Down if !preferences.alerts.suppress_down => AttentionReason {
+        Liveness::Down if !preferences.suppresses_down_alerts() => AttentionReason {
             label: "silent heartbeat".to_string(),
             level: "down",
             rank: 0,
@@ -10699,7 +10714,11 @@ fn attention_reason(
             })
             .unwrap_or_else(|| AttentionReason {
                 label: if live == Liveness::Down {
-                    "down alerts muted"
+                    if preferences.kind == HostKind::Workstation {
+                        "offline as expected"
+                    } else {
+                        "down alerts muted"
+                    }
                 } else {
                     "all clear"
                 }
@@ -10721,7 +10740,8 @@ fn reason_markup(reason: &AttentionReason, hidden: bool) -> String {
 
 fn muted_preferences_markup(preferences: &HostPreferences) -> String {
     let mut muted = Vec::new();
-    if preferences.alerts.suppress_down {
+    let workstation = preferences.kind == HostKind::Workstation;
+    if !workstation && preferences.alerts.suppress_down {
         muted.push("down");
     }
     if preferences.alerts.suppress_backup {
@@ -10730,7 +10750,16 @@ fn muted_preferences_markup(preferences: &HostPreferences) -> String {
     if preferences.alerts.suppress_nix_freshness {
         muted.push("Nix freshness");
     }
-    let label = if muted.is_empty() {
+    let label = if workstation {
+        if muted.is_empty() {
+            "down alerts off for workstation".to_string()
+        } else {
+            format!(
+                "down alerts off for workstation · {} muted",
+                muted.join(", ")
+            )
+        }
+    } else if muted.is_empty() {
         String::new()
     } else {
         format!("{} muted", muted.join(", "))
@@ -12687,18 +12716,20 @@ fn alert_items(
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
         match live {
-            Liveness::Down if !host.preferences.alerts.suppress_down => alerts.push(AlertItem {
-                level: "critical",
-                host: host.name.clone(),
-                role: host.role.clone(),
-                issue: "No heartbeat received".to_string(),
-                detail: "Pharos has not received a report within the allowed heartbeat window."
-                    .to_string(),
-                source: "heartbeat",
-                seen: seen_label(host.last_seen, now),
-                next_action: "Check host power, network, and pharos-beacon.".to_string(),
-                sort_time: host.last_seen.unwrap_or(now),
-            }),
+            Liveness::Down if !host.preferences.suppresses_down_alerts() => {
+                alerts.push(AlertItem {
+                    level: "critical",
+                    host: host.name.clone(),
+                    role: host.role.clone(),
+                    issue: "No heartbeat received".to_string(),
+                    detail: "Pharos has not received a report within the allowed heartbeat window."
+                        .to_string(),
+                    source: "heartbeat",
+                    seen: seen_label(host.last_seen, now),
+                    next_action: "Check host power, network, and pharos-beacon.".to_string(),
+                    sort_time: host.last_seen.unwrap_or(now),
+                })
+            }
             Liveness::Down => {}
             Liveness::Stale => alerts.push(AlertItem {
                 level: "warning",
@@ -13512,7 +13543,7 @@ fn activity_events(
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
         match live {
-            Liveness::Down if !host.preferences.alerts.suppress_down => {
+            Liveness::Down if !host.preferences.suppresses_down_alerts() => {
                 events.push(ActivityEvent::new(
                     now,
                     host.name.clone(),
@@ -14631,11 +14662,16 @@ fn render_home_with_capabilities(
         if kernel_reboot_required(h.kernel.as_ref()).is_some() {
             search_parts.push("restart needed kernel reboot required".to_string());
         }
-        if h.preferences.alerts.suppress_down
+        if h.preferences.suppresses_down_alerts()
             || h.preferences.alerts.suppress_backup
             || h.preferences.alerts.suppress_nix_freshness
         {
-            search_parts.push("muted alert preferences".to_string());
+            search_parts.push(if h.preferences.kind == HostKind::Workstation {
+                "workstation expected offline down alerts suppressed muted alert preferences"
+                    .to_string()
+            } else {
+                "muted alert preferences".to_string()
+            });
         }
         let sort_name = html_escape(&h.name.to_lowercase());
         let last_sort = h.last_seen.unwrap_or(0);
@@ -16907,6 +16943,105 @@ mod tests {
     }
 
     #[test]
+    fn workstation_down_state_remains_visible_without_creating_down_alerts() {
+        let mut workstation = host_with_backups("stm2607", 500, vec![]);
+        workstation.preferences.kind = HostKind::Workstation;
+
+        let alerts = alert_items(
+            std::slice::from_ref(&workstation),
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(!alerts.iter().any(|alert| alert.source == "heartbeat"));
+
+        let events = activity_events(
+            runtime(std::slice::from_ref(&workstation), &[]),
+            "csb1",
+            1000,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.title == "No heartbeat received"));
+
+        let payload = hosts_payload(vec![workstation.clone()], &[], &BTreeMap::new(), 1000);
+        assert_eq!(payload["hosts"][0]["liveness"], "down");
+        assert_eq!(
+            payload["hosts"][0]["attention"]["label"],
+            "offline as expected"
+        );
+        assert_eq!(payload["hosts"][0]["attention"]["level"], "ok");
+
+        let fleet = render_home(
+            runtime(std::slice::from_ref(&workstation), &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(fleet.contains(r#"data-host="stm2607" data-live="down""#));
+        assert!(fleet.contains("offline as expected"));
+        assert!(fleet.contains("down alerts off for workstation"));
+
+        let map = map_hosts(
+            std::slice::from_ref(&workstation),
+            "csb1",
+            1000,
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(map[0].live, "down");
+        assert_eq!(map[0].attention, "offline as expected");
+        assert!(silent_beacon_alerts(std::slice::from_ref(&workstation), 1000).is_empty());
+
+        workstation.service_observations = vec![ServiceObservation {
+            id: "nginx".to_string(),
+            label: "nginx".to_string(),
+            state: ServiceObservationState::Warning,
+            summary: "response is slow".to_string(),
+        }];
+        let service_alerts = alert_items(
+            std::slice::from_ref(&workstation),
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(service_alerts
+            .iter()
+            .any(|alert| alert.issue == "nginx: warning"));
+        assert!(!service_alerts
+            .iter()
+            .any(|alert| alert.source == "heartbeat"));
+
+        let server = host_with_backups("always-on", 500, vec![]);
+        let server_alerts = alert_items(
+            std::slice::from_ref(&server),
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(server_alerts
+            .iter()
+            .any(|alert| alert.source == "heartbeat"));
+    }
+
+    #[test]
     fn render_home_sorts_self_host_like_any_other_host() {
         fn host(name: &str) -> Host {
             Host {
@@ -17430,12 +17565,18 @@ mod tests {
             }
         }
 
+        let mut manually_muted = host("manually-muted", Some(600));
+        manually_muted.preferences.alerts.suppress_down = true;
+        let mut workstation = host("workstation", Some(600));
+        workstation.preferences.kind = HostKind::Workstation;
         let alerts = silent_beacon_alerts(
             &[
                 host("live", Some(950)),
                 host("stale", Some(800)),
                 host("down", Some(600)),
                 host("awaiting", None),
+                manually_muted,
+                workstation,
             ],
             1000,
         );

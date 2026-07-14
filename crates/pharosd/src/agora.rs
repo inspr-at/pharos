@@ -59,7 +59,7 @@ const AGORA_CSS: &str = r#"<style>
 .host-setup-note{margin-top:18px;padding:10px 12px;border-left:3px solid var(--sun);background:rgba(255,248,234,.62);color:var(--muted);font-size:12px}.host-setup-note strong{display:block;margin-bottom:2px;color:var(--ink)}
 .settings-disclosures{border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.settings-disclosure+.settings-disclosure{border-top:1px solid rgba(210,226,234,.86)}
 .settings-disclosure>summary{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;min-height:58px;padding:0 14px;list-style:none;cursor:pointer}.settings-disclosure>summary::-webkit-details-marker{display:none}.settings-disclosure-title,.settings-disclosure-meta{display:flex;align-items:center;gap:10px;min-width:0}.settings-disclosure-title>.ico{width:17px;height:17px;color:#315d7c}.settings-disclosure-title strong{font-size:13px}.settings-disclosure-meta{color:var(--muted);font-size:12px}.settings-disclosure-meta>.ico{width:15px;height:15px;transition:transform .16s ease}.settings-disclosure[open] .settings-disclosure-meta>.ico{transform:rotate(180deg)}
-.settings-disclosure-body{padding:0 14px 20px}.preference-list{display:grid}.preference-row{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:54px;border-top:1px solid rgba(214,226,234,.62)}.preference-row:first-child{border-top:0}.preference-row strong{display:block;font-size:13px}.preference-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px}.preference-switch{position:relative;flex:0 0 auto;width:38px;height:22px}.preference-switch input{position:absolute;opacity:0;pointer-events:none}.preference-switch i{position:absolute;inset:0;border:1px solid rgba(137,151,163,.38);border-radius:999px;background:#edf2f4;transition:.16s}.preference-switch i:after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(45,75,95,.18);transition:.16s}.preference-switch input:checked+i{border-color:rgba(37,132,95,.36);background:rgba(37,132,95,.78)}.preference-switch input:checked+i:after{transform:translateX(16px)}.preference-switch input:focus-visible+i{outline:2px solid rgba(31,127,181,.42);outline-offset:2px}
+.settings-disclosure-body{padding:0 14px 20px}.preference-list{display:grid}.preference-row{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:54px;border-top:1px solid rgba(214,226,234,.62)}.preference-row:first-child{border-top:0}.preference-row strong{display:block;font-size:13px}.preference-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px}.preference-switch{position:relative;flex:0 0 auto;width:38px;height:22px}.preference-switch input{position:absolute;opacity:0;pointer-events:none}.preference-switch i{position:absolute;inset:0;border:1px solid rgba(137,151,163,.38);border-radius:999px;background:#edf2f4;transition:.16s}.preference-switch i:after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(45,75,95,.18);transition:.16s}.preference-switch input:checked+i{border-color:rgba(37,132,95,.36);background:rgba(37,132,95,.78)}.preference-switch input:checked+i:after{transform:translateX(16px)}.preference-switch input:focus-visible+i{outline:2px solid rgba(31,127,181,.42);outline-offset:2px}.preference-switch input:disabled+i{opacity:.52;cursor:not-allowed}
 .preference-actions{display:flex;align-items:center;gap:12px;margin-top:14px}.preference-actions .primary-action{min-height:38px;background:#fff;color:var(--ink)}.preference-actions .primary-action:hover{background:#f4fafb}
 .host-advanced{display:grid;gap:12px}.host-advanced-note{margin:0;color:var(--muted);font-size:12px}.host-advanced-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.host-advanced-meta div{min-width:0;padding:9px 10px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,252,253,.72)}.host-advanced-meta span,.host-advanced-meta strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.host-advanced-meta span{color:var(--muted);font-size:10px}.host-advanced-meta strong{margin-top:2px;font-size:11px}.host-advanced .review-output{min-height:120px;max-height:260px}
 .host-kind-row{display:grid;grid-template-columns:minmax(0,1fr) 180px auto;align-items:center;gap:12px;padding:11px 0;border-top:1px solid rgba(214,226,234,.62);border-bottom:1px solid rgba(214,226,234,.62)}.host-kind-copy strong,.host-kind-copy span{display:block}.host-kind-copy strong{font-size:13px}.host-kind-copy span{margin-top:2px;color:var(--muted);font-size:11px}.host-kind-row select{height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px;padding:0 10px}.host-kind-row .primary-action{min-height:38px;background:#fff;color:var(--ink)}
@@ -711,6 +711,8 @@ if(root){{
   const backup=root.querySelector('[data-alert-backup]');
   const nix=root.querySelector('[data-alert-nix]');
   const kind=root.querySelector('[data-host-kind]');
+  const downCopy=root.querySelector('[data-alert-down-copy]');
+  let manualDownSuppressed=root.dataset.manualDownSuppressed==='true';
   function setStatus(state,text){{if(!status)return;status.dataset.state=state;status.textContent=text}}
   function setPressed(value){{root.querySelectorAll('[data-preset]').forEach(button=>button.setAttribute('aria-pressed',String((button.dataset.preset||'').toLowerCase()===value.toLowerCase())))}}
   function setPicked(value){{
@@ -727,12 +729,20 @@ if(root){{
     const enabled=[down,backup,nix].filter(input=>input?.checked).length;
     if(alertSummary)alertSummary.textContent=enabled+' on';
   }}
+  function syncDownAlertPolicy(){{
+    if(!down)return;
+    const workstation=(kind?.value||root.dataset.kind)==='workstation';
+    down.disabled=root.dataset.hostReported!=='true'||workstation;
+    down.checked=workstation?false:!manualDownSuppressed;
+    if(downCopy)downCopy.textContent=workstation?'Off automatically for workstations.':'Warn when this host stops reporting.';
+    updateAlertSummary();
+  }}
   function requestedPreferences(){{
     return {{
       accent:color?.value||null,
       kind:kind?.value||root.dataset.kind||'server',
       alerts:{{
-        suppress_down:!down?.checked,
+        suppress_down:manualDownSuppressed,
         suppress_backup:!backup?.checked,
         suppress_nix_freshness:!nix?.checked,
       }},
@@ -771,9 +781,11 @@ if(root){{
   root.querySelector('[data-save-color]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
   root.querySelector('[data-save-alerts]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
   root.querySelector('[data-save-kind]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
-  [down,backup,nix].forEach(input=>input?.addEventListener('change',updateAlertSummary));
+  down?.addEventListener('change',()=>{{manualDownSuppressed=!down.checked;updateAlertSummary()}});
+  [backup,nix].forEach(input=>input?.addEventListener('change',updateAlertSummary));
+  kind?.addEventListener('change',syncDownAlertPolicy);
   setPicked(color?.value||'{accent}');
-  updateAlertSummary();
+  syncDownAlertPolicy();
 }}
 </script></div></body></html>"##,
         header = crate::page_header(
@@ -859,7 +871,7 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         )
     };
     let enabled_alerts = [
-        !shown_preferences.alerts.suppress_down,
+        !shown_preferences.suppresses_down_alerts(),
         !shown_preferences.alerts.suppress_backup,
         !shown_preferences.alerts.suppress_nix_freshness,
     ]
@@ -922,12 +934,13 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         ""
     };
     format!(
-        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-kind="{kind}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><button class="primary-action" type="button" data-save-color{disabled}>{color_action}</button><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span>Warn when this host stops reporting.</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div><div class="preference-actions"><button class="primary-action" type="button" data-save-alerts{disabled}>Save alert preferences</button></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select><button class="primary-action" type="button" data-save-kind{disabled}>Save host type</button></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section></section>"##,
+        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-kind="{kind}" data-manual-down-suppressed="{manual_down_suppressed}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><button class="primary-action" type="button" data-save-color{disabled}>{color_action}</button><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span data-alert-down-copy>{down_copy}</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{down_disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div><div class="preference-actions"><button class="primary-action" type="button" data-save-alerts{disabled}>Save alert preferences</button></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select><button class="primary-action" type="button" data-save-kind{disabled}>Save host type</button></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section></section>"##,
         host_name = html_escape(&host.name),
         ready = if ready { "true" } else { "false" },
         has_reported = if host.has_reported { "true" } else { "false" },
         disabled = if host.has_reported { "" } else { " disabled" },
         kind = shown_preferences.kind.label(),
+        manual_down_suppressed = shown_preferences.alerts.suppress_down,
         role = html_escape(&role_copy),
         accent = html_escape(accent),
         badge = badge,
@@ -945,7 +958,18 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         bell = crate::icons::BELL,
         enabled_alerts = enabled_alerts,
         chevron = crate::icons::CHEVRON_DOWN,
-        down_checked = checked(!shown_preferences.alerts.suppress_down),
+        down_checked = checked(!shown_preferences.suppresses_down_alerts()),
+        down_disabled =
+            if !host.has_reported || shown_preferences.kind == pharos_core::HostKind::Workstation {
+                " disabled"
+            } else {
+                ""
+            },
+        down_copy = if shown_preferences.kind == pharos_core::HostKind::Workstation {
+            "Off automatically for workstations."
+        } else {
+            "Warn when this host stops reporting."
+        },
         backup_checked = checked(!shown_preferences.alerts.suppress_backup),
         nix_checked = checked(!shown_preferences.alerts.suppress_nix_freshness),
         sliders = crate::icons::SLIDERS,
@@ -1681,6 +1705,45 @@ mod tests {
         assert!(!html.contains("Services</button>"));
         assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
+    }
+
+    #[test]
+    fn workstation_settings_explain_automatic_down_policy_and_preserve_manual_choice() {
+        let mut declaration = manifest();
+        declaration.host.preferences.kind = HostKind::Workstation;
+        let mut runtime = runtime_host("hsb8");
+        runtime.preferences.kind = HostKind::Workstation;
+
+        let html = render_page(
+            &[declaration],
+            &BTreeMap::new(),
+            &[runtime],
+            Some("hsb8"),
+            "markus",
+            true,
+        );
+
+        assert!(html.contains(r#"data-kind="workstation" data-manual-down-suppressed="false""#));
+        assert!(html.contains("Off automatically for workstations."));
+        assert!(html.contains(r#"<input data-alert-down type="checkbox" disabled>"#));
+        assert!(html.contains(r#"<span data-alert-summary>2 on</span>"#));
+        assert!(
+            html.contains("let manualDownSuppressed=root.dataset.manualDownSuppressed==='true'")
+        );
+        assert!(html.contains("suppress_down:manualDownSuppressed"));
+        assert!(html.contains("kind?.addEventListener('change',syncDownAlertPolicy)"));
+
+        let server_html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime_host("hsb8")],
+            Some("hsb8"),
+            "markus",
+            true,
+        );
+        assert!(server_html.contains(r#"<input data-alert-down type="checkbox" checked>"#));
+        assert!(server_html.contains("Warn when this host stops reporting."));
+        assert!(server_html.contains(r#"<span data-alert-summary>3 on</span>"#));
     }
 
     #[test]
