@@ -85,6 +85,8 @@ impl HostPreferences {
 
 pub const HOST_PREFERENCES_SCHEMA: &str = "inspr.pharos.host-preferences.v1";
 pub const HOST_PREFERENCES_VERSION: u16 = 1;
+pub const HOST_REPORT_RESPONSE_SCHEMA: &str = "inspr.pharos.report-response.v1";
+pub const HOST_REPORT_RESPONSE_VERSION: u16 = 1;
 
 /// Narrow declarative preference registry shared with nixcfg. It contains
 /// display/alert metadata only and is not extensible to commands or paths.
@@ -135,6 +137,69 @@ impl HostPreferencesRegistry {
 
     pub fn preferences_for(&self, host: &str) -> Option<&HostPreferences> {
         self.hosts.get(host)
+    }
+}
+
+/// Optional server response to a successful beacon report. Pending settings
+/// reuse the exact declarative registry accepted from nixcfg; this envelope
+/// cannot carry commands, paths, or arbitrary extension fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostReportResponse {
+    pub schema: String,
+    pub version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_preferences: Option<HostPreferencesRegistry>,
+}
+
+impl HostReportResponse {
+    pub fn pending(host: &str, preferences: HostPreferences) -> Result<Self, String> {
+        let mut hosts = BTreeMap::new();
+        hosts.insert(host.to_string(), preferences);
+        let response = Self {
+            schema: HOST_REPORT_RESPONSE_SCHEMA.to_string(),
+            version: HOST_REPORT_RESPONSE_VERSION,
+            pending_preferences: Some(HostPreferencesRegistry {
+                schema: HOST_PREFERENCES_SCHEMA.to_string(),
+                version: HOST_PREFERENCES_VERSION,
+                hosts,
+            }),
+        };
+        response.validate_contract_for(host)?;
+        Ok(response)
+    }
+
+    pub fn validate_contract_for(&self, host: &str) -> Result<(), String> {
+        if self.schema != HOST_REPORT_RESPONSE_SCHEMA {
+            return Err(format!(
+                "unsupported report response schema {:?}",
+                self.schema
+            ));
+        }
+        if self.version != HOST_REPORT_RESPONSE_VERSION {
+            return Err(format!(
+                "unsupported report response version {}",
+                self.version
+            ));
+        }
+        let Some(registry) = &self.pending_preferences else {
+            return Ok(());
+        };
+        registry.validate_contract()?;
+        if registry.hosts.len() != 1 || !registry.hosts.contains_key(host) {
+            return Err(
+                "report response preferences must contain exactly the reporting host".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn preferences_for(&self, host: &str) -> Result<Option<&HostPreferences>, String> {
+        self.validate_contract_for(host)?;
+        Ok(self
+            .pending_preferences
+            .as_ref()
+            .and_then(|registry| registry.preferences_for(host)))
     }
 }
 
@@ -2615,6 +2680,79 @@ mod tests {
                 "version": 1,
                 "hosts": {},
                 "commands": ["rebuild"]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn report_response_reuses_one_strict_host_preferences_registry() {
+        let preferences = HostPreferences {
+            accent: Some("#9868d0".to_string()),
+            kind: HostKind::Workstation,
+            alerts: HostAlertPreferences {
+                suppress_down: false,
+                suppress_backup: true,
+                suppress_nix_freshness: false,
+            },
+        };
+        let response = HostReportResponse::pending("gpc0", preferences.clone())
+            .expect("pending response validates");
+        assert_eq!(response.preferences_for("gpc0"), Ok(Some(&preferences)));
+        assert_eq!(
+            response.pending_preferences.as_ref().map(|registry| {
+                (
+                    registry.schema.as_str(),
+                    registry.version,
+                    registry.hosts.len(),
+                )
+            }),
+            Some((HOST_PREFERENCES_SCHEMA, HOST_PREFERENCES_VERSION, 1))
+        );
+
+        let mismatched: HostReportResponse = serde_json::from_value(serde_json::json!({
+            "schema": "inspr.pharos.report-response.v1",
+            "version": 1,
+            "pending_preferences": {
+                "schema": "inspr.pharos.host-preferences.v1",
+                "version": 1,
+                "hosts": {
+                    "athena": {
+                        "accent": "#9868d0",
+                        "kind": "workstation",
+                        "alerts": {}
+                    }
+                }
+            }
+        }))
+        .expect("typed but mismatched response parses");
+        assert!(mismatched.validate_contract_for("gpc0").is_err());
+
+        assert!(
+            serde_json::from_value::<HostReportResponse>(serde_json::json!({
+                "schema": "inspr.pharos.report-response.v1",
+                "version": 1,
+                "pending_preferences": {
+                    "schema": "inspr.pharos.host-preferences.v1",
+                    "version": 1,
+                    "hosts": {
+                        "gpc0": {
+                            "accent": "#9868d0",
+                            "kind": "workstation",
+                            "alerts": {},
+                            "command": "rebuild"
+                        }
+                    }
+                }
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<HostReportResponse>(serde_json::json!({
+                "schema": "inspr.pharos.report-response.v1",
+                "version": 1,
+                "pending_preferences": null,
+                "command": "rebuild"
             }))
             .is_err()
         );

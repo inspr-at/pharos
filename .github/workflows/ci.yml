@@ -27,6 +27,28 @@ jobs:
         run: cargo deny check
       - name: shell syntax
         run: bash -n scripts/install-pharos-beacon-systemd.sh scripts/bootstrap-pharos-nixos-anywhere.sh
+      - name: native systemd settings state dry run
+        run: |
+          work="$(mktemp -d)"
+          cleanup() {
+            find "$work" -type f -delete 2>/dev/null || true
+            rmdir "$work" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          printf '#!/bin/sh\nexit 0\n' >"$work/pharos-beacon"
+          chmod 0755 "$work/pharos-beacon"
+          printf 'PHAROS_TOKEN=test-only-placeholder\n' >"$work/token.env"
+          chmod 0600 "$work/token.env"
+          output="$(scripts/install-pharos-beacon-systemd.sh \
+            --binary "$work/pharos-beacon" \
+            --token-env "$work/token.env" \
+            --host test-host \
+            --dry-run)"
+          grep -F 'Environment=PHAROS_PREFERENCES_FILE="/var/lib/pharos-beacon/host-preferences.json"' <<<"$output"
+          grep -F 'StateDirectory=pharos-beacon' <<<"$output"
+          grep -F 'StateDirectoryMode=0700' <<<"$output"
+          grep -F 'UMask=0077' <<<"$output"
+          ! grep -F 'test-only-placeholder' <<<"$output"
       - name: nixos-anywhere handoff dry run
         run: |
           work="$(mktemp -d)"

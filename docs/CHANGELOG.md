@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.38 - 2026-07-14
+
+- Apply color, host type, and alert choices on native non-Nix hosts through the heartbeat they already send, with no inbound listener or additional operator setup.
+- Keep the selected values in private host-owned service state and confirm them only after the host reports the applied settings on its next heartbeat.
+- Reuse the exact narrow Nix host-settings schema, reject commands and unknown fields, and preserve the last valid local settings when a response is malformed, mismatched, oversized, or cannot be written safely.
+
 ## 0.1.37 - 2026-07-14
 
 - Open Add server with only two obvious choices: create a new server or connect one that already exists, using centered Pharos-style icon controls on desktop and mobile.

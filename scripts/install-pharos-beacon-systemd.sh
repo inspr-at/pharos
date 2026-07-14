@@ -8,6 +8,7 @@ Usage: install-pharos-beacon-systemd.sh --binary PATH|--binary-url URL --token-e
 Installs pharos-beacon as a native systemd service on non-Nix Linux hosts.
 The token env/file must already exist unless --allow-legacy is set for the
 temporary PHAROS-37 rollout window.
+Host settings are stored privately in /var/lib/pharos-beacon.
 
 Options:
   --binary PATH          Local pharos-beacon binary to install.
@@ -223,6 +224,7 @@ Environment=PHAROS_URL=$(systemd_quote "$pharos_url")
 Environment=PHAROS_INTERVAL=$interval
 Environment=PHAROS_HOSTNAME=$(systemd_quote "$host")
 Environment=PHAROS_ROLE=$(systemd_quote "$role")
+Environment=PHAROS_PREFERENCES_FILE="/var/lib/pharos-beacon/host-preferences.json"
 EOF
   if [[ -n "$nixcfg_dir" ]]; then
     echo "Environment=NIXCFG_DIR=$(systemd_quote "$nixcfg_dir")"
@@ -237,6 +239,9 @@ EOF
 ExecStart=$install_path
 Restart=always
 RestartSec=10s
+StateDirectory=pharos-beacon
+StateDirectoryMode=0700
+UMask=0077
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true
