@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.35 - 2026-07-14
+
+- Keep declared-host removal pending until both the reviewed nixcfg declaration and the Janus-owned host credential are retired; removing a manifest alone no longer reports success.
+- Add a separate machine-authenticated retirement-owner lease that can execute only an already approved host retirement, never return credential material, and cannot retire its own owner host.
+- Show credential retirement as a persisted checklist gate with waiting, running, action-required, retry, and complete states while preserving typed failure evidence and the original operator intent.
+
 ## 0.1.34 - 2026-07-13
 
 - Keep the running workflow step visibly active with a low-frequency stepped indicator that avoids continuous full-dialog compositing and honors reduced-motion preferences.
