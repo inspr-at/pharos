@@ -8,7 +8,7 @@
 
 rustPlatform.buildRustPackage {
   pname = binaryName;
-  version = "0.0.1";
+  version = lib.removeSuffix "\n" (builtins.readFile (src + "/VERSION"));
 
   inherit src;
 

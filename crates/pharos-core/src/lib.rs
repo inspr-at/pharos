@@ -65,6 +65,10 @@ pub struct HostPreferences {
 }
 
 impl HostPreferences {
+    pub fn suppresses_down_alerts(&self) -> bool {
+        self.kind == HostKind::Workstation || self.alerts.suppress_down
+    }
+
     pub fn validate_contract(&self) -> Result<(), String> {
         if let Some(accent) = self.accent.as_deref() {
             let bytes = accent.as_bytes();
@@ -2557,6 +2561,28 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn workstation_kind_suppresses_down_alerts_without_changing_manual_preference() {
+        let workstation = HostPreferences {
+            kind: HostKind::Workstation,
+            ..Default::default()
+        };
+        assert!(workstation.suppresses_down_alerts());
+        assert!(!workstation.alerts.suppress_down);
+
+        let server = HostPreferences::default();
+        assert!(!server.suppresses_down_alerts());
+
+        let muted_server = HostPreferences {
+            alerts: HostAlertPreferences {
+                suppress_down: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(muted_server.suppresses_down_alerts());
     }
 
     #[test]

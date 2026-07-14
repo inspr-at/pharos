@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.36 - 2026-07-14
+
+- Treat a Workstation host type as an explicit expected-offline policy: Fleet and Map retain the true Down state while Alerts, Activity, and outbound silent-heartbeat notifications omit that expected outage.
+- Keep Server behavior unchanged, preserve the existing manual Down-alert preference, and continue surfacing backup, Nix freshness, kernel, and service warnings independently of host type.
+- Explain the automatic Workstation policy in Host Settings with a disabled Down-alert control while preserving the user's manual preference for a future switch back to Server.
+
 ## 0.1.35 - 2026-07-14
 
 - Keep declared-host removal pending until both the reviewed nixcfg declaration and the Janus-owned host credential are retired; removing a manifest alone no longer reports success.
