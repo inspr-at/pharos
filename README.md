@@ -149,6 +149,13 @@ option below). The beacon validates the complete fixed schema, selects only its
 own hostname, and keeps its last valid value if a later read is missing or
 malformed. Unknown fields are rejected; the file cannot carry commands.
 
+Native systemd beacons use the same schema without requiring an operator to
+edit that file. A successful report can return a pending preference set for
+that reporting non-Nix host only. The beacon validates the bounded response and
+atomically replaces its private `/var/lib/pharos-beacon/host-preferences.json`
+file with mode `0600`; malformed, mismatched, or failed writes leave the last
+valid file untouched. Nix hosts never receive this local-write response.
+
 ### Local Docker Compose
 
 `docker-compose.yml` is a local smoke topology, not the production deployment.
@@ -305,7 +312,9 @@ sudo ./scripts/install-pharos-beacon-systemd.sh \
 
 The installer also accepts `--binary-url` for a prebuilt binary. It never creates
 or prints token values; the token file or env file must already exist unless
-`--allow-legacy` is passed for the temporary PHAROS-37 rollout window.
+`--allow-legacy` is passed for the temporary PHAROS-37 rollout window. systemd
+creates `/var/lib/pharos-beacon` as private service state, where preferences
+selected in Pharos are applied automatically after the next heartbeat.
 
 ## Beacon tokens
 

@@ -11,7 +11,12 @@
 //!      PHAROS_TOKEN (per-host bearer token from /register),
 //!      PHAROS_BACKUP_MODE (auto/off/restic/status-file/command).
 
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(all(unix, test))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,9 +24,41 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pharos_core::{
     BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
     HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
-    KernelPosture, NixFreshness, ServiceObservation, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
-    MAX_INBOUND_RTT_MS,
+    HostReportResponse, KernelPosture, NixFreshness, ServiceObservation, ServiceObservationState,
+    HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_INBOUND_RTT_MS,
 };
+
+const MAX_REPORT_RESPONSE_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferencesApplyError {
+    InvalidResponse,
+    HostMismatch,
+    NotConfigured,
+    UnsupportedOnNix,
+    WriteFailed,
+}
+
+impl PreferencesApplyError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::InvalidResponse => "invalid_response",
+            Self::HostMismatch => "host_mismatch",
+            Self::NotConfigured => "preferences_file_not_configured",
+            Self::UnsupportedOnNix => "nix_host_uses_declarative_delivery",
+            Self::WriteFailed => "atomic_write_failed",
+        }
+    }
+
+    fn observation(self) -> ServiceObservation {
+        ServiceObservation {
+            id: "host-preferences".to_string(),
+            label: "Host settings".to_string(),
+            state: ServiceObservationState::Warning,
+            summary: format!("settings apply failed: {}", self.code()),
+        }
+    }
+}
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -82,6 +119,106 @@ fn read_host_preferences(path: &Path, host: &str) -> Result<HostPreferences, &'s
     let raw =
         std::fs::read_to_string(path).map_err(|_| "host preference registry is unavailable")?;
     parse_host_preferences(&raw, host)
+}
+
+fn atomic_write_host_preferences(
+    path: &Path,
+    registry: &HostPreferencesRegistry,
+) -> Result<(), PreferencesApplyError> {
+    registry
+        .validate_contract()
+        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
+    let parent = path.parent().ok_or(PreferencesApplyError::WriteFailed)?;
+    if !parent.is_dir() {
+        return Err(PreferencesApplyError::WriteFailed);
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(PreferencesApplyError::WriteFailed)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| PreferencesApplyError::WriteFailed)?
+        .as_nanos();
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+    let mut bytes =
+        serde_json::to_vec_pretty(registry).map_err(|_| PreferencesApplyError::InvalidResponse)?;
+    bytes.push(b'\n');
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(PreferencesApplyError::WriteFailed);
+    }
+    Ok(())
+}
+
+fn apply_report_response(
+    body: &str,
+    host: &str,
+    is_nix: bool,
+    preferences_path: Option<&Path>,
+) -> Result<Option<HostPreferences>, PreferencesApplyError> {
+    let response = serde_json::from_str::<HostReportResponse>(body)
+        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
+    if response
+        .pending_preferences
+        .as_ref()
+        .is_some_and(|registry| registry.hosts.len() != 1 || !registry.hosts.contains_key(host))
+    {
+        return Err(PreferencesApplyError::HostMismatch);
+    }
+    response
+        .validate_contract_for(host)
+        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
+    let Some(registry) = response.pending_preferences.as_ref() else {
+        return Ok(None);
+    };
+    if is_nix {
+        return Err(PreferencesApplyError::UnsupportedOnNix);
+    }
+    let path = preferences_path.ok_or(PreferencesApplyError::NotConfigured)?;
+    atomic_write_host_preferences(path, registry)?;
+    Ok(registry.preferences_for(host).cloned())
+}
+
+fn apply_report_http_response(
+    response: ureq::Response,
+    host: &str,
+    is_nix: bool,
+    preferences_path: Option<&Path>,
+) -> Result<Option<HostPreferences>, PreferencesApplyError> {
+    if response.status() == 204 {
+        return Ok(None);
+    }
+    if response.status() != 200 {
+        return Err(PreferencesApplyError::InvalidResponse);
+    }
+    let body = read_bounded_report_response(response.into_reader())?;
+    apply_report_response(&body, host, is_nix, preferences_path)
+}
+
+fn read_bounded_report_response(reader: impl Read) -> Result<String, PreferencesApplyError> {
+    let mut body = String::new();
+    reader
+        .take(MAX_REPORT_RESPONSE_BYTES + 1)
+        .read_to_string(&mut body)
+        .map_err(|_| PreferencesApplyError::InvalidResponse)?;
+    if body.len() as u64 > MAX_REPORT_RESPONSE_BYTES {
+        return Err(PreferencesApplyError::InvalidResponse);
+    }
+    Ok(body)
 }
 
 /// Locate a flake checkout (one containing flake.lock).
@@ -1104,6 +1241,7 @@ fn main() {
     let preferences_path = env_value("PHAROS_PREFERENCES_FILE").map(std::path::PathBuf::from);
     let mut preferences = HostPreferences::default();
     let mut preferences_error_reported = false;
+    let mut preferences_apply_error: Option<PreferencesApplyError> = None;
 
     // PHAROS_INTERVAL (secs) set => loop forever (recurring service);
     // unset => report once and exit (one-shot / timer-driven).
@@ -1137,7 +1275,10 @@ fn main() {
         } else {
             NixFreshness::default()
         };
-        let service_observations = vec![ServiceObservation::nix_freshness(&freshness)];
+        let mut service_observations = vec![ServiceObservation::nix_freshness(&freshness)];
+        if let Some(error) = preferences_apply_error {
+            service_observations.push(error.observation());
+        }
         let observed_at = now_unix();
         let kernel = collect_kernel_posture(is_nix, observed_at);
         let location = collect_location(observed_at);
@@ -1165,18 +1306,36 @@ fn main() {
         let started = Instant::now();
         match request.send_string(&body) {
             Ok(resp) => {
+                let status = resp.status();
                 last_report_rtt_ms = Some(report_rtt_millis(started.elapsed()));
                 println!(
                     "{}",
                     success_log_line(
                         &host,
                         &endpoint,
-                        resp.status(),
+                        status,
                         &report.freshness,
                         report.location.as_ref(),
                         &report.backup_observations
                     )
                 );
+                match apply_report_http_response(resp, &host, is_nix, preferences_path.as_deref()) {
+                    Ok(Some(applied)) => {
+                        preferences = applied;
+                        preferences_apply_error = None;
+                        println!("pharos-beacon: applied pending host settings");
+                    }
+                    Ok(None) => {
+                        preferences_apply_error = None;
+                    }
+                    Err(error) => {
+                        preferences_apply_error = Some(error);
+                        eprintln!(
+                            "pharos-beacon: pending host settings were not applied ({})",
+                            error.code()
+                        );
+                    }
+                }
             }
             Err(e) => {
                 last_report_rtt_ms = None;
@@ -1271,6 +1430,165 @@ mod tests {
         )
         .is_err());
         assert_eq!(previous, HostPreferences::default());
+    }
+
+    #[test]
+    fn pending_preferences_are_atomically_written_as_the_shared_registry() {
+        let root = kernel_fixture("pending-preferences");
+        std::fs::create_dir(&root).expect("create preferences fixture");
+        let path = root.join("host-preferences.json");
+        let preferences = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            kind: pharos_core::HostKind::Workstation,
+            alerts: pharos_core::HostAlertPreferences {
+                suppress_down: false,
+                suppress_backup: true,
+                suppress_nix_freshness: false,
+            },
+        };
+        let response = HostReportResponse::pending("gpc0", preferences.clone())
+            .expect("pending response validates");
+        let body = serde_json::to_string(&response).expect("response serializes");
+
+        let applied = apply_report_response(&body, "gpc0", false, Some(&path))
+            .expect("pending preferences apply");
+        assert_eq!(applied, Some(preferences.clone()));
+        assert_eq!(
+            read_host_preferences(&path, "gpc0").expect("written registry parses"),
+            preferences
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("preferences metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .expect("fixture directory readable")
+                .count(),
+            1,
+            "atomic apply must not leave temporary files behind"
+        );
+        std::fs::remove_dir_all(root).expect("remove preferences fixture");
+    }
+
+    #[test]
+    fn invalid_or_misdirected_pending_preferences_keep_the_previous_file() {
+        let root = kernel_fixture("invalid-pending-preferences");
+        std::fs::create_dir(&root).expect("create preferences fixture");
+        let path = root.join("host-preferences.json");
+        let previous = HostPreferences {
+            accent: Some("#1f7fb5".to_string()),
+            ..Default::default()
+        };
+        let initial = HostReportResponse::pending("gpc0", previous.clone())
+            .expect("initial response validates");
+        apply_report_response(
+            &serde_json::to_string(&initial).expect("initial response serializes"),
+            "gpc0",
+            false,
+            Some(&path),
+        )
+        .expect("initial preferences apply");
+        let previous_bytes = std::fs::read(&path).expect("read previous registry");
+
+        let invalid = r##"{
+          "schema":"inspr.pharos.report-response.v1",
+          "version":1,
+          "pending_preferences":{
+            "schema":"inspr.pharos.host-preferences.v1",
+            "version":1,
+            "hosts":{
+              "gpc0":{
+                "accent":"#48b8a8",
+                "kind":"workstation",
+                "alerts":{},
+                "command":"rebuild"
+              }
+            }
+          }
+        }"##;
+        assert_eq!(
+            apply_report_response(invalid, "gpc0", false, Some(&path)),
+            Err(PreferencesApplyError::InvalidResponse)
+        );
+
+        let wrong_host = HostReportResponse::pending(
+            "athena",
+            HostPreferences {
+                accent: Some("#48b8a8".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("other host response validates for its host");
+        assert_eq!(
+            apply_report_response(
+                &serde_json::to_string(&wrong_host).expect("response serializes"),
+                "gpc0",
+                false,
+                Some(&path),
+            ),
+            Err(PreferencesApplyError::HostMismatch)
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("previous registry remains"),
+            previous_bytes
+        );
+        std::fs::remove_dir_all(root).expect("remove preferences fixture");
+    }
+
+    #[test]
+    fn pending_preferences_require_a_non_nix_host_and_configured_file() {
+        let response = HostReportResponse::pending(
+            "gpc0",
+            HostPreferences {
+                accent: Some("#48b8a8".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("pending response validates");
+        let body = serde_json::to_string(&response).expect("response serializes");
+
+        assert_eq!(
+            apply_report_response(&body, "gpc0", false, None),
+            Err(PreferencesApplyError::NotConfigured)
+        );
+        assert_eq!(
+            apply_report_response(
+                &body,
+                "gpc0",
+                true,
+                Some(Path::new("/unused/preferences.json")),
+            ),
+            Err(PreferencesApplyError::UnsupportedOnNix)
+        );
+        let observation = PreferencesApplyError::WriteFailed.observation();
+        assert_eq!(observation.id, "host-preferences");
+        assert_eq!(observation.state, ServiceObservationState::Warning);
+        assert_eq!(
+            observation.summary,
+            "settings apply failed: atomic_write_failed"
+        );
+    }
+
+    #[test]
+    fn pending_preferences_response_body_is_bounded() {
+        let at_limit = vec![b' '; MAX_REPORT_RESPONSE_BYTES as usize];
+        assert_eq!(
+            read_bounded_report_response(std::io::Cursor::new(at_limit))
+                .expect("body at limit is accepted")
+                .len(),
+            MAX_REPORT_RESPONSE_BYTES as usize
+        );
+        let oversized = vec![b' '; MAX_REPORT_RESPONSE_BYTES as usize + 1];
+        assert_eq!(
+            read_bounded_report_response(std::io::Cursor::new(oversized)),
+            Err(PreferencesApplyError::InvalidResponse)
+        );
     }
 
     #[test]

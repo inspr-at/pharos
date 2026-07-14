@@ -33,7 +33,7 @@ use std::os::unix::fs::PermissionsExt;
 use axum::extract::{FromRef, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
@@ -42,15 +42,15 @@ use pharos_core::{
     ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
     ExistingHostPreflightSummary, ExistingHostSetupContext, Host, HostKind, HostLocation,
     HostLocationSource, HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse,
-    HostReport, KernelPosture, KernelPostureState, Liveness, LocationSetupIntent,
-    ManifestLocationMode, ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness,
-    PreflightCheckState, PrivilegedActionMode, ProvisioningBackupProposal,
-    ProvisioningBackupProposalKind, ProvisioningBackupSecretFile, ProvisioningHandoff,
-    ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry, ProvisioningProviderResource,
-    ProvisioningSetupIntent, ProvisioningTerminalOutcome, SecretOwner, ServiceObservation,
-    ServiceObservationState, SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
-    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
-    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    HostReport, HostReportResponse, KernelPosture, KernelPostureState, Liveness,
+    LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
+    ManifestStatusSource, NixFreshness, PreflightCheckState, PrivilegedActionMode,
+    ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
+    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
+    ProvisioningProviderResource, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
+    SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
+    EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
+    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8891,10 +8891,10 @@ async fn report(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(rep): Json<HostReport>,
-) -> StatusCode {
+) -> Response {
     if state.retired_hosts.is_retired(&rep.name) {
         tracing::warn!(host = %rep.name, "report rejected: host retired from Pharos");
-        return StatusCode::GONE;
+        return StatusCode::GONE.into_response();
     }
     if let Err(error) = rep.validate_contract() {
         tracing::warn!(
@@ -8904,7 +8904,7 @@ async fn report(
             error = %error,
             "report rejected: invalid report contract"
         );
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     if let Some(token) = bearer_token(&headers) {
         match state
@@ -8914,7 +8914,7 @@ async fn report(
             ReportTokenAuth::Allowed => {}
             ReportTokenAuth::Denied => {
                 tracing::warn!(host = %rep.name, "report rejected: invalid bearer token");
-                return StatusCode::UNAUTHORIZED;
+                return StatusCode::UNAUTHORIZED.into_response();
             }
             ReportTokenAuth::Unavailable(err) => {
                 tracing::error!(
@@ -8922,12 +8922,12 @@ async fn report(
                     error = %err,
                     "report rejected: beacon token verifier unavailable"
                 );
-                return StatusCode::SERVICE_UNAVAILABLE;
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
         }
     } else if state.beacon_auth.require_report_token {
         tracing::warn!(host = %rep.name, "report rejected: missing bearer token");
-        return StatusCode::UNAUTHORIZED;
+        return StatusCode::UNAUTHORIZED.into_response();
     } else {
         tracing::warn!(
             host = %rep.name,
@@ -8936,11 +8936,28 @@ async fn report(
     }
     tracing::info!(host = %rep.name, "report received");
     let host_name = rep.name.clone();
-    let settings_applied = state
+    let requested_preferences = state
         .store
         .get(&host_name)
-        .and_then(|host| host.requested_preferences)
-        .is_some_and(|requested| requested == rep.preferences);
+        .and_then(|host| host.requested_preferences);
+    let settings_applied = requested_preferences
+        .as_ref()
+        .is_some_and(|requested| requested == &rep.preferences);
+    let pending_preferences = (!rep.is_nix)
+        .then(|| requested_preferences.clone())
+        .flatten()
+        .filter(|requested| requested != &rep.preferences);
+    if let Some(observation) = rep
+        .service_observations
+        .iter()
+        .find(|observation| observation.id == "host-preferences")
+    {
+        tracing::warn!(
+            host = %host_name,
+            state = observation.state.label(),
+            "host settings application reported attention"
+        );
+    }
     let now = now_unix();
     state.store.record(rep, now);
     if settings_applied {
@@ -8954,7 +8971,20 @@ async fn report(
             }
         }
     }
-    StatusCode::NO_CONTENT
+    let Some(preferences) = pending_preferences else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    match HostReportResponse::pending(&host_name, preferences) {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => {
+            tracing::error!(
+                host = %host_name,
+                error = %error,
+                "pending host settings response could not be constructed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Local host registration for MVP onboarding (PHAROS-8/7). Protected by a
@@ -20495,7 +20525,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             Json(test_report("ares")),
         )
         .await;
-        assert_eq!(report_status, StatusCode::GONE);
+        assert_eq!(report_status.status(), StatusCode::GONE);
 
         let (status, _) = allow_host_reonboarding(
             State(state.clone()),
@@ -20514,7 +20544,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             Json(test_report("ares")),
         )
         .await;
-        assert_eq!(report_status, StatusCode::NO_CONTENT);
+        assert_eq!(report_status.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -20806,7 +20836,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status.status(), StatusCode::NO_CONTENT);
         assert!(state
             .store
             .list()
@@ -20828,7 +20858,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -20843,7 +20873,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -20853,7 +20883,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let status = report(State(state), HeaderMap::new(), Json(test_report("ares"))).await;
 
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -20868,7 +20898,98 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn report_returns_pending_preferences_only_to_the_reporting_non_nix_host() {
+        let state = report_test_state(false);
+        let mut initial = test_report("gpc0");
+        initial.is_nix = false;
+        initial.freshness = NixFreshness::default();
+        state.store.record(initial.clone(), now_unix());
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            kind: HostKind::Workstation,
+            alerts: pharos_core::HostAlertPreferences {
+                suppress_down: false,
+                suppress_backup: true,
+                suppress_nix_freshness: false,
+            },
+        };
+        state
+            .store
+            .request_preferences("gpc0", requested.clone())
+            .expect("preferences request queued");
+
+        let response = report(State(state.clone()), HeaderMap::new(), Json(initial)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body reads");
+        let payload: HostReportResponse =
+            serde_json::from_slice(&bytes).expect("response contract parses");
+        assert_eq!(payload.preferences_for("gpc0"), Ok(Some(&requested)));
+        assert_eq!(
+            state
+                .store
+                .get("gpc0")
+                .and_then(|host| host.requested_preferences),
+            Some(requested),
+            "delivery is not acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_never_returns_local_write_preferences_to_nix_hosts() {
+        let state = report_test_state(false);
+        let initial = test_report("ares");
+        state.store.record(initial.clone(), now_unix());
+        state
+            .store
+            .request_preferences(
+                "ares",
+                HostPreferences {
+                    accent: Some("#48b8a8".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("preferences request queued");
+
+        let response = report(State(state.clone()), HeaderMap::new(), Json(initial)).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state
+            .store
+            .get("ares")
+            .and_then(|host| host.requested_preferences)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn matching_non_nix_report_acknowledges_pending_preferences() {
+        let state = report_test_state(false);
+        let mut initial = test_report("gpc0");
+        initial.is_nix = false;
+        initial.freshness = NixFreshness::default();
+        state.store.record(initial.clone(), now_unix());
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        state
+            .store
+            .request_preferences("gpc0", requested.clone())
+            .expect("preferences request queued");
+        initial.preferences = requested.clone();
+
+        let response = report(State(state.clone()), HeaderMap::new(), Json(initial)).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let host = state.store.get("gpc0").expect("host remains");
+        assert_eq!(host.preferences, requested);
+        assert!(host.requested_preferences.is_none());
     }
 
     #[tokio::test]
@@ -20889,7 +21010,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status.status(), StatusCode::NO_CONTENT);
         assert!(!state.store.has_token("ares"));
         let _ = std::fs::remove_file(path);
     }
@@ -20913,7 +21034,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
         let _ = std::fs::remove_file(path);
     }
 
@@ -20942,8 +21063,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(janus_status, StatusCode::NO_CONTENT);
-        assert_eq!(local_status, StatusCode::NO_CONTENT);
+        assert_eq!(janus_status.status(), StatusCode::NO_CONTENT);
+        assert_eq!(local_status.status(), StatusCode::NO_CONTENT);
         let _ = std::fs::remove_file(path);
     }
 
@@ -20971,8 +21092,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(ares_status, StatusCode::NO_CONTENT);
-        assert_eq!(athena_status, StatusCode::NO_CONTENT);
+        assert_eq!(ares_status.status(), StatusCode::NO_CONTENT);
+        assert_eq!(athena_status.status(), StatusCode::NO_CONTENT);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -20996,7 +21117,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status.status(), StatusCode::NO_CONTENT);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -21019,7 +21140,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
