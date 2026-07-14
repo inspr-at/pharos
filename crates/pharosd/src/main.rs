@@ -3587,6 +3587,21 @@ main[data-view="list"] .list-wrap{display:block}
 body[data-assistant-open="true"]{overflow:hidden}
 @media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths,.assistant-providers,.assistant-preflight-form,.assistant-preflight-facts,.assistant-checks,.assistant-bootstrap,.assistant-review-technical{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}.assistant-facts{grid-template-columns:1fr}.assistant-template{grid-template-columns:1fr}.assistant-template em{white-space:normal}.assistant-result-head{display:grid}.assistant-result-head span{text-align:left}.assistant-review-row>span{display:grid;gap:3px}.assistant-review-row small{text-align:left}.assistant-confirm{grid-template-columns:1fr}.assistant-confirm-actions{justify-content:flex-end}.assistant-start{flex:1}.assistant-review-identity input{font-size:24px}}
 @media (max-width:640px){.assistant-created-summary{grid-template-columns:1fr}.assistant-created-fact+.assistant-created-fact{padding:10px 0 0;border-top:1px solid rgba(210,226,234,.9);border-left:0}.assistant-created-actions{align-items:stretch;flex-direction:column}.assistant-finish{width:100%}.assistant-created-advanced{grid-template-columns:1fr}}
+/* PHAROS-136: one decision per setup-assistant screen. */
+.assistant-sheet{width:min(900px,100%);background:rgba(255,255,255,.97)}
+.assistant-overlay:not([data-assistant-stage="choose"]) .assistant-sheet{width:min(700px,100%)}
+.assistant-head{align-items:center;padding:28px 32px 24px}.assistant-head-copy{display:flex;align-items:center;gap:16px;min-width:0}.assistant-head h2{font-size:32px}.assistant-head p{margin-top:7px;font-size:14px}.assistant-close{width:42px;height:42px;min-width:42px}.assistant-close .ico{width:20px;height:20px}
+.assistant-nav-back{appearance:none;display:inline-flex;align-items:center;gap:6px;min-height:36px;padding:0 8px 0 2px;border:0;background:transparent;color:#315d7c;font:inherit;font-size:13px;font-weight:720;cursor:pointer}.assistant-nav-back:hover,.assistant-nav-back:focus-visible{color:#0f4f80;outline:0}.assistant-nav-back .ico{width:18px;height:18px}
+.assistant-body{gap:20px;padding:30px 32px 34px}.assistant-overlay[data-assistant-stage] .assistant-paths,.assistant-overlay[data-assistant-stage] .assistant-provider-step,.assistant-overlay[data-assistant-stage] .assistant-existing-step,.assistant-overlay[data-assistant-stage] .assistant-preflight-result,.assistant-overlay[data-assistant-stage] .assistant-plan,.assistant-overlay[data-assistant-stage] .assistant-job{display:none}
+.assistant-overlay[data-assistant-stage="choose"] .assistant-paths{display:grid}.assistant-overlay[data-assistant-stage="template"] .assistant-provider-step{display:grid}.assistant-overlay[data-assistant-stage="existing"] .assistant-existing-step{display:grid}.assistant-overlay[data-assistant-stage="bootstrap"] .assistant-preflight-result{display:grid}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-overlay[data-assistant-stage="job"] .assistant-job{display:grid}
+.assistant-paths{grid-template-columns:repeat(2,minmax(0,1fr));gap:22px}.assistant-path{place-items:center;align-content:center;gap:26px;min-height:300px;padding:34px;text-align:center;box-shadow:none}.assistant-path:hover,.assistant-path:focus-visible{transform:translateY(-1px);box-shadow:0 14px 32px rgba(45,75,95,.08),0 0 0 3px rgba(103,177,196,.09)}.assistant-path .onboard-mark{display:grid;place-items:center;width:86px;height:86px;justify-self:center;border-color:rgba(21,158,153,.36);color:#218f91;box-shadow:0 0 0 12px rgba(21,158,153,.07)}.assistant-path:nth-child(2) .onboard-mark{border-color:rgba(214,155,49,.38);color:#be7d19;box-shadow:0 0 0 12px rgba(214,155,49,.07)}.assistant-path .onboard-mark .ico{width:38px;height:38px}.assistant-path-copy{display:grid!important;gap:8px}.assistant-path strong{font-size:23px}.assistant-path .assistant-path-copy>span{font-size:15px}
+.assistant-provider-step{gap:20px}.assistant-step-copy{display:grid;gap:5px}.assistant-step-copy strong{font-size:16px}.assistant-step-copy span{color:var(--muted);font-size:13px;line-height:1.45}.assistant-providers{display:none}.assistant-templates{gap:10px}.assistant-template{min-height:82px;padding:16px 18px}.assistant-template strong{font-size:15px}.assistant-template span{font-size:12px}.assistant-template em{padding-left:12px;color:#9a5b00;font-size:12px}.assistant-template:hover,.assistant-template:focus-visible{transform:translateY(-1px)}
+.assistant-preflight-form{display:grid;grid-template-columns:1fr;gap:18px;padding:0;border:0;background:transparent}.assistant-primary-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.assistant-preflight-form label,.assistant-preflight-facts label{gap:7px}.assistant-preflight-form label span,.assistant-preflight-facts label span{font-size:12px}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{height:44px;font-size:14px}.assistant-preflight-details,.assistant-check-details{border-top:1px solid rgba(214,226,234,.82);border-right:0;border-bottom:1px solid rgba(214,226,234,.82);border-left:0;border-radius:0;background:transparent;padding:0}.assistant-preflight-details summary,.assistant-check-details summary{display:flex;align-items:center;justify-content:space-between;min-height:46px;color:#315d7c;cursor:pointer;font-size:13px;font-weight:720;list-style:none}.assistant-preflight-details summary::-webkit-details-marker,.assistant-check-details summary::-webkit-details-marker{display:none}.assistant-preflight-details summary .ico,.assistant-check-details summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-preflight-details[open] summary .ico,.assistant-check-details[open] summary .ico{transform:rotate(180deg)}.assistant-preflight-facts{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:4px 0 16px;margin:0}.assistant-check{justify-self:end;min-height:42px;padding:0 18px;font-size:13px}
+.assistant-preflight-result{gap:18px;padding:0;border:0;background:transparent}.assistant-result-head{display:grid;gap:4px}.assistant-result-head strong{font-size:17px}.assistant-result-head span{max-width:none;text-align:left;font-size:13px}.assistant-bootstrap{grid-template-columns:1fr;gap:10px}.assistant-bootstrap-option{min-height:76px;padding:14px 16px;opacity:.58}.assistant-bootstrap-option[data-available="true"]{opacity:1;background:#fff}.assistant-bootstrap-option:before{display:none}.assistant-bootstrap-option strong{font-size:14px}.assistant-bootstrap-option span{font-size:12px}.assistant-check-details{margin-top:2px}.assistant-checks{grid-template-columns:1fr;gap:7px;padding:0 0 14px}
+.assistant-plan{gap:20px;padding:0;border:0;background:transparent}.assistant-plan>.assistant-plan-head{display:none}.assistant-review-summary{gap:12px}.assistant-existing-review{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-review-summary{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-review{display:grid}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-provider-readiness,.assistant-overlay[data-assistant-selected-path="existing"] .assistant-plan-field,.assistant-overlay[data-assistant-selected-path="existing"] [data-provider-plan-resources]{display:none}.assistant-review-identity{padding-bottom:12px}.assistant-review-identity input{font-size:26px}.assistant-review-details{margin-top:2px}.assistant-review-technical{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-setup-intent{display:grid;padding:8px 0 2px;border:0;background:transparent}.assistant-choice-options{gap:7px}.assistant-confirm{border-top:1px solid rgba(210,226,234,.84);padding-top:18px}.assistant-confirm-actions{display:none}.assistant-start{min-height:42px;padding:0 17px;font-size:13px}.assistant-start .ico{width:16px;height:16px}
+.assistant-job{grid-template-columns:28px minmax(0,1fr);align-items:start;gap:12px;padding:18px;border:1px solid rgba(103,177,196,.34);border-radius:8px;background:rgba(239,249,250,.72)}.assistant-job>div{display:grid;gap:4px}.assistant-job strong{font-size:15px}.assistant-job span{font-size:12px}.assistant-job-spinner{width:22px;height:22px;border:2px solid rgba(21,158,153,.18);border-top-color:var(--sea);border-radius:50%;animation:assistantSpin .8s linear infinite}.assistant-error{padding:11px 13px;border:1px solid rgba(191,58,53,.24);border-radius:7px;background:rgba(255,238,235,.72);color:#8f312d;font-size:12px;line-height:1.4}.assistant-next,.assistant-progress{display:none!important}
+@keyframes assistantSpin{to{transform:rotate(360deg)}}
+@media (max-width:640px){.assistant-overlay{padding:10px}.assistant-sheet{max-height:calc(100vh - 20px)}.assistant-head{padding:20px}.assistant-head-copy{gap:10px}.assistant-head h2{font-size:27px}.assistant-head p{font-size:13px}.assistant-nav-back span{display:none}.assistant-body{padding:22px 20px 24px}.assistant-paths,.assistant-primary-fields,.assistant-preflight-facts,.assistant-review-technical{grid-template-columns:1fr}.assistant-path{min-height:190px;padding:24px}.assistant-path .onboard-mark{width:68px;height:68px;box-shadow:0 0 0 9px rgba(21,158,153,.07)}.assistant-path:nth-child(2) .onboard-mark{box-shadow:0 0 0 9px rgba(214,155,49,.07)}.assistant-path .onboard-mark .ico{width:30px;height:30px}.assistant-path strong{font-size:20px}.assistant-confirm{grid-template-columns:1fr}.assistant-start{width:100%}}
 .map-main{width:min(1380px,100%)}
 .map-main[data-map-view="maximized"]{width:100%}
 .map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
@@ -4879,17 +4894,17 @@ function assistantTemplate(template){
   return Object.prototype.hasOwnProperty.call(ASSISTANT_TEMPLATE_PROVIDERS,template)?template:'';
 }
 function assistantStage(stage){
-  return stage==='plan'?'plan':'';
+  return ['choose','template','existing','bootstrap','plan','job'].includes(stage)?stage:'choose';
 }
 function assistantState(overlay){
   return {
     path: assistantPath(overlay?.dataset.assistantSelectedPath||''),
     provider: assistantProvider(overlay?.dataset.assistantSelectedProvider||''),
     template: assistantTemplate(overlay?.dataset.assistantSelectedTemplate||''),
-    stage: assistantStage(overlay?.dataset.assistantStage||'')
+    stage: assistantStage(overlay?.dataset.assistantStage||'choose')
   };
 }
-function writeAssistantUrl(open,path='',provider='',template='',stage=''){
+function writeAssistantUrl(open,path='',provider='',template='',stage='choose'){
   const params=new URLSearchParams(location.search);
   if(open){
     params.set(ASSISTANT_SETUP_PARAM,'add-server');
@@ -4902,8 +4917,17 @@ function writeAssistantUrl(open,path='',provider='',template='',stage=''){
     else params.delete(ASSISTANT_PROVIDER_PARAM);
     if(safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===safeProvider)params.set(ASSISTANT_TEMPLATE_PARAM,safeTemplate);
     else params.delete(ASSISTANT_TEMPLATE_PARAM);
-    const safeStage=safeTemplate?assistantStage(stage):'';
-    if(safeStage)params.set(ASSISTANT_STAGE_PARAM,safeStage);
+    let safeStage='choose';
+    if(safePath==='new')safeStage=safeTemplate&&assistantStage(stage)==='plan'?'plan':'template';
+    if(safePath==='existing')safeStage=['bootstrap','plan'].includes(assistantStage(stage))?assistantStage(stage):'existing';
+    const jobId=(document.querySelector('[data-setup-assistant]')?.dataset.assistantJobId||'').trim();
+    if(jobId&&jobId.length<=128){
+      safeStage='job';
+      params.set(ASSISTANT_JOB_PARAM,jobId);
+    }else{
+      params.delete(ASSISTANT_JOB_PARAM);
+    }
+    if(safeStage!=='choose')params.set(ASSISTANT_STAGE_PARAM,safeStage);
     else params.delete(ASSISTANT_STAGE_PARAM);
   }else{
     params.delete(ASSISTANT_SETUP_PARAM);
@@ -4917,46 +4941,39 @@ function writeAssistantUrl(open,path='',provider='',template='',stage=''){
   history.replaceState(null,'',location.pathname+(query?'?'+query:''));
 }
 function syncAssistantNext(overlay){
-  const {path,provider,template,stage}=assistantState(overlay);
-  const title=overlay.querySelector('[data-assistant-next-title]');
-  const copy=overlay.querySelector('[data-assistant-next-copy]');
-  const button=overlay.querySelector('[data-assistant-continue]');
-  if(button){
-    button.disabled=true;
-    button.textContent='Continue';
-  }
-  if(path==='new'){
-    if(template&&stage==='plan'){
-      if(title)title.textContent='Review plan';
-      if(copy)copy.textContent='Confirm only after the plan looks right. No resources or tokens are created by viewing this plan.';
-    }else if(template){
-      const selected=[...overlay.querySelectorAll('[data-assistant-template]')].find(btn=>btn.dataset.assistantTemplate===template);
-      if(title)title.textContent='Template selected';
-      if(copy)copy.textContent=selected?.dataset.assistantNext||'Next: review the provisioning plan before anything is created.';
-      if(button)button.disabled=false;
-    }else if(provider){
-      if(title)title.textContent='Choose a template';
-      if(copy)copy.textContent='Pick a starting point. No credentials, resources, or host records have been created.';
-    }else{
-      if(title)title.textContent='Choose a provider';
-      if(copy)copy.textContent='Hetzner is the polished path. Manual and Netcup-style hosts route through import.';
-    }
-  }else if(path==='existing'){
-    const result=overlay.querySelector('[data-preflight-result]');
-    const summary=overlay.querySelector('[data-preflight-summary]');
-    if(stage==='plan'){
-      if(title)title.textContent='Protection and place';
-      if(copy)copy.textContent=`${currentSetupIntentSummary(overlay)} These choices are setup intent only; no runtime facts or secrets are stored here.`;
-    }else{
-      if(title)title.textContent=result&&!result.hidden?(summary?.textContent||'Preflight complete'):'Check existing server';
-      if(copy)copy.textContent=result&&!result.hidden?'Choose a bootstrap path only after the read-only checks look right.':'Enter the server name and SSH address, then run a read-only preflight. No tokens or host records are created.';
-    }
-  }else{
-    if(title)title.textContent='Next step';
-    if(copy)copy.textContent='Choose a path to preview the next step. No changes have been started.';
+  const {path,provider,stage}=assistantState(overlay);
+  overlay.dataset.assistantStage=stage;
+  const title=overlay.querySelector('#setup-assistant-title');
+  const copy=title?.parentElement?.querySelector('p');
+  const back=overlay.querySelector('[data-assistant-step-back]');
+  if(back)back.hidden=stage==='choose'||stage==='job'||overlay.dataset.providerCreated==='true';
+  if(stage==='template'){
+    if(title)title.textContent=provider==='manual-import'?'Connect a server':'New server';
+    if(copy)copy.textContent=provider==='manual-import'?'Choose the provider handoff.':'Choose a starting point.';
+  }else if(stage==='existing'){
+    if(title)title.textContent='Existing server';
+    if(copy)copy.textContent='Enter the server you already control.';
+  }else if(stage==='bootstrap'){
+    if(title)title.textContent='Choose setup';
+    if(copy)copy.textContent='Pick the available installation method.';
+  }else if(stage==='plan'&&path==='new'){
+    if(title)title.textContent='Review server';
+    if(copy)copy.textContent='Nothing has been created yet.';
+  }else if(stage==='plan'&&path==='existing'){
+    if(title)title.textContent='Review setup';
+    if(copy)copy.textContent='No host changes have been started yet.';
+  }else if(stage!=='job'){
+    if(title)title.textContent='Add a server';
+    if(copy)copy.textContent='What would you like to add?';
   }
   updateAssistantReview(overlay);
   syncAssistantStart(overlay);
+}
+function showAssistantError(overlay,message=''){
+  const error=overlay?.querySelector('[data-assistant-error]');
+  if(!error)return;
+  error.textContent=message;
+  error.hidden=!message;
 }
 function provisioningJobTerminal(state){
   return ['complete','failed','cleanup-needed'].includes(state||'');
@@ -4968,19 +4985,6 @@ function latestProvisioningMessage(job){
   const progress=Array.isArray(job?.progress)?job.progress:[];
   const latest=progress[progress.length-1];
   return latest?.message||'Tracked setup job is waiting for progress.';
-}
-function provisioningHandoffMessage(job){
-  const handoff=job?.handoff;
-  if(!handoff)return '';
-  const parts=[
-    handoff.title||'Bootstrap handoff',
-    handoff.summary||'',
-    handoff.token_policy||'',
-    handoff.secret_target?`Target: ${handoff.secret_target}.`:'',
-    handoff.command_ref?`Use: ${handoff.command_ref}.`:'',
-    ...(Array.isArray(handoff.next_steps)?handoff.next_steps:[])
-  ];
-  return parts.filter(Boolean).join(' ');
 }
 const BACKUP_INTENT_COPY={
   'required':['backup required','observe existing jobs or queue Pharos enrollment'],
@@ -5005,25 +5009,6 @@ const ACCESS_INTENT_COPY={
 function setupIntentChoice(overlay,name,fallback){
   return overlay.querySelector(`input[name="${name}"]:checked`)?.value||fallback;
 }
-function setupIntentSummary(backup,location,access){
-  const backupCopy=BACKUP_INTENT_COPY[backup]||BACKUP_INTENT_COPY.deferred;
-  const locationCopy=LOCATION_INTENT_COPY[location]||LOCATION_INTENT_COPY.auto;
-  const accessCopy=ACCESS_INTENT_COPY[access]||ACCESS_INTENT_COPY['operator-only'];
-  return `Backups: ${backupCopy[0]}. Location: ${locationCopy[0]}. Access: ${accessCopy[0]}.`;
-}
-function setupIntentDetail(backup,location,access){
-  const backupCopy=BACKUP_INTENT_COPY[backup]||BACKUP_INTENT_COPY.deferred;
-  const locationCopy=LOCATION_INTENT_COPY[location]||LOCATION_INTENT_COPY.auto;
-  const accessCopy=ACCESS_INTENT_COPY[access]||ACCESS_INTENT_COPY['operator-only'];
-  return `Next: ${backupCopy[1]}; ${locationCopy[1]}; ${accessCopy[1]}.`;
-}
-function currentSetupIntentSummary(overlay){
-  return setupIntentSummary(
-    setupIntentChoice(overlay,'backup_intent','deferred'),
-    setupIntentChoice(overlay,'location_intent','auto'),
-    setupIntentChoice(overlay,'access_intent','operator-only')
-  );
-}
 const SETUP_TEMPLATE_REVIEW={
   'hetzner-small-nixos':'Small NixOS',
   'hetzner-lab':'Lab NixOS',
@@ -5044,14 +5029,12 @@ function updateAssistantReview(overlay){
   if(!overlay||overlay.dataset.providerCreated==='true')return;
   const state=assistantState(overlay);
   const reviewing=state.stage==='plan';
-  const title=overlay.querySelector('#setup-assistant-title');
-  const copy=title?.parentElement?.querySelector('p');
   const details=overlay.querySelector('[data-assistant-review-details]');
+  const advancedLabel=overlay.querySelector('[data-assistant-advanced-label]');
   const confirmCopy=overlay.querySelector('[data-assistant-confirm-copy]');
   const start=overlay.querySelector('[data-assistant-start]');
   if(reviewing&&state.path==='new'){
-    if(title)title.textContent='Review server';
-    if(copy)copy.textContent='Nothing has been created yet.';
+    if(advancedLabel)advancedLabel.textContent='Advanced server options';
     if(confirmCopy)confirmCopy.textContent='I understand this creates a paid cloud server.';
     if(assistantStartLabel(start)!=='Starting setup')setAssistantStartLabel(start,'Create server');
     const location=assistantReviewValue(overlay,'[data-new-location]','fsn1');
@@ -5073,15 +5056,24 @@ function updateAssistantReview(overlay){
         .join(' · ');
     }
   }else if(reviewing&&state.path==='existing'){
-    if(title)title.textContent='Review setup';
-    if(copy)copy.textContent='No host changes have been started yet.';
+    if(advancedLabel)advancedLabel.textContent='Advanced setup';
     if(confirmCopy)confirmCopy.textContent='I reviewed this setup path.';
     if(assistantStartLabel(start)!=='Starting setup')setAssistantStartLabel(start,'Record setup path');
-    if(details)details.open=true;
-  }else{
-    if(title)title.textContent='Add a server';
-    if(copy)copy.textContent='Choose what you want to add. Nothing changes until you confirm.';
+    const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'Existing server').trim()||'Existing server';
+    const request=existingPreflightRequest(overlay);
+    const connection=request.ssh.route==='none'?'Manual handoff':`${request.ssh.route}${request.ssh.host?` · ${request.ssh.host}`:''}`;
+    const selected=overlay.querySelector('[data-bootstrap-option][data-selected="true"] strong');
+    const values={
+      '[data-existing-review-host]':hostName,
+      '[data-existing-review-connection]':connection,
+      '[data-existing-review-method]':selected?.textContent||'Selected setup method'
+    };
+    Object.entries(values).forEach(([selector,value])=>{
+      const node=overlay.querySelector(selector);
+      if(node)node.textContent=value;
+    });
   }
+  if(details&&state.stage!=='plan')details.open=false;
 }
 function providerPlanResourceTitle(resource){
   return String(resource?.key||'provider resource').replace(/_/g,' ').replace(/\b\w/g,letter=>letter.toUpperCase());
@@ -5131,8 +5123,6 @@ function updateProviderReadiness(overlay){
         : runtime?.message||'Provider readiness could not be verified.';
     }
   }
-  const details=overlay?.querySelector('[data-assistant-review-details]');
-  if(runtime&&!ready&&details)details.open=true;
   syncAssistantStart(overlay);
 }
 function syncAssistantStart(overlay){
@@ -5168,32 +5158,6 @@ async function loadProviderPlanReview(overlay){
   const payload=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(payload.error||'provider plan could not be loaded');
   renderProviderPlanReview(overlay,payload);
-}
-function provisioningIntentMessage(job){
-  const intent=job?.setup_intent;
-  if(!intent)return '';
-  return `Setup intent recorded. ${setupIntentSummary(intent.backup,intent.location,intent.access)} ${setupIntentDetail(intent.backup,intent.location,intent.access)}`;
-}
-function provisioningBackupProposalMessage(job){
-  const proposal=job?.backup_proposal;
-  if(!proposal)return '';
-  const files=Array.isArray(proposal.secret_files)?proposal.secret_files:[];
-  const fileCopy=files.map(file=>`${file.key||'runtime file'} at ${file.path||'runtime path'}`).join('; ');
-  const next=Array.isArray(proposal.next_steps)?proposal.next_steps.join(' '):'';
-  return [`Backup proposal: ${proposal.title||'declarative backup proposal'}.`,proposal.summary||'',fileCopy?`Runtime files: ${fileCopy}.`:'',next].filter(Boolean).join(' ');
-}
-function provisioningExistingContextMessage(job){
-  const context=job?.existing_host_context;
-  if(!context)return '';
-  const ssh=context.ssh||{};
-  const route=ssh.route||'manual';
-  const target=ssh.host?` to ${ssh.host}`:'';
-  const user=ssh.user?` as ${ssh.user}`:'';
-  const summary=context.preflight_summary?.label?`Preflight: ${context.preflight_summary.label}.`:'';
-  const checks=Array.isArray(context.preflight_checks)?context.preflight_checks:[];
-  const checkCopy=checks.length?`${checks.length} preflight checks saved.`:'No preflight checks were saved.';
-  const steps=Array.isArray(context.verification_steps)?context.verification_steps.join(' '):'';
-  return [`Existing host: ${route}${target}${user}.`,summary,checkCopy,steps].filter(Boolean).join(' ');
 }
 const PROVIDER_LOCATION_LABELS={
   fsn1:'Falkenstein',
@@ -5236,16 +5200,9 @@ function renderProviderCreatedResult(overlay,job){
     activeResource&&['bootstrapping','waiting-for-heartbeat','cleanup-needed'].includes(job?.state)
   );
   if(!visible){
-    const wasVisible=overlay.dataset.providerCreated==='true';
     delete overlay.dataset.providerCreated;
     overlay.pharosProvisioningJob=null;
     result.hidden=true;
-    if(wasVisible){
-      const headTitle=overlay.querySelector('#setup-assistant-title');
-      const headCopy=headTitle?.parentElement?.querySelector('p');
-      if(headTitle)headTitle.textContent='Add a server';
-      if(headCopy)headCopy.textContent='Choose what you want to add. Nothing changes until you confirm.';
-    }
     return false;
   }
   overlay.dataset.providerCreated='true';
@@ -5258,6 +5215,8 @@ function renderProviderCreatedResult(overlay,job){
   const headCopy=headTitle?.parentElement?.querySelector('p');
   if(headTitle)headTitle.textContent=viewTitle;
   if(headCopy)headCopy.textContent=deleted?'The provider resource is no longer active.':cleanupNeeded?'Review recovery before making another provider change.':'Install Pharos to finish setup.';
+  const back=overlay.querySelector('[data-assistant-step-back]');
+  if(back)back.hidden=true;
   const setupReady=!cleanupNeeded&&handoff?.status==='provider-created-bootstrap-required';
   const title=result.querySelector('[data-created-title]');
   const ready=result.querySelector('[data-created-ready-text]');
@@ -5313,31 +5272,41 @@ function renderProviderCreatedResult(overlay,job){
 function renderProvisioningJob(overlay,job){
   if(!overlay||!job)return;
   overlay.dataset.assistantJobId=job.id||'';
-  const title=overlay.querySelector('[data-assistant-next-title]');
-  const copy=overlay.querySelector('[data-assistant-next-copy]');
+  overlay.dataset.assistantStage='job';
+  const title=overlay.querySelector('#setup-assistant-title');
+  const copy=title?.parentElement?.querySelector('p');
   const jobBox=overlay.querySelector('[data-assistant-job]');
   const jobTitle=overlay.querySelector('[data-assistant-job-title]');
   const jobMessage=overlay.querySelector('[data-assistant-job-message]');
+  const spinner=overlay.querySelector('.assistant-job-spinner');
   const label=provisioningJobLabel(job.state);
   const message=latestProvisioningMessage(job);
-  const handoff=provisioningHandoffMessage(job);
-  const setupIntent=provisioningIntentMessage(job);
-  const backupProposal=provisioningBackupProposalMessage(job);
-  const existingContext=provisioningExistingContextMessage(job);
-  const fullMessage=[handoff||message,existingContext,setupIntent,backupProposal].filter(Boolean).join(' ');
   const providerCreated=renderProviderCreatedResult(overlay,job);
   const rolledBack=job.state==='complete'&&job.terminal_outcome==='rolled-back';
-  if(title)title.textContent=rolledBack?'Setup rolled back':job.state==='failed'?'Setup did not start':`Setup ${label}`;
-  if(copy)copy.textContent=fullMessage;
+  if(!providerCreated){
+    if(title)title.textContent=rolledBack?'Setup rolled back':job.state==='failed'?'Setup did not start':job.state==='complete'?'Setup complete':'Setting up server';
+    if(copy)copy.textContent=provisioningJobTerminal(job.state)?`Setup ${label}.`:'This may take a few minutes.';
+  }
   if(jobBox){
     jobBox.hidden=false;
+    jobBox.dataset.state=job.state||'pending';
     if(!providerCreated)jobBox.scrollIntoView({block:'nearest'});
   }
-  if(jobTitle)jobTitle.textContent=`Tracked job: ${label}`;
-  if(jobMessage)jobMessage.textContent=[message,handoff,existingContext,setupIntent,backupProposal].filter(Boolean).join(' ');
-  overlay.querySelectorAll('[data-progress-state]').forEach(step=>{
-    step.dataset.active=String(step.dataset.progressState===job.state);
-  });
+  if(spinner)spinner.hidden=provisioningJobTerminal(job.state);
+  const jobHeading={
+    planning:'Preparing setup',
+    provisioning:'Creating server',
+    bootstrapping:'Installing Pharos',
+    'waiting-for-heartbeat':'Waiting for the first heartbeat',
+    'backup-pending':'Finishing backup setup',
+    complete:'Setup complete',
+    failed:'Setup failed',
+    'cleanup-needed':'Setup needs attention'
+  }[job.state]||`Setup ${label}`;
+  if(jobTitle)jobTitle.textContent=jobHeading;
+  if(jobMessage)jobMessage.textContent=message;
+  const state=assistantState(overlay);
+  writeAssistantUrl(true,state.path,state.provider,state.template,'job');
 }
 function preflightBoolValue(overlay,name){
   const value=overlay.querySelector(`[data-preflight-fact="${name}"]`)?.value||'';
@@ -5410,22 +5379,15 @@ function selectExistingBootstrap(overlay,option,button){
   overlay.querySelectorAll('[data-bootstrap-option]').forEach(item=>{
     item.dataset.selected=String(item===button);
   });
-  const title=overlay.querySelector('[data-assistant-next-title]');
-  const copy=overlay.querySelector('[data-assistant-next-copy]');
-  const continueButton=overlay.querySelector('[data-assistant-continue]');
-  if(title)title.textContent=`Review: ${option.label||preflightStateTitle(option.method)}`;
-  const parts=[
-    option.message||'Review this path before applying changes.',
-    Array.isArray(option.changes)?option.changes.join(' '):'',
-    option.token_handoff||'',
-    option.existing_token_policy||'',
-    option.next_state?`Next: ${option.next_state}.`:''
-  ].filter(Boolean);
-  if(copy)copy.textContent=parts.join(' ');
-  if(continueButton){
-    continueButton.disabled=false;
-    continueButton.textContent='Record path';
-  }
+  overlay.dataset.assistantStage='plan';
+  const confirm=overlay.querySelector('[data-assistant-confirm]');
+  if(confirm)confirm.checked=false;
+  const details=overlay.querySelector('[data-assistant-review-details]');
+  if(details)details.open=false;
+  showAssistantError(overlay);
+  syncAssistantNext(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
 }
 function existingBootstrapTemplate(method){
   if(method==='nixos-anywhere')return 'nixos-anywhere';
@@ -5492,6 +5454,10 @@ function renderExistingPreflight(overlay,preflight){
     });
     bootstrap.hidden=options.length===0;
   }
+  overlay.dataset.assistantStage='bootstrap';
+  showAssistantError(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'bootstrap');
   syncAssistantNext(overlay);
 }
 async function runExistingPreflight(overlay,button){
@@ -5556,8 +5522,7 @@ function scheduleProvisioningPoll(overlay,id){
       renderProvisioningJob(overlay,job);
       if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,id);
     }catch(error){
-      const copy=overlay.querySelector('[data-assistant-next-copy]');
-      if(copy)copy.textContent=error.message||'setup job could not be refreshed';
+      showAssistantError(overlay,error.message||'Setup status could not be refreshed.');
     }
   },1500);
 }
@@ -5638,7 +5603,6 @@ function setAssistantTemplate(template,write=true){
   const safeTemplate=assistantTemplate(template);
   const nextTemplate=safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===provider?safeTemplate:'';
   overlay.dataset.assistantSelectedTemplate=nextTemplate;
-  if(!nextTemplate)overlay.dataset.assistantStage='';
   overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
     const visible=!btn.hidden&&btn.dataset.assistantTemplateProvider===provider;
     btn.setAttribute('aria-pressed',String(visible&&btn.dataset.assistantTemplate===nextTemplate));
@@ -5678,11 +5642,12 @@ function setAssistantPath(path,write=true){
   const previousPath=assistantPath(overlay.dataset.assistantSelectedPath||'');
   overlay.dataset.assistantSelectedPath=safePath;
   if(safePath!==previousPath){
-    overlay.dataset.assistantStage='';
+    delete overlay.dataset.assistantJobId;
     overlay.dataset.existingBootstrapMethod='';
     overlay.pharosExistingPreflight=null;
     overlay.pharosProviderPlan=null;
     overlay.pharosProviderRuntime=null;
+    showAssistantError(overlay);
     const reviewDetails=overlay.querySelector('[data-assistant-review-details]');
     if(reviewDetails)reviewDetails.open=false;
   }
@@ -5697,11 +5662,15 @@ function setAssistantPath(path,write=true){
     if(confirm)confirm.checked=false;
   }
   if(safePath==='new'){
-    setAssistantProvider(assistantProvider(overlay.dataset.assistantSelectedProvider||'')||'hetzner-cloud',false);
+    overlay.dataset.assistantStage='template';
+    setAssistantProvider('hetzner-cloud',false);
+    setAssistantTemplate('',false);
   }else if(safePath==='existing'){
+    overlay.dataset.assistantStage='existing';
     setAssistantProvider('',false);
     setAssistantTemplate('',false);
   }else{
+    overlay.dataset.assistantStage='choose';
     setAssistantProvider('',false);
     setAssistantTemplate('',false);
   }
@@ -5717,21 +5686,25 @@ function setAssistantOpen(open,write=true){
   overlay.hidden=!open;
   document.body.dataset.assistantOpen=open?'true':'false';
   if(!open){
+    window.clearTimeout(window.pharosAssistantJobTimer);
     delete overlay.dataset.providerCreated;
+    delete overlay.dataset.assistantJobId;
     overlay.pharosProvisioningJob=null;
     const created=overlay.querySelector('[data-assistant-created]');
     if(created)created.hidden=true;
-    const headTitle=overlay.querySelector('#setup-assistant-title');
-    const headCopy=headTitle?.parentElement?.querySelector('p');
-    if(headTitle)headTitle.textContent='Add a server';
-    if(headCopy)headCopy.textContent='Choose what you want to add. Nothing changes until you confirm.';
+    const job=overlay.querySelector('[data-assistant-job]');
+    if(job)job.hidden=true;
+    showAssistantError(overlay);
     setAssistantPath('',false);
+  }else if(!overlay.dataset.assistantStage){
+    overlay.dataset.assistantStage='choose';
+    syncAssistantNext(overlay);
   }
   if(write){
     const state=assistantState(overlay);
     writeAssistantUrl(open,state.path,state.provider,state.template,state.stage);
   }
-  if(open)overlay.querySelector('[data-assistant-close]')?.focus();
+  if(open)overlay.querySelector('[data-assistant-path]')?.focus();
 }
 function restoreAssistantFromUrl(){
   const overlay=document.querySelector('[data-setup-assistant]');
@@ -5749,10 +5722,7 @@ function restoreAssistantFromUrl(){
       renderProvisioningJob(overlay,job);
       if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,job.id);
     }).catch(error=>{
-      const title=overlay.querySelector('[data-assistant-next-title]');
-      const copy=overlay.querySelector('[data-assistant-next-copy]');
-      if(title)title.textContent='Setup job unavailable';
-      if(copy)copy.textContent=error.message||'The tracked setup job could not be loaded.';
+      showAssistantError(overlay,error.message||'The setup job could not be loaded.');
     });
     return;
   }
@@ -5761,11 +5731,15 @@ function restoreAssistantFromUrl(){
   if(path==='new'){
     setAssistantProvider(assistantProvider(params.get(ASSISTANT_PROVIDER_PARAM))||'hetzner-cloud',false);
     setAssistantTemplate(params.get(ASSISTANT_TEMPLATE_PARAM),false);
-    overlay.dataset.assistantStage=assistantStage(params.get(ASSISTANT_STAGE_PARAM));
+    const requestedStage=assistantStage(params.get(ASSISTANT_STAGE_PARAM));
+    overlay.dataset.assistantStage=assistantState(overlay).template&&requestedStage==='plan'?'plan':'template';
     syncAssistantNext(overlay);
     if(overlay.dataset.assistantStage==='plan'){
       loadProviderPlanReview(overlay).catch(()=>updateProviderReadiness(overlay));
     }
+  }else if(path==='existing'){
+    overlay.dataset.assistantStage='existing';
+    syncAssistantNext(overlay);
   }
 }
 function initSetupAssistant(){
@@ -5777,7 +5751,28 @@ function initSetupAssistant(){
   document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!overlay.hidden)setAssistantOpen(false)});
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>setAssistantPath(btn.dataset.assistantPath)));
   overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>btn.addEventListener('click',()=>setAssistantProvider(btn.dataset.assistantProvider)));
-  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>btn.addEventListener('click',()=>setAssistantTemplate(btn.dataset.assistantTemplate)));
+  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>btn.addEventListener('click',()=>{
+    setAssistantTemplate(btn.dataset.assistantTemplate,false);
+    const selected=assistantState(overlay);
+    if(selected.provider==='manual-import'){
+      setAssistantPath('existing');
+      overlay.querySelector('[data-preflight-host-name]')?.focus();
+      return;
+    }
+    overlay.dataset.assistantStage='plan';
+    const confirm=overlay.querySelector('[data-assistant-confirm]');
+    if(confirm)confirm.checked=false;
+    const details=overlay.querySelector('[data-assistant-review-details]');
+    if(details)details.open=false;
+    showAssistantError(overlay);
+    syncAssistantNext(overlay);
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
+    loadProviderPlanReview(overlay).catch(error=>{
+      updateProviderReadiness(overlay);
+      showAssistantError(overlay,error.message||'Provider readiness could not be checked.');
+    });
+  }));
   overlay.querySelector('[data-preflight-form]')?.addEventListener('submit',async event=>{
     event.preventDefault();
     const button=overlay.querySelector('[data-preflight-check]');
@@ -5786,10 +5781,9 @@ function initSetupAssistant(){
     try{
       await runExistingPreflight(overlay,button);
     }catch(error){
-      const result=overlay.querySelector('[data-preflight-result]');
-      if(result)result.hidden=false;
       if(summary)summary.textContent='Preflight could not run';
       if(message)message.textContent=error.message||'Check the server details and try again.';
+      showAssistantError(overlay,error.message||'Check the server details and try again.');
       syncAssistantNext(overlay);
     }finally{
       if(button){
@@ -5813,19 +5807,31 @@ function initSetupAssistant(){
       updateProviderReadiness(overlay);
     });
   });
-  overlay.querySelector('[data-assistant-back]')?.addEventListener('click',()=>{
-    overlay.dataset.assistantStage='';
+  overlay.querySelector('[data-assistant-step-back]')?.addEventListener('click',()=>{
+    const before=assistantState(overlay);
     const confirm=overlay.querySelector('[data-assistant-confirm]');
     if(confirm)confirm.checked=false;
     const details=overlay.querySelector('[data-assistant-review-details]');
     if(details)details.open=false;
-    const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'');
+    if(before.stage==='template'||before.stage==='existing'){
+      setAssistantPath('',false);
+    }else if(before.stage==='bootstrap'){
+      overlay.dataset.assistantStage='existing';
+    }else if(before.stage==='plan'){
+      overlay.dataset.assistantStage=before.path==='new'?'template':'bootstrap';
+    }
+    showAssistantError(overlay);
     syncAssistantNext(overlay);
-    if(state.path==='new'){
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
+    if(state.stage==='template'){
       overlay.querySelector(`[data-assistant-template="${state.template}"]`)?.focus();
+    }else if(state.stage==='existing'){
+      overlay.querySelector('[data-preflight-host-name]')?.focus();
+    }else if(state.stage==='bootstrap'){
+      overlay.querySelector('[data-bootstrap-option][data-available="true"]')?.focus();
     }else{
-      overlay.querySelector('[data-preflight-result]')?.scrollIntoView({block:'nearest'});
+      overlay.querySelector('[data-assistant-path]')?.focus();
     }
   });
   overlay.querySelector('[data-assistant-finish]')?.addEventListener('click',()=>{
@@ -5857,47 +5863,14 @@ function initSetupAssistant(){
   overlay.querySelector('[data-assistant-start]')?.addEventListener('click',async event=>{
     if(event.currentTarget.disabled)return;
     const start=event.currentTarget;
-    const title=overlay.querySelector('[data-assistant-next-title]');
-    const copy=overlay.querySelector('[data-assistant-next-copy]');
+    showAssistantError(overlay);
     try{
       await startProvisioningJob(overlay,start);
     }catch(error){
       updateAssistantReview(overlay);
       syncAssistantStart(overlay);
-      if(title)title.textContent='Setup could not start';
-      if(copy)copy.textContent=error.message||'The setup job could not be created.';
+      showAssistantError(overlay,error.message||'The setup job could not be created.');
     }
-  });
-  overlay.querySelector('[data-assistant-continue]')?.addEventListener('click',event=>{
-    if(event.currentTarget.disabled)return;
-    const before=assistantState(overlay);
-    if(before.path==='new'&&before.provider==='manual-import'){
-      setAssistantPath('existing',false);
-      const state=assistantState(overlay);
-      writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
-      syncAssistantNext(overlay);
-      overlay.querySelector('[data-preflight-host-name]')?.focus();
-      return;
-    }
-    overlay.dataset.assistantStage='plan';
-    if(assistantState(overlay).path==='existing'){
-      const start=overlay.querySelector('[data-assistant-start]');
-      const confirm=overlay.querySelector('[data-assistant-confirm]');
-      if(confirm)confirm.checked=true;
-      if(start){
-        start.disabled=false;
-        setAssistantStartLabel(start,'Record setup path');
-      }
-      const details=overlay.querySelector('[data-assistant-review-details]');
-      if(details)details.open=true;
-    }else{
-      const confirm=overlay.querySelector('[data-assistant-confirm]');
-      if(confirm)confirm.checked=false;
-      loadProviderPlanReview(overlay).catch(()=>updateProviderReadiness(overlay));
-    }
-    const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
-    syncAssistantNext(overlay);
   });
   window.addEventListener('popstate',restoreAssistantFromUrl);
   restoreAssistantFromUrl();
@@ -10998,65 +10971,33 @@ fn onboard_row() -> String {
 
 fn setup_assistant() -> String {
     format!(
-        r#"<section class="assistant-overlay" data-setup-assistant hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div><h2 id="setup-assistant-title">Add a server</h2><p>Choose what you want to add. Nothing changes until you confirm.</p></div><button class="assistant-close" type="button" data-assistant-close>Close</button></header><div class="assistant-body"><div class="assistant-paths"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span><strong>New server</strong><span>Provision a server from a provider template.</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span><strong>Existing server</strong><span>Onboard a server you already control.</span></span></button></div><div class="assistant-provider-step" data-assistant-provider-step><div class="assistant-step-head"><strong>New server</strong><span>Choose where this server starts.</span></div><div class="assistant-providers"><button class="assistant-provider" type="button" data-assistant-provider="hetzner-cloud" aria-pressed="false"><span class="assistant-provider-title"><strong>Hetzner Cloud</strong><span class="assistant-badge">Recommended</span></span><p>Best supported path for a fresh Pharos-managed server.</p><span class="assistant-facts"><span><b>Credentials needed</b>API token later</span><span><b>Cost</b>Paid cloud</span><span><b>Bootstrap</b>NixOS ready</span></span></button><button class="assistant-provider" type="button" data-assistant-provider="manual-import" aria-pressed="false"><span class="assistant-provider-title"><strong>Manual / existing provider</strong></span><p>Use this for Netcup or any provider that is not safely automated yet.</p><span class="assistant-facts"><span><b>Credentials needed</b>SSH later</span><span><b>Cost</b>Your provider</span><span><b>Bootstrap</b>Import path</span></span></button></div><div class="assistant-step-head"><strong>Template</strong><span>No provider resources are created here.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" data-assistant-next="Next: review a Hetzner Cloud plan for a small NixOS server. No resources have been created." aria-pressed="false"><span><strong>Small NixOS server</strong><span>Low monthly cost, automatic NixOS bootstrap, good first production default.</span></span><em>low cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" data-assistant-next="Next: review a lab-style plan and confirm current pricing before creating anything." aria-pressed="false"><span><strong>Lab / free-tier style</strong><span>Smallest practical shape. Pricing and availability must be checked at plan time.</span></span><em>check cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" data-assistant-next="Next: choose exact provider size, region, and image before creating anything." aria-pressed="false"><span><strong>Bring your own plan</strong><span>Use when you already know the size, region, and bootstrap profile you want.</span></span><em>custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button></div></div><div class="assistant-existing-step" data-assistant-existing-step><div class="assistant-step-head"><strong>Add existing server</strong><span>Read-only check first.</span></div><form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label><details class="assistant-preflight-details"><summary>Known facts</summary><div class="assistant-preflight-facts"><label><span>Login works</span><select data-preflight-fact="ssh_authenticated"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Admin access</span><select data-preflight-admin><option value="">Unknown</option><option value="sudo">sudo</option><option value="root">root</option><option value="none">No</option></select></label><label><span>Operating system</span><select data-preflight-os><option value="">Unknown</option><option value="linux">Linux</option><option value="nixos">NixOS</option><option value="other">Other</option></select></label><label><span>Nix available</span><select data-preflight-fact="nix_available"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Disk free</span><input data-preflight-disk type="number" min="0" step="1" inputmode="numeric" placeholder="GiB"></label><label><span>Can reach Pharos</span><select data-preflight-fact="pharos_reachable"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label></div></details><button class="assistant-check" type="submit" data-preflight-check>Check server</button></form><div class="assistant-preflight-result" data-preflight-result hidden><div class="assistant-result-head"><strong data-preflight-summary>Preflight</strong><span data-preflight-message>Waiting for checks.</span></div><div class="assistant-checks" data-preflight-checks></div><div class="assistant-bootstrap" data-preflight-bootstrap hidden></div></div></div><div class="assistant-plan" data-assistant-plan><div class="assistant-plan-head"><strong>Review plan</strong><span>Nothing is created until you start setup.</span></div><div class="assistant-plan-list"><div class="assistant-plan-row"><span><strong>Provider resources</strong><span>Prepare server, SSH key, firewall, and selected region.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>SSH and bootstrap</strong><span>Prepare NixOS bootstrap path without exposing private key material.</span></span><em class="assistant-plan-chip">planned</em></div><div class="assistant-plan-row"><span><strong>Beacon registration</strong><span>Create only a safe handoff; raw tokens are never shown.</span></span><em class="assistant-plan-chip" data-kind="protected">protected</em></div><div class="assistant-plan-row"><span><strong>First heartbeat</strong><span>Wait until the new host reports before marking it live.</span></span><em class="assistant-plan-chip">waiting</em></div><div class="assistant-plan-row"><span><strong>Backup and location</strong><span>Hand off backup enrollment and site/location setup after first contact.</span></span><em class="assistant-plan-chip" data-kind="later">later</em></div></div><label class="assistant-confirm"><input type="checkbox" data-assistant-confirm><span>I understand this may create provider resources.</span><button class="assistant-start" type="button" data-assistant-start disabled>Start setup</button></label><div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states"><span data-progress-state="planning">planning</span><span data-progress-state="provisioning">provisioning</span><span data-progress-state="bootstrapping">bootstrapping</span><span data-progress-state="waiting-for-heartbeat">waiting for heartbeat</span><span data-progress-state="backup-pending">backup pending</span><span data-progress-state="complete" data-risk="ok">complete</span><span data-progress-state="failed" data-risk="fail">failed</span><span data-progress-state="cleanup-needed" data-risk="fail">cleanup needed</span></div></div><div class="assistant-next" data-assistant-next><div><strong data-assistant-next-title>Next step</strong><span data-assistant-next-copy>Choose a path to preview the next step. No changes have been started.</span></div><button type="button" data-assistant-continue disabled>Continue</button></div></div></div></section>"#,
+        r#"<section class="assistant-overlay" data-setup-assistant data-assistant-stage="choose" hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div class="assistant-head-copy"><button class="assistant-nav-back" type="button" data-assistant-step-back hidden>{arrow_left}<span>Back</span></button><div><h2 id="setup-assistant-title">Add a server</h2><p>What would you like to add?</p></div></div><button class="assistant-close" type="button" data-assistant-close title="Close" aria-label="Close">{close}</button></header><div class="assistant-body">
+
+<section class="assistant-paths" data-assistant-step="choose"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span class="assistant-path-copy"><strong>New server</strong><span>Create a new server</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span class="assistant-path-copy"><strong>Existing server</strong><span>Connect a server you already have</span></span></button></section>
+
+<section class="assistant-provider-step" data-assistant-step="template"><div class="assistant-step-copy"><strong>Choose a starting point</strong><span>Pharos creates this server in Hetzner Cloud. You review everything before it starts.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" aria-pressed="false"><span><strong>Small server</strong><span>Recommended for most uses</span></span><em>Recommended</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" aria-pressed="false"><span><strong>Lab server</strong><span>The smallest practical option</span></span><em>Lower cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" aria-pressed="false"><span><strong>Custom server</strong><span>Choose size and region during review</span></span><em>Custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" aria-pressed="false" hidden><span><strong>Netcup server</strong><span>Create it with Netcup, then connect it to Pharos</span></span></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="oracle-always-free-lab" aria-pressed="false" hidden><span><strong>Oracle lab server</strong><span>Create it externally, then connect it to Pharos</span></span></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="gcp-free-tier-lab" aria-pressed="false" hidden><span><strong>Google Cloud lab server</strong><span>Create it externally, then connect it to Pharos</span></span></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" aria-pressed="false" hidden><span><strong>Another provider</strong><span>Create it externally, then connect it to Pharos</span></span></button></div></section>
+
+<section class="assistant-existing-step" data-assistant-step="existing"><form class="assistant-preflight-form" data-preflight-form><div class="assistant-primary-fields"><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="my-server"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label></div><details class="assistant-preflight-details"><summary>Advanced {chevron}</summary><div class="assistant-preflight-facts"><label><span>SSH user</span><input data-preflight-ssh-user autocomplete="username" placeholder="root"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label><label><span>Role</span><input data-preflight-role autocomplete="off" placeholder="server"></label><label><span>Host type</span><select data-preflight-host-type><option value="">Detect automatically</option><option value="nixos">NixOS</option><option value="linux-beacon">Linux</option></select></label><label><span>Heartbeat seconds</span><input data-preflight-heartbeat type="number" min="10" max="3600" step="10" inputmode="numeric" value="60"></label><label><span>Login works</span><select data-preflight-fact="ssh_authenticated"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Admin access</span><select data-preflight-admin><option value="">Unknown</option><option value="sudo">sudo</option><option value="root">root</option><option value="none">No</option></select></label><label><span>Operating system</span><select data-preflight-os><option value="">Unknown</option><option value="linux">Linux</option><option value="nixos">NixOS</option><option value="other">Other</option></select></label><label><span>Nix available</span><select data-preflight-fact="nix_available"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Disk free</span><input data-preflight-disk type="number" min="0" step="1" inputmode="numeric" placeholder="GiB"></label><label><span>Can reach Pharos</span><select data-preflight-fact="pharos_reachable"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label></div></details><button class="assistant-check" type="submit" data-preflight-check>Check server</button></form></section>
+
+<section class="assistant-preflight-result" data-assistant-step="bootstrap" data-preflight-result><div class="assistant-result-head"><strong data-preflight-summary>Connection checked</strong><span data-preflight-message>Choose how Pharos should be installed.</span></div><div class="assistant-bootstrap" data-preflight-bootstrap></div><details class="assistant-check-details"><summary>Technical checks {chevron}</summary><div class="assistant-checks" data-preflight-checks></div></details></section>
+
+<section class="assistant-plan" data-assistant-step="plan" data-assistant-plan><section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud · Falkenstein</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Small NixOS · CX22</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><section class="assistant-existing-review" data-existing-review><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-existing-review-host>Existing server</small></span></div><div class="assistant-review-row">{link}<span><strong>Connection</strong><small data-existing-review-connection>SSH connection</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-existing-review-method>Selected method</small></span></div></section><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span></div><details class="assistant-review-details" data-assistant-review-details><summary><span data-assistant-advanced-label>Advanced setup</span>{chevron}</summary><div class="assistant-review-technical"><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><input data-new-location autocomplete="off" value="fsn1" placeholder="fsn1"></label><label class="assistant-plan-field"><span>Server type</span><input data-new-server-type autocomplete="off" value="cx22" placeholder="cx22"></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public-key name</span><input data-new-ssh-key autocomplete="off" placeholder="existing key name"></label><div class="assistant-plan-list" data-provider-plan-resources></div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div></div></div></details><div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I understand this creates a paid cloud server.</span></label><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Create server</span>{arrow_right}</button></div></section>
+
+<section class="assistant-job" data-assistant-step="job" data-assistant-job hidden aria-live="polite"><span class="assistant-job-spinner" aria-hidden="true"></span><div><strong data-assistant-job-title>Starting setup</strong><span data-assistant-job-message>Pharos is preparing the server.</span></div></section><section class="assistant-created" data-assistant-created data-state="active" hidden aria-live="polite"><h3 data-created-title>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready" data-created-ready><span data-created-ready-text>Ready for setup</span></div></div><div class="assistant-created-progress" data-created-progress aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions" data-created-actions><button class="assistant-finish" type="button" data-assistant-finish>Continue setup {arrow_right}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><section class="assistant-created-setup" data-created-setup hidden><h4>Finish installation</h4><ol data-created-next-steps></ol><p class="assistant-created-guidance" data-created-guidance>The server exists. Continue with the prepared bootstrap handoff, then wait for its first heartbeat.</p><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></section><details data-created-recovery><summary>Recovery options {chevron}</summary><section class="assistant-created-danger" data-created-danger><div class="assistant-created-danger-head">{warning}<div><strong>Delete this server</strong><p>Removes the paid Hetzner server. This cannot be undone.</p></div></div><label class="assistant-delete-confirm"><input type="checkbox" data-created-delete-confirm><span>I understand this permanently deletes the server.</span></label><div class="assistant-delete-actions"><button class="assistant-delete" type="button" data-created-delete disabled>{trash} Delete server</button><span data-created-delete-status role="status" aria-live="polite"></span></div></section></details></section><div class="assistant-error" data-assistant-error role="alert" hidden></div>
+
+</div></div></section>"#,
         plus = icons::PLUS,
-        server = icons::SERVER
-    )
-    .replace(
-        r#"<button class="assistant-close" type="button" data-assistant-close>Close</button>"#,
-        &format!(
-            r#"<button class="assistant-close" type="button" data-assistant-close title="Close" aria-label="Close">{}</button>"#,
-            icons::X
-        ),
-    )
-    .replace(
-        r#"<div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><div class="assistant-progress" aria-label="provisioning progress states">"#,
-        &format!(
-            r#"<div class="assistant-job" data-assistant-job hidden><strong data-assistant-job-title>Tracked job</strong><span data-assistant-job-message>Waiting for setup.</span></div><section class="assistant-created" data-assistant-created data-state="active" hidden aria-live="polite"><h3 data-created-title>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready" data-created-ready><span data-created-ready-text>Ready for setup</span></div></div><div class="assistant-created-progress" data-created-progress aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions" data-created-actions><button class="assistant-finish" type="button" data-assistant-finish>Continue setup {arrow}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><section class="assistant-created-setup" data-created-setup hidden><h4>Finish installation</h4><ol data-created-next-steps></ol><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></section><details data-created-recovery><summary>Recovery options {chevron}</summary><section class="assistant-created-danger" data-created-danger><div class="assistant-created-danger-head">{warning}<div><strong>Delete this server</strong><p>Removes the paid Hetzner server. This cannot be undone.</p></div></div><label class="assistant-delete-confirm"><input type="checkbox" data-created-delete-confirm><span>I understand this permanently deletes the server.</span></label><div class="assistant-delete-actions"><button class="assistant-delete" type="button" data-created-delete disabled>{trash} Delete server</button><span data-created-delete-status role="status" aria-live="polite"></span></div></section></details></section><div class="assistant-progress" aria-label="provisioning progress states">"#,
-            server = icons::SERVER,
-            map_pin = icons::MAP_PIN,
-            arrow = icons::ARROW_RIGHT,
-            chevron = icons::CHEVRON_DOWN,
-            warning = icons::TRIANGLE_ALERT,
-            trash = icons::TRASH_2,
-        ),
-    )
-    .replace(
-        r#"<dl class="assistant-created-advanced">"#,
-        r#"<p class="assistant-created-guidance" data-created-guidance>The server exists. Continue with the prepared bootstrap handoff, then wait for its first heartbeat.</p><dl class="assistant-created-advanced">"#,
-    )
-    .replace(
-        r#"<div class="assistant-plan-list">"#,
-        &format!(
-            r#"<section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud · Falkenstein</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Small NixOS · CX22</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><details class="assistant-review-details" data-assistant-review-details><summary>Technical details {chevron}</summary><div class="assistant-review-technical"><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span></div><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><input data-new-location autocomplete="off" value="fsn1" placeholder="fsn1"></label><label class="assistant-plan-field"><span>Server type</span><input data-new-server-type autocomplete="off" value="cx22" placeholder="cx22"></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public-key name</span><input data-new-ssh-key autocomplete="off" placeholder="existing key name"></label><div class="assistant-plan-list" data-provider-plan-resources>"#,
-            server = icons::SERVER,
-            setup = icons::SLIDERS,
-            after = icons::SHIELD_CHECK,
-            chevron = icons::CHEVRON_DOWN,
-        ),
-    )
-    .replace(
-        r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
-        r#"<form class="assistant-preflight-form" data-preflight-form><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="hsb8"></label><label><span>Role</span><input data-preflight-role autocomplete="off" placeholder="server"></label><label><span>Host type</span><select data-preflight-host-type><option value="">Decide after check</option><option value="nixos">NixOS</option><option value="linux-beacon">Linux beacon</option></select></label><label><span>Heartbeat</span><input data-preflight-heartbeat type="number" min="10" max="3600" step="10" inputmode="numeric" value="60" aria-label="Heartbeat seconds"></label><label><span>SSH user</span><input data-preflight-ssh-user autocomplete="username" placeholder="root"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label>"#,
-    )
-    .replace(
-        r#"</div></div><label class="assistant-confirm">"#,
-        r#"</div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-plan-head"><strong>Protection and place</strong><span>Saved as setup intent.</span></div><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div><div class="assistant-intent-note"><span>No secrets stored</span><span>Runtime facts stay separate</span></div></div></div></details></div><label class="assistant-confirm">"#,
-    )
-    .replace(
-        r#"</div><div class="assistant-setup-intent""#,
-        r#"</div></div><div class="assistant-setup-intent""#,
-    )
-    .replace(
-        r#"<label class="assistant-confirm"><input type="checkbox" data-assistant-confirm><span>I understand this may create provider resources.</span><button class="assistant-start" type="button" data-assistant-start disabled>Start setup</button></label>"#,
-        &format!(
-            r#"<div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I understand this creates a paid cloud server.</span></label><div class="assistant-confirm-actions"><button class="assistant-back" type="button" data-assistant-back>Back</button><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Create server</span>{}</button></div></div>"#,
-            icons::ARROW_RIGHT
-        ),
-    )
-    .replace(
-        r#"<button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button>"#,
-        r#"<button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" data-assistant-next="Next: review Netcup caveats, then import the server through existing-host onboarding. No Netcup resources are created by Pharos." aria-pressed="false" hidden><span><strong>Netcup manual import</strong><span>Buy/create the server in Netcup first, verify SSH and billing, then import it safely.</span></span><em>manual</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="oracle-always-free-lab" data-assistant-next="Next: verify Oracle Always Free eligibility, quota, and capacity, then import the VM. No Oracle resources are created by Pharos." aria-pressed="false" hidden><span><strong>Oracle Always Free lab</strong><span>Create the VM externally, confirm current free-tier limits, then import it safely.</span></span><em>verify cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="gcp-free-tier-lab" data-assistant-next="Next: verify Google Cloud free-tier limits, region, and billing, then import the VM. No Google Cloud resources are created by Pharos." aria-pressed="false" hidden><span><strong>Google Cloud free-tier lab</strong><span>Create the VM externally, confirm current free-tier limits, then import it safely.</span></span><em>verify cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" data-assistant-next="Next: switch to existing-host import. Provider automation is intentionally not assumed." aria-pressed="false" hidden><span><strong>Manual import handoff</strong><span>For any provider, prepare SSH/import instead of automated provisioning.</span></span><em>import</em></button>"#,
+        server = icons::SERVER,
+        close = icons::X,
+        arrow_left = icons::ARROW_LEFT,
+        arrow_right = icons::ARROW_RIGHT,
+        chevron = icons::CHEVRON_DOWN,
+        setup = icons::SLIDERS,
+        after = icons::SHIELD_CHECK,
+        link = icons::LINK,
+        map_pin = icons::MAP_PIN,
+        warning = icons::TRIANGLE_ALERT,
+        trash = icons::TRASH_2,
     )
 }
 
@@ -17900,19 +17841,37 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains("Waiting for the first host"));
         assert!(empty.contains("Add first server"));
         assert!(empty.contains("Add a server"));
+        assert!(empty.contains("What would you like to add?"));
         assert!(empty.contains("setup_path"));
         assert!(empty.contains("setup_provider"));
         assert!(empty.contains("setup_template"));
         assert!(empty.contains("setup_stage"));
-        assert!(empty.contains("Hetzner Cloud"));
-        assert!(empty.contains("Manual / existing provider"));
+        assert!(empty.contains(r#"data-assistant-stage="choose""#));
+        assert_eq!(empty.matches(r#"data-assistant-path=""#).count(), 2);
+        assert!(empty.contains(r#"data-assistant-path="new""#));
+        assert!(empty.contains(r#"data-assistant-path="existing""#));
+        assert!(empty.contains("New server"));
+        assert!(empty.contains("Create a new server"));
+        assert!(empty.contains("Existing server"));
+        assert!(empty.contains("Connect a server you already have"));
+        assert!(empty.contains(r#"data-assistant-step="choose""#));
+        assert!(empty.contains(r#"data-assistant-step="template""#));
+        assert!(empty.contains(r#"data-assistant-step="existing""#));
+        assert!(empty.contains(r#"data-assistant-step="bootstrap""#));
+        assert!(empty.contains(r#"data-assistant-step="plan""#));
+        assert!(empty.contains(r#"data-assistant-step="job""#));
+        assert!(empty.contains(r#"data-assistant-step-back"#));
+        assert!(empty.contains("Small server"));
+        assert!(empty.contains("Recommended for most uses"));
+        assert!(empty.contains("Lab server"));
+        assert!(empty.contains("Custom server"));
+        assert!(empty.contains("Choose size and region during review"));
         assert!(empty.contains(r#"data-new-host-name"#));
         assert!(empty.contains(r#"data-new-role"#));
         assert!(empty.contains(r#"data-new-location"#));
         assert!(empty.contains(r#"data-new-server-type"#));
         assert!(empty.contains(r#"data-new-image"#));
         assert!(empty.contains(r#"data-new-ssh-key"#));
-        assert!(empty.contains("Add existing server"));
         assert!(empty.contains(r#"data-preflight-form"#));
         assert!(empty.contains(r#"data-preflight-host-name"#));
         assert!(empty.contains(r#"data-preflight-role"#));
@@ -17922,20 +17881,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"data-preflight-ssh-host"#));
         assert!(empty.contains(r#"data-preflight-result"#));
         assert!(empty.contains(r#"data-preflight-bootstrap"#));
-        assert!(empty.contains("Known facts"));
+        assert!(empty.contains("Advanced"));
+        assert!(empty.contains("Technical checks"));
         assert!(empty.contains("Check server"));
-        assert!(empty.contains("Small NixOS server"));
-        assert!(empty.contains("Lab / free-tier style"));
-        assert!(empty.contains("Bring your own plan"));
-        assert!(empty.contains("Netcup manual import"));
-        assert!(empty.contains("Oracle Always Free lab"));
-        assert!(empty.contains("Google Cloud free-tier lab"));
         assert!(empty.contains("data-assistant-template=\"hetzner-small-nixos\""));
         assert!(empty.contains("data-assistant-template=\"netcup-manual-import\""));
         assert!(empty.contains("data-assistant-template=\"oracle-always-free-lab\""));
         assert!(empty.contains("data-assistant-template=\"gcp-free-tier-lab\""));
-        assert!(empty.contains("No provider resources are created here."));
-        assert!(empty.contains("Review plan"));
         assert!(empty.contains(r#"data-assistant-review"#));
         assert!(empty.contains(r#"data-review-provider"#));
         assert!(empty.contains(r#"data-review-server"#));
@@ -17943,21 +17895,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"data-review-after"#));
         assert!(empty.contains(r#"data-provider-readiness"#));
         assert!(empty.contains(r#"data-provider-plan-resources"#));
-        assert!(empty.contains("Provider resources"));
-        assert!(empty.contains("SSH and bootstrap"));
-        assert!(empty.contains("Beacon registration"));
-        assert!(empty.contains("First heartbeat"));
-        assert!(empty.contains("Backup and location"));
         assert!(empty.contains(r#"data-existing-setup-intent"#));
-        assert!(empty.contains("Protection and place"));
         assert!(empty.contains(r#"name="backup_intent" value="optional""#));
         assert!(empty.contains(r#"name="backup_intent" value="external""#));
         assert!(empty.contains(r#"name="location_intent" value="site-fallback""#));
         assert!(empty.contains(r#"name="access_intent" value="operator-only""#));
         assert!(empty.contains(r#"name="access_intent" value="limited-users""#));
-        assert!(empty.contains("No secrets stored"));
         assert!(empty.contains("I understand this creates a paid cloud server."));
-        assert!(empty.contains(r#"data-assistant-back"#));
         assert!(empty.contains("Create server"));
         assert!(empty.contains("data-assistant-job"));
         assert!(empty.contains(r#"data-assistant-created"#));
@@ -17972,9 +17916,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"data-created-delete-status"#));
         assert!(empty.contains(r#"data-created-resource"#));
         assert!(empty.contains(r#"data-created-ssh"#));
-        assert!(empty.contains("data-progress-state=\"failed\""));
-        assert!(empty.contains("cleanup needed"));
-        assert!(empty.contains(r#"data-assistant-next-title"#));
+        assert!(!empty.contains(r#"data-assistant-continue"#));
+        assert!(!empty.contains(r#"data-assistant-next-title"#));
+        assert!(!empty.contains(r#"data-progress-state"#));
+        assert!(!empty.contains("Choose what you want to add. Nothing changes until you confirm."));
+        assert!(!empty.contains("Manual / existing provider"));
         assert!(empty.contains(r#"aria-pressed="false""#));
         assert!(empty.contains("awaiting first heartbeat"));
 
@@ -18275,7 +18221,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
 
         assert!(!html.contains(r#"<button class="onboard-tile""#));
-        assert!(!html.contains("Add server"));
+        assert!(
+            !html.contains(r#"<button class="onboard-primary" type="button" data-onboard-open>"#)
+        );
         assert!(!html.contains(r#"<section class="assistant-overlay""#));
         assert!(!html.contains(r#"<tr class="onboard-row""#));
     }

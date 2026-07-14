@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.37 - 2026-07-14
+
+- Open Add server with only two obvious choices: create a new server or connect one that already exists, using centered Pharos-style icon controls on desktop and mobile.
+- Present one decision per step with predictable Back navigation, while keeping provider templates, connection facts, and technical checks out of sight until that path needs them.
+- Preserve guarded provider readiness, existing-host preflight, explicit confirmation, setup progress, and recovery behavior without the previous lifecycle chips, duplicated footer controls, or all-at-once form.
+
 ## 0.1.36 - 2026-07-14
 
 - Treat a Workstation host type as an explicit expected-offline policy: Fleet and Map retain the true Down state while Alerts, Activity, and outbound silent-heartbeat notifications omit that expected outage.
