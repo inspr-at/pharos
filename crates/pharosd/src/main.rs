@@ -64,7 +64,7 @@ use crate::host_actions::{
     AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
     HostActionState, HostActionStore, HostActionStoreError, HostRemovalPlan,
     HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
-    RetiredHostStore,
+    RetiredHostStore, RetirementAgentResultRequest,
 };
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::nixcfg_dispatch::NixcfgDispatch;
@@ -85,6 +85,7 @@ struct AppState {
     beacon_auth: BeaconAuth,
     provider_runtime: ProviderRuntimeConfig,
     nixcfg_dispatch: NixcfgDispatch,
+    retirement_owner: RetirementOwnerAuth,
     host_actions: Arc<HostActionStore>,
     retired_hosts: Arc<RetiredHostStore>,
 }
@@ -2872,6 +2873,40 @@ impl BeaconAuth {
             .get(host)
             .is_some_and(|stored| constant_time_eq(stored, expected_hash)))
     }
+
+    fn janus_manages_host(&self, host: &str) -> Result<bool, JanusTokenHashError> {
+        if self.report_token_mode == BeaconTokenMode::Local {
+            return Ok(false);
+        }
+        Ok(load_janus_token_hashes(&self.janus_token_hash_sources)?.contains_key(host))
+    }
+}
+
+#[derive(Clone, Default)]
+struct RetirementOwnerAuth {
+    owner_host: Option<String>,
+}
+
+impl RetirementOwnerAuth {
+    fn from_env() -> Self {
+        let owner_host = env_nonempty("PHAROS_RETIREMENT_OWNER_HOST");
+        if let Some(host) = owner_host.as_deref() {
+            assert!(
+                valid_action_host_name(host),
+                "PHAROS_RETIREMENT_OWNER_HOST must be a valid host name"
+            );
+            tracing::info!(owner = %host, "Pharos retirement owner enabled");
+        }
+        Self { owner_host }
+    }
+
+    fn configured(&self) -> bool {
+        self.owner_host.is_some()
+    }
+
+    fn is_owner(&self, host: &str) -> bool {
+        self.owner_host.as_deref() == Some(host)
+    }
 }
 
 #[derive(Clone)]
@@ -4038,7 +4073,8 @@ async function submitHostAction(){
   const status=overlay?.querySelector('[data-host-action-status]');
   if(!primary||!status)return;
   primary.disabled=true;
-  status.textContent=action==='remove'?'Recording retirement and revoking reports…'
+  status.textContent=action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
+    :action==='remove'?'Recording retirement and revoking reports…'
     :hostActionContext.stage==='recover'?'Queueing target-local recovery checks…'
     :hostActionContext.stage==='confirm'?'Recording attended confirmation…'
     :'Requesting a guarded review…';
@@ -4049,6 +4085,7 @@ async function submitHostAction(){
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
     else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
+    else if(action==='remove'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry-retirement',{});
     else if(action==='remove'){
       const disposition=overlay.querySelector('[data-host-remove-disposition]')?.value||'';
       const successor=(overlay.querySelector('[data-host-remove-successor-input]')?.value||'').trim();
@@ -6405,6 +6442,12 @@ struct AgentActionClaimRequest {
     host: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementAgentClaimRequest {
+    owner: String,
+}
+
 fn action_request_header(headers: &HeaderMap) -> bool {
     headers
         .get("X-Pharos-Action")
@@ -6440,17 +6483,19 @@ fn action_message(job: &HostActionJob) -> Cow<'static, str> {
         });
     }
     if job.workflow_kind() == host_actions::HostWorkflowKind::RemoveHost {
-        return Cow::Borrowed(match job.state {
-            HostActionState::ProposalRequested => {
-                "The retirement intent is saved while Pharos finishes the guarded handoff."
+        return match job.state {
+            HostActionState::ProposalRequested => Cow::Borrowed(
+                "The retirement intent is saved while Pharos finishes the guarded handoff.",
+            ),
+            HostActionState::RemovalPending => Cow::Owned(job.summary().workflow.guidance),
+            HostActionState::Succeeded => {
+                Cow::Borrowed("The host retirement completed and was recorded.")
             }
-            HostActionState::RemovalPending => {
-                "Beacon access is revoked; declarative removal is waiting for review and apply."
+            HostActionState::Failed => {
+                Cow::Borrowed("The removal request stopped safely and remains recorded.")
             }
-            HostActionState::Succeeded => "The host retirement completed and was recorded.",
-            HostActionState::Failed => "The removal request stopped safely and remains recorded.",
-            _ => "The host retirement workflow is recorded.",
-        });
+            _ => Cow::Borrowed("The host retirement workflow is recorded."),
+        };
     }
     if job.recovery_started_at.is_some() {
         return match job.state {
@@ -6595,6 +6640,7 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
             let source = match event.source {
                 HostActionEventSource::Operator => "operator",
                 HostActionEventSource::HostAgent => "host agent",
+                HostActionEventSource::RetirementAgent => "retirement owner",
                 HostActionEventSource::Beacon => "heartbeat",
                 HostActionEventSource::Pharos => "Pharos",
             };
@@ -7088,10 +7134,38 @@ async fn request_host_removal(
         .filter(|successor| !successor.is_empty())
         .map(str::to_string);
     let declaration_pending = host_needs_declaration_cleanup(&state, &host);
+    let credential_retirement_required = match state.beacon_auth.janus_manages_host(&host) {
+        Ok(required) => required,
+        Err(_) => {
+            return action_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Janus credential ownership could not be verified",
+            );
+        }
+    };
+    if credential_retirement_required && !state.retirement_owner.configured() {
+        return action_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "A retirement owner must be configured before removing this host",
+        );
+    }
+    if state.retirement_owner.is_owner(&host) {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Move retirement ownership to another host before removing this owner",
+        );
+    }
+    if credential_retirement_required && !declaration_pending {
+        return action_error(
+            StatusCode::CONFLICT,
+            "This Janus-managed host needs a declared retirement path before removal",
+        );
+    }
     let removal_plan = HostRemovalPlan {
         disposition: request.disposition,
         successor,
         declaration_pending,
+        credential_retirement_required,
     };
     if !removal_plan.validate(&host) {
         return action_error(
@@ -7198,6 +7272,47 @@ async fn request_host_removal(
     action_response(StatusCode::ACCEPTED, &job)
 }
 
+async fn retry_host_retirement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Host retirement was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&existing.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Host retirement recovery access is not granted",
+        );
+    }
+    if !state.retired_hosts.is_retired(&existing.host) {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The host no longer has a pending retirement record",
+        );
+    }
+    let actor = action_actor(&state.auth, &headers);
+    match state.host_actions.retry_retirement(&id, &actor, now_unix()) {
+        Ok(job) => action_response(StatusCode::ACCEPTED, &job),
+        Err(HostActionStoreError::InvalidTransition) => action_error(
+            StatusCode::CONFLICT,
+            "Credential retirement is not waiting for an operator retry",
+        ),
+        Err(HostActionStoreError::NotFound) => {
+            action_error(StatusCode::NOT_FOUND, "Host retirement was not found")
+        }
+        Err(_) => action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The credential retirement retry could not be recorded",
+        ),
+    }
+}
+
 async fn allow_host_reonboarding(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7247,11 +7362,15 @@ fn reconcile_completed_removals(state: &AppState, now: i64) {
             tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "retired host checklist reconciliation could not be persisted");
             continue;
         }
-        if !retired.declaration_pending {
-            state.store.remove(&retired.host);
+        if retired.declaration_pending && host_is_declared(state, &retired.host) {
             continue;
         }
-        if host_is_declared(state, &retired.host) {
+        if state
+            .host_actions
+            .mark_removal_declaration_completed(&retired.removal_job_id, now)
+            .is_err()
+        {
+            tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "declarative removal completion could not be persisted");
             continue;
         }
         state.store.remove(&retired.host);
@@ -7282,6 +7401,84 @@ fn agent_authorized(state: &AppState, headers: &HeaderMap, host: &str) -> Result
         ReportTokenAuth::Allowed => Ok(()),
         ReportTokenAuth::Denied => Err(StatusCode::UNAUTHORIZED),
         ReportTokenAuth::Unavailable(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+fn retirement_owner_authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+) -> Result<(), StatusCode> {
+    if !state.retirement_owner.is_owner(owner) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if state.retired_hosts.is_retired(owner) {
+        return Err(StatusCode::GONE);
+    }
+    let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    match state
+        .beacon_auth
+        .report_token_status(&state.store, owner, token)
+    {
+        ReportTokenAuth::Allowed => Ok(()),
+        ReportTokenAuth::Denied => Err(StatusCode::UNAUTHORIZED),
+        ReportTokenAuth::Unavailable(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn claim_retirement_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RetirementAgentClaimRequest>,
+) -> axum::response::Response {
+    let owner = request.owner.trim().to_string();
+    if !valid_action_host_name(&owner) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(status) = retirement_owner_authorized(&state, &headers, &owner) {
+        return status.into_response();
+    }
+    reconcile_completed_removals(&state, now_unix());
+    match state.host_actions.claim_retirement(&owner, now_unix()) {
+        Ok(Some(lease)) => (StatusCode::OK, Json(lease)).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn record_retirement_action_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<RetirementAgentResultRequest>,
+) -> axum::response::Response {
+    let owner = request.owner.trim().to_string();
+    let host = request.host.trim().to_string();
+    if !valid_action_host_name(&owner) || !valid_action_host_name(&host) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(status) = retirement_owner_authorized(&state, &headers, &owner) {
+        return status.into_response();
+    }
+    if !state.retired_hosts.is_retired(&host) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    match state
+        .host_actions
+        .record_retirement_result(&id, &request, now_unix())
+    {
+        Ok(job) => {
+            if job.state == HostActionState::Succeeded {
+                state.store.remove(&host);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(HostActionStoreError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(HostActionStoreError::WrongHost) => StatusCode::FORBIDDEN.into_response(),
+        Err(HostActionStoreError::InvalidJob | HostActionStoreError::InvalidTransition) => {
+            StatusCode::CONFLICT.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -9165,7 +9362,9 @@ async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
             can_onboard: access.can_agora(),
             can_manage_fleet: access.can_manage_fleet(),
             system_update_available: state.nixcfg_dispatch.system_update_available(),
-            host_removal_available: state.nixcfg_dispatch.host_removal_available(),
+            host_removal_available: state.nixcfg_dispatch.host_removal_available()
+                && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
+                    || state.retirement_owner.configured()),
         },
     ))
 }
@@ -13225,7 +13424,12 @@ fn activity_events(
             } else {
                 " · runtime registration only"
             };
-            format!(" Disposition: {disposition}{successor}{cleanup}.")
+            let credentials = if plan.credential_retirement_required {
+                " · Janus credential retirement required"
+            } else {
+                ""
+            };
+            format!(" Disposition: {disposition}{successor}{cleanup}{credentials}.")
         });
         events.push(
             ActivityEvent::new(
@@ -14651,6 +14855,7 @@ async fn main() {
     let beacon_auth = BeaconAuth::from_env();
     let provider_runtime = ProviderRuntimeConfig::from_env();
     let nixcfg_dispatch = NixcfgDispatch::from_env();
+    let retirement_owner = RetirementOwnerAuth::from_env();
     let alert_notifier = AlertNotifier::from_env();
     let state = AppState {
         store,
@@ -14660,6 +14865,7 @@ async fn main() {
         beacon_auth,
         provider_runtime,
         nixcfg_dispatch,
+        retirement_owner,
         host_actions,
         retired_hosts,
     };
@@ -14724,6 +14930,10 @@ async fn main() {
         )
         .route("/host-actions/{host}/remove", post(request_host_removal))
         .route(
+            "/host-actions/jobs/{id}/retry-retirement",
+            post(retry_host_retirement),
+        )
+        .route(
             "/host-actions/{host}/allow-reonboarding",
             post(allow_host_reonboarding),
         )
@@ -14744,6 +14954,11 @@ async fn main() {
         .route(
             "/agent/actions/{id}/result",
             post(record_host_action_result),
+        )
+        .route("/agent/retirements/claim", post(claim_retirement_action))
+        .route(
+            "/agent/retirements/{id}/result",
+            post(record_retirement_action_result),
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
@@ -16496,6 +16711,7 @@ mod tests {
                     disposition: HostRetirementDisposition::Rebuilt,
                     successor: Some("stm2607".to_string()),
                     declaration_pending: true,
+                    credential_retirement_required: false,
                 },
                 1_000,
             )
@@ -19802,6 +20018,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             beacon_auth,
             provider_runtime: ProviderRuntimeConfig::default(),
             nixcfg_dispatch: NixcfgDispatch::disabled(),
+            retirement_owner: RetirementOwnerAuth::default(),
             host_actions: Arc::new(HostActionStore::new(None)),
             retired_hosts: Arc::new(RetiredHostStore::new(None)),
         }
@@ -20315,6 +20532,152 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(payload["job"]["workflow"]["kind"], "remove_host");
         assert_eq!(payload["job"]["workflow"]["current_step"], "revoke");
         let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[tokio::test]
+    async fn janus_managed_removal_requires_a_distinct_configured_owner() {
+        let hash_path = janus_hash_file("hsb8", "retirement-token");
+        let manifest_path = std::env::temp_dir().join(format!(
+            "pharos-retirement-owner-manifest-{}-{}.json",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&test_manifest("hsb8", true)).expect("manifest serializes"),
+        )
+        .expect("manifest written");
+        let mut state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_token_hash_sources: vec![JanusTokenHashSource::File(hash_path.clone())],
+            local_register_enabled: false,
+        });
+        state.manifests = Arc::new(ManifestRegistry::from_paths(vec![manifest_path.clone()]));
+        state.store.record(test_report("hsb8"), now_unix());
+
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "hsb8".to_string(),
+                disposition: HostRetirementDisposition::Destroyed,
+                successor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!state.retired_hosts.is_retired("hsb8"));
+
+        state.retirement_owner = RetirementOwnerAuth {
+            owner_host: Some("hsb8".to_string()),
+        };
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "hsb8".to_string(),
+                disposition: HostRetirementDisposition::Destroyed,
+                successor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!state.retired_hosts.is_retired("hsb8"));
+
+        let _ = std::fs::remove_file(hash_path);
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[tokio::test]
+    async fn configured_retirement_owner_is_the_only_identity_that_can_finish_janus_cleanup() {
+        let mut state = report_test_state(true);
+        state.retirement_owner = RetirementOwnerAuth {
+            owner_host: Some("csb1".to_string()),
+        };
+        register_test_token(&state, "csb1", "owner-token");
+        let job = state
+            .host_actions
+            .begin_removal(
+                "hsb8",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Destroyed,
+                    successor: None,
+                    declaration_pending: true,
+                    credential_retirement_required: true,
+                },
+                100,
+            )
+            .expect("retirement recorded");
+        state
+            .host_actions
+            .mark_removal_access_revoked(&job.id, 101)
+            .expect("access revoked");
+        state
+            .retired_hosts
+            .retire(RetiredHost {
+                host: "hsb8".to_string(),
+                requested_by: "markus".to_string(),
+                removal_job_id: job.id.clone(),
+                disposition: HostRetirementDisposition::Destroyed,
+                successor: None,
+                declaration_pending: true,
+                retired_at: 100,
+            })
+            .expect("retired host recorded");
+
+        assert_eq!(
+            claim_retirement_action(
+                State(state.clone()),
+                bearer_headers("wrong-token"),
+                Json(RetirementAgentClaimRequest {
+                    owner: "csb1".to_string(),
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            claim_retirement_action(
+                State(state.clone()),
+                bearer_headers("owner-token"),
+                Json(RetirementAgentClaimRequest {
+                    owner: "csb1".to_string(),
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            record_retirement_action_result(
+                State(state.clone()),
+                bearer_headers("owner-token"),
+                AxumPath(job.id.clone()),
+                Json(RetirementAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "hsb8".to_string(),
+                    outcome: host_actions::RetirementAgentOutcome::Succeeded,
+                    reason: None,
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            state
+                .host_actions
+                .get(&job.id)
+                .expect("completed retirement")
+                .state,
+            HostActionState::Succeeded
+        );
     }
 
     #[tokio::test]

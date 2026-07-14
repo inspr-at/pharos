@@ -18,6 +18,7 @@ const ACTION_VERSION: u16 = 1;
 const RETIRED_SCHEMA: &str = "inspr.pharos.retired-hosts.v1";
 const RETIRED_VERSION: u16 = 2;
 const LEASE_SECS: i64 = 180;
+const RETIREMENT_LEASE_SECS: i64 = 1800;
 const WORKFLOW_SCHEMA: &str = "inspr.pharos.host-workflow.v1";
 const WORKFLOW_VERSION: u16 = 2;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -99,6 +100,7 @@ pub(crate) enum HostActionState {
 pub(crate) enum HostActionEventSource {
     Operator,
     HostAgent,
+    RetirementAgent,
     Beacon,
     Pharos,
 }
@@ -127,9 +129,36 @@ pub(crate) enum HostActionEventKind {
     SettingsApplied,
     SettingsFailed,
     RemovalAccessRevoked,
+    RemovalDeclarationCompleted,
+    RemovalCredentialClaimed,
+    RemovalCredentialRetired,
+    RemovalCredentialFailed,
+    RemovalCredentialRetryQueued,
     RemovalFailed,
     RemovalCompleted,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetirementFailureReason {
+    CheckoutNotReady,
+    RetirementContractInvalid,
+    JanusUnavailable,
+    JanusRejected,
+    ResultContractInvalid,
+}
+
+impl RetirementFailureReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CheckoutNotReady => "reviewed checkout not ready",
+            Self::RetirementContractInvalid => "retirement contract invalid",
+            Self::JanusUnavailable => "Janus unavailable",
+            Self::JanusRejected => "Janus rejected retirement",
+            Self::ResultContractInvalid => "retirement result invalid",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -217,6 +246,8 @@ pub(crate) struct HostActionEvent {
     pub(crate) failure_gate: Option<HostActionFailureGate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recovery_mode: Option<HostActionRecoveryMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retirement_failure: Option<RetirementFailureReason>,
 }
 
 impl HostActionEvent {
@@ -235,6 +266,9 @@ impl HostActionEvent {
             && self
                 .recovery_mode
                 .is_none_or(|_| self.kind == HostActionEventKind::RecoveryPassed)
+            && self
+                .retirement_failure
+                .is_none_or(|_| self.kind == HostActionEventKind::RemovalCredentialFailed)
     }
 }
 
@@ -293,6 +327,7 @@ pub(crate) enum HostWorkflowExecutionLocation {
     Pharos,
     Github,
     TargetHost,
+    RetirementOwner,
 }
 
 impl HostWorkflowExecutionLocation {
@@ -301,6 +336,7 @@ impl HostWorkflowExecutionLocation {
             Self::Pharos => "Pharos".to_string(),
             Self::Github => "GitHub".to_string(),
             Self::TargetHost => host.to_string(),
+            Self::RetirementOwner => "retirement owner".to_string(),
         }
     }
 }
@@ -404,6 +440,8 @@ pub(crate) struct HostRemovalPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) successor: Option<String>,
     pub(crate) declaration_pending: bool,
+    #[serde(default)]
+    pub(crate) credential_retirement_required: bool,
 }
 
 impl HostRemovalPlan {
@@ -455,6 +493,8 @@ pub(crate) struct HostActionJob {
     #[serde(default)]
     lease_phase: Option<AgentActionPhase>,
     lease_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement_lease_until: Option<i64>,
 }
 
 impl HostActionJob {
@@ -496,6 +536,7 @@ impl HostActionJob {
                     && self.recovery_started_at.is_none()
                     && self.result.is_none()))
             && self.lease_state_valid()
+            && self.retirement_lease_state_valid()
             && match self.kind {
                 HostActionKind::RemoveHost => self
                     .removal_plan
@@ -523,6 +564,71 @@ impl HostActionJob {
             }
             _ => self.lease_phase.is_none() && self.lease_until.is_none(),
         }
+    }
+
+    fn retirement_lease_state_valid(&self) -> bool {
+        self.retirement_lease_until.is_none_or(|until| {
+            self.kind == HostActionKind::RemoveHost
+                && self.state == HostActionState::RemovalPending
+                && until > self.updated_at
+                && self.removal_access_revoked()
+                && self.declaration_removed()
+                && self.credential_retirement_required()
+                && !self.credentials_retired()
+                && !self.credential_retry_required()
+        })
+    }
+
+    fn has_event(&self, kind: HostActionEventKind) -> bool {
+        self.events.iter().any(|event| event.kind == kind)
+    }
+
+    fn removal_access_revoked(&self) -> bool {
+        self.has_event(HostActionEventKind::RemovalAccessRevoked)
+    }
+
+    fn declaration_removed(&self) -> bool {
+        self.removal_plan
+            .as_ref()
+            .is_some_and(|plan| !plan.declaration_pending)
+            || self.has_event(HostActionEventKind::RemovalDeclarationCompleted)
+    }
+
+    fn credential_retirement_required(&self) -> bool {
+        self.removal_plan
+            .as_ref()
+            .is_some_and(|plan| plan.credential_retirement_required)
+    }
+
+    fn credentials_retired(&self) -> bool {
+        !self.credential_retirement_required()
+            || self.has_event(HostActionEventKind::RemovalCredentialRetired)
+    }
+
+    fn credential_retry_required(&self) -> bool {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match event.kind {
+                HostActionEventKind::RemovalCredentialFailed => Some(true),
+                HostActionEventKind::RemovalCredentialRetryQueued
+                | HostActionEventKind::RemovalCredentialClaimed
+                | HostActionEventKind::RemovalCredentialRetired => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    fn latest_retirement_failure(&self) -> Option<RetirementFailureReason> {
+        self.events.iter().rev().find_map(|event| {
+            (event.kind == HostActionEventKind::RemovalCredentialFailed)
+                .then_some(event.retirement_failure)
+                .flatten()
+        })
+    }
+
+    fn removal_gates_ready(&self) -> bool {
+        self.removal_access_revoked() && self.declaration_removed() && self.credentials_retired()
     }
 
     pub(crate) fn summary(&self) -> HostActionSummary {
@@ -570,6 +676,7 @@ impl HostActionJob {
             actor: actor.map(str::to_string),
             failure_gate,
             recovery_mode,
+            retirement_failure: None,
         });
     }
 
@@ -804,12 +911,36 @@ impl HostActionJob {
                     }
                     evidence.push(workflow_evidence(
                         "Declarative cleanup",
-                        if plan.declaration_pending {
-                            "required"
+                        if self.declaration_removed() {
+                            "complete"
+                        } else if plan.declaration_pending {
+                            "pending"
                         } else {
                             "not required"
                         },
                     ));
+                    evidence.push(workflow_evidence(
+                        "Credential retirement",
+                        if self.credentials_retired() {
+                            if plan.credential_retirement_required {
+                                "complete"
+                            } else {
+                                "not required"
+                            }
+                        } else if self.credential_retry_required() {
+                            "action required"
+                        } else if self.retirement_lease_until.is_some() {
+                            "running"
+                        } else {
+                            "pending"
+                        },
+                    ));
+                    if let Some(reason) = self.latest_retirement_failure() {
+                        evidence.push(workflow_evidence(
+                            "Credential retirement stopped at",
+                            reason.label(),
+                        ));
+                    }
                 }
             }
         }
@@ -1371,12 +1502,27 @@ impl HostActionJob {
             .removal_plan
             .as_ref()
             .is_some_and(|plan| plan.declaration_pending);
+        let declaration_removed = self.declaration_removed();
+        let credentials_required = self.credential_retirement_required();
+        let credentials_retired = self.credentials_retired();
+        let credential_running = self.retirement_lease_until.is_some();
+        let credential_retry_required = self.credential_retry_required();
+        let primary_action = credential_retry_required.then(|| HostWorkflowAction {
+            kind: HostWorkflowActionKind::Retry,
+            label: "Retry credential retirement".to_string(),
+        });
         (
             format!("Remove {} from Pharos", self.host),
             if failed {
                 "The removal request stopped before Pharos could finish revoking this host. Review the saved failure before trying again."
             } else if preparing {
                 "The retirement intent is saved. Pharos is finishing the guarded handoff before changing host visibility."
+            } else if credential_retry_required {
+                "The reviewed declaration is gone, but owner-side credential retirement stopped. Review the recorded reason, then retry the same bounded workflow."
+            } else if credential_running {
+                "The reviewed declaration is gone. The retirement owner is removing the host credential through Janus."
+            } else if pending && declaration_removed && credentials_required {
+                "The reviewed declaration is gone. Pharos is waiting for the retirement owner to claim credential cleanup."
             } else if pending {
                 "Reporting access is revoked. Pharos is waiting for the declared host entry to be reviewed and removed."
             } else {
@@ -1387,6 +1533,10 @@ impl HostActionJob {
                 "removal stopped"
             } else if preparing {
                 "preparing removal"
+            } else if credential_retry_required {
+                "credential retirement needs attention"
+            } else if credential_running {
+                "retiring credentials"
             } else if pending {
                 "removal pending"
             } else {
@@ -1398,7 +1548,7 @@ impl HostActionJob {
             } else {
                 "clear"
             },
-            None,
+            primary_action,
             vec![
                 workflow_step(
                     "confirm",
@@ -1428,12 +1578,10 @@ impl HostActionJob {
                         WorkflowStepState::Skipped
                     } else if preparing {
                         WorkflowStepState::Queued
+                    } else if declaration_removed {
+                        WorkflowStepState::Passed
                     } else if declaration_pending {
-                        if pending {
-                            WorkflowStepState::Waiting
-                        } else {
-                            WorkflowStepState::Passed
-                        }
+                        WorkflowStepState::Waiting
                     } else {
                         WorkflowStepState::Skipped
                     },
@@ -1445,10 +1593,40 @@ impl HostActionJob {
                 )
                 .at(HostWorkflowExecutionLocation::Github),
                 workflow_step(
+                    "credentials",
+                    "PROTECT",
+                    "Retire the host credential",
+                    if !credentials_required {
+                        WorkflowStepState::Skipped
+                    } else if credentials_retired {
+                        WorkflowStepState::Passed
+                    } else if credential_retry_required {
+                        WorkflowStepState::ActionRequired
+                    } else if credential_running {
+                        WorkflowStepState::Running
+                    } else if declaration_removed {
+                        WorkflowStepState::Waiting
+                    } else {
+                        WorkflowStepState::Queued
+                    },
+                    if !credentials_required {
+                        "No Janus-owned credential was registered for this host."
+                    } else if credential_retry_required {
+                        "The bounded owner-side run stopped without returning credential material."
+                    } else {
+                        "The configured owner runs only the reviewed Janus retirement intent."
+                    },
+                )
+                .at(HostWorkflowExecutionLocation::RetirementOwner),
+                workflow_step(
                     "record",
                     "RECORD",
                     "Save the retirement record",
-                    WorkflowStepState::Passed,
+                    if self.state == HostActionState::Succeeded {
+                        WorkflowStepState::Passed
+                    } else {
+                        WorkflowStepState::Queued
+                    },
                     "The retirement remains auditable after the runtime record is removed.",
                 ),
             ],
@@ -1587,6 +1765,15 @@ fn event_label(event: &HostActionEvent) -> String {
         HostActionEventKind::SettingsApplied => "Host reported the requested settings",
         HostActionEventKind::SettingsFailed => "Settings request stopped",
         HostActionEventKind::RemovalAccessRevoked => "Host reporting access revoked",
+        HostActionEventKind::RemovalDeclarationCompleted => "Declarative host entry removed",
+        HostActionEventKind::RemovalCredentialClaimed => {
+            "Retirement owner started credential retirement"
+        }
+        HostActionEventKind::RemovalCredentialRetired => "Host credential retired",
+        HostActionEventKind::RemovalCredentialFailed => "Host credential retirement stopped",
+        HostActionEventKind::RemovalCredentialRetryQueued => {
+            "Host credential retirement retry queued"
+        }
         HostActionEventKind::RemovalFailed => "Host removal stopped",
         HostActionEventKind::RemovalCompleted => "Host retirement completed",
         HostActionEventKind::Cancelled => "Workflow cancelled before live change",
@@ -1599,6 +1786,10 @@ fn event_label(event: &HostActionEvent) -> String {
     if let Some(mode) = event.recovery_mode {
         label.push_str(": ");
         label.push_str(mode.label());
+    }
+    if let Some(reason) = event.retirement_failure {
+        label.push_str(" at ");
+        label.push_str(reason.label());
     }
     label
 }
@@ -1671,6 +1862,43 @@ pub(crate) struct AgentActionResultRequest {
     pub(crate) result: Option<HostActionResult>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct RetirementAgentLease {
+    pub(crate) schema: &'static str,
+    pub(crate) version: u16,
+    pub(crate) id: String,
+    pub(crate) host: String,
+    pub(crate) ticket: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetirementAgentOutcome {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetirementAgentResultRequest {
+    pub(crate) owner: String,
+    pub(crate) host: String,
+    pub(crate) outcome: RetirementAgentOutcome,
+    #[serde(default)]
+    pub(crate) reason: Option<RetirementFailureReason>,
+}
+
+impl RetirementAgentResultRequest {
+    fn valid(&self) -> bool {
+        valid_host_name(&self.owner)
+            && valid_host_name(&self.host)
+            && match self.outcome {
+                RetirementAgentOutcome::Succeeded => self.reason.is_none(),
+                RetirementAgentOutcome::Failed => self.reason.is_some(),
+            }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HostActionStoreError {
     ActiveJob,
@@ -1714,6 +1942,7 @@ impl HostActionStore {
                             disposition: HostRetirementDisposition::Unmanaged,
                             successor: None,
                             declaration_pending: job.state == HostActionState::RemovalPending,
+                            credential_retirement_required: false,
                         });
                     }
                     if job.events.is_empty() {
@@ -1726,6 +1955,7 @@ impl HostActionStore {
                             actor: None,
                             failure_gate: None,
                             recovery_mode: None,
+                            retirement_failure: None,
                         });
                     }
                 }
@@ -1833,6 +2063,7 @@ impl HostActionStore {
             events: Vec::new(),
             lease_phase: None,
             lease_until: None,
+            retirement_lease_until: None,
         };
         job.record_event(
             proposal.now,
@@ -2043,7 +2274,9 @@ impl HostActionStore {
             kind: HostActionKind::RemoveHost,
             actor,
             ticket: "PHAROS-127",
-            state: if removal_plan.declaration_pending {
+            state: if removal_plan.declaration_pending
+                || removal_plan.credential_retirement_required
+            {
                 HostActionState::RemovalPending
             } else {
                 HostActionState::Succeeded
@@ -2104,7 +2337,8 @@ impl HostActionStore {
                 .removal_plan
                 .as_ref()
                 .is_some_and(|plan| plan.declaration_pending);
-            job.state = if declaration_pending {
+            let credential_retirement_required = job.credential_retirement_required();
+            job.state = if declaration_pending || credential_retirement_required {
                 HostActionState::RemovalPending
             } else {
                 HostActionState::Succeeded
@@ -2116,7 +2350,7 @@ impl HostActionStore {
                 HostActionEventKind::RemovalAccessRevoked,
                 None,
             );
-            if !declaration_pending {
+            if !declaration_pending && !credential_retirement_required {
                 job.record_event(
                     now,
                     HostActionEventSource::Pharos,
@@ -2209,6 +2443,7 @@ impl HostActionStore {
             events: Vec::new(),
             lease_phase: None,
             lease_until: None,
+            retirement_lease_until: None,
         };
         job.record_event(
             now,
@@ -2625,6 +2860,9 @@ impl HostActionStore {
         if job.kind != HostActionKind::RemoveHost || job.state != HostActionState::RemovalPending {
             return Ok(None);
         }
+        if !job.removal_gates_ready() || job.retirement_lease_until.is_some() {
+            return Ok(None);
+        }
         let previous = job.clone();
         job.state = HostActionState::Succeeded;
         job.updated_at = now;
@@ -2640,6 +2878,198 @@ impl HostActionStore {
             return Err(error);
         }
         Ok(Some(updated))
+    }
+
+    pub(crate) fn mark_removal_declaration_completed(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<HostActionJob>, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let Some(job) = jobs.get_mut(id) else {
+            return Ok(None);
+        };
+        if job.kind != HostActionKind::RemoveHost || job.state != HostActionState::RemovalPending {
+            return Ok(None);
+        }
+        if job.declaration_removed() {
+            return Ok(Some(job.clone()));
+        }
+        let previous = job.clone();
+        job.updated_at = now;
+        job.record_event(
+            now,
+            HostActionEventSource::Pharos,
+            HostActionEventKind::RemovalDeclarationCompleted,
+            None,
+        );
+        let updated = job.clone();
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(Some(updated))
+    }
+
+    pub(crate) fn claim_retirement(
+        &self,
+        owner: &str,
+        now: i64,
+    ) -> Result<Option<RetirementAgentLease>, HostActionStoreError> {
+        if !valid_host_name(owner) {
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let candidate = jobs
+            .values()
+            .filter(|job| {
+                job.kind == HostActionKind::RemoveHost
+                    && job.state == HostActionState::RemovalPending
+                    && job.removal_access_revoked()
+                    && job.declaration_removed()
+                    && job.credential_retirement_required()
+                    && !job.credentials_retired()
+                    && !job.credential_retry_required()
+                    && job.retirement_lease_until.is_none_or(|until| until <= now)
+            })
+            .min_by_key(|job| (job.created_at, &job.id))
+            .map(|job| job.id.clone());
+        let Some(id) = candidate else {
+            return Ok(None);
+        };
+        let (previous, updated, lease) = {
+            let job = jobs.get_mut(&id).expect("retirement candidate exists");
+            let previous = job.clone();
+            job.updated_at = now;
+            job.retirement_lease_until = Some(now + RETIREMENT_LEASE_SECS);
+            job.record_event(
+                now,
+                HostActionEventSource::RetirementAgent,
+                HostActionEventKind::RemovalCredentialClaimed,
+                Some(owner),
+            );
+            let lease = RetirementAgentLease {
+                schema: "inspr.pharos.retirement-agent-lease.v1",
+                version: 1,
+                id: job.id.clone(),
+                host: job.host.clone(),
+                ticket: job.ticket.clone(),
+            };
+            (previous, job.clone(), lease)
+        };
+        if !updated.validate() {
+            jobs.insert(id, previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id, previous);
+            return Err(error);
+        }
+        Ok(Some(lease))
+    }
+
+    pub(crate) fn record_retirement_result(
+        &self,
+        id: &str,
+        request: &RetirementAgentResultRequest,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if !request.valid() {
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.host != request.host {
+                return Err(HostActionStoreError::WrongHost);
+            }
+            if job.kind != HostActionKind::RemoveHost
+                || job.state != HostActionState::RemovalPending
+                || job.retirement_lease_until.is_none()
+                || !job.declaration_removed()
+                || !job.credential_retirement_required()
+                || job.credentials_retired()
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            job.updated_at = now;
+            job.retirement_lease_until = None;
+            let event_kind = match request.outcome {
+                RetirementAgentOutcome::Succeeded => HostActionEventKind::RemovalCredentialRetired,
+                RetirementAgentOutcome::Failed => HostActionEventKind::RemovalCredentialFailed,
+            };
+            job.events.push(HostActionEvent {
+                at: now,
+                state: job.state,
+                source: HostActionEventSource::RetirementAgent,
+                kind: event_kind,
+                actor: Some(request.owner.clone()),
+                failure_gate: None,
+                recovery_mode: None,
+                retirement_failure: request.reason,
+            });
+            if request.outcome == RetirementAgentOutcome::Succeeded && job.removal_gates_ready() {
+                job.state = HostActionState::Succeeded;
+                job.record_event(
+                    now,
+                    HostActionEventSource::Pharos,
+                    HostActionEventKind::RemovalCompleted,
+                    None,
+                );
+            }
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn retry_retirement(
+        &self,
+        id: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.kind != HostActionKind::RemoveHost
+                || job.state != HostActionState::RemovalPending
+                || !job.credential_retry_required()
+                || job.retirement_lease_until.is_some()
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            job.updated_at = now;
+            job.record_event(
+                now,
+                HostActionEventSource::Operator,
+                HostActionEventKind::RemovalCredentialRetryQueued,
+                Some(actor),
+            );
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
     }
 
     fn new_update_review(
@@ -2669,6 +3099,7 @@ impl HostActionStore {
             events: Vec::new(),
             lease_phase: None,
             lease_until: None,
+            retirement_lease_until: None,
         };
         job.record_event(
             now,
@@ -3822,6 +4253,7 @@ mod tests {
             actor: None,
             failure_gate: Some(HostActionFailureGate::Switch),
             recovery_mode: None,
+            retirement_failure: None,
         });
         job.events.push(HostActionEvent {
             at: 342,
@@ -3831,6 +4263,7 @@ mod tests {
             actor: None,
             failure_gate: None,
             recovery_mode: None,
+            retirement_failure: None,
         });
 
         assert_eq!(job.latest_failure_gate(), None);
@@ -3959,6 +4392,7 @@ mod tests {
                     disposition: HostRetirementDisposition::Rebuilt,
                     successor: Some("stm2607".to_string()),
                     declaration_pending: true,
+                    credential_retirement_required: false,
                 },
                 100,
             )
@@ -4002,10 +4436,119 @@ mod tests {
                     disposition: HostRetirementDisposition::Rebuilt,
                     successor: None,
                     declaration_pending: true,
+                    credential_retirement_required: false,
                 },
                 102,
             ),
             Err(HostActionStoreError::InvalidJob)
+        );
+    }
+
+    #[test]
+    fn janus_retirement_requires_both_gates_and_supports_bounded_retry() {
+        let store = HostActionStore::new(None);
+        let started = store
+            .begin_removal(
+                "hsb8",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Destroyed,
+                    successor: None,
+                    declaration_pending: true,
+                    credential_retirement_required: true,
+                },
+                200,
+            )
+            .expect("removal recorded");
+        let pending = store
+            .mark_removal_access_revoked(&started.id, 201)
+            .expect("reporting revoked");
+        assert_eq!(pending.state, HostActionState::RemovalPending);
+        assert!(store
+            .claim_retirement("csb1", 202)
+            .expect("owner poll")
+            .is_none());
+        assert!(store
+            .complete_removal(&started.id, 202)
+            .expect("completion gate")
+            .is_none());
+
+        store
+            .mark_removal_declaration_completed(&started.id, 203)
+            .expect("declaration recorded");
+        let lease = store
+            .claim_retirement("csb1", 204)
+            .expect("owner claim")
+            .expect("retirement lease");
+        assert_eq!(lease.host, "hsb8");
+        let running = store.get(&started.id).expect("running retirement");
+        assert_eq!(
+            running.summary().workflow.current_step.as_deref(),
+            Some("credentials")
+        );
+        assert_eq!(
+            running
+                .summary()
+                .workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "credentials")
+                .expect("credential step")
+                .state,
+            WorkflowStepState::Running
+        );
+
+        let stopped = store
+            .record_retirement_result(
+                &started.id,
+                &RetirementAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "hsb8".to_string(),
+                    outcome: RetirementAgentOutcome::Failed,
+                    reason: Some(RetirementFailureReason::JanusUnavailable),
+                },
+                205,
+            )
+            .expect("typed failure recorded");
+        assert_eq!(stopped.state, HostActionState::RemovalPending);
+        assert_eq!(
+            stopped
+                .summary()
+                .workflow
+                .primary_action
+                .expect("retry action")
+                .label,
+            "Retry credential retirement"
+        );
+        assert!(store
+            .claim_retirement("csb1", 206)
+            .expect("blocked poll")
+            .is_none());
+
+        store
+            .retry_retirement(&started.id, "markus", 207)
+            .expect("retry queued");
+        store
+            .claim_retirement("csb1", 208)
+            .expect("retry claim")
+            .expect("retry lease");
+        let completed = store
+            .record_retirement_result(
+                &started.id,
+                &RetirementAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "hsb8".to_string(),
+                    outcome: RetirementAgentOutcome::Succeeded,
+                    reason: None,
+                },
+                209,
+            )
+            .expect("retirement completed");
+        assert_eq!(completed.state, HostActionState::Succeeded);
+        assert_eq!(
+            completed.summary().workflow.current_step,
+            None,
+            "all removal gates are complete"
         );
     }
 
