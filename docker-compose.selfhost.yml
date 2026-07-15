@@ -27,6 +27,10 @@ services:
       PHAROS_REQUIRE_BEACON_TOKEN: "1"
       PHAROS_BEACON_TOKEN_MODE: ${PHAROS_BEACON_TOKEN_MODE:-local}
 
+      # Optional public Janus URL used only to open value-free provider setup.
+      # Secret values remain in Janus/agenix and private runtime mounts.
+      PHAROS_JANUS_PUBLIC_URL: ${PHAROS_JANUS_PUBLIC_URL:-}
+
       # Optional existing-host native bootstrap executor. It remains disabled
       # unless every trust/route input is supplied explicitly. Mount the
       # referenced SSH files read-only with a local compose override.

@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.39 - 2026-07-15
+
+- Add one reduced Provider connections screen under Settings, with a compact managed-or-guided status and one clear next action for Hetzner Cloud, netcup, AWS, Google Cloud, and Oracle Cloud.
+- Open secure Hetzner setup through Janus using value-free metadata only, and keep provider credentials out of Pharos pages, browser state, responses, and deployment files.
+- Send an interrupted Add server flow to the exact provider setup page and return to the same step, while keeping unsupported or eligibility-dependent providers on honest two-step guided paths.
+
 ## 0.1.38 - 2026-07-14
 
 - Apply color, host type, and alert choices on native non-Nix hosts through the heartbeat they already send, with no inbound listener or additional operator setup.
