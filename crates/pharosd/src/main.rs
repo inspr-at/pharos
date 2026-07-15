@@ -475,6 +475,7 @@ struct ProvisioningCleanupRequest {
 struct ProviderRuntimeConfig {
     hetzner_cloud: HetznerCloudRuntimeConfig,
     existing_host: ExistingHostRuntimeConfig,
+    janus_public_url: Option<Url>,
 }
 
 impl ProviderRuntimeConfig {
@@ -482,8 +483,33 @@ impl ProviderRuntimeConfig {
         Self {
             hetzner_cloud: HetznerCloudRuntimeConfig::from_env(),
             existing_host: ExistingHostRuntimeConfig::from_env(),
+            janus_public_url: env_nonempty("PHAROS_JANUS_PUBLIC_URL")
+                .and_then(|value| provider_setup_base_url(&value)),
         }
     }
+}
+
+fn provider_setup_base_url(value: &str) -> Option<Url> {
+    let mut url = Url::parse(value).ok()?;
+    let local_http = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    if !(url.scheme() == "https" || local_http)
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&path);
+    Some(url)
 }
 
 #[derive(Clone, Debug)]
@@ -2240,7 +2266,7 @@ fn hetzner_runtime_readiness(config: &HetznerCloudRuntimeConfig) -> SetupProvide
     let provider_ready = credential_configured && execution_enabled && firewall_configured;
     let ready_with_defaults = provider_ready && default_ssh_key_configured;
     let message = if !credential_configured {
-        "Provider connection needs administrator setup."
+        "Hetzner Cloud is not connected. Set it up before creating a server."
     } else if !execution_enabled {
         "Provider connection is configured, but server creation is disabled."
     } else if !firewall_configured {
@@ -2259,6 +2285,182 @@ fn hetzner_runtime_readiness(config: &HetznerCloudRuntimeConfig) -> SetupProvide
         ready_with_defaults,
         message,
     }
+}
+
+const PROVIDER_CONNECTIONS_SCHEMA: &str = "inspr.pharos.provider-connections.v1";
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ProviderConnectionCapability {
+    Managed,
+    Guided,
+}
+
+impl ProviderConnectionCapability {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Managed => "Managed",
+            Self::Guided => "Guided",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ProviderConnectionState {
+    Ready,
+    NeedsAttention,
+    NotConnected,
+    Guided,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ProviderConnectionSummary {
+    key: &'static str,
+    name: &'static str,
+    description: &'static str,
+    capability: ProviderConnectionCapability,
+    state: ProviderConnectionState,
+    state_label: &'static str,
+    note: &'static str,
+    detail_href: &'static str,
+    action_label: &'static str,
+    available_in_add_server: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ProviderConnectionsPayload {
+    schema: &'static str,
+    version: u16,
+    providers: Vec<ProviderConnectionSummary>,
+}
+
+fn provider_connections(runtime: &ProviderRuntimeConfig) -> ProviderConnectionsPayload {
+    let hetzner = hetzner_runtime_readiness(&runtime.hetzner_cloud);
+    let (hetzner_state, hetzner_label, hetzner_action) = if hetzner.ready_with_defaults {
+        (ProviderConnectionState::Ready, "Ready", "Review")
+    } else if hetzner.credential_configured {
+        (
+            ProviderConnectionState::NeedsAttention,
+            "Needs attention",
+            "Continue",
+        )
+    } else {
+        (
+            ProviderConnectionState::NotConnected,
+            "Not connected",
+            "Connect",
+        )
+    };
+    ProviderConnectionsPayload {
+        schema: PROVIDER_CONNECTIONS_SCHEMA,
+        version: 1,
+        providers: vec![
+            ProviderConnectionSummary {
+                key: "hetzner-cloud",
+                name: "Hetzner Cloud",
+                description: "Create and set up servers automatically.",
+                capability: ProviderConnectionCapability::Managed,
+                state: hetzner_state,
+                state_label: hetzner_label,
+                note: hetzner.message,
+                detail_href: "/settings/providers/hetzner-cloud",
+                action_label: hetzner_action,
+                available_in_add_server: hetzner.ready_with_defaults,
+            },
+            ProviderConnectionSummary {
+                key: "netcup",
+                name: "netcup",
+                description: "Order there, then continue setup in Pharos.",
+                capability: ProviderConnectionCapability::Guided,
+                state: ProviderConnectionState::Guided,
+                state_label: "No connection needed",
+                note: "Pharos does not claim unsupported server-order automation.",
+                detail_href: "/settings/providers/netcup",
+                action_label: "Start",
+                available_in_add_server: false,
+            },
+            ProviderConnectionSummary {
+                key: "aws",
+                name: "AWS",
+                description: "Credits may cover initial use.",
+                capability: ProviderConnectionCapability::Guided,
+                state: ProviderConnectionState::Guided,
+                state_label: "Credits expire",
+                note: "AWS credits and free-plan eligibility are time-limited.",
+                detail_href: "/settings/providers/aws",
+                action_label: "Start",
+                available_in_add_server: false,
+            },
+            ProviderConnectionSummary {
+                key: "google-cloud",
+                name: "Google Cloud",
+                description: "Eligible small servers in selected regions.",
+                capability: ProviderConnectionCapability::Guided,
+                state: ProviderConnectionState::Guided,
+                state_label: "Eligibility varies",
+                note: "Free-tier eligibility depends on region, machine, disk, and account.",
+                detail_href: "/settings/providers/google-cloud",
+                action_label: "Start",
+                available_in_add_server: false,
+            },
+            ProviderConnectionSummary {
+                key: "oracle-cloud",
+                name: "Oracle Cloud",
+                description: "Eligible capacity in your home region.",
+                capability: ProviderConnectionCapability::Guided,
+                state: ProviderConnectionState::Guided,
+                state_label: "Capacity varies",
+                note: "Always Free capacity is not guaranteed and has no paid fallback.",
+                detail_href: "/settings/providers/oracle-cloud",
+                action_label: "Start",
+                available_in_add_server: false,
+            },
+        ],
+    }
+}
+
+fn provider_connection(
+    runtime: &ProviderRuntimeConfig,
+    key: &str,
+) -> Option<ProviderConnectionSummary> {
+    provider_connections(runtime)
+        .providers
+        .into_iter()
+        .find(|provider| provider.key == key)
+}
+
+fn provider_official_destination(key: &str) -> Option<(&'static str, &'static str)> {
+    match key {
+        "netcup" => Some(("Open netcup", "https://www.netcup.com/en/server/")),
+        "aws" => Some(("Open AWS Free Tier", "https://aws.amazon.com/free/")),
+        "google-cloud" => Some((
+            "Open Google Cloud free program",
+            "https://cloud.google.com/free/docs/free-cloud-features",
+        )),
+        "oracle-cloud" => Some((
+            "Open Oracle Cloud Free Tier",
+            "https://www.oracle.com/cloud/free/",
+        )),
+        _ => None,
+    }
+}
+
+fn hetzner_janus_setup_url(runtime: &ProviderRuntimeConfig, host: &str) -> Option<String> {
+    if !valid_action_host_name(host) {
+        return None;
+    }
+    let mut url = runtime.janus_public_url.clone()?;
+    url.set_path("/vault/new");
+    url.query_pairs_mut()
+        .append_pair("service", "Hetzner Cloud provider")
+        .append_pair("host", host)
+        .append_pair("env", "PHAROS_HCLOUD_API_TOKEN")
+        .append_pair("display", "Hetzner Cloud API token for Pharos")
+        .append_pair("classification", "high")
+        .append_pair("rotation", "180")
+        .append_pair("tags", "pharos,provider,hetzner");
+    Some(url.to_string())
 }
 
 fn setup_provider_plan(
@@ -3700,6 +3902,17 @@ body[data-assistant-open="true"]{overflow:hidden}
 .assistant-overlay[data-provider-created="true"] .assistant-next,.assistant-overlay[data-provider-created="true"] .assistant-created>h3{display:none}
 @media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}.host-action-overlay{padding:10px}.host-action-dialog{width:100%;max-height:calc(100vh - 20px)}.host-action-dialog-head,.host-action-dialog-body{padding-left:16px;padding-right:16px}.host-action-dialog-foot{align-items:stretch;flex-direction:column;padding-left:16px;padding-right:16px}.host-action-dialog-buttons{width:100%;margin-left:0}.host-action-dialog-button{flex:1}.host-action-safe-note{justify-content:center}.host-action-fact strong{max-width:55vw}.host-workflow-group{grid-template-columns:1fr}.host-workflow-group h3{padding:11px 0 3px}.host-workflow-step{grid-template-columns:18px minmax(0,1fr)}.host-workflow-step-state{grid-column:2;text-align:left}.host-workflow-step[data-current="true"]{margin:0 -6px;padding-left:6px;padding-right:6px}}
 @media (max-width:640px){.host-workflow-meta{align-items:flex-start;flex-direction:column;gap:3px}.host-workflow-step-state{justify-items:start}}
+.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr) auto}.assistant-provider-readiness a{color:#0f4f80;font-weight:760;text-decoration:none;white-space:nowrap}.assistant-provider-readiness a:hover,.assistant-provider-readiness a:focus-visible{text-decoration:underline;text-underline-offset:2px;outline:0}
+.providers-main{width:min(1120px,100%)}
+.provider-list{overflow:hidden;border:1px solid rgba(210,226,234,.90);border-radius:8px;background:rgba(255,255,255,.78);box-shadow:0 16px 38px rgba(54,88,108,.06)}
+.provider-row{--provider-color:var(--wait);display:grid;grid-template-columns:52px minmax(250px,1.7fr) minmax(84px,.55fr) minmax(136px,.75fr) minmax(92px,.48fr);align-items:center;gap:14px;min-height:92px;padding:15px 22px;border-bottom:1px solid rgba(210,226,234,.82)}.provider-row:last-child{border-bottom:0}.provider-row[data-provider-state="ready"]{--provider-color:var(--live)}.provider-row[data-provider-state="needs-attention"]{--provider-color:var(--stale)}.provider-row[data-provider-state="not-connected"]{--provider-color:var(--wait)}.provider-row[data-provider-state="guided"]{--provider-color:var(--accent)}
+.provider-mark{display:grid;place-items:center;width:42px;height:42px;color:#48627a}.provider-mark .ico{width:28px;height:28px;stroke-width:1.7}
+.provider-copy{min-width:0}.provider-copy strong{display:block;color:var(--ink);font-size:15px}.provider-copy span{display:block;margin-top:3px;color:var(--muted);font-size:12px;line-height:1.35}.provider-capability{color:#315d7c;font-size:12px}.provider-state{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.provider-state:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--provider-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--provider-color) 10%,transparent)}
+.provider-action,.provider-primary,.provider-secondary{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:38px;border-radius:7px;font-size:12px;font-weight:760;text-decoration:none}.provider-action{justify-self:end;color:#0f5f95;padding:0 8px}.provider-action:hover,.provider-action:focus-visible{text-decoration:underline;text-underline-offset:3px;outline:0}.provider-action-muted{justify-self:end;color:var(--muted);font-size:11px;text-align:right}.providers-footnote{margin:17px 0 0;color:var(--muted);font-size:12px}
+.provider-detail{padding-top:36px}.provider-back{display:inline-flex;align-items:center;gap:7px;margin-bottom:26px;color:#315d7c;font-size:13px;font-weight:720;text-decoration:none}.provider-back:hover{text-decoration:underline;text-underline-offset:3px}.provider-back .ico{width:15px;height:15px}.provider-detail-head{display:flex;align-items:center;gap:16px;margin-bottom:26px}.provider-detail-mark{display:grid;place-items:center;width:54px;height:54px;border:1px solid rgba(214,155,49,.28);border-radius:50%;background:rgba(255,255,255,.74);color:var(--sun);box-shadow:0 0 0 8px rgba(214,155,49,.06)}.provider-detail-mark .ico{width:27px;height:27px}.provider-detail-head h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:32px;line-height:1.05;font-weight:500;letter-spacing:0;color:#12304b}.provider-detail-head p{margin:7px 0 0;color:var(--muted);font-size:14px}
+.provider-step-list,.provider-connection-status{overflow:hidden;border-top:1px solid rgba(210,226,234,.88);border-bottom:1px solid rgba(210,226,234,.88);background:rgba(255,255,255,.46)}.provider-step{display:grid;grid-template-columns:34px minmax(0,1fr) auto;align-items:center;gap:17px;min-height:116px;padding:20px 8px;border-bottom:1px solid rgba(210,226,234,.78)}.provider-step:last-child{border-bottom:0}.provider-step>span{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(103,177,196,.36);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:17px}.provider-step strong{display:block;font-size:15px}.provider-step p{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.45}.provider-primary{min-width:142px;padding:0 15px;border:1px solid #12304b;background:#12304b;color:#fff}.provider-primary:hover,.provider-primary:focus-visible{background:#1c4363;outline:0}.provider-secondary{min-width:142px;padding:0 15px;border:1px solid rgba(103,177,196,.48);background:rgba(255,255,255,.82);color:#0f5f80}.provider-secondary:hover,.provider-secondary:focus-visible{background:rgba(223,241,249,.74);outline:0}.provider-primary .ico,.provider-secondary .ico{width:15px;height:15px}
+.provider-connection-status{padding:0 8px}.provider-connection-copy{padding:20px 0;border-bottom:1px solid rgba(210,226,234,.78)}.provider-connection-copy strong{font-size:17px}.provider-connection-copy p{margin:4px 0 0;color:var(--muted);font-size:12px}.provider-readiness-list{display:grid}.provider-readiness-fact{display:grid;grid-template-columns:10px minmax(0,1fr) auto;align-items:center;gap:11px;min-height:54px;border-bottom:1px solid rgba(210,226,234,.66);font-size:13px}.provider-readiness-fact i{width:8px;height:8px;border-radius:50%;background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.09)}.provider-readiness-fact[data-ready="true"] i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.09)}.provider-readiness-fact span{color:#315d7c}.provider-readiness-fact strong{font-size:12px}.provider-connection-action{display:flex;align-items:center;gap:14px;min-height:82px;padding:16px 0}.provider-admin-note{margin:0;color:var(--muted);font-size:12px;line-height:1.45}
+@media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head h1{font-size:27px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-action{align-items:stretch;flex-direction:column}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
 @media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -5121,6 +5334,13 @@ function updateProviderReadiness(overlay){
       message.textContent=ready
         ? 'Provider connection, SSH public key, and firewall are ready.'
         : runtime?.message||'Provider readiness could not be verified.';
+    }
+    const setup=readiness.querySelector('[data-provider-setup]');
+    if(setup){
+      setup.hidden=ready;
+      const params=new URLSearchParams();
+      params.set('return',location.pathname+location.search);
+      setup.href='/settings/providers/hetzner-cloud?'+params.toString();
     }
   }
   syncAssistantStart(overlay);
@@ -9342,6 +9562,86 @@ pub(crate) fn render_no_access_page(
     )
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ProviderSettingsQuery {
+    #[serde(default, rename = "return")]
+    return_path: Option<String>,
+}
+
+async fn provider_settings_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    let access = access_for_headers(&state.auth, &headers);
+    no_store_html(render_provider_connections_page(
+        &provider_connections(&state.provider_runtime),
+        ShellContext {
+            user_label: &user_label,
+            logout_enabled: state.auth.is_some(),
+        },
+        access.can_manage_fleet(),
+    ))
+}
+
+async fn provider_settings_detail_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(provider_key): AxumPath<String>,
+    Query(query): Query<ProviderSettingsQuery>,
+) -> Response {
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    let access = access_for_headers(&state.auth, &headers);
+    let shell = ShellContext {
+        user_label: &user_label,
+        logout_enabled: state.auth.is_some(),
+    };
+    let Some(provider) = provider_connection(&state.provider_runtime, &provider_key) else {
+        return (
+            StatusCode::NOT_FOUND,
+            no_store_headers(),
+            Html(render_no_access_page(
+                "Provider not found",
+                "Return to Provider connections and choose an available path.",
+                shell,
+                "platform-settings",
+            )),
+        )
+            .into_response();
+    };
+    let return_path = safe_provider_return_path(query.return_path.as_deref());
+    let body = if provider.key == "hetzner-cloud" {
+        render_hetzner_connection_page(
+            &state.provider_runtime,
+            shell,
+            access.can_manage_fleet(),
+            return_path.as_deref(),
+        )
+    } else {
+        render_guided_provider_page(
+            &provider,
+            shell,
+            access.can_manage_fleet(),
+            return_path.as_deref(),
+        )
+    };
+    no_store_html(body).into_response()
+}
+
+async fn provider_connections_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
+    let catalog = provider_connections(&state.provider_runtime);
+    no_store_json(json!({
+        "schema": catalog.schema,
+        "version": catalog.version,
+        "can_manage": access.can_manage_fleet(),
+        "providers": catalog.providers,
+    }))
+}
+
 async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
@@ -10871,20 +11171,26 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
     } else {
         ""
     };
-    let settings_current = if active == "settings" {
+    let host_settings_current = if active == "settings" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
+    let platform_settings_current = if active == "platform-settings" {
         r#" aria-current="page""#
     } else {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{settings_current}>{settings}<span>Host settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}"##,
+        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{host_settings_current}>{host_settings}<span>Host settings</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
         alerts = icons::status_svg(Liveness::Stale),
         backups = icons::SHIELD_CHECK,
         activity = icons::LIST,
-        settings = icons::SLIDERS,
+        host_settings = icons::SLIDERS,
+        platform_settings = icons::SETTINGS,
         history = icons::HISTORY,
         version = html_escape(&release_label()),
         release_dialog = release_dialog(),
@@ -10894,7 +11200,8 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         alerts_current = alerts_current,
         backups_current = backups_current,
         activity_current = activity_current,
-        settings_current = settings_current,
+        host_settings_current = host_settings_current,
+        platform_settings_current = platform_settings_current,
         user_label = html_escape(user_label),
         user_title = html_escape(user_label),
         logout = logout
@@ -10907,6 +11214,212 @@ fn page_header(title: &str, subtitle: &str, now: i64) -> String {
         title = html_escape(title),
         subtitle = html_escape(subtitle),
         as_of = clock_label(now)
+    )
+}
+
+fn provider_icon(key: &str) -> &'static str {
+    match key {
+        "hetzner-cloud" => icons::CLOUD,
+        "netcup" => icons::SHOPPING_CART,
+        "aws" => icons::BOX,
+        "google-cloud" => icons::HEXAGON,
+        "oracle-cloud" => icons::DATABASE,
+        _ => icons::SERVER,
+    }
+}
+
+fn render_provider_connection_row(
+    provider: &ProviderConnectionSummary,
+    can_manage: bool,
+) -> String {
+    let action = if can_manage {
+        format!(
+            r#"<a class="provider-action" href="{href}">{label}</a>"#,
+            href = html_escape(provider.detail_href),
+            label = html_escape(provider.action_label),
+        )
+    } else {
+        r#"<span class="provider-action-muted">Ask an administrator</span>"#.to_string()
+    };
+    format!(
+        r#"<article class="provider-row" data-provider="{key}" data-provider-state="{state}"><span class="provider-mark" aria-hidden="true">{icon}</span><span class="provider-copy"><strong>{name}</strong><span>{description}</span></span><span class="provider-capability">{capability}</span><span class="provider-state" title="{note}">{state_label}</span>{action}</article>"#,
+        key = html_escape(provider.key),
+        state = match provider.state {
+            ProviderConnectionState::Ready => "ready",
+            ProviderConnectionState::NeedsAttention => "needs-attention",
+            ProviderConnectionState::NotConnected => "not-connected",
+            ProviderConnectionState::Guided => "guided",
+        },
+        icon = provider_icon(provider.key),
+        name = html_escape(provider.name),
+        description = html_escape(provider.description),
+        capability = html_escape(provider.capability.label()),
+        state_label = html_escape(provider.state_label),
+        note = html_escape(provider.note),
+        action = action,
+    )
+}
+
+fn render_provider_connections_page(
+    providers: &ProviderConnectionsPayload,
+    shell: ShellContext<'_>,
+    can_manage: bool,
+) -> String {
+    let rows = providers
+        .providers
+        .iter()
+        .map(|provider| render_provider_connection_row(provider, can_manage))
+        .collect::<String>();
+    format!(
+        r#"{HEAD}{sidebar}<main class="providers-main">{header}<section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
+        header = page_header(
+            "Provider connections",
+            "Connect a provider once, then add servers.",
+            now_unix()
+        ),
+        rows = rows,
+    )
+}
+
+fn safe_provider_return_path(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty()
+        || value.len() > 2048
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn guided_provider_import_href(provider: &str) -> String {
+    format!(
+        "/?setup=add-server&setup_path=existing&setup_stage=existing&setup_source={}",
+        provider
+    )
+}
+
+fn render_guided_provider_page(
+    provider: &ProviderConnectionSummary,
+    shell: ShellContext<'_>,
+    can_manage: bool,
+    return_path: Option<&str>,
+) -> String {
+    let (external_label, external_url) = provider_official_destination(provider.key)
+        .unwrap_or(("Open provider", "https://pharos.barta.cm/"));
+    let external_action = if can_manage {
+        format!(
+            r#"<a class="provider-primary" href="{url}" target="_blank" rel="noopener noreferrer">{label}{external}</a>"#,
+            url = html_escape(external_url),
+            label = html_escape(external_label),
+            external = icons::EXTERNAL_LINK,
+        )
+    } else {
+        r#"<span class="provider-action-muted">Ask an administrator</span>"#.to_string()
+    };
+    let import_action = if can_manage {
+        format!(
+            r#"<a class="provider-secondary" href="{href}">Continue in Pharos{arrow}</a>"#,
+            href = html_escape(&guided_provider_import_href(provider.key)),
+            arrow = icons::ARROW_RIGHT,
+        )
+    } else {
+        String::new()
+    };
+    let back_href =
+        safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
+    format!(
+        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a><header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
+        back_href = html_escape(&back_href),
+        back = icons::ARROW_LEFT,
+        icon = provider_icon(provider.key),
+        name = html_escape(provider.name),
+        description = html_escape(provider.description),
+        note = html_escape(provider.note),
+        external_action = external_action,
+        import_action = import_action,
+    )
+}
+
+fn provider_readiness_fact(
+    label: &str,
+    ready: bool,
+    ready_label: &str,
+    blocked_label: &str,
+) -> String {
+    format!(
+        r#"<div class="provider-readiness-fact" data-ready="{ready}"><i aria-hidden="true"></i><span>{label}</span><strong>{state}</strong></div>"#,
+        ready = ready,
+        label = html_escape(label),
+        state = html_escape(if ready { ready_label } else { blocked_label }),
+    )
+}
+
+fn render_hetzner_connection_page(
+    runtime: &ProviderRuntimeConfig,
+    shell: ShellContext<'_>,
+    can_manage: bool,
+    return_path: Option<&str>,
+) -> String {
+    let readiness = hetzner_runtime_readiness(&runtime.hetzner_cloud);
+    let facts = [
+        provider_readiness_fact(
+            "Secure connection",
+            readiness.credential_configured,
+            "Connected",
+            "Not connected",
+        ),
+        provider_readiness_fact(
+            "Server creation",
+            readiness.execution_enabled,
+            "Enabled",
+            "Disabled",
+        ),
+        provider_readiness_fact("Firewall", readiness.firewall_configured, "Ready", "Needed"),
+        provider_readiness_fact(
+            "SSH key",
+            readiness.default_ssh_key_configured,
+            "Ready",
+            "Needed",
+        ),
+    ]
+    .join("");
+    let back_href =
+        safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
+    let action = if !can_manage {
+        r#"<p class="provider-admin-note">Ask a Pharos administrator to connect this provider.</p>"#
+            .to_string()
+    } else if readiness.ready_with_defaults {
+        r#"<a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Add a server<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a>"#.to_string()
+    } else if let Some(url) = hetzner_janus_setup_url(runtime, &self_host()) {
+        format!(
+            r#"<a class="provider-primary" href="{url}" target="_blank" rel="noopener noreferrer">Open secure setup{external}</a><p class="provider-admin-note">Janus prepares the encrypted connection. After it is deployed, refresh this page.</p>"#,
+            url = html_escape(&url),
+            external = icons::EXTERNAL_LINK,
+        )
+    } else {
+        r#"<p class="provider-admin-note">Secure setup is not connected to Janus on this Pharos installation. Configure the Janus public URL, then refresh this page.</p>"#.to_string()
+    };
+    format!(
+        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a><header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Connect Hetzner Cloud</h1><p>One secure connection lets Pharos create reviewed servers.</p></div></header><section class="provider-connection-status" data-provider-ready="{ready}"><div class="provider-connection-copy"><strong>{status}</strong><p>{message}</p></div><div class="provider-readiness-list">{facts}</div><div class="provider-connection-action">{action}</div></section><p class="providers-footnote">Pharos never displays the provider token. Live server creation remains blocked until every check is ready.</p></main>{FOOT}"#,
+        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
+        back_href = html_escape(&back_href),
+        back = icons::ARROW_LEFT,
+        cloud = icons::CLOUD,
+        ready = readiness.ready_with_defaults,
+        status = if readiness.ready_with_defaults {
+            "Ready to create servers"
+        } else {
+            "Connection needs attention"
+        },
+        message = html_escape(readiness.message),
+        facts = facts,
+        action = action,
     )
 }
 
@@ -11011,7 +11524,7 @@ fn setup_assistant() -> String {
 
 <section class="assistant-preflight-result" data-assistant-step="bootstrap" data-preflight-result><div class="assistant-result-head"><strong data-preflight-summary>Connection checked</strong><span data-preflight-message>Choose how Pharos should be installed.</span></div><div class="assistant-bootstrap" data-preflight-bootstrap></div><details class="assistant-check-details"><summary>Technical checks {chevron}</summary><div class="assistant-checks" data-preflight-checks></div></details></section>
 
-<section class="assistant-plan" data-assistant-step="plan" data-assistant-plan><section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud · Falkenstein</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Small NixOS · CX22</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><section class="assistant-existing-review" data-existing-review><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-existing-review-host>Existing server</small></span></div><div class="assistant-review-row">{link}<span><strong>Connection</strong><small data-existing-review-connection>SSH connection</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-existing-review-method>Selected method</small></span></div></section><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span></div><details class="assistant-review-details" data-assistant-review-details><summary><span data-assistant-advanced-label>Advanced setup</span>{chevron}</summary><div class="assistant-review-technical"><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><input data-new-location autocomplete="off" value="fsn1" placeholder="fsn1"></label><label class="assistant-plan-field"><span>Server type</span><input data-new-server-type autocomplete="off" value="cx22" placeholder="cx22"></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public-key name</span><input data-new-ssh-key autocomplete="off" placeholder="existing key name"></label><div class="assistant-plan-list" data-provider-plan-resources></div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div></div></div></details><div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I understand this creates a paid cloud server.</span></label><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Create server</span>{arrow_right}</button></div></section>
+<section class="assistant-plan" data-assistant-step="plan" data-assistant-plan><section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud · Falkenstein</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Small NixOS · CX22</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><section class="assistant-existing-review" data-existing-review><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-existing-review-host>Existing server</small></span></div><div class="assistant-review-row">{link}<span><strong>Connection</strong><small data-existing-review-connection>SSH connection</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-existing-review-method>Selected method</small></span></div></section><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span><a data-provider-setup href="/settings/providers/hetzner-cloud">Set up provider</a></div><details class="assistant-review-details" data-assistant-review-details><summary><span data-assistant-advanced-label>Advanced setup</span>{chevron}</summary><div class="assistant-review-technical"><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><input data-new-location autocomplete="off" value="fsn1" placeholder="fsn1"></label><label class="assistant-plan-field"><span>Server type</span><input data-new-server-type autocomplete="off" value="cx22" placeholder="cx22"></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public-key name</span><input data-new-ssh-key autocomplete="off" placeholder="existing key name"></label><div class="assistant-plan-list" data-provider-plan-resources></div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div></div></div></details><div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I understand this creates a paid cloud server.</span></label><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Create server</span>{arrow_right}</button></div></section>
 
 <section class="assistant-job" data-assistant-step="job" data-assistant-job hidden aria-live="polite"><span class="assistant-job-spinner" aria-hidden="true"></span><div><strong data-assistant-job-title>Starting setup</strong><span data-assistant-job-message>Pharos is preparing the server.</span></div></section><section class="assistant-created" data-assistant-created data-state="active" hidden aria-live="polite"><h3 data-created-title>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready" data-created-ready><span data-created-ready-text>Ready for setup</span></div></div><div class="assistant-created-progress" data-created-progress aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions" data-created-actions><button class="assistant-finish" type="button" data-assistant-finish>Continue setup {arrow_right}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><section class="assistant-created-setup" data-created-setup hidden><h4>Finish installation</h4><ol data-created-next-steps></ol><p class="assistant-created-guidance" data-created-guidance>The server exists. Continue with the prepared bootstrap handoff, then wait for its first heartbeat.</p><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></section><details data-created-recovery><summary>Recovery options {chevron}</summary><section class="assistant-created-danger" data-created-danger><div class="assistant-created-danger-head">{warning}<div><strong>Delete this server</strong><p>Removes the paid Hetzner server. This cannot be undone.</p></div></div><label class="assistant-delete-confirm"><input type="checkbox" data-created-delete-confirm><span>I understand this permanently deletes the server.</span></label><div class="assistant-delete-actions"><button class="assistant-delete" type="button" data-created-delete disabled>{trash} Delete server</button><span data-created-delete-status role="status" aria-live="polite"></span></div></section></details></section><div class="assistant-error" data-assistant-error role="alert" hidden></div>
 
@@ -14887,6 +15400,12 @@ async fn main() {
         .route("/alerts", get(alerts_page))
         .route("/backups", get(backups_page))
         .route("/activity", get(activity_page))
+        .route("/settings/providers", get(provider_settings_page))
+        .route("/settings/providers.json", get(provider_connections_json))
+        .route(
+            "/settings/providers/{provider}",
+            get(provider_settings_detail_page),
+        )
         .route("/agora", get(agora::page))
         .route(
             "/agora/proposals/host-palette.json",
@@ -20007,7 +20526,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let blocked = hetzner_runtime_readiness(&HetznerCloudRuntimeConfig::default());
         assert!(!blocked.provider_ready);
         assert!(!blocked.ready_with_defaults);
-        assert!(blocked.message.contains("administrator setup"));
+        assert!(blocked.message.contains("not connected"));
 
         let token_path = std::env::temp_dir().join(format!(
             "pharos-runtime-readiness-token-{}-{}",
@@ -20029,6 +20548,165 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!json.contains("pharos-bootstrap-firewall"));
         assert!(!json.contains("test-provider-token"));
         let _ = std::fs::remove_file(token_path);
+    }
+
+    #[test]
+    fn provider_setup_url_accepts_only_safe_public_bases() {
+        let public = provider_setup_base_url("https://vault.barta.cm/")
+            .expect("public HTTPS Janus URL is accepted");
+        assert_eq!(public.host_str(), Some("vault.barta.cm"));
+        assert!(provider_setup_base_url("http://127.0.0.1:8081").is_some());
+        assert!(provider_setup_base_url("http://localhost:8081/").is_some());
+
+        for unsafe_url in [
+            "http://vault.barta.cm",
+            "https://user@vault.barta.cm",
+            "https://vault.barta.cm?token=value",
+            "https://vault.barta.cm/#secret",
+        ] {
+            assert!(
+                provider_setup_base_url(unsafe_url).is_none(),
+                "unsafe Janus base URL must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_catalog_is_small_honest_and_secret_free() {
+        let catalog = provider_connections(&ProviderRuntimeConfig::default());
+        assert_eq!(catalog.schema, PROVIDER_CONNECTIONS_SCHEMA);
+        assert_eq!(catalog.providers.len(), 5);
+        assert_eq!(
+            catalog
+                .providers
+                .iter()
+                .map(|provider| provider.key)
+                .collect::<Vec<_>>(),
+            vec![
+                "hetzner-cloud",
+                "netcup",
+                "aws",
+                "google-cloud",
+                "oracle-cloud"
+            ]
+        );
+
+        let hetzner = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.key == "hetzner-cloud")
+            .expect("Hetzner connection");
+        assert_eq!(hetzner.capability, ProviderConnectionCapability::Managed);
+        assert_eq!(hetzner.state, ProviderConnectionState::NotConnected);
+        assert!(!hetzner.available_in_add_server);
+        assert!(catalog
+            .providers
+            .iter()
+            .filter(|provider| provider.key != "hetzner-cloud")
+            .all(
+                |provider| provider.capability == ProviderConnectionCapability::Guided
+                    && provider.state == ProviderConnectionState::Guided
+                    && !provider.available_in_add_server
+            ));
+
+        let json = serde_json::to_string(&catalog).expect("catalog serializes");
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+    }
+
+    #[test]
+    fn provider_catalog_unlocks_hetzner_only_after_every_gate() {
+        let token_path = std::env::temp_dir().join(format!(
+            "pharos-provider-catalog-token-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::write(&token_path, "test-provider-token").expect("write provider token fixture");
+        let runtime = ProviderRuntimeConfig {
+            hetzner_cloud: HetznerCloudRuntimeConfig {
+                credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
+                execute_enabled: true,
+                default_ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
+                firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
+                ..HetznerCloudRuntimeConfig::default()
+            },
+            ..ProviderRuntimeConfig::default()
+        };
+        let provider = provider_connection(&runtime, "hetzner-cloud").expect("Hetzner provider");
+        assert_eq!(provider.state, ProviderConnectionState::Ready);
+        assert_eq!(provider.state_label, "Ready");
+        assert!(provider.available_in_add_server);
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[test]
+    fn provider_connections_page_keeps_the_first_screen_reduced() {
+        let catalog = provider_connections(&ProviderRuntimeConfig::default());
+        let managed = render_provider_connections_page(
+            &catalog,
+            ShellContext {
+                user_label: "markus",
+                logout_enabled: true,
+            },
+            true,
+        );
+        assert!(managed.contains("Provider connections"));
+        assert!(managed.contains("Connect a provider once, then add servers."));
+        assert_eq!(managed.matches(r#"data-provider=""#).count(), 5);
+        assert!(managed.contains(r#"href="/settings/providers/hetzner-cloud""#));
+        assert!(
+            managed.contains("Managed creation unlocks only after every readiness check passes.")
+        );
+        assert!(!managed.contains("API token later"));
+        assert!(!managed.contains("Credentials needed"));
+
+        let read_only = render_provider_connections_page(
+            &catalog,
+            ShellContext {
+                user_label: "viewer",
+                logout_enabled: true,
+            },
+            false,
+        );
+        assert_eq!(read_only.matches("Ask an administrator").count(), 5);
+        assert!(!read_only.contains(r#"class="provider-action""#));
+    }
+
+    #[test]
+    fn hetzner_secure_setup_link_contains_names_not_secret_values() {
+        let runtime = ProviderRuntimeConfig {
+            janus_public_url: provider_setup_base_url("https://vault.barta.cm"),
+            ..ProviderRuntimeConfig::default()
+        };
+        let setup = hetzner_janus_setup_url(&runtime, "csb1").expect("Janus setup link");
+        let url = Url::parse(&setup).expect("setup link parses");
+        let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(url.path(), "/vault/new");
+        assert_eq!(query.get("host").map(|value| value.as_ref()), Some("csb1"));
+        assert_eq!(
+            query.get("env").map(|value| value.as_ref()),
+            Some("PHAROS_HCLOUD_API_TOKEN")
+        );
+        assert!(!query.contains_key("value"));
+        assert!(!setup.to_ascii_lowercase().contains("bearer "));
+        assert!(hetzner_janus_setup_url(&runtime, "../../other-host").is_none());
+    }
+
+    #[test]
+    fn provider_return_path_stays_on_the_current_origin() {
+        assert_eq!(
+            safe_provider_return_path(Some("/?setup=add-server&setup_path=new")),
+            Some("/?setup=add-server&setup_path=new".to_string())
+        );
+        for unsafe_path in [
+            "",
+            "https://example.com",
+            "//example.com",
+            "/\\example.com",
+            "/\nnext",
+        ] {
+            assert!(safe_provider_return_path(Some(unsafe_path)).is_none());
+        }
     }
 
     #[test]

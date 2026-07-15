@@ -205,11 +205,19 @@ key and a reviewed firewall in the Hetzner project, mount the API token as a
 private runtime file, then set:
 
 ```bash
+export PHAROS_JANUS_PUBLIC_URL=https://vault.barta.cm
 export PHAROS_HCLOUD_EXECUTE=1
 export PHAROS_HCLOUD_API_TOKEN_FILE=/run/pharos/hcloud-token
 export PHAROS_HCLOUD_SSH_KEY_REF=pharos-bootstrap-key
 export PHAROS_HCLOUD_FIREWALL_REF=pharos-bootstrap-firewall
 ```
+
+`PHAROS_JANUS_PUBLIC_URL` is non-secret. When present, **Settings → Provider
+connections → Hetzner Cloud** opens Janus's value-free secure-setup flow. The
+Pharos UI passes only service, host, environment-variable name, classification,
+rotation, and tags; it never receives or displays the token value. Omit this URL
+when the installation has no Janus endpoint and complete the private runtime
+mount out of band instead.
 
 Pharos resolves both named resources before the create call and attaches their
 numeric provider IDs to the server request. If the token, public key, or
