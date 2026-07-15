@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.41 - 2026-07-15
+
+- Animate the sidebar lighthouse with a compact, silent native video while preserving the existing still image as the loading and playback fallback.
+- Add one browser-local Still sidebar image switch under Settings; motion remains the default and the preference survives navigation and refreshes.
+- Avoid hidden work by skipping motion on compact layouts, reduced-motion or data-saving connections, pausing it in background tabs, and serving a 329 KB versioned asset with no audio stream.
+
 ## 0.1.40 - 2026-07-15
 
 - Add a reduced Hetzner Cloud connection screen with only API connection, SSH key, and firewall checks; region and provider choices stay behind Connection details until they need attention.
