@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.40 - 2026-07-15
+
+- Add a reduced Hetzner Cloud connection screen with only API connection, SSH key, and firewall checks; region and provider choices stay behind Connection details until they need attention.
+- Test the provider through read-only official API calls, keep the token in the Janus and agenix file boundary, persist only safe evidence, and block creation when connection or catalog evidence is stale.
+- Load current locations, available server plans, and project prices into Add server instead of relying on a fixed plan, then validate the exact choice again before the separate paid-creation confirmation.
+
 ## 0.1.39 - 2026-07-15
 
 - Add one reduced Provider connections screen under Settings, with a compact managed-or-guided status and one clear next action for Hetzner Cloud, netcup, AWS, Google Cloud, and Oracle Cloud.
