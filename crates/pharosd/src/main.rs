@@ -3649,6 +3649,8 @@ fn unquote_env_value(value: &str) -> &str {
 
 const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
 const SIDEBAR_LIGHTHOUSE_PNG: &[u8] = include_bytes!("../assets/sidebar-lighthouse.png");
+const SIDEBAR_LIGHTHOUSE_MOTION_MP4: &[u8] =
+    include_bytes!("../assets/sidebar-lighthouse-motion-v1.mp4");
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="5" fill="#f7fbfc"/><path d="M10.5 5 12 2.5 13.5 5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="10" y="5" width="4" height="3" rx=".5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 8 8.6 20M14 8l1.4 12M9.2 13.5h5.6M7 20h10M6 22h12M16.6 6.4l2.4-1M7.4 6.4l-2.4-1" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 const APP_VERSION: &str = env!("PHAROS_APP_VERSION");
 const GIT_COMMIT: &str = env!("PHAROS_GIT_COMMIT");
@@ -3661,7 +3663,9 @@ body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,s
 body:before{content:"";position:fixed;inset:0;z-index:-3;background:radial-gradient(circle at 86% 5%,rgba(214,155,49,.16),transparent 12rem),radial-gradient(circle at 18% 28%,rgba(21,158,153,.08),transparent 18rem),linear-gradient(180deg,rgba(255,255,255,.94),rgba(239,249,250,.82));pointer-events:none}
 .app-shell{min-height:100vh;display:grid;grid-template-columns:var(--side) minmax(0,1fr)}
 .sidebar{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:24px;padding:30px 18px 18px;border-right:1px solid rgba(211,225,233,.78);background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(247,252,253,.82));box-shadow:12px 0 38px rgba(45,75,95,.05);overflow:hidden}
-.sidebar:before{content:"";position:absolute;left:-18%;right:-20%;bottom:-10%;height:66%;background:url('/assets/sidebar-lighthouse.png') left bottom/118% auto no-repeat;opacity:.78;pointer-events:none;-webkit-mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%);mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%)}
+.sidebar:before,.sidebar-motion{position:absolute;left:-18%;right:-20%;bottom:-10%;height:66%;pointer-events:none;-webkit-mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%);mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%);transition:opacity .55s ease}
+.sidebar:before{content:"";background:url('/assets/sidebar-lighthouse.png') left bottom/118% auto no-repeat;opacity:.78}
+.sidebar-motion{overflow:hidden;opacity:0}.sidebar-motion video{position:absolute;left:0;bottom:0;width:118%;height:auto;display:block}.sidebar[data-motion-ready="true"][data-sidebar-still="false"]:before{opacity:0}.sidebar[data-motion-ready="true"][data-sidebar-still="false"] .sidebar-motion{opacity:.78}
 .side-brand,.side-nav,.side-foot{position:relative;z-index:1}.side-brand{display:flex;align-items:center;gap:13px;padding:0 12px}.side-mark{display:grid;place-items:center;width:36px;height:50px;color:var(--sun)}.side-mark .ico{width:31px;height:31px}.side-logo{font-family:Georgia,"Times New Roman",serif;font-size:22px;letter-spacing:.18em;color:#14304b;text-transform:uppercase}
 .side-nav{display:grid;gap:7px}.side-link{display:grid;grid-template-columns:23px minmax(0,1fr) auto;align-items:center;gap:11px;min-height:46px;padding:0 13px;border-radius:7px;color:#294761;text-decoration:none;font-weight:520}.side-link[aria-current="page"]{background:rgba(223,241,249,.76);color:#0f4f80}.side-link .ico{width:18px;height:18px}.side-badge{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:#ffe7bb;color:#9a5b00;font-size:12px;font-weight:700}
 .side-bottom{position:relative;z-index:1;margin-top:auto;display:grid;gap:8px}.side-version{appearance:none;display:flex;align-items:center;justify-content:center;gap:7px;min-height:32px;width:100%;border:1px solid rgba(211,225,233,.70);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.68),rgba(247,252,253,.54));box-shadow:0 8px 20px rgba(45,75,95,.08);-webkit-backdrop-filter:blur(10px) saturate(1.05);backdrop-filter:blur(10px) saturate(1.05);color:#4c6780;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.side-version:hover,.side-version:focus-visible{color:#0f4f80;background:rgba(223,241,249,.72);outline:0}.side-version .ico{width:14px;height:14px}.side-foot{display:flex;align-items:center;justify-content:space-between;gap:9px;min-height:48px;padding:7px 8px 7px 11px;border:1px solid rgba(211,225,233,.70);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.78),rgba(247,252,253,.62));box-shadow:0 10px 26px rgba(45,75,95,.12);-webkit-backdrop-filter:blur(10px) saturate(1.08);backdrop-filter:blur(10px) saturate(1.08);color:#294761;font-size:13px}.side-user{min-width:0;display:flex;align-items:center;gap:9px;font-weight:650;text-shadow:0 1px 0 rgba(255,255,255,.76)}.side-user:before{content:"";flex:0 0 auto;width:24px;height:24px;border-radius:50%;border:1px solid rgba(214,155,49,.38);background:radial-gradient(circle,#fff 0 33%,rgba(214,155,49,.18) 36%,transparent 68%)}.side-user span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.side-logout{display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border-radius:50%;color:#4c6780;text-decoration:none}.side-logout:hover{background:rgba(223,241,249,.78);color:#0f4f80}.side-logout .ico{width:16px;height:16px}
@@ -4051,7 +4055,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .map-panel[data-label-density="compact"] .map-status-dot{grid-row:auto;margin-top:0;width:8px;height:8px}
 .map-panel[data-label-density="compact"] .map-name{font-size:12px}
 .map-panel[data-label-density="compact"] .map-signals,.map-panel[data-label-density="compact"] .map-source{display:none}
-@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-bottom{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:1050px}}
+@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before,.sidebar-motion{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-bottom{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:1050px}}
 @media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
 @media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-primary{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
@@ -4068,6 +4072,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 @media (max-width:640px){.host-workflow-meta{align-items:flex-start;flex-direction:column;gap:3px}.host-workflow-step-state{justify-items:start}}
 .assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr) auto}.assistant-provider-readiness a{color:#0f4f80;font-weight:760;text-decoration:none;white-space:nowrap}.assistant-provider-readiness a:hover,.assistant-provider-readiness a:focus-visible{text-decoration:underline;text-underline-offset:2px;outline:0}
 .providers-main{width:min(1120px,100%)}
+.settings-section-title{margin:0 0 9px;font-family:Georgia,"Times New Roman",serif;font-size:20px;font-weight:500;color:#12304b}.appearance-settings{margin:0 0 26px}.appearance-row{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:72px;padding:12px 2px;border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.appearance-copy strong{display:block;color:var(--ink);font-size:14px}.appearance-copy span{display:block;margin-top:3px;color:var(--muted);font-size:12px}.appearance-toggle{position:relative;display:inline-flex;align-items:center;flex:0 0 auto;width:42px;height:24px;cursor:pointer}.appearance-toggle input{position:absolute;width:1px;height:1px;opacity:0}.appearance-switch{position:absolute;inset:0;border:1px solid rgba(137,151,163,.42);border-radius:999px;background:rgba(226,234,238,.86);transition:background .18s ease,border-color .18s ease,box-shadow .18s ease}.appearance-switch:after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 2px 5px rgba(45,75,95,.22);transition:transform .18s ease}.appearance-toggle input:checked+.appearance-switch{border-color:rgba(21,158,153,.56);background:rgba(21,158,153,.72)}.appearance-toggle input:checked+.appearance-switch:after{transform:translateX(18px)}.appearance-toggle input:focus-visible+.appearance-switch{box-shadow:0 0 0 3px rgba(31,127,181,.15)}
 .provider-list{overflow:hidden;border:1px solid rgba(210,226,234,.90);border-radius:8px;background:rgba(255,255,255,.78);box-shadow:0 16px 38px rgba(54,88,108,.06)}
 .provider-row{--provider-color:var(--wait);display:grid;grid-template-columns:52px minmax(250px,1.7fr) minmax(84px,.55fr) minmax(136px,.75fr) minmax(92px,.48fr);align-items:center;gap:14px;min-height:92px;padding:15px 22px;border-bottom:1px solid rgba(210,226,234,.82)}.provider-row:last-child{border-bottom:0}.provider-row[data-provider-state="ready"]{--provider-color:var(--live)}.provider-row[data-provider-state="needs-attention"]{--provider-color:var(--stale)}.provider-row[data-provider-state="not-connected"]{--provider-color:var(--wait)}.provider-row[data-provider-state="guided"]{--provider-color:var(--accent)}
 .provider-mark{display:grid;place-items:center;width:42px;height:42px;color:#48627a}.provider-mark .ico{width:28px;height:28px;stroke-width:1.7}
@@ -4081,7 +4086,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .provider-menu{position:relative}.provider-menu>summary{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(173,205,220,.68);border-radius:50%;background:rgba(255,255,255,.82);color:#47657e;cursor:pointer;list-style:none}.provider-menu>summary::-webkit-details-marker{display:none}.provider-menu>summary .ico{width:17px;height:17px}.provider-menu>div{position:absolute;z-index:6;right:0;top:46px;min-width:150px;padding:5px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:#fff;box-shadow:0 14px 34px rgba(45,75,95,.16)}.provider-menu button{width:100%;min-height:36px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:#9a332f;font:inherit;font-size:12px;text-align:left;cursor:pointer}.provider-menu button:hover,.provider-menu button:focus-visible{background:rgba(255,232,229,.72);outline:0}
 .provider-details{border-bottom:1px solid rgba(210,226,234,.76)}.provider-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:58px;padding:0 22px;color:#315d7c;font-size:13px;font-weight:760;cursor:pointer;list-style:none}.provider-details>summary::-webkit-details-marker{display:none}.provider-details>summary .ico{width:17px;height:17px;transition:transform .18s ease}.provider-details[open]>summary .ico{transform:rotate(180deg)}.provider-details form{padding:2px 22px 20px}.provider-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider-fields label{display:grid;gap:6px;color:#526d82;font-size:11px;font-weight:720}.provider-fields select{width:100%;height:40px;padding:0 32px 0 10px;border:1px solid rgba(173,205,220,.72);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px}.provider-details-action{display:flex;align-items:center;gap:12px;margin-top:14px}.provider-details-action span,.provider-action-feedback{color:var(--muted);font-size:11px}.provider-details>p{margin:0;padding:0 22px 18px;color:var(--muted);font-size:11px;line-height:1.45}.provider-action-feedback{min-height:0;margin:0;padding:0 22px}.provider-action-feedback:not(:empty){min-height:40px;padding-top:12px;padding-bottom:12px;color:#8d3430}.provider-details+.provider-action-feedback:not(:empty){border-top:0}
 @media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
-@media (prefers-reduced-motion:reduce){.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation:none}}
+@media (prefers-reduced-motion:reduce){.sidebar-motion{display:none}.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
 const FOOT: &str = r#"</div><script>
@@ -6885,6 +6890,127 @@ const RELEASE_HISTORY_PORTAL: &str = r#"<script>
   document.addEventListener('keydown',event=>{
     if(event.key==='Escape'&&!modal.hidden){event.preventDefault();hide()}
   });
+  script?.remove();
+})();
+</script>"#;
+
+const SIDEBAR_MOTION_RUNTIME: &str = r#"<script>
+(()=>{
+  const script=document.currentScript;
+  const sidebar=document.querySelector('[data-sidebar]');
+  const video=sidebar?.querySelector('[data-sidebar-motion]');
+  if(!sidebar||!video){script?.remove();return}
+  const storageKey='pharos.sidebar.still.v1';
+  const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
+  const desktop=window.matchMedia('(min-width: 901px)');
+  const connection=navigator.connection;
+  let toggle=null;
+  let note=null;
+  let playbackFailed=false;
+  let preferStill=false;
+  try{preferStill=localStorage.getItem(storageKey)==='true'}catch(_error){}
+  video.muted=true;
+
+  function savePreference(){
+    try{localStorage.setItem(storageKey,preferStill?'true':'false')}catch(_error){}
+  }
+  function dataSaverEnabled(){return connection?.saveData===true}
+  function systemRequiresStill(){
+    return preferStill||reducedMotion.matches||!desktop.matches||dataSaverEnabled();
+  }
+  function syncToggle(){
+    if(toggle)toggle.checked=preferStill;
+    if(!note)return
+    if(preferStill)note.textContent='Gentle motion is off.';
+    else if(reducedMotion.matches)note.textContent='Motion is off for reduced-motion.';
+    else if(dataSaverEnabled())note.textContent='Motion is off for data saving.';
+    else if(!desktop.matches)note.textContent='Motion is shown on wider screens.';
+    else if(playbackFailed)note.textContent='Motion could not play; using the still image.';
+    else note.textContent='Gentle motion is on.';
+  }
+  function unloadMotion(){
+    video.pause();
+    if(video.hasAttribute('src')){
+      video.removeAttribute('src');
+      video.load();
+    }
+  }
+  function showStill(){
+    sidebar.dataset.sidebarStill='true';
+    delete sidebar.dataset.motionReady;
+    unloadMotion();
+  }
+  function motionFailed(){
+    playbackFailed=true;
+    sidebar.dataset.motionFallback='true';
+    syncToggle();
+    showStill();
+  }
+  function playRejected(error){
+    if(error?.name==='AbortError')return
+    motionFailed();
+  }
+  function requestMotion(){
+    if(!video.canPlayType('video/mp4')){motionFailed();return}
+    if(document.hidden)return
+    sidebar.dataset.sidebarStill='false';
+    delete sidebar.dataset.motionFallback;
+    if(!video.hasAttribute('src')){
+      video.setAttribute('src',video.dataset.src);
+      video.load();
+    }
+    const playing=video.play();
+    if(playing&&typeof playing.catch==='function')playing.catch(playRejected);
+  }
+  function applyPreference(){
+    syncToggle();
+    if(systemRequiresStill()||playbackFailed)showStill();else requestMotion();
+  }
+  function bindToggle(){
+    toggle=document.querySelector('[data-sidebar-still-toggle]');
+    note=document.querySelector('[data-sidebar-still-note]');
+    if(!toggle)return
+    syncToggle();
+    toggle.addEventListener('change',()=>{
+      preferStill=toggle.checked;
+      playbackFailed=false;
+      savePreference();
+      applyPreference();
+    });
+  }
+  function watchMedia(query){
+    if(typeof query.addEventListener==='function')query.addEventListener('change',applyPreference);
+    else if(typeof query.addListener==='function')query.addListener(applyPreference);
+  }
+
+  video.addEventListener('canplay',()=>{
+    if(!systemRequiresStill()&&!playbackFailed)sidebar.dataset.motionReady='true';
+  });
+  video.addEventListener('playing',()=>{
+    if(!systemRequiresStill()&&!playbackFailed)sidebar.dataset.motionReady='true';
+  });
+  video.addEventListener('error',motionFailed);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden)video.pause();else applyPreference();
+  });
+  window.addEventListener('pagehide',()=>video.pause());
+  window.addEventListener('storage',event=>{
+    if(event.key!==storageKey)return
+    preferStill=event.newValue==='true';
+    playbackFailed=false;
+    applyPreference();
+  });
+  watchMedia(reducedMotion);
+  watchMedia(desktop);
+  if(connection&&typeof connection.addEventListener==='function'){
+    connection.addEventListener('change',applyPreference);
+  }
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',bindToggle,{once:true});
+  }else{
+    bindToggle();
+  }
+  applyPreference();
   script?.remove();
 })();
 </script>"#;
@@ -10434,6 +10560,16 @@ async fn sidebar_lighthouse_asset() -> impl axum::response::IntoResponse {
     )
 }
 
+async fn sidebar_lighthouse_motion_asset() -> impl axum::response::IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "video/mp4"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        SIDEBAR_LIGHTHOUSE_MOTION_MP4,
+    )
+}
+
 async fn favicon_svg() -> impl axum::response::IntoResponse {
     (
         [
@@ -11753,7 +11889,7 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation"><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{host_settings_current}>{host_settings}<span>Host settings</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}"##,
+        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="/assets/sidebar-lighthouse-motion-v1.mp4" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{host_settings_current}>{host_settings}<span>Host settings</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{sidebar_motion}"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
@@ -11766,6 +11902,7 @@ fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
         version = html_escape(&release_label()),
         release_dialog = release_dialog(),
         release_portal = RELEASE_HISTORY_PORTAL,
+        sidebar_motion = SIDEBAR_MOTION_RUNTIME,
         fleet_current = fleet_current,
         map_current = map_current,
         alerts_current = alerts_current,
@@ -11842,12 +11979,12 @@ fn render_provider_connections_page(
         .map(|provider| render_provider_connection_row(provider, can_manage))
         .collect::<String>();
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main">{header}<section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main">{header}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         header = page_header(
-            "Provider connections",
-            "Connect a provider once, then add servers.",
-            now_unix()
+            "Settings",
+            "Appearance and provider connections.",
+            now_unix(),
         ),
         rows = rows,
     )
@@ -16229,6 +16366,10 @@ async fn main() {
             "/assets/sidebar-lighthouse.png",
             get(sidebar_lighthouse_asset),
         )
+        .route(
+            "/assets/sidebar-lighthouse-motion-v1.mp4",
+            get(sidebar_lighthouse_motion_asset),
+        )
         .route("/register", post(register))
         .route("/report", post(report))
         .route("/agent/actions/claim", post(claim_host_action))
@@ -16381,6 +16522,23 @@ mod tests {
     fn sidebar_exposes_root_portaled_release_history_dialog() {
         let html = sidebar("markus", true, "fleet");
 
+        assert!(html.contains(r#"data-sidebar-still="true""#));
+        assert!(html.contains(r#"data-sidebar-motion"#));
+        assert!(html.contains(r#"data-src="/assets/sidebar-lighthouse-motion-v1.mp4""#));
+        assert!(html.contains(r#"muted loop playsinline preload="none""#));
+        assert!(html.contains("pharos.sidebar.still.v1"));
+        assert!(html.contains("prefers-reduced-motion: reduce"));
+        assert!(html.contains("connection?.saveData===true"));
+        assert!(html.contains("visibilitychange"));
+        assert!(html.contains("video.removeAttribute('src')"));
+        assert!(html.contains("error?.name==='AbortError'"));
+        let hidden_guard = html
+            .find("if(document.hidden)return")
+            .expect("hidden guard exists");
+        let attach_source = html
+            .find("video.setAttribute('src',video.dataset.src)")
+            .expect("dynamic source attachment exists");
+        assert!(hidden_guard < attach_source);
         assert!(html.contains(r#"class="side-version""#));
         assert!(html.contains(&release_label()));
         assert!(html.contains("Release history"));
@@ -16652,6 +16810,25 @@ mod tests {
         assert!(svg.contains(r#"<svg xmlns="http://www.w3.org/2000/svg""#));
         assert!(svg.contains(r##"stroke="#d69b31""##));
         assert!(svg.contains(r#"M10.5 5 12 2.5 13.5 5"#));
+    }
+
+    #[tokio::test]
+    async fn sidebar_motion_serves_a_small_versioned_mp4() {
+        let response = sidebar_lighthouse_motion_asset().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sidebar motion body");
+        assert!(!body.is_empty());
+        assert!(body.len() < 500_000);
     }
 
     #[tokio::test]
@@ -21491,8 +21668,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             },
             true,
         );
-        assert!(managed.contains("Provider connections"));
-        assert!(managed.contains("Connect a provider once, then add servers."));
+        assert!(managed.contains("Settings"));
+        assert!(managed.contains("Appearance and provider connections."));
+        assert!(managed.contains("Still sidebar image"));
+        assert!(managed.contains("Gentle motion is on."));
+        assert!(managed.contains(r#"data-sidebar-still-toggle"#));
+        assert!(managed.contains(r#"aria-describedby="sidebar-still-note""#));
+        assert!(!managed.contains(r#"data-sidebar-still-toggle checked"#));
         assert_eq!(managed.matches(r#"data-provider=""#).count(), 5);
         assert!(managed.contains(r#"href="/settings/providers/hetzner-cloud""#));
         assert!(
