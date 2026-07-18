@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,8 +47,9 @@ use pharos_core::{
     LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
     ManifestStatusSource, NixFreshness, PreflightCheckState, PrivilegedActionMode,
     ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
-    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningProgressEntry,
-    ProvisioningProviderResource, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
+    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningPaidAuthorization,
+    ProvisioningPaidExecution, ProvisioningProgressEntry, ProvisioningProviderResource,
+    ProvisioningReviewedPaidPlan, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
     SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
     EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
     HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
@@ -71,9 +72,9 @@ use crate::host_actions::{
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::nixcfg_dispatch::NixcfgDispatch;
 use crate::provider_connections::{
-    evidence_is_fresh, safe_hcloud_api_base, test_hetzner_connection, HetznerConnectionAttempt,
-    HetznerConnectionCode, HetznerConnectionPreferences, HetznerConnectionTestResult,
-    HetznerTestConfig, ProviderConnectionStore,
+    compare_gross_prices, evidence_is_fresh, safe_hcloud_api_base, test_hetzner_connection,
+    HetznerConnectionAttempt, HetznerConnectionCode, HetznerConnectionPreferences,
+    HetznerConnectionTestResult, HetznerTestConfig, ProviderConnectionStore,
 };
 #[cfg(test)]
 use crate::provider_connections::{
@@ -96,6 +97,7 @@ struct AppState {
     beacon_auth: BeaconAuth,
     provider_runtime: ProviderRuntimeConfig,
     provider_connections: Arc<ProviderConnectionStore>,
+    paid_create_lock: Arc<tokio::sync::Mutex<()>>,
     nixcfg_dispatch: NixcfgDispatch,
     retirement_owner: RetirementOwnerAuth,
     host_actions: Arc<HostActionStore>,
@@ -120,31 +122,298 @@ impl FromRef<AppState> for Arc<ManifestRegistry> {
     }
 }
 
+const PROVISIONING_JOB_SNAPSHOT_SCHEMA: &str = "inspr.pharos.provisioning-jobs-snapshot.v1";
+const PROVISIONING_JOB_SNAPSHOT_VERSION: u16 = 1;
+const PROVISIONING_JOB_STORE_MARKER_SCHEMA: &str = "inspr.pharos.provisioning-jobs-store.v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisioningJobSnapshot {
+    schema: String,
+    version: u16,
+    store_id: String,
+    jobs: Vec<ProvisioningJob>,
+    content_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisioningJobStoreMarker {
+    schema: String,
+    version: u16,
+    store_id: String,
+}
+
+fn provisioning_job_store_marker_path(path: &Path) -> PathBuf {
+    let mut marker = path.as_os_str().to_os_string();
+    marker.push(".initialized");
+    PathBuf::from(marker)
+}
+
+fn provisioning_snapshot_digest(
+    store_id: &str,
+    jobs: &[ProvisioningJob],
+) -> Result<String, String> {
+    let encoded = serde_json::to_vec(jobs)
+        .map_err(|_| "provisioning jobs could not be encoded".to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"pharos.provisioning-jobs-snapshot.v1\0");
+    digest.update(store_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(encoded);
+    Ok(hex(&digest.finalize()))
+}
+
+fn validate_provisioning_jobs(
+    snapshot: Vec<ProvisioningJob>,
+) -> Result<BTreeMap<String, ProvisioningJob>, String> {
+    let mut jobs = BTreeMap::new();
+    let valid = snapshot.into_iter().all(|job| {
+        let valid = job.validate_contract().is_ok()
+            && paid_job_integrity_valid(&job)
+            && !jobs.contains_key(&job.id);
+        if valid {
+            jobs.insert(job.id.clone(), job);
+        }
+        valid
+    });
+    if valid {
+        Ok(jobs)
+    } else {
+        Err("provisioning job snapshot failed validation".to_string())
+    }
+}
+
+fn new_provisioning_store_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|_| "provisioning store identity could not be generated".to_string())?;
+    Ok(hex(&bytes))
+}
+
+fn atomic_write_provisioning_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|_| "provisioning job directory is unavailable".to_string())?;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temporary = path.with_extension(format!("pharos-tmp-{}-{nonce}", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|_| "provisioning jobs could not be durably stored".to_string())
+}
+
+fn write_provisioning_snapshot(
+    path: &Path,
+    store_id: &str,
+    jobs: &BTreeMap<String, ProvisioningJob>,
+) -> Result<(), String> {
+    let jobs = jobs.values().cloned().collect::<Vec<_>>();
+    let snapshot = ProvisioningJobSnapshot {
+        schema: PROVISIONING_JOB_SNAPSHOT_SCHEMA.to_string(),
+        version: PROVISIONING_JOB_SNAPSHOT_VERSION,
+        store_id: store_id.to_string(),
+        content_sha256: provisioning_snapshot_digest(store_id, &jobs)?,
+        jobs,
+    };
+    let encoded = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|_| "provisioning jobs could not be encoded".to_string())?;
+    atomic_write_provisioning_file(path, &encoded)
+}
+
+fn ensure_provisioning_store_marker(path: &Path, store_id: &str) -> Result<(), String> {
+    let marker_path = provisioning_job_store_marker_path(path);
+    match std::fs::read(&marker_path) {
+        Ok(bytes) => {
+            let marker = serde_json::from_slice::<ProvisioningJobStoreMarker>(&bytes)
+                .map_err(|_| "provisioning store marker is malformed".to_string())?;
+            if marker.schema != PROVISIONING_JOB_STORE_MARKER_SCHEMA
+                || marker.version != PROVISIONING_JOB_SNAPSHOT_VERSION
+                || marker.store_id != store_id
+                || !is_sha256_hex(&marker.store_id)
+                || marker
+                    .store_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase())
+            {
+                return Err("provisioning store marker failed validation".to_string());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let marker = ProvisioningJobStoreMarker {
+                schema: PROVISIONING_JOB_STORE_MARKER_SCHEMA.to_string(),
+                version: PROVISIONING_JOB_SNAPSHOT_VERSION,
+                store_id: store_id.to_string(),
+            };
+            let encoded = serde_json::to_vec_pretty(&marker)
+                .map_err(|_| "provisioning store marker could not be encoded".to_string())?;
+            atomic_write_provisioning_file(&marker_path, &encoded)
+        }
+        Err(_) => Err("provisioning store marker is unreadable".to_string()),
+    }
+}
+
+fn decode_provisioning_snapshot(
+    bytes: &[u8],
+    expected_store_id: Option<&str>,
+) -> Result<(BTreeMap<String, ProvisioningJob>, String), String> {
+    let snapshot = serde_json::from_slice::<ProvisioningJobSnapshot>(bytes)
+        .map_err(|_| "provisioning job snapshot is malformed".to_string())?;
+    if snapshot.schema != PROVISIONING_JOB_SNAPSHOT_SCHEMA
+        || snapshot.version != PROVISIONING_JOB_SNAPSHOT_VERSION
+        || !is_sha256_hex(&snapshot.store_id)
+        || snapshot
+            .store_id
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase())
+        || !is_sha256_hex(&snapshot.content_sha256)
+        || snapshot
+            .content_sha256
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase())
+        || expected_store_id.is_some_and(|expected| expected != snapshot.store_id)
+        || provisioning_snapshot_digest(&snapshot.store_id, &snapshot.jobs)?
+            != snapshot.content_sha256
+    {
+        return Err("provisioning job snapshot failed integrity validation".to_string());
+    }
+    let store_id = snapshot.store_id;
+    let jobs = validate_provisioning_jobs(snapshot.jobs)?;
+    Ok((jobs, store_id))
+}
+
 struct ProvisioningJobStore {
     path: Option<PathBuf>,
+    store_id: Option<String>,
+    durable_ready: AtomicBool,
     jobs: RwLock<BTreeMap<String, ProvisioningJob>>,
+    persistence_lock: Mutex<()>,
     cleanup_claims: Mutex<BTreeSet<String>>,
     counter: AtomicU64,
 }
 
 impl ProvisioningJobStore {
     fn new(path: Option<PathBuf>) -> Self {
-        let jobs = path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|bytes| serde_json::from_slice::<Vec<ProvisioningJob>>(&bytes).ok())
-            .map(|jobs| {
-                jobs.into_iter()
-                    .filter(|job| job.validate_contract().is_ok())
-                    .map(|job| (job.id.clone(), job))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let (jobs, store_id, durable_ready) = match path.as_ref() {
+            None => (BTreeMap::new(), None, false),
+            Some(path) => {
+                let marker_path = provisioning_job_store_marker_path(path);
+                let loaded = (|| -> Result<(BTreeMap<String, ProvisioningJob>, String), String> {
+                    let marker = match std::fs::read(&marker_path) {
+                        Ok(bytes) => {
+                            let marker =
+                                serde_json::from_slice::<ProvisioningJobStoreMarker>(&bytes)
+                                    .map_err(|_| {
+                                        "provisioning store marker is malformed".to_string()
+                                    })?;
+                            if marker.schema != PROVISIONING_JOB_STORE_MARKER_SCHEMA
+                                || marker.version != PROVISIONING_JOB_SNAPSHOT_VERSION
+                                || !is_sha256_hex(&marker.store_id)
+                                || marker
+                                    .store_id
+                                    .bytes()
+                                    .any(|byte| byte.is_ascii_uppercase())
+                            {
+                                return Err(
+                                    "provisioning store marker failed validation".to_string()
+                                );
+                            }
+                            Some(marker)
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(_) => return Err("provisioning store marker is unreadable".to_string()),
+                    };
+                    let marker_expected = marker.as_ref().map(|marker| marker.store_id.as_str());
+                    match std::fs::read(path) {
+                        Ok(bytes) => {
+                            decode_provisioning_snapshot(&bytes, marker_expected).or_else(|_| {
+                                if marker.is_some() {
+                                    return Err(
+                                        "initialized snapshot is not a valid envelope".to_string()
+                                    );
+                                }
+                                let legacy = serde_json::from_slice::<Vec<ProvisioningJob>>(&bytes)
+                                    .map_err(|_| {
+                                        "legacy provisioning snapshot is malformed".to_string()
+                                    })?;
+                                let jobs = validate_provisioning_jobs(legacy)?;
+                                let store_id = new_provisioning_store_id()?;
+                                write_provisioning_snapshot(path, &store_id, &jobs)?;
+                                Ok((jobs, store_id))
+                            })
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if marker.is_some() {
+                                Err("initialized provisioning snapshot is missing".to_string())
+                            } else {
+                                let jobs = BTreeMap::new();
+                                let store_id = new_provisioning_store_id()?;
+                                write_provisioning_snapshot(path, &store_id, &jobs)?;
+                                Ok((jobs, store_id))
+                            }
+                        }
+                        Err(_) => Err("provisioning job snapshot is unreadable".to_string()),
+                    }
+                })();
+                match loaded {
+                    Ok((jobs, store_id)) => {
+                        if ensure_provisioning_store_marker(path, &store_id).is_ok() {
+                            (jobs, Some(store_id), true)
+                        } else {
+                            tracing::error!(path = %path.display(), "provisioning store marker could not be validated; paid provider actions are disabled");
+                            (BTreeMap::new(), None, false)
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(path = %path.display(), error = %error, "provisioning job snapshot failed validation; paid provider actions are disabled");
+                        (BTreeMap::new(), None, false)
+                    }
+                }
+            }
+        };
         Self {
             path,
+            store_id,
+            durable_ready: AtomicBool::new(durable_ready),
             jobs: RwLock::new(jobs),
+            persistence_lock: Mutex::new(()),
             cleanup_claims: Mutex::new(BTreeSet::new()),
             counter: AtomicU64::new(1),
+        }
+    }
+
+    fn durable_ready(&self) -> bool {
+        self.path.is_some() && self.durable_ready.load(Ordering::Acquire)
+    }
+
+    fn require_durable(&self) -> Result<(), ProvisioningPaidStoreError> {
+        if self.durable_ready() {
+            Ok(())
+        } else {
+            Err(ProvisioningPaidStoreError::PersistenceFailed)
         }
     }
 
@@ -154,16 +423,29 @@ impl ProvisioningJobStore {
         now: i64,
         provider_runtime: &ProviderRuntimeConfig,
     ) -> Result<ProvisioningJob, ProvisioningJobStartError> {
+        if request.provider == "hetzner-cloud" && !self.durable_ready() {
+            return Err(ProvisioningJobStartError::PersistenceFailed);
+        }
         if !valid_setup_provider(&request.provider) {
             return Err(ProvisioningJobStartError::UnsupportedProvider);
         }
         if !valid_setup_template(&request.provider, &request.template) {
             return Err(ProvisioningJobStartError::UnsupportedTemplate);
         }
-        let id = format!(
-            "setup-{now}-{}",
-            self.counter.fetch_add(1, Ordering::Relaxed)
-        );
+        let id = loop {
+            let candidate = format!(
+                "setup-{now}-{}",
+                self.counter.fetch_add(1, Ordering::Relaxed)
+            );
+            if !self
+                .jobs
+                .read()
+                .expect("provisioning job store lock")
+                .contains_key(&candidate)
+            {
+                break candidate;
+            }
+        };
         let (state, progress) = provisioning_job_progress(request, provider_runtime, now);
         let handoff = provisioning_job_handoff(request);
         let setup_intent = provisioning_setup_intent(request);
@@ -199,16 +481,24 @@ impl ProvisioningJobStore {
             handoff,
             setup_intent,
             backup_proposal,
+            reviewed_plan: None,
+            paid_authorization: None,
+            paid_execution: None,
             provider_resources: vec![],
             progress,
         };
         job.validate_contract()
             .map_err(|_| ProvisioningJobStartError::InvalidJob)?;
-        {
-            let mut jobs = self.jobs.write().expect("provisioning job store lock");
-            jobs.insert(job.id.clone(), job.clone());
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs.insert(job.id.clone(), job.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            if let Some(previous) = previous {
+                jobs.insert(job.id.clone(), previous);
+            } else {
+                jobs.remove(&job.id);
+            }
+            return Err(ProvisioningJobStartError::PersistenceFailed);
         }
-        self.persist();
         Ok(job)
     }
 
@@ -227,6 +517,360 @@ impl ProvisioningJobStore {
             .values()
             .cloned()
             .collect()
+    }
+
+    fn paid_project_blocked(&self, except_id: Option<&str>) -> bool {
+        let jobs = self.jobs.read().expect("provisioning job store lock");
+        paid_project_blocked_in(&jobs, except_id)
+    }
+
+    fn attach_paid_review(
+        &self,
+        id: &str,
+        reviewed_plan: ProvisioningReviewedPaidPlan,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
+        self.require_durable()?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        if paid_project_blocked_in(&jobs, Some(id)) {
+            return Err(ProvisioningPaidStoreError::ProjectBusy);
+        }
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningPaidStoreError::NotFound)?;
+        if previous.provider != "hetzner-cloud"
+            || previous.state != ProvisioningJobState::Planning
+            || previous.reviewed_plan.is_some()
+            || previous.paid_authorization.is_some()
+            || previous.paid_execution.is_some()
+        {
+            return Err(ProvisioningPaidStoreError::InvalidState);
+        }
+        let mut updated = previous.clone();
+        updated.reviewed_plan = Some(reviewed_plan);
+        updated.updated_at = now.max(updated.created_at);
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Planning,
+            message: "Exact paid provider plan stored for separate attended approval; no provider resource was created.".to_string(),
+            observed_at: now,
+        });
+        updated
+            .validate_contract()
+            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
+        if !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningPaidStoreError::ContractFailed);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningPaidStoreError::PersistenceFailed);
+        }
+        Ok(updated)
+    }
+
+    fn confirm_paid_review(
+        &self,
+        id: &str,
+        plan_sha256: &str,
+        operator_ref: &str,
+        operator_label: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
+        self.require_durable()?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        if paid_project_blocked_in(&jobs, Some(id)) {
+            return Err(ProvisioningPaidStoreError::ProjectBusy);
+        }
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningPaidStoreError::NotFound)?;
+        let reviewed = previous
+            .reviewed_plan
+            .as_ref()
+            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
+        if reviewed.plan_sha256 != plan_sha256 || reviewed_paid_plan_digest(reviewed) != plan_sha256
+        {
+            return Err(ProvisioningPaidStoreError::PlanMismatch);
+        }
+        if now >= reviewed.expires_at {
+            return Err(ProvisioningPaidStoreError::Expired);
+        }
+        if let Some(authorization) = &previous.paid_authorization {
+            return if authorization.plan_sha256 == plan_sha256
+                && authorization.operator_ref == operator_ref
+            {
+                Ok(previous)
+            } else {
+                Err(ProvisioningPaidStoreError::OperatorMismatch)
+            };
+        }
+        if previous.state != ProvisioningJobState::Planning || previous.paid_execution.is_some() {
+            return Err(ProvisioningPaidStoreError::InvalidState);
+        }
+        let mut updated = previous.clone();
+        updated.paid_authorization = Some(ProvisioningPaidAuthorization {
+            plan_sha256: plan_sha256.to_string(),
+            operator_ref: operator_ref.to_string(),
+            operator_label: operator_label.to_string(),
+            confirmed_at: now,
+            expires_at: reviewed.expires_at,
+        });
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Planning,
+            message: "Attended authorization stored for this exact plan; no provider resource was created and billing has not started.".to_string(),
+            observed_at: now,
+        });
+        updated
+            .validate_contract()
+            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
+        if !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningPaidStoreError::ContractFailed);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningPaidStoreError::PersistenceFailed);
+        }
+        Ok(updated)
+    }
+
+    fn claim_paid_execution(
+        &self,
+        id: &str,
+        plan_sha256: &str,
+        operator_ref: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
+        self.require_durable()?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        if paid_project_blocked_in(&jobs, Some(id)) {
+            return Err(ProvisioningPaidStoreError::ProjectBusy);
+        }
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningPaidStoreError::NotFound)?;
+        let reviewed = previous
+            .reviewed_plan
+            .as_ref()
+            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
+        let authorization = previous
+            .paid_authorization
+            .as_ref()
+            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
+        if reviewed.plan_sha256 != plan_sha256
+            || authorization.plan_sha256 != plan_sha256
+            || reviewed_paid_plan_digest(reviewed) != plan_sha256
+        {
+            return Err(ProvisioningPaidStoreError::PlanMismatch);
+        }
+        if authorization.operator_ref != operator_ref {
+            return Err(ProvisioningPaidStoreError::OperatorMismatch);
+        }
+        if now >= authorization.expires_at {
+            return Err(ProvisioningPaidStoreError::Expired);
+        }
+        if previous.paid_execution.is_some() {
+            return Ok(previous);
+        }
+        if previous.state != ProvisioningJobState::Planning {
+            return Err(ProvisioningPaidStoreError::InvalidState);
+        }
+        let attempt_id = format!("{}-1", previous.id);
+        let mut updated = previous.clone();
+        updated.state = ProvisioningJobState::Provisioning;
+        updated.updated_at = now;
+        updated.paid_execution = Some(ProvisioningPaidExecution {
+            plan_sha256: plan_sha256.to_string(),
+            attempt_id,
+            state: "claimed".to_string(),
+            claimed_at: now,
+            provider_request_started_at: None,
+            provider_id: None,
+        });
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Provisioning,
+            message: "Single-use paid create claimed durably; final live provider checks are running before any create request.".to_string(),
+            observed_at: now,
+        });
+        updated
+            .validate_contract()
+            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
+        if !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningPaidStoreError::ContractFailed);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningPaidStoreError::PersistenceFailed);
+        }
+        Ok(updated)
+    }
+
+    fn mark_paid_request_started(
+        &self,
+        id: &str,
+        plan_sha256: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
+        self.update_paid_execution(id, plan_sha256, now, true, |execution| {
+            if execution.state != "claimed" {
+                return Err(ProvisioningPaidStoreError::InvalidState);
+            }
+            execution.state = "request-started".to_string();
+            execution.provider_request_started_at = Some(now);
+            Ok((
+                ProvisioningJobState::Provisioning,
+                "Final checks passed; the one authorized provider create request has started."
+                    .to_string(),
+            ))
+        })
+    }
+
+    fn fail_paid_execution(
+        &self,
+        id: &str,
+        plan_sha256: &str,
+        uncertain: bool,
+        message: String,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
+        self.update_paid_execution(id, plan_sha256, now, false, |execution| {
+            execution.state = if uncertain {
+                "uncertain"
+            } else {
+                "failed-closed"
+            }
+            .to_string();
+            Ok((
+                if uncertain {
+                    ProvisioningJobState::CleanupNeeded
+                } else {
+                    ProvisioningJobState::Failed
+                },
+                message,
+            ))
+        })
+    }
+
+    fn update_paid_execution(
+        &self,
+        id: &str,
+        plan_sha256: &str,
+        now: i64,
+        require_unexpired: bool,
+        update: impl FnOnce(
+            &mut ProvisioningPaidExecution,
+        )
+            -> Result<(ProvisioningJobState, String), ProvisioningPaidStoreError>,
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
+        self.require_durable()?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningPaidStoreError::NotFound)?;
+        let mut updated = previous.clone();
+        if require_unexpired
+            && updated
+                .paid_authorization
+                .as_ref()
+                .is_none_or(|authorization| now >= authorization.expires_at)
+        {
+            return Err(ProvisioningPaidStoreError::Expired);
+        }
+        let execution = updated
+            .paid_execution
+            .as_mut()
+            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
+        if execution.plan_sha256 != plan_sha256 {
+            return Err(ProvisioningPaidStoreError::PlanMismatch);
+        }
+        let (state, message) = update(execution)?;
+        updated.state = state;
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state,
+            message,
+            observed_at: now,
+        });
+        updated
+            .validate_contract()
+            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
+        if !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningPaidStoreError::ContractFailed);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningPaidStoreError::PersistenceFailed);
+        }
+        Ok(updated)
+    }
+
+    fn complete_paid_create(
+        &self,
+        id: &str,
+        plan_sha256: &str,
+        resource: ProvisioningProviderResource,
+        handoff: Option<ProvisioningHandoff>,
+        reconciled: bool,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
+        self.require_durable()?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningPaidStoreError::NotFound)?;
+        let mut updated = previous.clone();
+        let execution = updated
+            .paid_execution
+            .as_mut()
+            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
+        if execution.plan_sha256 != plan_sha256
+            || !matches!(execution.state.as_str(), "request-started" | "uncertain")
+        {
+            return Err(ProvisioningPaidStoreError::InvalidState);
+        }
+        execution.state = if reconciled { "reconciled" } else { "created" }.to_string();
+        execution.provider_id = Some(resource.provider_id.clone());
+        updated.state = if handoff.is_some() {
+            ProvisioningJobState::WaitingForHeartbeat
+        } else {
+            ProvisioningJobState::CleanupNeeded
+        };
+        updated.updated_at = now;
+        updated.provider_resources.clear();
+        updated.provider_resources.push(resource);
+        if handoff.is_some() {
+            updated.handoff = handoff;
+        }
+        updated.progress.push(ProvisioningProgressEntry {
+            state: updated.state,
+            message: if reconciled {
+                "The single provider server was reconciled by its required ownership labels and reviewed server facts; no duplicate request was sent."
+            } else {
+                "The single authorized provider server was created and durably recorded."
+            }
+            .to_string(),
+            observed_at: now,
+        });
+        updated
+            .validate_contract()
+            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
+        if !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningPaidStoreError::ContractFailed);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningPaidStoreError::PersistenceFailed);
+        }
+        Ok(updated)
     }
 
     fn append_progress(
@@ -249,8 +893,7 @@ impl ProvisioningJobStore {
             return None;
         }
         let job = job.clone();
-        drop(jobs);
-        self.persist();
+        let _ = self.persist_jobs(&jobs);
         Some(job)
     }
 
@@ -273,14 +916,20 @@ impl ProvisioningJobStore {
         id: &str,
         provider_id: &str,
         now: i64,
-    ) -> Option<ProvisioningJob> {
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
         let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let current = jobs.get(id)?.clone();
+        let current = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningPaidStoreError::NotFound)?;
+        if current.reviewed_plan.is_some() {
+            self.require_durable()?;
+        }
         if !matches!(
             current.state,
             ProvisioningJobState::WaitingForHeartbeat | ProvisioningJobState::CleanupNeeded
         ) {
-            return None;
+            return Err(ProvisioningPaidStoreError::InvalidState);
         }
         let matching: Vec<&ProvisioningProviderResource> = current
             .provider_resources
@@ -296,10 +945,10 @@ impl ProvisioningJobStore {
             })
             .collect();
         if current.provider_resources.len() != 1 || matching.len() != 1 {
-            return None;
+            return Err(ProvisioningPaidStoreError::InvalidState);
         }
 
-        let mut updated = current;
+        let mut updated = current.clone();
         updated.state = ProvisioningJobState::CleanupNeeded;
         updated.terminal_outcome = None;
         updated.updated_at = now;
@@ -310,11 +959,18 @@ impl ProvisioningJobStore {
                     .to_string(),
             observed_at: now,
         });
-        updated.validate_contract().ok()?;
+        updated
+            .validate_contract()
+            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
+        if !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningPaidStoreError::ContractFailed);
+        }
         jobs.insert(id.to_string(), updated.clone());
-        drop(jobs);
-        self.persist();
-        Some(updated)
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), current);
+            return Err(ProvisioningPaidStoreError::PersistenceFailed);
+        }
+        Ok(updated)
     }
 
     fn complete_provider_cleanup(
@@ -323,13 +979,19 @@ impl ProvisioningJobStore {
         resource: ProvisioningProviderResource,
         handoff: ProvisioningHandoff,
         now: i64,
-    ) -> Option<ProvisioningJob> {
+    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
         let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let current = jobs.get(id)?.clone();
-        if current.state != ProvisioningJobState::CleanupNeeded {
-            return None;
+        let current = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningPaidStoreError::NotFound)?;
+        if current.reviewed_plan.is_some() {
+            self.require_durable()?;
         }
-        let mut updated = current;
+        if current.state != ProvisioningJobState::CleanupNeeded {
+            return Err(ProvisioningPaidStoreError::InvalidState);
+        }
+        let mut updated = current.clone();
         updated.state = ProvisioningJobState::Complete;
         updated.terminal_outcome = Some(ProvisioningTerminalOutcome::RolledBack);
         updated.updated_at = now;
@@ -345,11 +1007,18 @@ impl ProvisioningJobStore {
             .retain(|existing| existing.provider_id != resource.provider_id);
         updated.provider_resources.push(resource);
         updated.handoff = Some(handoff);
-        updated.validate_contract().ok()?;
+        updated
+            .validate_contract()
+            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
+        if !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningPaidStoreError::ContractFailed);
+        }
         jobs.insert(id.to_string(), updated.clone());
-        drop(jobs);
-        self.persist();
-        Some(updated)
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), current);
+            return Err(ProvisioningPaidStoreError::PersistenceFailed);
+        }
+        Ok(updated)
     }
 
     fn transition_existing_host(
@@ -378,65 +1047,28 @@ impl ProvisioningJobStore {
             return None;
         }
         let job = job.clone();
-        drop(jobs);
-        self.persist();
+        let _ = self.persist_jobs(&jobs);
         Some(job)
     }
 
-    fn transition_provider_resource(
-        &self,
-        id: &str,
-        state: ProvisioningJobState,
-        message: impl Into<String>,
-        resource: ProvisioningProviderResource,
-        handoff: Option<ProvisioningHandoff>,
-        now: i64,
-    ) -> Option<ProvisioningJob> {
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let job = jobs.get_mut(id)?;
-        job.state = state;
-        job.updated_at = now;
-        job.progress.push(ProvisioningProgressEntry {
-            state,
-            message: message.into(),
-            observed_at: now,
-        });
-        job.provider_resources
-            .retain(|existing| existing.provider_id != resource.provider_id);
-        job.provider_resources.push(resource);
-        if handoff.is_some() {
-            job.handoff = handoff;
-        }
-        if job.validate_contract().is_err() {
-            return None;
-        }
-        let job = job.clone();
-        drop(jobs);
-        self.persist();
-        Some(job)
-    }
-
-    fn persist(&self) {
-        let Some(path) = &self.path else { return };
-        let snapshot: Vec<ProvisioningJob> = self
-            .jobs
-            .read()
-            .expect("provisioning job store lock")
-            .values()
-            .cloned()
-            .collect();
-        let Ok(json) = serde_json::to_vec_pretty(&snapshot) else {
-            return;
+    fn persist_jobs(&self, jobs: &BTreeMap<String, ProvisioningJob>) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Ok(());
         };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let Some(store_id) = &self.store_id else {
+            self.durable_ready.store(false, Ordering::Release);
+            return Err("provisioning store identity is unavailable".to_string());
+        };
+        let _persistence = self
+            .persistence_lock
+            .lock()
+            .map_err(|_| "provisioning persistence lock failed".to_string())?;
+        let result = ensure_provisioning_store_marker(path, store_id)
+            .and_then(|()| write_provisioning_snapshot(path, store_id, jobs));
+        if result.is_err() {
+            self.durable_ready.store(false, Ordering::Release);
         }
-        if let Err(e) = std::fs::write(path, json) {
-            tracing::warn!(
-                "failed to persist provisioning jobs to {}: {e}",
-                path.display()
-            );
-        }
+        result
     }
 }
 
@@ -480,6 +1112,92 @@ struct ProvisioningJobStartRequest {
 struct ProvisioningCleanupRequest {
     #[serde(default)]
     confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisioningPaidConfirmRequest {
+    plan_sha256: String,
+    attended: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisioningPaidCreateRequest {
+    plan_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisioningPaidStoreError {
+    NotFound,
+    InvalidState,
+    PlanMismatch,
+    Expired,
+    OperatorMismatch,
+    ProjectBusy,
+    ContractFailed,
+    PersistenceFailed,
+}
+
+fn reviewed_paid_plan_digest(plan: &ProvisioningReviewedPaidPlan) -> String {
+    let mut material = plan.clone();
+    material.plan_sha256 = "0".repeat(64);
+    let encoded = serde_json::to_vec(&material).unwrap_or_default();
+    hex(&Sha256::digest(encoded))
+}
+
+fn paid_job_integrity_valid(job: &ProvisioningJob) -> bool {
+    let Some(plan) = job.reviewed_plan.as_ref() else {
+        return job.paid_authorization.is_none() && job.paid_execution.is_none();
+    };
+    if reviewed_paid_plan_digest(plan) != plan.plan_sha256
+        || job.host_name.as_deref() != Some(plan.server_name.as_str())
+        || plan.required_labels != paid_required_labels(&job.id, &plan.provider_project)
+    {
+        return false;
+    }
+    let resources = job
+        .provider_resources
+        .iter()
+        .filter(|resource| resource.provider == "hetzner-cloud" && resource.kind == "server")
+        .collect::<Vec<_>>();
+    match job.paid_execution.as_ref() {
+        None => resources.is_empty(),
+        Some(execution) if matches!(execution.state.as_str(), "created" | "reconciled") => {
+            let Some(provider_id) = execution.provider_id.as_deref() else {
+                return false;
+            };
+            provider_id.parse::<u64>().is_ok_and(|id| id > 0)
+                && resources.len() == 1
+                && resources[0].provider_id == provider_id
+                && resources[0].name == plan.server_name
+        }
+        Some(_) => resources.is_empty(),
+    }
+}
+
+fn paid_project_blocked_in(
+    jobs: &BTreeMap<String, ProvisioningJob>,
+    except_id: Option<&str>,
+) -> bool {
+    jobs.iter().any(|(id, job)| {
+        if except_id == Some(id.as_str()) || job.provider != "hetzner-cloud" {
+            return false;
+        }
+        job.paid_execution.as_ref().is_some_and(|execution| {
+            matches!(
+                execution.state.as_str(),
+                "claimed" | "request-started" | "uncertain"
+            )
+        }) || job.provider_resources.iter().any(|resource| {
+            resource.provider == "hetzner-cloud"
+                && resource.kind == "server"
+                && matches!(
+                    resource.state.as_str(),
+                    "created" | "created-address-pending"
+                )
+        })
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -921,6 +1639,8 @@ struct HetznerCloudRuntimeConfig {
     api_base_url: String,
     request_timeout: Duration,
     evidence_ttl_secs: i64,
+    project_label: Option<String>,
+    approval_ttl_secs: i64,
 }
 
 impl Default for HetznerCloudRuntimeConfig {
@@ -934,6 +1654,8 @@ impl Default for HetznerCloudRuntimeConfig {
             api_base_url: "https://api.hetzner.cloud/v1".to_string(),
             request_timeout: Duration::from_secs(20),
             evidence_ttl_secs: 60 * 60,
+            project_label: None,
+            approval_ttl_secs: 15 * 60,
         }
     }
 }
@@ -967,6 +1689,12 @@ impl HetznerCloudRuntimeConfig {
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|seconds| (60..=86_400).contains(seconds))
             .unwrap_or(60 * 60);
+        let project_label = env_nonempty("PHAROS_HCLOUD_PROJECT_LABEL")
+            .filter(|value| safe_paid_display_text(value, 120));
+        let approval_ttl_secs = env_nonempty("PHAROS_HCLOUD_APPROVAL_TTL_SECS")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|seconds| (60..=30 * 60).contains(seconds))
+            .unwrap_or(15 * 60);
         Self {
             credential_source,
             execute_enabled,
@@ -976,6 +1704,8 @@ impl HetznerCloudRuntimeConfig {
             api_base_url,
             request_timeout,
             evidence_ttl_secs,
+            project_label,
+            approval_ttl_secs,
         }
     }
 
@@ -991,6 +1721,49 @@ impl HetznerCloudRuntimeConfig {
     }
 }
 
+/// One operation-scoped credential snapshot. The raw token stays in memory and
+/// is never serialized or logged; only its domain-separated binding is stored
+/// in the reviewed plan so a different provider project cannot be mutated.
+struct HetznerOperationContext {
+    runtime: HetznerCloudRuntimeConfig,
+    token: String,
+    credential_binding_sha256: String,
+}
+
+impl HetznerOperationContext {
+    fn resolve(runtime: HetznerCloudRuntimeConfig) -> Result<Self, HetznerExecutionError> {
+        let token = runtime.api_token()?;
+        let credential_binding_sha256 = hetzner_credential_binding(&token);
+        Ok(Self {
+            runtime,
+            token,
+            credential_binding_sha256,
+        })
+    }
+
+    fn matches_reviewed_plan(&self, reviewed: &ProvisioningReviewedPaidPlan) -> bool {
+        self.credential_binding_sha256 == reviewed.credential_binding_sha256
+    }
+}
+
+fn hetzner_credential_binding(token: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pharos.hetzner-cloud.credential-binding.v1\0");
+    digest.update(token.as_bytes());
+    hex(&digest.finalize())
+}
+
+fn hetzner_http_client(
+    runtime: &HetznerCloudRuntimeConfig,
+) -> Result<reqwest::Client, HetznerExecutionError> {
+    reqwest::Client::builder()
+        .timeout(runtime.request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|_| HetznerExecutionError::ClientUnavailable)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProviderCredentialSource {
     Environment(&'static str),
@@ -1003,9 +1776,10 @@ enum HetznerExecutionError {
     CredentialUnavailable,
     ClientUnavailable,
     PrerequisiteRequestFailed,
-    ServerSelectionUnavailable,
+    ImageUnavailable,
     SshKeyUnavailable,
     FirewallUnavailable,
+    ApprovalExpired,
     RequestFailed,
     HttpStatus(u16),
     InvalidResponse,
@@ -1022,8 +1796,8 @@ impl HetznerExecutionError {
                 "Hetzner Cloud prerequisite checks did not complete; no provider resources were created"
                     .to_string()
             }
-            Self::ServerSelectionUnavailable => {
-                "The reviewed Hetzner Cloud location or server plan is missing; no provider resources were created"
+            Self::ImageUnavailable => {
+                "The reviewed Hetzner Cloud image is no longer available; no provider resources were created"
                     .to_string()
             }
             Self::SshKeyUnavailable => {
@@ -1032,6 +1806,10 @@ impl HetznerExecutionError {
             }
             Self::FirewallUnavailable => {
                 "The configured Hetzner Cloud firewall was not found; no provider resources were created"
+                    .to_string()
+            }
+            Self::ApprovalExpired => {
+                "The paid authorization expired before the provider create request; no provider resources were created"
                     .to_string()
             }
             Self::RequestFailed => {
@@ -1148,11 +1926,97 @@ struct HetznerCreateServerResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct HetznerServerListResponse {
+    servers: Vec<HetznerListedServer>,
+    meta: HetznerListMeta,
+}
+
+#[derive(Debug, Deserialize)]
+struct HetznerListMeta {
+    pagination: HetznerPagination,
+}
+
+#[derive(Debug, Deserialize)]
+struct HetznerPagination {
+    page: u32,
+    next_page: Option<u32>,
+    last_page: u32,
+    total_entries: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HetznerListedServer {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    server_type: Option<HetznerNamedServerFact>,
+    #[serde(default)]
+    image: Option<HetznerNamedServerFact>,
+    #[serde(default)]
+    datacenter: Option<HetznerDatacenterFact>,
+    #[serde(default)]
+    public_net: Option<HetznerPublicNet>,
+}
+
+impl HetznerListedServer {
+    fn matches_labels(&self, required: &BTreeMap<String, String>) -> bool {
+        required
+            .iter()
+            .all(|(key, value)| self.labels.get(key) == Some(value))
+    }
+
+    fn matches_reviewed_plan(&self, reviewed: &ProvisioningReviewedPaidPlan) -> bool {
+        self.name == reviewed.server_name
+            && self.matches_labels(&reviewed.required_labels)
+            && self.server_type.as_ref().map(|fact| fact.name.as_str())
+                == Some(reviewed.server_type.as_str())
+            && self.image.as_ref().map(|fact| fact.name.as_str()) == Some(reviewed.image.as_str())
+            && self
+                .datacenter
+                .as_ref()
+                .map(|fact| fact.location.name.as_str())
+                == Some(reviewed.location.as_str())
+    }
+
+    fn into_created(self) -> HetznerCreatedServer {
+        HetznerCreatedServer {
+            id: self.id,
+            name: self.name,
+            labels: self.labels,
+            server_type: self.server_type,
+            image: self.image,
+            datacenter: self.datacenter,
+            public_net: self.public_net,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct HetznerCreatedServer {
     id: u64,
     name: String,
     #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    server_type: Option<HetznerNamedServerFact>,
+    #[serde(default)]
+    image: Option<HetznerNamedServerFact>,
+    #[serde(default)]
+    datacenter: Option<HetznerDatacenterFact>,
+    #[serde(default)]
     public_net: Option<HetznerPublicNet>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HetznerNamedServerFact {
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HetznerDatacenterFact {
+    location: HetznerNamedServerFact,
 }
 
 impl HetznerCreatedServer {
@@ -1166,13 +2030,71 @@ impl HetznerCreatedServer {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct HetznerPublicNet {
     #[serde(default)]
     ipv4: Option<HetznerPublicIp>,
 }
 
-#[derive(Debug, Deserialize)]
+async fn fetch_hetzner_servers(
+    operation: &HetznerOperationContext,
+) -> Result<Vec<HetznerListedServer>, HetznerExecutionError> {
+    let client = hetzner_http_client(&operation.runtime)?;
+    let endpoint = hetzner_api_endpoint(&operation.runtime, "servers")?;
+    let mut page = 1_u32;
+    let mut servers = Vec::new();
+    for _ in 0..20 {
+        let response = client
+            .get(endpoint.clone())
+            .bearer_auth(&operation.token)
+            .query(&[("page", page), ("per_page", 50_u32)])
+            .send()
+            .await
+            .map_err(|_| HetznerExecutionError::PrerequisiteRequestFailed)?;
+        if !response.status().is_success() {
+            return Err(HetznerExecutionError::PrerequisiteRequestFailed);
+        }
+        let payload = response
+            .json::<HetznerServerListResponse>()
+            .await
+            .map_err(|_| HetznerExecutionError::InvalidResponse)?;
+        if payload
+            .servers
+            .iter()
+            .any(|server| server.id == 0 || !valid_bootstrap_name(server.name.trim()))
+        {
+            return Err(HetznerExecutionError::InvalidResponse);
+        }
+        let pagination_page = payload.meta.pagination.page;
+        let last_page = payload.meta.pagination.last_page;
+        let total_entries = usize::try_from(payload.meta.pagination.total_entries)
+            .map_err(|_| HetznerExecutionError::InvalidResponse)?;
+        let next_page = payload.meta.pagination.next_page;
+        let observed_total = servers.len().saturating_add(payload.servers.len());
+        if pagination_page != page
+            || last_page == 0
+            || pagination_page > last_page
+            || observed_total > total_entries
+        {
+            return Err(HetznerExecutionError::InvalidResponse);
+        }
+        servers.extend(payload.servers);
+        let Some(next_page) = next_page else {
+            return if page == last_page && servers.len() == total_entries {
+                Ok(servers)
+            } else {
+                Err(HetznerExecutionError::InvalidResponse)
+            };
+        };
+        if next_page != page.saturating_add(1) || page >= last_page {
+            return Err(HetznerExecutionError::InvalidResponse);
+        }
+        page = next_page;
+    }
+    Err(HetznerExecutionError::InvalidResponse)
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct HetznerPublicIp {
     ip: String,
 }
@@ -1181,6 +2103,12 @@ struct HetznerPublicIp {
 struct HetznerSshKeyListResponse {
     #[serde(default)]
     ssh_keys: Vec<HetznerNamedResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HetznerImageListResponse {
+    #[serde(default)]
+    images: Vec<HetznerNamedResource>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1228,6 +2156,23 @@ where
         .ok_or(missing)
 }
 
+async fn verify_hetzner_image(
+    operation: &HetznerOperationContext,
+    image: &str,
+) -> Result<(), HetznerExecutionError> {
+    let client = hetzner_http_client(&operation.runtime)?;
+    resolve_hetzner_resource_id::<HetznerImageListResponse>(
+        &client,
+        hetzner_api_endpoint(&operation.runtime, "images")?,
+        &operation.token,
+        image,
+        |response| response.images,
+        HetznerExecutionError::ImageUnavailable,
+    )
+    .await
+    .map(|_| ())
+}
+
 fn hetzner_api_endpoint(
     config: &HetznerCloudRuntimeConfig,
     path: &str,
@@ -1239,32 +2184,24 @@ fn hetzner_api_endpoint(
     Ok(endpoint)
 }
 
-async fn create_hetzner_server(
-    request: &ProvisioningJobStartRequest,
-    config: &HetznerCloudRuntimeConfig,
-) -> Result<HetznerCreatedServer, HetznerExecutionError> {
-    let token = config.api_token()?;
-    let client = reqwest::Client::builder()
-        .timeout(config.request_timeout)
-        .build()
-        .map_err(|_| HetznerExecutionError::ClientUnavailable)?;
-    let ssh_key_ref = request
-        .ssh_key_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or(config.default_ssh_key_ref.as_deref())
-        .ok_or(HetznerExecutionError::SshKeyUnavailable)?;
-    let firewall_ref = config
-        .firewall_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or(HetznerExecutionError::FirewallUnavailable)?;
+#[derive(Debug, Clone, Copy)]
+struct HetznerCreatePrerequisites {
+    ssh_key_id: u64,
+    firewall_id: u64,
+}
+
+async fn resolve_hetzner_create_prerequisites(
+    plan: &ProvisioningReviewedPaidPlan,
+    operation: &HetznerOperationContext,
+) -> Result<HetznerCreatePrerequisites, HetznerExecutionError> {
+    let client = hetzner_http_client(&operation.runtime)?;
+    let ssh_key_ref = plan.ssh_key_ref.as_str();
+    let firewall_ref = plan.firewall_ref.as_str();
+    verify_hetzner_image(operation, &plan.image).await?;
     let ssh_key_id = resolve_hetzner_resource_id::<HetznerSshKeyListResponse>(
         &client,
-        hetzner_api_endpoint(config, "ssh_keys")?,
-        &token,
+        hetzner_api_endpoint(&operation.runtime, "ssh_keys")?,
+        &operation.token,
         ssh_key_ref,
         |response| response.ssh_keys,
         HetznerExecutionError::SshKeyUnavailable,
@@ -1272,58 +2209,44 @@ async fn create_hetzner_server(
     .await?;
     let firewall_id = resolve_hetzner_resource_id::<HetznerFirewallListResponse>(
         &client,
-        hetzner_api_endpoint(config, "firewalls")?,
-        &token,
+        hetzner_api_endpoint(&operation.runtime, "firewalls")?,
+        &operation.token,
         firewall_ref,
         |response| response.firewalls,
         HetznerExecutionError::FirewallUnavailable,
     )
     .await?;
-    let endpoint = hetzner_api_endpoint(config, "servers")?;
-    let mut labels = BTreeMap::new();
-    labels.insert("managed-by".to_string(), "pharos".to_string());
-    labels.insert("pharos-setup".to_string(), "tracked-job".to_string());
+    Ok(HetznerCreatePrerequisites {
+        ssh_key_id,
+        firewall_id,
+    })
+}
+
+async fn send_hetzner_create(
+    plan: &ProvisioningReviewedPaidPlan,
+    prerequisites: HetznerCreatePrerequisites,
+    operation: &HetznerOperationContext,
+) -> Result<HetznerCreatedServer, HetznerExecutionError> {
+    if now_unix() >= plan.expires_at {
+        return Err(HetznerExecutionError::ApprovalExpired);
+    }
+    let client = hetzner_http_client(&operation.runtime)?;
+    let endpoint = hetzner_api_endpoint(&operation.runtime, "servers")?;
     let payload = HetznerCreateServerRequest {
-        name: request
-            .host_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("pharos-host")
-            .to_string(),
-        server_type: request
-            .server_type
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or(HetznerExecutionError::ServerSelectionUnavailable)?
-            .to_string(),
-        image: request
-            .image
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("debian-12")
-            .to_string(),
-        location: Some(
-            request
-                .location
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or(HetznerExecutionError::ServerSelectionUnavailable)?
-                .to_string(),
-        ),
-        ssh_keys: vec![ssh_key_id],
+        name: plan.server_name.clone(),
+        server_type: plan.server_type.clone(),
+        image: plan.image.clone(),
+        location: Some(plan.location.clone()),
+        ssh_keys: vec![prerequisites.ssh_key_id],
         firewalls: vec![HetznerCreateFirewall {
-            firewall: firewall_id,
+            firewall: prerequisites.firewall_id,
         }],
-        labels,
+        labels: plan.required_labels.clone(),
         start_after_create: true,
     };
     let response = client
         .post(endpoint)
-        .bearer_auth(token)
+        .bearer_auth(&operation.token)
         .json(&payload)
         .send()
         .await
@@ -1332,11 +2255,29 @@ async fn create_hetzner_server(
     if !status.is_success() {
         return Err(HetznerExecutionError::HttpStatus(status.as_u16()));
     }
-    response
+    let server = response
         .json::<HetznerCreateServerResponse>()
         .await
         .map(|payload| payload.server)
-        .map_err(|_| HetznerExecutionError::InvalidResponse)
+        .map_err(|_| HetznerExecutionError::InvalidResponse)?;
+    if server.id == 0
+        || server.name.trim() != plan.server_name
+        || server.server_type.as_ref().map(|value| value.name.as_str())
+            != Some(plan.server_type.as_str())
+        || server.image.as_ref().map(|value| value.name.as_str()) != Some(plan.image.as_str())
+        || server
+            .datacenter
+            .as_ref()
+            .map(|value| value.location.name.as_str())
+            != Some(plan.location.as_str())
+        || !plan
+            .required_labels
+            .iter()
+            .all(|(key, value)| server.labels.get(key) == Some(value))
+    {
+        return Err(HetznerExecutionError::InvalidResponse);
+    }
+    Ok(server)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1347,17 +2288,13 @@ enum HetznerDeleteResult {
 
 async fn delete_hetzner_server(
     provider_id: u64,
-    config: &HetznerCloudRuntimeConfig,
+    operation: &HetznerOperationContext,
 ) -> Result<HetznerDeleteResult, HetznerExecutionError> {
-    let token = config.api_token()?;
-    let client = reqwest::Client::builder()
-        .timeout(config.request_timeout)
-        .build()
-        .map_err(|_| HetznerExecutionError::ClientUnavailable)?;
-    let endpoint = hetzner_api_endpoint(config, &format!("servers/{provider_id}"))?;
+    let client = hetzner_http_client(&operation.runtime)?;
+    let endpoint = hetzner_api_endpoint(&operation.runtime, &format!("servers/{provider_id}"))?;
     let response = client
         .delete(endpoint)
-        .bearer_auth(token)
+        .bearer_auth(&operation.token)
         .send()
         .await
         .map_err(|_| HetznerExecutionError::RequestFailed)?;
@@ -1382,6 +2319,7 @@ enum ProvisioningCleanupError {
     ResourceMissing,
     ResourceAmbiguous,
     ResourceInvalid,
+    OwnershipMismatch,
     RuntimeDisabled,
     ProviderUnavailable,
     ProviderUncertain,
@@ -1396,6 +2334,7 @@ impl ProvisioningCleanupError {
             Self::CleanupNotAllowed
             | Self::ResourceMissing
             | Self::ResourceAmbiguous
+            | Self::OwnershipMismatch
             | Self::CleanupInProgress => StatusCode::CONFLICT,
             Self::RuntimeDisabled | Self::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::ProviderUncertain => StatusCode::BAD_GATEWAY,
@@ -1419,6 +2358,9 @@ impl ProvisioningCleanupError {
             }
             Self::ResourceInvalid => {
                 "The tracked provider server is not valid for guarded cleanup; no deletion was attempted."
+            }
+            Self::OwnershipMismatch => {
+                "The live provider server does not match the reviewed ownership labels and name; no deletion was attempted."
             }
             Self::RuntimeDisabled => {
                 "Hetzner Cloud execution is disabled; no deletion was attempted."
@@ -1535,10 +2477,10 @@ fn provisioning_job_progress(
                 });
                 return (ProvisioningJobState::Failed, progress);
             }
-            if !request.apply {
+            if request.apply {
                 progress.push(ProvisioningProgressEntry {
                     state: ProvisioningJobState::Failed,
-                    message: "Hetzner Cloud executor requires explicit apply confirmation; no provider resources were created.".to_string(),
+                    message: "Direct Hetzner Cloud apply is not accepted; review, authorize, and create must be separate requests. No provider resources were created.".to_string(),
                     observed_at: now,
                 });
                 return (ProvisioningJobState::Failed, progress);
@@ -1568,11 +2510,11 @@ fn provisioning_job_progress(
                 return (ProvisioningJobState::Failed, progress);
             }
             progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::Provisioning,
-                message: "Hetzner Cloud create/apply accepted; provider request is running through the configured executor.".to_string(),
+                state: ProvisioningJobState::Planning,
+                message: "Hetzner Cloud inputs accepted for an immutable paid-plan review; no provider resource was created.".to_string(),
                 observed_at: now,
             });
-            (ProvisioningJobState::Provisioning, progress)
+            (ProvisioningJobState::Planning, progress)
         }
         "manual-import" => {
             progress.push(ProvisioningProgressEntry {
@@ -2219,6 +3161,36 @@ fn valid_provider_selector(value: &str) -> bool {
         && !value.to_ascii_lowercase().contains("password=")
 }
 
+fn safe_paid_display_text(value: &str, max_chars: usize) -> bool {
+    let value = value.trim();
+    let lowered = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.chars().count() <= max_chars
+        && !value.chars().any(char::is_control)
+        && !lowered.contains("bearer ")
+        && !lowered.contains("token=")
+        && !lowered.contains("token:")
+        && !lowered.contains("password=")
+        && !lowered.contains("secret=")
+}
+
+fn valid_hcloud_server_name(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn invalid_hetzner_create_inputs(
     request: &ProvisioningJobStartRequest,
     config: &HetznerCloudRuntimeConfig,
@@ -2226,7 +3198,7 @@ fn invalid_hetzner_create_inputs(
     request
         .host_name
         .as_deref()
-        .is_none_or(|value| !valid_bootstrap_name(value.trim()))
+        .is_none_or(|value| !valid_hcloud_server_name(value))
         || request
             .role
             .as_deref()
@@ -2250,6 +3222,7 @@ enum ProvisioningJobStartError {
     UnsupportedProvider,
     UnsupportedTemplate,
     InvalidJob,
+    PersistenceFailed,
 }
 
 impl std::fmt::Display for ProvisioningJobStartError {
@@ -2258,6 +3231,9 @@ impl std::fmt::Display for ProvisioningJobStartError {
             Self::UnsupportedProvider => write!(f, "unsupported setup provider"),
             Self::UnsupportedTemplate => write!(f, "unsupported setup template"),
             Self::InvalidJob => write!(f, "provisioning job contract failed validation"),
+            Self::PersistenceFailed => {
+                write!(f, "provisioning job could not be durably stored")
+            }
         }
     }
 }
@@ -2344,6 +3320,7 @@ struct SetupProviderRuntimeReadiness {
     credential_configured: bool,
     credential_boundary_ready: bool,
     execution_enabled: bool,
+    project_label_configured: bool,
     default_ssh_key_configured: bool,
     firewall_configured: bool,
     default_location_configured: bool,
@@ -2383,6 +3360,10 @@ fn hetzner_runtime_readiness(
     let credential_configured = config.api_token().is_ok();
     let credential_boundary_ready = config.credential_boundary_ready();
     let execution_enabled = config.execute_enabled;
+    let project_label_configured = config
+        .project_label
+        .as_deref()
+        .is_some_and(|value| safe_paid_display_text(value, 120));
     let default_ssh_key_configured = config
         .default_ssh_key_ref
         .as_deref()
@@ -2408,6 +3389,7 @@ fn hetzner_runtime_readiness(
         && credential_boundary_ready
         && store.ready(now, config.evidence_ttl_secs);
     let ready_with_defaults = provider_ready
+        && project_label_configured
         && default_ssh_key_configured
         && firewall_configured
         && default_location_configured;
@@ -2417,6 +3399,8 @@ fn hetzner_runtime_readiness(
         "Hetzner Cloud is not connected. Start secure setup before creating a server."
     } else if !credential_boundary_ready {
         HetznerConnectionCode::CredentialBoundaryRequired.safe_message()
+    } else if !project_label_configured {
+        "Set a safe provider project label before reviewing paid work."
     } else if !connection_tested {
         "The secure credential is available. Test the connection to continue."
     } else if !evidence_fresh {
@@ -2430,6 +3414,7 @@ fn hetzner_runtime_readiness(
         credential_configured,
         credential_boundary_ready,
         execution_enabled,
+        project_label_configured,
         default_ssh_key_configured,
         firewall_configured,
         default_location_configured,
@@ -3969,9 +4954,13 @@ body[data-assistant-open="true"]{overflow:hidden}
 .assistant-preflight-form{display:grid;grid-template-columns:1fr;gap:18px;padding:0;border:0;background:transparent}.assistant-primary-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.assistant-preflight-form label,.assistant-preflight-facts label{gap:7px}.assistant-preflight-form label span,.assistant-preflight-facts label span{font-size:12px}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{height:44px;font-size:14px}.assistant-preflight-details,.assistant-check-details{border-top:1px solid rgba(214,226,234,.82);border-right:0;border-bottom:1px solid rgba(214,226,234,.82);border-left:0;border-radius:0;background:transparent;padding:0}.assistant-preflight-details summary,.assistant-check-details summary{display:flex;align-items:center;justify-content:space-between;min-height:46px;color:#315d7c;cursor:pointer;font-size:13px;font-weight:720;list-style:none}.assistant-preflight-details summary::-webkit-details-marker,.assistant-check-details summary::-webkit-details-marker{display:none}.assistant-preflight-details summary .ico,.assistant-check-details summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-preflight-details[open] summary .ico,.assistant-check-details[open] summary .ico{transform:rotate(180deg)}.assistant-preflight-facts{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:4px 0 16px;margin:0}.assistant-check{justify-self:end;min-height:42px;padding:0 18px;font-size:13px}
 .assistant-preflight-result{gap:18px;padding:0;border:0;background:transparent}.assistant-result-head{display:grid;gap:4px}.assistant-result-head strong{font-size:17px}.assistant-result-head span{max-width:none;text-align:left;font-size:13px}.assistant-bootstrap{grid-template-columns:1fr;gap:10px}.assistant-bootstrap-option{min-height:76px;padding:14px 16px;opacity:.58}.assistant-bootstrap-option[data-available="true"]{opacity:1;background:#fff}.assistant-bootstrap-option:before{display:none}.assistant-bootstrap-option strong{font-size:14px}.assistant-bootstrap-option span{font-size:12px}.assistant-check-details{margin-top:2px}.assistant-checks{grid-template-columns:1fr;gap:7px;padding:0 0 14px}
 .assistant-plan{gap:20px;padding:0;border:0;background:transparent}.assistant-plan>.assistant-plan-head{display:none}.assistant-review-summary{gap:12px}.assistant-existing-review{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-review-summary{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-review{display:grid}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-provider-readiness,.assistant-overlay[data-assistant-selected-path="existing"] .assistant-plan-field,.assistant-overlay[data-assistant-selected-path="existing"] [data-provider-plan-resources]{display:none}.assistant-review-identity{padding-bottom:12px}.assistant-review-identity input{font-size:26px}.assistant-review-details{margin-top:2px}.assistant-review-technical{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-setup-intent{display:grid;padding:8px 0 2px;border:0;background:transparent}.assistant-choice-options{gap:7px}.assistant-confirm{border-top:1px solid rgba(210,226,234,.84);padding-top:18px}.assistant-confirm-actions{display:none}.assistant-start{min-height:42px;padding:0 17px;font-size:13px}.assistant-start .ico{width:16px;height:16px}
+.assistant-paid-review{display:none;gap:16px}.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-paid-review,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-paid-review{display:grid}.assistant-overlay[data-assistant-selected-path="new"] .assistant-confirm>label{display:none}.assistant-overlay[data-assistant-selected-path="new"] .assistant-confirm{grid-template-columns:1fr}.assistant-overlay[data-assistant-selected-path="new"] .assistant-start{justify-self:end}.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-review-details,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-review-details{display:none}.assistant-paid-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.assistant-paid-head strong{font-family:Georgia,"Times New Roman",serif;font-size:21px;font-weight:500;color:var(--ink)}.assistant-paid-head span{display:inline-flex;align-items:center;min-height:26px;padding:0 9px;border:1px solid rgba(214,155,49,.30);border-radius:999px;background:rgba(255,246,228,.76);color:#8d5707;font-size:11px;font-weight:780}.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-paid-head span{border-color:rgba(21,158,153,.28);background:rgba(233,249,248,.76);color:var(--live)}.assistant-paid-boundary{margin:0;padding:11px 13px;border-left:3px solid var(--sun);background:rgba(255,246,228,.58);color:#694a18;font-size:12px;line-height:1.45}.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-paid-boundary{border-left-color:var(--sea);background:rgba(233,249,248,.62);color:#195b5c}.assistant-paid-policy{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin:0;border-top:1px solid rgba(210,226,234,.86);border-left:1px solid rgba(210,226,234,.86);border-radius:8px;overflow:hidden}.assistant-paid-policy>div{min-width:0;padding:10px 12px;border-right:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86);background:rgba(255,255,255,.76)}.assistant-paid-policy>div[data-paid-wide]{grid-column:1/-1}.assistant-paid-policy dt{color:var(--muted);font-size:10px;font-weight:720;text-transform:uppercase;letter-spacing:.045em}.assistant-paid-policy dd{margin:4px 0 0;color:var(--ink);font-size:12px;line-height:1.4;overflow-wrap:anywhere}.assistant-paid-policy code{font-size:10px;color:#315d7c}.assistant-paid-label-list{display:flex;flex-wrap:wrap;gap:6px;margin:0;padding:0;list-style:none}.assistant-paid-label-list li{padding:3px 7px;border:1px solid rgba(210,226,234,.88);border-radius:999px;background:rgba(247,252,253,.92);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px}.assistant-paid-next{display:grid;gap:3px;padding:11px 13px;border:1px solid rgba(210,226,234,.84);border-radius:8px;background:rgba(247,252,253,.74)}.assistant-paid-next strong{font-size:12px}.assistant-paid-next p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-paid-authorization{margin:0;color:var(--muted);font-size:11px}.assistant-paid-authorization strong{color:var(--ink)}
+.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-paid-review{display:grid}.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-review-details{display:none}.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-paid-head span{border-color:rgba(21,158,153,.28);background:rgba(233,249,248,.76);color:var(--live)}.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-paid-boundary{border-left-color:var(--sea);background:rgba(233,249,248,.62);color:#195b5c}
+.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-paid-review{display:grid}.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-review-details{display:none}.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-paid-head span{border-color:rgba(214,155,49,.30);background:rgba(255,246,228,.76);color:#8d5707}
 .assistant-job{grid-template-columns:28px minmax(0,1fr);align-items:start;gap:12px;padding:18px;border:1px solid rgba(103,177,196,.34);border-radius:8px;background:rgba(239,249,250,.72)}.assistant-job>div{display:grid;gap:4px}.assistant-job strong{font-size:15px}.assistant-job span{font-size:12px}.assistant-job-spinner{width:22px;height:22px;border:2px solid rgba(21,158,153,.18);border-top-color:var(--sea);border-radius:50%;animation:assistantSpin .8s linear infinite}.assistant-error{padding:11px 13px;border:1px solid rgba(191,58,53,.24);border-radius:7px;background:rgba(255,238,235,.72);color:#8f312d;font-size:12px;line-height:1.4}.assistant-next,.assistant-progress{display:none!important}
+@supports (height:100dvh){.assistant-overlay{min-height:100dvh}.assistant-sheet{max-height:calc(100dvh - 48px)}}
 @keyframes assistantSpin{to{transform:rotate(360deg)}}
-@media (max-width:640px){.assistant-overlay{padding:10px}.assistant-sheet{max-height:calc(100vh - 20px)}.assistant-head{padding:20px}.assistant-head-copy{gap:10px}.assistant-head h2{font-size:27px}.assistant-head p{font-size:13px}.assistant-nav-back span{display:none}.assistant-body{padding:22px 20px 24px}.assistant-paths,.assistant-primary-fields,.assistant-preflight-facts,.assistant-review-technical{grid-template-columns:1fr}.assistant-path{min-height:190px;padding:24px}.assistant-path .onboard-mark{width:68px;height:68px;box-shadow:0 0 0 9px rgba(21,158,153,.07)}.assistant-path:nth-child(2) .onboard-mark{box-shadow:0 0 0 9px rgba(214,155,49,.07)}.assistant-path .onboard-mark .ico{width:30px;height:30px}.assistant-path strong{font-size:20px}.assistant-confirm{grid-template-columns:1fr}.assistant-start{width:100%}}
+@media (max-width:640px){.assistant-overlay{padding:10px 10px max(10px,env(safe-area-inset-bottom))}.assistant-sheet{max-height:calc(100dvh - 20px)}.assistant-head{padding:20px}.assistant-head-copy{gap:10px}.assistant-head h2{font-size:27px}.assistant-head p{font-size:13px}.assistant-nav-back span{display:none}.assistant-body{padding:22px 20px max(24px,env(safe-area-inset-bottom))}.assistant-paths,.assistant-primary-fields,.assistant-preflight-facts,.assistant-review-technical,.assistant-paid-policy{grid-template-columns:1fr}.assistant-paid-policy>div[data-paid-wide]{grid-column:auto}.assistant-path{min-height:190px;padding:24px}.assistant-path .onboard-mark{width:68px;height:68px;box-shadow:0 0 0 9px rgba(21,158,153,.07)}.assistant-path:nth-child(2) .onboard-mark{box-shadow:0 0 0 9px rgba(214,155,49,.07)}.assistant-path .onboard-mark .ico{width:30px;height:30px}.assistant-path strong{font-size:20px}.assistant-confirm{grid-template-columns:1fr}.assistant-start,.assistant-overlay[data-assistant-selected-path="new"] .assistant-start{width:100%;min-height:44px;justify-self:stretch}}
 .map-main{width:min(1380px,100%)}
 .map-main[data-map-view="maximized"]{width:100%}
 .map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
@@ -5308,7 +6297,8 @@ function writeAssistantUrl(open,path='',provider='',template='',stage='choose'){
     if(safePath==='existing')safeStage=['bootstrap','plan'].includes(assistantStage(stage))?assistantStage(stage):'existing';
     const jobId=(document.querySelector('[data-setup-assistant]')?.dataset.assistantJobId||'').trim();
     if(jobId&&jobId.length<=128){
-      safeStage='job';
+      const paidStage=document.querySelector('[data-setup-assistant]')?.dataset.assistantPaidStage||'';
+      safeStage=['reviewed','authorized','claimed','reconcile'].includes(paidStage)?'plan':'job';
       params.set(ASSISTANT_JOB_PARAM,jobId);
     }else{
       params.delete(ASSISTANT_JOB_PARAM);
@@ -5332,7 +6322,7 @@ function syncAssistantNext(overlay){
   const title=overlay.querySelector('#setup-assistant-title');
   const copy=title?.parentElement?.querySelector('p');
   const back=overlay.querySelector('[data-assistant-step-back]');
-  if(back)back.hidden=stage==='choose'||stage==='job'||overlay.dataset.providerCreated==='true';
+  if(back)back.hidden=stage==='choose'||stage==='job'||overlay.dataset.providerCreated==='true'||Boolean(overlay.dataset.assistantJobId);
   if(stage==='template'){
     if(title)title.textContent=provider==='manual-import'?'Connect a server':'New server';
     if(copy)copy.textContent=provider==='manual-import'?'Choose the provider handoff.':'Choose a starting point.';
@@ -5343,8 +6333,9 @@ function syncAssistantNext(overlay){
     if(title)title.textContent='Choose setup';
     if(copy)copy.textContent='Pick the available installation method.';
   }else if(stage==='plan'&&path==='new'){
-    if(title)title.textContent='Review server';
-    if(copy)copy.textContent='Nothing has been created yet.';
+    const paidStage=overlay.dataset.assistantPaidStage||'';
+    if(title)title.textContent=paidStage==='reconcile'?'Check provider result':paidStage==='claimed'?'Continue authorized create':paidStage==='authorized'?'Create authorized server':paidStage==='reviewed'?'Authorize paid plan':'Review server';
+    if(copy)copy.textContent=paidStage==='reconcile'?'Pharos will inspect exact ownership labels without replaying the paid request.':paidStage==='claimed'?'The create is durably claimed, but the provider request has not started.':paidStage?'The exact provider plan is persisted. Nothing has been created yet.':'Nothing has been created yet.';
   }else if(stage==='plan'&&path==='existing'){
     if(title)title.textContent='Review setup';
     if(copy)copy.textContent='No host changes have been started yet.';
@@ -5419,10 +6410,9 @@ function updateAssistantReview(overlay){
   const advancedLabel=overlay.querySelector('[data-assistant-advanced-label]');
   const confirmCopy=overlay.querySelector('[data-assistant-confirm-copy]');
   const start=overlay.querySelector('[data-assistant-start]');
-  if(reviewing&&state.path==='new'){
+  if(reviewing&&state.path==='new'&&!['reviewed','authorized'].includes(overlay.dataset.assistantPaidStage||'')){
     if(advancedLabel)advancedLabel.textContent='Advanced server options';
-    if(confirmCopy)confirmCopy.textContent='I understand this creates a paid cloud server.';
-    if(assistantStartLabel(start)!=='Starting setup')setAssistantStartLabel(start,'Create server');
+    if(assistantStartLabel(start)!=='Saving review')setAssistantStartLabel(start,'Review paid plan');
     const location=assistantReviewValue(overlay,'[data-new-location]');
     const serverType=assistantReviewValue(overlay,'[data-new-server-type]');
     const template=SETUP_TEMPLATE_REVIEW[state.template]||'NixOS server';
@@ -5465,6 +6455,7 @@ function providerPlanResourceTitle(resource){
   return String(resource?.key||'provider resource').replace(/_/g,' ').replace(/\b\w/g,letter=>letter.toUpperCase());
 }
 let currentProviderCatalog=null;
+let assistantReturnFocus=null;
 function providerPlanAvailability(serverType,location){
   return (Array.isArray(serverType?.locations)?serverType.locations:[]).find(item=>item?.name===location&&item?.available&&item?.monthly_gross);
 }
@@ -5548,14 +6539,20 @@ function updateProviderReadiness(overlay){
   const sshKey=assistantReviewValue(overlay,'[data-new-ssh-key]');
   const keyReady=Boolean(runtime?.default_ssh_key_configured||sshKey);
   const planReady=Boolean(assistantReviewValue(overlay,'[data-new-location]')&&assistantReviewValue(overlay,'[data-new-server-type]'));
-  const ready=Boolean(runtime?.provider_ready&&keyReady&&planReady);
+  const durableReady=runtime?.durable_job_store_ready===true;
+  const projectAvailable=runtime?.paid_project_available===true;
+  const ready=Boolean(runtime?.provider_ready&&durableReady&&projectAvailable&&keyReady&&planReady);
   if(readiness){
     readiness.dataset.state=ready?'ready':'blocked';
     const message=readiness.querySelector('span');
     if(message){
       message.textContent=ready
         ? 'Provider connection, SSH public key, and firewall are ready.'
-        : runtime?.message||'Provider readiness could not be verified.';
+        : !durableReady
+          ? 'Configure durable Pharos persistence before reviewing a paid server.'
+          : !projectAvailable
+            ? 'Resolve the existing paid attempt or tracked server before starting another.'
+            : runtime?.message||'Provider readiness could not be verified.';
     }
     const setup=readiness.querySelector('[data-provider-setup]');
     if(setup){
@@ -5573,6 +6570,11 @@ function syncAssistantStart(overlay){
   const confirmed=Boolean(overlay.querySelector('[data-assistant-confirm]')?.checked);
   if(!start)return;
   if(state.path==='new'){
+    const paidStage=overlay.dataset.assistantPaidStage||'';
+    if(['reviewed','authorized','claimed','reconcile'].includes(paidStage)){
+      start.disabled=overlay.dataset.assistantPaidActionPending==='true'||!overlay.pharosProvisioningJob?.reviewed_plan;
+      return;
+    }
     const runtime=overlay.pharosProviderRuntime||null;
     const keyReady=Boolean(runtime?.default_ssh_key_configured||assistantReviewValue(overlay,'[data-new-ssh-key]'));
     const inputsReady=[
@@ -5582,7 +6584,7 @@ function syncAssistantStart(overlay){
       '[data-new-server-type]',
       '[data-new-image]'
     ].every(selector=>Boolean(assistantReviewValue(overlay,selector)));
-    start.disabled=!(confirmed&&runtime?.provider_ready&&keyReady&&inputsReady);
+    start.disabled=!(runtime?.provider_ready&&runtime?.durable_job_store_ready===true&&runtime?.paid_project_available===true&&runtime?.project_label_configured&&keyReady&&inputsReady);
   }else{
     start.disabled=!confirmed;
   }
@@ -5594,6 +6596,7 @@ async function loadProviderPlanReview(overlay){
   updateProviderReadiness(overlay);
   const params=new URLSearchParams({provider:state.provider,template:state.template});
   const response=await fetch(`/setup/provider-plan.json?${params.toString()}`,{
+    credentials:'same-origin',
     headers:{'accept':'application/json'},
     cache:'no-store'
   });
@@ -5616,6 +6619,159 @@ function providerSshLabel(resource){
   const user=ssh.user?`${ssh.user}@`:'';
   const port=ssh.port&&Number(ssh.port)!==22?`:${ssh.port}`:'';
   return `${user}${ssh.host}${port}`;
+}
+function paidPlanExpired(job){
+  const expiresAt=Number(job?.reviewed_plan?.expires_at||0);
+  return !Number.isFinite(expiresAt)||expiresAt<=Math.floor(Date.now()/1000);
+}
+function paidPlanTimeLabel(seconds){
+  const instant=new Date(Number(seconds)*1000);
+  if(!Number.isFinite(instant.getTime()))return 'Invalid expiry';
+  return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(instant);
+}
+function setPaidPlanTime(overlay,selector,seconds,fallback='not recorded'){
+  const node=overlay.querySelector(selector);
+  if(!node)return;
+  const instant=new Date(Number(seconds)*1000);
+  if(!Number.isFinite(instant.getTime())||Number(seconds)<=0){
+    node.textContent=fallback;
+    node.removeAttribute('datetime');
+    return;
+  }
+  node.textContent=paidPlanTimeLabel(seconds);
+  node.dateTime=instant.toISOString();
+}
+function setPaidPlanText(overlay,selector,value){
+  const node=overlay.querySelector(selector);
+  if(node)node.textContent=String(value||'not recorded');
+}
+function renderPaidPlanReview(overlay,job,authoritative=false){
+  const plan=job?.reviewed_plan;
+  if(!overlay||!job?.id||!plan)return false;
+  if(authoritative)delete overlay.dataset.assistantPaidActionPending;
+  delete overlay.dataset.providerCreated;
+  overlay.dataset.assistantSelectedPath='new';
+  overlay.dataset.assistantSelectedProvider='hetzner-cloud';
+  overlay.dataset.assistantSelectedTemplate=assistantTemplate(job.template||'')||'hetzner-small-nixos';
+  overlay.dataset.assistantStage='plan';
+  overlay.dataset.assistantJobId=job.id;
+  const executionState=String(job.paid_execution?.state||'');
+  const claimed=executionState==='claimed';
+  const reconciling=['request-started','uncertain'].includes(executionState);
+  overlay.dataset.assistantPaidStage=reconciling?'reconcile':claimed?'claimed':job.paid_authorization?'authorized':'reviewed';
+  overlay.pharosProvisioningJob=job;
+  const jobBox=overlay.querySelector('[data-assistant-job]');
+  const created=overlay.querySelector('[data-assistant-created]');
+  if(jobBox)jobBox.hidden=true;
+  if(created)created.hidden=true;
+  const hostName=overlay.querySelector('[data-new-host-name]');
+  if(hostName&&job.host_name)hostName.value=job.host_name;
+  const currency=plan.price_currency||'';
+  setPaidPlanText(overlay,'[data-paid-server-name]',plan.server_name);
+  setPaidPlanText(overlay,'[data-paid-provider-project]',plan.provider_project);
+  setPaidPlanText(overlay,'[data-paid-region]',[plan.location_label,plan.location].filter(Boolean).join(' · '));
+  setPaidPlanText(overlay,'[data-paid-server-type]',[plan.server_type_label,plan.server_type].filter(Boolean).join(' · '));
+  setPaidPlanText(overlay,'[data-paid-image]',plan.image);
+  setPaidPlanText(overlay,'[data-paid-price-hourly]',`${plan.price_hourly_gross} ${currency} / hour`);
+  setPaidPlanText(overlay,'[data-paid-price-monthly]',`${plan.price_monthly_gross} ${currency} / month`);
+  setPaidPlanText(overlay,'[data-paid-cap-hourly]',`${plan.max_hourly_gross} ${currency} / hour`);
+  setPaidPlanText(overlay,'[data-paid-cap-monthly]',`${plan.max_monthly_gross} ${currency} / month`);
+  setPaidPlanText(overlay,'[data-paid-max-active]',`${plan.max_active_servers} maximum · ${plan.observed_active_servers} currently observed`);
+  setPaidPlanText(overlay,'[data-paid-ssh-key]',plan.ssh_key_ref);
+  setPaidPlanText(overlay,'[data-paid-firewall]',plan.firewall_ref);
+  setPaidPlanText(overlay,'[data-paid-operations]',(Array.isArray(plan.allowed_operations)?plan.allowed_operations:[]).join(', '));
+  setPaidPlanText(overlay,'[data-paid-cleanup]',plan.cleanup_policy);
+  setPaidPlanText(overlay,'[data-paid-plan-hash]',plan.plan_sha256);
+  setPaidPlanTime(overlay,'[data-paid-catalog-refreshed]',plan.catalog_refreshed_at);
+  setPaidPlanTime(overlay,'[data-paid-expiry]',plan.expires_at);
+  setPaidPlanTime(overlay,'[data-paid-confirmed-at]',job.paid_authorization?.confirmed_at,'not authorized');
+  const executionFacts=[];
+  if(executionState)executionFacts.push(executionState);
+  if(job.paid_execution?.claimed_at)executionFacts.push(`claimed ${paidPlanTimeLabel(job.paid_execution.claimed_at)}`);
+  if(job.paid_execution?.provider_request_started_at)executionFacts.push(`provider request started ${paidPlanTimeLabel(job.paid_execution.provider_request_started_at)}`);
+  setPaidPlanText(overlay,'[data-paid-execution-state]',executionFacts.join(' · ')||'not started');
+  const labels=overlay.querySelector('[data-paid-labels]');
+  if(labels){
+    labels.replaceChildren();
+    Object.entries(plan.required_labels||{}).sort(([left],[right])=>left.localeCompare(right)).forEach(([key,value])=>{
+      const item=document.createElement('li');
+      item.textContent=`${key}=${value}`;
+      labels.append(item);
+    });
+  }
+  const authorized=Boolean(job.paid_authorization);
+  const expired=paidPlanExpired(job)&&!claimed;
+  const stage=overlay.querySelector('[data-paid-stage-status]');
+  const boundary=overlay.querySelector('[data-paid-billing-boundary]');
+  const next=overlay.querySelector('[data-paid-next-step]');
+  const authorization=overlay.querySelector('[data-paid-authorization]');
+  const operator=overlay.querySelector('[data-paid-operator]');
+  if(stage)stage.textContent=reconciling?'Create result check required':expired?'Review expired':claimed?'Authorized create claimed':authorized?'Authorized':'Persisted review';
+  if(boundary){
+    boundary.textContent=reconciling
+      ? 'The paid attempt is already claimed. Pharos will check exact ownership labels and reviewed server facts and will not send a duplicate create request.'
+      : expired
+        ? 'This review expired without creating a server or starting billing.'
+      : claimed
+        ? 'The paid create is durably claimed, but no provider request has started. Continuing may send the one authorized create request after fresh live checks.'
+      : authorized
+        ? 'Authorization is stored, but no server exists yet. Billing can begin only after Create sends the one allowed provider request and Hetzner accepts it.'
+        : 'Token enrollment, read-only testing, review, and authorization create nothing. Billing begins only when Hetzner accepts server creation.';
+  }
+  if(next){
+    next.textContent=reconciling
+      ? 'Check the provider result. One exact ownership-and-server-fact match is adopted; zero or multiple matches stop for manual review.'
+      : expired
+        ? 'Return to the editable choices and persist a fresh current review.'
+      : claimed
+        ? 'Continue the authorized create. The server enforces the authorization expiry, then rechecks the exact plan before it may send the one allowed provider request.'
+      : authorized
+        ? 'Create this exact server before the authorization expires. Pharos rechecks price and inventory first.'
+        : 'Authorize this exact persisted plan before it expires. Authorization still does not create the server.';
+  }
+  if(authorization){
+    authorization.hidden=!authorized;
+    if(operator)operator.textContent=job.paid_authorization?.operator_label||'the authenticated operator';
+  }
+  syncAssistantNext(overlay);
+  const start=overlay.querySelector('[data-assistant-start]');
+  setAssistantStartLabel(start,reconciling?'Check provider result':expired?'Review again':claimed?'Continue authorized create':authorized?'Create server':'Allow one paid server');
+  syncAssistantStart(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
+  const paidReview=overlay.querySelector('[data-paid-review]');
+  paidReview?.scrollIntoView({block:'nearest'});
+  if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
+    paidReview?.focus({preventScroll:true});
+  }
+  window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
+  if(!expired&&!claimed&&!reconciling){
+    const delay=Math.max(0,Math.min(2147483000,Number(plan.expires_at)*1000-Date.now()+25));
+    window.pharosAssistantPaidExpiryTimer=window.setTimeout(()=>{
+      if(!overlay.hidden&&overlay.pharosProvisioningJob?.id===job.id)renderPaidPlanReview(overlay,overlay.pharosProvisioningJob);
+    },delay);
+  }
+  return true;
+}
+function renderAssistantProvisioningJob(overlay,job){
+  const executionState=String(job?.paid_execution?.state||'');
+  if(job?.provider==='hetzner-cloud'&&job?.reviewed_plan&&(!executionState||['claimed','request-started','uncertain'].includes(executionState))){
+    return renderPaidPlanReview(overlay,job,true);
+  }
+  renderProvisioningJob(overlay,job);
+  return false;
+}
+function resetPaidPlanReview(overlay){
+  window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
+  delete overlay.dataset.assistantPaidActionPending;
+  delete overlay.dataset.assistantJobId;
+  delete overlay.dataset.assistantPaidStage;
+  overlay.pharosProvisioningJob=null;
+  overlay.dataset.assistantStage='plan';
+  showAssistantError(overlay);
+  syncAssistantNext(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
 }
 function renderProviderCreatedResult(overlay,job){
   const result=overlay?.querySelector('[data-assistant-created]');
@@ -5706,6 +6862,8 @@ function renderProviderCreatedResult(overlay,job){
 }
 function renderProvisioningJob(overlay,job){
   if(!overlay||!job)return;
+  delete overlay.dataset.assistantPaidActionPending;
+  delete overlay.dataset.assistantPaidStage;
   overlay.dataset.assistantJobId=job.id||'';
   overlay.dataset.assistantStage='job';
   const title=overlay.querySelector('#setup-assistant-title');
@@ -5742,6 +6900,11 @@ function renderProvisioningJob(overlay,job){
   if(jobMessage)jobMessage.textContent=message;
   const state=assistantState(overlay);
   writeAssistantUrl(true,state.path,state.provider,state.template,'job');
+  if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
+    const focusTarget=providerCreated?overlay.querySelector('[data-assistant-created]'):jobBox;
+    focusTarget?.setAttribute('tabindex','-1');
+    focusTarget?.focus({preventScroll:true});
+  }
 }
 function preflightBoolValue(overlay,name){
   const value=overlay.querySelector(`[data-preflight-fact="${name}"]`)?.value||'';
@@ -5921,12 +7084,99 @@ async function runExistingPreflight(overlay,button){
 }
 async function fetchProvisioningJob(id){
   const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(id)}`,{
+    credentials:'same-origin',
     headers:{'accept':'application/json'},
     cache:'no-store'
   });
   const payload=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(payload.error||'setup job could not be loaded');
   return payload.job;
+}
+async function recoverPaidJobAfterActionError(overlay){
+  const job=overlay?.pharosProvisioningJob;
+  if(!job?.id||!job?.reviewed_plan)return false;
+  try{
+    const latest=await fetchProvisioningJob(job.id);
+    renderAssistantProvisioningJob(overlay,latest);
+  }catch(_error){
+    window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
+    overlay.dataset.assistantPaidActionPending='true';
+    const title=overlay.querySelector('#setup-assistant-title');
+    const copy=title?.parentElement?.querySelector('p');
+    const start=overlay.querySelector('[data-assistant-start]');
+    if(title)title.textContent='Create result unknown';
+    if(copy)copy.textContent='Pharos could not reload the durable attempt. Do not retry the paid action until status can be checked.';
+    if(start){start.disabled=true;setAssistantStartLabel(start,'Reload status to continue')}
+    syncAssistantStart(overlay);
+  }
+  return true;
+}
+async function confirmPaidProvisioningJob(overlay,start){
+  const job=overlay?.pharosProvisioningJob;
+  const plan=job?.reviewed_plan;
+  if(!job?.id||!plan?.plan_sha256)throw new Error('Persist the exact paid plan before authorizing it.');
+  if(paidPlanExpired(job)&&overlay.dataset.assistantPaidStage!=='reconcile'){
+    resetPaidPlanReview(overlay);
+    await loadProviderPlanReview(overlay);
+    return;
+  }
+  overlay.dataset.assistantPaidActionPending='true';
+  setAssistantStartLabel(start,'Authorizing');
+  start.disabled=true;
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/confirm`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({plan_sha256:plan.plan_sha256,attended:true}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok){
+    if(response.status===409){resetPaidPlanReview(overlay);await loadProviderPlanReview(overlay)}
+    throw new Error(payload.error||'The exact paid plan could not be authorized.');
+  }
+  if(!renderPaidPlanReview(overlay,payload.job,true))throw new Error('The authorized plan response was incomplete.');
+}
+async function createPaidProvisioningJob(overlay,start){
+  const job=overlay?.pharosProvisioningJob;
+  const plan=job?.reviewed_plan;
+  const executionState=String(job?.paid_execution?.state||'');
+  if(!job?.id||!plan?.plan_sha256||!job?.paid_authorization){
+    throw new Error('Authorize the exact persisted plan before creating the server.');
+  }
+  if(paidPlanExpired(job)&&overlay.dataset.assistantPaidStage!=='reconcile'&&executionState!=='claimed'){
+    resetPaidPlanReview(overlay);
+    await loadProviderPlanReview(overlay);
+    return;
+  }
+  overlay.dataset.assistantPaidActionPending='true';
+  setAssistantStartLabel(start,'Creating server');
+  start.disabled=true;
+  const title=overlay.querySelector('#setup-assistant-title');
+  const copy=title?.parentElement?.querySelector('p');
+  if(title)title.textContent='Creating authorized server';
+  if(copy)copy.textContent='Pharos is rechecking the exact plan before sending one provider request.';
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/create`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({plan_sha256:plan.plan_sha256}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok){
+    if(payload.job?.paid_execution?.state==='failed-closed'){
+      resetPaidPlanReview(overlay);
+      await loadProviderPlanReview(overlay);
+      return;
+    }
+    if(payload.job?.reviewed_plan)renderAssistantProvisioningJob(overlay,payload.job);
+    else if(response.status===409){resetPaidPlanReview(overlay);await loadProviderPlanReview(overlay)}
+    throw new Error(payload.error||'The authorized server could not be created.');
+  }
+  if(!payload.job)throw new Error('The provider create response was incomplete.');
+  renderProvisioningJob(overlay,payload.job);
+  if(payload.job.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
 }
 async function deleteTrackedProviderServer(overlay,button){
   const job=overlay?.pharosProvisioningJob;
@@ -5939,7 +7189,8 @@ async function deleteTrackedProviderServer(overlay,button){
   if(status)status.textContent='Deleting the tracked server…';
   const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/cleanup`,{
     method:'POST',
-    headers:{'content-type':'application/json','accept':'application/json'},
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
     body:JSON.stringify({confirm:true}),
     cache:'no-store'
   });
@@ -5963,6 +7214,12 @@ function scheduleProvisioningPoll(overlay,id){
 }
 async function startProvisioningJob(overlay,start){
   const state=assistantState(overlay);
+  const paidJob=overlay.pharosProvisioningJob;
+  if(state.path==='new'&&state.provider==='hetzner-cloud'&&paidJob?.reviewed_plan){
+    if(paidJob.paid_authorization)await createPaidProvisioningJob(overlay,start);
+    else await confirmPaidProvisioningJob(overlay,start);
+    return;
+  }
   const body={provider:state.provider,template:state.template};
   body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
   body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
@@ -5991,7 +7248,7 @@ async function startProvisioningJob(overlay,start){
     if(serverType)body.server_type=serverType;
     if(image)body.image=image;
     if(sshKey)body.ssh_key_ref=sshKey;
-    body.apply=true;
+    body.apply=false;
   }else if(state.path==='existing'){
     const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
     const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
@@ -6017,19 +7274,26 @@ async function startProvisioningJob(overlay,start){
     }
     body.apply=true;
   }
-  setAssistantStartLabel(start,'Starting setup');
+  setAssistantStartLabel(start,state.path==='new'?'Saving review':'Starting setup');
   start.disabled=true;
+  const headers={'content-type':'application/json','accept':'application/json'};
+  if(state.path==='new'&&state.provider==='hetzner-cloud')headers['X-Pharos-Action']='1';
   const response=await fetch('/setup/provisioning-jobs',{
     method:'POST',
-    headers:{'content-type':'application/json','accept':'application/json'},
+    credentials:'same-origin',
+    headers,
     body:JSON.stringify(body),
     cache:'no-store'
   });
   const payload=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(payload.error||'setup job could not be started');
-  renderProvisioningJob(overlay,payload.job);
-  setAssistantStartLabel(start,'Setup job recorded');
-  if(payload.job?.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
+  if(state.path==='new'&&state.provider==='hetzner-cloud'){
+    if(!renderPaidPlanReview(overlay,payload.job,true))throw new Error('The persisted paid-plan response was incomplete.');
+  }else{
+    renderProvisioningJob(overlay,payload.job);
+    setAssistantStartLabel(start,'Setup job recorded');
+    if(payload.job?.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
+  }
 }
 function setAssistantTemplate(template,write=true){
   const overlay=document.querySelector('[data-setup-assistant]');
@@ -6078,7 +7342,9 @@ function setAssistantPath(path,write=true){
   overlay.dataset.assistantSelectedPath=safePath;
   if(safePath!==previousPath){
     delete overlay.dataset.assistantJobId;
+    delete overlay.dataset.assistantPaidStage;
     overlay.dataset.existingBootstrapMethod='';
+    overlay.pharosProvisioningJob=null;
     overlay.pharosExistingPreflight=null;
     overlay.pharosProviderPlan=null;
     overlay.pharosProviderRuntime=null;
@@ -6118,12 +7384,16 @@ function setAssistantPath(path,write=true){
 function setAssistantOpen(open,write=true){
   const overlay=document.querySelector('[data-setup-assistant]');
   if(!overlay)return;
+  const wasHidden=overlay.hidden;
+  if(open&&wasHidden&&document.activeElement instanceof HTMLElement)assistantReturnFocus=document.activeElement;
   overlay.hidden=!open;
   document.body.dataset.assistantOpen=open?'true':'false';
   if(!open){
     window.clearTimeout(window.pharosAssistantJobTimer);
+    window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
     delete overlay.dataset.providerCreated;
     delete overlay.dataset.assistantJobId;
+    delete overlay.dataset.assistantPaidStage;
     overlay.pharosProvisioningJob=null;
     const created=overlay.querySelector('[data-assistant-created]');
     if(created)created.hidden=true;
@@ -6140,6 +7410,10 @@ function setAssistantOpen(open,write=true){
     writeAssistantUrl(open,state.path,state.provider,state.template,state.stage);
   }
   if(open)overlay.querySelector('[data-assistant-path]')?.focus();
+  else if(!wasHidden&&assistantReturnFocus?.isConnected){
+    assistantReturnFocus.focus();
+    assistantReturnFocus=null;
+  }
 }
 function restoreAssistantFromUrl(){
   const overlay=document.querySelector('[data-setup-assistant]');
@@ -6151,21 +7425,26 @@ function restoreAssistantFromUrl(){
     setAssistantPath('',false);
     return;
   }
-  const jobId=(params.get(ASSISTANT_JOB_PARAM)||'').trim();
-  if(jobId&&jobId.length<=128){
-    fetchProvisioningJob(jobId).then(job=>{
-      renderProvisioningJob(overlay,job);
-      if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,job.id);
-    }).catch(error=>{
-      showAssistantError(overlay,error.message||'The setup job could not be loaded.');
-    });
-    return;
-  }
   const path=assistantPath(params.get(ASSISTANT_PATH_PARAM));
   setAssistantPath(path,false);
   if(path==='new'){
     setAssistantProvider(assistantProvider(params.get(ASSISTANT_PROVIDER_PARAM))||'hetzner-cloud',false);
     setAssistantTemplate(params.get(ASSISTANT_TEMPLATE_PARAM),false);
+  }
+  const jobId=(params.get(ASSISTANT_JOB_PARAM)||'').trim();
+  if(jobId&&jobId.length<=128){
+    fetchProvisioningJob(jobId).then(job=>{
+      const paidReview=renderAssistantProvisioningJob(overlay,job);
+      if(!paidReview&&!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,job.id);
+    }).catch(error=>{
+      showAssistantError(overlay,error.message||'The setup job could not be loaded.');
+      if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
+        overlay.querySelector('[data-assistant-close]')?.focus();
+      }
+    });
+    return;
+  }
+  if(path==='new'){
     const requestedStage=assistantStage(params.get(ASSISTANT_STAGE_PARAM));
     overlay.dataset.assistantStage=assistantState(overlay).template&&requestedStage==='plan'?'plan':'template';
     syncAssistantNext(overlay);
@@ -6183,7 +7462,30 @@ function initSetupAssistant(){
   document.querySelectorAll('[data-onboard-open]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(true)));
   overlay.querySelectorAll('[data-assistant-close]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(false)));
   overlay.addEventListener('click',event=>{if(event.target===overlay)setAssistantOpen(false)});
-  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!overlay.hidden)setAssistantOpen(false)});
+  document.addEventListener('keydown',event=>{
+    if(overlay.hidden)return;
+    if(event.key==='Escape'){
+      setAssistantOpen(false);
+      return;
+    }
+    if(event.key!=='Tab')return;
+    const focusable=[...overlay.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])')]
+      .filter(node=>node.getClientRects().length>0&&!node.closest('[hidden]'));
+    if(!focusable.length){
+      event.preventDefault();
+      overlay.querySelector('[data-assistant-close]')?.focus();
+      return;
+    }
+    const first=focusable[0];
+    const last=focusable[focusable.length-1];
+    if(!focusable.includes(document.activeElement)){
+      event.preventDefault();
+      (event.shiftKey?last:first).focus();
+      return;
+    }
+    if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}
+    else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}
+  });
   overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>setAssistantPath(btn.dataset.assistantPath)));
   overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>btn.addEventListener('click',()=>setAssistantProvider(btn.dataset.assistantProvider)));
   overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>btn.addEventListener('click',()=>{
@@ -6302,8 +7604,11 @@ function initSetupAssistant(){
     try{
       await startProvisioningJob(overlay,start);
     }catch(error){
-      updateAssistantReview(overlay);
-      syncAssistantStart(overlay);
+      const paidRecovered=await recoverPaidJobAfterActionError(overlay);
+      if(!paidRecovered){
+        updateAssistantReview(overlay);
+        syncAssistantStart(overlay);
+      }
       showAssistantError(overlay,error.message||'The setup job could not be created.');
     }
   });
@@ -8225,6 +9530,26 @@ fn hetzner_setup_defaults(state: &AppState, now: i64) -> Option<serde_json::Valu
     }))
 }
 
+fn paid_setup_runtime_readiness(state: &AppState, now: i64) -> serde_json::Value {
+    let readiness = hetzner_runtime_readiness(
+        &state.provider_runtime.hetzner_cloud,
+        &state.provider_connections,
+        now,
+    );
+    let mut value = serde_json::to_value(readiness).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "durable_job_store_ready".to_string(),
+            json!(state.provisioning_jobs.durable_ready()),
+        );
+        object.insert(
+            "paid_project_available".to_string(),
+            json!(!state.provisioning_jobs.paid_project_blocked(None)),
+        );
+    }
+    value
+}
+
 async fn setup_provider_plan_json(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8245,11 +9570,7 @@ async fn setup_provider_plan_json(
             Json(json!({
                 "plan": plan,
                 "runtime": if query.provider == "hetzner-cloud" {
-                    Some(hetzner_runtime_readiness(
-                        &state.provider_runtime.hetzner_cloud,
-                        &state.provider_connections,
-                        now,
-                    ))
+                    Some(paid_setup_runtime_readiness(&state, now))
                 } else {
                     None
                 },
@@ -8281,6 +9602,15 @@ async fn create_provisioning_job(
     headers: HeaderMap,
     Json(request): Json<ProvisioningJobStartRequest>,
 ) -> impl IntoResponse {
+    if request.provider == "hetzner-cloud" && request.apply {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({
+                "error": "Direct apply is not allowed. Persist a reviewed plan, authorize that exact plan, then create it in a separate request."
+            })),
+        );
+    }
     if !access_for_headers(&state.auth, &headers).can_agora() {
         return (
             StatusCode::FORBIDDEN,
@@ -8290,7 +9620,41 @@ async fn create_provisioning_job(
     }
     let mut provider_runtime = state.provider_runtime.clone();
     if request.provider == "hetzner-cloud" {
-        match guarded_hetzner_runtime(&state, &request, now_unix()) {
+        let _serialized_paid_review = state.paid_create_lock.lock().await;
+        if let Err((status, message)) = paid_operator(&state, &headers) {
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+        if !state.provisioning_jobs.durable_ready() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                no_store_headers(),
+                Json(json!({
+                    "error": "Paid provider actions require a valid durable provisioning-job store. Configure PHAROS_DB or PHAROS_PROVISIONING_JOBS_DB and restart Pharos."
+                })),
+            );
+        }
+        if state.provisioning_jobs.paid_project_blocked(None) {
+            return (
+                StatusCode::CONFLICT,
+                no_store_headers(),
+                Json(json!({
+                    "error": "Another paid server attempt or tracked server still owns the project gate. Resolve it before starting a new paid review."
+                })),
+            );
+        }
+        let now = now_unix();
+        run_hetzner_connection_test_for(
+            &state,
+            now,
+            request.ssh_key_ref.as_deref(),
+            request.location.as_deref(),
+        )
+        .await;
+        match guarded_hetzner_runtime(&state, &request, now) {
             Ok(runtime) => provider_runtime.hetzner_cloud = runtime,
             Err((status, message)) => {
                 return (
@@ -8300,16 +9664,109 @@ async fn create_provisioning_job(
                 );
             }
         }
+        let review_operation = match HetznerOperationContext::resolve(
+            provider_runtime.hetzner_cloud.clone(),
+        ) {
+            Ok(operation) => operation,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    no_store_headers(),
+                    Json(json!({
+                        "error": "The secure provider credential could not be pinned for this review. No provider resource was created."
+                    })),
+                );
+            }
+        };
+        if verify_hetzner_image(
+            &review_operation,
+            request.image.as_deref().unwrap_or_default(),
+        )
+        .await
+        .is_err()
+        {
+            return (
+                StatusCode::CONFLICT,
+                no_store_headers(),
+                Json(json!({
+                    "error": "The selected Hetzner Cloud image is not currently available. No provider resource was created."
+                })),
+            );
+        }
+        let active_servers = match fetch_hetzner_servers(&review_operation).await {
+            Ok(servers) => servers,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    no_store_headers(),
+                    Json(json!({
+                        "error": "Current Hetzner Cloud server inventory could not be verified. No provider resource was created."
+                    })),
+                );
+            }
+        };
+        if !active_servers.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                no_store_headers(),
+                Json(json!({
+                    "error": "This Hetzner Cloud project already has an active server; the Phase 1 maximum is one. No provider resource was created."
+                })),
+            );
+        }
+        let job = match state
+            .provisioning_jobs
+            .start(&request, now, &provider_runtime)
+        {
+            Ok(job) => job,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    no_store_headers(),
+                    Json(json!({ "error": error.to_string() })),
+                );
+            }
+        };
+        let reviewed_plan = match build_reviewed_paid_plan(
+            &job,
+            &request,
+            &review_operation,
+            &state.provider_connections,
+            now,
+        ) {
+            Ok(plan) => plan,
+            Err((status, message)) => {
+                return (
+                    status,
+                    no_store_headers(),
+                    Json(json!({ "error": message })),
+                );
+            }
+        };
+        return match state
+            .provisioning_jobs
+            .attach_paid_review(&job.id, reviewed_plan, now)
+        {
+            Ok(job) => (
+                StatusCode::CREATED,
+                no_store_headers(),
+                Json(json!({ "job": job })),
+            ),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                no_store_headers(),
+                Json(json!({
+                    "error": "The reviewed plan could not be durably stored. No provider resource was created."
+                })),
+            ),
+        };
     }
     match state
         .provisioning_jobs
         .start(&request, now_unix(), &provider_runtime)
     {
         Ok(job) => {
-            let job = if should_run_hetzner_executor(&request, &job) {
-                execute_hetzner_setup_job(&state, &request, job, &provider_runtime.hetzner_cloud)
-                    .await
-            } else if should_run_existing_host_executor(&state, &request, &job) {
+            let job = if should_run_existing_host_executor(&state, &request, &job) {
                 execute_existing_host_setup_job(&state, &request, job).await
             } else {
                 job
@@ -8328,6 +9785,882 @@ async fn create_provisioning_job(
     }
 }
 
+fn paid_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String), (StatusCode, &'static str)> {
+    if !action_request_header(headers) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "A fresh attended action confirmation is required.",
+        ));
+    }
+    if !access_for_headers(&state.auth, headers).can_manage_fleet() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Fleet management access is required for paid provider actions.",
+        ));
+    }
+    let Some(auth) = state.auth.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Paid provider actions require configured OIDC authentication.",
+        ));
+    };
+    let Some(user) = auth.current_user(headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Sign in again before reviewing or authorizing paid provider work.",
+        ));
+    };
+    if !safe_paid_display_text(&user.display_name, 200) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "The authenticated operator identity is not safe to record.",
+        ));
+    }
+    Ok((user.operator_ref, user.display_name))
+}
+
+fn build_reviewed_paid_plan(
+    job: &ProvisioningJob,
+    request: &ProvisioningJobStartRequest,
+    operation: &HetznerOperationContext,
+    connections: &ProviderConnectionStore,
+    now: i64,
+) -> Result<ProvisioningReviewedPaidPlan, (StatusCode, &'static str)> {
+    let runtime = &operation.runtime;
+    let catalog = connections
+        .catalog_if_fresh(now, runtime.evidence_ttl_secs)
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Current Hetzner Cloud catalog evidence is not available.",
+        ))?;
+    let location = request
+        .location
+        .as_deref()
+        .ok_or((StatusCode::BAD_REQUEST, "Choose a server location."))?;
+    let server_type = request
+        .server_type
+        .as_deref()
+        .ok_or((StatusCode::BAD_REQUEST, "Choose a current server plan."))?;
+    let selection = catalog.exact_selection(location, server_type).ok_or((
+        StatusCode::CONFLICT,
+        "That exact server plan is no longer available at the reviewed price.",
+    ))?;
+    let project = runtime.project_label.as_deref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Set the safe Hetzner Cloud project label before paid plan review.",
+    ))?;
+    let ssh_key_ref = request
+        .ssh_key_ref
+        .as_deref()
+        .or(runtime.default_ssh_key_ref.as_deref())
+        .ok_or((StatusCode::CONFLICT, "Choose a current SSH public key."))?;
+    let firewall_ref = runtime
+        .firewall_ref
+        .as_deref()
+        .ok_or((StatusCode::CONFLICT, "Choose a current provider firewall."))?;
+    let image = request
+        .image
+        .as_deref()
+        .ok_or((StatusCode::BAD_REQUEST, "Choose the reviewed server image."))?;
+    let required_labels = paid_required_labels(&job.id, project);
+    let server_name = job.host_name.as_deref().ok_or((
+        StatusCode::BAD_REQUEST,
+        "Choose the exact provider server name.",
+    ))?;
+    let mut reviewed = ProvisioningReviewedPaidPlan {
+        provider_project: project.to_string(),
+        credential_binding_sha256: operation.credential_binding_sha256.clone(),
+        server_name: server_name.to_string(),
+        location: selection.location,
+        location_label: selection.location_label,
+        server_type: selection.server_type,
+        server_type_label: format!(
+            "{} · {}",
+            selection.server_type_label, selection.hardware_summary
+        ),
+        image: image.to_string(),
+        price_currency: selection.currency,
+        price_hourly_gross: selection.hourly_gross.clone(),
+        price_monthly_gross: selection.monthly_gross.clone(),
+        max_hourly_gross: selection.hourly_gross,
+        max_monthly_gross: selection.monthly_gross,
+        observed_active_servers: 0,
+        max_active_servers: 1,
+        catalog_refreshed_at: selection.catalog_refreshed_at,
+        expires_at: now.saturating_add(runtime.approval_ttl_secs),
+        ssh_key_ref: ssh_key_ref.to_string(),
+        firewall_ref: firewall_ref.to_string(),
+        required_labels,
+        allowed_operations: vec!["create-server".to_string(), "delete-server".to_string()],
+        cleanup_policy: "No silent retry or automatic deletion. If setup fails, Pharos keeps the tracked server visible and requires separately confirmed cleanup.".to_string(),
+        plan_sha256: "0".repeat(64),
+    };
+    reviewed.plan_sha256 = reviewed_paid_plan_digest(&reviewed);
+    reviewed.validate_contract().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "The paid plan contract is invalid.",
+        )
+    })?;
+    Ok(reviewed)
+}
+
+fn paid_required_labels(job_id: &str, project: &str) -> BTreeMap<String, String> {
+    let owner_digest = hex(&Sha256::digest(project.as_bytes()));
+    BTreeMap::from([
+        ("managed-by".to_string(), "pharos".to_string()),
+        ("pharos-setup".to_string(), "tracked-job".to_string()),
+        ("pharos-owner".to_string(), owner_digest[..16].to_string()),
+        ("pharos-job".to_string(), job_id.to_string()),
+        ("pharos-attempt".to_string(), format!("{job_id}-1")),
+    ])
+}
+
+fn paid_store_error_response(error: ProvisioningPaidStoreError) -> (StatusCode, &'static str) {
+    match error {
+        ProvisioningPaidStoreError::NotFound => {
+            (StatusCode::NOT_FOUND, "The reviewed plan was not found.")
+        }
+        ProvisioningPaidStoreError::PlanMismatch => (
+            StatusCode::CONFLICT,
+            "The request does not match the exact persisted plan. Review current details again.",
+        ),
+        ProvisioningPaidStoreError::Expired => (
+            StatusCode::CONFLICT,
+            "This paid authorization has expired. Review current details again.",
+        ),
+        ProvisioningPaidStoreError::OperatorMismatch => (
+            StatusCode::FORBIDDEN,
+            "The authenticated operator does not match this paid authorization.",
+        ),
+        ProvisioningPaidStoreError::ProjectBusy => (
+            StatusCode::CONFLICT,
+            "Another paid attempt or tracked server still owns the provider project gate.",
+        ),
+        ProvisioningPaidStoreError::InvalidState => (
+            StatusCode::CONFLICT,
+            "This paid setup is not in the required state for that action.",
+        ),
+        ProvisioningPaidStoreError::ContractFailed
+        | ProvisioningPaidStoreError::PersistenceFailed => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The paid action could not be durably recorded. No new provider request was sent.",
+        ),
+    }
+}
+
+fn validate_paid_job_binding(
+    job: &ProvisioningJob,
+    plan_sha256: &str,
+    operator_ref: &str,
+) -> Result<(), ProvisioningPaidStoreError> {
+    let plan = job
+        .reviewed_plan
+        .as_ref()
+        .ok_or(ProvisioningPaidStoreError::InvalidState)?;
+    let authorization = job
+        .paid_authorization
+        .as_ref()
+        .ok_or(ProvisioningPaidStoreError::InvalidState)?;
+    if plan.plan_sha256 != plan_sha256
+        || authorization.plan_sha256 != plan_sha256
+        || reviewed_paid_plan_digest(plan) != plan_sha256
+    {
+        return Err(ProvisioningPaidStoreError::PlanMismatch);
+    }
+    let recovery_only = job.paid_execution.as_ref().is_some_and(|execution| {
+        matches!(
+            execution.state.as_str(),
+            "request-started" | "uncertain" | "created" | "reconciled" | "failed-closed"
+        )
+    });
+    if !recovery_only && authorization.operator_ref != operator_ref {
+        return Err(ProvisioningPaidStoreError::OperatorMismatch);
+    }
+    Ok(())
+}
+
+async fn revalidate_reviewed_paid_plan(
+    state: &AppState,
+    job: &ProvisioningJob,
+    now: i64,
+) -> Result<(HetznerOperationContext, Vec<HetznerListedServer>), (StatusCode, &'static str)> {
+    let reviewed = job.reviewed_plan.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "The immutable paid plan is missing. Review current details again.",
+    ))?;
+    if reviewed.validate_contract().is_err()
+        || reviewed_paid_plan_digest(reviewed) != reviewed.plan_sha256
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "The persisted paid plan no longer validates. Review current details again.",
+        ));
+    }
+    if now >= reviewed.expires_at {
+        return Err((
+            StatusCode::CONFLICT,
+            "This paid plan has expired. Review current details again.",
+        ));
+    }
+
+    run_hetzner_connection_test_for(
+        state,
+        now,
+        Some(&reviewed.ssh_key_ref),
+        Some(&reviewed.location),
+    )
+    .await;
+    let runtime = effective_hetzner_runtime(
+        &state.provider_runtime.hetzner_cloud,
+        &state.provider_connections,
+    );
+    if !runtime.credential_boundary_ready()
+        || !runtime.execute_enabled
+        || !state
+            .provider_connections
+            .ready(now, runtime.evidence_ttl_secs)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The live Hetzner Cloud credential and execution gate are not ready. No provider resource was created.",
+        ));
+    }
+    if runtime.project_label.as_deref() != Some(reviewed.provider_project.as_str()) {
+        return Err((
+            StatusCode::CONFLICT,
+            "The configured provider project label changed. Review current details again.",
+        ));
+    }
+    let catalog = state
+        .provider_connections
+        .catalog_if_fresh(now, runtime.evidence_ttl_secs)
+        .ok_or((
+            StatusCode::CONFLICT,
+            "A fresh live provider catalog is not available. Review current details again.",
+        ))?;
+    let selection = catalog
+        .exact_selection(&reviewed.location, &reviewed.server_type)
+        .ok_or((
+            StatusCode::CONFLICT,
+            "The reviewed region and server type are no longer available. Review current details again.",
+        ))?;
+    let current_server_type_label = format!(
+        "{} · {}",
+        selection.server_type_label, selection.hardware_summary
+    );
+    if selection.location != reviewed.location
+        || selection.location_label != reviewed.location_label
+        || selection.server_type != reviewed.server_type
+        || current_server_type_label != reviewed.server_type_label
+        || selection.currency != reviewed.price_currency
+        || selection.hourly_gross != reviewed.price_hourly_gross
+        || selection.monthly_gross != reviewed.price_monthly_gross
+        || compare_gross_prices(&selection.hourly_gross, &reviewed.max_hourly_gross)
+            .is_none_or(|ordering| ordering == std::cmp::Ordering::Greater)
+        || compare_gross_prices(&selection.monthly_gross, &reviewed.max_monthly_gross)
+            .is_none_or(|ordering| ordering == std::cmp::Ordering::Greater)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Provider availability, hardware, currency, or exact gross price changed. Review current details again.",
+        ));
+    }
+    if !catalog
+        .ssh_keys
+        .iter()
+        .any(|value| value == &reviewed.ssh_key_ref)
+        || !catalog
+            .firewalls
+            .iter()
+            .any(|value| value == &reviewed.firewall_ref)
+        || runtime.firewall_ref.as_deref() != Some(reviewed.firewall_ref.as_str())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "The reviewed SSH key or firewall changed. Review current details again.",
+        ));
+    }
+    if reviewed.required_labels != paid_required_labels(&job.id, reviewed.provider_project.as_str())
+        || reviewed.allowed_operations
+            != vec!["create-server".to_string(), "delete-server".to_string()]
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "The required ownership policy changed. Review current details again.",
+        ));
+    }
+    let operation = HetznerOperationContext::resolve(runtime).map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The secure provider credential could not be pinned. No provider resource was created.",
+        )
+    })?;
+    if !operation.matches_reviewed_plan(reviewed) {
+        return Err((
+            StatusCode::CONFLICT,
+            "The provider credential/project binding changed. Review current details again.",
+        ));
+    }
+    verify_hetzner_image(&operation, &reviewed.image)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "The reviewed provider image is no longer available. Review current details again.",
+            )
+        })?;
+    let servers = fetch_hetzner_servers(&operation).await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Current provider server inventory could not be verified. No provider resource was created.",
+        )
+    })?;
+    Ok((operation, servers))
+}
+
+async fn paid_reconciliation_inventory(
+    state: &AppState,
+    reviewed: &ProvisioningReviewedPaidPlan,
+) -> Result<Vec<HetznerListedServer>, (StatusCode, &'static str)> {
+    let runtime = effective_hetzner_runtime(
+        &state.provider_runtime.hetzner_cloud,
+        &state.provider_connections,
+    );
+    if !runtime.credential_boundary_ready()
+        || runtime.project_label.as_deref() != Some(reviewed.provider_project.as_str())
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The secure provider credential is unavailable for reconciliation. Pharos will not replay the paid request.",
+        ));
+    }
+    let operation = HetznerOperationContext::resolve(runtime).map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The secure provider credential is unavailable for reconciliation. Pharos will not replay the paid request.",
+        )
+    })?;
+    fetch_hetzner_servers(&operation).await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Provider inventory could not be read for reconciliation. Pharos will not replay the paid request.",
+        )
+    })
+}
+
+async fn confirm_paid_provisioning_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProvisioningPaidConfirmRequest>,
+) -> impl IntoResponse {
+    let (operator_ref, operator_label) = match paid_operator(&state, &headers) {
+        Ok(operator) => operator,
+        Err((status, message)) => {
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+    };
+    if !state.provisioning_jobs.durable_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store_headers(),
+            Json(
+                json!({ "error": "The durable provisioning-job store is unavailable; no paid action was taken." }),
+            ),
+        );
+    }
+    if state.provisioning_jobs.paid_project_blocked(Some(&id)) {
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(
+                json!({ "error": "Another paid attempt or tracked server still owns the provider project gate." }),
+            ),
+        );
+    }
+    if !request.attended {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": "Attended confirmation is required." })),
+        );
+    }
+    let Some(job) = state.provisioning_jobs.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            no_store_headers(),
+            Json(json!({ "error": "The reviewed plan was not found." })),
+        );
+    };
+    if job.reviewed_plan.as_ref().is_none_or(|plan| {
+        plan.plan_sha256 != request.plan_sha256
+            || reviewed_paid_plan_digest(plan) != request.plan_sha256
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(json!({
+                "error": "The confirmation does not match the exact persisted plan. Review current details again."
+            })),
+        );
+    }
+    let now = now_unix();
+    let (_, servers) = match revalidate_reviewed_paid_plan(&state, &job, now).await {
+        Ok(result) => result,
+        Err((status, message)) => {
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+    };
+    if !servers.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(json!({
+                "error": "The provider project already has an active server; the reviewed active-count limit no longer holds. Review current details again."
+            })),
+        );
+    }
+    match state.provisioning_jobs.confirm_paid_review(
+        &id,
+        &request.plan_sha256,
+        &operator_ref,
+        &operator_label,
+        now,
+    ) {
+        Ok(job) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "job": job })),
+        ),
+        Err(error) => {
+            let (status, message) = paid_store_error_response(error);
+            (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            )
+        }
+    }
+}
+
+fn reviewed_hetzner_provider_resource(
+    plan: &ProvisioningReviewedPaidPlan,
+    server: &HetznerCreatedServer,
+) -> ProvisioningProviderResource {
+    let ssh_address = server.ssh_address();
+    ProvisioningProviderResource {
+        provider: "hetzner-cloud".to_string(),
+        kind: "server".to_string(),
+        provider_id: server.id.to_string(),
+        name: plan.server_name.clone(),
+        state: if ssh_address.is_some() {
+            "created".to_string()
+        } else {
+            "created-address-pending".to_string()
+        },
+        location: Some(plan.location.clone()),
+        ssh: ssh_address.map(|address| SshAccessIntent {
+            route: SshRoute::Direct,
+            user: Some("root".to_string()),
+            host: Some(address),
+            port: Some(22),
+        }),
+    }
+}
+
+async fn create_paid_provisioning_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProvisioningPaidCreateRequest>,
+) -> impl IntoResponse {
+    let (operator_ref, _) = match paid_operator(&state, &headers) {
+        Ok(operator) => operator,
+        Err((status, message)) => {
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+    };
+    let _serialized_create = state.paid_create_lock.lock().await;
+    if !state.provisioning_jobs.durable_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store_headers(),
+            Json(
+                json!({ "error": "The durable provisioning-job store is unavailable; no paid provider request was sent." }),
+            ),
+        );
+    }
+    if state.provisioning_jobs.paid_project_blocked(Some(&id)) {
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(
+                json!({ "error": "Another paid attempt or tracked server still owns the provider project gate." }),
+            ),
+        );
+    }
+    let Some(initial_job) = state.provisioning_jobs.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            no_store_headers(),
+            Json(json!({ "error": "The reviewed plan was not found." })),
+        );
+    };
+    if let Err(error) = validate_paid_job_binding(&initial_job, &request.plan_sha256, &operator_ref)
+    {
+        let (status, message) = paid_store_error_response(error);
+        return (
+            status,
+            no_store_headers(),
+            Json(json!({ "error": message })),
+        );
+    }
+    if initial_job
+        .paid_execution
+        .as_ref()
+        .is_some_and(|execution| matches!(execution.state.as_str(), "created" | "reconciled"))
+    {
+        return (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "job": initial_job, "idempotent": true })),
+        );
+    }
+    let reviewed = initial_job
+        .reviewed_plan
+        .as_ref()
+        .expect("paid binding requires reviewed plan")
+        .clone();
+    if initial_job
+        .paid_execution
+        .as_ref()
+        .is_some_and(|execution| {
+            matches!(execution.state.as_str(), "request-started" | "uncertain")
+        })
+    {
+        let servers = match paid_reconciliation_inventory(&state, &reviewed).await {
+            Ok(servers) => servers,
+            Err((status, message)) => {
+                return (
+                    status,
+                    no_store_headers(),
+                    Json(json!({ "error": message })),
+                );
+            }
+        };
+        let matches = servers
+            .iter()
+            .filter(|server| server.matches_reviewed_plan(&reviewed))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            let server = matches.into_iter().next().expect("one reconciled server");
+            let resource = reviewed_hetzner_provider_resource(&reviewed, &server.into_created());
+            let handoff = hetzner_bootstrap_handoff(&resource);
+            return match state.provisioning_jobs.complete_paid_create(
+                &id,
+                &request.plan_sha256,
+                resource,
+                handoff,
+                true,
+                now_unix(),
+            ) {
+                Ok(job) => (
+                    StatusCode::OK,
+                    no_store_headers(),
+                    Json(json!({ "job": job, "idempotent": true })),
+                ),
+                Err(error) => {
+                    let (status, message) = paid_store_error_response(error);
+                    (
+                        status,
+                        no_store_headers(),
+                        Json(json!({ "error": message })),
+                    )
+                }
+            };
+        }
+        let message = if matches.is_empty() {
+            "The earlier provider create result is uncertain and no server matching the exact ownership and reviewed facts was found. Pharos will not replay the paid request; inspect the provider project and check this same attempt again before any new review."
+        } else {
+            "Multiple servers match the exact paid-attempt ownership and reviewed facts. Pharos will not create or choose between them; manual provider review is required."
+        };
+        let job = state
+            .provisioning_jobs
+            .fail_paid_execution(
+                &id,
+                &request.plan_sha256,
+                true,
+                message.to_string(),
+                now_unix(),
+            )
+            .unwrap_or(initial_job);
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(json!({ "error": message, "job": job })),
+        );
+    }
+    let now = now_unix();
+    let authorization = initial_job
+        .paid_authorization
+        .as_ref()
+        .expect("paid binding requires authorization");
+    if now >= authorization.expires_at {
+        if initial_job
+            .paid_execution
+            .as_ref()
+            .is_some_and(|execution| execution.state == "claimed")
+        {
+            let message = "This paid authorization expired before the provider request started. The durable attempt was closed without creating a server; review current details again.";
+            let job = state
+                .provisioning_jobs
+                .fail_paid_execution(&id, &request.plan_sha256, false, message.to_string(), now)
+                .unwrap_or(initial_job);
+            return (
+                StatusCode::CONFLICT,
+                no_store_headers(),
+                Json(json!({ "error": message, "job": job })),
+            );
+        }
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(
+                json!({ "error": "This paid authorization expired. Review current details again." }),
+            ),
+        );
+    }
+    let (initial_runtime, _) = match revalidate_reviewed_paid_plan(&state, &initial_job, now).await
+    {
+        Ok(result) => result,
+        Err((status, message)) => {
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+    };
+    let prerequisites =
+        match resolve_hetzner_create_prerequisites(&reviewed, &initial_runtime).await {
+            Ok(prerequisites) => prerequisites,
+            Err(error) => {
+                let message = format!(
+                    "{}; the provider create request was not sent.",
+                    error.safe_message()
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    no_store_headers(),
+                    Json(json!({ "error": message, "job": initial_job })),
+                );
+            }
+        };
+    let final_check_at = now_unix();
+    let (runtime, servers) =
+        match revalidate_reviewed_paid_plan(&state, &initial_job, final_check_at).await {
+            Ok(result) => result,
+            Err((status, message)) => {
+                return (
+                    status,
+                    no_store_headers(),
+                    Json(json!({ "error": message, "job": initial_job })),
+                );
+            }
+        };
+    let boundary_now = now_unix();
+    if boundary_now >= authorization.expires_at {
+        let message = "This paid authorization expired during the final live checks. No provider create request was sent; review current details again.";
+        let job = if initial_job
+            .paid_execution
+            .as_ref()
+            .is_some_and(|execution| execution.state == "claimed")
+        {
+            state
+                .provisioning_jobs
+                .fail_paid_execution(
+                    &id,
+                    &request.plan_sha256,
+                    false,
+                    message.to_string(),
+                    boundary_now,
+                )
+                .unwrap_or(initial_job)
+        } else {
+            initial_job
+        };
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(json!({ "error": message, "job": job })),
+        );
+    }
+    if let Some(execution) = initial_job.paid_execution.as_ref() {
+        match execution.state.as_str() {
+            "claimed" => {
+                if !servers.is_empty() {
+                    let message = "Provider inventory changed after authorization. The durable attempt was stopped before the provider create request; review current details again.";
+                    let job = state
+                        .provisioning_jobs
+                        .fail_paid_execution(
+                            &id,
+                            &request.plan_sha256,
+                            false,
+                            message.to_string(),
+                            now_unix(),
+                        )
+                        .unwrap_or(initial_job);
+                    return (
+                        StatusCode::CONFLICT,
+                        no_store_headers(),
+                        Json(json!({ "error": message, "job": job })),
+                    );
+                }
+            }
+            "failed-closed" => {
+                return (
+                    StatusCode::CONFLICT,
+                    no_store_headers(),
+                    Json(
+                        json!({ "error": "The paid attempt is closed and cannot be replayed. Review current details again." }),
+                    ),
+                );
+            }
+            _ => {
+                return (
+                    StatusCode::CONFLICT,
+                    no_store_headers(),
+                    Json(json!({ "error": "The paid attempt is not safe to run." })),
+                );
+            }
+        }
+    } else {
+        if !servers.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                no_store_headers(),
+                Json(json!({
+                    "error": "The provider project already has an active server; the reviewed maximum no longer holds. Review current details again."
+                })),
+            );
+        }
+        if let Err(error) = state.provisioning_jobs.claim_paid_execution(
+            &id,
+            &request.plan_sha256,
+            &operator_ref,
+            boundary_now,
+        ) {
+            let (status, message) = paid_store_error_response(error);
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+    }
+
+    let started = match state.provisioning_jobs.mark_paid_request_started(
+        &id,
+        &request.plan_sha256,
+        now_unix(),
+    ) {
+        Ok(job) => job,
+        Err(error) => {
+            let (status, message) = paid_store_error_response(error);
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+    };
+    match send_hetzner_create(&reviewed, prerequisites, &runtime).await {
+        Ok(server) => {
+            let resource = reviewed_hetzner_provider_resource(&reviewed, &server);
+            let handoff = hetzner_bootstrap_handoff(&resource);
+            match state.provisioning_jobs.complete_paid_create(
+                &id,
+                &request.plan_sha256,
+                resource,
+                handoff,
+                false,
+                now_unix(),
+            ) {
+                Ok(job) => (
+                    StatusCode::CREATED,
+                    no_store_headers(),
+                    Json(json!({ "job": job })),
+                ),
+                Err(ProvisioningPaidStoreError::PersistenceFailed) => {
+                    let message = "Hetzner accepted the create response, but Pharos could not durably record it. The result is uncertain; restart with the valid durable store and reconcile by exact ownership labels. Pharos will not replay the paid request.";
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        no_store_headers(),
+                        Json(json!({
+                            "error": message,
+                            "job": state.provisioning_jobs.get(&id)
+                        })),
+                    )
+                }
+                Err(error) => {
+                    let (status, message) = paid_store_error_response(error);
+                    (
+                        status,
+                        no_store_headers(),
+                        Json(json!({ "error": message })),
+                    )
+                }
+            }
+        }
+        Err(error) => {
+            let uncertain = error.resource_state_uncertain();
+            let message = if uncertain {
+                format!(
+                    "{}. The result is uncertain; Pharos will reconcile by exact ownership labels and will not replay this paid request.",
+                    error.safe_message()
+                )
+            } else {
+                format!(
+                    "{}; no provider create request was accepted.",
+                    error.safe_message()
+                )
+            };
+            let job = state
+                .provisioning_jobs
+                .fail_paid_execution(
+                    &id,
+                    &request.plan_sha256,
+                    uncertain,
+                    message.clone(),
+                    now_unix(),
+                )
+                .unwrap_or(started);
+            (
+                StatusCode::BAD_GATEWAY,
+                no_store_headers(),
+                Json(json!({ "error": message, "job": job })),
+            )
+        }
+    }
+}
+
 fn guarded_hetzner_runtime(
     state: &AppState,
     request: &ProvisioningJobStartRequest,
@@ -8341,6 +10674,26 @@ fn guarded_hetzner_runtime(
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "The secure Hetzner Cloud connection is not available.",
+        ));
+    }
+    if !runtime.execute_enabled {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Managed Hetzner Cloud execution is disabled.",
+        ));
+    }
+    if runtime.project_label.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Set the safe Hetzner Cloud project label before paid plan review.",
+        ));
+    }
+    if missing_hetzner_create_inputs(request, &runtime)
+        || invalid_hetzner_create_inputs(request, &runtime)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Host, image, region, server type, SSH key, or firewall selection is invalid.",
         ));
     }
     if !state
@@ -8396,6 +10749,7 @@ fn guarded_hetzner_runtime(
     Ok(runtime)
 }
 
+#[cfg(test)]
 fn should_run_hetzner_executor(
     request: &ProvisioningJobStartRequest,
     job: &ProvisioningJob,
@@ -8576,47 +10930,6 @@ async fn execute_existing_host_setup_job(
     }
 }
 
-fn hetzner_provider_resource(
-    request: &ProvisioningJobStartRequest,
-    server: &HetznerCreatedServer,
-    ssh_address: Option<&str>,
-) -> ProvisioningProviderResource {
-    let requested_name = request
-        .host_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| valid_bootstrap_name(value))
-        .unwrap_or("pharos-host");
-    let name = if valid_bootstrap_name(server.name.trim()) {
-        server.name.trim()
-    } else {
-        requested_name
-    };
-    ProvisioningProviderResource {
-        provider: "hetzner-cloud".to_string(),
-        kind: "server".to_string(),
-        provider_id: server.id.to_string(),
-        name: name.to_string(),
-        state: if ssh_address.is_some() {
-            "created".to_string()
-        } else {
-            "created-address-pending".to_string()
-        },
-        location: request
-            .location
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| valid_provider_selector(value))
-            .map(str::to_string),
-        ssh: ssh_address.map(|address| SshAccessIntent {
-            route: SshRoute::Direct,
-            user: Some("root".to_string()),
-            host: Some(address.to_string()),
-            port: Some(22),
-        }),
-    }
-}
-
 fn hetzner_bootstrap_handoff(
     resource: &ProvisioningProviderResource,
 ) -> Option<ProvisioningHandoff> {
@@ -8667,12 +10980,77 @@ async fn execute_hetzner_cleanup_job(
     if target.already_deleted {
         return Ok((job, true));
     }
+    let reviewed = job.reviewed_plan.clone().ok_or_else(|| {
+        ProvisioningCleanupFailure::new(
+            ProvisioningCleanupError::OwnershipMismatch,
+            Some(job.clone()),
+        )
+    })?;
+    if !state.provisioning_jobs.durable_ready()
+        || job.validate_contract().is_err()
+        || !paid_job_integrity_valid(&job)
+    {
+        return Err(ProvisioningCleanupFailure::new(
+            ProvisioningCleanupError::OwnershipMismatch,
+            Some(job),
+        ));
+    }
     if !state.provider_runtime.hetzner_cloud.execute_enabled {
         return Err(ProvisioningCleanupFailure::new(
             ProvisioningCleanupError::RuntimeDisabled,
             Some(job),
         ));
     }
+    let runtime = effective_hetzner_runtime(
+        &state.provider_runtime.hetzner_cloud,
+        &state.provider_connections,
+    );
+    if !runtime.credential_boundary_ready()
+        || runtime.project_label.as_deref() != Some(reviewed.provider_project.as_str())
+        || target.resource.name != reviewed.server_name
+    {
+        return Err(ProvisioningCleanupFailure::new(
+            ProvisioningCleanupError::OwnershipMismatch,
+            Some(job),
+        ));
+    }
+    let operation = HetznerOperationContext::resolve(runtime).map_err(|_| {
+        ProvisioningCleanupFailure::new(
+            ProvisioningCleanupError::ProviderUnavailable,
+            Some(job.clone()),
+        )
+    })?;
+    let credential_binding_matches = operation.matches_reviewed_plan(&reviewed);
+    let servers = fetch_hetzner_servers(&operation).await.map_err(|_| {
+        ProvisioningCleanupFailure::new(
+            ProvisioningCleanupError::ProviderUnavailable,
+            Some(job.clone()),
+        )
+    })?;
+    let provider_already_absent = match servers
+        .iter()
+        .find(|server| server.id == target.provider_id)
+    {
+        None if credential_binding_matches => true,
+        None => {
+            return Err(ProvisioningCleanupFailure::new(
+                ProvisioningCleanupError::ProviderUnavailable,
+                Some(job),
+            ));
+        }
+        Some(server)
+            if server.name == reviewed.server_name
+                && server.matches_labels(&reviewed.required_labels) =>
+        {
+            false
+        }
+        Some(_) => {
+            return Err(ProvisioningCleanupFailure::new(
+                ProvisioningCleanupError::OwnershipMismatch,
+                Some(job),
+            ));
+        }
+    };
     if !state.provisioning_jobs.claim_provider_cleanup(&job.id) {
         return Err(ProvisioningCleanupFailure::new(
             ProvisioningCleanupError::CleanupInProgress,
@@ -8685,18 +11063,25 @@ async fn execute_hetzner_cleanup_job(
         &target.resource.provider_id,
         now_unix(),
     ) {
-        Some(started) => started,
-        None => {
+        Ok(started) => started,
+        Err(error) => {
             state.provisioning_jobs.release_provider_cleanup(&job.id);
             return Err(ProvisioningCleanupFailure::new(
-                ProvisioningCleanupError::CleanupNotAllowed,
+                if error == ProvisioningPaidStoreError::PersistenceFailed {
+                    ProvisioningCleanupError::PersistenceFailed
+                } else {
+                    ProvisioningCleanupError::CleanupNotAllowed
+                },
                 state.provisioning_jobs.get(&job.id),
             ));
         }
     };
 
-    let provider_result =
-        delete_hetzner_server(target.provider_id, &state.provider_runtime.hetzner_cloud).await;
+    let provider_result = if provider_already_absent {
+        Ok(HetznerDeleteResult::AlreadyAbsent)
+    } else {
+        delete_hetzner_server(target.provider_id, &operation).await
+    };
     let outcome = match provider_result {
         Ok(delete_result) => {
             let mut deleted_resource = target.resource;
@@ -8707,7 +11092,7 @@ async fn execute_hetzner_cleanup_job(
                 .provisioning_jobs
                 .complete_provider_cleanup(&job.id, deleted_resource, handoff, now_unix())
                 .map(|job| (job, delete_result == HetznerDeleteResult::AlreadyAbsent))
-                .ok_or_else(|| {
+                .map_err(|_| {
                     ProvisioningCleanupFailure::new(
                         ProvisioningCleanupError::PersistenceFailed,
                         state.provisioning_jobs.get(&job.id),
@@ -8743,82 +11128,6 @@ async fn execute_hetzner_cleanup_job(
     };
     state.provisioning_jobs.release_provider_cleanup(&job.id);
     outcome
-}
-
-async fn execute_hetzner_setup_job(
-    state: &AppState,
-    request: &ProvisioningJobStartRequest,
-    job: ProvisioningJob,
-    runtime: &HetznerCloudRuntimeConfig,
-) -> ProvisioningJob {
-    let now = now_unix();
-    match create_hetzner_server(request, runtime).await {
-        Ok(server) => {
-            let ssh_address = server.ssh_address();
-            let resource = hetzner_provider_resource(request, &server, ssh_address.as_deref());
-            let bootstrapping = state
-                .provisioning_jobs
-                .append_progress(
-                    &job.id,
-                    ProvisioningJobState::Bootstrapping,
-                    "Hetzner Cloud server created; preparing the protected NixOS and beacon handoff.",
-                    now,
-                )
-                .unwrap_or_else(|| job.clone());
-            match hetzner_bootstrap_handoff(&resource) {
-                Some(handoff) => state
-                    .provisioning_jobs
-                    .transition_provider_resource(
-                        &bootstrapping.id,
-                        ProvisioningJobState::WaitingForHeartbeat,
-                        "Server created and SSH destination recorded; finish setup to install Pharos and receive the first heartbeat.",
-                        resource,
-                        Some(handoff),
-                        now_unix(),
-                    )
-                    .unwrap_or(bootstrapping),
-                None => state
-                    .provisioning_jobs
-                    .transition_provider_resource(
-                        &bootstrapping.id,
-                        ProvisioningJobState::CleanupNeeded,
-                        "Server was created but no usable public IPv4 address was returned; verify the provider console before retrying or deleting the resource.",
-                        resource,
-                        None,
-                        now_unix(),
-                    )
-                    .unwrap_or(bootstrapping),
-            }
-        }
-        Err(error) => {
-            let host_name = request
-                .host_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("requested host");
-            let state_after_error = if error.resource_state_uncertain() {
-                ProvisioningJobState::CleanupNeeded
-            } else {
-                ProvisioningJobState::Failed
-            };
-            let message = if state_after_error == ProvisioningJobState::CleanupNeeded {
-                format!(
-                    "{}. Cleanup needed: verify Hetzner Cloud for provider resource name {host_name} before retrying.",
-                    error.safe_message()
-                )
-            } else {
-                format!(
-                    "{}; no provider resources were created by Pharos.",
-                    error.safe_message()
-                )
-            };
-            state
-                .provisioning_jobs
-                .append_progress(&job.id, state_after_error, message, now)
-                .unwrap_or(job)
-        }
-    }
 }
 
 async fn provisioning_job_json(
@@ -8889,6 +11198,22 @@ async fn cleanup_provisioning_job(
             Json(json!({ "error": "Provisioning job not found." })),
         );
     };
+    if let Err((status, message)) = paid_operator(&state, &headers) {
+        return (
+            status,
+            no_store_headers(),
+            Json(json!({ "error": message })),
+        );
+    }
+    if !state.provisioning_jobs.durable_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store_headers(),
+            Json(
+                json!({ "error": "The durable provisioning-job store is unavailable; no provider deletion was sent." }),
+            ),
+        );
+    }
 
     match execute_hetzner_cleanup_job(&state, job).await {
         Ok((job, already_absent)) => (
@@ -10122,6 +12447,15 @@ fn unavailable_hetzner_test_result(
 }
 
 async fn run_hetzner_connection_test(state: &AppState, now: i64) {
+    run_hetzner_connection_test_for(state, now, None, None).await;
+}
+
+async fn run_hetzner_connection_test_for(
+    state: &AppState,
+    now: i64,
+    ssh_key_override: Option<&str>,
+    location_override: Option<&str>,
+) {
     let runtime = effective_hetzner_runtime(
         &state.provider_runtime.hetzner_cloud,
         &state.provider_connections,
@@ -10135,9 +12469,9 @@ async fn run_hetzner_connection_test(state: &AppState, now: i64) {
                     token: &token,
                     credential_boundary_ready: runtime.credential_boundary_ready(),
                     execution_enabled: runtime.execute_enabled,
-                    ssh_key_ref: runtime.default_ssh_key_ref.as_deref(),
+                    ssh_key_ref: ssh_key_override.or(runtime.default_ssh_key_ref.as_deref()),
                     firewall_ref: runtime.firewall_ref.as_deref(),
-                    default_location: runtime.default_location.as_deref(),
+                    default_location: location_override.or(runtime.default_location.as_deref()),
                 },
                 now,
             )
@@ -12399,7 +14733,7 @@ fn setup_assistant() -> String {
 
 <section class="assistant-preflight-result" data-assistant-step="bootstrap" data-preflight-result><div class="assistant-result-head"><strong data-preflight-summary>Connection checked</strong><span data-preflight-message>Choose how Pharos should be installed.</span></div><div class="assistant-bootstrap" data-preflight-bootstrap></div><details class="assistant-check-details"><summary>Technical checks {chevron}</summary><div class="assistant-checks" data-preflight-checks></div></details></section>
 
-<section class="assistant-plan" data-assistant-step="plan" data-assistant-plan><section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Current recommended plan</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><section class="assistant-existing-review" data-existing-review><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-existing-review-host>Existing server</small></span></div><div class="assistant-review-row">{link}<span><strong>Connection</strong><small data-existing-review-connection>SSH connection</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-existing-review-method>Selected method</small></span></div></section><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span><a data-provider-setup href="/settings/providers/hetzner-cloud">Set up provider</a></div><details class="assistant-review-details" data-assistant-review-details><summary><span data-assistant-advanced-label>Advanced setup</span>{chevron}</summary><div class="assistant-review-technical"><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><select data-new-location aria-label="Location"><option value="">Loading current locations…</option></select></label><label class="assistant-plan-field"><span>Server plan</span><select data-new-server-type aria-label="Server plan"><option value="">Loading current plans…</option></select></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public key</span><select data-new-ssh-key aria-label="SSH public key"><option value="">Use connection default</option></select></label><div class="assistant-plan-list" data-provider-plan-resources></div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div></div></div></details><div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I understand this creates a paid cloud server.</span></label><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Create server</span>{arrow_right}</button></div></section>
+<section class="assistant-plan" data-assistant-step="plan" data-assistant-plan><section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Current recommended plan</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><section class="assistant-existing-review" data-existing-review><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-existing-review-host>Existing server</small></span></div><div class="assistant-review-row">{link}<span><strong>Connection</strong><small data-existing-review-connection>SSH connection</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-existing-review-method>Selected method</small></span></div></section><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span><a data-provider-setup href="/settings/providers/hetzner-cloud">Set up provider</a></div><details class="assistant-review-details" data-assistant-review-details><summary><span data-assistant-advanced-label>Advanced setup</span>{chevron}</summary><div class="assistant-review-technical"><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><select data-new-location aria-label="Location"><option value="">Loading current locations…</option></select></label><label class="assistant-plan-field"><span>Server plan</span><select data-new-server-type aria-label="Server plan"><option value="">Loading current plans…</option></select></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public key</span><select data-new-ssh-key aria-label="SSH public key"><option value="">Use connection default</option></select></label><div class="assistant-plan-list" data-provider-plan-resources></div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div></div></div></details><section class="assistant-paid-review" data-paid-review tabindex="-1"><div class="assistant-paid-head"><strong>Exact paid plan</strong><span data-paid-stage-status role="status" aria-live="polite">Persisted review</span></div><p class="assistant-paid-boundary" data-paid-billing-boundary>Review and authorization do not create a server or start billing.</p><dl class="assistant-paid-policy" data-paid-policy data-paid-plan-details><div><dt>Server name</dt><dd data-paid-server-name>not reviewed</dd></div><div><dt>Provider project</dt><dd data-paid-provider-project data-paid-plan-project>not reviewed</dd></div><div><dt>Region</dt><dd data-paid-region data-paid-plan-location>not reviewed</dd></div><div><dt>Server type</dt><dd data-paid-server-type data-paid-plan-server>not reviewed</dd></div><div><dt>Catalog checked</dt><dd><time data-paid-catalog-refreshed>not reviewed</time></dd></div><div><dt>Image</dt><dd data-paid-image data-paid-plan-image>not reviewed</dd></div><div><dt>Hourly gross price</dt><dd data-paid-price-hourly>not reviewed</dd></div><div><dt>Monthly gross price</dt><dd data-paid-price-monthly data-paid-plan-price>not reviewed</dd></div><div><dt>Hourly authorization cap</dt><dd data-paid-cap-hourly>not reviewed</dd></div><div><dt>Monthly authorization cap</dt><dd data-paid-cap-monthly>not reviewed</dd></div><div><dt>Active-server limit</dt><dd data-paid-max-active data-paid-plan-limit>not reviewed</dd></div><div><dt>Review expires</dt><dd><time data-paid-expiry data-paid-plan-expiry>not reviewed</time></dd></div><div><dt>Authorized at</dt><dd><time data-paid-confirmed-at>not authorized</time></dd></div><div><dt>Execution state</dt><dd data-paid-execution-state>not started</dd></div><div><dt>SSH public key</dt><dd data-paid-ssh-key data-paid-plan-ssh-key>not reviewed</dd></div><div><dt>Firewall</dt><dd data-paid-firewall data-paid-plan-firewall>not reviewed</dd></div><div data-paid-wide><dt>Allowed provider operations</dt><dd data-paid-operations data-paid-plan-operations>not reviewed</dd></div><div data-paid-wide><dt>Required ownership labels</dt><dd><ul class="assistant-paid-label-list" data-paid-labels data-paid-plan-labels></ul></dd></div><div data-paid-wide><dt>Failure and cleanup policy</dt><dd data-paid-cleanup data-paid-plan-cleanup>not reviewed</dd></div><div data-paid-wide><dt>Exact plan fingerprint</dt><dd><code data-paid-plan-hash>not reviewed</code></dd></div></dl><p class="assistant-paid-authorization" data-paid-authorization hidden>Authorized by <strong data-paid-operator>this operator</strong>.</p><div class="assistant-paid-next"><strong>Next step</strong><p data-paid-next-step data-paid-plan-next-step>Authorize this exact persisted plan.</p></div></section><div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I reviewed this setup path.</span></label><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Review paid plan</span>{arrow_right}</button></div></section>
 
 <section class="assistant-job" data-assistant-step="job" data-assistant-job hidden aria-live="polite"><span class="assistant-job-spinner" aria-hidden="true"></span><div><strong data-assistant-job-title>Starting setup</strong><span data-assistant-job-message>Pharos is preparing the server.</span></div></section><section class="assistant-created" data-assistant-created data-state="active" hidden aria-live="polite"><h3 data-created-title>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready" data-created-ready><span data-created-ready-text>Ready for setup</span></div></div><div class="assistant-created-progress" data-created-progress aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions" data-created-actions><button class="assistant-finish" type="button" data-assistant-finish>Continue setup {arrow_right}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><section class="assistant-created-setup" data-created-setup hidden><h4>Finish installation</h4><ol data-created-next-steps></ol><p class="assistant-created-guidance" data-created-guidance>The server exists. Continue with the prepared bootstrap handoff, then wait for its first heartbeat.</p><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></section><details data-created-recovery><summary>Recovery options {chevron}</summary><section class="assistant-created-danger" data-created-danger><div class="assistant-created-danger-head">{warning}<div><strong>Delete this server</strong><p>Removes the paid Hetzner server. This cannot be undone.</p></div></div><label class="assistant-delete-confirm"><input type="checkbox" data-created-delete-confirm><span>I understand this permanently deletes the server.</span></label><div class="assistant-delete-actions"><button class="assistant-delete" type="button" data-created-delete disabled>{trash} Delete server</button><span data-created-delete-status role="status" aria-live="polite"></span></div></section></details></section><div class="assistant-error" data-assistant-error role="alert" hidden></div>
 
@@ -16264,6 +18598,7 @@ async fn main() {
         beacon_auth,
         provider_runtime,
         provider_connections,
+        paid_create_lock: Arc::new(tokio::sync::Mutex::new(())),
         nixcfg_dispatch,
         retirement_owner,
         host_actions,
@@ -16315,6 +18650,14 @@ async fn main() {
         .route("/setup/provider-plan.json", get(setup_provider_plan_json))
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
         .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
+        .route(
+            "/setup/provisioning-jobs/{id}/confirm",
+            post(confirm_paid_provisioning_job),
+        )
+        .route(
+            "/setup/provisioning-jobs/{id}/create",
+            post(create_paid_provisioning_job),
+        )
         .route(
             "/setup/provisioning-jobs/{id}/cleanup",
             post(cleanup_provisioning_job),
@@ -16402,6 +18745,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[derive(Clone, Debug)]
     struct RecordedSshCall {
@@ -16621,6 +18966,9 @@ mod tests {
             handoff: None,
             setup_intent: Some(setup_intent),
             backup_proposal: None,
+            reviewed_plan: None,
+            paid_authorization: None,
+            paid_execution: None,
             provider_resources: vec![],
             progress: vec![ProvisioningProgressEntry {
                 state,
@@ -19382,8 +21730,51 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"name="location_intent" value="site-fallback""#));
         assert!(empty.contains(r#"name="access_intent" value="operator-only""#));
         assert!(empty.contains(r#"name="access_intent" value="limited-users""#));
-        assert!(empty.contains("I understand this creates a paid cloud server."));
-        assert!(empty.contains("Create server"));
+        assert!(!empty.contains("I understand this creates a paid cloud server."));
+        assert!(empty.contains("Review paid plan"));
+        assert!(empty.contains(r#"<dl class="assistant-paid-policy" data-paid-policy"#));
+        for selector in [
+            "data-paid-server-name",
+            "data-paid-provider-project",
+            "data-paid-region",
+            "data-paid-server-type",
+            "data-paid-catalog-refreshed",
+            "data-paid-image",
+            "data-paid-price-hourly",
+            "data-paid-price-monthly",
+            "data-paid-cap-hourly",
+            "data-paid-cap-monthly",
+            "data-paid-max-active",
+            "data-paid-expiry",
+            "data-paid-confirmed-at",
+            "data-paid-execution-state",
+            "data-paid-ssh-key",
+            "data-paid-firewall",
+            "data-paid-operations",
+            "data-paid-labels",
+            "data-paid-cleanup",
+            "data-paid-next-step",
+        ] {
+            assert!(
+                empty.contains(selector),
+                "missing paid policy selector {selector}"
+            );
+        }
+        assert!(empty.contains("Review and authorization do not create a server or start billing."));
+        assert!(empty.contains("Continue authorized create"));
+        assert!(empty.contains("Check provider result"));
+        assert!(empty.contains("Create result unknown"));
+        assert!(empty.contains(r#"data-assistant-paid-stage="claimed""#));
+        assert!(empty.contains("executionState!=='claimed'"));
+        assert!(empty.contains("paid_execution?.state==='failed-closed'"));
+        assert!(empty.contains("assistantPaidActionPending"));
+        assert!(empty.contains("!expired&&!claimed&&!reconciling"));
+        assert!(empty.contains("focusTarget?.setAttribute('tabindex','-1')"));
+        assert!(empty.contains("!focusable.includes(document.activeElement)"));
+        assert!(empty.contains("body.apply=false"));
+        assert!(empty.contains("X-Pharos-Action"));
+        assert!(empty.contains("/confirm"));
+        assert!(empty.contains("/create"));
         assert!(empty.contains("data-assistant-job"));
         assert!(empty.contains(r#"data-assistant-created"#));
         assert!(empty.contains("Server created"));
@@ -20011,98 +22402,64 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
-    fn hetzner_executor_gate_persists_precise_safe_failures() {
-        let store = ProvisioningJobStore::new(None);
-        let mut request = ProvisioningJobStartRequest {
-            provider: "hetzner-cloud".to_string(),
-            template: "hetzner-small-nixos".to_string(),
-            apply: false,
-            host_name: None,
-            role: None,
-            is_nix: None,
-            heartbeat_interval_secs: None,
-            backup_intent: None,
-            location_intent: None,
-            access_intent: None,
-            location: None,
-            server_type: None,
-            image: None,
-            ssh_key_ref: None,
-            ssh: None,
-            preflight_summary: None,
-            preflight_checks: vec![],
-        };
-        let runtime = ProviderRuntimeConfig {
-            hetzner_cloud: HetznerCloudRuntimeConfig {
-                credential_source: Some(ProviderCredentialSource::File(PathBuf::from(
-                    "/run/secrets/pharos-hcloud-token",
-                ))),
-                execute_enabled: false,
-                ..HetznerCloudRuntimeConfig::default()
-            },
-            ..ProviderRuntimeConfig::default()
-        };
+    fn hetzner_direct_apply_fails_without_execution_claim() {
+        let path = provisioning_store_test_path("direct-apply-rejection");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let request = hcloud_apply_request("hcloud-direct-apply");
+        let runtime = test_hcloud_store_runtime();
 
         let job = store
             .start(&request, 1_700_000_001, &runtime)
-            .expect("configured backend still creates recoverable job");
+            .expect("direct apply is recorded as a safe terminal job");
+
         assert_eq!(job.state, ProvisioningJobState::Failed);
-        assert!(job.progress[1]
+        assert!(job.reviewed_plan.is_none());
+        assert!(job.paid_authorization.is_none());
+        assert!(job.paid_execution.is_none());
+        assert!(job.provider_resources.is_empty());
+        assert!(!should_run_hetzner_executor(&request, &job));
+        assert!(job
+            .progress
+            .last()
+            .expect("direct-apply rejection progress")
             .message
-            .contains("explicit apply confirmation"));
-
-        request.apply = true;
-        let disabled = store
-            .start(&request, 1_700_000_002, &runtime)
-            .expect("disabled execution records safe failure");
-        assert!(disabled.progress[1]
-            .message
-            .contains("live execution is disabled"));
-
-        let enabled = ProviderRuntimeConfig {
-            hetzner_cloud: HetznerCloudRuntimeConfig {
-                credential_source: Some(ProviderCredentialSource::Environment(
-                    "PHAROS_HCLOUD_API_TOKEN",
-                )),
-                execute_enabled: true,
-                firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
-                ..HetznerCloudRuntimeConfig::default()
-            },
-            ..ProviderRuntimeConfig::default()
-        };
-        let missing_inputs = store
-            .start(&request, 1_700_000_003, &enabled)
-            .expect("missing inputs record safe failure");
-        assert!(missing_inputs.progress[1]
-            .message
-            .contains("needs host, location, server type, image"));
-
-        request.host_name = Some("hcloud-lab-1".to_string());
-        request.location = Some("fsn1".to_string());
-        request.server_type = Some("cx22".to_string());
-        request.image = Some("debian-12".to_string());
-        request.ssh_key_ref = Some("unsupported key value".to_string());
-        let invalid = store
-            .start(&request, 1_700_000_004, &enabled)
-            .expect("invalid inputs record safe failure");
-        assert_eq!(invalid.state, ProvisioningJobState::Failed);
-        assert!(invalid.provider_resources.is_empty());
-        assert!(invalid.progress[1]
-            .message
-            .contains("unsupported characters"));
-
-        request.ssh_key_ref = Some("janus:pharos/ssh/hcloud-lab-1".to_string());
-        let gated = store
-            .start(&request, 1_700_000_005, &enabled)
-            .expect("fully shaped request reaches provider gate");
-        assert_eq!(gated.state, ProvisioningJobState::Provisioning);
-        assert_eq!(gated.progress[1].state, ProvisioningJobState::Provisioning);
-        assert!(gated.progress[1]
-            .message
-            .contains("provider request is running"));
-        let json = serde_json::to_string(&gated).expect("job serializes");
+            .contains("Direct Hetzner Cloud apply is not accepted"));
+        let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn paid_review_endpoint_rejects_direct_apply_and_open_auth_before_provider_access() {
+        let direct = create_provisioning_job(
+            State(report_test_state(false)),
+            HeaderMap::new(),
+            Json(hcloud_apply_request("hcloud-direct-endpoint")),
+        )
+        .await
+        .into_response();
+        assert_eq!(direct.status(), StatusCode::BAD_REQUEST);
+
+        let mut action_headers = HeaderMap::new();
+        action_headers.insert("X-Pharos-Action", "1".parse().expect("valid header"));
+        let open_auth = create_provisioning_job(
+            State(report_test_state(false)),
+            action_headers,
+            Json(hcloud_review_request("hcloud-open-auth")),
+        )
+        .await
+        .into_response();
+        assert_eq!(open_auth.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let missing_action = create_provisioning_job(
+            State(report_test_state(false)),
+            HeaderMap::new(),
+            Json(hcloud_review_request("hcloud-no-action")),
+        )
+        .await
+        .into_response();
+        assert_eq!(missing_action.status(), StatusCode::FORBIDDEN);
     }
 
     #[derive(Clone, Debug)]
@@ -20127,7 +22484,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
         tokio::spawn(async move {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let Ok(Ok((mut stream, _))) =
                     timeout(Duration::from_secs(2), listener.accept()).await
                 else {
@@ -20148,7 +22505,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                         path: path.clone(),
                         body: body.to_string(),
                     });
-                let (status, response_body) = if path.starts_with("/ssh_keys?") {
+                let (status, response_body) = if path.starts_with("/images?") {
+                    ("200 OK", r#"{"images":[{"id":77,"name":"debian-12"}]}"#)
+                } else if path.starts_with("/ssh_keys?") {
                     (
                         "200 OK",
                         r#"{"ssh_keys":[{"id":101,"name":"pharos-bootstrap-key"}]}"#,
@@ -20178,6 +22537,61 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         (format!("http://{addr}"), requests)
     }
 
+    async fn hcloud_cleanup_mock_server(
+        inventory_body: String,
+        delete_status: &'static str,
+        delete_body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<RecordedHcloudRequest>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind cleanup mock");
+        let addr = listener.local_addr().expect("cleanup mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_millis(500), listener.accept()).await
+                else {
+                    break;
+                };
+                let mut buf = vec![0; 8192];
+                let size = stream.read(&mut buf).await.expect("read cleanup request");
+                let request = String::from_utf8_lossy(&buf[..size]);
+                let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+                let mut request_line = head.lines().next().unwrap_or_default().split_whitespace();
+                let method = request_line.next().unwrap_or_default().to_string();
+                let path = request_line.next().unwrap_or_default().to_string();
+                recorded
+                    .lock()
+                    .expect("cleanup request lock")
+                    .push(RecordedHcloudRequest {
+                        method: method.clone(),
+                        path: path.clone(),
+                        body: body.to_string(),
+                    });
+                let (status, response_body) = if method == "GET" && path.starts_with("/servers?") {
+                    ("200 OK", inventory_body.as_str())
+                } else if method == "DELETE" && path.starts_with("/servers/") {
+                    (delete_status, delete_body)
+                } else {
+                    ("404 Not Found", r#"{"error":"unexpected"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write cleanup response");
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
     fn hcloud_apply_request(host_name: &str) -> ProvisioningJobStartRequest {
         ProvisioningJobStartRequest {
             provider: "hetzner-cloud".to_string(),
@@ -20200,18 +22614,145 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         }
     }
 
-    fn test_hcloud_state(api_base_url: String) -> (AppState, PathBuf) {
+    fn hcloud_review_request(host_name: &str) -> ProvisioningJobStartRequest {
+        ProvisioningJobStartRequest {
+            apply: false,
+            ..hcloud_apply_request(host_name)
+        }
+    }
+
+    fn test_hcloud_store_runtime() -> ProviderRuntimeConfig {
+        ProviderRuntimeConfig {
+            hetzner_cloud: HetznerCloudRuntimeConfig {
+                credential_source: Some(ProviderCredentialSource::File(PathBuf::from(
+                    "/run/secrets/pharos-hcloud-token",
+                ))),
+                execute_enabled: true,
+                firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
+                default_location: Some("fsn1".to_string()),
+                project_label: Some("test-project".to_string()),
+                approval_ttl_secs: 15 * 60,
+                ..HetznerCloudRuntimeConfig::default()
+            },
+            ..ProviderRuntimeConfig::default()
+        }
+    }
+
+    fn test_reviewed_paid_plan(job: &ProvisioningJob) -> ProvisioningReviewedPaidPlan {
+        let mut reviewed = ProvisioningReviewedPaidPlan {
+            provider_project: "test-project".to_string(),
+            credential_binding_sha256: hetzner_credential_binding("test-hcloud-token"),
+            server_name: job.host_name.clone().expect("reviewed server name"),
+            location: "fsn1".to_string(),
+            location_label: "Falkenstein (fsn1)".to_string(),
+            server_type: "cx22".to_string(),
+            server_type_label: "CX22 - 2 vCPU / 4 GB".to_string(),
+            image: "debian-12".to_string(),
+            price_currency: "EUR".to_string(),
+            price_hourly_gross: "0.0060".to_string(),
+            price_monthly_gross: "3.4900".to_string(),
+            max_hourly_gross: "0.0060".to_string(),
+            max_monthly_gross: "3.4900".to_string(),
+            observed_active_servers: 0,
+            max_active_servers: 1,
+            catalog_refreshed_at: job.created_at,
+            expires_at: job.created_at + 15 * 60,
+            ssh_key_ref: "pharos-bootstrap-key".to_string(),
+            firewall_ref: "pharos-bootstrap-firewall".to_string(),
+            required_labels: paid_required_labels(&job.id, "test-project"),
+            allowed_operations: vec!["create-server".to_string(), "delete-server".to_string()],
+            cleanup_policy: "No silent retry or automatic deletion; separately confirm cleanup."
+                .to_string(),
+            plan_sha256: "0".repeat(64),
+        };
+        reviewed.plan_sha256 = reviewed_paid_plan_digest(&reviewed);
+        reviewed
+            .validate_contract()
+            .expect("reviewed paid plan fixture is valid");
+        reviewed
+    }
+
+    fn start_hcloud_review_job(
+        store: &ProvisioningJobStore,
+        host_name: &str,
+        created_at: i64,
+    ) -> ProvisioningJob {
+        let request = hcloud_review_request(host_name);
+        let job = store
+            .start(&request, created_at, &test_hcloud_store_runtime())
+            .expect("review job starts");
+        assert_eq!(job.state, ProvisioningJobState::Planning);
+        job
+    }
+
+    fn test_paid_resource(host_name: &str, provider_id: &str) -> ProvisioningProviderResource {
+        ProvisioningProviderResource {
+            provider: "hetzner-cloud".to_string(),
+            kind: "server".to_string(),
+            provider_id: provider_id.to_string(),
+            name: host_name.to_string(),
+            state: "created".to_string(),
+            location: Some("fsn1".to_string()),
+            ssh: Some(SshAccessIntent {
+                route: SshRoute::Direct,
+                user: Some("root".to_string()),
+                host: Some("192.0.2.42".to_string()),
+                port: Some(22),
+            }),
+        }
+    }
+
+    fn provisioning_store_test_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time moves forward")
             .as_nanos();
+        let sequence = TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "pharos-{label}-{}-{nanos}-{sequence}.json",
+            std::process::id()
+        ))
+    }
+
+    fn remove_provisioning_store_test_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(provisioning_job_store_marker_path(path));
+    }
+
+    struct TestHcloudFiles {
+        token_path: PathBuf,
+        jobs_path: PathBuf,
+    }
+
+    impl AsRef<Path> for TestHcloudFiles {
+        fn as_ref(&self) -> &Path {
+            &self.token_path
+        }
+    }
+
+    impl Drop for TestHcloudFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.token_path);
+            remove_provisioning_store_test_files(&self.jobs_path);
+        }
+    }
+
+    fn test_hcloud_state(api_base_url: String) -> (AppState, TestHcloudFiles) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_nanos();
+        let sequence = TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let token_path = std::env::temp_dir().join(format!(
-            "pharos-hcloud-test-token-{}-{}",
+            "pharos-hcloud-test-token-{}-{}-{}",
             std::process::id(),
-            nanos
+            nanos,
+            sequence
         ));
         std::fs::write(&token_path, "test-hcloud-token").expect("write test token");
+        let jobs_path = token_path.with_extension("provisioning-jobs.json");
         let mut state = report_test_state(false);
+        state.provisioning_jobs = Arc::new(ProvisioningJobStore::new(Some(jobs_path.clone())));
         state.provider_runtime = ProviderRuntimeConfig {
             hetzner_cloud: HetznerCloudRuntimeConfig {
                 credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
@@ -20222,18 +22763,245 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 api_base_url,
                 request_timeout: Duration::from_secs(2),
                 evidence_ttl_secs: 60 * 60,
+                project_label: Some("test-project".to_string()),
+                approval_ttl_secs: 15 * 60,
             },
             ..ProviderRuntimeConfig::default()
         };
-        (state, token_path)
+        (
+            state,
+            TestHcloudFiles {
+                token_path,
+                jobs_path,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn paid_create_payload_uses_only_the_persisted_plan_and_ownership_labels() {
+        let response_body = r#"{"server":{"id":4242,"name":"hcloud-paid-test","labels":{"managed-by":"pharos","pharos-setup":"tracked-job","pharos-owner":"75c84d20a0aa90c5","pharos-job":"setup-1700000000-1","pharos-attempt":"setup-1700000000-1-1"},"server_type":{"name":"cx22"},"image":{"name":"debian-12"},"datacenter":{"location":{"name":"fsn1"}},"public_net":{"ipv4":{"ip":"192.0.2.42"}}}}"#;
+        let (api, requests) = hcloud_mock_server("201 Created", response_body, true).await;
+        let (state, token_path) = test_hcloud_state(api);
+        let job =
+            start_hcloud_review_job(&state.provisioning_jobs, "hcloud-paid-test", 1_700_000_000);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let digest = reviewed.plan_sha256.clone();
+        let reviewed_job = state
+            .provisioning_jobs
+            .attach_paid_review(&job.id, reviewed.clone(), 1_700_000_001)
+            .expect("review attaches");
+        state
+            .provisioning_jobs
+            .confirm_paid_review(
+                &job.id,
+                &digest,
+                &"a".repeat(64),
+                "Test Operator",
+                1_700_000_002,
+            )
+            .expect("review confirms");
+        state
+            .provisioning_jobs
+            .claim_paid_execution(&job.id, &digest, &"a".repeat(64), 1_700_000_003)
+            .expect("execution claims");
+        let _started = state
+            .provisioning_jobs
+            .mark_paid_request_started(&job.id, &digest, 1_700_000_004)
+            .expect("request marker persists");
+
+        let mut create_plan = reviewed_job.reviewed_plan.clone().expect("reviewed plan");
+        create_plan.expires_at = now_unix() + 60;
+        let operation =
+            HetznerOperationContext::resolve(state.provider_runtime.hetzner_cloud.clone())
+                .expect("operation credential resolves");
+        let prerequisites = resolve_hetzner_create_prerequisites(&create_plan, &operation)
+            .await
+            .expect("mock prerequisites resolve");
+        let server = send_hetzner_create(&create_plan, prerequisites, &operation)
+            .await
+            .expect("mock provider creates server");
+        assert_eq!(server.id, 4242);
+
+        let recorded = requests.lock().expect("hcloud requests");
+        assert_eq!(recorded.len(), 4);
+        assert!(recorded[0].path.starts_with("/images?"));
+        assert!(recorded[1].path.starts_with("/ssh_keys?"));
+        assert!(recorded[2].path.starts_with("/firewalls?"));
+        assert_eq!(recorded[3].method, "POST");
+        assert_eq!(recorded[3].path, "/servers");
+        let payload: serde_json::Value =
+            serde_json::from_str(&recorded[3].body).expect("create payload is JSON");
+        assert_eq!(payload["name"], "hcloud-paid-test");
+        assert_eq!(payload["server_type"], reviewed.server_type);
+        assert_eq!(payload["image"], reviewed.image);
+        assert_eq!(payload["location"], reviewed.location);
+        for (key, value) in &reviewed.required_labels {
+            assert_eq!(payload["labels"][key], value.as_str());
+        }
+        let body = recorded[3].body.to_ascii_lowercase();
+        assert!(!body.contains("test-hcloud-token"));
+        assert!(!body.contains("bearer "));
+        drop(recorded);
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[test]
+    fn paid_reconciliation_requires_all_reviewed_server_facts() {
+        let path = provisioning_store_test_path("paid-reconciliation-facts");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let job = start_hcloud_review_job(&store, "hcloud-reconcile-facts", 1_700_000_050);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let exact = json!({
+            "id": 4242,
+            "name": reviewed.server_name,
+            "labels": reviewed.required_labels,
+            "server_type": {"name": reviewed.server_type},
+            "image": {"name": reviewed.image},
+            "datacenter": {"location": {"name": reviewed.location}}
+        });
+        let server: HetznerListedServer =
+            serde_json::from_value(exact.clone()).expect("exact inventory server parses");
+        assert!(server.matches_reviewed_plan(&reviewed));
+
+        for (pointer, replacement) in [
+            ("/server_type/name", json!("cx32")),
+            ("/image/name", json!("unexpected-image")),
+            ("/datacenter/location/name", json!("nbg1")),
+        ] {
+            let mut changed = exact.clone();
+            *changed
+                .pointer_mut(pointer)
+                .expect("reviewed fact pointer exists") = replacement;
+            let server: HetznerListedServer =
+                serde_json::from_value(changed).expect("changed inventory server parses");
+            assert!(!server.matches_reviewed_plan(&reviewed));
+        }
+        let mut incomplete = exact;
+        incomplete
+            .as_object_mut()
+            .expect("server object")
+            .remove("datacenter");
+        let server: HetznerListedServer =
+            serde_json::from_value(incomplete).expect("incomplete inventory server parses");
+        assert!(!server.matches_reviewed_plan(&reviewed));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn paid_cleanup_rejects_live_ownership_mismatch_without_delete() {
+        let inventory = r#"{"servers":[{"id":4242,"name":"hcloud-owned-test","labels":{"managed-by":"someone-else"}}],"meta":{"pagination":{"page":1,"next_page":null,"last_page":1,"total_entries":1}}}"#;
+        let (api, requests) = hcloud_mock_server("200 OK", inventory, true).await;
+        let (state, token_path) = test_hcloud_state(api);
+        let created_at = 1_700_000_000;
+        let job =
+            start_hcloud_review_job(&state.provisioning_jobs, "hcloud-owned-test", created_at);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let digest = reviewed.plan_sha256.clone();
+        state
+            .provisioning_jobs
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("review attaches");
+        state
+            .provisioning_jobs
+            .confirm_paid_review(
+                &job.id,
+                &digest,
+                &"a".repeat(64),
+                "Test Operator",
+                created_at + 2,
+            )
+            .expect("review confirms");
+        state
+            .provisioning_jobs
+            .claim_paid_execution(&job.id, &digest, &"a".repeat(64), created_at + 3)
+            .expect("execution claims");
+        state
+            .provisioning_jobs
+            .mark_paid_request_started(&job.id, &digest, created_at + 4)
+            .expect("request starts");
+        let resource = test_paid_resource("hcloud-owned-test", "4242");
+        let handoff = hetzner_bootstrap_handoff(&resource).expect("handoff");
+        let created = state
+            .provisioning_jobs
+            .complete_paid_create(
+                &job.id,
+                &digest,
+                resource,
+                Some(handoff),
+                false,
+                created_at + 5,
+            )
+            .expect("create persists");
+
+        let failure = execute_hetzner_cleanup_job(&state, created)
+            .await
+            .expect_err("mismatched labels stop cleanup");
+        assert_eq!(failure.error, ProvisioningCleanupError::OwnershipMismatch);
+        let recorded = requests.lock().expect("hcloud requests");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "GET");
+        assert!(recorded[0].path.starts_with("/servers?"));
+        assert!(!recorded.iter().any(|request| request.method == "DELETE"));
+        drop(recorded);
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_numeric_provider_resource_cannot_bypass_paid_ownership() {
+        let (api, requests) = hcloud_mock_server("204 No Content", "", true).await;
+        let (state, token_path) = test_hcloud_state(api);
+        let mut legacy = state
+            .provisioning_jobs
+            .start(
+                &hcloud_apply_request("hcloud-legacy-cleanup"),
+                1_700_000_010,
+                &state.provider_runtime,
+            )
+            .expect("legacy-shaped job fixture persists");
+        let resource = test_paid_resource("hcloud-legacy-cleanup", "4241");
+        legacy.state = ProvisioningJobState::WaitingForHeartbeat;
+        legacy.updated_at = 1_700_000_011;
+        legacy.provider_resources = vec![resource.clone()];
+        legacy.handoff = hetzner_bootstrap_handoff(&resource);
+
+        let failure = execute_hetzner_cleanup_job(&state, legacy)
+            .await
+            .expect_err("legacy numeric ID has no Phase 1 ownership envelope");
+        assert_eq!(failure.error, ProvisioningCleanupError::OwnershipMismatch);
+        assert!(requests.lock().expect("hcloud requests").is_empty());
+        let _ = std::fs::remove_file(token_path);
     }
 
     fn tracked_hcloud_cleanup_job(state: &AppState, provider_id: &str) -> ProvisioningJob {
-        let request = hcloud_apply_request("hcloud-cleanup-test");
+        let request = hcloud_review_request("hcloud-cleanup-test");
         let job = state
             .provisioning_jobs
             .start(&request, 1_700_000_020, &state.provider_runtime)
             .expect("tracked Hetzner job starts");
+        let reviewed = test_reviewed_paid_plan(&job);
+        let digest = reviewed.plan_sha256.clone();
+        state
+            .provisioning_jobs
+            .attach_paid_review(&job.id, reviewed, 1_700_000_021)
+            .expect("cleanup review attaches");
+        state
+            .provisioning_jobs
+            .confirm_paid_review(
+                &job.id,
+                &digest,
+                &"a".repeat(64),
+                "Test Operator",
+                1_700_000_022,
+            )
+            .expect("cleanup review confirms");
+        state
+            .provisioning_jobs
+            .claim_paid_execution(&job.id, &digest, &"a".repeat(64), 1_700_000_023)
+            .expect("cleanup execution claims");
+        state
+            .provisioning_jobs
+            .mark_paid_request_started(&job.id, &digest, 1_700_000_024)
+            .expect("cleanup create boundary persists");
         let resource = ProvisioningProviderResource {
             provider: "hetzner-cloud".to_string(),
             kind: "server".to_string(),
@@ -20251,20 +23019,38 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let handoff = hetzner_bootstrap_handoff(&resource).expect("bootstrap handoff");
         state
             .provisioning_jobs
-            .transition_provider_resource(
+            .complete_paid_create(
                 &job.id,
-                ProvisioningJobState::WaitingForHeartbeat,
-                "Server created and tracked for cleanup testing.",
+                &digest,
                 resource,
                 Some(handoff),
-                1_700_000_021,
+                false,
+                1_700_000_025,
             )
             .expect("tracked resource persisted")
     }
 
+    fn owned_cleanup_inventory(provider_id: &str) -> String {
+        json!({
+            "servers": [{
+                "id": provider_id.parse::<u64>().expect("numeric provider id"),
+                "name": "hcloud-cleanup-test",
+                "labels": paid_required_labels("setup-1700000020-1", "test-project")
+            }],
+            "meta": {"pagination": {
+                "page": 1,
+                "next_page": null,
+                "last_page": 1,
+                "total_entries": 1
+            }}
+        })
+        .to_string()
+    }
+
     #[tokio::test]
     async fn hetzner_cleanup_deletes_once_and_replays_without_provider_request() {
-        let (api, requests) = hcloud_mock_server("204 No Content", "", true).await;
+        let (api, requests) =
+            hcloud_cleanup_mock_server(owned_cleanup_inventory("4242"), "204 No Content", "").await;
         let (state, token_path) = test_hcloud_state(api);
         let job = tracked_hcloud_cleanup_job(&state, "4242");
 
@@ -20292,10 +23078,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         {
             let recorded = requests.lock().expect("hcloud requests");
-            assert_eq!(recorded.len(), 1);
-            assert_eq!(recorded[0].method, "DELETE");
-            assert_eq!(recorded[0].path, "/servers/4242");
-            assert!(recorded[0].body.is_empty());
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[0].method, "GET");
+            assert!(recorded[0].path.starts_with("/servers?"));
+            assert_eq!(recorded[1].method, "DELETE");
+            assert_eq!(recorded[1].path, "/servers/4242");
+            assert!(recorded[1].body.is_empty());
         }
 
         let (replayed, replay_already_absent) =
@@ -20304,7 +23092,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 .expect("cleanup replay is idempotent");
         assert!(replay_already_absent);
         assert_eq!(replayed, deleted);
-        assert_eq!(requests.lock().expect("hcloud requests").len(), 1);
+        assert_eq!(requests.lock().expect("hcloud requests").len(), 2);
 
         let json = serde_json::to_string(&deleted).expect("cleanup job serializes");
         assert!(!json.contains("test-hcloud-token"));
@@ -20316,7 +23104,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     #[tokio::test]
     async fn hetzner_cleanup_accepts_provider_already_absent() {
         let (api, requests) =
-            hcloud_mock_server("404 Not Found", r#"{"error":"not_found"}"#, true).await;
+            hcloud_cleanup_mock_server(
+                r#"{"servers":[],"meta":{"pagination":{"page":1,"next_page":null,"last_page":1,"total_entries":0}}}"#.to_string(),
+                "204 No Content",
+                "",
+            )
+            .await;
         let (state, token_path) = test_hcloud_state(api);
         let job = tracked_hcloud_cleanup_job(&state, "4243");
 
@@ -20331,12 +23124,68 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn hetzner_cleanup_rejects_incomplete_inventory_as_absence_proof() {
+        for inventory in [r#"{}"#, r#"{"servers":[]}"#] {
+            let (api, requests) =
+                hcloud_cleanup_mock_server(inventory.to_string(), "204 No Content", "").await;
+            let (state, token_path) = test_hcloud_state(api);
+            let job = tracked_hcloud_cleanup_job(&state, "4249");
+
+            let failure = execute_hetzner_cleanup_job(&state, job)
+                .await
+                .expect_err("partial inventory cannot prove provider absence");
+            assert_eq!(failure.error, ProvisioningCleanupError::ProviderUnavailable);
+            let recorded = requests.lock().expect("hcloud requests");
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].method, "GET");
+            assert!(!recorded.iter().any(|request| request.method == "DELETE"));
+            drop(recorded);
+            let _ = std::fs::remove_file(token_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn rotated_credential_cleanup_requires_visible_ownership_proof() {
+        let (api, requests) =
+            hcloud_cleanup_mock_server(owned_cleanup_inventory("4251"), "204 No Content", "").await;
+        let (state, files) = test_hcloud_state(api);
+        let job = tracked_hcloud_cleanup_job(&state, "4251");
+        std::fs::write(files.as_ref(), "rotated-test-hcloud-token")
+            .expect("rotate credential fixture");
+
+        let (deleted, already_absent) = execute_hetzner_cleanup_job(&state, job)
+            .await
+            .expect("exact visible ownership permits cleanup after rotation");
+        assert!(!already_absent);
+        assert_eq!(deleted.provider_resources[0].state, "deleted");
+        assert_eq!(requests.lock().expect("hcloud requests").len(), 2);
+        drop(files);
+
+        let empty_inventory = r#"{"servers":[],"meta":{"pagination":{"page":1,"next_page":null,"last_page":1,"total_entries":0}}}"#;
+        let (api, requests) =
+            hcloud_cleanup_mock_server(empty_inventory.to_string(), "204 No Content", "").await;
+        let (state, files) = test_hcloud_state(api);
+        let job = tracked_hcloud_cleanup_job(&state, "4252");
+        std::fs::write(files.as_ref(), "rotated-test-hcloud-token")
+            .expect("rotate credential fixture");
+
+        let failure = execute_hetzner_cleanup_job(&state, job)
+            .await
+            .expect_err("rotated credential cannot prove absence in the original project");
+        assert_eq!(failure.error, ProvisioningCleanupError::ProviderUnavailable);
+        let recorded = requests.lock().expect("hcloud requests");
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded.iter().any(|request| request.method == "DELETE"));
+    }
+
+    #[tokio::test]
     async fn hetzner_cleanup_uncertain_results_remain_recoverable() {
         for (status, body) in [
             ("500 Internal Server Error", r#"{"error":"temporary"}"#),
             ("200 OK", r#"{"unexpected":true}"#),
         ] {
-            let (api, requests) = hcloud_mock_server(status, body, true).await;
+            let (api, requests) =
+                hcloud_cleanup_mock_server(owned_cleanup_inventory("4244"), status, body).await;
             let (state, token_path) = test_hcloud_state(api);
             let job = tracked_hcloud_cleanup_job(&state, "4244");
             let failure = execute_hetzner_cleanup_job(&state, job)
@@ -20353,7 +23202,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 .expect("safe recovery progress")
                 .message
                 .contains("deletion was not proven"));
-            assert_eq!(requests.lock().expect("hcloud requests").len(), 1);
+            assert_eq!(requests.lock().expect("hcloud requests").len(), 2);
             let json = serde_json::to_string(&persisted).expect("job serializes");
             assert!(!json.contains("test-hcloud-token"));
             assert!(!json.to_ascii_lowercase().contains("bearer "));
@@ -20371,10 +23220,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let failure = execute_hetzner_cleanup_job(&state, job)
             .await
             .expect_err("network uncertainty fails closed");
-        assert_eq!(failure.error, ProvisioningCleanupError::ProviderUncertain);
+        assert_eq!(failure.error, ProvisioningCleanupError::ProviderUnavailable);
         assert_eq!(
             failure.job.expect("persisted job").state,
-            ProvisioningJobState::CleanupNeeded
+            ProvisioningJobState::WaitingForHeartbeat
         );
         let _ = std::fs::remove_file(token_path);
     }
@@ -20385,43 +23234,34 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let (mut state, token_path) = test_hcloud_state(api);
         let job = tracked_hcloud_cleanup_job(&state, "4246");
         state.provider_runtime.hetzner_cloud.execute_enabled = false;
-        let disabled = execute_hetzner_cleanup_job(&state, job)
+        let disabled = execute_hetzner_cleanup_job(&state, job.clone())
             .await
             .expect_err("disabled runtime fails closed");
         assert_eq!(disabled.error, ProvisioningCleanupError::RuntimeDisabled);
         assert!(requests.lock().expect("hcloud requests").is_empty());
 
         state.provider_runtime.hetzner_cloud.execute_enabled = true;
-        let job = tracked_hcloud_cleanup_job(&state, "4247");
         let second = ProvisioningProviderResource {
             provider_id: "4248".to_string(),
             name: "unexpected-second-server".to_string(),
             ..job.provider_resources[0].clone()
         };
-        let ambiguous = state
-            .provisioning_jobs
-            .transition_provider_resource(
-                &job.id,
-                ProvisioningJobState::WaitingForHeartbeat,
-                "A second resource was recorded for fail-closed testing.",
-                second,
-                None,
-                1_700_000_022,
-            )
-            .expect("ambiguous test job persists");
+        let mut ambiguous = job.clone();
+        ambiguous.provider_resources.push(second);
         let failure = execute_hetzner_cleanup_job(&state, ambiguous)
             .await
             .expect_err("ambiguous resources fail closed");
         assert_eq!(failure.error, ProvisioningCleanupError::ResourceAmbiguous);
         assert!(requests.lock().expect("hcloud requests").is_empty());
 
-        let invalid = tracked_hcloud_cleanup_job(&state, "not-a-number");
+        let mut invalid = job.clone();
+        invalid.provider_resources[0].provider_id = "not-a-number".to_string();
         let failure = execute_hetzner_cleanup_job(&state, invalid)
             .await
             .expect_err("non-numeric provider id fails closed");
         assert_eq!(failure.error, ProvisioningCleanupError::ResourceInvalid);
 
-        let mut unproven_deleted = tracked_hcloud_cleanup_job(&state, "4249");
+        let mut unproven_deleted = job;
         unproven_deleted.provider_resources[0].state = "deleted".to_string();
         let failure = execute_hetzner_cleanup_job(&state, unproven_deleted)
             .await
@@ -20446,7 +23286,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
-    async fn cleanup_endpoint_deletes_confirmed_tracked_resource() {
+    async fn cleanup_endpoint_rejects_open_mode_before_provider_delete() {
         let (api, requests) = hcloud_mock_server("204 No Content", "", true).await;
         let (state, token_path) = test_hcloud_state(api);
         let job = tracked_hcloud_cleanup_job(&state, "4250");
@@ -20459,201 +23299,593 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await
         .into_response();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let persisted = state
             .provisioning_jobs
             .get(&job.id)
             .expect("cleanup endpoint persists job");
-        assert_eq!(persisted.state, ProvisioningJobState::Complete);
-        assert_eq!(
-            persisted.terminal_outcome,
-            Some(ProvisioningTerminalOutcome::RolledBack)
-        );
-        assert_eq!(persisted.provider_resources[0].state, "deleted");
-        assert_eq!(requests.lock().expect("hcloud requests").len(), 1);
+        assert_eq!(persisted.state, ProvisioningJobState::WaitingForHeartbeat);
+        assert_eq!(persisted.terminal_outcome, None);
+        assert_eq!(persisted.provider_resources[0].state, "created");
+        assert!(requests.lock().expect("hcloud requests").is_empty());
         let _ = std::fs::remove_file(token_path);
     }
 
-    #[tokio::test]
-    async fn hetzner_executor_success_persists_waiting_for_heartbeat() {
-        let (api, requests) = hcloud_mock_server(
-            "201 Created",
-            r#"{"server":{"id":4242,"name":"hcloud-lab-3","public_net":{"ipv4":{"ip":"192.0.2.42"}}}}"#,
-            true,
+    #[test]
+    fn paid_plan_can_attach_confirm_claim_start_and_complete() {
+        let path = provisioning_store_test_path("paid-success");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_000_100;
+        let job = start_hcloud_review_job(&store, "hcloud-paid-success", created_at);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let plan_sha256 = reviewed.plan_sha256.clone();
+        let operator_ref = "b".repeat(64);
+
+        let attached = store
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("exact review attaches");
+        assert_eq!(
+            attached
+                .reviewed_plan
+                .as_ref()
+                .map(|plan| plan.plan_sha256.as_str()),
+            Some(plan_sha256.as_str())
+        );
+
+        let confirmed = store
+            .confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &operator_ref,
+                "operator@example.test",
+                created_at + 2,
+            )
+            .expect("exact review confirms");
+        assert_eq!(
+            confirmed
+                .paid_authorization
+                .as_ref()
+                .map(|authorization| authorization.operator_ref.as_str()),
+            Some(operator_ref.as_str())
+        );
+
+        let claimed = store
+            .claim_paid_execution(&job.id, &plan_sha256, &operator_ref, created_at + 3)
+            .expect("authorized execution claims");
+        assert_eq!(claimed.state, ProvisioningJobState::Provisioning);
+        assert_eq!(
+            claimed
+                .paid_execution
+                .as_ref()
+                .map(|execution| execution.state.as_str()),
+            Some("claimed")
+        );
+
+        let started = store
+            .mark_paid_request_started(&job.id, &plan_sha256, created_at + 4)
+            .expect("provider request marker persists");
+        assert_eq!(
+            started
+                .paid_execution
+                .as_ref()
+                .and_then(|execution| execution.provider_request_started_at),
+            Some(created_at + 4)
+        );
+
+        let resource = test_paid_resource("hcloud-paid-success", "4242");
+        let handoff = hetzner_bootstrap_handoff(&resource).expect("bootstrap handoff");
+        let complete = store
+            .complete_paid_create(
+                &job.id,
+                &plan_sha256,
+                resource,
+                Some(handoff),
+                false,
+                created_at + 5,
+            )
+            .expect("known provider result completes");
+
+        assert_eq!(complete.state, ProvisioningJobState::WaitingForHeartbeat);
+        assert_eq!(complete.provider_resources[0].provider_id, "4242");
+        assert_eq!(
+            complete
+                .paid_execution
+                .as_ref()
+                .map(|execution| (execution.state.as_str(), execution.provider_id.as_deref())),
+            Some(("created", Some("4242")))
+        );
+        assert_eq!(store.get(&job.id), Some(complete));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_already_started_paid_request_can_reconcile_after_authorization_expiry() {
+        let path = provisioning_store_test_path("paid-expired-reconcile");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_000_500;
+        let job = start_hcloud_review_job(&store, "hcloud-paid-reconcile", created_at);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let plan_sha256 = reviewed.plan_sha256.clone();
+        let expires_at = reviewed.expires_at;
+        let operator_ref = "b".repeat(64);
+        store
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("review attaches");
+        store
+            .confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &operator_ref,
+                "operator@example.test",
+                created_at + 2,
+            )
+            .expect("review confirms");
+        store
+            .claim_paid_execution(&job.id, &plan_sha256, &operator_ref, created_at + 3)
+            .expect("execution claims");
+        store
+            .mark_paid_request_started(&job.id, &plan_sha256, created_at + 4)
+            .expect("request marker persists");
+        store
+            .fail_paid_execution(
+                &job.id,
+                &plan_sha256,
+                true,
+                "Provider response was uncertain; reconcile by labels.".to_string(),
+                created_at + 5,
+            )
+            .expect("uncertain result persists");
+
+        let resource = test_paid_resource("hcloud-paid-reconcile", "4343");
+        let handoff = hetzner_bootstrap_handoff(&resource).expect("bootstrap handoff");
+        let reconciled = store
+            .complete_paid_create(
+                &job.id,
+                &plan_sha256,
+                resource,
+                Some(handoff),
+                true,
+                expires_at + 100,
+            )
+            .expect("read-only reconciliation remains possible after expiry");
+        assert_eq!(reconciled.state, ProvisioningJobState::WaitingForHeartbeat);
+        assert_eq!(
+            reconciled
+                .paid_execution
+                .as_ref()
+                .map(|execution| execution.state.as_str()),
+            Some("reconciled")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn another_fleet_operator_can_reconcile_but_cannot_send_the_claimed_request() {
+        let path = provisioning_store_test_path("paid-recovery-operator");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_000_800;
+        let job = start_hcloud_review_job(&store, "hcloud-operator-recovery", created_at);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let plan_sha256 = reviewed.plan_sha256.clone();
+        let authorizing_operator = "b".repeat(64);
+        let recovery_operator = "c".repeat(64);
+        store
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("review attaches");
+        store
+            .confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &authorizing_operator,
+                "authorizing@example.test",
+                created_at + 2,
+            )
+            .expect("review confirms");
+        let claimed = store
+            .claim_paid_execution(&job.id, &plan_sha256, &authorizing_operator, created_at + 3)
+            .expect("execution claims");
+        assert_eq!(
+            validate_paid_job_binding(&claimed, &plan_sha256, &recovery_operator),
+            Err(ProvisioningPaidStoreError::OperatorMismatch)
+        );
+
+        store
+            .mark_paid_request_started(&job.id, &plan_sha256, created_at + 4)
+            .expect("provider request boundary persists");
+        let uncertain = store
+            .fail_paid_execution(
+                &job.id,
+                &plan_sha256,
+                true,
+                "Provider result is uncertain; reconcile without replay.".to_string(),
+                created_at + 5,
+            )
+            .expect("uncertain result persists");
+        validate_paid_job_binding(&uncertain, &plan_sha256, &recovery_operator)
+            .expect("another fully privileged operator may perform read-only recovery");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn paid_plan_rejects_tampered_hash_expiry_and_wrong_operator() {
+        let path = provisioning_store_test_path("paid-rejections");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_001_100;
+        let job = start_hcloud_review_job(&store, "hcloud-paid-reject", created_at);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let plan_sha256 = reviewed.plan_sha256.clone();
+        let expires_at = reviewed.expires_at;
+        store
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("exact review attaches");
+
+        assert_eq!(
+            store.confirm_paid_review(
+                &job.id,
+                &"f".repeat(64),
+                &"b".repeat(64),
+                "operator@example.test",
+                created_at + 2,
+            ),
+            Err(ProvisioningPaidStoreError::PlanMismatch)
+        );
+        assert_eq!(
+            store.confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &"b".repeat(64),
+                "operator@example.test",
+                expires_at,
+            ),
+            Err(ProvisioningPaidStoreError::Expired)
+        );
+
+        let operator_ref = "b".repeat(64);
+        store
+            .confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &operator_ref,
+                "operator@example.test",
+                created_at + 3,
+            )
+            .expect("valid operator confirms before expiry");
+        assert_eq!(
+            store.confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &"c".repeat(64),
+                "different@example.test",
+                created_at + 4,
+            ),
+            Err(ProvisioningPaidStoreError::OperatorMismatch)
+        );
+        let wrong_operator_claim =
+            store.claim_paid_execution(&job.id, &plan_sha256, &"c".repeat(64), created_at + 4);
+        assert_eq!(
+            wrong_operator_claim,
+            Err(ProvisioningPaidStoreError::OperatorMismatch)
+        );
+        assert!(store
+            .get(&job.id)
+            .expect("rejected plan remains stored")
+            .paid_execution
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn paid_actions_require_a_valid_durable_snapshot() {
+        let memory_only = ProvisioningJobStore::new(None);
+        assert!(!memory_only.durable_ready());
+        assert_eq!(
+            memory_only.start(
+                &hcloud_review_request("hcloud-memory-only"),
+                1_700_001_500,
+                &test_hcloud_store_runtime(),
+            ),
+            Err(ProvisioningJobStartError::PersistenceFailed)
+        );
+
+        let malformed_path = provisioning_store_test_path("paid-malformed-snapshot");
+        std::fs::write(&malformed_path, b"{not-json").expect("write malformed snapshot");
+        let malformed = ProvisioningJobStore::new(Some(malformed_path.clone()));
+        assert!(!malformed.durable_ready());
+        assert_eq!(
+            malformed.start(
+                &hcloud_review_request("hcloud-malformed-store"),
+                1_700_001_501,
+                &test_hcloud_store_runtime(),
+            ),
+            Err(ProvisioningJobStartError::PersistenceFailed)
+        );
+        let _ = std::fs::remove_file(malformed_path);
+
+        let tampered_path = provisioning_store_test_path("paid-tampered-snapshot");
+        let store = ProvisioningJobStore::new(Some(tampered_path.clone()));
+        let job = start_hcloud_review_job(&store, "hcloud-tampered-store", 1_700_001_600);
+        let reviewed = test_reviewed_paid_plan(&job);
+        store
+            .attach_paid_review(&job.id, reviewed, 1_700_001_601)
+            .expect("valid review persists");
+        let mut snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&tampered_path).expect("read persisted snapshot"),
         )
-        .await;
+        .expect("snapshot JSON");
+        snapshot["jobs"][0]["reviewed_plan"]["server_name"] = json!("changed-after-review");
+        std::fs::write(
+            &tampered_path,
+            serde_json::to_vec_pretty(&snapshot).expect("encode tampered snapshot"),
+        )
+        .expect("write tampered snapshot");
+        let tampered = ProvisioningJobStore::new(Some(tampered_path.clone()));
+        assert!(!tampered.durable_ready());
+        assert!(tampered.list().is_empty());
+        remove_provisioning_store_test_files(&tampered_path);
+
+        let replaced_path = provisioning_store_test_path("paid-replaced-snapshot");
+        let store = ProvisioningJobStore::new(Some(replaced_path.clone()));
+        let job = start_hcloud_review_job(&store, "hcloud-replaced-store", 1_700_001_700);
+        let reviewed = test_reviewed_paid_plan(&job);
+        store
+            .attach_paid_review(&job.id, reviewed, 1_700_001_701)
+            .expect("valid review persists");
+        drop(store);
+        std::fs::write(&replaced_path, b"[]").expect("replace snapshot with valid empty JSON");
+        let replaced = ProvisioningJobStore::new(Some(replaced_path.clone()));
+        assert!(!replaced.durable_ready());
+        assert!(replaced.list().is_empty());
+        remove_provisioning_store_test_files(&replaced_path);
+
+        let missing_path = provisioning_store_test_path("paid-missing-after-init");
+        let initialized = ProvisioningJobStore::new(Some(missing_path.clone()));
+        assert!(initialized.durable_ready());
+        drop(initialized);
+        std::fs::remove_file(&missing_path).expect("remove initialized snapshot");
+        let missing = ProvisioningJobStore::new(Some(missing_path.clone()));
+        assert!(!missing.durable_ready());
+        remove_provisioning_store_test_files(&missing_path);
+    }
+
+    #[test]
+    fn unresolved_paid_attempt_reserves_the_project_across_reload() {
+        let path = provisioning_store_test_path("paid-project-reservation");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let operator_ref = "b".repeat(64);
+
+        let first = start_hcloud_review_job(&store, "hcloud-first-attempt", 1_700_001_700);
+        let first_plan = test_reviewed_paid_plan(&first);
+        let first_digest = first_plan.plan_sha256.clone();
+        store
+            .attach_paid_review(&first.id, first_plan, 1_700_001_701)
+            .expect("first review attaches");
+        store
+            .confirm_paid_review(
+                &first.id,
+                &first_digest,
+                &operator_ref,
+                "operator@example.test",
+                1_700_001_702,
+            )
+            .expect("first review confirms");
+
+        let second = start_hcloud_review_job(&store, "hcloud-second-attempt", 1_700_001_703);
+        let second_plan = test_reviewed_paid_plan(&second);
+        let second_digest = second_plan.plan_sha256.clone();
+        store
+            .attach_paid_review(&second.id, second_plan, 1_700_001_704)
+            .expect("second review can exist before either claim");
+        store
+            .confirm_paid_review(
+                &second.id,
+                &second_digest,
+                &operator_ref,
+                "operator@example.test",
+                1_700_001_705,
+            )
+            .expect("second review confirms");
+
+        store
+            .claim_paid_execution(&first.id, &first_digest, &operator_ref, 1_700_001_706)
+            .expect("first attempt claims project");
+        store
+            .mark_paid_request_started(&first.id, &first_digest, 1_700_001_707)
+            .expect("first request boundary persists");
+        store
+            .fail_paid_execution(
+                &first.id,
+                &first_digest,
+                true,
+                "Provider result is uncertain; do not replay.".to_string(),
+                1_700_001_708,
+            )
+            .expect("uncertain reservation persists");
+
+        let reloaded = ProvisioningJobStore::new(Some(path.clone()));
+        assert!(reloaded.durable_ready());
+        assert!(reloaded.paid_project_blocked(None));
+        assert_eq!(
+            reloaded
+                .claim_paid_execution(&second.id, &second_digest, &operator_ref, 1_700_001_709,),
+            Err(ProvisioningPaidStoreError::ProjectBusy)
+        );
+        assert!(reloaded
+            .get(&second.id)
+            .expect("second review remains")
+            .paid_execution
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn malformed_successful_create_response_remains_uncertain() {
+        let response_body = r#"{"server":{"id":0,"name":"hcloud-partial-success","labels":{"managed-by":"pharos","pharos-setup":"tracked-job","pharos-owner":"75c84d20a0aa90c5","pharos-job":"setup-1700001800-1","pharos-attempt":"setup-1700001800-1-1"}}}"#;
+        let (api, requests) = hcloud_mock_server("201 Created", response_body, true).await;
         let (state, token_path) = test_hcloud_state(api);
-        let request = hcloud_apply_request("hcloud-lab-3");
-
-        let job = state
-            .provisioning_jobs
-            .start(&request, 1_700_000_008, &state.provider_runtime)
-            .expect("hetzner job starts");
-        assert_eq!(job.state, ProvisioningJobState::Provisioning);
-        let job =
-            execute_hetzner_setup_job(&state, &request, job, &state.provider_runtime.hetzner_cloud)
-                .await;
-
-        assert_eq!(job.state, ProvisioningJobState::WaitingForHeartbeat);
-        assert!(job
-            .progress
-            .iter()
-            .any(|entry| entry.state == ProvisioningJobState::Bootstrapping));
-        let resource = job
-            .provider_resources
-            .first()
-            .expect("provider resource persisted");
-        assert_eq!(resource.provider, "hetzner-cloud");
-        assert_eq!(resource.kind, "server");
-        assert_eq!(resource.provider_id, "4242");
-        assert_eq!(resource.name, "hcloud-lab-3");
-        assert_eq!(resource.state, "created");
-        assert_eq!(resource.location.as_deref(), Some("fsn1"));
-        assert_eq!(
-            resource.ssh.as_ref().and_then(|ssh| ssh.host.as_deref()),
-            Some("192.0.2.42")
+        let job = start_hcloud_review_job(
+            &state.provisioning_jobs,
+            "hcloud-partial-success",
+            1_700_001_800,
         );
-        let handoff = job.handoff.as_ref().expect("bootstrap handoff persisted");
-        assert_eq!(handoff.method, BootstrapMethod::NixosAnywhere);
-        assert_eq!(handoff.status, "provider-created-bootstrap-required");
+        let mut plan = test_reviewed_paid_plan(&job);
+        plan.expires_at = now_unix() + 60;
+        let operation =
+            HetznerOperationContext::resolve(state.provider_runtime.hetzner_cloud.clone())
+                .expect("operation credential resolves");
+        let prerequisites = resolve_hetzner_create_prerequisites(&plan, &operation)
+            .await
+            .expect("prerequisites resolve");
+        let error = send_hetzner_create(&plan, prerequisites, &operation)
+            .await
+            .expect_err("zero provider identity is not a successful create");
+        assert!(error.resource_state_uncertain());
+        assert_eq!(requests.lock().expect("hcloud requests").len(), 4);
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[test]
+    fn request_start_boundary_rechecks_authorization_expiry() {
+        let path = provisioning_store_test_path("paid-boundary-expiry");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_001_900;
+        let job = start_hcloud_review_job(&store, "hcloud-expiry-boundary", created_at);
+        let plan = test_reviewed_paid_plan(&job);
+        let digest = plan.plan_sha256.clone();
+        let expires_at = plan.expires_at;
+        let operator_ref = "b".repeat(64);
+        store
+            .attach_paid_review(&job.id, plan, created_at + 1)
+            .expect("review attaches");
+        store
+            .confirm_paid_review(
+                &job.id,
+                &digest,
+                &operator_ref,
+                "operator@example.test",
+                created_at + 2,
+            )
+            .expect("review confirms");
+        store
+            .claim_paid_execution(&job.id, &digest, &operator_ref, expires_at - 1)
+            .expect("claim before expiry persists");
         assert_eq!(
-            handoff.command_ref.as_deref(),
-            Some("scripts/bootstrap-pharos-nixos-anywhere.sh")
+            store.mark_paid_request_started(&job.id, &digest, expires_at),
+            Err(ProvisioningPaidStoreError::Expired)
         );
-        let requests = requests.lock().expect("hcloud requests");
-        let create = requests
-            .iter()
-            .find(|request| request.method == "POST" && request.path == "/servers")
-            .expect("server create request recorded");
-        let payload: serde_json::Value =
-            serde_json::from_str(&create.body).expect("create payload parses");
-        assert_eq!(payload["ssh_keys"], json!([101]));
-        assert_eq!(payload["firewalls"], json!([{ "firewall": 202 }]));
-        assert!(!create.body.contains("test-hcloud-token"));
         assert_eq!(
-            state
-                .provisioning_jobs
+            store
                 .get(&job.id)
-                .expect("persisted")
-                .state,
-            ProvisioningJobState::WaitingForHeartbeat
+                .and_then(|job| job.paid_execution)
+                .map(|execution| execution.state),
+            Some("claimed".to_string())
         );
-        let json = serde_json::to_string(&job).expect("job serializes");
-        assert!(!json.contains("test-hcloud-token"));
-        assert!(!json.to_ascii_lowercase().contains("bearer "));
-        assert!(!json.to_ascii_lowercase().contains("token="));
-        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(path);
     }
 
-    #[tokio::test]
-    async fn hetzner_executor_without_public_ipv4_requires_cleanup_review() {
-        let (api, _) = hcloud_mock_server(
-            "201 Created",
-            r#"{"server":{"id":4243,"name":"hcloud-lab-5","public_net":{}}}"#,
-            true,
-        )
-        .await;
-        let (state, token_path) = test_hcloud_state(api);
-        let request = hcloud_apply_request("hcloud-lab-5");
+    #[test]
+    fn paid_claim_and_request_started_marker_survive_reload() {
+        let path = provisioning_store_test_path("paid-reload");
+        let created_at = 1_700_002_100;
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let job = start_hcloud_review_job(&store, "hcloud-paid-reload", created_at);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let plan_sha256 = reviewed.plan_sha256.clone();
+        let operator_ref = "b".repeat(64);
+        store
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("exact review attaches");
+        store
+            .confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &operator_ref,
+                "operator@example.test",
+                created_at + 2,
+            )
+            .expect("exact review confirms");
+        store
+            .claim_paid_execution(&job.id, &plan_sha256, &operator_ref, created_at + 3)
+            .expect("execution claim persists");
+        drop(store);
 
-        let job = state
-            .provisioning_jobs
-            .start(&request, 1_700_000_010, &state.provider_runtime)
-            .expect("hetzner job starts");
-        let job =
-            execute_hetzner_setup_job(&state, &request, job, &state.provider_runtime.hetzner_cloud)
-                .await;
+        let reloaded = ProvisioningJobStore::new(Some(path.clone()));
+        let claimed = reloaded.get(&job.id).expect("claimed job reloads");
+        assert_eq!(
+            claimed
+                .paid_execution
+                .as_ref()
+                .map(|execution| execution.state.as_str()),
+            Some("claimed")
+        );
+        assert!(claimed
+            .paid_execution
+            .as_ref()
+            .expect("claim")
+            .provider_request_started_at
+            .is_none());
+        reloaded
+            .mark_paid_request_started(&job.id, &plan_sha256, created_at + 4)
+            .expect("request-started marker persists");
+        drop(reloaded);
 
-        assert_eq!(job.state, ProvisioningJobState::CleanupNeeded);
-        assert!(job.handoff.is_none());
-        let resource = job
-            .provider_resources
-            .first()
-            .expect("uncertain resource persisted");
-        assert_eq!(resource.state, "created-address-pending");
-        assert!(resource.ssh.is_none());
-        assert!(job
-            .progress
-            .last()
-            .expect("cleanup progress")
-            .message
-            .contains("no usable public IPv4 address"));
-        let json = serde_json::to_string(&job).expect("job serializes");
-        assert!(!json.contains("test-hcloud-token"));
-        assert!(!json.to_ascii_lowercase().contains("bearer "));
-        assert!(!json.to_ascii_lowercase().contains("token="));
-        let _ = std::fs::remove_file(token_path);
+        let reloaded = ProvisioningJobStore::new(Some(path.clone()));
+        let started = reloaded.get(&job.id).expect("started job reloads");
+        assert_eq!(
+            started
+                .paid_execution
+                .as_ref()
+                .map(|execution| execution.state.as_str()),
+            Some("request-started")
+        );
+        assert_eq!(
+            started
+                .paid_execution
+                .as_ref()
+                .and_then(|execution| execution.provider_request_started_at),
+            Some(created_at + 4)
+        );
+        let _ = std::fs::remove_file(path);
     }
 
-    #[tokio::test]
-    async fn hetzner_executor_refuses_create_without_reviewed_firewall() {
-        let (api, requests) = hcloud_mock_server(
-            "201 Created",
-            r#"{"server":{"id":4244,"name":"must-not-exist"}}"#,
-            false,
-        )
-        .await;
-        let (state, token_path) = test_hcloud_state(api);
-        let request = hcloud_apply_request("hcloud-lab-6");
+    #[test]
+    fn paid_claim_rolls_back_when_persistence_fails() {
+        let obstruction = provisioning_store_test_path("paid-persistence-obstruction");
+        std::fs::create_dir_all(&obstruction).expect("test store directory");
+        let path = obstruction.join("jobs.json");
+        let created_at = 1_700_003_100;
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let job = start_hcloud_review_job(&store, "hcloud-paid-persist", created_at);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let plan_sha256 = reviewed.plan_sha256.clone();
+        let operator_ref = "b".repeat(64);
+        store
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("exact review attaches");
+        store
+            .confirm_paid_review(
+                &job.id,
+                &plan_sha256,
+                &operator_ref,
+                "operator@example.test",
+                created_at + 2,
+            )
+            .expect("exact review confirms");
 
-        let job = state
-            .provisioning_jobs
-            .start(&request, 1_700_000_011, &state.provider_runtime)
-            .expect("hetzner job starts");
-        let job =
-            execute_hetzner_setup_job(&state, &request, job, &state.provider_runtime.hetzner_cloud)
-                .await;
+        std::fs::remove_file(&path).expect("remove persisted snapshot");
+        std::fs::remove_file(provisioning_job_store_marker_path(&path))
+            .expect("remove persistence marker");
+        std::fs::remove_dir(&obstruction).expect("remove store directory");
+        std::fs::write(&obstruction, b"not a directory").expect("obstruct persistence path");
 
-        assert_eq!(job.state, ProvisioningJobState::Failed);
-        assert!(job.provider_resources.is_empty());
-        assert!(job
-            .progress
-            .last()
-            .expect("safe failure progress")
-            .message
-            .contains("firewall was not found"));
-        assert!(!requests
-            .lock()
-            .expect("hcloud requests")
-            .iter()
-            .any(|request| request.method == "POST"));
-        let _ = std::fs::remove_file(token_path);
-    }
-
-    #[tokio::test]
-    async fn hetzner_executor_failure_persists_cleanup_guidance() {
-        let (api, _) = hcloud_mock_server(
-            "500 Internal Server Error",
-            r#"{"error":"temporary"}"#,
-            true,
-        )
-        .await;
-        let (state, token_path) = test_hcloud_state(api);
-        let request = hcloud_apply_request("hcloud-lab-4");
-
-        let job = state
-            .provisioning_jobs
-            .start(&request, 1_700_000_009, &state.provider_runtime)
-            .expect("hetzner job starts");
-        let job =
-            execute_hetzner_setup_job(&state, &request, job, &state.provider_runtime.hetzner_cloud)
-                .await;
-
-        assert_eq!(job.state, ProvisioningJobState::CleanupNeeded);
-        let message = job
-            .progress
-            .last()
-            .expect("cleanup progress")
-            .message
-            .as_str();
-        assert!(message.contains("HTTP status 500"));
-        assert!(message.contains("provider resource name hcloud-lab-4"));
-        assert!(!message.contains("temporary"));
-        let json = serde_json::to_string(&job).expect("job serializes");
-        assert!(!json.contains("test-hcloud-token"));
-        assert!(!json.to_ascii_lowercase().contains("bearer "));
-        assert!(!json.to_ascii_lowercase().contains("token="));
-        let _ = std::fs::remove_file(token_path);
+        assert_eq!(
+            store.claim_paid_execution(&job.id, &plan_sha256, &operator_ref, created_at + 3),
+            Err(ProvisioningPaidStoreError::PersistenceFailed)
+        );
+        let unchanged = store.get(&job.id).expect("confirmed job remains in memory");
+        assert_eq!(unchanged.state, ProvisioningJobState::Planning);
+        assert!(unchanged.paid_authorization.is_some());
+        assert!(unchanged.paid_execution.is_none());
+        let _ = std::fs::remove_file(obstruction);
     }
 
     fn setup_runtime_host(name: &str, backup_observations: Vec<BackupObservation>) -> Host {
@@ -20859,7 +24091,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn provider_setup_job_persists_backup_intent_without_provider_apply() {
-        let store = ProvisioningJobStore::new(None);
+        let path = provisioning_store_test_path("provider-setup-intent");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
         let request = ProvisioningJobStartRequest {
             provider: "hetzner-cloud".to_string(),
             template: "hetzner-small-nixos".to_string(),
@@ -20916,6 +24149,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let json = serde_json::to_string(&job).expect("job serializes");
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.to_ascii_lowercase().contains("token="));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -21540,6 +24774,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let runtime = HetznerCloudRuntimeConfig {
             credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
             execute_enabled: true,
+            project_label: Some("test-project".to_string()),
             default_ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
             firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
             default_location: Some("fsn1".to_string()),
@@ -21638,6 +24873,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             hetzner_cloud: HetznerCloudRuntimeConfig {
                 credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
                 execute_enabled: true,
+                project_label: Some("test-project".to_string()),
                 default_ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
                 firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
                 default_location: Some("fsn1".to_string()),
@@ -21924,6 +25160,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             beacon_auth,
             provider_runtime: ProviderRuntimeConfig::default(),
             provider_connections: Arc::new(ProviderConnectionStore::new(None)),
+            paid_create_lock: Arc::new(tokio::sync::Mutex::new(())),
             nixcfg_dispatch: NixcfgDispatch::disabled(),
             retirement_owner: RetirementOwnerAuth::default(),
             host_actions: Arc::new(HostActionStore::new(None)),

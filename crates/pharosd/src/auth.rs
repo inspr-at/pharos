@@ -33,12 +33,14 @@ use openidconnect::{
     EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, SubjectIdentifier, TokenResponse,
 };
+use sha2::{Digest, Sha256};
 
 const SESSION_COOKIE: &str = "pharos_session";
 const SESSION_TTL_SECS: i64 = 8 * 3600;
 const FLOW_TTL_SECS: i64 = 600;
 const ALLOWED_OPERATORS_ENV: &str = "PHAROS_ALLOWED_OPERATORS";
 const ACCESS_POLICY_FILE_ENV: &str = "PHAROS_ACCESS_POLICY_FILE";
+const OPERATOR_REF_DOMAIN: &str = "pharos:oidc-principal:operator-ref:v2:";
 
 type OidcClient = CoreClient<
     EndpointSet,
@@ -66,6 +68,7 @@ struct Pending {
 
 #[derive(Clone)]
 pub struct AuthUser {
+    pub operator_ref: String,
     pub display_name: String,
 }
 
@@ -284,9 +287,7 @@ impl Auth {
             .expect("sessions lock")
             .get(&sid)
             .filter(|s| s.expires > now())
-            .map(|s| AuthUser {
-                display_name: s.display_name.clone(),
-            })
+            .map(|session| AuthUser::from_session(session, self.issuer.as_str()))
     }
 
     pub fn current_access(&self, headers: &HeaderMap) -> AccessGrant {
@@ -328,6 +329,24 @@ impl Auth {
             }
         }
     }
+}
+
+impl AuthUser {
+    fn from_session(session: &Session, issuer: &str) -> Self {
+        Self {
+            operator_ref: operator_ref_from_principal(issuer, &session.subject),
+            display_name: session.display_name.clone(),
+        }
+    }
+}
+
+fn operator_ref_from_principal(issuer: &str, subject: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(OPERATOR_REF_DOMAIN.as_bytes());
+    hasher.update(issuer.as_bytes());
+    hasher.update([0]);
+    hasher.update(subject.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Clone)]
@@ -854,6 +873,44 @@ mod tests {
             display_name_from_user_info(&user_info),
             Some("markus".to_string())
         );
+    }
+
+    #[test]
+    fn operator_ref_is_stable_domain_separated_lowercase_hex() {
+        let operator_ref =
+            operator_ref_from_principal("https://issuer.example.test", "opaque-subject");
+
+        assert_eq!(
+            operator_ref,
+            "6672d3b0e81375008a36d203936aeec654db7566abda3451e7a672be5d36170d"
+        );
+        assert_eq!(operator_ref.len(), 64);
+        assert!(operator_ref
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(!operator_ref.contains("opaque-subject"));
+        assert_ne!(
+            operator_ref,
+            operator_ref_from_principal("https://other-issuer.example.test", "opaque-subject")
+        );
+    }
+
+    #[test]
+    fn auth_user_derives_operator_ref_from_private_session_subject() {
+        let session = Session {
+            subject: "opaque-subject".to_string(),
+            display_name: "Markus".to_string(),
+            identifiers: vec!["markus".to_string()],
+            expires: i64::MAX,
+        };
+
+        let user = AuthUser::from_session(&session, "https://issuer.example.test");
+
+        assert_eq!(
+            user.operator_ref,
+            "6672d3b0e81375008a36d203936aeec654db7566abda3451e7a672be5d36170d"
+        );
+        assert_eq!(user.display_name, "Markus");
     }
 
     #[test]

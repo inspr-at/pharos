@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.42 - 2026-07-18
+
+- Persist an exact, secret-free Hetzner Cloud plan with server name, current gross prices, hard caps, project and resource selectors, a non-secret credential binding, ownership labels, a one-server maximum, and a short expiry before any paid action is available.
+- Require the authenticated operator to authorize that exact digest in a separate attended step, then revalidate live credentials, catalog facts, image, SSH key, firewall, prices, complete project inventory, and the bound server facts immediately before one single-use create request.
+- Require a checksummed, store-bound durable job sidecar, reserve the project across restart while any attempt is unresolved, pin one no-retry/no-redirect credential snapshot per provider operation, reconcile uncertain results without replay, and allow separately confirmed cleanup only with exact ownership evidence, including safe recovery after credential or operator rotation.
+
 ## 0.1.41 - 2026-07-15
 
 - Animate the sidebar lighthouse with a compact, silent native video while preserving the existing still image as the loading and playback fallback.

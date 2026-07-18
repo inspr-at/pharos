@@ -40,10 +40,12 @@ services:
       PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE: ${PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE:-}
 
       # Optional Hetzner Cloud executor. Keep the API token in a mounted
-      # runtime file. The SSH public key and firewall must already exist in the
-      # Hetzner project; Pharos resolves both before creating a server.
+      # runtime file. The project label is non-secret operator-facing context;
+      # the SSH public key and firewall must already exist in that project.
       PHAROS_HCLOUD_EXECUTE: ${PHAROS_HCLOUD_EXECUTE:-0}
       PHAROS_HCLOUD_API_TOKEN_FILE: ${PHAROS_HCLOUD_API_TOKEN_FILE:-}
+      PHAROS_HCLOUD_PROJECT_LABEL: ${PHAROS_HCLOUD_PROJECT_LABEL:-}
+      PHAROS_HCLOUD_APPROVAL_TTL_SECS: ${PHAROS_HCLOUD_APPROVAL_TTL_SECS:-900}
       PHAROS_HCLOUD_SSH_KEY_REF: ${PHAROS_HCLOUD_SSH_KEY_REF:-}
       PHAROS_HCLOUD_FIREWALL_REF: ${PHAROS_HCLOUD_FIREWALL_REF:-}
 

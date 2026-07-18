@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/markus-barta/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/markus-barta/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.41-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.42-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -46,7 +46,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v0.1.41
+## What ships in v0.1.42
 
 | Area | Current capability |
 | --- | --- |
@@ -56,7 +56,7 @@ operation.
 | **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications |
 | **Host settings** | Color, server/workstation kind and alert preferences with requested, declared and applied state shown separately |
 | **Onboarding** | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions |
-| **Providers** | Read-only provider connection checks, current Hetzner Cloud catalog data and opt-in, confirmation-gated server creation |
+| **Providers** | Read-only provider checks, exact paid-plan review, attended authorization, single-use Hetzner Cloud creation and ownership-checked cleanup |
 | **Guarded actions** | Fixed review/apply/restart, fleet-update proposal and host-retirement workflows with leases, confirmation and recovery evidence |
 | **Access** | OIDC Authorization Code + PKCE for people; independent per-host bearer authentication for machines |
 
@@ -98,9 +98,16 @@ different report schemas. The current report contract is
 
 ### Persistence
 
-`pharosd` keeps working state in memory and optionally persists it when
-`PHAROS_DB` points to a JSON file. Provisioning, provider, guarded-action and
-retirement state use derived JSON sidecars beside that file.
+`pharosd` keeps working state in memory and persists it when `PHAROS_DB` points
+to a JSON file. Provisioning, provider, guarded-action and retirement state use
+derived JSON sidecars beside that file. Most read-only/local use remains
+available without persistence, but paid provider review, authorization,
+creation, reconciliation, and cleanup fail closed unless the provisioning-job
+sidecar is configured and valid. `PHAROS_PROVISIONING_JOBS_DB` can name that
+sidecar explicitly when `PHAROS_DB` is not used. Paid job snapshots use a
+checksummed, store-bound envelope and an adjacent `.initialized` marker; back
+up and restore both together. If an initialized snapshot disappears or is
+replaced by a bare/partial JSON list, paid actions stay disabled.
 
 This is intentionally a small-fleet design:
 
@@ -357,14 +364,33 @@ Hetzner creation is disabled unless every prerequisite is supplied:
 ```bash
 export PHAROS_HCLOUD_EXECUTE=1
 export PHAROS_HCLOUD_API_TOKEN_FILE=/run/pharos/hcloud-token
+export PHAROS_HCLOUD_PROJECT_LABEL=personal-lab
+# Optional: 60–1800 seconds; defaults to 900 (15 minutes).
+export PHAROS_HCLOUD_APPROVAL_TTL_SECS=900
 export PHAROS_HCLOUD_SSH_KEY_REF=pharos-bootstrap-key
 export PHAROS_HCLOUD_FIREWALL_REF=pharos-bootstrap-firewall
 ```
 
-Pharos tests the connection with read-only API calls, loads current locations,
-plans and prices, then validates the chosen resources again before a separate
-paid-creation confirmation. The SSH key and firewall must already exist in the
-provider project.
+`PHAROS_HCLOUD_PROJECT_LABEL` is a safe, non-secret name shown during review;
+the API token remains the authority for the actual provider project. Pharos
+persists only a domain-separated credential fingerprint alongside the
+value-free review, exact prices, and expiry; the raw token is never persisted
+or returned. It requires a separate authenticated authorization and enables
+**Create** only while that bounded authorization and credential binding are
+current. The default authorization window is 15 minutes and cannot be
+configured above 30 minutes.
+
+Immediately before creation, Pharos rechecks the current catalog, price,
+project server count, SSH key, and firewall. The former direct `apply=true`
+path is rejected: paid creation must follow persisted review → authorize →
+**Create**. A valid durable provisioning-job sidecar is mandatory, and an
+unresolved create attempt reserves the provider project across restarts so a
+new review cannot race an uncertain result. The SSH key and firewall must
+already exist in the provider project. Each provider operation pins one token
+snapshot and disables HTTP redirects. After a legitimate token rotation,
+reconciliation and cleanup can recover only from an exact visible ownership
+match; an empty inventory under a different credential is never accepted as
+proof that the original server is absent.
 
 netcup, AWS, Google Cloud and Oracle Cloud currently use guided import paths.
 Pharos does not claim ordering, billing or free-tier guarantees for them.
@@ -391,7 +417,8 @@ promised third-party API. The important boundaries are:
 | Variable | Purpose |
 | --- | --- |
 | `PHAROS_ADDR` | Listen address, default `127.0.0.1:8080` |
-| `PHAROS_DB` | Optional JSON host-store path; enables derived persistent sidecars |
+| `PHAROS_DB` | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly |
+| `PHAROS_PROVISIONING_JOBS_DB` | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset |
 | `PHAROS_OIDC_ISSUER` | OIDC discovery issuer |
 | `PHAROS_OIDC_CLIENT_ID` | Public OIDC client identifier |
 | `PHAROS_OIDC_REDIRECT_URI` | Exact callback URI |
@@ -422,7 +449,7 @@ See the committed Compose files and NixOS module for the complete wiring.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.41**. It is already used as a real
+Pharos is an active early release at **v0.1.42**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

@@ -1415,6 +1415,214 @@ impl ProvisioningProviderResource {
     }
 }
 
+/// Exact, secret-free provider plan shown to an operator before paid-service
+/// authorization. It may contain a one-way credential binding, but provider
+/// credentials and other secret values never belong in this record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningReviewedPaidPlan {
+    pub provider_project: String,
+    pub credential_binding_sha256: String,
+    pub server_name: String,
+    pub location: String,
+    pub location_label: String,
+    pub server_type: String,
+    pub server_type_label: String,
+    pub image: String,
+    pub price_currency: String,
+    pub price_hourly_gross: String,
+    pub price_monthly_gross: String,
+    pub max_hourly_gross: String,
+    pub max_monthly_gross: String,
+    pub observed_active_servers: u16,
+    pub max_active_servers: u16,
+    pub catalog_refreshed_at: UnixSeconds,
+    pub expires_at: UnixSeconds,
+    pub ssh_key_ref: String,
+    pub firewall_ref: String,
+    #[serde(default)]
+    pub required_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub allowed_operations: Vec<String>,
+    pub cleanup_policy: String,
+    pub plan_sha256: String,
+}
+
+impl ProvisioningReviewedPaidPlan {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        for value in [
+            self.provider_project.as_str(),
+            self.location_label.as_str(),
+            self.server_type_label.as_str(),
+        ] {
+            if !safe_paid_text(value, 200) {
+                return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+            }
+        }
+        if !safe_paid_text(&self.cleanup_policy, 600) {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        for value in [
+            self.server_name.as_str(),
+            self.location.as_str(),
+            self.server_type.as_str(),
+            self.image.as_str(),
+            self.ssh_key_ref.as_str(),
+            self.firewall_ref.as_str(),
+        ] {
+            if !safe_paid_identifier(value, 160) {
+                return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+            }
+        }
+        if self.price_currency.len() != 3
+            || !self
+                .price_currency
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase())
+        {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        let Some(hourly) = gross_price_units(&self.price_hourly_gross) else {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        };
+        let Some(monthly) = gross_price_units(&self.price_monthly_gross) else {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        };
+        let Some(max_hourly) = gross_price_units(&self.max_hourly_gross) else {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        };
+        let Some(max_monthly) = gross_price_units(&self.max_monthly_gross) else {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        };
+        if hourly > max_hourly || monthly > max_monthly {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        if self.max_active_servers != 1 || self.observed_active_servers >= self.max_active_servers {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        if self.catalog_refreshed_at <= 0 || self.expires_at <= self.catalog_refreshed_at {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        if self.required_labels.len() < 2 || self.required_labels.len() > 16 {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        for (key, value) in &self.required_labels {
+            if !safe_paid_identifier(key, 63) || !safe_paid_identifier(value, 63) {
+                return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+            }
+        }
+        if self.required_labels.get("managed-by").map(String::as_str) != Some("pharos")
+            || self.required_labels.get("pharos-setup").map(String::as_str) != Some("tracked-job")
+        {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        if self.allowed_operations.len() != 2
+            || !self
+                .allowed_operations
+                .iter()
+                .any(|operation| operation == "create-server")
+            || !self
+                .allowed_operations
+                .iter()
+                .any(|operation| operation == "delete-server")
+            || self
+                .allowed_operations
+                .iter()
+                .any(|operation| !safe_paid_identifier(operation, 64))
+        {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        if !lower_hex_sha256(&self.credential_binding_sha256)
+            || !lower_hex_sha256(&self.plan_sha256)
+        {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        Ok(())
+    }
+}
+
+/// Attended operator authorization for one exact reviewed paid plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningPaidAuthorization {
+    pub plan_sha256: String,
+    pub operator_ref: String,
+    pub operator_label: String,
+    pub confirmed_at: UnixSeconds,
+    pub expires_at: UnixSeconds,
+}
+
+impl ProvisioningPaidAuthorization {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        if !lower_hex_sha256(&self.plan_sha256)
+            || !lower_hex_sha256(&self.operator_ref)
+            || !safe_paid_text(&self.operator_label, 200)
+            || self.confirmed_at <= 0
+            || self.expires_at <= self.confirmed_at
+        {
+            return Err(ServerLifecycleContractError::InvalidPaidAuthorization);
+        }
+        Ok(())
+    }
+}
+
+/// Single-use paid execution claim bound to the authorized plan hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningPaidExecution {
+    pub plan_sha256: String,
+    pub attempt_id: String,
+    pub state: String,
+    pub claimed_at: UnixSeconds,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_started_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+}
+
+impl ProvisioningPaidExecution {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        if !lower_hex_sha256(&self.plan_sha256)
+            || !safe_paid_identifier(&self.attempt_id, 128)
+            || self.claimed_at <= 0
+            || !matches!(
+                self.state.as_str(),
+                "claimed"
+                    | "request-started"
+                    | "created"
+                    | "reconciled"
+                    | "failed-closed"
+                    | "uncertain"
+            )
+            || self
+                .provider_request_started_at
+                .is_some_and(|started_at| started_at < self.claimed_at)
+            || self
+                .provider_id
+                .as_deref()
+                .is_some_and(|provider_id| !safe_paid_identifier(provider_id, 160))
+        {
+            return Err(ServerLifecycleContractError::InvalidPaidExecution);
+        }
+        let timestamps_and_identity_match_state = match self.state.as_str() {
+            "claimed" => self.provider_request_started_at.is_none() && self.provider_id.is_none(),
+            "request-started" => {
+                self.provider_request_started_at.is_some() && self.provider_id.is_none()
+            }
+            "created" | "reconciled" => {
+                self.provider_request_started_at.is_some() && self.provider_id.is_some()
+            }
+            "failed-closed" => self.provider_id.is_none(),
+            "uncertain" => self.provider_request_started_at.is_some(),
+            _ => false,
+        };
+        if !timestamps_and_identity_match_state {
+            return Err(ServerLifecycleContractError::InvalidPaidExecution);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningJob {
     #[serde(default = "default_provisioning_job_schema")]
@@ -1445,6 +1653,12 @@ pub struct ProvisioningJob {
     pub setup_intent: Option<ProvisioningSetupIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_proposal: Option<ProvisioningBackupProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_plan: Option<ProvisioningReviewedPaidPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_authorization: Option<ProvisioningPaidAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_execution: Option<ProvisioningPaidExecution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_resources: Vec<ProvisioningProviderResource>,
     #[serde(default)]
@@ -1483,6 +1697,61 @@ impl ProvisioningJob {
         if let Some(backup_proposal) = &self.backup_proposal {
             backup_proposal.validate_contract()?;
         }
+        if let Some(reviewed_plan) = &self.reviewed_plan {
+            reviewed_plan.validate_contract()?;
+            if self.provider != "hetzner-cloud"
+                || self.host_name.as_deref().is_none_or(|host| {
+                    !safe_paid_identifier(host, 63) || host != reviewed_plan.server_name
+                })
+                || self.created_at <= 0
+                || self.updated_at < self.created_at
+                || reviewed_plan.catalog_refreshed_at > self.created_at
+                || reviewed_plan.expires_at <= self.created_at
+            {
+                return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+            }
+        }
+        if let Some(authorization) = &self.paid_authorization {
+            authorization.validate_contract()?;
+            let Some(reviewed_plan) = &self.reviewed_plan else {
+                return Err(ServerLifecycleContractError::PaidAuthorizationWithoutReviewedPlan);
+            };
+            if authorization.plan_sha256 != reviewed_plan.plan_sha256 {
+                return Err(ServerLifecycleContractError::PaidPlanHashMismatch);
+            }
+            if authorization.expires_at != reviewed_plan.expires_at {
+                return Err(ServerLifecycleContractError::PaidAuthorizationExpiryMismatch);
+            }
+            if authorization.confirmed_at < self.created_at
+                || authorization.confirmed_at >= authorization.expires_at
+                || authorization.confirmed_at > self.updated_at
+            {
+                return Err(ServerLifecycleContractError::InvalidPaidAuthorization);
+            }
+        }
+        if let Some(execution) = &self.paid_execution {
+            execution.validate_contract()?;
+            let Some(authorization) = &self.paid_authorization else {
+                return Err(ServerLifecycleContractError::PaidExecutionWithoutAuthorization);
+            };
+            if execution.plan_sha256 != authorization.plan_sha256
+                || self
+                    .reviewed_plan
+                    .as_ref()
+                    .is_some_and(|reviewed_plan| execution.plan_sha256 != reviewed_plan.plan_sha256)
+            {
+                return Err(ServerLifecycleContractError::PaidPlanHashMismatch);
+            }
+            if execution.claimed_at < authorization.confirmed_at
+                || execution.claimed_at >= authorization.expires_at
+                || execution.claimed_at > self.updated_at
+                || execution
+                    .provider_request_started_at
+                    .is_some_and(|started_at| started_at > self.updated_at)
+            {
+                return Err(ServerLifecycleContractError::InvalidPaidExecution);
+            }
+        }
         for resource in &self.provider_resources {
             resource.validate_contract()?;
         }
@@ -1504,6 +1773,61 @@ fn safe_provisioning_text(value: &str) -> bool {
 fn safe_provisioning_artifact_text(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && !value.contains('\r') && !looks_like_secret_material(value)
+}
+
+fn safe_paid_text(value: &str, max_chars: usize) -> bool {
+    value == value.trim()
+        && value.chars().count() <= max_chars
+        && safe_provisioning_text(value)
+        && !value.chars().any(char::is_control)
+}
+
+fn safe_paid_identifier(value: &str, max_len: usize) -> bool {
+    value == value.trim()
+        && !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':' | '/')
+        })
+        && !looks_like_secret_material(value)
+}
+
+fn lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn gross_price_units(value: &str) -> Option<u128> {
+    if value != value.trim() || value.is_empty() || value.len() > 21 {
+        return None;
+    }
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
+        Some(_) => return None,
+        None => (value, ""),
+    };
+    if whole.is_empty()
+        || whole.len() > 12
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 8
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || value.matches('.').count() > 1
+    {
+        return None;
+    }
+    let whole = whole.parse::<u128>().ok()?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>().ok()? * 10_u128.pow((8 - fraction.len()) as u32)
+    };
+    whole.checked_mul(100_000_000)?.checked_add(fraction)
 }
 
 fn looks_like_secret_material(value: &str) -> bool {
@@ -1539,6 +1863,13 @@ pub enum ServerLifecycleContractError {
     InvalidExistingHostContext,
     InvalidBackupProposal,
     InvalidProviderResource,
+    InvalidReviewedPaidPlan,
+    InvalidPaidAuthorization,
+    InvalidPaidExecution,
+    PaidAuthorizationWithoutReviewedPlan,
+    PaidExecutionWithoutAuthorization,
+    PaidPlanHashMismatch,
+    PaidAuthorizationExpiryMismatch,
     EmptyJobId,
     EmptyProvider,
     EmptyTemplate,
@@ -1582,6 +1913,42 @@ impl std::fmt::Display for ServerLifecycleContractError {
             }
             Self::InvalidProviderResource => {
                 write!(f, "provider resource must be plain non-secret text")
+            }
+            Self::InvalidReviewedPaidPlan => {
+                write!(
+                    f,
+                    "reviewed paid plan is invalid or exceeds its bounded policy"
+                )
+            }
+            Self::InvalidPaidAuthorization => {
+                write!(
+                    f,
+                    "paid authorization is invalid or outside its review window"
+                )
+            }
+            Self::InvalidPaidExecution => {
+                write!(
+                    f,
+                    "paid execution is invalid or outside its authorization window"
+                )
+            }
+            Self::PaidAuthorizationWithoutReviewedPlan => {
+                write!(f, "paid authorization requires an exact reviewed plan")
+            }
+            Self::PaidExecutionWithoutAuthorization => {
+                write!(f, "paid execution requires an attended authorization")
+            }
+            Self::PaidPlanHashMismatch => {
+                write!(
+                    f,
+                    "paid review, authorization, and execution hashes must match"
+                )
+            }
+            Self::PaidAuthorizationExpiryMismatch => {
+                write!(
+                    f,
+                    "paid authorization expiry must exactly match the reviewed plan expiry"
+                )
             }
             Self::EmptyJobId => write!(f, "provisioning job id is required"),
             Self::EmptyProvider => write!(f, "provisioning provider is required"),
@@ -3090,6 +3457,9 @@ mod tests {
                 access: AccessSetupIntent::LimitedUsers,
             }),
             backup_proposal: None,
+            reviewed_plan: None,
+            paid_authorization: None,
+            paid_execution: None,
             provider_resources: vec![ProvisioningProviderResource {
                 provider: "hetzner-cloud".to_string(),
                 kind: "server".to_string(),
@@ -3208,6 +3578,272 @@ mod tests {
         assert_eq!(
             empty_provider.validate_contract(),
             Err(ServerLifecycleContractError::EmptyProvider)
+        );
+    }
+
+    fn reviewed_paid_plan_fixture() -> ProvisioningReviewedPaidPlan {
+        ProvisioningReviewedPaidPlan {
+            provider_project: "Hetzner Cloud / Pharos production".to_string(),
+            credential_binding_sha256: "b".repeat(64),
+            server_name: "paid-lab-1".to_string(),
+            location: "fsn1".to_string(),
+            location_label: "Falkenstein (fsn1)".to_string(),
+            server_type: "cx23".to_string(),
+            server_type_label: "CX23 · 2 vCPU · 4 GB".to_string(),
+            image: "debian-12".to_string(),
+            price_currency: "EUR".to_string(),
+            price_hourly_gross: "0.0060".to_string(),
+            price_monthly_gross: "3.4900".to_string(),
+            max_hourly_gross: "0.0060".to_string(),
+            max_monthly_gross: "3.4900".to_string(),
+            observed_active_servers: 0,
+            max_active_servers: 1,
+            catalog_refreshed_at: 1_700_000_000,
+            expires_at: 1_700_000_900,
+            ssh_key_ref: "pharos-bootstrap-key".to_string(),
+            firewall_ref: "pharos-bootstrap-firewall".to_string(),
+            required_labels: BTreeMap::from([
+                ("managed-by".to_string(), "pharos".to_string()),
+                ("pharos-setup".to_string(), "tracked-job".to_string()),
+            ]),
+            allowed_operations: vec!["create-server".to_string(), "delete-server".to_string()],
+            cleanup_policy: "No silent retry or automatic deletion; separately confirm cleanup."
+                .to_string(),
+            plan_sha256: "a".repeat(64),
+        }
+    }
+
+    fn paid_provisioning_job_fixture() -> ProvisioningJob {
+        ProvisioningJob {
+            schema: PROVISIONING_JOB_SCHEMA.to_string(),
+            version: PROVISIONING_JOB_VERSION,
+            id: "setup-paid-1700000100-1".to_string(),
+            provider: "hetzner-cloud".to_string(),
+            template: "hetzner-small-nixos".to_string(),
+            host_name: Some("paid-lab-1".to_string()),
+            role: Some("server".to_string()),
+            is_nix: Some(true),
+            heartbeat_interval_secs: Some(60),
+            existing_host_context: None,
+            state: ProvisioningJobState::Planning,
+            terminal_outcome: None,
+            created_at: 1_700_000_100,
+            updated_at: 1_700_000_300,
+            handoff: None,
+            setup_intent: None,
+            backup_proposal: None,
+            reviewed_plan: Some(reviewed_paid_plan_fixture()),
+            paid_authorization: Some(ProvisioningPaidAuthorization {
+                plan_sha256: "a".repeat(64),
+                operator_ref: "b".repeat(64),
+                operator_label: "operator@example.test".to_string(),
+                confirmed_at: 1_700_000_200,
+                expires_at: 1_700_000_900,
+            }),
+            paid_execution: Some(ProvisioningPaidExecution {
+                plan_sha256: "a".repeat(64),
+                attempt_id: "paid-attempt-1".to_string(),
+                state: "claimed".to_string(),
+                claimed_at: 1_700_000_300,
+                provider_request_started_at: None,
+                provider_id: None,
+            }),
+            provider_resources: vec![],
+            progress: vec![ProvisioningProgressEntry {
+                state: ProvisioningJobState::Planning,
+                message: "Paid plan reviewed, authorized, and claimed for one execution."
+                    .to_string(),
+                observed_at: 1_700_000_300,
+            }],
+        }
+    }
+
+    #[test]
+    fn paid_provisioning_contract_is_additive_value_free_and_exactly_bound() {
+        let job = paid_provisioning_job_fixture();
+        job.validate_contract()
+            .expect("exact paid review chain is valid");
+
+        let json = serde_json::to_string(&job).expect("paid job serializes");
+        assert!(json.contains(r#""reviewed_plan""#));
+        assert!(json.contains(r#""paid_authorization""#));
+        assert!(json.contains(r#""paid_execution""#));
+        assert!(json.contains(r#""max_active_servers":1"#));
+        assert!(json.contains(r#""state":"claimed""#));
+        assert!(!json.to_ascii_lowercase().contains("bearer "));
+        assert!(!json.to_ascii_lowercase().contains("token="));
+        assert!(!json.to_ascii_lowercase().contains("password="));
+
+        let round_trip: ProvisioningJob =
+            serde_json::from_str(&json).expect("paid job round trips");
+        assert_eq!(round_trip, job);
+
+        let legacy: ProvisioningJob = serde_json::from_value(serde_json::json!({
+            "id": "legacy-setup-1",
+            "provider": "existing-host",
+            "template": "manual-deferred",
+            "state": "planning",
+            "created_at": 1_700_000_000,
+            "updated_at": 1_700_000_000
+        }))
+        .expect("legacy v1 job without paid fields remains readable");
+        assert!(legacy.reviewed_plan.is_none());
+        assert!(legacy.paid_authorization.is_none());
+        assert!(legacy.paid_execution.is_none());
+        legacy
+            .validate_contract()
+            .expect("legacy v1 job remains valid");
+    }
+
+    #[test]
+    fn paid_review_rejects_unbounded_stale_secret_or_malformed_policy() {
+        let valid = reviewed_paid_plan_fixture();
+        valid.validate_contract().expect("fixture is valid");
+
+        for invalid in [
+            ProvisioningReviewedPaidPlan {
+                max_active_servers: 2,
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                observed_active_servers: 1,
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                max_monthly_gross: "3.4800".to_string(),
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                price_hourly_gross: "6e-3".to_string(),
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                provider_project: "provider token=raw-value".to_string(),
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                expires_at: valid.catalog_refreshed_at,
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                required_labels: BTreeMap::from([("managed-by".to_string(), "pharos".to_string())]),
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                allowed_operations: vec!["create-server".to_string()],
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                plan_sha256: "A".repeat(64),
+                ..valid.clone()
+            },
+            ProvisioningReviewedPaidPlan {
+                credential_binding_sha256: "B".repeat(64),
+                ..valid.clone()
+            },
+        ] {
+            assert_eq!(
+                invalid.validate_contract(),
+                Err(ServerLifecycleContractError::InvalidReviewedPaidPlan)
+            );
+        }
+    }
+
+    #[test]
+    fn paid_authorization_and_execution_fail_closed_on_missing_or_changed_review() {
+        let valid = paid_provisioning_job_fixture();
+
+        let authorization_without_review = ProvisioningJob {
+            reviewed_plan: None,
+            paid_execution: None,
+            ..valid.clone()
+        };
+        assert_eq!(
+            authorization_without_review.validate_contract(),
+            Err(ServerLifecycleContractError::PaidAuthorizationWithoutReviewedPlan)
+        );
+
+        let authorization_hash_mismatch = ProvisioningJob {
+            paid_authorization: Some(ProvisioningPaidAuthorization {
+                plan_sha256: "c".repeat(64),
+                ..valid.paid_authorization.clone().expect("authorization")
+            }),
+            paid_execution: None,
+            ..valid.clone()
+        };
+        assert_eq!(
+            authorization_hash_mismatch.validate_contract(),
+            Err(ServerLifecycleContractError::PaidPlanHashMismatch)
+        );
+
+        let server_name_outside_review = ProvisioningJob {
+            host_name: Some("different-paid-host".to_string()),
+            ..valid.clone()
+        };
+        assert_eq!(
+            server_name_outside_review.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidReviewedPaidPlan)
+        );
+
+        let extended_authorization = ProvisioningJob {
+            paid_authorization: Some(ProvisioningPaidAuthorization {
+                expires_at: 1_700_001_000,
+                ..valid.paid_authorization.clone().expect("authorization")
+            }),
+            paid_execution: None,
+            ..valid.clone()
+        };
+        assert_eq!(
+            extended_authorization.validate_contract(),
+            Err(ServerLifecycleContractError::PaidAuthorizationExpiryMismatch)
+        );
+
+        let execution_without_authorization = ProvisioningJob {
+            paid_authorization: None,
+            ..valid.clone()
+        };
+        assert_eq!(
+            execution_without_authorization.validate_contract(),
+            Err(ServerLifecycleContractError::PaidExecutionWithoutAuthorization)
+        );
+
+        let execution_at_expiry = ProvisioningJob {
+            updated_at: 1_700_000_900,
+            paid_execution: Some(ProvisioningPaidExecution {
+                claimed_at: 1_700_000_900,
+                ..valid.paid_execution.clone().expect("execution")
+            }),
+            ..valid.clone()
+        };
+        assert_eq!(
+            execution_at_expiry.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidPaidExecution)
+        );
+
+        let unknown_execution_state = ProvisioningJob {
+            paid_execution: Some(ProvisioningPaidExecution {
+                state: "retry-anything".to_string(),
+                ..valid.paid_execution.clone().expect("execution")
+            }),
+            ..valid.clone()
+        };
+        assert_eq!(
+            unknown_execution_state.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidPaidExecution)
+        );
+
+        let created_without_provider_identity = ProvisioningJob {
+            paid_execution: Some(ProvisioningPaidExecution {
+                state: "created".to_string(),
+                provider_request_started_at: Some(1_700_000_300),
+                provider_id: None,
+                ..valid.paid_execution.clone().expect("execution")
+            }),
+            ..valid
+        };
+        assert_eq!(
+            created_without_provider_identity.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidPaidExecution)
         );
     }
 

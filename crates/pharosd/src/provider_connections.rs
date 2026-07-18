@@ -180,6 +180,22 @@ pub(crate) struct HetznerCatalog {
     pub(crate) firewalls: Vec<String>,
 }
 
+/// Safe, immutable catalog facts for one exact location/server-type choice.
+/// Prices are canonical fixed-point decimal strings so callers can persist and
+/// hash them without depending on floating-point formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HetznerCatalogSelection {
+    pub(crate) catalog_refreshed_at: i64,
+    pub(crate) location: String,
+    pub(crate) location_label: String,
+    pub(crate) server_type: String,
+    pub(crate) server_type_label: String,
+    pub(crate) hardware_summary: String,
+    pub(crate) currency: String,
+    pub(crate) hourly_gross: String,
+    pub(crate) monthly_gross: String,
+}
+
 impl HetznerCatalog {
     pub(crate) fn supports_location(&self, location: &str) -> bool {
         self.locations.iter().any(|item| item.name == location)
@@ -210,14 +226,62 @@ impl HetznerCatalog {
             .filter(|server_type| self.supports_plan(location, &server_type.name))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            let left_price = monthly_price(left, location).unwrap_or(f64::MAX);
-            let right_price = monthly_price(right, location).unwrap_or(f64::MAX);
-            left_price
-                .partial_cmp(&right_price)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.name.cmp(&right.name))
+            let price_order = match (
+                monthly_price(left, location),
+                monthly_price(right, location),
+            ) {
+                (Some(left), Some(right)) => {
+                    compare_gross_prices(left, right).unwrap_or(Ordering::Equal)
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            price_order.then_with(|| left.name.cmp(&right.name))
         });
         candidates.into_iter().next()
+    }
+
+    pub(crate) fn exact_selection(
+        &self,
+        location: &str,
+        server_type: &str,
+    ) -> Option<HetznerCatalogSelection> {
+        let location_record = self.locations.iter().find(|item| item.name == location)?;
+        let server_type_record = self
+            .server_types
+            .iter()
+            .find(|item| item.name == server_type)?;
+        let availability = server_type_record
+            .locations
+            .iter()
+            .find(|item| item.name == location && item.available)?;
+        let hourly_gross = normalize_gross_price(availability.hourly_gross.as_deref()?)?;
+        let monthly_gross = normalize_gross_price(availability.monthly_gross.as_deref()?)?;
+
+        Some(HetznerCatalogSelection {
+            catalog_refreshed_at: self.refreshed_at,
+            location: location_record.name.clone(),
+            location_label: format!(
+                "{}, {} ({})",
+                location_record.city, location_record.country, location_record.name
+            ),
+            server_type: server_type_record.name.clone(),
+            server_type_label: format!(
+                "{} ({})",
+                server_type_record.description, server_type_record.name
+            ),
+            hardware_summary: format!(
+                "{} vCPU · {} GB RAM · {} GB disk · {}",
+                server_type_record.cores,
+                server_type_record.memory_gb,
+                server_type_record.disk_gb,
+                server_type_record.architecture
+            ),
+            currency: self.currency.clone(),
+            hourly_gross,
+            monthly_gross,
+        })
     }
 }
 
@@ -225,13 +289,81 @@ fn memory_gb(server_type: &HetznerServerType) -> f64 {
     server_type.memory_gb.parse::<f64>().unwrap_or(0.0)
 }
 
-fn monthly_price(server_type: &HetznerServerType, location: &str) -> Option<f64> {
+fn monthly_price<'a>(server_type: &'a HetznerServerType, location: &str) -> Option<&'a str> {
     server_type
         .locations
         .iter()
         .find(|item| item.name == location && item.available)
         .and_then(|item| item.monthly_gross.as_deref())
-        .and_then(|value| value.parse::<f64>().ok())
+}
+
+/// Canonicalize a non-negative fixed-point gross price without floating-point
+/// parsing. The accepted grammar is `DIGITS` or `DIGITS.DIGITS`; signs,
+/// exponents, whitespace, separators, and empty integer/fraction parts fail
+/// closed. Leading integer zeroes and trailing fractional zeroes are removed.
+pub(crate) fn normalize_gross_price(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 32
+        || value.trim() != value
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+
+    let mut parts = value.split('.');
+    let integer = parts.next()?;
+    let fraction = parts.next();
+    if integer.is_empty()
+        || parts.next().is_some()
+        || fraction.is_some_and(str::is_empty)
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|part| !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let fraction = fraction.unwrap_or_default().trim_end_matches('0');
+    if fraction.is_empty() {
+        Some(integer.to_string())
+    } else {
+        Some(format!("{integer}.{fraction}"))
+    }
+}
+
+/// Compare two strict fixed-point gross prices exactly. Invalid inputs return
+/// `None`; valid values are compared without a bounded integer conversion.
+pub(crate) fn compare_gross_prices(left: &str, right: &str) -> Option<Ordering> {
+    let left = normalize_gross_price(left)?;
+    let right = normalize_gross_price(right)?;
+    let (left_integer, left_fraction) = left.split_once('.').unwrap_or((&left, ""));
+    let (right_integer, right_fraction) = right.split_once('.').unwrap_or((&right, ""));
+
+    let integer_order = left_integer
+        .len()
+        .cmp(&right_integer.len())
+        .then_with(|| left_integer.cmp(right_integer));
+    if integer_order != Ordering::Equal {
+        return Some(integer_order);
+    }
+
+    let width = left_fraction.len().max(right_fraction.len());
+    for index in 0..width {
+        let left_digit = left_fraction.as_bytes().get(index).copied().unwrap_or(b'0');
+        let right_digit = right_fraction
+            .as_bytes()
+            .get(index)
+            .copied()
+            .unwrap_or(b'0');
+        match left_digit.cmp(&right_digit) {
+            Ordering::Equal => {}
+            ordering => return Some(ordering),
+        }
+    }
+    Some(Ordering::Equal)
 }
 
 #[derive(Debug, Clone)]
@@ -540,6 +672,8 @@ pub(crate) async fn test_hetzner_connection(
     let Ok(client) = reqwest::Client::builder()
         .timeout(config.request_timeout)
         .user_agent("Pharos provider connection test")
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .build()
     else {
         return failed(HetznerConnectionCode::RequestFailed);
@@ -768,19 +902,7 @@ fn safe_selector(value: &str) -> Option<String> {
 
 fn safe_price(value: &str) -> Option<String> {
     let value = value.trim();
-    if value.is_empty()
-        || value.len() > 32
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_digit() || character == '.')
-        || value
-            .parse::<f64>()
-            .ok()
-            .is_none_or(|price| !price.is_finite() || price < 0.0)
-    {
-        return None;
-    }
-    Some(value.to_string())
+    normalize_gross_price(value).map(|_| value.to_string())
 }
 
 async fn fetch_locations(
@@ -1108,6 +1230,122 @@ mod tests {
             firewall_ref: Some("pharos-bootstrap-firewall"),
             default_location: Some("fsn1"),
         }
+    }
+
+    fn catalog_fixture() -> HetznerCatalog {
+        HetznerCatalog {
+            refreshed_at: 1_700_000_000,
+            currency: "EUR".to_string(),
+            locations: vec![HetznerLocation {
+                name: "fsn1".to_string(),
+                city: "Falkenstein".to_string(),
+                country: "DE".to_string(),
+                network_zone: "eu-central".to_string(),
+            }],
+            server_types: vec![HetznerServerType {
+                name: "cx23".to_string(),
+                description: "CX23".to_string(),
+                category: "cost_optimized".to_string(),
+                cores: 2,
+                memory_gb: "4".to_string(),
+                disk_gb: 40,
+                architecture: "x86".to_string(),
+                locations: vec![HetznerServerTypeLocation {
+                    name: "fsn1".to_string(),
+                    available: true,
+                    recommended: true,
+                    monthly_gross: Some("3.4900".to_string()),
+                    hourly_gross: Some("0.0060".to_string()),
+                }],
+            }],
+            ssh_keys: vec!["pharos-bootstrap-key".to_string()],
+            firewalls: vec!["pharos-bootstrap-firewall".to_string()],
+        }
+    }
+
+    #[test]
+    fn gross_prices_are_normalized_strictly_without_floating_point() {
+        for (input, expected) in [
+            ("0", "0"),
+            ("000", "0"),
+            ("0003.4900", "3.49"),
+            ("0.0060", "0.006"),
+            ("3.0000", "3"),
+            (
+                "99999999999999999999999999999999",
+                "99999999999999999999999999999999",
+            ),
+        ] {
+            assert_eq!(normalize_gross_price(input).as_deref(), Some(expected));
+        }
+
+        for invalid in [
+            "",
+            " 1",
+            "1 ",
+            "+1",
+            "-1",
+            ".1",
+            "1.",
+            "1..0",
+            "1e2",
+            "1,00",
+            "NaN",
+            "١.0",
+            "999999999999999999999999999999999",
+        ] {
+            assert_eq!(normalize_gross_price(invalid), None, "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn gross_price_comparison_is_exact_and_rejects_invalid_values() {
+        assert_eq!(
+            compare_gross_prices("3.4900", "3.49"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(compare_gross_prices("0.006", "0.01"), Some(Ordering::Less));
+        assert_eq!(
+            compare_gross_prices("100000000000000000000", "99999999999999999999.99"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_gross_prices("1.0001", "1.00001"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(compare_gross_prices("1e2", "100"), None);
+    }
+
+    #[test]
+    fn exact_catalog_selection_returns_canonical_safe_review_facts() {
+        let catalog = catalog_fixture();
+        let selection = catalog
+            .exact_selection("fsn1", "cx23")
+            .expect("exact available selection");
+
+        assert_eq!(selection.catalog_refreshed_at, 1_700_000_000);
+        assert_eq!(selection.location, "fsn1");
+        assert_eq!(selection.location_label, "Falkenstein, DE (fsn1)");
+        assert_eq!(selection.server_type, "cx23");
+        assert_eq!(selection.server_type_label, "CX23 (cx23)");
+        assert_eq!(
+            selection.hardware_summary,
+            "2 vCPU · 4 GB RAM · 40 GB disk · x86"
+        );
+        assert_eq!(selection.currency, "EUR");
+        assert_eq!(selection.hourly_gross, "0.006");
+        assert_eq!(selection.monthly_gross, "3.49");
+
+        assert!(catalog.exact_selection("hel1", "cx23").is_none());
+        assert!(catalog.exact_selection("fsn1", "cpx21").is_none());
+
+        let mut unavailable = catalog.clone();
+        unavailable.server_types[0].locations[0].available = false;
+        assert!(unavailable.exact_selection("fsn1", "cx23").is_none());
+
+        let mut unpriced = catalog;
+        unpriced.server_types[0].locations[0].hourly_gross = None;
+        assert!(unpriced.exact_selection("fsn1", "cx23").is_none());
     }
 
     #[tokio::test]
