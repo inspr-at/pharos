@@ -5,7 +5,7 @@ members = ["crates/pharos-core", "crates/pharosd", "crates/pharos-beacon"]
 [workspace.package]
 version = "0.1.41"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 authors = ["Markus Barta"]
 repository = "https://github.com/markus-barta/pharos"
 

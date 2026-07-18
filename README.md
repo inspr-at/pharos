@@ -1,262 +1,260 @@
-# Pharos 🔦
+# Pharos
 
-Minimal fleet management + host access for the INSPR/DSC fleet — the lean,
-INSPR-native successor to FleetCom. Planning lives in PPM project **PHAROS**.
+**Fleet clarity before fleet control.**
 
-## MVP scope (v1)
+[![CI](https://github.com/markus-barta/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/markus-barta/pharos/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.41-d79b2b)](docs/CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
-1. **Auth** — Zitadel OIDC login (PHAROS-4).
-2. **Onboarding / host registration** — `inspr onboard` registers a host,
-   receives a per-host beacon token, and deploys `pharos-beacon` (PHAROS-6/7/8).
-3. **Nix host freshness** — a human one-liner TL;DR per host of what it is
-   "missing": `flake.lock 12d old · 3 commits behind nixcfg` (PHAROS-15).
+Pharos is a compact, self-hosted fleet control plane for people and automation.
+It turns scattered heartbeats, host declarations, backup facts and guarded
+operations into one legible operating picture.
 
-Everything else (per-host authz, command channel, alerting, drag, …) is
-explicitly deferred. See PPM PHAROS-1 and the `guideline/pharos-architecture`
-+ `guideline/pharos-ui` knowledge entries.
+It is deliberately not a generic remote shell. Pharos separates what a host
+reported, what configuration declares, what an operator requested and what an
+executor proved. That separation is the product.
 
-## Current shipped shape
+[Product site](https://pharos.inspr.at) ·
+[Source](https://github.com/markus-barta/pharos) ·
+[Changelog](docs/CHANGELOG.md) ·
+[INSPR](https://www.inspr.at)
 
-Rust, aligned with the Janus workspace, but the live v1 is deliberately smaller
-than the long-term ADR target:
+## Why Pharos exists
 
-- `pharosd`: axum server with an in-memory store and optional JSON persistence
-  (`PHAROS_DB`). sqlx/SQLite remains a PHAROS-3 durability decision, not the
-  current deployed store.
-- UI: server-rendered HTML plus a small vanilla-JS bridge over stable JSON APIs.
-  Leptos remains the ADR direction if the dashboard grows beyond this thin
-  surface; it is not required for the accepted July 2026 v1 dashboard.
-- Auth: Zitadel OIDC for human routes when OIDC env is configured. Local/dev is
-  open when those env vars are absent. `PHAROS_ALLOWED_OPERATORS` can then
-  restrict authenticated users to explicit Pharos operators.
-- Machine auth: local MVP bearer tokens via `/register` + `PHAROS_TOKEN`.
-  Janus Forge/Warden migration remains later.
+A fleet becomes difficult before it becomes large. Five machines can already
+mean five different answers to basic questions:
 
-## Planned direction (ADR-001 / ADR-002, in PHAROS-2)
+- Is the host alive, or did the dashboard simply stop hearing from it?
+- Is a NixOS host running what its declaration says?
+- Did the latest backup succeed, and when?
+- Is a pending restart expected or forgotten?
+- Was a change requested, reviewed, applied and verified, or merely clicked?
+- Which system is allowed to hold a provider credential?
 
-Keep the Rust workspace and shared `pharos-core` contracts. Move storage to
-SQLite only if JSON persistence stops being enough for the fleet. Move the UI to
-Leptos only if the operator surface grows enough to justify a frontend build.
-Move token issuance/rotation to Janus once the local MVP token flow is proven.
+Most dashboards flatten these questions into a green or red dot. Pharos keeps
+their sources and meanings visible.
 
-## Workspace
+| State | Meaning | Source |
+| --- | --- | --- |
+| **Observed** | What a host or bounded probe reported | `pharos-beacon`, server receive time, optional probes |
+| **Declared** | What should exist | Read-only host manifests and the nixcfg preference registry |
+| **Requested** | What an operator asked to change | Persisted Pharos workflow state |
+| **Executed** | What a bounded agent or provider operation attempted | Leased action result |
+| **Verified** | What fresh evidence confirms after the action | New heartbeat, kernel, service and backup evidence |
 
-| Crate | What |
-| --- | --- |
-| `pharos-core` | shared types (host, report, nix-freshness TL;DR, liveness) — used by server **and** agent so the schema can't drift |
-| `pharosd` | the server: host registry, JSON persistence, JSON APIs, dashboard, Agora |
-| `pharos-beacon` | per-host agent (Nix freshness + heartbeat report) |
-
-## Develop
-
-Toolchain comes from `devenv` (no global rustup) — `direnv allow`, then:
-
-```bash
-cargo run -p pharosd      # http://127.0.0.1:8080  (/, /healthz, /version, /hosts.json, /agora)
-cargo test --all
-cargo clippy --all-targets -- -D warnings
-```
-
-## Release Versioning
-
-`VERSION` is the visible product version and must match the Cargo workspace
-version. `pharosd` embeds that version at build time and reports it from
-`/version` together with the build commit. The dashboard sidebar shows the same
-version and links to the release history rendered from `docs/CHANGELOG.md`.
-
-Before every production deploy:
-
-1. Bump `VERSION` using semver.
-2. Keep the Cargo workspace version in sync.
-3. Add the newest entry to `docs/CHANGELOG.md` in operator-facing language.
-4. Do not deploy a changed product with an unchanged visible version.
-
-`PHAROS_MANIFEST_PATHS` may point to one or more nixcfg-generated v1 host
-manifests, separated by `:` or `,`. pharosd serves them at
-`/declared-hosts.json` with runtime state overlaid separately from the declared
-manifest. Agora uses the same manifest data for per-host settings proposals.
-
-```bash
-PHAROS_MANIFEST_PATHS=/etc/hostdash-config/hsb8.json cargo run -p pharosd
-```
-
-### Declarative Nix host settings
-
-Agora can request the fixed `inspr.pharos.host-preferences.v1` preference set
-through nixcfg's guarded `pharos-host-settings.yml` workflow. This integration
-is off by default. The current production exception uses a dedicated classic
-GitHub PAT with no configured expiration and only the top-level `repo` scope.
-GitHub requires that broad scope to dispatch a workflow in a private repository
-with a classic PAT, so never reuse this credential for interactive Git, pull
-requests, merges, or another service. Replace it with Janus-brokered GitHub App
-installation tokens when JANUS-275 lands:
-
-```bash
-export PHAROS_NIXCFG_DISPATCH_ENABLED=1
-export PHAROS_NIXCFG_DISPATCH_TOKEN_FILE=/run/pharos/nixcfg-dispatch-token
-export PHAROS_HOST_PREFERENCES_PATH=/nixcfg/modules/pharos-host-preferences.json
-# Enable only after the fixed review-only removal workflow is installed.
-export PHAROS_HOST_REMOVAL_DISPATCH_ENABLED=1
-# Machine identity that owns target-local Janus credential retirement.
-export PHAROS_RETIREMENT_OWNER_HOST=csb1
-```
-
-Mount the token as a private, read-only runtime file; never place its value in
-Compose, an environment variable, logs, or the host store. pharosd calls only
-the fixed workflow-dispatch endpoint. The workflow's scoped `GITHUB_TOKEN` owns
-validation, commit, pull request, checks, and ordinary merge; pharosd has no git
-or merge logic. Treat the classic PAT as a temporary, explicitly reviewed
-privilege exception even though Pharos deliberately uses only the narrow API
+That model prevents a merged declaration from masquerading as a deployed
+system, and prevents a successful API request from masquerading as a completed
 operation.
 
-Mount nixcfg's complete host-preference registry read-only at
-`PHAROS_HOST_PREFERENCES_PATH`. Pharos validates the exact registry contract
-and treats it as declared state; a loaded host manifest remains the fallback
-when no registry entry exists. The registry never becomes applied state by
-itself.
+## What ships in v0.1.41
 
-An accepted dispatch means only that the request reached GitHub. It does not
-mean the workflow merged or that a host rebuilt. Fleet therefore keeps three
-states separate: requested operator intent, the declaration currently loaded
-from the nixcfg-generated manifest, and the last preference set reported by
-the beacon. A declared change remains **change waiting** until the host's own
-later rebuild applies it and the beacon reports the matching value. Pharos does
-not trigger that rebuild or any fleet-wide deployment.
+| Area | Current capability |
+| --- | --- |
+| **Fleet** | Grid and list views, search, sorting, host liveness, heartbeat history, Nix freshness, kernel posture and service observations |
+| **Map** | Optional host location and reachability signals without turning location into a control channel |
+| **Backups** | Per-host backup posture from beacon observations, including protected, stale, failed and unreported states |
+| **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications |
+| **Host settings** | Color, server/workstation kind and alert preferences with requested, declared and applied state shown separately |
+| **Onboarding** | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions |
+| **Providers** | Read-only provider connection checks, current Hetzner Cloud catalog data and opt-in, confirmation-gated server creation |
+| **Guarded actions** | Fixed review/apply/restart, fleet-update proposal and host-retirement workflows with leases, confirmation and recovery evidence |
+| **Access** | OIDC Authorization Code + PKCE for people; independent per-host bearer authentication for machines |
 
-Host removal uses the same narrow dispatch credential but a separate opt-in
-workflow. Local-token runtime-only hosts are retired directly in Pharos. A
-Janus-managed host must have a declared retirement path and remains visibly
-pending while nixcfg prepares a review-only cleanup proposal. After that
-declaration is reviewed, merged, and applied, the configured retirement owner
-claims a separate machine-authenticated lease and runs only the reviewed Janus
-retirement intent. Pharos completes the workflow only after both declaration
-cleanup and a value-free owner result pass. A stopped owner run requires an
-operator retry; it is never silently replayed. The current owner cannot retire
-itself until ownership moves to another host.
+The UI is server-rendered HTML with a focused vanilla-JavaScript interaction
+layer. There is no separate frontend build or client framework.
 
-Pharos records whether the old host was destroyed, left unmanaged, or rebuilt;
-rebuilt hosts must name a different successor that is already onboarded. No
-removal action deletes a server, provider resource, disk, service, or
-application data. `/agent/retirements/claim` and
-`/agent/retirements/{id}/result` accept only the configured owner's existing
-per-host machine identity. A compromised target host therefore cannot approve
-or complete its own credential retirement.
+## Architecture
 
-After a NixOS generation owns the declaration, point the beacon at that
-generation's registry with
-`PHAROS_PREFERENCES_FILE=/etc/pharos/host-preferences.json` (or the NixOS module
-option below). The beacon validates the complete fixed schema, selects only its
-own hostname, and keeps its last valid value if a later read is missing or
-malformed. Unknown fields are rejected; the file cannot carry commands.
+```text
+                                  read-only declarations
+                             ┌────────────────────────────┐
+                             │ nixcfg manifests/preferences│
+                             └──────────────┬─────────────┘
+                                            │
+  browser ── OIDC + PKCE ─┐                 ▼
+                           │        ┌─────────────────┐
+  pharos-beacon ─ report ──┼───────▶│    pharosd      │
+                           │        │ Axum + SSR + API │
+  target agent ◀─ lease ───┤        └────────┬────────┘
+               ─ result ──▶│                 │
+                           │                 ▼
+  Janus hash sidecars ─────┘        JSON snapshots/sidecars
+                                            │ fixed, opt-in calls
+                                            ▼
+                              nixcfg / Hetzner Cloud
+```
 
-Native systemd beacons use the same schema without requiring an operator to
-edit that file. A successful report can return a pending preference set for
-that reporting non-Nix host only. The beacon validates the bounded response and
-atomically replaces its private `/var/lib/pharos-beacon/host-preferences.json`
-file with mode `0600`; malformed, mismatched, or failed writes leave the last
-valid file untouched. Nix hosts never receive this local-write response.
+### Workspace
 
-### Local Docker Compose
+| Crate | Responsibility |
+| --- | --- |
+| `pharos-core` | Versioned host, report, liveness, preferences, provisioning and manifest contracts shared by server and agent |
+| `pharosd` | Fleet store, OIDC guard, machine APIs, server-rendered dashboard, provider connections and guarded workflows |
+| `pharos-beacon` | Small per-host reporter for heartbeat, Nix freshness, kernel, backup, location and bounded service observations |
 
-`docker-compose.yml` is a local smoke topology, not the production deployment.
-It builds `pharosd:local`, persists `/data/pharos.json` in a local Docker
-volume, binds only `127.0.0.1:8080`, and keeps OIDC/operator policy off unless
-you export the relevant env vars yourself. Production compose remains in
-`nixcfg` under `hosts/csb1/docker/docker-compose.yml`.
+The shared Rust contracts matter: server and beacon cannot silently drift onto
+different report schemas. The current report contract is
+`inspr.pharos.host-report.v1`.
+
+### Persistence
+
+`pharosd` keeps working state in memory and optionally persists it when
+`PHAROS_DB` points to a JSON file. Provisioning, provider, guarded-action and
+retirement state use derived JSON sidecars beside that file.
+
+This is intentionally a small-fleet design:
+
+- one `pharosd` process is the expected writer;
+- there is no SQL database, clustering or multi-node consensus;
+- OIDC sessions and in-flight login state are memory-only;
+- a restart requires users to sign in again;
+- the data volume still needs ordinary host-level backup.
+
+Heartbeat history is bounded to the latest 24 hours and at most 3,000 samples
+per host. Liveness is stamped by the server when a report arrives; an agent
+cannot declare itself recently seen.
+
+## Quick start
+
+### Docker
+
+The fastest useful local run starts the server and a development beacon:
 
 ```bash
-docker compose up --build pharosd
 docker compose --profile beacon up --build
 ```
 
-The optional `pharos-beacon` profile reports to the local `pharosd` service.
-For strict-token local tests, register a host and provide `PHAROS_TOKEN` from an
-untracked local environment; never commit token values.
+Then open:
 
-### Self-Host Docker Compose
+- Dashboard: <http://127.0.0.1:8080>
+- Health: <http://127.0.0.1:8080/healthz>
+- Build metadata: <http://127.0.0.1:8080/version>
 
-`docker-compose.selfhost.yml` is the reusable self-host control-plane template.
-It runs the released GHCR image, persists `/data/pharos.json`, requires OIDC for
-human routes, requires an operator allowlist, and keeps beacon ingestion
-strict-token gated from first start. Keep all runtime values in your shell, host
-secret manager, or orchestrator. Do not commit a populated env file.
+The local Compose topology binds only to loopback, stores data in a Docker
+volume and intentionally leaves OIDC and strict beacon authentication off. It
+is a smoke environment, not a production template.
 
-Minimum first-run values:
+### Native development
+
+The repository includes a `devenv` environment:
+
+```bash
+devenv shell
+cargo run -p pharosd
+```
+
+In another shell, send one local report:
+
+```bash
+PHAROS_URL=http://127.0.0.1:8080 \
+PHAROS_HOSTNAME=local-dev \
+PHAROS_ROLE="Development host" \
+cargo run -p pharos-beacon
+```
+
+Set `PHAROS_INTERVAL=60` to keep the beacon running. Without it, the beacon
+reports once and exits.
+
+## Self-hosting baseline
+
+[`docker-compose.selfhost.yml`](docker-compose.selfhost.yml) is the reusable
+control-plane template. It requires OIDC, an operator allowlist and strict
+machine authentication from first start.
 
 ```bash
 export PHAROS_OIDC_ISSUER=https://issuer.example
 export PHAROS_OIDC_CLIENT_ID=pharos
 export PHAROS_OIDC_REDIRECT_URI=https://pharos.example/auth/callback
 export PHAROS_ALLOWED_OPERATORS=alice
-read -rsp 'Pharos registration token: ' PHAROS_REGISTRATION_TOKEN; echo
-export PHAROS_REGISTRATION_TOKEN
 export PHAROS_BIND=127.0.0.1:8080
+
+read -rsp "Pharos registration token: " PHAROS_REGISTRATION_TOKEN
+echo
+export PHAROS_REGISTRATION_TOKEN
+
 docker compose -f docker-compose.selfhost.yml config
 docker compose -f docker-compose.selfhost.yml up -d
 ```
 
-Put a reverse proxy or tailnet endpoint in front of `PHAROS_BIND`; expose only
-HTTPS to users. The registration token is only for initial beacon registration.
-After moving to Janus sidecars, set `PHAROS_BEACON_TOKEN_MODE=janus` and provide
-the private hash sidecar mount/env from your secret-rendering system.
+Put an HTTPS reverse proxy or a private tailnet endpoint in front of
+`PHAROS_BIND`. For durable operation, supply runtime values through your host
+secret manager or orchestrator rather than a committed environment file.
 
-Hetzner Cloud creation is also off by default. Prepare an existing SSH public
-key and a reviewed firewall in the Hetzner project, mount the API token as a
-private runtime file, then set:
+The OIDC client is public and uses PKCE, so it has no client secret.
+`PHAROS_ALLOWED_OPERATORS` grants full fleet access to explicit identities.
+`PHAROS_ACCESS_POLICY_FILE` can additionally grant scoped host visibility to
+other authenticated identities.
 
-```bash
-export PHAROS_JANUS_PUBLIC_URL=https://vault.barta.cm
-export PHAROS_HCLOUD_EXECUTE=1
-export PHAROS_HCLOUD_API_TOKEN_FILE=/run/pharos/hcloud-token
-export PHAROS_HCLOUD_SSH_KEY_REF=pharos-bootstrap-key
-export PHAROS_HCLOUD_FIREWALL_REF=pharos-bootstrap-firewall
-```
+If OIDC variables are absent, human routes are open. That behavior is useful
+for loopback development and unsafe for a publicly reachable deployment.
 
-`PHAROS_JANUS_PUBLIC_URL` is non-secret. When present, **Settings → Provider
-connections → Hetzner Cloud** opens Janus's value-free secure-setup flow. The
-Pharos UI passes only service, host, environment-variable name, classification,
-rotation, and tags; it never receives or displays the token value. Omit this URL
-when the installation has no Janus endpoint and complete the private runtime
-mount out of band instead.
+## Trust model
 
-Pharos resolves both named resources before the create call and attaches their
-numeric provider IDs to the server request. If the token, public key, or
-firewall is unavailable, setup fails before creating a server. Keep the token
-mount in a private Compose override or orchestrator secret; never place the raw
-value in Compose, an env file, or the setup UI.
+Pharos assumes infrastructure state is useful only when its authority is
+understandable.
 
-Before the first heartbeat, the tracked setup can be reopened from its fleet
-card. **Recovery options** can remove only that job's single persisted Hetzner
-server after explicit confirmation. The same operation is available as
-`POST /setup/provisioning-jobs/{id}/cleanup` with `{"confirm":true}`. A proven
-delete or provider `404` becomes an idempotent rolled-back outcome; network,
-unexpected success, and error responses remain `cleanup-needed` so an operator
-can verify the provider console before retrying. The API token is never returned
-in job or cleanup responses.
+### 1. Human and machine routes are separate
 
-Existing-host native systemd execution is deliberately off by default. The
-assistant still provides a reviewable manual handoff without it. To enable the
-executor, mount a private SSH identity and a pinned `known_hosts` file
-read-only, then set:
+Dashboard and operator APIs are behind the OIDC guard when configured.
+Registration, reports and target-agent routes use bearer credentials instead
+of browser sessions. Health, version and authentication endpoints remain
+public.
 
-```bash
-export PHAROS_EXISTING_HOST_EXECUTE=1
-export PHAROS_EXISTING_HOST_PHAROS_URL=https://pharos.example
-export PHAROS_EXISTING_HOST_IDENTITY_FILE=/run/pharos/ssh/id
-export PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE=/run/pharos/ssh/known_hosts
-```
+### 2. Machine identity is per host
 
-The executor refuses unknown host keys, password/interactive SSH, an existing
-target token file, or an unreadable runtime reference. It transfers the bundled
-beacon and installer first, then sends the newly issued beacon token only over
-SSH stdin into a root-owned `0600` env file. Local/dual token mode supports this
-direct handoff; Janus-only mode fails closed until a Janus credential broker is
-configured. Do not put private SSH material in the Compose file or repository.
+Local registration returns a raw beacon token exactly once and stores only its
+SHA-256 hash. Report verification uses constant-time comparison.
 
-### Native NixOS beacon
+| `PHAROS_BEACON_TOKEN_MODE` | Accepted token source |
+| --- | --- |
+| `local` | Hashes persisted by local `/register` |
+| `dual` | Local hashes or Janus-produced hash sidecars during migration |
+| `janus` | Janus-produced hash sidecars only; local registration is disabled by default |
 
-The flake exports a package and NixOS module for replacing the interim Docker
-beacon with a native systemd service:
+`PHAROS_REQUIRE_BEACON_TOKEN=1` is the production posture. The self-host
+template sets it explicitly.
+
+### 3. Secret values stay out of product state
+
+Janus integration gives `pharosd` host names and token hashes, not raw beacon
+tokens. Provider credentials are read from private runtime files when an
+executor is enabled. They are not serialized into jobs, returned to the
+browser or written into the host store.
+
+The Janus provider-setup link carries value-free metadata only. Pharos is not a
+general secret manager.
+
+### 4. Automation is narrow and off by default
+
+Provider creation, existing-host execution and nixcfg dispatch each require
+explicit runtime enablement and complete trust inputs. Missing tokens, SSH
+identity, pinned host keys, reviewed firewalls, backup evidence or fresh
+post-action observations stop the workflow.
+
+Host-action state contains no credentials, arbitrary commands, Nix store paths
+or command output. Target agents can claim only a fixed phase of a persisted
+workflow for a bounded lease.
+
+### 5. Requested is never presented as applied
+
+Nix host settings become declared only after the configured nixcfg artifact is
+loaded. They become applied only after a later beacon reports the same value.
+Non-Nix hosts may receive their own bounded preferences document in the report
+response; the beacon validates it and replaces its private file atomically.
+
+### 6. Destructive scope stays explicit
+
+Removing a host from Pharos revokes reports and records retirement state. It
+does not delete a server, disk, service or application data. The one exception
+is an explicitly confirmed cleanup endpoint for the single Hetzner server
+recorded by an incomplete provisioning job. Uncertain provider responses remain
+visible for operator review.
+
+## Beacons
+
+### Native NixOS service
+
+The flake exports `nixosModules.pharos-beacon`:
 
 ```nix
 {
@@ -271,131 +269,210 @@ beacon with a native systemd service:
 
   services.pharos-beacon = {
     enable = true;
-    tokenFile = "/etc/pharos/pharos-beacon.token";
-    nixcfgDir = "/home/mba/Code/nixcfg";
+    url = "https://pharos.example";
+    tokenFile = "/run/secrets/pharos-beacon-token";
+    nixcfgDir = "/etc/nixos";
     preferencesFile = "/etc/pharos/host-preferences.json";
   };
 }
 ```
 
-For first installation onto an existing machine, run the helper from a Linux
-host with Nix and `nixos-anywhere` installed:
+The module loads `tokenFile` through a systemd credential, runs the beacon as
+an unprivileged service and hardens its filesystem view. Set
+`allowLegacyReports = true` only for a controlled migration.
 
-```bash
-scripts/bootstrap-pharos-nixos-anywhere.sh \
-  --flake /path/to/nixcfg#host-name \
-  --target root@host-name \
-  --token-file /private/runtime/pharos-beacon.token \
-  --known-hosts /private/runtime/known_hosts \
-  --identity /private/runtime/id_ed25519
-```
+### Portable Linux service
 
-The helper validates private-file permissions and strict SSH trust, preserves
-the target host keys, copies the token with `nixos-anywhere --extra-files`, and
-waits for `pharos-beacon.service`. The raw token is not a command argument and
-never enters Nix evaluation or the Nix store. The module loads the root-only
-source file through a per-service systemd credential, so the unprivileged
-beacon can read its private copy without weakening the source permissions. The
-target configuration must import `nixosModules.pharos-beacon` and use the shown
-first-bootstrap token path.
-After the first heartbeat, migrate that file to an agenix- or Janus-managed
-runtime path and update `tokenFile` declaratively.
-
-`tokenEnvironmentFile` remains supported when a root-owned env file containing
-`PHAROS_TOKEN=...` is more practical. `allowLegacyReports = true` exists only
-for controlled migrations and must not be used with strict production report
-ingestion.
-
-### Portable non-Nix beacon
-
-Non-Nix Linux hosts can install the beacon as a native systemd service without
-Docker:
+For a non-Nix Linux host:
 
 ```bash
 sudo ./scripts/install-pharos-beacon-systemd.sh \
   --binary ./pharos-beacon \
   --token-file /etc/pharos/pharos-beacon.token \
-  --host ares
+  --host example-host
 ```
 
-The installer also accepts `--binary-url` for a prebuilt binary. It never creates
-or prints token values; the token file or env file must already exist unless
-`--allow-legacy` is passed for the temporary PHAROS-37 rollout window. systemd
-creates `/var/lib/pharos-beacon` as private service state, where preferences
-selected in Pharos are applied automatically after the next heartbeat.
+The installer expects token material to exist already. It does not generate or
+print credentials. The service keeps mutable preferences in its private state
+directory and reports them on the next heartbeat.
 
-## Beacon tokens
+### What a beacon reports
 
-`POST /register` is the local MVP token issuer. Set
-`PHAROS_REGISTRATION_TOKEN`, then call it with `Authorization: Bearer ...`.
-The response returns the raw per-host token once; pharosd stores only its
-SHA-256 hash. Keep this path for development and migration only.
+Collectors are explicit and bounded:
+
+- host identity, role and heartbeat interval;
+- Nix `flake.lock` age and commits behind the configured checkout;
+- running versus current kernel posture;
+- optional backup observations from Restic, a status file or a configured
+  bounded command;
+- optional location from static configuration, a bounded command or an
+  operator-enabled IP service;
+- bounded service observations and report round-trip timing;
+- currently applied host preferences.
+
+Unknown or malformed contract fields fail validation. A missing observation is
+shown as unknown rather than guessed.
+
+## Guarded operations
+
+Pharos can coordinate changes without becoming a free-form command bus.
+
+### Host update and restart
+
+The current workflow persists:
+
+1. operator intent;
+2. target-local review and preflight;
+3. the exact review result;
+4. attended confirmation;
+5. a leased apply/restart phase;
+6. fresh system, kernel, service and heartbeat verification;
+7. typed failure or recovery evidence.
+
+Review failures can be retried explicitly. Failures after confirmation require
+recovery; Pharos does not silently replay a switch or reboot.
+
+### Declarative settings and fleet proposals
+
+The nixcfg integration dispatches fixed GitHub Actions workflows. Pharos has no
+Git implementation and cannot merge or deploy a host. A dispatch acceptance
+means only that GitHub received the request.
+
+Enable it only after mounting a dedicated runtime credential and reviewing the
+target workflow:
 
 ```bash
-PHAROS_REGISTRATION_TOKEN=dev cargo run -p pharosd
-
-curl -sS -H 'Authorization: Bearer dev' \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"ares","role":"NixOS Host","is_nix":true,"heartbeat_interval_secs":60}' \
-  http://127.0.0.1:8080/register
+export PHAROS_NIXCFG_DISPATCH_ENABLED=1
+export PHAROS_NIXCFG_DISPATCH_TOKEN_FILE=/run/pharos/nixcfg-dispatch-token
+export PHAROS_HOST_PREFERENCES_PATH=/manifests/host-preferences.json
 ```
 
-`pharos-beacon` sends that token as `PHAROS_TOKEN`, or reads it from
-`PHAROS_TOKEN_FILE` when configured. For Janus-managed issuance, set
-`PHAROS_BEACON_TOKEN_MODE=janus` and provide
-`PHAROS_BEACON_TOKEN_HASH_FILE` pointing at a private Janus/Forge-produced JSON
-file. For per-host sidecars, use `PHAROS_BEACON_TOKEN_HASH_FILES` as a
-comma-separated list or `PHAROS_BEACON_TOKEN_HASH_DIR` to read every non-hidden
-`.json` regular file in a private directory. Those files contain host names and
-SHA-256 token hashes only; pharosd never needs the raw beacon token. `dual` mode
-accepts both the local persisted hashes and Janus hash files during migration.
-In `janus` mode, local `/register` is disabled unless
-`PHAROS_ALLOW_LOCAL_REGISTER=1` is set explicitly.
+The current classic-PAT path is a temporary integration boundary. A scoped
+GitHub App or Janus-brokered installation token is the intended replacement.
 
-The hash file contract is:
+### Hetzner Cloud
 
-```json
-{
-  "schema": "inspr.pharos.beacon-token-hashes.v1",
-  "hosts": [
-    { "name": "ares", "token_sha256": "<64 lowercase hex chars>" }
-  ]
-}
-```
-
-When
-`PHAROS_REQUIRE_BEACON_TOKEN=0`, `/report` accepts legacy reports without a
-bearer token even if the host already has a stored token hash, while still
-rejecting an explicitly wrong bearer token. Set
-`PHAROS_REQUIRE_BEACON_TOKEN=1` to reject reports that do not present a valid
-per-host token; by default that becomes true when `PHAROS_REGISTRATION_TOKEN`
-is configured or a Janus hash file is configured.
-
-Production uses strict token-only report ingestion. Before enabling the same
-policy in another deployment, ensure every beacon has a per-host token and
-pharosd has either persisted local hashes or a Janus-managed hash file for those
-hosts.
-
-## Operator authorization
-
-When OIDC is enabled, set `PHAROS_ALLOWED_OPERATORS` to a comma- or
-space-separated allowlist. Entries match normalized OIDC subject,
-`preferred_username`, or email claims collected from the ID token/UserInfo.
+Hetzner creation is disabled unless every prerequisite is supplied:
 
 ```bash
-PHAROS_ALLOWED_OPERATORS=markus cargo run -p pharosd
+export PHAROS_HCLOUD_EXECUTE=1
+export PHAROS_HCLOUD_API_TOKEN_FILE=/run/pharos/hcloud-token
+export PHAROS_HCLOUD_SSH_KEY_REF=pharos-bootstrap-key
+export PHAROS_HCLOUD_FIREWALL_REF=pharos-bootstrap-firewall
 ```
 
-If OIDC is configured and the allowlist is absent, Pharos keeps compatibility
-mode and allows all authenticated users. Production should set the allowlist
-explicitly before adding broader operator access or sensitive controls.
+Pharos tests the connection with read-only API calls, loads current locations,
+plans and prices, then validates the chosen resources again before a separate
+paid-creation confirmation. The SSH key and firewall must already exist in the
+provider project.
 
-## Route boundaries
+netcup, AWS, Google Cloud and Oracle Cloud currently use guided import paths.
+Pharos does not claim ordering, billing or free-tier guarantees for them.
 
-- Human routes: `/`, `/hosts.json`, `/agora`, and Agora proposal APIs are gated
-  by OIDC and the Pharos operator policy when auth is configured.
-- Public/machine routes: `/healthz`, `/version`, `/assets/*`, `/auth/*`,
-  `/declared-hosts.json`, `/register`, `/report`, `/agent/actions/*`, and
-  `/agent/retirements/*`.
-- `/declared-hosts.json` is declaration plus runtime overlay; the manifest stays
-  declarative and Pharos does not write runtime state back into it.
+## Selected HTTP surface
+
+The full UI and internal JSON routes are implementation interfaces, not a
+promised third-party API. The important boundaries are:
+
+| Route | Boundary |
+| --- | --- |
+| `GET /healthz`, `GET /version` | Public health and build metadata |
+| `POST /register` | Deployment bootstrap token; issues one per-host token |
+| `POST /report` | Versioned beacon contract and per-host bearer token |
+| `GET /hosts.json`, `GET /declared-hosts.json` | OIDC/access-policy guarded fleet views |
+| `POST /setup/existing-host/preflight` | Guarded read-only onboarding facts |
+| `/host-actions/...` | OIDC/operator guarded workflow requests |
+| `/agent/actions/...`, `/agent/retirements/...` | Machine-authenticated fixed leases and value-free results |
+
+## Configuration map
+
+### Server
+
+| Variable | Purpose |
+| --- | --- |
+| `PHAROS_ADDR` | Listen address, default `127.0.0.1:8080` |
+| `PHAROS_DB` | Optional JSON host-store path; enables derived persistent sidecars |
+| `PHAROS_OIDC_ISSUER` | OIDC discovery issuer |
+| `PHAROS_OIDC_CLIENT_ID` | Public OIDC client identifier |
+| `PHAROS_OIDC_REDIRECT_URI` | Exact callback URI |
+| `PHAROS_ALLOWED_OPERATORS` | Comma/space-separated full-fleet identities |
+| `PHAROS_ACCESS_POLICY_FILE` | Optional scoped identity-to-host policy |
+| `PHAROS_REGISTRATION_TOKEN` | Bootstrap authorization for local registration |
+| `PHAROS_REQUIRE_BEACON_TOKEN` | Require a valid machine token on every report |
+| `PHAROS_BEACON_TOKEN_MODE` | `local`, `dual` or `janus` |
+| `PHAROS_BEACON_TOKEN_HASH_FILE`, `PHAROS_BEACON_TOKEN_HASH_FILES`, `PHAROS_BEACON_TOKEN_HASH_DIR` | Private Janus hash sidecars |
+| `PHAROS_MANIFEST_PATHS` | Read-only declared-host manifests |
+| `PHAROS_HOST_PREFERENCES_PATH` | Read-only declared preference registry |
+| `PHAROS_ALERT_WEBHOOK_URL` | Optional HTTP(S) or Telegram silent-heartbeat notifier |
+
+### Beacon
+
+| Variable | Purpose |
+| --- | --- |
+| `PHAROS_URL` | Base URL of `pharosd` |
+| `PHAROS_INTERVAL` | Recurring report interval; unset means report once |
+| `PHAROS_HOSTNAME`, `PHAROS_ROLE` | Explicit reported identity |
+| `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE` | Per-host bearer credential |
+| `NIXCFG_DIR` | Checkout used for Nix freshness |
+| `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
+| `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
+| `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
+
+See the committed Compose files and NixOS module for the complete wiring.
+
+## Project status
+
+Pharos is an active early release at **v0.1.41**. It is already used as a real
+fleet dashboard and guarded operations layer, but its limits are part of its
+interface.
+
+Good fit today:
+
+- a small, self-hosted Linux or NixOS fleet;
+- one control-plane instance;
+- operators who value explicit evidence over broad automation;
+- environments that can provide OIDC, private runtime files and HTTPS;
+- gradual adoption, beginning with read-only fleet visibility.
+
+Not provided today:
+
+- multi-node high availability or a transactional SQL store;
+- a multi-tenant SaaS control plane;
+- arbitrary remote shell or general command execution;
+- automatic reconciliation of every declared change;
+- broad cloud-provider lifecycle management;
+- a replacement for a secret manager, backup engine or infrastructure source
+  of truth.
+
+Provider APIs, SSH execution, nixcfg dispatch, alert delivery and target agents
+are external dependencies. Their availability and permissions affect the
+corresponding workflow. Pharos records that uncertainty instead of treating it
+as success.
+
+## Development
+
+Run the same core checks as CI:
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all --locked
+cargo deny check
+```
+
+Additional checks cover the NixOS module, native systemd installer,
+`nixos-anywhere` handoff and self-host Compose contract.
+
+The visible version in [`VERSION`](VERSION), the Cargo workspace version and
+the latest entry in [`docs/CHANGELOG.md`](docs/CHANGELOG.md) must stay aligned.
+`pharosd` exposes the version and build commit at `/version`.
+
+## License
+
+Pharos is licensed under the
+[GNU Affero General Public License v3.0 only](LICENSE), expressed as
+`AGPL-3.0-only`.
+
+The AGPL protects the availability of source for modified network deployments.
+Third-party dependencies and embedded third-party assets retain their own
+licenses.
