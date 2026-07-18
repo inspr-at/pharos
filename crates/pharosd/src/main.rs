@@ -3387,6 +3387,7 @@ fn hetzner_runtime_readiness(
     let api_access = evidence_fresh && attempt.as_ref().is_some_and(|attempt| attempt.api_access);
     let provider_ready = credential_configured
         && credential_boundary_ready
+        && execution_enabled
         && store.ready(now, config.evidence_ttl_secs);
     let ready_with_defaults = provider_ready
         && project_label_configured
@@ -3405,6 +3406,12 @@ fn hetzner_runtime_readiness(
         "The secure credential is available. Test the connection to continue."
     } else if !evidence_fresh {
         "The last connection test is stale. Test again before creating a server."
+    } else if !execution_enabled
+        && attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.code == HetznerConnectionCode::Ready)
+    {
+        HetznerConnectionCode::ExecutionDisabled.safe_message()
     } else if let Some(attempt) = attempt.as_ref() {
         attempt.code.safe_message()
     } else {
@@ -14520,9 +14527,10 @@ fn render_hetzner_connection_page(
             r#"<p class="provider-admin-note">Secure setup is not connected to Janus on this Pharos installation.</p>"#.to_string()
         })
     } else if !readiness.execution_enabled {
-        setup_link.unwrap_or_else(|| {
-            r#"<p class="provider-admin-note">Managed creation is disabled on this Pharos installation.</p>"#.to_string()
-        })
+        format!(
+            r#"<button class="provider-primary" type="button" data-provider-test>{refresh}Test connection</button>"#,
+            refresh = icons::REFRESH_CW,
+        )
     } else if api_ready && catalog.is_some() && !(ssh_ready && firewall_ready && location_ready) {
         r#"<button class="provider-primary" type="button" data-provider-open-details>Finish setup</button>"#
             .to_string()
@@ -24792,6 +24800,75 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!json.contains("pharos-bootstrap-key"));
         assert!(!json.contains("pharos-bootstrap-firewall"));
         assert!(!json.contains("test-provider-token"));
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[test]
+    fn execution_disabled_provider_can_retest_without_unlocking_paid_work() {
+        let now = now_unix();
+        let token_path = std::env::temp_dir().join(format!(
+            "pharos-disabled-provider-token-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::write(&token_path, "disabled-provider-token")
+            .expect("write provider token fixture");
+        let runtime = ProviderRuntimeConfig {
+            hetzner_cloud: HetznerCloudRuntimeConfig {
+                credential_source: Some(ProviderCredentialSource::File(token_path.clone())),
+                execute_enabled: false,
+                project_label: Some("test-project".to_string()),
+                default_ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
+                firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
+                default_location: Some("fsn1".to_string()),
+                ..HetznerCloudRuntimeConfig::default()
+            },
+            ..ProviderRuntimeConfig::default()
+        };
+        let store = Arc::new(ready_provider_connection_store(now));
+
+        let readiness = hetzner_runtime_readiness(&runtime.hetzner_cloud, &store, now);
+        assert!(readiness.api_access);
+        assert!(readiness.evidence_fresh);
+        assert!(!readiness.execution_enabled);
+        assert!(!readiness.provider_ready);
+        assert!(!readiness.ready_with_defaults);
+        assert_eq!(
+            readiness.message,
+            HetznerConnectionCode::ExecutionDisabled.safe_message()
+        );
+        let provider =
+            provider_connection(&runtime, &store, "hetzner-cloud", now).expect("Hetzner provider");
+        assert_eq!(provider.state, ProviderConnectionState::NeedsAttention);
+        assert!(!provider.available_in_add_server);
+
+        let mut state = report_test_state(false);
+        state.provider_runtime = runtime.clone();
+        state.provider_connections = store.clone();
+        assert_eq!(
+            guarded_hetzner_runtime(&state, &hcloud_review_request("disabled-review"), now)
+                .expect_err("paid review stays disabled"),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Managed Hetzner Cloud execution is disabled."
+            )
+        );
+
+        let shell = ShellContext {
+            user_label: "markus",
+            logout_enabled: true,
+        };
+        let managed = render_hetzner_connection_page(&runtime, &store, shell, true, None);
+        assert_eq!(managed.matches(r#" data-provider-test>"#).count(), 1);
+        assert!(managed.contains("Test connection</button>"));
+        assert!(managed.contains(r#"data-provider-ready="false""#));
+        assert!(managed.contains(HetznerConnectionCode::ExecutionDisabled.safe_message()));
+        assert!(!managed.contains(r#"class="provider-primary" href="/?setup=add-server"#));
+
+        let viewer = render_hetzner_connection_page(&runtime, &store, shell, false, None);
+        assert!(!viewer.contains(r#" data-provider-test>"#));
+        assert!(!viewer.contains(r#"class="provider-primary" href="/?setup=add-server"#));
+        assert!(viewer.contains("Ask a Pharos administrator"));
         let _ = std::fs::remove_file(token_path);
     }
 

@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.43 - 2026-07-18
+
+- Keep the authenticated read-only Hetzner Cloud connection test available while managed execution is disabled, without exposing Add server or paid-review actions.
+- Make current `PHAROS_HCLOUD_EXECUTE=0` state fail closed even when fresh evidence was recorded while execution was enabled, and cover the read-only requests and disabled gate with focused regressions.
+
 ## 0.1.42 - 2026-07-18
 
 - Persist an exact, secret-free Hetzner Cloud plan with server name, current gross prices, hard caps, project and resource selectors, a non-secret credential binding, ownership labels, a one-server maximum, and a short expiry before any paid action is available.

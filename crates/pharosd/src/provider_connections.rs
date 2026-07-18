@@ -1179,12 +1179,13 @@ mod tests {
                     .await
                     .expect("read provider request");
                 let request = String::from_utf8_lossy(&buffer[..size]);
-                let path = request
+                let mut request_line = request
                     .lines()
                     .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or_default()
-                    .to_string();
+                    .split_whitespace();
+                assert_eq!(request_line.next(), Some("GET"));
+                let path = request_line.next().unwrap_or_default().to_string();
                 assert!(
                     request.contains("authorization: Bearer provider-test-token")
                         || request.contains("Authorization: Bearer provider-test-token")
@@ -1369,6 +1370,39 @@ mod tests {
         assert!(!json.contains(TOKEN));
         assert!(!json.to_ascii_lowercase().contains("bearer "));
         assert!(!json.contains("must stay redacted"));
+    }
+
+    #[tokio::test]
+    async fn execution_disabled_test_stays_read_only_and_cannot_unlock_creation() {
+        let (api, requests) = mock_api("200 OK").await;
+        let mut config = test_config(&api);
+        config.execution_enabled = false;
+
+        let result = test_hetzner_connection(config, 1_700_000_000).await;
+
+        assert_eq!(
+            result.attempt.code,
+            HetznerConnectionCode::ExecutionDisabled
+        );
+        assert!(result.attempt.api_access);
+        assert!(!result.attempt.execution_enabled);
+        assert!(!result.attempt.ready());
+        assert!(result.catalog.is_some());
+        assert_eq!(
+            requests
+                .lock()
+                .expect("provider requests")
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "/locations?page=1&per_page=50",
+                "/server_types?page=1&per_page=50",
+                "/pricing",
+                "/ssh_keys?page=1&per_page=50",
+                "/firewalls?page=1&per_page=50",
+            ]
+        );
     }
 
     #[tokio::test]
