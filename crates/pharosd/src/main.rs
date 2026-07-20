@@ -5082,7 +5082,9 @@ body[data-assistant-open="true"]{overflow:hidden}
 .provider-menu{position:relative}.provider-menu>summary{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(173,205,220,.68);border-radius:50%;background:rgba(255,255,255,.82);color:#47657e;cursor:pointer;list-style:none}.provider-menu>summary::-webkit-details-marker{display:none}.provider-menu>summary .ico{width:17px;height:17px}.provider-menu>div{position:absolute;z-index:6;right:0;top:46px;min-width:150px;padding:5px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:#fff;box-shadow:0 14px 34px rgba(45,75,95,.16)}.provider-menu button{width:100%;min-height:36px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:#9a332f;font:inherit;font-size:12px;text-align:left;cursor:pointer}.provider-menu button:hover,.provider-menu button:focus-visible{background:rgba(255,232,229,.72);outline:0}
 .provider-details{border-bottom:1px solid rgba(210,226,234,.76)}.provider-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:58px;padding:0 22px;color:#315d7c;font-size:13px;font-weight:760;cursor:pointer;list-style:none}.provider-details>summary::-webkit-details-marker{display:none}.provider-details>summary .ico{width:17px;height:17px;transition:transform .18s ease}.provider-details[open]>summary .ico{transform:rotate(180deg)}.provider-details form{padding:2px 22px 20px}.provider-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider-fields label{display:grid;gap:6px;color:#526d82;font-size:11px;font-weight:720}.provider-fields select{width:100%;height:40px;padding:0 32px 0 10px;border:1px solid rgba(173,205,220,.72);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px}.provider-details-action{display:flex;align-items:center;gap:12px;margin-top:14px}.provider-details-action span,.provider-action-feedback{color:var(--muted);font-size:11px}.provider-details>p{margin:0;padding:0 22px 18px;color:var(--muted);font-size:11px;line-height:1.45}.provider-action-feedback{min-height:0;margin:0;padding:0 22px}.provider-action-feedback:not(:empty){min-height:40px;padding-top:12px;padding-bottom:12px;color:#8d3430}.provider-details+.provider-action-feedback:not(:empty){border-top:0}
 .provider-help{margin-top:20px;padding:24px;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:rgba(255,255,255,.70);box-shadow:0 14px 34px rgba(54,88,108,.05)}.provider-help-head{display:grid;gap:7px;max-width:760px}.provider-help-kicker{color:#0f5f80;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.provider-help h2{margin:0;font-family:Georgia,"Times New Roman",serif;color:#12304b;font-size:24px;font-weight:500}.provider-help-head p,.provider-help-step p,.provider-help-finish p{margin:0;color:var(--muted);font-size:12px;line-height:1.55}.provider-help-steps{display:grid;margin:22px 0 0;padding:0;list-style:none}.provider-help-step{display:grid;grid-template-columns:32px minmax(0,1fr);gap:14px;padding:18px 0;border-top:1px solid rgba(210,226,234,.76)}.provider-help-number{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(103,177,196,.36);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:16px}.provider-help-step h3{margin:4px 0 6px;color:var(--ink);font-size:14px}.provider-help-step ul{display:grid;gap:5px;margin:10px 0 0;padding-left:18px;color:#526d82;font-size:11px;line-height:1.5}.provider-help-links{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-top:12px}.provider-help-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-help-links .ico{width:13px;height:13px}.provider-help-secret-note{color:#8a5b13;font-size:11px;line-height:1.45}.provider-help-finish{padding:16px 18px;border-radius:7px;background:rgba(223,241,249,.48)}.provider-help-finish strong{display:block;margin-bottom:4px;color:#12304b;font-size:13px}
+.provider-guide-progress{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:22px 0 0;padding:0;list-style:none}.provider-guide-progress button{display:flex;align-items:center;gap:9px;width:100%;min-height:46px;padding:8px 10px;border:1px solid rgba(173,205,220,.66);border-radius:7px;background:rgba(255,255,255,.74);color:#526d82;font:inherit;font-size:11px;font-weight:720;text-align:left;cursor:pointer}.provider-guide-progress button:hover,.provider-guide-progress button:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-progress button[aria-current="step"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-progress i{display:grid;place-items:center;width:24px;height:24px;flex:0 0 auto;border-radius:50%;background:#e5f1f5;color:#315d7c;font-family:Georgia,"Times New Roman",serif;font-size:13px;font-style:normal}.provider-guide-progress [data-complete="true"] i{background:var(--live);color:#fff}.provider-guide-panel{display:grid;gap:18px;margin-top:18px;padding:22px;border:1px solid rgba(210,226,234,.88);border-radius:8px;background:#fff}.provider-guide-panel[hidden],.provider-guide-platform-panel[hidden]{display:none}.provider-guide-panel-head{display:grid;gap:6px}.provider-guide-panel-head span{color:#0f5f80;font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}.provider-guide-panel h3{margin:0;color:#12304b;font-size:18px}.provider-guide-panel p{margin:0;color:#526d82;font-size:12px;line-height:1.55}.provider-guide-state{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:7px;background:rgba(255,245,224,.64);color:#80560f;font-size:11px;font-weight:720}.provider-guide-state[data-ready="true"]{background:rgba(225,244,235,.72);color:var(--live)}.provider-guide-state i{width:8px;height:8px;border-radius:50%;background:currentColor}.provider-guide-tasks{display:grid;gap:10px;margin:0;padding:0;counter-reset:guide-task;list-style:none}.provider-guide-task{position:relative;display:grid;gap:5px;min-height:34px;padding-left:38px;counter-increment:guide-task}.provider-guide-task::before{content:counter(guide-task);position:absolute;top:0;left:0;display:grid;place-items:center;width:26px;height:26px;border:1px solid rgba(103,177,196,.38);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:13px}.provider-guide-task strong{color:var(--ink);font-size:12px}.provider-guide-task p{font-size:11px}.provider-guide-task a{color:#0f5f80;font-weight:720;text-underline-offset:3px}.provider-guide-secret{padding:12px 14px;border-left:3px solid #d89a2f;border-radius:4px;background:rgba(255,245,224,.58);color:#71501a;font-size:11px;line-height:1.5}.provider-guide-platforms{display:flex;flex-wrap:wrap;gap:8px}.provider-guide-platforms button{min-height:36px;padding:0 13px;border:1px solid rgba(173,205,220,.76);border-radius:7px;background:#fff;color:#315d7c;font:inherit;font-size:11px;font-weight:720;cursor:pointer}.provider-guide-platforms button[aria-pressed="true"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-platform-panel{display:grid;gap:14px;padding:16px;border-radius:7px;background:rgba(246,250,251,.92)}.provider-guide-command{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin-top:6px}.provider-guide-command code{display:block;overflow-x:auto;padding:10px 12px;border:1px solid rgba(210,226,234,.92);border-radius:6px;background:#f4f8fa;color:#18354c;font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word}.provider-guide-copy{min-height:34px;padding:0 11px;border:1px solid rgba(173,205,220,.76);border-radius:6px;background:#fff;color:#0f5f80;font:inherit;font-size:10px;font-weight:760;cursor:pointer}.provider-guide-copy:hover,.provider-guide-copy:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-copy-status{min-height:18px;color:var(--live);font-size:10px}.provider-guide-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding-top:4px}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:auto}.provider-guide-links{display:flex;align-items:center;flex-wrap:wrap;gap:14px}.provider-guide-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-guide-links .ico{width:13px;height:13px}.provider-guide-finish{display:grid;gap:8px;padding:14px 16px;border-radius:7px;background:rgba(223,241,249,.48)}
 @media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-help{padding:20px 18px}.provider-help-step{grid-template-columns:30px minmax(0,1fr);gap:11px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
+@media (max-width:760px){.provider-guide-progress{grid-template-columns:1fr}.provider-guide-panel{padding:18px 14px}.provider-guide-command{grid-template-columns:1fr}.provider-guide-copy{justify-self:start}.provider-guide-actions{align-items:stretch;flex-direction:column}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:100%}}
 @media (prefers-reduced-motion:reduce){.sidebar-motion{display:none}.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -7655,6 +7657,61 @@ async function runProviderAction(button,url,body){
     }
   }
 }
+function showProviderGuidePanel(guide,name){
+  const panel=guide.querySelector(`[data-guide-panel="${name}"]`);
+  if(!panel)return;
+  guide.querySelectorAll('[data-guide-panel]').forEach(item=>{item.hidden=item!==panel});
+  guide.querySelectorAll('[data-guide-nav]').forEach(button=>{
+    if(button.dataset.guideNav===name)button.setAttribute('aria-current','step');
+    else button.removeAttribute('aria-current');
+  });
+  panel.focus({preventScroll:true});
+  panel.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function initProviderSetupGuide(){
+  const guide=document.querySelector('[data-provider-setup-guide]');
+  if(!guide)return;
+  showProviderGuidePanel(guide,guide.dataset.initialStep||'api');
+  guide.querySelectorAll('[data-guide-nav]').forEach(button=>button.addEventListener('click',()=>{
+    showProviderGuidePanel(guide,button.dataset.guideNav);
+  }));
+  guide.querySelectorAll('[data-guide-next]').forEach(button=>button.addEventListener('click',()=>{
+    showProviderGuidePanel(guide,button.dataset.guideNext);
+  }));
+  guide.querySelectorAll('[data-guide-platform]').forEach(button=>button.addEventListener('click',()=>{
+    const platform=button.dataset.guidePlatform;
+    guide.querySelectorAll('[data-guide-platform]').forEach(choice=>choice.setAttribute('aria-pressed',choice===button?'true':'false'));
+    guide.querySelectorAll('[data-guide-platform-panel]').forEach(panel=>{panel.hidden=panel.dataset.guidePlatformPanel!==platform});
+    guide.querySelector(`[data-guide-platform-panel="${platform}"]`)?.focus({preventScroll:true});
+  }));
+  guide.querySelectorAll('[data-copy-command]').forEach(button=>button.addEventListener('click',async()=>{
+    const command=document.getElementById(button.dataset.copyCommand||'');
+    const status=button.closest('[data-guide-panel]')?.querySelector('[data-guide-copy-status]');
+    if(!command||!navigator.clipboard?.writeText){
+      if(status)status.textContent='Copy is unavailable here. Select the command text manually.';
+      return;
+    }
+    try{
+      await navigator.clipboard.writeText(command.textContent||'');
+      if(status)status.textContent='Safe command copied. No key or credential was copied.';
+    }catch(_error){
+      if(status)status.textContent='Copy was blocked by the browser. Select the command text manually.';
+    }
+  }));
+  guide.querySelectorAll('[data-guide-provider-test]').forEach(button=>button.addEventListener('click',()=>{
+    runProviderAction(button,'/settings/providers/hetzner-cloud/test');
+  }));
+  guide.querySelectorAll('[data-guide-open-details]').forEach(button=>button.addEventListener('click',()=>{
+    const details=document.querySelector('[data-provider-details]');
+    if(!details){
+      setProviderActionStatus('Refresh the provider choices first.',true);
+      return;
+    }
+    details.open=true;
+    details.scrollIntoView({behavior:'smooth',block:'nearest'});
+    setTimeout(()=>details.querySelector('select')?.focus(),180);
+  }));
+}
 function initProviderConnection(){
   const details=document.querySelector('[data-provider-details]');
   document.querySelectorAll('[data-provider-open-details]').forEach(button=>button.addEventListener('click',()=>{
@@ -7834,6 +7891,7 @@ document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.datase
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
 initControls();
 initProviderConnection();
+initProviderSetupGuide();
 resumeBeatClock();
 scheduleRefresh(3000);
 </script></body></html>"#;
@@ -14426,12 +14484,19 @@ fn provider_select_option(value: &str, label: &str, selected: Option<&str>) -> S
     )
 }
 
-fn render_hetzner_setup_help(can_manage: bool, secure_setup_url: Option<&str>) -> String {
+fn render_hetzner_setup_help(
+    can_manage: bool,
+    secure_setup_url: Option<&str>,
+    api_ready: bool,
+    ssh_available: bool,
+    firewall_available: bool,
+    choices_ready: bool,
+) -> String {
     let secure_setup = if can_manage {
         secure_setup_url
             .map(|url| {
                 format!(
-                    r#"<a href="{url}" target="_blank" rel="noopener noreferrer">Open this installation's secure credential setup{external}</a>"#,
+                    r#"<a class="provider-secondary" href="{url}" target="_blank" rel="noopener noreferrer">Open secure credential setup{external}</a>"#,
                     url = html_escape(url),
                     external = icons::EXTERNAL_LINK,
                 )
@@ -14442,10 +14507,64 @@ fn render_hetzner_setup_help(can_manage: bool, secure_setup_url: Option<&str>) -
     } else {
         r#"<span class="provider-help-secret-note">An administrator must complete the installation's secure credential workflow.</span>"#.to_string()
     };
+    let initial_step = if !api_ready {
+        "api"
+    } else if !ssh_available {
+        "ssh"
+    } else if !firewall_available {
+        "firewall"
+    } else {
+        "finish"
+    };
+    let api_action = if api_ready {
+        r#"<button class="provider-primary" type="button" data-guide-next="ssh">Continue to SSH key</button>"#.to_string()
+    } else if can_manage {
+        format!(
+            r#"{secure_setup}<button class="provider-primary" type="button" data-guide-provider-test>Test connection</button>"#
+        )
+    } else {
+        secure_setup.clone()
+    };
     format!(
-        r#"<section class="provider-help" aria-labelledby="hetzner-setup-help-title"><header class="provider-help-head"><span class="provider-help-kicker">Setup help</span><h2 id="hetzner-setup-help-title">Prepare the Hetzner project</h2><p>Create these prerequisites in the same Hetzner Cloud project that Pharos will manage. Resource names are your choice; Pharos stores only the names and current catalog evidence.</p></header><ol class="provider-help-steps"><li class="provider-help-step"><span class="provider-help-number" aria-hidden="true">1</span><div><h3>API connection</h3><p>In Hetzner Console, open Security, choose API tokens, and generate a project-scoped token with Read &amp; Write permission. Managed create and cleanup require both read and mutation access.</p><ul><li>Copy the token once, directly into this installation's approved secure credential workflow.</li><li>Never paste it into this settings page, chat, tickets, shell history, source control, or logs.</li><li>If the token is exposed or its one-time handoff is lost, revoke it and generate a replacement.</li></ul><div class="provider-help-links"><a href="https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/" target="_blank" rel="noopener noreferrer">Hetzner API-token guide{external}</a>{secure_setup}</div></div></li><li class="provider-help-step"><span class="provider-help-number" aria-hidden="true">2</span><div><h3>SSH key</h3><p>Use a reviewed key pair available to the Linux executor that will bootstrap the new server. If none exists, generate an Ed25519 key pair on that executor according to your installation's secret-management policy.</p><ul><li>Add only the public key to Security → SSH Keys in the same Hetzner project.</li><li>Keep the private key in the executor's protected key store or SSH agent; never upload it to Hetzner or Pharos.</li><li>Confirm the executor can use the private key before approving a paid server.</li></ul><div class="provider-help-links"><a href="https://docs.hetzner.com/cloud/servers/getting-started/connecting-to-the-server/" target="_blank" rel="noopener noreferrer">Hetzner SSH guide{external}</a></div></div></li><li class="provider-help-step"><span class="provider-help-number" aria-hidden="true">3</span><div><h3>Firewall</h3><p>In the same project, create a Cloud Firewall for bootstrap access. Pharos will attach the selected firewall when it creates the server.</p><ul><li>Allow inbound TCP port 22 only from the executor's public source CIDRs (typically an IPv4 /32 and, when used, an IPv6 /128).</li><li>Do not use world-open source ranges unless your security policy explicitly accepts that exposure.</li><li>Leave outbound rules empty when unrestricted egress is intended; the bootstrap needs access to package sources and the Pharos endpoint.</li><li>The firewall may remain unattached until Pharos creates the server.</li></ul><div class="provider-help-links"><a href="https://docs.hetzner.com/cloud/firewalls/getting-started/creating-a-firewall/" target="_blank" rel="noopener noreferrer">Hetzner Firewall guide{external}</a></div></div></li></ol><div class="provider-help-finish"><strong>Finish in Pharos</strong><p>Choose Test connection to refresh the provider catalog, select the location, SSH key, and firewall, then choose Save and test. If a dropdown is empty, confirm that the resource exists in the token's project and test the connection again.</p></div></section>"#,
+        r#"<section class="provider-help" data-provider-setup-guide data-initial-step="{initial_step}" aria-labelledby="hetzner-setup-help-title"><header class="provider-help-head"><span class="provider-help-kicker">Guided setup</span><h2 id="hetzner-setup-help-title">Prepare the Hetzner project</h2><p>Follow one small task at a time. This assistant never asks for a token, private key, passphrase, or IP address, and it sends none of them to Pharos.</p></header><ol class="provider-guide-progress" aria-label="Hetzner setup progress"><li><button type="button" data-guide-nav="api" data-complete="{api_ready}"><i aria-hidden="true">1</i>API connection</button></li><li><button type="button" data-guide-nav="ssh" data-complete="{ssh_available}"><i aria-hidden="true">2</i>SSH key</button></li><li><button type="button" data-guide-nav="firewall" data-complete="{firewall_available}"><i aria-hidden="true">3</i>Firewall</button></li><li><button type="button" data-guide-nav="finish" data-complete="{choices_ready}"><i aria-hidden="true">4</i>Finish</button></li></ol>
+
+<section class="provider-guide-panel" data-guide-panel="api" tabindex="-1"><header class="provider-guide-panel-head"><span>Step 1 of 4</span><h3>Connect the Hetzner API</h3><p>The token lets Pharos read this project and, only after a separate paid approval, create or remove its tracked server.</p></header><div class="provider-guide-state" data-ready="{api_ready}"><i aria-hidden="true"></i>{api_state}</div><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Open the correct Hetzner project.</strong><p><a href="https://console.hetzner.cloud/" target="_blank" rel="noopener noreferrer">Open Hetzner Console{external}</a>, sign in, and choose the one project Pharos should manage.</p></li><li class="provider-guide-task"><strong>Open Security → API tokens.</strong><p>Choose Generate API token. Use a recognizable name such as “Pharos provider access.”</p></li><li class="provider-guide-task"><strong>Select Read &amp; Write, then generate the token.</strong><p>Read-only access cannot perform a separately approved server create or cleanup.</p></li><li class="provider-guide-task"><strong>Move it directly into secure setup.</strong><p>The token is shown once. Copy it straight into this installation's approved credential workflow, then close the Hetzner token screen.</p></li></ol><div class="provider-guide-secret"><strong>Stop if you are about to paste the token into Pharos, chat, a ticket, Terminal, source code, or logs.</strong> If it was exposed or lost, revoke it in Hetzner and make a replacement.</div><div class="provider-guide-links"><a href="https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/" target="_blank" rel="noopener noreferrer">Official API-token guide{external}</a></div><div class="provider-guide-actions">{api_action}</div></section>
+
+<section class="provider-guide-panel" data-guide-panel="ssh" tabindex="-1" hidden><header class="provider-guide-panel-head"><span>Step 2 of 4</span><h3>Add an SSH public key</h3><p>An SSH key pair has two halves: Hetzner receives the public <code>.pub</code> half; the private half never leaves the computer or automation executor that will make the first login.</p></header><div class="provider-guide-state" data-ready="{ssh_available}"><i aria-hidden="true"></i>{ssh_state}</div><div><p><strong>Where will the first server login come from?</strong></p><div class="provider-guide-platforms" role="group" aria-label="SSH key computer"><button type="button" data-guide-platform="macos" aria-pressed="false">My Mac</button><button type="button" data-guide-platform="linux" aria-pressed="false">Linux or automation executor</button></div></div>
+<section class="provider-guide-platform-panel" data-guide-platform-panel="macos" tabindex="-1" hidden><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Open Terminal on the Mac.</strong><p>Press Command-Space, type Terminal, and press Return.</p></li><li class="provider-guide-task"><strong>Check for the normal Ed25519 key pair.</strong><p>Copy and run this safe command. It copies only the public <code>.pub</code> file when both halves exist and prints only a result message.</p><div class="provider-guide-command"><code id="provider-command-mac-check">if test -f "$HOME/.ssh/id_ed25519" &amp;&amp; test -f "$HOME/.ssh/id_ed25519.pub"; then pbcopy &lt; "$HOME/.ssh/id_ed25519.pub"; echo "PUBLIC KEY COPIED"; else echo "NO KEY FOUND"; fi</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-mac-check">Copy command</button></div></li><li class="provider-guide-task"><strong>If it says NO KEY FOUND, create a dedicated key.</strong><p>Run the first command and choose a strong passphrase when asked. Then run the second command to copy only its public half.</p><div class="provider-guide-command"><code id="provider-command-mac-create">ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/pharos_bootstrap_ed25519" -C "Pharos bootstrap"</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-mac-create">Copy command</button></div><div class="provider-guide-command"><code id="provider-command-mac-copy">pbcopy &lt; "$HOME/.ssh/pharos_bootstrap_ed25519.pub" &amp;&amp; echo "PUBLIC KEY COPIED"</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-mac-copy">Copy command</button></div></li></ol></section>
+<section class="provider-guide-platform-panel" data-guide-platform-panel="linux" tabindex="-1" hidden><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Open a terminal on the Linux computer or executor.</strong><p>Use the machine that will actually connect to and bootstrap the new server.</p></li><li class="provider-guide-task"><strong>Check for the normal Ed25519 key pair.</strong><div class="provider-guide-command"><code id="provider-command-linux-check">if test -f "$HOME/.ssh/id_ed25519" &amp;&amp; test -f "$HOME/.ssh/id_ed25519.pub"; then echo "KEY FOUND"; else echo "NO KEY FOUND"; fi</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-linux-check">Copy command</button></div></li><li class="provider-guide-task"><strong>If needed, create a dedicated key.</strong><p>Follow the installation's key-store and passphrase policy. Never place the private file in Pharos.</p><div class="provider-guide-command"><code id="provider-command-linux-create">ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/pharos_bootstrap_ed25519" -C "Pharos bootstrap"</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-linux-create">Copy command</button></div></li><li class="provider-guide-task"><strong>Copy only the public line.</strong><p>The command displays only the public <code>.pub</code> half. Copy that one line locally. Never run it without the <code>.pub</code> suffix.</p><div class="provider-guide-command"><code id="provider-command-linux-public">if test -f "$HOME/.ssh/id_ed25519" &amp;&amp; test -f "$HOME/.ssh/id_ed25519.pub"; then cat "$HOME/.ssh/id_ed25519.pub"; else cat "$HOME/.ssh/pharos_bootstrap_ed25519.pub"; fi</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-linux-public">Copy command</button></div></li></ol></section>
+<p class="provider-guide-copy-status" data-guide-copy-status aria-live="polite"></p><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Return to the same Hetzner project.</strong><p>Open Security → SSH Keys → Add SSH key.</p></li><li class="provider-guide-task"><strong>Name and add the public key.</strong><p>Use a recognizable non-secret name such as “pharos-bootstrap,” paste the copied public line into Public key, and choose Add SSH key.</p></li></ol><div class="provider-guide-secret">A public key normally begins with <code>ssh-ed25519</code>. A private key file has no <code>.pub</code> suffix and must never be opened, pasted, uploaded, or sent to Pharos.</div><div class="provider-guide-links"><a href="https://console.hetzner.cloud/" target="_blank" rel="noopener noreferrer">Open Hetzner Console{external}</a><a href="https://docs.hetzner.com/cloud/servers/getting-started/connecting-to-the-server/" target="_blank" rel="noopener noreferrer">Official SSH guide{external}</a></div><div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="api">Back</button><button class="provider-primary" type="button" data-guide-next="firewall">SSH key added — continue</button></div></section>
+
+<section class="provider-guide-panel" data-guide-panel="firewall" tabindex="-1" hidden><header class="provider-guide-panel-head"><span>Step 3 of 4</span><h3>Create the bootstrap firewall</h3><p>The firewall admits SSH only from the trusted computer or executor you just chose. Pharos stores the firewall name, not its source address.</p></header><div class="provider-guide-state" data-ready="{firewall_available}"><i aria-hidden="true"></i>{firewall_state}</div><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Copy the current public IPv4 range from the same computer.</strong><p>On macOS, this copies the address plus <code>/32</code>. On Linux, it prints the same value for local copying. The lookup goes directly to icanhazip.com; use your organization's known egress range instead when one is provided.</p><div class="provider-guide-command"><code id="provider-command-firewall-mac">printf '%s/32' "$(curl -4fsS https://icanhazip.com)" | pbcopy &amp;&amp; echo "PUBLIC IPv4 RANGE COPIED"</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-firewall-mac">Copy macOS command</button></div><div class="provider-guide-command"><code id="provider-command-firewall-linux">printf '%s/32\n' "$(curl -4fsS https://icanhazip.com)"</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-firewall-linux">Copy Linux command</button></div></li><li class="provider-guide-task"><strong>In Hetzner, open Security → Firewalls → Create firewall.</strong><p>Use a recognizable name such as “pharos-bootstrap.”</p></li><li class="provider-guide-task"><strong>Add one inbound rule.</strong><p>Protocol: TCP. Port: 22. Source IPs: paste the trusted range ending in <code>/32</code>. Never choose Any IPv4 or Any IPv6 for SSH unless your security policy explicitly requires it.</p></li><li class="provider-guide-task"><strong>Keep outbound access available.</strong><p>Leave outbound rules empty when unrestricted outbound traffic is intended; initial setup needs package sources and the Pharos endpoint.</p></li><li class="provider-guide-task"><strong>Create it without attaching a resource.</strong><p>The firewall can remain unattached. Pharos attaches the selected firewall during the separately approved server create.</p></li></ol><p class="provider-guide-copy-status" data-guide-copy-status aria-live="polite"></p><div class="provider-guide-links"><a href="https://console.hetzner.cloud/" target="_blank" rel="noopener noreferrer">Open Hetzner Console{external}</a><a href="https://docs.hetzner.com/cloud/firewalls/getting-started/creating-a-firewall/" target="_blank" rel="noopener noreferrer">Official Firewall guide{external}</a></div><div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="ssh">Back</button><button class="provider-primary" type="button" data-guide-next="finish">Firewall created — finish</button></div></section>
+
+<section class="provider-guide-panel" data-guide-panel="finish" tabindex="-1" hidden><header class="provider-guide-panel-head"><span>Step 4 of 4</span><h3>Refresh and select the resources</h3><p>This final check reads the current Hetzner catalog. It does not create a server or start billing.</p></header><div class="provider-guide-state" data-ready="{choices_ready}"><i aria-hidden="true"></i>{finish_state}</div><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Refresh provider choices.</strong><p>Choose Test connection below. Pharos reloads the page after the safe read-only check.</p></li><li class="provider-guide-task"><strong>Open Connection details above.</strong><p>Choose a default location, the SSH key you added, and the firewall you created.</p></li><li class="provider-guide-task"><strong>Choose Save and test.</strong><p>The three checks above should read API connection: Connected, SSH key: Ready, and Firewall: Ready. Paid execution remains a separate approval.</p></li></ol><div class="provider-guide-finish"><strong>If a dropdown is empty</strong><p>Confirm the resource was created in the same Hetzner project as the API token, then choose Test connection again.</p></div><div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="firewall">Back</button><button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><button class="provider-primary" type="button" data-guide-open-details>Open Connection details</button></div></section></section>"#,
         external = icons::EXTERNAL_LINK,
-        secure_setup = secure_setup,
+        initial_step = initial_step,
+        api_ready = api_ready,
+        ssh_available = ssh_available,
+        firewall_available = firewall_available,
+        choices_ready = choices_ready,
+        api_state = if api_ready {
+            "Pharos already detects a working API connection. Do not replace its token."
+        } else {
+            "No working API connection is currently detected."
+        },
+        ssh_state = if ssh_available {
+            "At least one SSH public key is available in this Hetzner project."
+        } else {
+            "No SSH public key is currently available in the refreshed project catalog."
+        },
+        firewall_state = if firewall_available {
+            "At least one firewall is available in this Hetzner project."
+        } else {
+            "No firewall is currently available in the refreshed project catalog."
+        },
+        finish_state = if choices_ready {
+            "The location, SSH key, and firewall selections have been verified."
+        } else {
+            "Refresh the catalog, then select and verify all three choices."
+        },
+        api_action = api_action,
     )
 }
 
@@ -14468,6 +14587,14 @@ fn render_hetzner_connection_page(
         && attempt
             .as_ref()
             .is_some_and(|item| item.default_location_ready);
+    let ssh_available = api_ready
+        && catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.ssh_keys.is_empty());
+    let firewall_available = api_ready
+        && catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.firewalls.is_empty());
     let tested_label = readiness
         .tested_at
         .map(|tested_at| {
@@ -14629,7 +14756,14 @@ fn render_hetzner_connection_page(
     } else {
         "Janus and agenix must mount the provider token before Pharos can test it."
     };
-    let setup_help = render_hetzner_setup_help(can_manage, janus_url.as_deref());
+    let setup_help = render_hetzner_setup_help(
+        can_manage,
+        janus_url.as_deref(),
+        api_ready,
+        ssh_available,
+        firewall_available,
+        ssh_ready && firewall_ready && location_ready,
+    );
     format!(
         r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a><header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
@@ -25036,22 +25170,41 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn hetzner_setup_help_is_generic_complete_and_secret_safe() {
-        let managed =
-            render_hetzner_setup_help(true, Some("https://secrets.example.test/provider-setup"));
+        let managed = render_hetzner_setup_help(
+            true,
+            Some("https://secrets.example.test/provider-setup"),
+            true,
+            false,
+            false,
+            false,
+        );
         let api = managed.find("API connection").expect("API help");
         let ssh = managed.find("SSH key").expect("SSH help");
         let firewall = managed.find("Firewall").expect("firewall help");
 
         assert!(api < ssh && ssh < firewall);
+        assert!(managed.contains(r#"data-provider-setup-guide"#));
+        assert!(managed.contains(r#"data-initial-step="ssh""#));
+        assert_eq!(managed.matches(r#"data-guide-panel="#).count(), 4);
+        assert_eq!(managed.matches(r#"data-guide-copy-status"#).count(), 2);
         assert!(managed.contains("Read &amp; Write"));
-        assert!(managed.contains("same Hetzner Cloud project"));
-        assert!(managed.contains("Linux executor"));
-        assert!(managed.contains("public source CIDRs"));
+        assert!(managed.contains("same Hetzner project"));
+        assert!(managed.contains("My Mac"));
+        assert!(managed.contains("Linux or automation executor"));
+        assert!(managed.contains("PUBLIC KEY COPIED"));
+        assert!(managed.contains("ssh-keygen -t ed25519 -a 100"));
+        assert!(managed.contains("public key normally begins"));
+        assert!(managed.contains("PUBLIC IPv4 RANGE COPIED"));
+        assert!(managed.contains("Protocol: TCP. Port: 22."));
+        assert!(managed.contains("Any IPv4 or Any IPv6"));
+        assert!(managed.contains("Open Connection details"));
         assert!(managed.contains("If a dropdown is empty"));
         assert!(managed.contains("https://docs.hetzner.com/cloud/api/"));
         assert!(managed.contains("https://docs.hetzner.com/cloud/servers/"));
         assert!(managed.contains("https://docs.hetzner.com/cloud/firewalls/"));
-        assert!(managed.contains("https://secrets.example.test/provider-setup"));
+        assert!(!managed.contains("https://secrets.example.test/provider-setup"));
+        assert!(!managed.contains(r#"name="token""#));
+        assert!(!managed.contains(r#"type="password""#));
         for installation_specific in [
             "Janus",
             "agenix",
@@ -25062,8 +25215,29 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             assert!(!managed.contains(installation_specific));
         }
 
-        let viewer =
-            render_hetzner_setup_help(false, Some("https://secrets.example.test/provider-setup"));
+        let needs_api = render_hetzner_setup_help(
+            true,
+            Some("https://secrets.example.test/provider-setup"),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(needs_api.contains(r#"data-initial-step="api""#));
+        assert!(needs_api.contains("https://secrets.example.test/provider-setup"));
+
+        let ready = render_hetzner_setup_help(true, None, true, true, true, true);
+        assert!(ready.contains(r#"data-initial-step="finish""#));
+        assert!(ready.contains("selections have been verified"));
+
+        let viewer = render_hetzner_setup_help(
+            false,
+            Some("https://secrets.example.test/provider-setup"),
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(viewer.contains("An administrator must complete"));
         assert!(!viewer.contains("https://secrets.example.test/provider-setup"));
     }
