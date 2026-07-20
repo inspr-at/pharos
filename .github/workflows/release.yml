@@ -17,6 +17,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: fetch release tag object
+        if: github.ref_type == 'tag'
+        run: git fetch --quiet --force --no-tags origin "+${GITHUB_REF}:${GITHUB_REF}"
       - name: release consistency
         run: scripts/check-release-consistency.sh
       - uses: docker/setup-buildx-action@v3

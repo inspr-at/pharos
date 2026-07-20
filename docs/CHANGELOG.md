@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.45 - 2026-07-20
+
+- Materialize the pushed annotated tag object inside the release checkout before enforcing the semantic-release gate, preserving immutable tags while allowing a verified release to publish.
+
 ## 0.1.44 - 2026-07-20
 
 - Add a generic in-product guide below Hetzner Cloud settings for creating a project-scoped Read & Write API token, preparing a Linux-executor SSH key, and defining a least-privilege bootstrap firewall.
