@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.47 - 2026-07-20
+
+- Add an English/German Hetzner portal-label switch with localized official documentation links and safe project-selector links for every provider setup destination.
+- Run every macOS and Linux terminal snippet through an explicit Bash boundary so the copied commands work unchanged from Fish, Zsh, or Bash.
+- Correct firewall navigation to the standalone Firewalls item in the left Cloud menu and call out that it is not under Security.
+
 ## 0.1.46 - 2026-07-20
 
 - Replace the abstract Hetzner prerequisite text with a four-stage setup assistant that opens at the first missing API, SSH-key, firewall, or Pharos-selection task.
