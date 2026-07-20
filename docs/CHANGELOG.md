@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.46 - 2026-07-20
+
+- Replace the abstract Hetzner prerequisite text with a four-stage setup assistant that opens at the first missing API, SSH-key, firewall, or Pharos-selection task.
+- Give beginners exact Hetzner click paths and separate macOS and Linux key-pair commands while copying only static safe commands and never accepting a token, private key, passphrase, or source address.
+- Detect existing provider resources, keep official reference links and installation-specific secure handoff, explain the firewall source lookup and no-billing finish check, and retain full viewer and responsive behavior.
+
 ## 0.1.45 - 2026-07-20
 
 - Materialize the pushed annotated tag object inside the release checkout before enforcing the semantic-release gate, preserving immutable tags while allowing a verified release to publish.
