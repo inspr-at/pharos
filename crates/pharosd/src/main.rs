@@ -5081,7 +5081,8 @@ body[data-assistant-open="true"]{overflow:hidden}
 .provider-checks{display:grid}.provider-check{display:grid;grid-template-columns:42px minmax(0,1fr) auto;align-items:center;gap:14px;min-height:74px;padding:10px 22px;border-bottom:1px solid rgba(210,226,234,.70)}.provider-check-icon{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(210,226,234,.9);border-radius:50%;background:rgba(247,252,253,.86);color:#45647e}.provider-check-icon .ico{width:19px;height:19px}.provider-check-copy strong{display:block;font-size:14px}.provider-check-copy small{display:block;margin-top:3px;overflow:hidden;color:var(--muted);font-size:11px;text-overflow:ellipsis;white-space:nowrap}.provider-check-state{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;font-weight:720}.provider-check-state i{width:8px;height:8px;border-radius:50%;background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.08)}.provider-check[data-state="ready"] .provider-check-icon,.provider-check[data-state="ready"] .provider-check-state{color:var(--live)}.provider-check[data-state="ready"] .provider-check-state i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.09)}
 .provider-menu{position:relative}.provider-menu>summary{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(173,205,220,.68);border-radius:50%;background:rgba(255,255,255,.82);color:#47657e;cursor:pointer;list-style:none}.provider-menu>summary::-webkit-details-marker{display:none}.provider-menu>summary .ico{width:17px;height:17px}.provider-menu>div{position:absolute;z-index:6;right:0;top:46px;min-width:150px;padding:5px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:#fff;box-shadow:0 14px 34px rgba(45,75,95,.16)}.provider-menu button{width:100%;min-height:36px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:#9a332f;font:inherit;font-size:12px;text-align:left;cursor:pointer}.provider-menu button:hover,.provider-menu button:focus-visible{background:rgba(255,232,229,.72);outline:0}
 .provider-details{border-bottom:1px solid rgba(210,226,234,.76)}.provider-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:58px;padding:0 22px;color:#315d7c;font-size:13px;font-weight:760;cursor:pointer;list-style:none}.provider-details>summary::-webkit-details-marker{display:none}.provider-details>summary .ico{width:17px;height:17px;transition:transform .18s ease}.provider-details[open]>summary .ico{transform:rotate(180deg)}.provider-details form{padding:2px 22px 20px}.provider-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider-fields label{display:grid;gap:6px;color:#526d82;font-size:11px;font-weight:720}.provider-fields select{width:100%;height:40px;padding:0 32px 0 10px;border:1px solid rgba(173,205,220,.72);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px}.provider-details-action{display:flex;align-items:center;gap:12px;margin-top:14px}.provider-details-action span,.provider-action-feedback{color:var(--muted);font-size:11px}.provider-details>p{margin:0;padding:0 22px 18px;color:var(--muted);font-size:11px;line-height:1.45}.provider-action-feedback{min-height:0;margin:0;padding:0 22px}.provider-action-feedback:not(:empty){min-height:40px;padding-top:12px;padding-bottom:12px;color:#8d3430}.provider-details+.provider-action-feedback:not(:empty){border-top:0}
-@media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
+.provider-help{margin-top:20px;padding:24px;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:rgba(255,255,255,.70);box-shadow:0 14px 34px rgba(54,88,108,.05)}.provider-help-head{display:grid;gap:7px;max-width:760px}.provider-help-kicker{color:#0f5f80;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.provider-help h2{margin:0;font-family:Georgia,"Times New Roman",serif;color:#12304b;font-size:24px;font-weight:500}.provider-help-head p,.provider-help-step p,.provider-help-finish p{margin:0;color:var(--muted);font-size:12px;line-height:1.55}.provider-help-steps{display:grid;margin:22px 0 0;padding:0;list-style:none}.provider-help-step{display:grid;grid-template-columns:32px minmax(0,1fr);gap:14px;padding:18px 0;border-top:1px solid rgba(210,226,234,.76)}.provider-help-number{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(103,177,196,.36);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:16px}.provider-help-step h3{margin:4px 0 6px;color:var(--ink);font-size:14px}.provider-help-step ul{display:grid;gap:5px;margin:10px 0 0;padding-left:18px;color:#526d82;font-size:11px;line-height:1.5}.provider-help-links{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-top:12px}.provider-help-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-help-links .ico{width:13px;height:13px}.provider-help-secret-note{color:#8a5b13;font-size:11px;line-height:1.45}.provider-help-finish{padding:16px 18px;border-radius:7px;background:rgba(223,241,249,.48)}.provider-help-finish strong{display:block;margin-bottom:4px;color:#12304b;font-size:13px}
+@media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-help{padding:20px 18px}.provider-help-step{grid-template-columns:30px minmax(0,1fr);gap:11px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
 @media (prefers-reduced-motion:reduce){.sidebar-motion{display:none}.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
@@ -14425,6 +14426,29 @@ fn provider_select_option(value: &str, label: &str, selected: Option<&str>) -> S
     )
 }
 
+fn render_hetzner_setup_help(can_manage: bool, secure_setup_url: Option<&str>) -> String {
+    let secure_setup = if can_manage {
+        secure_setup_url
+            .map(|url| {
+                format!(
+                    r#"<a href="{url}" target="_blank" rel="noopener noreferrer">Open this installation's secure credential setup{external}</a>"#,
+                    url = html_escape(url),
+                    external = icons::EXTERNAL_LINK,
+                )
+            })
+            .unwrap_or_else(|| {
+                r#"<span class="provider-help-secret-note">Use the secure secret-management workflow documented by this installation before returning here.</span>"#.to_string()
+            })
+    } else {
+        r#"<span class="provider-help-secret-note">An administrator must complete the installation's secure credential workflow.</span>"#.to_string()
+    };
+    format!(
+        r#"<section class="provider-help" aria-labelledby="hetzner-setup-help-title"><header class="provider-help-head"><span class="provider-help-kicker">Setup help</span><h2 id="hetzner-setup-help-title">Prepare the Hetzner project</h2><p>Create these prerequisites in the same Hetzner Cloud project that Pharos will manage. Resource names are your choice; Pharos stores only the names and current catalog evidence.</p></header><ol class="provider-help-steps"><li class="provider-help-step"><span class="provider-help-number" aria-hidden="true">1</span><div><h3>API connection</h3><p>In Hetzner Console, open Security, choose API tokens, and generate a project-scoped token with Read &amp; Write permission. Managed create and cleanup require both read and mutation access.</p><ul><li>Copy the token once, directly into this installation's approved secure credential workflow.</li><li>Never paste it into this settings page, chat, tickets, shell history, source control, or logs.</li><li>If the token is exposed or its one-time handoff is lost, revoke it and generate a replacement.</li></ul><div class="provider-help-links"><a href="https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/" target="_blank" rel="noopener noreferrer">Hetzner API-token guide{external}</a>{secure_setup}</div></div></li><li class="provider-help-step"><span class="provider-help-number" aria-hidden="true">2</span><div><h3>SSH key</h3><p>Use a reviewed key pair available to the Linux executor that will bootstrap the new server. If none exists, generate an Ed25519 key pair on that executor according to your installation's secret-management policy.</p><ul><li>Add only the public key to Security → SSH Keys in the same Hetzner project.</li><li>Keep the private key in the executor's protected key store or SSH agent; never upload it to Hetzner or Pharos.</li><li>Confirm the executor can use the private key before approving a paid server.</li></ul><div class="provider-help-links"><a href="https://docs.hetzner.com/cloud/servers/getting-started/connecting-to-the-server/" target="_blank" rel="noopener noreferrer">Hetzner SSH guide{external}</a></div></div></li><li class="provider-help-step"><span class="provider-help-number" aria-hidden="true">3</span><div><h3>Firewall</h3><p>In the same project, create a Cloud Firewall for bootstrap access. Pharos will attach the selected firewall when it creates the server.</p><ul><li>Allow inbound TCP port 22 only from the executor's public source CIDRs (typically an IPv4 /32 and, when used, an IPv6 /128).</li><li>Do not use world-open source ranges unless your security policy explicitly accepts that exposure.</li><li>Leave outbound rules empty when unrestricted egress is intended; the bootstrap needs access to package sources and the Pharos endpoint.</li><li>The firewall may remain unattached until Pharos creates the server.</li></ul><div class="provider-help-links"><a href="https://docs.hetzner.com/cloud/firewalls/getting-started/creating-a-firewall/" target="_blank" rel="noopener noreferrer">Hetzner Firewall guide{external}</a></div></div></li></ol><div class="provider-help-finish"><strong>Finish in Pharos</strong><p>Choose Test connection to refresh the provider catalog, select the location, SSH key, and firewall, then choose Save and test. If a dropdown is empty, confirm that the resource exists in the token's project and test the connection again.</p></div></section>"#,
+        external = icons::EXTERNAL_LINK,
+        secure_setup = secure_setup,
+    )
+}
+
 fn render_hetzner_connection_page(
     runtime: &ProviderRuntimeConfig,
     store: &ProviderConnectionStore,
@@ -14605,8 +14629,9 @@ fn render_hetzner_connection_page(
     } else {
         "Janus and agenix must mount the provider token before Pharos can test it."
     };
+    let setup_help = render_hetzner_setup_help(can_manage, janus_url.as_deref());
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a><header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section><p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a><header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         back_href = html_escape(&back_href),
         back = icons::ARROW_LEFT,
@@ -14636,6 +14661,7 @@ fn render_hetzner_connection_page(
         },
         menu = menu,
         details = details,
+        setup_help = setup_help,
         setup_note = html_escape(setup_note),
     )
 }
@@ -25009,6 +25035,40 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn hetzner_setup_help_is_generic_complete_and_secret_safe() {
+        let managed =
+            render_hetzner_setup_help(true, Some("https://secrets.example.test/provider-setup"));
+        let api = managed.find("API connection").expect("API help");
+        let ssh = managed.find("SSH key").expect("SSH help");
+        let firewall = managed.find("Firewall").expect("firewall help");
+
+        assert!(api < ssh && ssh < firewall);
+        assert!(managed.contains("Read &amp; Write"));
+        assert!(managed.contains("same Hetzner Cloud project"));
+        assert!(managed.contains("Linux executor"));
+        assert!(managed.contains("public source CIDRs"));
+        assert!(managed.contains("If a dropdown is empty"));
+        assert!(managed.contains("https://docs.hetzner.com/cloud/api/"));
+        assert!(managed.contains("https://docs.hetzner.com/cloud/servers/"));
+        assert!(managed.contains("https://docs.hetzner.com/cloud/firewalls/"));
+        assert!(managed.contains("https://secrets.example.test/provider-setup"));
+        for installation_specific in [
+            "Janus",
+            "agenix",
+            "/run/",
+            "pharos-bootstrap-key",
+            "pharos-bootstrap-firewall",
+        ] {
+            assert!(!managed.contains(installation_specific));
+        }
+
+        let viewer =
+            render_hetzner_setup_help(false, Some("https://secrets.example.test/provider-setup"));
+        assert!(viewer.contains("An administrator must complete"));
+        assert!(!viewer.contains("https://secrets.example.test/provider-setup"));
+    }
+
+    #[test]
     fn hetzner_connection_page_has_three_plain_checks_and_hides_managed_names_from_viewers() {
         let now = now_unix();
         let store = ready_provider_connection_store(now);
@@ -25037,6 +25097,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(managed.contains("Firewall"));
         assert!(managed.contains("Add a server"));
         assert!(managed.contains(r#"class="provider-details""#));
+        assert!(managed.contains(r#"class="provider-help""#));
+        assert!(managed.contains("Prepare the Hetzner project"));
         assert!(!managed.contains(">Services<"));
         assert!(!managed.contains(">Access<"));
         assert!(!managed.contains("provider-page-fixture"));
@@ -25046,6 +25108,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!viewer.contains("pharos-bootstrap-key"));
         assert!(!viewer.contains("pharos-bootstrap-firewall"));
         assert!(!viewer.contains(r#"class="provider-details""#));
+        assert!(viewer.contains(r#"class="provider-help""#));
         let _ = std::fs::remove_file(token_path);
     }
 

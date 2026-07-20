@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/markus-barta/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/markus-barta/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.43-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.44-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -46,7 +46,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v0.1.43
+## What ships in v0.1.44
 
 | Area | Current capability |
 | --- | --- |
@@ -56,7 +56,7 @@ operation.
 | **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications |
 | **Host settings** | Color, server/workstation kind and alert preferences with requested, declared and applied state shown separately |
 | **Onboarding** | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions |
-| **Providers** | Read-only provider checks, exact paid-plan review, attended authorization, single-use Hetzner Cloud creation and ownership-checked cleanup |
+| **Providers** | In-product prerequisite guidance, read-only provider checks, exact paid-plan review, attended authorization, single-use Hetzner Cloud creation and ownership-checked cleanup |
 | **Guarded actions** | Fixed review/apply/restart, fleet-update proposal and host-retirement workflows with leases, confirmation and recovery evidence |
 | **Access** | OIDC Authorization Code + PKCE for people; independent per-host bearer authentication for machines |
 
@@ -449,7 +449,7 @@ See the committed Compose files and NixOS module for the complete wiring.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.43**. It is already used as a real
+Pharos is an active early release at **v0.1.44**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

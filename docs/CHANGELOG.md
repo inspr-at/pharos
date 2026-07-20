@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.44 - 2026-07-20
+
+- Add a generic in-product guide below Hetzner Cloud settings for creating a project-scoped Read & Write API token, preparing a Linux-executor SSH key, and defining a least-privilege bootstrap firewall.
+- Link to current official Hetzner instructions, route managers to each installation's secure credential workflow, and explain how to refresh empty location, key, or firewall choices without placing secrets in Pharos.
+- Cover manager and viewer access, responsive presentation, prerequisite ordering, installation-neutral wording, and secret-safe boundaries with focused regressions.
+
 ## 0.1.43 - 2026-07-18
 
 - Keep the authenticated read-only Hetzner Cloud connection test available while managed execution is disabled, without exposing Add server or paid-review actions.
