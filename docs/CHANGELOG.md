@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.48 - 2026-07-20
+
+- Turn the Hetzner firewall assistant into a literal English/German walkthrough of the current form, including how to remove the default Any IPv4, Any IPv6, and optional ICMP entries.
+- Explain TCP, SSH port 22, and the single-address `/32` boundary in beginner language, with an exact ready check before firewall creation.
+- Keep the macOS source range in the local clipboard with Fish-safe execution and explicitly prevent operators from sharing the real address in chat, tickets, or logs.
+
 ## 0.1.47 - 2026-07-20
 
 - Add an English/German Hetzner portal-label switch with localized official documentation links and safe project-selector links for every provider setup destination.
