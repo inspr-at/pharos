@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.49 - 2026-07-20
+
+- Make the Hetzner firewall assistant branch explicitly between a fixed bootstrap executor, a dynamic or Starlink connection, and a Tailscale end state before showing firewall-creation steps.
+- Treat a dynamic `/32` as temporary attended access that must be refreshed immediately before later paid creation and bootstrap, while keeping SSH keys mandatory under CGNAT.
+- Prevent Tailscale `100.x` addresses from being presented as public Hetzner sources, document the current public-SSH bootstrap boundary, and require verified tailnet access before removing public SSH.
+
 ## 0.1.48 - 2026-07-20
 
 - Turn the Hetzner firewall assistant into a literal English/German walkthrough of the current form, including how to remove the default Any IPv4, Any IPv6, and optional ICMP entries.
