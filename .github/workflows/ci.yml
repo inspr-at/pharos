@@ -26,7 +26,9 @@ jobs:
       - name: dependency audit
         run: cargo deny check
       - name: shell syntax
-        run: bash -n scripts/install-pharos-beacon-systemd.sh scripts/bootstrap-pharos-nixos-anywhere.sh
+        run: bash -n scripts/install-pharos-beacon-systemd.sh scripts/bootstrap-pharos-nixos-anywhere.sh scripts/check-release-consistency.sh
+      - name: release consistency
+        run: scripts/check-release-consistency.sh
       - name: native systemd settings state dry run
         run: |
           work="$(mktemp -d)"
