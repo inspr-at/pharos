@@ -900,6 +900,10 @@ fn safe_selector(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+fn safe_provider_resource_name(value: &str) -> Option<String> {
+    safe_short_text(value, 160)
+}
+
 fn safe_price(value: &str) -> Option<String> {
     let value = value.trim();
     normalize_gross_price(value).map(|_| value.to_string())
@@ -956,7 +960,7 @@ where
         output.extend(
             select(response)
                 .into_iter()
-                .filter_map(|item| safe_selector(&item.name)),
+                .filter_map(|item| safe_provider_resource_name(&item.name)),
         );
         if next_page.is_none() {
             output.sort();
@@ -1203,7 +1207,7 @@ mod tests {
                 } else if path == "/pricing" {
                     r#"{"pricing":{"currency":"EUR","server_types":[{"name":"cx23","prices":[{"location":"fsn1","price_hourly":{"gross":"0.0060"},"price_monthly":{"gross":"3.4900"}}]}]}}"#
                 } else if path.starts_with("/ssh_keys?") {
-                    r#"{"ssh_keys":[{"name":"pharos-bootstrap-key"}]}"#
+                    r#"{"ssh_keys":[{"name":"ops@workstation"}]}"#
                 } else {
                     r#"{"firewalls":[{"name":"pharos-bootstrap-firewall"}]}"#
                 };
@@ -1227,7 +1231,7 @@ mod tests {
             token: TOKEN,
             credential_boundary_ready: true,
             execution_enabled: true,
-            ssh_key_ref: Some("pharos-bootstrap-key"),
+            ssh_key_ref: Some("ops@workstation"),
             firewall_ref: Some("pharos-bootstrap-firewall"),
             default_location: Some("fsn1"),
         }
