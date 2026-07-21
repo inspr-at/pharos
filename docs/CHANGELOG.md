@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.53 - 2026-07-21
+
+- Make Fleet foreground recovery atomic: stop client-side heartbeat projection, supersede stale requests, apply one authoritative host snapshot, and only then restart the clock.
+- Stop trusting suspended background timers, expose a clear synchronizing or out-of-date state, and preserve last-known host states when synchronization fails.
+- Reconcile Fleet counters, cards, rows, timestamps, and heartbeat history from the same snapshot, with executable lifecycle regressions for suspension, rapid refocus, request replacement, and failure handling.
+
 ## 0.1.52 - 2026-07-21
 
 - Format provider-plan monthly prices with the browser locale, the catalog currency symbol, and exactly two decimal places.

@@ -16,6 +16,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all --check
@@ -27,6 +30,8 @@ jobs:
         run: cargo deny check
       - name: shell syntax
         run: bash -n scripts/install-pharos-beacon-systemd.sh scripts/bootstrap-pharos-nixos-anywhere.sh scripts/check-release-consistency.sh
+      - name: fleet browser lifecycle
+        run: node --test tests/fleet-refresh.test.mjs
       - name: release consistency
         run: scripts/check-release-consistency.sh
       - name: native systemd settings state dry run
