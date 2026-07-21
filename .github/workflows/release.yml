@@ -14,7 +14,6 @@ permissions:
   contents: read
   packages: write
   id-token: write
-  attestations: write
 
 jobs:
   image:
@@ -94,12 +93,23 @@ jobs:
           syft-version: v1.49.0
           upload-artifact: true
           upload-release-assets: false
-      - name: attest build provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-name: ghcr.io/markus-barta/pharos/pharosd
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+      - name: verify embedded OCI provenance and SBOM
+        env:
+          IMAGE: ghcr.io/markus-barta/pharos/pharosd
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          provenance=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{ json .Provenance.SLSA }}')
+          sbom=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{ json .SBOM.SPDX }}')
+          jq -e '
+            .buildDefinition.buildType == "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md"
+            and (.buildDefinition.resolvedDependencies | type == "array" and length > 0)
+            and (.runDetails.builder.id | type == "string" and length > 0)
+          ' <<<"${provenance}" >/dev/null
+          jq -e '
+            .spdxVersion == "SPDX-2.3"
+            and (.documentNamespace | type == "string" and length > 0)
+            and (.packages | type == "array" and length > 0)
+          ' <<<"${sbom}" >/dev/null
       - name: install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
@@ -109,3 +119,11 @@ jobs:
           IMAGE: ghcr.io/markus-barta/pharos/pharosd
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: verify image signature
+        env:
+          IMAGE: ghcr.io/markus-barta/pharos/pharosd
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" >/dev/null
