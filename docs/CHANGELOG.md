@@ -1,8 +1,14 @@
 # Pharos Changelog
 
+## 0.1.50 - 2026-07-21
+
+- Preserve valid human-readable Hetzner SSH-key and firewall names, including names containing characters such as `@`, when building provider dropdowns.
+- Explain that the SSH-key dropdown is sourced from public-key names returned by the current Hetzner project and never reads or uploads private key material.
+- Keep numbered setup tasks on one grid-aligned column and describe changing public addresses generically as dynamic IPs.
+
 ## 0.1.49 - 2026-07-20
 
-- Make the Hetzner firewall assistant branch explicitly between a fixed bootstrap executor, a dynamic or Starlink connection, and a Tailscale end state before showing firewall-creation steps.
+- Make the Hetzner firewall assistant branch explicitly between a static bootstrap executor, a dynamic-IP connection, and a Tailscale end state before showing firewall-creation steps.
 - Treat a dynamic `/32` as temporary attended access that must be refreshed immediately before later paid creation and bootstrap, while keeping SSH keys mandatory under CGNAT.
 - Prevent Tailscale `100.x` addresses from being presented as public Hetzner sources, document the current public-SSH bootstrap boundary, and require verified tailnet access before removing public SSH.
 
