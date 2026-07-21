@@ -4694,7 +4694,12 @@ main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
 .brand h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:31px;line-height:1.05;font-weight:500;letter-spacing:0;color:#12304b}
 .fleet{display:flex;align-items:center;gap:10px;margin:8px 0 0;color:var(--muted);font-size:14px}
 .wave{width:44px;height:10px;color:var(--sea);opacity:.78}
-.asof{font-size:12px;color:var(--muted);white-space:nowrap;padding-top:22px}
+.asof{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);white-space:nowrap;padding-top:22px;transition:color .16s ease}
+.asof[data-refresh-state]:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.09)}
+.asof[data-refresh-state="syncing"]{color:#0f4f80}.asof[data-refresh-state="syncing"]:before{background:var(--sea);box-shadow:0 0 0 4px rgba(21,158,153,.10);animation:fleet-sync-pulse 1s ease-in-out infinite}
+.asof[data-refresh-state="stale"]{color:#8a5700;font-weight:720}.asof[data-refresh-state="stale"]:before{background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.11)}
+main[data-fleet-sync-state="syncing"] .summary,main[data-fleet-sync-state="syncing"] [data-grid],main[data-fleet-sync-state="syncing"] .list-wrap{opacity:.72;transition:opacity .16s ease}
+@keyframes fleet-sync-pulse{0%,100%{opacity:.45;transform:scale(.82)}50%{opacity:1;transform:scale(1)}}
 .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
 .metric{appearance:none;position:relative;min-width:0;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;text-align:left;background:rgba(255,255,255,.82);border:1px solid rgba(210,226,234,.78);border-radius:8px;padding:14px 16px;box-shadow:0 12px 30px rgba(54,88,108,.06);backdrop-filter:blur(10px);cursor:pointer}
 .metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color,var(--wait)) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color,var(--wait)) 20%,transparent)}
@@ -5109,7 +5114,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .provider-guide-screen-help{display:grid;gap:10px;margin-top:7px;padding:14px 16px;border:1px solid rgba(103,177,196,.34);border-radius:7px;background:rgba(246,250,251,.92)}.provider-guide-screen-help>strong{color:#12304b;font-size:12px}.provider-guide-screen-help ol{display:grid;gap:8px;margin:0;padding-left:20px;color:#526d82;font-size:11px;line-height:1.55}.provider-guide-screen-help code{padding:1px 4px;border-radius:3px;background:#e8f1f4;color:#18354c}.provider-guide-ready-check{padding:11px 13px;border-left:3px solid var(--live);border-radius:4px;background:rgba(225,244,235,.58);color:#286c53;font-size:11px;line-height:1.5}.provider-guide-actions .provider-primary:disabled{cursor:not-allowed;border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad;box-shadow:none}
 @media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-help-toggle{padding:13px 18px}.provider-help-body{padding:20px 18px}.provider-help-step{grid-template-columns:30px minmax(0,1fr);gap:11px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
 @media (max-width:760px){.provider-guide-progress{grid-template-columns:1fr}.provider-guide-panel{padding:18px 14px}.provider-guide-command{grid-template-columns:1fr}.provider-guide-copy{justify-self:start}.provider-guide-actions{align-items:stretch;flex-direction:column}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:100%}}
-@media (prefers-reduced-motion:reduce){.sidebar-motion{display:none}.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation:none}}
+@media (prefers-reduced-motion:reduce){.sidebar-motion{display:none}.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before,.asof[data-refresh-state="syncing"]:before{animation:none}}
 </style></head><body><div class="app-shell">"#;
 
 const FOOT: &str = r#"</div><script>
@@ -5343,7 +5348,7 @@ function openHostActionDialog(action,root,returnFocus){
   overlay.hidden=false;
   document.body.dataset.hostActionDialogOpen='true';
   stopBeatClock();
-  scheduleRefresh(HIDDEN_REFRESH_MS);
+  scheduleRefresh(DIALOG_REFRESH_MS);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
   const storedKind=root.dataset.actionKind;
   const storedMatches=action==='workflow'
@@ -6055,6 +6060,11 @@ function stopBeatClock(){
 function frame(){
   stopBeatClock();
   if(document.hidden||document.body.dataset.hostActionDialogOpen==='true')return;
+  if(!fleetSnapshotFresh()){
+    setFleetSyncState('stale');
+    if(typeof document.hasFocus!=='function'||document.hasFocus())recoverFleet('watchdog');
+    return;
+  }
   const now=Date.now()/1000;
   document.querySelectorAll('.beat').forEach(beat=>{
     updateBeatClock(beat,now);
@@ -6063,7 +6073,9 @@ function frame(){
 }
 function resumeBeatClock(){
   stopBeatClock();
-  if(!document.hidden&&document.body.dataset.hostActionDialogOpen!=='true')frame();
+  const main=fleetMain();
+  if(main?.dataset.fleetSyncState!=='current')return;
+  if(!document.hidden&&(typeof document.hasFocus!=='function'||document.hasFocus())&&document.body.dataset.hostActionDialogOpen!=='true')frame();
 }
 function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
@@ -7855,13 +7867,117 @@ function initControls(){
   initSetupAssistant();
 }
 const REFRESH_MS=10000;
-const HIDDEN_REFRESH_MS=60000;
+const DIALOG_REFRESH_MS=60000;
 const FETCH_TIMEOUT_MS=9000;
+const MAX_SNAPSHOT_AGE_MS=REFRESH_MS*2+FETCH_TIMEOUT_MS;
 let refreshTimer=null;
 let refreshPromise=null;
 let refreshAbort=null;
-let refreshStartedAt=0;
 let refreshGeneration=0;
+let recoveryPromise=null;
+let lastSuccessfulRefreshAt=Date.now();
+function fleetMain(){return document.querySelector('main[data-fleet-sync-state]')}
+function fleetSnapshotFresh(at=Date.now()){
+  return !fleetMain()||at-lastSuccessfulRefreshAt<=MAX_SNAPSHOT_AGE_MS;
+}
+function fleetSnapshotLabel(asof){
+  const label=asof?.dataset.snapshotLabel||asof?.textContent||'last update unavailable';
+  return label.startsWith('as of ')?'last update '+label.slice(6):label;
+}
+function setFleetSyncState(state){
+  const main=fleetMain();
+  if(!main)return;
+  main.dataset.fleetSyncState=state;
+  const asof=main.querySelector('[data-as-of]');
+  if(!asof)return;
+  if(!asof.dataset.snapshotLabel)asof.dataset.snapshotLabel=asof.textContent||'';
+  asof.dataset.refreshState=state;
+  if(state==='syncing')asof.textContent='Syncing\u2026 \u00b7 '+fleetSnapshotLabel(asof);
+  else if(state==='stale')asof.textContent='Data out of date \u00b7 '+fleetSnapshotLabel(asof);
+  else asof.textContent=asof.dataset.snapshotLabel;
+}
+function setFleetSnapshotLabel(now){
+  const asof=fleetMain()?.querySelector('[data-as-of]');
+  if(!asof)return;
+  asof.dataset.snapshotLabel='as of '+clock(now);
+}
+function updateFleetSummary(hosts){
+  const counts={all:hosts.length,live:0,stale:0,down:0};
+  hosts.forEach(host=>{if(['live','stale','down'].includes(host.liveness))counts[host.liveness]++});
+  Object.entries(counts).forEach(([key,value])=>{
+    const target=document.querySelector('[data-summary-count="'+key+'"]');
+    if(target)target.textContent=String(value);
+  });
+}
+function validFleetSnapshot(data){
+  if(!data||!Number.isFinite(Number(data.as_of))||!Array.isArray(data.hosts))return false;
+  const names=data.hosts.map(host=>host?.name);
+  return new Set(names).size===names.length&&data.hosts.every(host=>host&&typeof host.name==='string'&&host.name&&['live','stale','down','awaiting_first_heartbeat'].includes(host.liveness));
+}
+function fleetMembershipMatches(hosts){
+  const grid=document.querySelector('[data-grid]');
+  if(!grid)return true;
+  const rendered=new Set(Array.from(grid.querySelectorAll('.card[data-host][data-host-surface="runtime"]')).map(card=>card.dataset.host));
+  const incoming=new Set(hosts.map(host=>host.name));
+  return rendered.size===incoming.size&&Array.from(rendered).every(name=>incoming.has(name));
+}
+function applyFleetSnapshot(data){
+  if(!validFleetSnapshot(data))return false;
+  const hosts=data.hosts;
+  if(!fleetMembershipMatches(hosts)){
+    window.location.reload();
+    return false;
+  }
+  const now=Number(data.as_of);
+  for(const h of hosts){
+    const surfaces=hostSurfaces(h.name);
+    for(const card of surfaces){
+      const live=h.liveness;
+      card.dataset.live=live;
+      const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences);
+      const backup=backupInfo(h,now);
+      const muted=mutedInfo(h.preferences);
+      card.dataset.sev=String(attention.rank ?? sevFor(live));
+      card.dataset.last=h.last_seen ?? 0;
+      card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+kernelSearch(h.kernel)+' '+muted.search).toLowerCase().trim();
+      const word=card.querySelector('[data-status-word]');
+      if(word)word.textContent=words[h.liveness]||h.liveness;
+      setReason(card,attention);
+      updateKernel(card,h);
+      updateMuted(card,muted);
+      updatePreferenceState(card,h);
+      updateHostActionState(card,h,backup);
+      const fresh=card.querySelector('[data-fresh]');
+      if(fresh)fresh.innerHTML=freshHtml(h.freshness);
+      updateBackup(card,backup);
+      setSeen(card,h.last_seen,now);
+      setCardAsOf(card,now);
+      const beat=card.querySelector('.beat');
+      if(beat){
+        const previous=Number(beat.dataset.last);
+        const last=h.last_seen == null ? NaN : Number(h.last_seen);
+        const interval=h.heartbeat_interval_secs || 60;
+        const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
+        const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
+        beat.dataset.interval=interval;
+        setBeatHistory(beat,beats,interval);
+        updateSignal(card,signalInfo(beats,last,interval,now));
+        if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
+          beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
+          flashBeat(beat);
+        }
+        beat.dataset.ready='true';
+        beat.dataset.last=Number.isFinite(last)?String(last):'';
+        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
+      }
+    }
+  }
+  updateFleetSummary(hosts);
+  applySort(document.querySelector('[data-sort]')?.value||'attention',false);
+  applySurfaceFilters(false);
+  setFleetSnapshotLabel(now);
+  return true;
+}
 function clearRefreshTimer(){
   if(refreshTimer!=null){
     clearTimeout(refreshTimer);
@@ -7869,75 +7985,46 @@ function clearRefreshTimer(){
   }
 }
 function nextRefreshDelay(){
-  return document.hidden||document.body.dataset.hostActionDialogOpen==='true'?HIDDEN_REFRESH_MS:REFRESH_MS;
+  return document.body.dataset.hostActionDialogOpen==='true'?DIALOG_REFRESH_MS:REFRESH_MS;
 }
 function scheduleRefresh(delay=nextRefreshDelay()){
   clearRefreshTimer();
+  if(!fleetMain()||document.hidden||(typeof document.hasFocus==='function'&&!document.hasFocus()))return;
   refreshTimer=setTimeout(()=>refresh('timer'),delay);
 }
-async function refresh(reason='manual'){
+function abandonRefresh(){
   clearRefreshTimer();
+  if(refreshAbort)refreshAbort.abort();
+  refreshGeneration++;
+  refreshAbort=null;
+  refreshPromise=null;
+}
+async function refresh(reason='manual',options={}){
+  if(!fleetMain())return false;
+  clearRefreshTimer();
+  if(options.force===true&&refreshPromise)abandonRefresh();
   if(refreshPromise)return refreshPromise;
   const controller=new AbortController();
   const generation=++refreshGeneration;
   refreshAbort=controller;
-  refreshStartedAt=Date.now();
   const timeout=setTimeout(()=>controller.abort(),FETCH_TIMEOUT_MS);
   refreshPromise=(async()=>{
   try{
     const res=await fetch('/hosts.json?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin',signal:controller.signal});
-    if(!res.ok)return;
+    const contentType=String(res.headers.get('content-type')||'').toLowerCase();
+    if(!res.ok||res.redirected||!contentType.includes('application/json'))throw new Error('fleet snapshot unavailable');
     const data=await res.json();
-    if(generation!==refreshGeneration)return;
-    const now=Number(data.as_of)||Math.floor(Date.now()/1000);
-    const asof=document.querySelector('[data-as-of]');
-    if(asof)asof.textContent='as of '+clock(now);
-    for(const h of data.hosts||[]){
-      const surfaces=hostSurfaces(h.name);
-      for(const card of surfaces){
-        const live=h.liveness;
-        card.dataset.live=live;
-        const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences);
-        const backup=backupInfo(h,now);
-        const muted=mutedInfo(h.preferences);
-        card.dataset.sev=String(attention.rank ?? sevFor(live));
-        card.dataset.last=h.last_seen ?? 0;
-        card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+kernelSearch(h.kernel)+' '+muted.search).toLowerCase().trim();
-        const word=card.querySelector('[data-status-word]');
-        if(word)word.textContent=words[h.liveness]||h.liveness;
-        setReason(card,attention);
-        updateKernel(card,h);
-        updateMuted(card,muted);
-        updatePreferenceState(card,h);
-        updateHostActionState(card,h,backup);
-        const fresh=card.querySelector('[data-fresh]');
-        if(fresh)fresh.innerHTML=freshHtml(h.freshness);
-        updateBackup(card,backup);
-        setSeen(card,h.last_seen,now);
-        setCardAsOf(card,now);
-        const beat=card.querySelector('.beat');
-        if(beat){
-          const previous=Number(beat.dataset.last);
-          const last=h.last_seen == null ? NaN : Number(h.last_seen);
-          const interval=h.heartbeat_interval_secs || 60;
-          const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
-          const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
-          beat.dataset.interval=interval;
-          setBeatHistory(beat,beats,interval);
-          updateSignal(card,signalInfo(beats,last,interval,now));
-          if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
-            beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
-            flashBeat(beat);
-          }
-          beat.dataset.ready='true';
-          beat.dataset.last=Number.isFinite(last)?String(last):'';
-          beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
-        }
-      }
-    }
-    applySort(document.querySelector('[data-sort]')?.value||'attention',false);
-    applySurfaceFilters(false);
-  }catch(_){}
+    if(generation!==refreshGeneration)return false;
+    if(!validFleetSnapshot(data))throw new Error('fleet snapshot invalid');
+    if(!applyFleetSnapshot(data))return false;
+    lastSuccessfulRefreshAt=Date.now();
+    setFleetSyncState('current');
+    resumeBeatClock();
+    return true;
+  }catch(error){
+    if(generation===refreshGeneration&&(options.recovery===true||!fleetSnapshotFresh()))setFleetSyncState('stale');
+    return false;
+  }
   finally{
     clearTimeout(timeout);
     if(generation===refreshGeneration){
@@ -7949,28 +8036,39 @@ async function refresh(reason='manual'){
   })();
   return refreshPromise;
 }
+function suspendFleet(){
+  stopBeatClock();
+  abandonRefresh();
+  recoveryPromise=null;
+}
+function recoverFleet(reason='foreground'){
+  if(!fleetMain()||document.hidden)return Promise.resolve(false);
+  if(recoveryPromise)return recoveryPromise;
+  stopBeatClock();
+  setFleetSyncState('syncing');
+  let recoveryRun;
+  recoveryRun=refresh(reason,{force:true,recovery:true}).finally(()=>{if(recoveryPromise===recoveryRun)recoveryPromise=null});
+  recoveryPromise=recoveryRun;
+  return recoveryPromise;
+}
 function resumeRefresh(reason){
   if(document.hidden){
-    scheduleRefresh(HIDDEN_REFRESH_MS);
-    return;
+    suspendFleet();
+    return Promise.resolve(false);
   }
-  if(refreshPromise&&refreshAbort&&Date.now()-refreshStartedAt>FETCH_TIMEOUT_MS){
-    refreshAbort.abort();
-    refreshGeneration++;
-    refreshAbort=null;
-    refreshPromise=null;
-  }
-  refresh(reason);
+  return recoverFleet(reason);
 }
-document.addEventListener('visibilitychange',()=>{resumeRefresh('visible');resumeBeatClock()});
-window.addEventListener('focus',()=>{resumeRefresh('focus');resumeBeatClock()});
-window.addEventListener('pageshow',()=>resumeRefresh('pageshow'));
-window.addEventListener('online',()=>resumeRefresh('online'));
+document.addEventListener('visibilitychange',()=>{if(document.hidden)suspendFleet();else recoverFleet('visible')});
+window.addEventListener('blur',suspendFleet);
+window.addEventListener('focus',()=>recoverFleet('focus'));
+window.addEventListener('pageshow',event=>{if(event.persisted||!fleetSnapshotFresh())recoverFleet('pageshow')});
+window.addEventListener('online',()=>recoverFleet('online'));
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
 initControls();
 initProviderConnection();
 initProviderSetupGuide();
+setFleetSyncState('current');
 resumeBeatClock();
 scheduleRefresh(3000);
 </script></body></html>"#;
@@ -14306,7 +14404,7 @@ fn summary_cards(hosts: &[Host], _self_name: &str, now: i64) -> String {
         }
     }
     format!(
-        r#"<section class="summary" aria-label="host summary"><button class="metric" type="button" data-live-filter="all" aria-pressed="true"><b>{total}</b><span>All hosts</span></button><button class="metric live" type="button" data-live-filter="live" aria-pressed="false"><b>{live}</b><span>Live</span></button><button class="metric stale" type="button" data-live-filter="stale" aria-pressed="false"><b>{stale}</b><span>Stale</span></button><button class="metric down" type="button" data-live-filter="down" aria-pressed="false"><b>{down}</b><span>Down</span></button></section>"#
+        r#"<section class="summary" aria-label="host summary"><button class="metric" type="button" data-live-filter="all" aria-pressed="true"><b data-summary-count="all">{total}</b><span>All hosts</span></button><button class="metric live" type="button" data-live-filter="live" aria-pressed="false"><b data-summary-count="live">{live}</b><span>Live</span></button><button class="metric stale" type="button" data-live-filter="stale" aria-pressed="false"><b data-summary-count="stale">{stale}</b><span>Stale</span></button><button class="metric down" type="button" data-live-filter="down" aria-pressed="false"><b data-summary-count="down">{down}</b><span>Down</span></button></section>"#
     )
 }
 
@@ -18871,13 +18969,14 @@ fn render_home_with_capabilities(
     };
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{action_dialog}{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{action_dialog}{FOOT}",
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar(),
         assistant = assistant,
         action_dialog = action_dialog,
+        now = now,
     )
 }
 
@@ -19843,6 +19942,67 @@ mod tests {
     }
 
     #[test]
+    fn fleet_foreground_recovery_is_atomic_and_failure_visible() {
+        let hosts = vec![host_with_backups("alpha", 970, vec![])];
+        let html = render_home(
+            runtime(&hosts, &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+
+        assert!(html.contains(
+            r#"<main data-view="grid" data-fleet-sync-state="current" data-fleet-snapshot-at="1000">"#
+        ));
+        for state in ["all", "live", "stale", "down"] {
+            assert!(html.contains(&format!(r#"data-summary-count="{state}""#)));
+        }
+        assert!(html.contains("function updateFleetSummary(hosts)"));
+        assert!(html.contains("updateFleetSummary(hosts);"));
+        assert!(html.contains("Data out of date \\u00b7 "));
+        assert!(html.contains("res.redirected||!contentType.includes('application/json')"));
+        assert!(html.contains("window.addEventListener('blur',suspendFleet)"));
+        assert!(html.contains(
+            "if(!fleetMain()||document.hidden||(typeof document.hasFocus==='function'&&!document.hasFocus()))return;"
+        ));
+        assert!(html.contains("if(options.force===true&&refreshPromise)abandonRefresh();"));
+        assert!(html.contains("if(generation!==refreshGeneration)return false;"));
+        assert!(html.contains("if(!fleetMembershipMatches(hosts))"));
+        assert!(html.contains("window.location.reload();"));
+        assert!(!html.contains("HIDDEN_REFRESH_MS"));
+
+        let recovery = html
+            .find("function recoverFleet(reason='foreground')")
+            .expect("foreground recovery exists");
+        let recovery = &html[recovery..];
+        let stop = recovery.find("stopBeatClock();").expect("clock stops");
+        let syncing = recovery
+            .find("setFleetSyncState('syncing');")
+            .expect("syncing state is visible");
+        let request = recovery
+            .find("refresh(reason,{force:true,recovery:true})")
+            .expect("authoritative recovery refresh exists");
+        assert!(stop < syncing && syncing < request);
+
+        let refresh = html
+            .find("async function refresh(reason='manual',options={})")
+            .expect("refresh exists");
+        let refresh = &html[refresh..];
+        let apply = refresh
+            .find("if(!applyFleetSnapshot(data))return false;")
+            .expect("snapshot applies");
+        let current = refresh
+            .find("setFleetSyncState('current');")
+            .expect("current state follows apply");
+        let resume = refresh
+            .find("resumeBeatClock();")
+            .expect("clock resumes after apply");
+        assert!(apply < current && current < resume);
+    }
+
+    #[test]
     fn render_home_surfaces_backup_posture_in_grid_and_list() {
         let host = Host {
             name: "athena".to_string(),
@@ -20065,7 +20225,7 @@ mod tests {
         assert_eq!(running_html.matches(r#"aria-busy="true""#).count(), 1);
         assert!(HEAD.contains("@keyframes host-workflow-spin"));
         assert!(HEAD.contains(
-            ".host-workflow-step[data-step-state=\"running\"] .host-workflow-marker:before{animation:none}"
+            ".host-workflow-step[data-step-state=\"running\"] .host-workflow-marker:before,.asof[data-refresh-state=\"syncing\"]:before{animation:none}"
         ));
         let reviewed = store
             .record_agent_result(
@@ -21403,8 +21563,8 @@ mod tests {
         assert!(!html.contains(r#""lon":-122.9898"#));
         assert!(html.contains(r#"data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">out "#));
         assert!(html.contains(r#"data-host="'+escapeHtml(host.name)+'" data-live="'+escapeHtml(host.live)+'" data-search="'+escapeHtml(host.search||'')+'" "#));
-        assert!(html.contains(r#"<b>5</b><span>All hosts</span>"#));
-        assert!(html.contains(r#"<b>4</b><span>Live</span>"#));
+        assert!(html.contains(r#"<b data-summary-count="all">5</b><span>All hosts</span>"#));
+        assert!(html.contains(r#"<b data-summary-count="live">4</b><span>Live</span>"#));
         assert!(html.contains("Approximate site-level coordinates."));
         assert!(html.contains("All servers stay visible"));
 
