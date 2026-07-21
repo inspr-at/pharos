@@ -5089,7 +5089,7 @@ body[data-assistant-open="true"]{overflow:hidden}
 .assistant-overlay[data-provider-created="true"] .assistant-next,.assistant-overlay[data-provider-created="true"] .assistant-created>h3{display:none}
 @media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}.host-action-overlay{padding:10px}.host-action-dialog{width:100%;max-height:calc(100vh - 20px)}.host-action-dialog-head,.host-action-dialog-body{padding-left:16px;padding-right:16px}.host-action-dialog-foot{align-items:stretch;flex-direction:column;padding-left:16px;padding-right:16px}.host-action-dialog-buttons{width:100%;margin-left:0}.host-action-dialog-button{flex:1}.host-action-safe-note{justify-content:center}.host-action-fact strong{max-width:55vw}.host-workflow-group{grid-template-columns:1fr}.host-workflow-group h3{padding:11px 0 3px}.host-workflow-step{grid-template-columns:18px minmax(0,1fr)}.host-workflow-step-state{grid-column:2;text-align:left}.host-workflow-step[data-current="true"]{margin:0 -6px;padding-left:6px;padding-right:6px}}
 @media (max-width:640px){.host-workflow-meta{align-items:flex-start;flex-direction:column;gap:3px}.host-workflow-step-state{justify-items:start}}
-.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr) auto}.assistant-provider-readiness a{color:#0f4f80;font-weight:760;text-decoration:none;white-space:nowrap}.assistant-provider-readiness a:hover,.assistant-provider-readiness a:focus-visible{text-decoration:underline;text-underline-offset:2px;outline:0}
+.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr) auto}.assistant-provider-readiness[data-state="attention"] i{background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.10)}.assistant-provider-readiness a{color:#0f4f80;font-weight:760;text-decoration:none;white-space:nowrap}.assistant-provider-readiness a:hover,.assistant-provider-readiness a:focus-visible{text-decoration:underline;text-underline-offset:2px;outline:0}
 .providers-main{width:min(1120px,100%)}
 .settings-section-title{margin:0 0 9px;font-family:Georgia,"Times New Roman",serif;font-size:20px;font-weight:500;color:#12304b}.appearance-settings{margin:0 0 26px}.appearance-row{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:72px;padding:12px 2px;border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.appearance-copy strong{display:block;color:var(--ink);font-size:14px}.appearance-copy span{display:block;margin-top:3px;color:var(--muted);font-size:12px}.appearance-toggle{position:relative;display:inline-flex;align-items:center;flex:0 0 auto;width:42px;height:24px;cursor:pointer}.appearance-toggle input{position:absolute;width:1px;height:1px;opacity:0}.appearance-switch{position:absolute;inset:0;border:1px solid rgba(137,151,163,.42);border-radius:999px;background:rgba(226,234,238,.86);transition:background .18s ease,border-color .18s ease,box-shadow .18s ease}.appearance-switch:after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 2px 5px rgba(45,75,95,.22);transition:transform .18s ease}.appearance-toggle input:checked+.appearance-switch{border-color:rgba(21,158,153,.56);background:rgba(21,158,153,.72)}.appearance-toggle input:checked+.appearance-switch:after{transform:translateX(18px)}.appearance-toggle input:focus-visible+.appearance-switch{box-shadow:0 0 0 3px rgba(31,127,181,.15)}
 .provider-list{overflow:hidden;border:1px solid rgba(210,226,234,.90);border-radius:8px;background:rgba(255,255,255,.78);box-shadow:0 16px 38px rgba(54,88,108,.06)}
@@ -6493,9 +6493,19 @@ let assistantReturnFocus=null;
 function providerPlanAvailability(serverType,location){
   return (Array.isArray(serverType?.locations)?serverType.locations:[]).find(item=>item?.name===location&&item?.available&&item?.monthly_gross);
 }
+function providerMoneyLabel(value,currency){
+  const amount=Number(value);
+  const code=String(currency||'').trim().toUpperCase();
+  if(!Number.isFinite(amount)||amount<0)return [String(value||''),code].filter(Boolean).join(' ');
+  try{
+    return new Intl.NumberFormat(undefined,{style:'currency',currency:code,minimumFractionDigits:2,maximumFractionDigits:2}).format(amount);
+  }catch(_error){
+    return `${new Intl.NumberFormat(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}).format(amount)}${code?` ${code}`:''}`;
+  }
+}
 function providerPlanLabel(serverType,location,currency){
   const availability=providerPlanAvailability(serverType,location);
-  const price=availability?.monthly_gross?` · ${availability.monthly_gross} ${currency}/month`:'';
+  const price=availability?.monthly_gross?` · ${providerMoneyLabel(availability.monthly_gross,currency)}/month`:'';
   return `${serverType?.name||'Plan'} · ${serverType?.cores||0} vCPU · ${serverType?.memory_gb||0} GB${price}`;
 }
 function recommendedProviderPlan(catalog,location){
@@ -6576,13 +6586,14 @@ function updateProviderReadiness(overlay){
   const durableReady=runtime?.durable_job_store_ready===true;
   const projectAvailable=runtime?.paid_project_available===true;
   const ready=Boolean(runtime?.provider_ready&&durableReady&&projectAvailable&&keyReady&&planReady);
+  const activationRequired=runtime?.connection_ready===true&&runtime?.execution_enabled===false;
   if(readiness){
-    readiness.dataset.state=ready?'ready':'blocked';
+    readiness.dataset.state=ready?'ready':activationRequired?'attention':'blocked';
     const message=readiness.querySelector('span');
     if(message){
       message.textContent=ready
         ? 'Provider connection, SSH public key, and firewall are ready.'
-        : runtime?.connection_ready===true&&runtime?.execution_enabled===false
+        : activationRequired
           ? 'Provider setup is complete. This Pharos installation must enable managed creation before paid review can begin.'
         : !durableReady
           ? 'Configure durable Pharos persistence before reviewing a paid server.'
@@ -6593,7 +6604,7 @@ function updateProviderReadiness(overlay){
     const setup=readiness.querySelector('[data-provider-setup]');
     if(setup){
       setup.hidden=ready;
-      setup.textContent=runtime?.connection_ready===true&&runtime?.execution_enabled===false?'Review activation step':'Set up provider';
+      setup.textContent=activationRequired?'Review activation step':'Set up provider';
       const params=new URLSearchParams();
       params.set('return',location.pathname+location.search);
       setup.href='/settings/providers/hetzner-cloud?'+params.toString();
@@ -22030,6 +22041,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"data-review-setup"#));
         assert!(empty.contains(r#"data-review-after"#));
         assert!(empty.contains(r#"data-provider-readiness"#));
+        assert!(HEAD.contains(
+            r#".assistant-provider-readiness[data-state="attention"] i{background:var(--stale)"#
+        ));
+        assert!(empty.contains("new Intl.NumberFormat(undefined,{style:'currency'"));
+        assert!(empty.contains("minimumFractionDigits:2,maximumFractionDigits:2"));
+        assert!(empty.contains("providerMoneyLabel(availability.monthly_gross,currency)"));
+        assert!(empty.contains("activationRequired?'attention':'blocked'"));
         assert!(empty.contains(r#"data-provider-plan-resources"#));
         assert!(empty.contains(r#"data-existing-setup-intent"#));
         assert!(empty.contains(r#"name="backup_intent" value="optional""#));
