@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.55 - 2026-07-21
+
+- Keep BuildKit's signed OCI provenance and SBOM attestations for private-repository releases, verify both before signing, and verify the keyless image signature before admitting the release.
+- Remove the unsupported duplicate GitHub attestation API call, which rejects user-owned private repositories after the image has already passed its build, vulnerability scan, and SBOM gates.
+
 ## 0.1.54 - 2026-07-21
 
 - Make report, alert, provider, and workflow persistence crash-safe and fail closed with bounded reads, checksummed durable sidecars, serialized mutation, startup validation, and explicit delivery supervision.
