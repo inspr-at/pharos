@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## 0.1.51 - 2026-07-21
+
+- Treat a verified provider connection as complete independently from the installation's paid-execution switch, while keeping managed creation locked until explicitly enabled.
+- Hand the completed provider guide to the server assistant and explain the remaining installation-level activation gate instead of looping back to another connection test.
+- Keep incomplete provider help expanded, automatically collapse it after every setup check is green, and preserve manual expand/collapse access.
+- Vertically center every numbered provider-assistant circle with one shared system-font and line-height rule.
+
 ## 0.1.50 - 2026-07-21
 
 - Preserve valid human-readable Hetzner SSH-key and firewall names, including names containing characters such as `@`, when building provider dropdowns.

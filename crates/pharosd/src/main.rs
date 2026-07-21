@@ -3335,6 +3335,7 @@ struct SetupProviderRuntimeReadiness {
     connection_tested: bool,
     evidence_fresh: bool,
     api_access: bool,
+    connection_ready: bool,
     provider_ready: bool,
     ready_with_defaults: bool,
     tested_at: Option<i64>,
@@ -3393,6 +3394,19 @@ fn hetzner_runtime_readiness(
             evidence_is_fresh(catalog.refreshed_at, now, config.evidence_ttl_secs)
         });
     let api_access = evidence_fresh && attempt.as_ref().is_some_and(|attempt| attempt.api_access);
+    let connection_ready = credential_configured
+        && credential_boundary_ready
+        && project_label_configured
+        && api_access
+        && default_ssh_key_configured
+        && firewall_configured
+        && default_location_configured
+        && attempt.as_ref().is_some_and(|attempt| {
+            attempt.ssh_key_ready
+                && attempt.firewall_ready
+                && attempt.default_location_ready
+                && attempt.catalog_ready
+        });
     let provider_ready = credential_configured
         && credential_boundary_ready
         && execution_enabled
@@ -3436,6 +3450,7 @@ fn hetzner_runtime_readiness(
         connection_tested,
         evidence_fresh,
         api_access,
+        connection_ready,
         provider_ready,
         ready_with_defaults,
         tested_at: attempt.map(|attempt| attempt.tested_at),
@@ -5089,10 +5104,10 @@ body[data-assistant-open="true"]{overflow:hidden}
 .provider-checks{display:grid}.provider-check{display:grid;grid-template-columns:42px minmax(0,1fr) auto;align-items:center;gap:14px;min-height:74px;padding:10px 22px;border-bottom:1px solid rgba(210,226,234,.70)}.provider-check-icon{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(210,226,234,.9);border-radius:50%;background:rgba(247,252,253,.86);color:#45647e}.provider-check-icon .ico{width:19px;height:19px}.provider-check-copy strong{display:block;font-size:14px}.provider-check-copy small{display:block;margin-top:3px;overflow:hidden;color:var(--muted);font-size:11px;text-overflow:ellipsis;white-space:nowrap}.provider-check-state{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;font-weight:720}.provider-check-state i{width:8px;height:8px;border-radius:50%;background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.08)}.provider-check[data-state="ready"] .provider-check-icon,.provider-check[data-state="ready"] .provider-check-state{color:var(--live)}.provider-check[data-state="ready"] .provider-check-state i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.09)}
 .provider-menu{position:relative}.provider-menu>summary{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(173,205,220,.68);border-radius:50%;background:rgba(255,255,255,.82);color:#47657e;cursor:pointer;list-style:none}.provider-menu>summary::-webkit-details-marker{display:none}.provider-menu>summary .ico{width:17px;height:17px}.provider-menu>div{position:absolute;z-index:6;right:0;top:46px;min-width:150px;padding:5px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:#fff;box-shadow:0 14px 34px rgba(45,75,95,.16)}.provider-menu button{width:100%;min-height:36px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:#9a332f;font:inherit;font-size:12px;text-align:left;cursor:pointer}.provider-menu button:hover,.provider-menu button:focus-visible{background:rgba(255,232,229,.72);outline:0}
 .provider-details{border-bottom:1px solid rgba(210,226,234,.76)}.provider-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:58px;padding:0 22px;color:#315d7c;font-size:13px;font-weight:760;cursor:pointer;list-style:none}.provider-details>summary::-webkit-details-marker{display:none}.provider-details>summary .ico{width:17px;height:17px;transition:transform .18s ease}.provider-details[open]>summary .ico{transform:rotate(180deg)}.provider-details form{padding:2px 22px 20px}.provider-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider-fields label{display:grid;gap:6px;color:#526d82;font-size:11px;font-weight:720}.provider-fields select{width:100%;height:40px;padding:0 32px 0 10px;border:1px solid rgba(173,205,220,.72);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px}.provider-details-action{display:flex;align-items:center;gap:12px;margin-top:14px}.provider-details-action span,.provider-action-feedback{color:var(--muted);font-size:11px}.provider-details>p{margin:0;padding:0 22px 18px;color:var(--muted);font-size:11px;line-height:1.45}.provider-action-feedback{min-height:0;margin:0;padding:0 22px}.provider-action-feedback:not(:empty){min-height:40px;padding-top:12px;padding-bottom:12px;color:#8d3430}.provider-details+.provider-action-feedback:not(:empty){border-top:0}
-.provider-help{margin-top:20px;padding:24px;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:rgba(255,255,255,.70);box-shadow:0 14px 34px rgba(54,88,108,.05)}.provider-help-head{display:grid;gap:7px;max-width:760px}.provider-help-kicker{color:#0f5f80;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.provider-help h2{margin:0;font-family:Georgia,"Times New Roman",serif;color:#12304b;font-size:24px;font-weight:500}.provider-help-head p,.provider-help-step p,.provider-help-finish p{margin:0;color:var(--muted);font-size:12px;line-height:1.55}.provider-help-steps{display:grid;margin:22px 0 0;padding:0;list-style:none}.provider-help-step{display:grid;grid-template-columns:32px minmax(0,1fr);gap:14px;padding:18px 0;border-top:1px solid rgba(210,226,234,.76)}.provider-help-number{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(103,177,196,.36);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:16px}.provider-help-step h3{margin:4px 0 6px;color:var(--ink);font-size:14px}.provider-help-step ul{display:grid;gap:5px;margin:10px 0 0;padding-left:18px;color:#526d82;font-size:11px;line-height:1.5}.provider-help-links{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-top:12px}.provider-help-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-help-links .ico{width:13px;height:13px}.provider-help-secret-note{color:#8a5b13;font-size:11px;line-height:1.45}.provider-help-finish{padding:16px 18px;border-radius:7px;background:rgba(223,241,249,.48)}.provider-help-finish strong{display:block;margin-bottom:4px;color:#12304b;font-size:13px}
-.provider-guide-language{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-top:14px;padding:10px 12px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(246,250,251,.78)}.provider-guide-language>strong{color:#294761;font-size:11px}.provider-guide-language-options{display:flex;gap:6px}.provider-guide-language button{min-height:30px;padding:0 10px;border:1px solid rgba(173,205,220,.76);border-radius:6px;background:#fff;color:#315d7c;font:inherit;font-size:10px;font-weight:760;cursor:pointer}.provider-guide-language button[aria-pressed="true"]{border-color:#0f5f80;background:rgba(223,241,249,.70);color:#12304b}.provider-guide-language p{flex:1 1 280px;margin:0;color:#526d82;font-size:10px;line-height:1.45}.provider-guide-route-note{padding:10px 12px;border-radius:6px;background:rgba(223,241,249,.44)}.provider-guide-progress{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:22px 0 0;padding:0;list-style:none}.provider-guide-progress button{display:flex;align-items:center;gap:9px;width:100%;min-height:46px;padding:8px 10px;border:1px solid rgba(173,205,220,.66);border-radius:7px;background:rgba(255,255,255,.74);color:#526d82;font:inherit;font-size:11px;font-weight:720;text-align:left;cursor:pointer}.provider-guide-progress button:hover,.provider-guide-progress button:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-progress button[aria-current="step"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-progress i{display:grid;place-items:center;width:24px;height:24px;flex:0 0 auto;border-radius:50%;background:#e5f1f5;color:#315d7c;font-family:Georgia,"Times New Roman",serif;font-size:13px;font-style:normal}.provider-guide-progress [data-complete="true"] i{background:var(--live);color:#fff}.provider-guide-panel{display:grid;gap:18px;margin-top:18px;padding:22px;border:1px solid rgba(210,226,234,.88);border-radius:8px;background:#fff}.provider-guide-panel[hidden],.provider-guide-platform-panel[hidden]{display:none}.provider-guide-panel-head{display:grid;gap:6px}.provider-guide-panel-head span{color:#0f5f80;font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}.provider-guide-panel h3{margin:0;color:#12304b;font-size:18px}.provider-guide-panel p{margin:0;color:#526d82;font-size:12px;line-height:1.55}.provider-guide-state{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:7px;background:rgba(255,245,224,.64);color:#80560f;font-size:11px;font-weight:720}.provider-guide-state[data-ready="true"]{background:rgba(225,244,235,.72);color:var(--live)}.provider-guide-state i{width:8px;height:8px;border-radius:50%;background:currentColor}.provider-guide-tasks{display:grid;gap:10px;margin:0;padding:0;counter-reset:guide-task;list-style:none}.provider-guide-task{display:grid;grid-template-columns:28px minmax(0,1fr);column-gap:12px;row-gap:5px;min-height:34px;counter-increment:guide-task}.provider-guide-task::before{content:counter(guide-task);display:grid;grid-column:1;grid-row:1;place-items:center;width:26px;height:26px;border:1px solid rgba(103,177,196,.38);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:13px}.provider-guide-task>*{grid-column:2}.provider-guide-task strong{color:var(--ink);font-size:12px}.provider-guide-task p{font-size:11px}.provider-guide-task a{color:#0f5f80;font-weight:720;text-underline-offset:3px}.provider-guide-secret{padding:12px 14px;border-left:3px solid #d89a2f;border-radius:4px;background:rgba(255,245,224,.58);color:#71501a;font-size:11px;line-height:1.5}.provider-guide-platforms{display:flex;flex-wrap:wrap;gap:8px}.provider-guide-platforms button{min-height:36px;padding:0 13px;border:1px solid rgba(173,205,220,.76);border-radius:7px;background:#fff;color:#315d7c;font:inherit;font-size:11px;font-weight:720;cursor:pointer}.provider-guide-platforms button[aria-pressed="true"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-platform-panel{display:grid;gap:14px;padding:16px;border-radius:7px;background:rgba(246,250,251,.92)}.provider-guide-command{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin-top:6px}.provider-guide-command code{display:block;overflow-x:auto;padding:10px 12px;border:1px solid rgba(210,226,234,.92);border-radius:6px;background:#f4f8fa;color:#18354c;font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word}.provider-guide-copy{min-height:34px;padding:0 11px;border:1px solid rgba(173,205,220,.76);border-radius:6px;background:#fff;color:#0f5f80;font:inherit;font-size:10px;font-weight:760;cursor:pointer}.provider-guide-copy:hover,.provider-guide-copy:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-copy-status{min-height:18px;color:var(--live);font-size:10px}.provider-guide-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding-top:4px}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:auto}.provider-guide-links{display:flex;align-items:center;flex-wrap:wrap;gap:14px}.provider-guide-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-guide-links .ico{width:13px;height:13px}.provider-guide-finish{display:grid;gap:8px;padding:14px 16px;border-radius:7px;background:rgba(223,241,249,.48)}
+.provider-help{overflow:hidden;margin-top:20px;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:rgba(255,255,255,.70);box-shadow:0 14px 34px rgba(54,88,108,.05)}.provider-help-toggle{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:72px;padding:14px 24px;color:#12304b;cursor:pointer;list-style:none}.provider-help-toggle::-webkit-details-marker{display:none}.provider-help-toggle>span{display:grid;gap:3px}.provider-help-toggle strong{font-size:13px}.provider-help-toggle small{color:var(--muted);font-size:11px;font-weight:500}.provider-help-toggle .ico{width:18px;height:18px;flex:0 0 auto;color:#315d7c;transition:transform .18s ease}.provider-help[open]>.provider-help-toggle{border-bottom:1px solid rgba(210,226,234,.76)}.provider-help[open]>.provider-help-toggle .ico{transform:rotate(180deg)}.provider-help-body{padding:22px 24px 24px}.provider-help-head{display:grid;gap:7px;max-width:760px}.provider-help-kicker{color:#0f5f80;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.provider-help h2{margin:0;font-family:Georgia,"Times New Roman",serif;color:#12304b;font-size:24px;font-weight:500}.provider-help-head p,.provider-help-step p,.provider-help-finish p{margin:0;color:var(--muted);font-size:12px;line-height:1.55}.provider-help-steps{display:grid;margin:22px 0 0;padding:0;list-style:none}.provider-help-step{display:grid;grid-template-columns:32px minmax(0,1fr);gap:14px;padding:18px 0;border-top:1px solid rgba(210,226,234,.76)}.provider-help-number{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(103,177,196,.36);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:16px}.provider-help-step h3{margin:4px 0 6px;color:var(--ink);font-size:14px}.provider-help-step ul{display:grid;gap:5px;margin:10px 0 0;padding-left:18px;color:#526d82;font-size:11px;line-height:1.5}.provider-help-links{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-top:12px}.provider-help-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-help-links .ico{width:13px;height:13px}.provider-help-secret-note{color:#8a5b13;font-size:11px;line-height:1.45}.provider-help-finish{padding:16px 18px;border-radius:7px;background:rgba(223,241,249,.48)}.provider-help-finish strong{display:block;margin-bottom:4px;color:#12304b;font-size:13px}
+.provider-guide-language{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-top:14px;padding:10px 12px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(246,250,251,.78)}.provider-guide-language>strong{color:#294761;font-size:11px}.provider-guide-language-options{display:flex;gap:6px}.provider-guide-language button{min-height:30px;padding:0 10px;border:1px solid rgba(173,205,220,.76);border-radius:6px;background:#fff;color:#315d7c;font:inherit;font-size:10px;font-weight:760;cursor:pointer}.provider-guide-language button[aria-pressed="true"]{border-color:#0f5f80;background:rgba(223,241,249,.70);color:#12304b}.provider-guide-language p{flex:1 1 280px;margin:0;color:#526d82;font-size:10px;line-height:1.45}.provider-guide-route-note{padding:10px 12px;border-radius:6px;background:rgba(223,241,249,.44)}.provider-guide-progress{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:22px 0 0;padding:0;list-style:none}.provider-guide-progress button{display:flex;align-items:center;gap:9px;width:100%;min-height:46px;padding:8px 10px;border:1px solid rgba(173,205,220,.66);border-radius:7px;background:rgba(255,255,255,.74);color:#526d82;font:inherit;font-size:11px;font-weight:720;text-align:left;cursor:pointer}.provider-guide-progress button:hover,.provider-guide-progress button:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-progress button[aria-current="step"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-progress i{display:grid;place-items:center;width:24px;height:24px;flex:0 0 auto;border-radius:50%;background:#e5f1f5;color:#315d7c;font-size:13px;font-style:normal}.provider-guide-progress [data-complete="true"] i{background:var(--live);color:#fff}.provider-guide-panel{display:grid;gap:18px;margin-top:18px;padding:22px;border:1px solid rgba(210,226,234,.88);border-radius:8px;background:#fff}.provider-guide-panel[hidden],.provider-guide-platform-panel[hidden]{display:none}.provider-guide-panel-head{display:grid;gap:6px}.provider-guide-panel-head span{color:#0f5f80;font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}.provider-guide-panel h3{margin:0;color:#12304b;font-size:18px}.provider-guide-panel p{margin:0;color:#526d82;font-size:12px;line-height:1.55}.provider-guide-state{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:7px;background:rgba(255,245,224,.64);color:#80560f;font-size:11px;font-weight:720}.provider-guide-state[data-ready="true"]{background:rgba(225,244,235,.72);color:var(--live)}.provider-guide-state i{width:8px;height:8px;border-radius:50%;background:currentColor}.provider-guide-tasks{display:grid;gap:10px;margin:0;padding:0;counter-reset:guide-task;list-style:none}.provider-guide-task{display:grid;grid-template-columns:28px minmax(0,1fr);column-gap:12px;row-gap:5px;min-height:34px;counter-increment:guide-task}.provider-guide-task::before{content:counter(guide-task);display:grid;grid-column:1;grid-row:1;place-items:center;width:26px;height:26px;border:1px solid rgba(103,177,196,.38);border-radius:50%;color:#0f5f80;font-size:13px}.provider-guide-task>*{grid-column:2}.provider-guide-task strong{color:var(--ink);font-size:12px}.provider-guide-task p{font-size:11px}.provider-guide-task a{color:#0f5f80;font-weight:720;text-underline-offset:3px}.provider-step>span,.provider-help-number,.provider-guide-progress i,.provider-guide-task::before{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums;line-height:1}.provider-guide-secret{padding:12px 14px;border-left:3px solid #d89a2f;border-radius:4px;background:rgba(255,245,224,.58);color:#71501a;font-size:11px;line-height:1.5}.provider-guide-platforms{display:flex;flex-wrap:wrap;gap:8px}.provider-guide-platforms button{min-height:36px;padding:0 13px;border:1px solid rgba(173,205,220,.76);border-radius:7px;background:#fff;color:#315d7c;font:inherit;font-size:11px;font-weight:720;cursor:pointer}.provider-guide-platforms button[aria-pressed="true"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-platform-panel{display:grid;gap:14px;padding:16px;border-radius:7px;background:rgba(246,250,251,.92)}.provider-guide-command{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin-top:6px}.provider-guide-command code{display:block;overflow-x:auto;padding:10px 12px;border:1px solid rgba(210,226,234,.92);border-radius:6px;background:#f4f8fa;color:#18354c;font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word}.provider-guide-copy{min-height:34px;padding:0 11px;border:1px solid rgba(173,205,220,.76);border-radius:6px;background:#fff;color:#0f5f80;font:inherit;font-size:10px;font-weight:760;cursor:pointer}.provider-guide-copy:hover,.provider-guide-copy:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-copy-status{min-height:18px;color:var(--live);font-size:10px}.provider-guide-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding-top:4px}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:auto}.provider-guide-links{display:flex;align-items:center;flex-wrap:wrap;gap:14px}.provider-guide-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-guide-links .ico{width:13px;height:13px}.provider-guide-finish{display:grid;gap:8px;padding:14px 16px;border-radius:7px;background:rgba(223,241,249,.48)}
 .provider-guide-screen-help{display:grid;gap:10px;margin-top:7px;padding:14px 16px;border:1px solid rgba(103,177,196,.34);border-radius:7px;background:rgba(246,250,251,.92)}.provider-guide-screen-help>strong{color:#12304b;font-size:12px}.provider-guide-screen-help ol{display:grid;gap:8px;margin:0;padding-left:20px;color:#526d82;font-size:11px;line-height:1.55}.provider-guide-screen-help code{padding:1px 4px;border-radius:3px;background:#e8f1f4;color:#18354c}.provider-guide-ready-check{padding:11px 13px;border-left:3px solid var(--live);border-radius:4px;background:rgba(225,244,235,.58);color:#286c53;font-size:11px;line-height:1.5}.provider-guide-actions .provider-primary:disabled{cursor:not-allowed;border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad;box-shadow:none}
-@media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-help{padding:20px 18px}.provider-help-step{grid-template-columns:30px minmax(0,1fr);gap:11px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
+@media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-help-toggle{padding:13px 18px}.provider-help-body{padding:20px 18px}.provider-help-step{grid-template-columns:30px minmax(0,1fr);gap:11px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
 @media (max-width:760px){.provider-guide-progress{grid-template-columns:1fr}.provider-guide-panel{padding:18px 14px}.provider-guide-command{grid-template-columns:1fr}.provider-guide-copy{justify-self:start}.provider-guide-actions{align-items:stretch;flex-direction:column}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:100%}}
 @media (prefers-reduced-motion:reduce){.sidebar-motion{display:none}.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation:none}}
 </style></head><body><div class="app-shell">"#;
@@ -6567,6 +6582,8 @@ function updateProviderReadiness(overlay){
     if(message){
       message.textContent=ready
         ? 'Provider connection, SSH public key, and firewall are ready.'
+        : runtime?.connection_ready===true&&runtime?.execution_enabled===false
+          ? 'Provider setup is complete. This Pharos installation must enable managed creation before paid review can begin.'
         : !durableReady
           ? 'Configure durable Pharos persistence before reviewing a paid server.'
           : !projectAvailable
@@ -6576,6 +6593,7 @@ function updateProviderReadiness(overlay){
     const setup=readiness.querySelector('[data-provider-setup]');
     if(setup){
       setup.hidden=ready;
+      setup.textContent=runtime?.connection_ready===true&&runtime?.execution_enabled===false?'Review activation step':'Set up provider';
       const params=new URLSearchParams();
       params.set('return',location.pathname+location.search);
       setup.href='/settings/providers/hetzner-cloud?'+params.toString();
@@ -14541,6 +14559,7 @@ fn render_hetzner_setup_help(
     ssh_available: bool,
     firewall_available: bool,
     choices_ready: bool,
+    execution_enabled: bool,
 ) -> String {
     let secure_setup = if can_manage {
         secure_setup_url
@@ -14575,8 +14594,45 @@ fn render_hetzner_setup_help(
     } else {
         secure_setup.clone()
     };
+    let (finish_title, finish_intro, finish_tasks, finish_followup) = if choices_ready {
+        if execution_enabled {
+            (
+                "Provider setup complete",
+                "The connection is ready. Continue in the server assistant; it keeps every paid action behind its own review and confirmation.",
+                r#"<li class="provider-guide-task"><strong>Open the server assistant.</strong><p>Choose Continue to server assistant below. No server is created by opening it.</p></li><li class="provider-guide-task"><strong>Choose a starting point.</strong><p>The assistant loads current regions, plans, and prices before it prepares an exact review.</p></li><li class="provider-guide-task"><strong>Review before any paid action.</strong><p>Review, authorization, and creation remain separate attended steps. Billing can begin only after the final create step is separately approved and accepted.</p></li>"#,
+                r#"<div class="provider-guide-finish"><strong>Next: prepare the first server</strong><p>The Hetzner project work is complete. Continue in Pharos; do not create the server manually in the provider portal.</p></div>"#,
+            )
+        } else {
+            (
+                "Provider setup complete",
+                "The connection is ready. One installation-level safety lock remains before the paid server assistant can continue.",
+                r#"<li class="provider-guide-task"><strong>No more provider-portal work is needed.</strong><p>The API connection, location, SSH public key, and firewall are verified.</p></li><li class="provider-guide-task"><strong>Enable managed creation in this Pharos installation.</strong><p>An installation administrator must enable managed provider creation in the deployment configuration and redeploy Pharos.</p></li><li class="provider-guide-task"><strong>Return to the server assistant.</strong><p>Enabling the capability does not create a server or start billing. The assistant still requires an exact current review, separate authorization, and a separate create action.</p></li>"#,
+                r#"<div class="provider-guide-finish"><strong>Next: installation activation</strong><p>This provider connection is complete. Managed server creation is still locked by the Pharos deployment, so the next action belongs to the installation administrator—not the provider portal.</p></div>"#,
+            )
+        }
+    } else {
+        (
+            "Refresh and select the resources",
+            "This final check reads the current Hetzner catalog. It does not create a server or start billing.",
+            r#"<li class="provider-guide-task"><strong>Refresh provider choices.</strong><p>Choose Test connection below. Pharos reloads the page after the safe read-only check.</p></li><li class="provider-guide-task"><strong>Open Connection details above.</strong><p>Choose a default location, the SSH key you added, and the firewall you created.</p></li><li class="provider-guide-task"><strong>Choose Save and test.</strong><p>The three checks above should read API connection: Connected, SSH key: Ready, and Firewall: Ready. Paid execution remains a separate approval.</p></li>"#,
+            r#"<div class="provider-guide-finish"><strong>If a dropdown is empty</strong><p>Confirm the resource was created in the same Hetzner project as the API token, then choose Test connection again.</p></div>"#,
+        )
+    };
+    let finish_actions = if choices_ready && can_manage {
+        r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Continue to server assistant</a>"#
+    } else if choices_ready {
+        r#"<span class="provider-help-secret-note">Ask an installation administrator to continue.</span>"#
+    } else {
+        r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><button class="provider-primary" type="button" data-guide-open-details>Open Connection details</button>"#
+    };
+    let guide_open = if choices_ready { "" } else { " open" };
+    let guide_summary = if choices_ready {
+        "Provider setup complete — expand for details and next steps"
+    } else {
+        "Prepare the Hetzner project — expand or collapse this guide"
+    };
     format!(
-        r#"<section class="provider-help" data-provider-setup-guide data-initial-step="{initial_step}" aria-labelledby="hetzner-setup-help-title"><header class="provider-help-head"><span class="provider-help-kicker">Guided setup</span><h2 id="hetzner-setup-help-title">Prepare the Hetzner project</h2><p>Follow one small task at a time. This assistant never asks for a token, private key, passphrase, or IP address, and it sends none of them to Pharos.</p></header><div class="provider-guide-language"><strong>Hetzner portal language / Portal-Sprache</strong><div class="provider-guide-language-options" role="group" aria-label="Hetzner portal language"><button type="button" data-guide-language="en" aria-pressed="true">English</button><button type="button" data-guide-language="de" aria-pressed="false">Deutsch</button></div><p data-guide-text-en="The portal paths, button names, and official guide links below follow your selection." data-guide-text-de="Die Portal-Pfade, Schaltflächen und offiziellen Anleitungen unten folgen deiner Auswahl.">The portal paths, button names, and official guide links below follow your selection.</p></div><ol class="provider-guide-progress" aria-label="Hetzner setup progress"><li><button type="button" data-guide-nav="api" data-complete="{api_ready}"><i aria-hidden="true">1</i>API connection</button></li><li><button type="button" data-guide-nav="ssh" data-complete="{ssh_available}"><i aria-hidden="true">2</i>SSH key</button></li><li><button type="button" data-guide-nav="firewall" data-complete="{firewall_available}"><i aria-hidden="true">3</i>Firewall</button></li><li><button type="button" data-guide-nav="finish" data-complete="{choices_ready}"><i aria-hidden="true">4</i>Finish</button></li></ol>
+        r#"<details class="provider-help" data-provider-setup-guide data-initial-step="{initial_step}"{guide_open}><summary class="provider-help-toggle"><span><strong>Guided setup</strong><small>{guide_summary}</small></span>{chevron}</summary><div class="provider-help-body"><header class="provider-help-head"><span class="provider-help-kicker">Guided setup</span><h2 id="hetzner-setup-help-title">Prepare the Hetzner project</h2><p>Follow one small task at a time. This assistant never asks for a token, private key, passphrase, or IP address, and it sends none of them to Pharos.</p></header><div class="provider-guide-language"><strong>Hetzner portal language / Portal-Sprache</strong><div class="provider-guide-language-options" role="group" aria-label="Hetzner portal language"><button type="button" data-guide-language="en" aria-pressed="true">English</button><button type="button" data-guide-language="de" aria-pressed="false">Deutsch</button></div><p data-guide-text-en="The portal paths, button names, and official guide links below follow your selection." data-guide-text-de="Die Portal-Pfade, Schaltflächen und offiziellen Anleitungen unten folgen deiner Auswahl.">The portal paths, button names, and official guide links below follow your selection.</p></div><ol class="provider-guide-progress" aria-label="Hetzner setup progress"><li><button type="button" data-guide-nav="api" data-complete="{api_ready}"><i aria-hidden="true">1</i>API connection</button></li><li><button type="button" data-guide-nav="ssh" data-complete="{ssh_available}"><i aria-hidden="true">2</i>SSH key</button></li><li><button type="button" data-guide-nav="firewall" data-complete="{firewall_available}"><i aria-hidden="true">3</i>Firewall</button></li><li><button type="button" data-guide-nav="finish" data-complete="{choices_ready}"><i aria-hidden="true">4</i>Finish</button></li></ol>
 
 <section class="provider-guide-panel" data-guide-panel="api" tabindex="-1"><header class="provider-guide-panel-head"><span>Step 1 of 4</span><h3>Connect the Hetzner API</h3><p>The token lets Pharos read this project and, only after a separate paid approval, create or remove its tracked server.</p></header><div class="provider-guide-state" data-ready="{api_ready}"><i aria-hidden="true"></i>{api_state}</div><p class="provider-guide-route-note" data-guide-text-en="Hetzner puts the project number inside exact console URLs. Pharos intentionally does not store that identifier, so the console link opens Projects; choose the project, then follow the bold path." data-guide-text-de="Hetzner verwendet die Projektnummer in exakten Console-URLs. Pharos speichert diese Kennung bewusst nicht. Der Console-Link öffnet deshalb Projekte; wähle das Projekt und folge dann dem fett gedruckten Pfad.">Hetzner puts the project number inside exact console URLs. Pharos intentionally does not store that identifier, so the console link opens Projects; choose the project, then follow the bold path.</p><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong data-guide-text-en="Open the correct Hetzner project." data-guide-text-de="Öffne das richtige Hetzner-Projekt.">Open the correct Hetzner project.</strong><p><a href="https://console.hetzner.com/projects" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Open Hetzner projects" data-guide-text-de="Hetzner-Projekte öffnen">Open Hetzner projects</span>{external}</a></p></li><li class="provider-guide-task"><strong data-guide-text-en="Open Security → API tokens." data-guide-text-de="Öffne Sicherheit → API-Tokens.">Open Security → API tokens.</strong><p data-guide-text-en="Choose Generate API token. Use a recognizable name such as “Pharos provider access.”" data-guide-text-de="Wähle API-Token hinzufügen. Verwende einen erkennbaren Namen wie „Pharos provider access“.">Choose Generate API token. Use a recognizable name such as “Pharos provider access.”</p></li><li class="provider-guide-task"><strong data-guide-text-en="Select Read &amp; Write, then generate the token." data-guide-text-de="Wähle Lesen &amp; Schreiben und erstelle dann den Token.">Select Read &amp; Write, then generate the token.</strong><p>Read-only access cannot perform a separately approved server create or cleanup.</p></li><li class="provider-guide-task"><strong>Move it directly into secure setup.</strong><p>The token is shown once. Copy it straight into this installation's approved credential workflow, then close the Hetzner token screen.</p></li></ol><div class="provider-guide-secret"><strong>Stop if you are about to paste the token into Pharos, chat, a ticket, Terminal, source code, or logs.</strong> If it was exposed or lost, revoke it in Hetzner and make a replacement.</div><div class="provider-guide-links"><a href="https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/" data-guide-href-en="https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/" data-guide-href-de="https://docs.hetzner.com/de/cloud/api/getting-started/generating-api-token/" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Official API-token guide" data-guide-text-de="Offizielle API-Token-Anleitung">Official API-token guide</span>{external}</a></div><div class="provider-guide-actions">{api_action}</div></section>
 
@@ -14605,13 +14661,21 @@ fn render_hetzner_setup_help(
 <p class="provider-guide-copy-status" data-guide-copy-status aria-live="polite"></p><div class="provider-guide-links"><a href="https://console.hetzner.com/projects" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Open Hetzner projects — then Firewalls" data-guide-text-de="Hetzner-Projekte öffnen — dann Firewalls">Open Hetzner projects — then Firewalls</span>{external}</a><a href="https://docs.hetzner.com/cloud/firewalls/getting-started/creating-a-firewall/" data-guide-href-en="https://docs.hetzner.com/cloud/firewalls/getting-started/creating-a-firewall/" data-guide-href-de="https://docs.hetzner.com/de/cloud/firewalls/getting-started/creating-a-firewall/" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Official Firewall guide" data-guide-text-de="Offizielle Firewall-Anleitung">Official Firewall guide</span>{external}</a></div><div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="ssh">Back</button><button class="provider-primary" type="button" data-guide-firewall-finish data-guide-next="finish" disabled>Firewall created — finish</button></div>
 </section>
 
-<section class="provider-guide-panel" data-guide-panel="finish" tabindex="-1" hidden><header class="provider-guide-panel-head"><span>Step 4 of 4</span><h3>Refresh and select the resources</h3><p>This final check reads the current Hetzner catalog. It does not create a server or start billing.</p></header><div class="provider-guide-state" data-ready="{choices_ready}"><i aria-hidden="true"></i>{finish_state}</div><div class="provider-guide-route-note"><strong>How the SSH-key dropdown works</strong><p>Pharos asks the Hetzner API for the names of public SSH keys already stored in this project. It never uploads or reads a private key. Selecting a name tells Hetzner which existing public key to place on a later, separately approved server.</p></div><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Refresh provider choices.</strong><p>Choose Test connection below. Pharos reloads the page after the safe read-only check.</p></li><li class="provider-guide-task"><strong>Open Connection details above.</strong><p>Choose a default location, the SSH key you added, and the firewall you created.</p></li><li class="provider-guide-task"><strong>Choose Save and test.</strong><p>The three checks above should read API connection: Connected, SSH key: Ready, and Firewall: Ready. Paid execution remains a separate approval.</p></li></ol><div class="provider-guide-finish"><strong>If a dropdown is empty</strong><p>Confirm the resource was created in the same Hetzner project as the API token, then choose Test connection again.</p></div><div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="firewall">Back</button><button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><button class="provider-primary" type="button" data-guide-open-details>Open Connection details</button></div></section></section>"#,
+<section class="provider-guide-panel" data-guide-panel="finish" tabindex="-1" hidden><header class="provider-guide-panel-head"><span>Step 4 of 4</span><h3>{finish_title}</h3><p>{finish_intro}</p></header><div class="provider-guide-state" data-ready="{choices_ready}"><i aria-hidden="true"></i>{finish_state}</div><div class="provider-guide-route-note"><strong>How the SSH-key dropdown works</strong><p>Pharos asks the Hetzner API for the names of public SSH keys already stored in this project. It never uploads or reads a private key. Selecting a name tells Hetzner which existing public key to place on a later, separately approved server.</p></div><ol class="provider-guide-tasks">{finish_tasks}</ol>{finish_followup}<div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="firewall">Back</button>{finish_actions}</div></section></div></details>"#,
         external = icons::EXTERNAL_LINK,
+        chevron = icons::CHEVRON_DOWN,
         initial_step = initial_step,
+        guide_open = guide_open,
+        guide_summary = guide_summary,
         api_ready = api_ready,
         ssh_available = ssh_available,
         firewall_available = firewall_available,
         choices_ready = choices_ready,
+        finish_title = finish_title,
+        finish_intro = finish_intro,
+        finish_tasks = finish_tasks,
+        finish_followup = finish_followup,
+        finish_actions = finish_actions,
         api_state = if api_ready {
             "Pharos already detects a working API connection. Do not replace its token."
         } else {
@@ -14655,6 +14719,7 @@ fn render_hetzner_connection_page(
         && attempt
             .as_ref()
             .is_some_and(|item| item.default_location_ready);
+    let connection_ready = readiness.connection_ready;
     let ssh_available = api_ready
         && catalog
             .as_ref()
@@ -14739,8 +14804,8 @@ fn render_hetzner_connection_page(
     let primary_action = if !can_manage {
         r#"<p class="provider-admin-note">Ask a Pharos administrator to connect this provider.</p>"#
             .to_string()
-    } else if readiness.ready_with_defaults {
-        r#"<a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Add a server<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a>"#.to_string()
+    } else if connection_ready {
+        r#"<a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Continue to server assistant<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a>"#.to_string()
     } else if !readiness.credential_configured || !readiness.credential_boundary_ready {
         setup_link.unwrap_or_else(|| {
             r#"<p class="provider-admin-note">Secure setup is not connected to Janus on this Pharos installation.</p>"#.to_string()
@@ -14804,7 +14869,7 @@ fn render_hetzner_connection_page(
                 .iter()
                 .map(|value| provider_select_option(value, value, current_firewall))
                 .collect::<String>();
-            let open = if readiness.ready_with_defaults {
+            let open = if connection_ready {
                 ""
             } else {
                 " open"
@@ -14831,32 +14896,38 @@ fn render_hetzner_connection_page(
         ssh_available,
         firewall_available,
         ssh_ready && firewall_ready && location_ready,
+        readiness.execution_enabled,
     );
+    let connection_message = if connection_ready && !readiness.execution_enabled {
+        "Provider setup is complete. Continue below for the installation-level activation step; no more provider-portal work is needed."
+    } else {
+        &readiness.message
+    };
     format!(
         r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a><header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         back_href = html_escape(&back_href),
         back = icons::ARROW_LEFT,
         cloud = icons::CLOUD,
-        ready = readiness.ready_with_defaults,
-        status = if readiness.ready_with_defaults {
+        ready = connection_ready,
+        status = if connection_ready {
             "Connected"
         } else if api_ready {
             "Setup needed"
         } else {
             "Not connected"
         },
-        headline = if readiness.ready_with_defaults {
-            "Ready to add servers"
+        headline = if connection_ready {
+            "Provider setup complete"
         } else if api_ready {
             "Finish the connection"
         } else {
             "Connect Hetzner Cloud"
         },
-        message = html_escape(&readiness.message),
+        message = html_escape(connection_message),
         checks = checks,
         primary_action = primary_action,
-        secondary_action = if readiness.ready_with_defaults {
+        secondary_action = if connection_ready {
             secondary_action
         } else {
             String::new()
@@ -25030,6 +25101,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let empty_store = ProviderConnectionStore::new(None);
         let blocked =
             hetzner_runtime_readiness(&HetznerCloudRuntimeConfig::default(), &empty_store, now);
+        assert!(!blocked.connection_ready);
         assert!(!blocked.provider_ready);
         assert!(!blocked.ready_with_defaults);
         assert!(blocked.message.contains("not connected"));
@@ -25050,11 +25122,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ..HetznerCloudRuntimeConfig::default()
         };
         let untested = hetzner_runtime_readiness(&runtime, &empty_store, now);
+        assert!(!untested.connection_ready);
         assert!(!untested.provider_ready);
         assert!(untested.message.contains("Test the connection"));
 
         let store = ready_provider_connection_store(now);
         let ready = hetzner_runtime_readiness(&runtime, &store, now);
+        assert!(ready.connection_ready);
         assert!(ready.provider_ready);
         assert!(ready.ready_with_defaults);
         let json = serde_json::to_string(&ready).expect("runtime readiness serializes");
@@ -25092,6 +25166,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(readiness.api_access);
         assert!(readiness.evidence_fresh);
         assert!(!readiness.execution_enabled);
+        assert!(readiness.connection_ready);
         assert!(!readiness.provider_ready);
         assert!(!readiness.ready_with_defaults);
         assert_eq!(
@@ -25122,9 +25197,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let managed = render_hetzner_connection_page(&runtime, &store, shell, true, None);
         assert_eq!(managed.matches(r#" data-provider-test>"#).count(), 1);
         assert!(managed.contains("Test connection</button>"));
-        assert!(managed.contains(r#"data-provider-ready="false""#));
-        assert!(managed.contains(HetznerConnectionCode::ExecutionDisabled.safe_message()));
-        assert!(!managed.contains(r#"class="provider-primary" href="/?setup=add-server"#));
+        assert!(managed.contains(r#"data-provider-ready="true""#));
+        assert!(managed.contains("Provider setup complete"));
+        assert!(managed.contains("installation-level activation step"));
+        assert!(managed.contains(r#"class="provider-primary" href="/?setup=add-server"#));
+        assert!(managed.contains("Continue to server assistant"));
 
         let viewer = render_hetzner_connection_page(&runtime, &store, shell, false, None);
         assert!(!viewer.contains(r#" data-provider-test>"#));
@@ -25278,6 +25355,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             false,
             false,
             false,
+            false,
         );
         let api = managed.find("API connection").expect("API help");
         let ssh = managed.find("SSH key").expect("SSH help");
@@ -25285,10 +25363,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         assert!(api < ssh && ssh < firewall);
         assert!(managed.contains(r#"data-provider-setup-guide"#));
+        assert!(managed.contains(r#"data-provider-setup-guide data-initial-step="ssh" open"#));
+        assert!(managed.contains("expand or collapse this guide"));
         assert!(HEAD.contains(
             ".provider-guide-task{display:grid;grid-template-columns:28px minmax(0,1fr)"
         ));
         assert!(HEAD.contains(".provider-guide-task>*{grid-column:2}"));
+        assert!(HEAD.contains(
+            ".provider-step>span,.provider-help-number,.provider-guide-progress i,.provider-guide-task::before{font-family:-apple-system"
+        ));
+        assert!(HEAD.contains("font-variant-numeric:tabular-nums;line-height:1"));
         assert!(managed.contains(r#"data-initial-step="ssh""#));
         assert_eq!(managed.matches(r#"data-guide-panel="#).count(), 4);
         assert_eq!(managed.matches(r#"data-guide-copy-status"#).count(), 2);
@@ -25382,17 +25466,29 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             false,
             false,
             false,
+            false,
         );
         assert!(needs_api.contains(r#"data-initial-step="api""#));
         assert!(needs_api.contains("https://secrets.example.test/provider-setup"));
 
-        let ready = render_hetzner_setup_help(true, None, true, true, true, true);
-        assert!(ready.contains(r#"data-initial-step="finish""#));
-        assert!(ready.contains("selections have been verified"));
+        let ready_locked = render_hetzner_setup_help(true, None, true, true, true, true, false);
+        assert!(ready_locked.contains(r#"data-initial-step="finish""#));
+        assert!(ready_locked.contains("selections have been verified"));
+        assert!(ready_locked.contains("Provider setup complete"));
+        assert!(ready_locked.contains("Next: installation activation"));
+        assert!(ready_locked.contains("No more provider-portal work is needed"));
+        assert!(ready_locked.contains("Continue to server assistant"));
+        assert!(!ready_locked.contains(r#"data-initial-step="finish" open"#));
+        assert!(ready_locked.contains("expand for details and next steps"));
+
+        let ready_enabled = render_hetzner_setup_help(true, None, true, true, true, true, true);
+        assert!(ready_enabled.contains("Next: prepare the first server"));
+        assert!(ready_enabled.contains("Review, authorization, and creation remain separate"));
 
         let viewer = render_hetzner_setup_help(
             false,
             Some("https://secrets.example.test/provider-setup"),
+            false,
             false,
             false,
             false,
