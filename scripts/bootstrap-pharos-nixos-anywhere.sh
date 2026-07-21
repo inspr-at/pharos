@@ -201,7 +201,7 @@ chmod 0600 "$log_file"
 runtime_base="${XDG_RUNTIME_DIR:-/tmp}"
 extra_root="$(mktemp -d "$runtime_base/pharos-nixos-anywhere.XXXXXX")"
 chmod 0700 "$extra_root"
-# shellcheck disable=SC2329 # invoked by the EXIT trap below
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap below
 cleanup() {
   if [[ -d "$extra_root" ]]; then
     find "$extra_root" -type f -exec chmod u+w '{}' + 2>/dev/null || true
