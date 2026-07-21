@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.56 - 2026-07-21
+
+- Pin the release signer to cosign v2.5.2, the version checksum-bootstrapped by the reviewed installer action, instead of requesting an incompatible v3 release whose assets use a different verification format.
+
 ## 0.1.55 - 2026-07-21
 
 - Keep BuildKit's signed OCI provenance and SBOM attestations for private-repository releases, verify both before signing, and verify the keyless image signature before admitting the release.
