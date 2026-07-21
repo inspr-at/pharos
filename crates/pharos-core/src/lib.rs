@@ -17,6 +17,19 @@ pub type UnixSeconds = i64;
 /// Upper bound for beacon-reported host-to-Pharos submit latency. This catches
 /// malformed values while keeping unusually slow mobile or VPN paths valid.
 pub const MAX_INBOUND_RTT_MS: u64 = 3_600_000;
+pub const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 10;
+pub const MAX_HEARTBEAT_INTERVAL_SECS: u64 = 3_600;
+pub const MAX_FLAKE_LOCK_AGE_DAYS: u32 = 36_500;
+pub const MAX_COMMITS_BEHIND: u32 = 1_000_000;
+pub const MAX_SERVICE_OBSERVATIONS: usize = 64;
+pub const MAX_BACKUP_OBSERVATIONS: usize = 64;
+pub const MAX_HOST_REPORT_BYTES: usize = 64 * 1024;
+pub const MAX_HOST_REGISTRATION_BYTES: usize = 4 * 1024;
+
+const MAX_ROLE_BYTES: usize = 96;
+const MAX_OBSERVATION_ID_BYTES: usize = 64;
+const MAX_OBSERVATION_LABEL_BYTES: usize = 96;
+const MAX_OBSERVATION_SUMMARY_BYTES: usize = 512;
 
 /// Server-stamped observation of the host-to-Pharos report submission path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,6 +269,7 @@ pub struct Host {
 
 /// Nix freshness for a host (PHAROS-15): what it is "missing".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NixFreshness {
     /// `false` for non-Nix hosts → renders `nix: n/a`.
     pub applicable: bool,
@@ -266,6 +280,28 @@ pub struct NixFreshness {
 }
 
 impl NixFreshness {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self
+            .flake_lock_age_days
+            .is_some_and(|days| days > MAX_FLAKE_LOCK_AGE_DAYS)
+        {
+            return Err(format!(
+                "flake_lock_age_days must be <= {MAX_FLAKE_LOCK_AGE_DAYS}"
+            ));
+        }
+        if self
+            .commits_behind
+            .is_some_and(|commits| commits > MAX_COMMITS_BEHIND)
+        {
+            return Err(format!("commits_behind must be <= {MAX_COMMITS_BEHIND}"));
+        }
+        if !self.applicable && (self.flake_lock_age_days.is_some() || self.commits_behind.is_some())
+        {
+            return Err("non-Nix freshness must not carry Nix values".to_string());
+        }
+        Ok(())
+    }
+
     /// Human one-liner TL;DR, e.g. `flake.lock 12d old · 3 commits behind nixcfg`,
     /// `up to date`, or `nix: n/a`.
     pub fn tldr(&self) -> String {
@@ -448,6 +484,7 @@ pub enum HostLocationSource {
 /// Approximate host location. It deliberately carries source and quality, not
 /// raw Wi-Fi scan data, provider payloads, or private address evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct HostLocation {
     pub latitude: f64,
     pub longitude: f64,
@@ -483,6 +520,13 @@ impl HostLocation {
             if !precision.is_finite() || precision < 0.0 {
                 return Err(format!("precision_meters {precision} must be non-negative"));
             }
+        }
+        if self
+            .label
+            .as_deref()
+            .is_some_and(|label| label.len() > 128 || !safe_observation_text(label))
+        {
+            return Err("location label must be bounded sanitized text".to_string());
         }
         Ok(())
     }
@@ -1835,7 +1879,11 @@ fn looks_like_secret_material(value: &str) -> bool {
     lowered.contains("-----begin")
         || lowered.contains("bearer ")
         || lowered.contains(" api_key")
+        || lowered.contains("api_key=")
+        || lowered.contains("api_key:")
+        || lowered.contains("apikey=")
         || lowered.contains("api-key")
+        || lowered.contains("authorization:")
         || lowered.contains("token=")
         || lowered.contains("token =")
         || lowered.contains("token:")
@@ -1846,6 +1894,10 @@ fn looks_like_secret_material(value: &str) -> bool {
         || lowered.contains("secret =")
         || lowered.contains("secret:")
         || lowered.starts_with("pat_")
+        || lowered.starts_with("sk-")
+        || lowered.starts_with("ghp_")
+        || lowered.starts_with("github_pat_")
+        || lowered.starts_with("xoxb-")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2009,23 +2061,19 @@ pub fn liveness(
     let Some(last) = last_seen else {
         return Liveness::AwaitingFirstHeartbeat;
     };
-    let interval = i64::try_from(interval_secs.unwrap_or(60)).unwrap_or(60);
-    let age = (now - last).max(0);
-    if age <= interval * 2 {
+    let interval = interval_secs.unwrap_or(60);
+    let age = now.saturating_sub(last).max(0) as u64;
+    if age <= interval.saturating_mul(2) {
         Liveness::Live
-    } else if age <= interval * 5 {
+    } else if age <= interval.saturating_mul(5) {
         Liveness::Stale
     } else {
         Liveness::Down
     }
 }
 
-pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v1";
-pub const HOST_REPORT_VERSION: u16 = 1;
-
-fn default_host_report_schema() -> String {
-    HOST_REPORT_SCHEMA.to_string()
-}
+pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v2";
+pub const HOST_REPORT_VERSION: u16 = 2;
 
 fn default_host_report_version() -> u16 {
     HOST_REPORT_VERSION
@@ -2034,10 +2082,9 @@ fn default_host_report_version() -> u16 {
 /// What a `pharos-beacon` sends to `pharosd` (PHAROS-9 ingestion). The server
 /// adds the receive timestamp; the agent never sends its own liveness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct HostReport {
-    #[serde(default = "default_host_report_schema")]
     pub schema: String,
-    #[serde(default = "default_host_report_version")]
     pub version: u16,
     pub name: String,
     pub role: String,
@@ -2066,16 +2113,29 @@ pub struct HostReport {
 impl HostReport {
     pub fn validate_contract(&self) -> Result<(), String> {
         if self.schema != HOST_REPORT_SCHEMA {
-            return Err(format!(
-                "unsupported report schema {:?}; expected {:?}",
-                self.schema, HOST_REPORT_SCHEMA
-            ));
+            return Err("unsupported report schema".to_string());
         }
         if self.version != HOST_REPORT_VERSION {
             return Err(format!(
                 "unsupported report version {}; expected {}",
                 self.version, HOST_REPORT_VERSION
             ));
+        }
+        validate_report_identity(&self.name, &self.role)?;
+        validate_heartbeat_interval(self.heartbeat_interval_secs)?;
+        self.freshness.validate_contract()?;
+        if self.service_observations.len() > MAX_SERVICE_OBSERVATIONS {
+            return Err(format!(
+                "service_observations must contain <= {MAX_SERVICE_OBSERVATIONS} entries"
+            ));
+        }
+        if self.backup_observations.len() > MAX_BACKUP_OBSERVATIONS {
+            return Err(format!(
+                "backup_observations must contain <= {MAX_BACKUP_OBSERVATIONS} entries"
+            ));
+        }
+        for observation in &self.service_observations {
+            observation.validate_contract()?;
         }
         if self
             .inbound_rtt_ms
@@ -2105,8 +2165,64 @@ impl HostReport {
                 );
             }
         }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| "report cannot be encoded as bounded JSON".to_string())?;
+        if encoded.len() > MAX_HOST_REPORT_BYTES {
+            return Err(format!(
+                "report must be <= {MAX_HOST_REPORT_BYTES} encoded bytes"
+            ));
+        }
         Ok(())
     }
+}
+
+fn validate_report_identity(name: &str, role: &str) -> Result<(), String> {
+    if !valid_canonical_hostname(name) {
+        return Err("host name must be a canonical DNS-style name".to_string());
+    }
+    if role.is_empty()
+        || role.len() > MAX_ROLE_BYTES
+        || role.trim() != role
+        || !role.is_ascii()
+        || role.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric()
+                || matches!(byte, b' ' | b'-' | b'_' | b'/' | b'.' | b'(' | b')'))
+        })
+        || looks_like_secret_material(role)
+    {
+        return Err("host role must be bounded plain text".to_string());
+    }
+    Ok(())
+}
+
+fn valid_canonical_hostname(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.bytes().any(|byte| byte.is_ascii_uppercase())
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
+fn validate_heartbeat_interval(interval: u64) -> Result<(), String> {
+    if !(MIN_HEARTBEAT_INTERVAL_SECS..=MAX_HEARTBEAT_INTERVAL_SECS).contains(&interval) {
+        return Err(format!(
+            "heartbeat_interval_secs must be between {MIN_HEARTBEAT_INTERVAL_SECS} and {MAX_HEARTBEAT_INTERVAL_SECS}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2134,6 +2250,7 @@ impl ServiceObservationState {
 /// Do not include process lists, env vars, URLs with credentials, or raw probe
 /// payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceObservation {
     pub id: String,
     pub label: String,
@@ -2142,6 +2259,29 @@ pub struct ServiceObservation {
 }
 
 impl ServiceObservation {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.id.is_empty()
+            || self.id.len() > MAX_OBSERVATION_ID_BYTES
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || self.id.starts_with('-')
+            || self.id.ends_with('-')
+        {
+            return Err("service observation id must be a canonical identifier".to_string());
+        }
+        if self.label.len() > MAX_OBSERVATION_LABEL_BYTES || !safe_observation_text(&self.label) {
+            return Err("service observation label must be bounded sanitized text".to_string());
+        }
+        if self.summary.len() > MAX_OBSERVATION_SUMMARY_BYTES
+            || !safe_observation_text(&self.summary)
+        {
+            return Err("service observation summary must be bounded sanitized text".to_string());
+        }
+        Ok(())
+    }
+
     pub fn nix_freshness(freshness: &NixFreshness) -> Self {
         let (state, summary) = if !freshness.applicable {
             (ServiceObservationState::Unknown, "nix: n/a".to_string())
@@ -2178,6 +2318,7 @@ impl ServiceObservation {
 /// - Values are sanitized metadata only: no repository passwords, env values,
 ///   credential-bearing URLs, raw logs, or secret paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BackupObservation {
     pub id: String,
     pub label: String,
@@ -2281,6 +2422,7 @@ pub enum BackupRunState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BackupValidationObservation {
     pub level: BackupValidationLevel,
     pub state: BackupValidationState,
@@ -2329,7 +2471,9 @@ pub enum BackupValidationState {
 }
 
 fn safe_observation_text(value: &str) -> bool {
-    let value = value.trim();
+    if value.trim() != value || value.len() > MAX_OBSERVATION_SUMMARY_BYTES {
+        return false;
+    }
     let lowered = value.to_ascii_lowercase();
     !value.is_empty()
         && !value.contains('\n')
@@ -2347,11 +2491,33 @@ fn safe_observation_text(value: &str) -> bool {
 /// The server creates/rotates the per-host token and starts the host in the
 /// grey "awaiting first heartbeat" state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HostRegistration {
+    pub schema: String,
+    pub version: u16,
     pub name: String,
     pub role: String,
     pub is_nix: bool,
     pub heartbeat_interval_secs: u64,
+}
+
+pub const HOST_REGISTRATION_SCHEMA: &str = "inspr.pharos.host-registration.v1";
+pub const HOST_REGISTRATION_VERSION: u16 = 1;
+
+impl HostRegistration {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.schema != HOST_REGISTRATION_SCHEMA {
+            return Err("unsupported registration schema".to_string());
+        }
+        if self.version != HOST_REGISTRATION_VERSION {
+            return Err(format!(
+                "unsupported registration version {}; expected {}",
+                self.version, HOST_REGISTRATION_VERSION
+            ));
+        }
+        validate_report_identity(&self.name, &self.role)?;
+        validate_heartbeat_interval(self.heartbeat_interval_secs)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2885,6 +3051,19 @@ mod tests {
     }
 
     #[test]
+    fn liveness_is_total_and_saturating_for_extreme_inputs() {
+        for last_seen in [i64::MIN, -1, 0, i64::MAX] {
+            for now in [i64::MIN, -1, 0, i64::MAX] {
+                for interval in [0, 1, 60, u64::MAX / 2, u64::MAX] {
+                    let result =
+                        std::panic::catch_unwind(|| liveness(Some(last_seen), Some(interval), now));
+                    assert!(result.is_ok(), "liveness must be total");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn host_heartbeat_log_defaults_for_existing_json() {
         let host: Host = serde_json::from_str(
             r#"{"name":"hades","role":"NixOS Host","is_nix":true,"last_seen":1000,"heartbeat_interval_secs":60,"freshness":{"applicable":true,"flake_lock_age_days":null,"commits_behind":null}}"#,
@@ -2905,16 +3084,34 @@ mod tests {
 
     #[test]
     fn host_report_location_is_optional_and_runtime_only() {
-        let legacy: HostReport = serde_json::from_str(
-            r#"{"schema":"inspr.pharos.host-report.v1","version":1,"name":"hsb8","role":"server","is_nix":true,"heartbeat_interval_secs":60,"freshness":{"applicable":true}}"#,
-        )
-        .expect("deserialize legacy report");
-        assert!(legacy.location.is_none());
-        assert!(legacy.inbound_rtt_ms.is_none());
-        assert!(legacy.kernel.is_none());
-        assert!(legacy.backup_observations.is_empty());
-        assert_eq!(legacy.preferences, HostPreferences::default());
-        legacy.validate_contract().expect("legacy report valid");
+        let current: HostReport = serde_json::from_value(serde_json::json!({
+            "schema": HOST_REPORT_SCHEMA,
+            "version": HOST_REPORT_VERSION,
+            "name": "hsb8",
+            "role": "server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60,
+            "freshness": {"applicable": true}
+        }))
+        .expect("deserialize current report");
+        assert!(current.location.is_none());
+        assert!(current.inbound_rtt_ms.is_none());
+        assert!(current.kernel.is_none());
+        assert!(current.backup_observations.is_empty());
+        assert_eq!(current.preferences, HostPreferences::default());
+        current.validate_contract().expect("current report valid");
+
+        let legacy: HostReport = serde_json::from_value(serde_json::json!({
+            "schema": "inspr.pharos.host-report.v1",
+            "version": 1,
+            "name": "hsb8",
+            "role": "server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60,
+            "freshness": {"applicable": true}
+        }))
+        .expect("legacy report remains structurally parseable");
+        assert!(legacy.validate_contract().is_err());
 
         let runtime = HostReport {
             inbound_rtt_ms: Some(42),
@@ -2929,7 +3126,7 @@ mod tests {
                 manual_override: false,
                 label: Some("Vienna area".to_string()),
             }),
-            ..legacy.clone()
+            ..current.clone()
         };
         runtime
             .validate_contract()
@@ -2938,7 +3135,7 @@ mod tests {
 
         let too_slow = HostReport {
             inbound_rtt_ms: Some(MAX_INBOUND_RTT_MS + 1),
-            ..legacy.clone()
+            ..current.clone()
         };
         assert!(too_slow.validate_contract().is_err());
 
@@ -2954,9 +3151,178 @@ mod tests {
                 manual_override: true,
                 label: None,
             }),
-            ..legacy
+            ..current
         };
         assert!(declared_runtime.validate_contract().is_err());
+    }
+
+    #[test]
+    fn report_and_registration_envelopes_are_explicit_and_closed() {
+        let report = serde_json::json!({
+            "schema": HOST_REPORT_SCHEMA,
+            "version": HOST_REPORT_VERSION,
+            "name": "athena.example",
+            "role": "Control Server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60,
+            "freshness": {"applicable": true}
+        });
+        let mut missing_schema = report.clone();
+        missing_schema.as_object_mut().unwrap().remove("schema");
+        assert!(serde_json::from_value::<HostReport>(missing_schema).is_err());
+        let mut unknown = report.clone();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<HostReport>(unknown).is_err());
+
+        let registration = serde_json::json!({
+            "schema": HOST_REGISTRATION_SCHEMA,
+            "version": HOST_REGISTRATION_VERSION,
+            "name": "athena.example",
+            "role": "Control Server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60
+        });
+        let parsed: HostRegistration = serde_json::from_value(registration.clone()).unwrap();
+        parsed.validate_contract().unwrap();
+        let mut missing_version = registration.clone();
+        missing_version.as_object_mut().unwrap().remove("version");
+        assert!(serde_json::from_value::<HostRegistration>(missing_version).is_err());
+        let mut unknown = registration;
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<HostRegistration>(unknown).is_err());
+    }
+
+    #[test]
+    fn report_contract_enforces_identity_bounds_and_sanitized_observations() {
+        let valid = HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
+            name: "athena.example".to_string(),
+            role: "Control Server".to_string(),
+            is_nix: true,
+            heartbeat_interval_secs: 60,
+            freshness: NixFreshness {
+                applicable: true,
+                flake_lock_age_days: Some(1),
+                commits_behind: Some(0),
+            },
+            kernel: None,
+            service_observations: vec![ServiceObservation {
+                id: "nix-freshness".to_string(),
+                label: "Nix freshness".to_string(),
+                state: ServiceObservationState::Healthy,
+                summary: "up to date".to_string(),
+            }],
+            backup_observations: vec![],
+            inbound_rtt_ms: Some(5),
+            location: None,
+            preferences: Default::default(),
+        };
+        valid.validate_contract().unwrap();
+
+        for name in ["Athena", "-athena", "athena-", "athena..example", ""] {
+            assert!(HostReport {
+                name: name.to_string(),
+                ..valid.clone()
+            }
+            .validate_contract()
+            .is_err());
+        }
+        for interval in [
+            0,
+            MIN_HEARTBEAT_INTERVAL_SECS - 1,
+            MAX_HEARTBEAT_INTERVAL_SECS + 1,
+            u64::MAX,
+        ] {
+            assert!(HostReport {
+                heartbeat_interval_secs: interval,
+                ..valid.clone()
+            }
+            .validate_contract()
+            .is_err());
+        }
+        assert!(HostReport {
+            freshness: NixFreshness {
+                flake_lock_age_days: Some(MAX_FLAKE_LOCK_AGE_DAYS + 1),
+                ..valid.freshness.clone()
+            },
+            ..valid.clone()
+        }
+        .validate_contract()
+        .is_err());
+        assert!(HostReport {
+            service_observations: vec![ServiceObservation {
+                summary: "token=must-not-be-forwarded".to_string(),
+                ..valid.service_observations[0].clone()
+            }],
+            ..valid.clone()
+        }
+        .validate_contract()
+        .is_err());
+        let large_backup = BackupObservation {
+            id: "backup".to_string(),
+            label: "b".repeat(MAX_OBSERVATION_LABEL_BYTES),
+            engine: BackupEngine::Restic,
+            state: BackupPostureState::Healthy,
+            configured: BackupConfiguredState::Enabled,
+            summary: "s".repeat(MAX_OBSERVATION_SUMMARY_BYTES),
+            target_label: Some("t".repeat(MAX_OBSERVATION_SUMMARY_BYTES)),
+            repository_id: Some("r".repeat(MAX_OBSERVATION_SUMMARY_BYTES)),
+            schedule: Some("c".repeat(MAX_OBSERVATION_SUMMARY_BYTES)),
+            next_run_at: None,
+            last_attempt_at: None,
+            last_attempt_state: None,
+            last_success_at: None,
+            snapshot_count: None,
+            total_bytes: None,
+            latest_snapshot_bytes: None,
+            last_check_at: None,
+            last_check_state: None,
+            restore_validation: Some(BackupValidationObservation {
+                level: BackupValidationLevel::RestoreSample,
+                state: BackupValidationState::Passed,
+                checked_at: None,
+                evidence_label: Some("e".repeat(MAX_OBSERVATION_SUMMARY_BYTES)),
+                summary: Some("v".repeat(MAX_OBSERVATION_SUMMARY_BYTES)),
+            }),
+        };
+        let oversized = HostReport {
+            backup_observations: vec![large_backup; MAX_BACKUP_OBSERVATIONS],
+            ..valid.clone()
+        };
+        assert!(oversized
+            .validate_contract()
+            .is_err_and(|error| error.contains("encoded bytes")));
+        assert!(HostReport {
+            service_observations: vec![
+                valid.service_observations[0].clone();
+                MAX_SERVICE_OBSERVATIONS + 1
+            ],
+            ..valid
+        }
+        .validate_contract()
+        .is_err());
+    }
+
+    #[test]
+    fn heartbeat_contract_property_holds_for_generated_inputs() {
+        let mut state = 0x4d595df4d0f33173_u64;
+        for _ in 0..10_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let interval = state;
+            let registration = HostRegistration {
+                schema: HOST_REGISTRATION_SCHEMA.to_string(),
+                version: HOST_REGISTRATION_VERSION,
+                name: "property-host.example".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: interval,
+            };
+            assert_eq!(
+                registration.validate_contract().is_ok(),
+                (MIN_HEARTBEAT_INTERVAL_SECS..=MAX_HEARTBEAT_INTERVAL_SECS).contains(&interval)
+            );
+        }
     }
 
     #[test]

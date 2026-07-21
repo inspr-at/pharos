@@ -8,28 +8,39 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: 1.95.0
           components: clippy, rustfmt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
-      - uses: Swatinem/rust-cache@v2
+          node-version: 22.23.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: install cargo-deny
         run: cargo install cargo-deny --version 0.19.9 --locked
       - name: dependency audit
         run: cargo deny check
-      - name: shell syntax
-        run: bash -n scripts/install-pharos-beacon-systemd.sh scripts/bootstrap-pharos-nixos-anywhere.sh scripts/check-release-consistency.sh
+      - name: install shell QA
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck shfmt
+      - name: shell syntax, lint, and format
+        run: |
+          bash -n scripts/*.sh
+          shellcheck scripts/*.sh
+          shfmt -d -i 2 -ci scripts/*.sh
       - name: fleet browser lifecycle
         run: node --test tests/fleet-refresh.test.mjs
       - name: release consistency
@@ -49,6 +60,7 @@ jobs:
           output="$(scripts/install-pharos-beacon-systemd.sh \
             --binary "$work/pharos-beacon" \
             --token-env "$work/token.env" \
+            --pharos-url https://pharos.example \
             --host test-host \
             --dry-run)"
           grep -F 'Environment=PHAROS_PREFERENCES_FILE="/var/lib/pharos-beacon/host-preferences.json"' <<<"$output"
@@ -80,10 +92,99 @@ jobs:
           PHAROS_OIDC_ISSUER=https://issuer.example \
           PHAROS_OIDC_CLIENT_ID=pharos \
           PHAROS_OIDC_REDIRECT_URI=https://pharos.example/auth/callback \
-          PHAROS_ALLOWED_OPERATORS=alice \
+          PHAROS_ALLOWED_OPERATORS=email:alice@example.com \
           PHAROS_REGISTRATION_TOKEN=placeholder \
           docker compose -f docker-compose.selfhost.yml config >/dev/null
       - name: build
         run: cargo build --all --locked
+      - name: persistence and alert failure injection
+        run: |
+          cargo test -p pharosd --locked store::tests
+          cargo test -p pharosd --locked provider_connections::tests
+          cargo test -p pharosd --locked alerts::tests
+      - name: OIDC authorization-code end to end
+        run: cargo test -p pharosd --locked auth::tests::oidc_authorization_code_pkce_flow_creates_a_browser_bound_session
+      - name: report and registration contract properties
+        run: cargo test -p pharos-core --locked --test report_contract_properties
+      - name: security header contract
+        run: cargo test -p pharosd --locked rendered_html_receives_nonce_csp_and_browser_security_headers
       - name: test
         run: cargo test --all --locked
+
+  janus-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: checkout the reviewed Janus producer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: markus-barta/janus
+          ref: b126567d3563cefd773120a8fcc87343e49b252d
+          path: janus
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: janus-contract
+      - name: producer and consumer schema compatibility
+        run: scripts/check-janus-contract.sh "$GITHUB_WORKSPACE/janus"
+
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.95.0
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: llvm-cov
+      - name: install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+      - name: enforce line coverage
+        run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80
+
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: browser
+      - name: install browser test dependencies
+        run: |
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+      - name: build test server
+        run: cargo build -p pharosd --locked
+      - name: accessibility, focus, responsive, and visual-layout QA
+        run: npm run test:browser
+      - name: retain browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: browser-failure-evidence
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  nix-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: build Nix package checks
+        run: nix build --print-build-logs .#checks.x86_64-linux.pharosd .#checks.x86_64-linux.pharos-beacon

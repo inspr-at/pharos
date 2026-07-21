@@ -5,7 +5,7 @@
 //! service; otherwise it reports once and exits. Token auth via Janus is
 //! PHAROS-8; the native (musl) Nix-module deployment is PHAROS-6/7.
 //!
-//! Env: PHAROS_URL (pharosd base, default http://100.64.0.4:8088),
+//! Env: PHAROS_URL (required pharosd base),
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
 //!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
 //!      PHAROS_TOKEN (per-host bearer token from /register),
@@ -18,17 +18,133 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(all(unix, test))]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
     BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
     HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
     HostReportResponse, KernelPosture, NixFreshness, ServiceObservation, ServiceObservationState,
-    HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_INBOUND_RTT_MS,
+    HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS,
+    MIN_HEARTBEAT_INTERVAL_SECS,
 };
+use url::Url;
 
 const MAX_REPORT_RESPONSE_BYTES: u64 = 64 * 1024;
+const LOCATION_COMMAND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportEndpoint {
+    request_url: String,
+    safe_origin: String,
+}
+
+fn report_endpoint(raw: &str) -> Result<ReportEndpoint, &'static str> {
+    let mut base = Url::parse(raw.trim()).map_err(|_| "invalid_url")?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err("unsafe_url");
+    }
+    if !base.path().ends_with('/') {
+        let mut path = base.path().to_string();
+        path.push('/');
+        base.set_path(&path);
+    }
+    let endpoint = base.join("report").map_err(|_| "invalid_url")?;
+    Ok(ReportEndpoint {
+        request_url: endpoint.as_str().to_string(),
+        safe_origin: endpoint.origin().ascii_serialization(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestDeadlines {
+    connect: Duration,
+    read: Duration,
+    write: Duration,
+    overall: Duration,
+}
+
+impl RequestDeadlines {
+    fn for_cadence(cadence_secs: u64) -> Result<Self, &'static str> {
+        if !(MIN_HEARTBEAT_INTERVAL_SECS..=MAX_HEARTBEAT_INTERVAL_SECS).contains(&cadence_secs) {
+            return Err("invalid_cadence");
+        }
+        let overall_secs = cadence_secs.saturating_sub(1).min(15);
+        Ok(Self {
+            connect: Duration::from_secs(overall_secs.min(5)),
+            read: Duration::from_secs(overall_secs.min(10)),
+            write: Duration::from_secs(overall_secs.min(10)),
+            overall: Duration::from_secs(overall_secs),
+        })
+    }
+
+    fn agent(self) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(self.connect))
+            .timeout_send_request(Some(self.write))
+            .timeout_send_body(Some(self.write))
+            .timeout_recv_response(Some(self.read))
+            .timeout_recv_body(Some(self.read))
+            .timeout_global(Some(self.overall))
+            .max_redirects(0)
+            .build()
+            .into()
+    }
+}
+
+fn retry_delay(cadence_secs: u64, consecutive_failures: u32, jitter_seed: u64) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(6);
+    let base_millis = 1_000_u64
+        .saturating_mul(1_u64 << exponent)
+        .min(cadence_secs.saturating_mul(500).max(1_000));
+    let jitter_window = (base_millis / 2).max(1);
+    let cap_millis = cadence_secs.saturating_mul(1_000).saturating_sub(1);
+    Duration::from_millis(
+        base_millis
+            .saturating_add(jitter_seed % jitter_window)
+            .min(cap_millis),
+    )
+}
+
+fn jitter_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ u64::from(std::process::id())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_notify(message: &str) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    let Some(socket_name) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let socket_name = socket_name.as_encoded_bytes();
+    let Ok(socket) = UnixDatagram::unbound() else {
+        return;
+    };
+    if let Some(abstract_name) = socket_name.strip_prefix(b"@") {
+        if let Ok(address) = SocketAddr::from_abstract_name(abstract_name) {
+            let _ = socket.send_to_addr(message.as_bytes(), &address);
+        }
+    } else if let Ok(path) = std::str::from_utf8(socket_name) {
+        let _ = socket.send_to(message.as_bytes(), path);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_notify(_message: &str) {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreferencesApplyError {
@@ -194,7 +310,7 @@ fn apply_report_response(
 }
 
 fn apply_report_http_response(
-    response: ureq::Response,
+    response: ureq::http::Response<ureq::Body>,
     host: &str,
     is_nix: bool,
     preferences_path: Option<&Path>,
@@ -205,7 +321,7 @@ fn apply_report_http_response(
     if response.status() != 200 {
         return Err(PreferencesApplyError::InvalidResponse);
     }
-    let body = read_bounded_report_response(response.into_reader())?;
+    let body = read_bounded_report_response(response.into_body().into_reader())?;
     apply_report_response(&body, host, is_nix, preferences_path)
 }
 
@@ -226,15 +342,10 @@ fn nixcfg_dir() -> Option<String> {
     if let Ok(d) = std::env::var("NIXCFG_DIR") {
         return Some(d);
     }
-    [
-        "/etc/nixos",
-        "/home/mba/Code/nixcfg",
-        "/root/dsccfg",
-        "/home/mba/dsccfg",
-    ]
-    .into_iter()
-    .find(|d| Path::new(&format!("{d}/flake.lock")).exists())
-    .map(String::from)
+    ["/etc/nixos"]
+        .into_iter()
+        .find(|d| Path::new(&format!("{d}/flake.lock")).exists())
+        .map(String::from)
 }
 
 fn kernel_running_path() -> PathBuf {
@@ -491,41 +602,133 @@ fn location_from_command_json(raw: &str, now: i64) -> Option<HostLocation> {
     Some(location)
 }
 
+#[derive(Debug)]
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn drain_bounded(
+    mut pipe: impl Read + Send + 'static,
+    limit: usize,
+) -> mpsc::Receiver<Result<BoundedOutput, &'static str>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut retained = Vec::with_capacity(limit.min(8 * 1024));
+        let mut truncated = false;
+        let mut chunk = [0_u8; 8 * 1024];
+        let result = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => {
+                    break Ok(BoundedOutput {
+                        bytes: retained,
+                        truncated,
+                    });
+                }
+                Ok(read) => {
+                    let remaining = limit.saturating_sub(retained.len());
+                    let keep = remaining.min(read);
+                    retained.extend_from_slice(&chunk[..keep]);
+                    truncated |= keep < read;
+                }
+                Err(_) => break Err("output_read"),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn collect_bounded(
+    receiver: &mpsc::Receiver<Result<BoundedOutput, &'static str>>,
+    deadline: Instant,
+) -> Result<BoundedOutput, &'static str> {
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| "output_timeout")?
+}
+
+#[cfg(unix)]
+fn isolate_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_command: &mut Command) {}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(group) = i32::try_from(child.id()) {
+        // The child is started as its own process group so inherited collector
+        // pipes cannot survive in a background descendant past the deadline.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<ExitStatus, &'static str> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                terminate_process_tree(child);
+                return Err("timeout");
+            }
+            Err(_) => {
+                terminate_process_tree(child);
+                return Err("wait");
+            }
+        }
+    }
+}
+
+fn output_string(output: BoundedOutput) -> Result<String, &'static str> {
+    if output.truncated {
+        return Err("output_limit");
+    }
+    String::from_utf8(output.bytes).map_err(|_| "output_encoding")
+}
+
 fn run_location_command(
     command: &str,
     args: &[String],
     timeout: Duration,
 ) -> Result<String, &'static str> {
-    let mut child = Command::new(command)
+    let mut command = Command::new(command);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "spawn")?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    pipe.read_to_string(&mut stdout).map_err(|_| "stdout")?;
-                }
-                return if status.success() {
-                    Ok(stdout)
-                } else {
-                    Err("exit")
-                };
-            }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("timeout");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => return Err("wait"),
+        .stderr(Stdio::null());
+    isolate_process_group(&mut command);
+    let mut child = command.spawn().map_err(|_| "spawn")?;
+    let output = child
+        .stdout
+        .take()
+        .map(|pipe| drain_bounded(pipe, LOCATION_COMMAND_OUTPUT_LIMIT_BYTES))
+        .ok_or("stdout")?;
+    let deadline = Instant::now() + timeout;
+    let status = wait_for_child(&mut child, deadline)?;
+    let stdout = match collect_bounded(&output, deadline).and_then(output_string) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            terminate_process_tree(&mut child);
+            return Err(error);
         }
+    };
+    if status.success() {
+        Ok(stdout)
+    } else {
+        Err("exit")
     }
 }
 
@@ -610,11 +813,14 @@ fn location_from_ip_api(now: i64) -> Option<HostLocation> {
         "http://ip-api.com/json/?fields=status,lat,lon,city,regionName,countryCode".to_string()
     });
     let precision = parse_f64(env_value("PHAROS_LOCATION_PRECISION_METERS")).unwrap_or(50_000.0);
-    let response = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(3))
+    let mut response = ureq::get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(3)))
+        .max_redirects(0)
+        .build()
         .call()
         .ok()?;
-    let raw = response.into_string().ok()?;
+    let raw = response.body_mut().read_to_string().ok()?;
     location_from_ip_api_json(&raw, now, precision)
 }
 
@@ -677,7 +883,7 @@ impl BackupMode {
 }
 
 const BACKUP_COMMAND_TIMEOUT_MS: u64 = 5_000;
-const BACKUP_COMMAND_OUTPUT_LIMIT_BYTES: u64 = 128 * 1024;
+const BACKUP_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
 const DEFAULT_BACKUP_STALE_AFTER_SECS: i64 = 36 * 60 * 60;
 
 #[derive(Debug)]
@@ -804,57 +1010,49 @@ fn collect_backup_status_file() -> Vec<BackupObservation> {
     }
 }
 
-fn read_limited(pipe: impl Read) -> Result<String, &'static str> {
-    let mut reader = pipe.take(BACKUP_COMMAND_OUTPUT_LIMIT_BYTES);
-    let mut out = String::new();
-    reader.read_to_string(&mut out).map_err(|_| "stdout")?;
-    Ok(out)
-}
-
 fn run_capture_command(
     command: &str,
     args: &[String],
     timeout: Duration,
 ) -> Result<CommandCapture, &'static str> {
-    let mut child = Command::new(command)
+    let mut command = Command::new(command);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "spawn")?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(read_limited)
-                    .transpose()?
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(read_limited)
-                    .transpose()?
-                    .unwrap_or_default();
-                return Ok(CommandCapture {
-                    success: status.success(),
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("timeout");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => return Err("wait"),
+        .stderr(Stdio::piped());
+    isolate_process_group(&mut command);
+    let mut child = command.spawn().map_err(|_| "spawn")?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| drain_bounded(pipe, BACKUP_COMMAND_OUTPUT_LIMIT_BYTES))
+        .ok_or("stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| drain_bounded(pipe, BACKUP_COMMAND_OUTPUT_LIMIT_BYTES))
+        .ok_or("stderr")?;
+    let deadline = Instant::now() + timeout;
+    let status = wait_for_child(&mut child, deadline)?;
+    let stdout = match collect_bounded(&stdout, deadline).and_then(output_string) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            terminate_process_tree(&mut child);
+            return Err(error);
         }
-    }
+    };
+    let stderr = match collect_bounded(&stderr, deadline).and_then(output_string) {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            terminate_process_tree(&mut child);
+            return Err(error);
+        }
+    };
+    Ok(CommandCapture {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
 }
 
 fn collect_backup_command(now: i64) -> Vec<BackupObservation> {
@@ -1230,9 +1428,27 @@ fn success_log_line(
     )
 }
 
+fn reporting_interval() -> Result<Option<u64>, &'static str> {
+    match std::env::var("PHAROS_INTERVAL") {
+        Ok(raw) => {
+            let seconds = raw.parse::<u64>().map_err(|_| "invalid_interval")?;
+            RequestDeadlines::for_cadence(seconds)?;
+            Ok(Some(seconds))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err("invalid_interval"),
+    }
+}
+
 fn main() {
-    let base = std::env::var("PHAROS_URL").unwrap_or_else(|_| "http://100.64.0.4:8088".into());
-    let endpoint = format!("{}/report", base.trim_end_matches('/'));
+    let base = env_value("PHAROS_URL").unwrap_or_else(|| {
+        eprintln!("pharos-beacon: PHAROS_URL is required");
+        std::process::exit(2);
+    });
+    let endpoint = report_endpoint(&base).unwrap_or_else(|_| {
+        eprintln!("pharos-beacon: PHAROS_URL is invalid or unsafe");
+        std::process::exit(2);
+    });
     let host = hostname();
     let is_nix = Path::new("/etc/NIXOS").exists();
     let dir = nixcfg_dir();
@@ -1245,12 +1461,18 @@ fn main() {
 
     // PHAROS_INTERVAL (secs) set => loop forever (recurring service);
     // unset => report once and exit (one-shot / timer-driven).
-    let interval = std::env::var("PHAROS_INTERVAL")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0);
+    let interval = reporting_interval().unwrap_or_else(|_| {
+        eprintln!(
+            "pharos-beacon: PHAROS_INTERVAL must be between {MIN_HEARTBEAT_INTERVAL_SECS} and {MAX_HEARTBEAT_INTERVAL_SECS} seconds"
+        );
+        std::process::exit(2);
+    });
     let beat = interval.unwrap_or(60);
+    let deadlines = RequestDeadlines::for_cadence(beat).expect("default cadence is valid");
+    let agent = deadlines.agent();
     let mut last_report_rtt_ms: Option<u64> = None;
+    let mut consecutive_failures = 0_u32;
+    systemd_notify("READY=1\nSTATUS=Waiting for first successful report");
 
     loop {
         if let Some(path) = preferences_path.as_deref() {
@@ -1298,21 +1520,29 @@ fn main() {
             location,
             preferences: preferences.clone(),
         };
+        if report.validate_contract().is_err() {
+            eprintln!("pharos-beacon: locally collected report violates the report contract");
+            std::process::exit(2);
+        }
         let body = serde_json::to_string(&report).expect("serialize report");
-        let mut request = ureq::post(&endpoint).set("Content-Type", "application/json");
+        let mut request = agent
+            .post(&endpoint.request_url)
+            .header("Content-Type", "application/json");
         if let Some(token) = &token {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+            request = request.header("Authorization", &format!("Bearer {token}"));
         }
         let started = Instant::now();
-        match request.send_string(&body) {
-            Ok(resp) => {
-                let status = resp.status();
+        let report_succeeded = match request.send(body.as_str()) {
+            Ok(resp) if resp.status().is_success() => {
+                let status = resp.status().as_u16();
                 last_report_rtt_ms = Some(report_rtt_millis(started.elapsed()));
+                consecutive_failures = 0;
+                systemd_notify("WATCHDOG=1\nSTATUS=Last report succeeded");
                 println!(
                     "{}",
                     success_log_line(
                         &host,
-                        &endpoint,
+                        &endpoint.safe_origin,
                         status,
                         &report.freshness,
                         report.location.as_ref(),
@@ -1336,18 +1566,33 @@ fn main() {
                         );
                     }
                 }
+                true
             }
-            Err(e) => {
+            Ok(_) => {
                 last_report_rtt_ms = None;
-                eprintln!("pharos-beacon: report to {endpoint} failed: {e}");
-                if interval.is_none() {
-                    std::process::exit(1);
-                }
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                systemd_notify("STATUS=Report failed; retrying");
+                eprintln!("pharos-beacon: report failed (unexpected HTTP status)");
+                false
             }
-        }
-        match interval {
-            Some(s) => std::thread::sleep(std::time::Duration::from_secs(s)),
-            None => break,
+            Err(_) => {
+                last_report_rtt_ms = None;
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                systemd_notify("STATUS=Report failed; retrying");
+                eprintln!("pharos-beacon: report failed (transport or HTTP error)");
+                false
+            }
+        };
+        let Some(cadence) = interval else {
+            if !report_succeeded {
+                std::process::exit(1);
+            }
+            break;
+        };
+        if report_succeeded {
+            thread::sleep(Duration::from_secs(cadence));
+        } else {
+            thread::sleep(retry_delay(cadence, consecutive_failures, jitter_seed()));
         }
     }
 }
@@ -2007,6 +2252,129 @@ mod tests {
         let error =
             run_location_command("/bin/sh", &args, Duration::from_millis(10)).expect_err("timeout");
         assert_eq!(error, "timeout");
+    }
+
+    #[test]
+    fn command_collectors_drain_large_stdout_and_stderr_concurrently() {
+        let block = "x".repeat(60);
+        let location_script =
+            format!("i=0; while [ \"$i\" -lt 1000 ]; do printf '%s' '{block}'; i=$((i+1)); done");
+        let output = run_location_command(
+            "/bin/sh",
+            &["-c".to_string(), location_script],
+            Duration::from_secs(3),
+        )
+        .expect("large output below the limit drains without pipe deadlock");
+        assert_eq!(output.len(), 60_000);
+
+        let capture_script = format!(
+            "i=0; while [ \"$i\" -lt 1500 ]; do printf '%s' '{block}'; i=$((i+1)); done; i=0; while [ \"$i\" -lt 1500 ]; do printf '%s' '{block}' >&2; i=$((i+1)); done"
+        );
+        let capture = run_capture_command(
+            "/bin/sh",
+            &["-c".to_string(), capture_script],
+            Duration::from_secs(3),
+        )
+        .expect("both pipes drain concurrently");
+        assert!(capture.success);
+        assert_eq!(capture.stdout.len(), 90_000);
+        assert_eq!(capture.stderr.len(), 90_000);
+    }
+
+    #[test]
+    fn command_collectors_enforce_output_and_descendant_deadlines() {
+        let block = "x".repeat(60);
+        let oversized =
+            format!("i=0; while [ \"$i\" -lt 1200 ]; do printf '%s' '{block}'; i=$((i+1)); done");
+        assert_eq!(
+            run_location_command(
+                "/bin/sh",
+                &["-c".to_string(), oversized],
+                Duration::from_secs(3)
+            )
+            .expect_err("oversized output is rejected"),
+            "output_limit"
+        );
+
+        let started = Instant::now();
+        let inherited_pipe = vec!["-c".to_string(), "(sleep 2) & printf '{}'".to_string()];
+        assert_eq!(
+            run_location_command("/bin/sh", &inherited_pipe, Duration::from_millis(100))
+                .expect_err("background descendants cannot hold the pipe forever"),
+            "output_timeout"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn report_endpoint_is_https_capable_and_never_exposes_unsafe_components() {
+        let endpoint = report_endpoint("https://pharos.example/base").expect("https endpoint");
+        assert_eq!(endpoint.request_url, "https://pharos.example/base/report");
+        assert_eq!(endpoint.safe_origin, "https://pharos.example");
+        assert!(!endpoint.safe_origin.contains("base"));
+
+        for unsafe_url in [
+            "ftp://pharos.example",
+            "https://user@pharos.example",
+            "https://pharos.example?token=hidden",
+            "https://pharos.example/#fragment",
+            "not a url",
+        ] {
+            assert!(report_endpoint(unsafe_url).is_err());
+        }
+    }
+
+    #[test]
+    fn request_deadlines_and_retry_delays_are_bounded_by_cadence() {
+        for cadence in [MIN_HEARTBEAT_INTERVAL_SECS, 60, MAX_HEARTBEAT_INTERVAL_SECS] {
+            let deadlines = RequestDeadlines::for_cadence(cadence).unwrap();
+            for deadline in [
+                deadlines.connect,
+                deadlines.read,
+                deadlines.write,
+                deadlines.overall,
+            ] {
+                assert!(deadline < Duration::from_secs(cadence));
+                assert!(!deadline.is_zero());
+            }
+            for failure in 1..=100 {
+                assert!(retry_delay(cadence, failure, u64::MAX) < Duration::from_secs(cadence));
+            }
+        }
+        assert!(RequestDeadlines::for_cadence(MIN_HEARTBEAT_INTERVAL_SECS - 1).is_err());
+        assert!(RequestDeadlines::for_cadence(MAX_HEARTBEAT_INTERVAL_SECS + 1).is_err());
+        assert!(retry_delay(60, 2, 0) > retry_delay(60, 1, 0));
+        assert_ne!(retry_delay(60, 1, 0), retry_delay(60, 1, 499));
+    }
+
+    #[test]
+    fn stalled_report_connection_obeys_the_overall_deadline() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture listener");
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept fixture request");
+            thread::sleep(Duration::from_millis(250));
+        });
+        let deadline = Duration::from_millis(50);
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(deadline))
+            .timeout_send_request(Some(deadline))
+            .timeout_send_body(Some(deadline))
+            .timeout_recv_response(Some(deadline))
+            .timeout_recv_body(Some(deadline))
+            .timeout_global(Some(deadline))
+            .max_redirects(0)
+            .build()
+            .into();
+        let started = Instant::now();
+        assert!(agent
+            .post(&format!("http://{address}/report"))
+            .send("{}")
+            .is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
     }
 
     #[test]

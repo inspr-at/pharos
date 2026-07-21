@@ -1,5 +1,14 @@
 # Pharos Changelog
 
+## 0.1.54 - 2026-07-21
+
+- Make report, alert, provider, and workflow persistence crash-safe and fail closed with bounded reads, checksummed durable sidecars, serialized mutation, startup validation, and explicit delivery supervision.
+- Split startup, routing, alerting, provisioning, Janus authentication, and UI rendering into reviewable modules, and move the static interface into separately testable assets without changing route authorization boundaries.
+- Consume Janus beacon verifier generations as immutable snapshots, reject invalid pointers, schemas, digests, permissions, and partial updates, and enforce producer/consumer compatibility against one byte-identical fixture in CI.
+- Add a signed in-process OIDC authorization-code/PKCE end-to-end test, strict browser security-header coverage, report-contract property tests, and real-browser accessibility, focus, responsive, alignment, and visual-regression checks.
+- Pin the Rust and Node toolchains, GitHub Actions, container bases, dependency workaround, and outbound provider behavior; publish vulnerability-scanned images with SPDX SBOM, provenance, and keyless signatures.
+- Enforce warning-free Rust, dependency policy, shell lint/format, 80% line coverage, Nix package builds, hardened self-host container posture, and Linux arm64 image smoke coverage in the release path.
+
 ## 0.1.53 - 2026-07-21
 
 - Make Fleet foreground recovery atomic: stop client-side heartbeat projection, supersede stale requests, apply one authoritative host snapshot, and only then restart the clock.

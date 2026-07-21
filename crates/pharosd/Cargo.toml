@@ -15,9 +15,18 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sha2 = "0.10"
+getrandom = "0.2"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # OIDC (Authorization Code + PKCE) against Zitadel (PHAROS-4). Default features
 # pull reqwest + rustls (ring), so no system OpenSSL — but ring needs a C
 # compiler, hence the non-slim build stage in the Dockerfile.
 openidconnect = "4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+base64 = "=0.22.1"
+rand = "=0.8.6"
+rsa = { version = "=0.9.10", features = ["sha2"] }

@@ -43,14 +43,14 @@ in
 
     url = lib.mkOption {
       type = lib.types.str;
-      default = "http://100.64.0.4:8088";
+      example = "https://pharos.example";
       description = "Base URL of pharosd. The beacon posts reports to /report.";
     };
 
     interval = lib.mkOption {
-      type = lib.types.ints.positive;
+      type = lib.types.ints.between 10 3600;
       default = 60;
-      description = "Heartbeat interval in seconds.";
+      description = "Heartbeat interval in seconds (10–3600).";
     };
 
     hostName = lib.mkOption {
@@ -69,7 +69,7 @@ in
     nixcfgDir = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      example = "/home/mba/Code/nixcfg";
+      example = "/srv/nixcfg";
       description = "Optional nixcfg checkout path used for flake.lock age and commits-behind freshness.";
     };
 
@@ -170,6 +170,9 @@ in
       environment = baseEnvironment;
 
       serviceConfig = {
+        Type = "notify";
+        NotifyAccess = "main";
+        WatchdogSec = "${toString (cfg.interval * 3)}s";
         ExecStart = lib.getExe cfg.package;
         Restart = "always";
         RestartSec = "10s";

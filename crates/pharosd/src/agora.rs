@@ -21,6 +21,7 @@ use crate::{
     host_actions::HostActionStoreError,
     html_escape,
     nixcfg_dispatch::NixcfgDispatchError,
+    store::StoreError,
     AppState, ShellContext,
 };
 
@@ -467,16 +468,27 @@ pub(crate) async fn request_host_preferences(
                 })),
             )
         }
-        Err("host not found") => unreachable!("runtime host checked before workflow dispatch"),
+        Err(StoreError::HostNotFound) => {
+            unreachable!("runtime host checked before workflow dispatch")
+        }
         Err(error) => {
             let failed = state
                 .host_actions
                 .fail_settings_change(&workflow.id, crate::now_unix())
                 .ok();
+            let status = match error {
+                StoreError::InvalidPreferences | StoreError::InvalidContract => {
+                    StatusCode::BAD_REQUEST
+                }
+                StoreError::Persistence(_) | StoreError::InvalidState(_) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                StoreError::HostNotFound => unreachable!("handled above"),
+            };
             (
-                StatusCode::BAD_REQUEST,
+                status,
                 Json(json!({
-                    "error": error,
+                    "error": error.safe_message(),
                     "job": failed.as_ref().map(|job| job.summary()),
                     "workflow_html": failed
                         .as_ref()

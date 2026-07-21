@@ -1,7 +1,5 @@
 use std::cmp::Ordering;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -9,12 +7,13 @@ use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use url::Url;
 
+use crate::durable_file::{atomic_write_json, load_optional_json, DurableFileError};
+
 const STORE_SCHEMA: &str = "inspr.pharos.provider-connection-state.v1";
 const STORE_VERSION: u16 = 1;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PAGES: u32 = 10;
 const PAGE_SIZE: u32 = 50;
-static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -404,18 +403,53 @@ pub(crate) struct ProviderConnectionStore {
     state: RwLock<ProviderConnectionStateFile>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ProviderConnectionStoreError {
+    Persistence(DurableFileError),
+    InvalidState(&'static str),
+}
+
+impl std::fmt::Display for ProviderConnectionStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Persistence(error) => write!(formatter, "{error}"),
+            Self::InvalidState(reason) => {
+                write!(formatter, "invalid provider connection store: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderConnectionStoreError {}
+
+impl From<DurableFileError> for ProviderConnectionStoreError {
+    fn from(error: DurableFileError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
 impl ProviderConnectionStore {
-    pub(crate) fn new(path: Option<PathBuf>) -> Self {
-        let state = path
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice::<ProviderConnectionStateFile>(&bytes).ok())
-            .filter(|state| state.schema == STORE_SCHEMA && state.version == STORE_VERSION)
-            .unwrap_or_default();
-        Self {
+    pub(crate) fn new(path: Option<PathBuf>) -> Result<Self, ProviderConnectionStoreError> {
+        let state = match path.as_deref() {
+            Some(path) => {
+                load_optional_json::<ProviderConnectionStateFile>(path)?.unwrap_or_default()
+            }
+            None => ProviderConnectionStateFile::default(),
+        };
+        if state.schema != STORE_SCHEMA {
+            return Err(ProviderConnectionStoreError::InvalidState(
+                "schema marker does not match",
+            ));
+        }
+        if state.version != STORE_VERSION {
+            return Err(ProviderConnectionStoreError::InvalidState(
+                "schema version is unsupported",
+            ));
+        }
+        Ok(Self {
             path,
             state: RwLock::new(state),
-        }
+        })
     }
 
     pub(crate) fn path_for(host_store_path: Option<&Path>) -> Option<PathBuf> {
@@ -469,18 +503,26 @@ impl ProviderConnectionStore {
             .disconnected_at
     }
 
-    pub(crate) fn record_test(&self, result: HetznerConnectionTestResult) {
-        {
-            let mut state = self.state.write().expect("provider connection store lock");
-            if result.attempt.api_access {
-                state.hetzner_cloud.disconnected_at = None;
-            }
-            if let Some(catalog) = result.catalog {
-                state.hetzner_cloud.catalog = Some(catalog);
-            }
-            state.hetzner_cloud.last_attempt = Some(result.attempt);
+    pub(crate) fn record_test(
+        &self,
+        result: HetznerConnectionTestResult,
+    ) -> Result<(), ProviderConnectionStoreError> {
+        let mut state = self.state.write().expect("provider connection store lock");
+        let previous = state.clone();
+        if result.attempt.api_access {
+            state.hetzner_cloud.disconnected_at = None;
         }
-        self.persist();
+        if let Some(catalog) = result.catalog {
+            state.hetzner_cloud.catalog = Some(catalog);
+        }
+        state.hetzner_cloud.last_attempt = Some(result.attempt);
+        if let Err(error) = self.persist(&state) {
+            if !provider_error_replaced_final_file(&error) {
+                *state = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn update_preferences(
@@ -517,29 +559,39 @@ impl ProviderConnectionStore {
         if !catalog.firewalls.iter().any(|value| value == firewall) {
             return Err(HetznerPreferenceError::InvalidFirewall);
         }
+        let previous = state.clone();
         state.hetzner_cloud.preferences = preferences;
-        drop(state);
-        self.persist();
+        if let Err(error) = self.persist(&state) {
+            if !provider_error_replaced_final_file(&error) {
+                *state = previous;
+            }
+            return Err(HetznerPreferenceError::PersistenceFailed);
+        }
         Ok(())
     }
 
-    pub(crate) fn disconnect(&self, now: i64) {
-        {
-            let mut state = self.state.write().expect("provider connection store lock");
-            state.hetzner_cloud.disconnected_at = Some(now);
-            state.hetzner_cloud.last_attempt = Some(HetznerConnectionAttempt {
-                tested_at: now,
-                code: HetznerConnectionCode::Disconnected,
-                api_access: false,
-                credential_boundary_ready: false,
-                execution_enabled: false,
-                ssh_key_ready: false,
-                firewall_ready: false,
-                default_location_ready: false,
-                catalog_ready: false,
-            });
+    pub(crate) fn disconnect(&self, now: i64) -> Result<(), ProviderConnectionStoreError> {
+        let mut state = self.state.write().expect("provider connection store lock");
+        let previous = state.clone();
+        state.hetzner_cloud.disconnected_at = Some(now);
+        state.hetzner_cloud.last_attempt = Some(HetznerConnectionAttempt {
+            tested_at: now,
+            code: HetznerConnectionCode::Disconnected,
+            api_access: false,
+            credential_boundary_ready: false,
+            execution_enabled: false,
+            ssh_key_ready: false,
+            firewall_ready: false,
+            default_location_ready: false,
+            catalog_ready: false,
+        });
+        if let Err(error) = self.persist(&state) {
+            if !provider_error_replaced_final_file(&error) {
+                *state = previous;
+            }
+            return Err(error);
         }
-        self.persist();
+        Ok(())
     }
 
     pub(crate) fn ready(&self, now: i64, ttl_secs: i64) -> bool {
@@ -567,48 +619,22 @@ impl ProviderConnectionStore {
             .filter(|catalog| evidence_is_fresh(catalog.refreshed_at, now, ttl_secs))
     }
 
-    fn persist(&self) {
-        let Some(path) = &self.path else { return };
-        let state = self
-            .state
-            .read()
-            .expect("provider connection store lock")
-            .clone();
-        let Ok(json) = serde_json::to_vec_pretty(&state) else {
-            return;
+    fn persist(
+        &self,
+        state: &ProviderConnectionStateFile,
+    ) -> Result<(), ProviderConnectionStoreError> {
+        let Some(path) = &self.path else {
+            return Ok(());
         };
-        let result = (|| -> std::io::Result<()> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let counter = PERSIST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            let temporary = path.with_extension(format!(
-                "provider-connection-tmp-{}-{counter}",
-                std::process::id()
-            ));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let write_result = (|| -> std::io::Result<()> {
-                let mut file = options.open(&temporary)?;
-                file.write_all(&json)?;
-                file.sync_all()?;
-                std::fs::rename(&temporary, path)?;
-                Ok(())
-            })();
-            if write_result.is_err() {
-                let _ = std::fs::remove_file(temporary);
-            }
-            write_result
-        })();
-        if result.is_err() {
-            tracing::warn!("failed to durably persist provider connection state");
-        }
+        atomic_write_json(path, state).map_err(ProviderConnectionStoreError::from)
     }
+}
+
+fn provider_error_replaced_final_file(error: &ProviderConnectionStoreError) -> bool {
+    matches!(
+        error,
+        ProviderConnectionStoreError::Persistence(error) if error.final_file_replaced()
+    )
 }
 
 pub(crate) fn evidence_is_fresh(observed_at: i64, now: i64, ttl_secs: i64) -> bool {
@@ -621,6 +647,7 @@ pub(crate) enum HetznerPreferenceError {
     InvalidLocation,
     InvalidSshKey,
     InvalidFirewall,
+    PersistenceFailed,
 }
 
 impl HetznerPreferenceError {
@@ -630,6 +657,9 @@ impl HetznerPreferenceError {
             Self::InvalidLocation => "Choose a currently available Hetzner Cloud location.",
             Self::InvalidSshKey => "Choose an SSH public key returned by Hetzner Cloud.",
             Self::InvalidFirewall => "Choose a firewall returned by Hetzner Cloud.",
+            Self::PersistenceFailed => {
+                "The provider choices could not be durably recorded. Try again after storage is healthy."
+            }
         }
     }
 }
@@ -1268,6 +1298,147 @@ mod tests {
         }
     }
 
+    fn ready_attempt(tested_at: i64) -> HetznerConnectionAttempt {
+        HetznerConnectionAttempt {
+            tested_at,
+            code: HetznerConnectionCode::Ready,
+            api_access: true,
+            credential_boundary_ready: true,
+            execution_enabled: true,
+            ssh_key_ready: true,
+            firewall_ready: true,
+            default_location_ready: true,
+            catalog_ready: true,
+        }
+    }
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-provider-store-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).expect("temporary directory created");
+        path
+    }
+
+    #[test]
+    fn corrupt_or_incompatible_provider_state_rejects_startup() {
+        let directory = temporary_directory("corrupt");
+        let path = directory.join("provider.json");
+        std::fs::write(&path, b"{not-json").expect("corrupt fixture written");
+        assert!(matches!(
+            ProviderConnectionStore::new(Some(path.clone())),
+            Err(ProviderConnectionStoreError::Persistence(
+                DurableFileError::Decode(_)
+            ))
+        ));
+
+        let incompatible = ProviderConnectionStateFile {
+            schema: "unexpected".to_string(),
+            ..ProviderConnectionStateFile::default()
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&incompatible).expect("fixture serializes"),
+        )
+        .expect("incompatible fixture written");
+        assert!(matches!(
+            ProviderConnectionStore::new(Some(path)),
+            Err(ProviderConnectionStoreError::InvalidState(_))
+        ));
+        std::fs::remove_dir_all(directory).expect("temporary directory removed");
+    }
+
+    #[test]
+    fn provider_mutations_roll_back_when_atomic_rename_fails() {
+        let directory = temporary_directory("rollback");
+        let failing_path = directory.join("destination-is-a-directory");
+        std::fs::create_dir(&failing_path).expect("failing destination created");
+        let store = ProviderConnectionStore {
+            path: Some(failing_path),
+            state: RwLock::new(ProviderConnectionStateFile::default()),
+        };
+
+        assert!(store
+            .record_test(HetznerConnectionTestResult {
+                attempt: ready_attempt(1_700_000_000),
+                catalog: Some(catalog_fixture()),
+            })
+            .is_err());
+        assert!(store.last_attempt().is_none());
+        assert!(store.catalog().is_none());
+
+        store
+            .state
+            .write()
+            .expect("provider state lock")
+            .hetzner_cloud
+            .catalog = Some(catalog_fixture());
+        let preferences = HetznerConnectionPreferences {
+            default_location: Some("fsn1".to_string()),
+            ssh_key_ref: Some("pharos-bootstrap-key".to_string()),
+            firewall_ref: Some("pharos-bootstrap-firewall".to_string()),
+        };
+        assert_eq!(
+            store.update_preferences(preferences, 1_700_000_000, 60),
+            Err(HetznerPreferenceError::PersistenceFailed)
+        );
+        assert_eq!(store.preferences(), HetznerConnectionPreferences::default());
+        assert!(store.disconnect(1_700_000_001).is_err());
+        assert!(store.disconnected_at().is_none());
+
+        std::fs::remove_dir_all(directory).expect("temporary directory removed");
+    }
+
+    #[test]
+    fn concurrent_provider_updates_leave_one_complete_reloadable_snapshot() {
+        let directory = temporary_directory("concurrency");
+        let path = directory.join("provider.json");
+        let store = Arc::new(
+            ProviderConnectionStore::new(Some(path.clone()))
+                .expect("provider connection store starts"),
+        );
+        let workers: Vec<_> = (0..20)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    store
+                        .record_test(HetznerConnectionTestResult {
+                            attempt: ready_attempt(1_700_000_000 + index),
+                            catalog: None,
+                        })
+                        .expect("concurrent provider evidence persists");
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("provider worker completes");
+        }
+        let final_attempt = store.last_attempt().expect("final attempt exists");
+        drop(store);
+
+        let reloaded = ProviderConnectionStore::new(Some(path.clone()))
+            .expect("provider connection store reloads");
+        assert_eq!(reloaded.last_attempt(), Some(final_attempt));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("provider snapshot metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(directory).expect("temporary directory removed");
+    }
+
     #[test]
     fn gross_prices_are_normalized_strictly_without_floating_point() {
         for (input, expected) in [
@@ -1445,7 +1616,8 @@ mod tests {
             "pharos-provider-connections-{}-{nanos}.json",
             std::process::id()
         ));
-        let store = ProviderConnectionStore::new(Some(path.clone()));
+        let store = ProviderConnectionStore::new(Some(path.clone()))
+            .expect("provider connection store starts");
         let catalog = HetznerCatalog {
             refreshed_at: 100,
             currency: "EUR".to_string(),
@@ -1474,27 +1646,30 @@ mod tests {
             ssh_keys: vec!["pharos-bootstrap-key".to_string()],
             firewalls: vec!["pharos-bootstrap-firewall".to_string()],
         };
-        store.record_test(HetznerConnectionTestResult {
-            attempt: HetznerConnectionAttempt {
-                tested_at: 100,
-                code: HetznerConnectionCode::Ready,
-                api_access: true,
-                credential_boundary_ready: true,
-                execution_enabled: true,
-                ssh_key_ready: true,
-                firewall_ready: true,
-                default_location_ready: true,
-                catalog_ready: true,
-            },
-            catalog: Some(catalog),
-        });
+        store
+            .record_test(HetznerConnectionTestResult {
+                attempt: HetznerConnectionAttempt {
+                    tested_at: 100,
+                    code: HetznerConnectionCode::Ready,
+                    api_access: true,
+                    credential_boundary_ready: true,
+                    execution_enabled: true,
+                    ssh_key_ready: true,
+                    firewall_ready: true,
+                    default_location_ready: true,
+                    catalog_ready: true,
+                },
+                catalog: Some(catalog),
+            })
+            .expect("provider evidence persists");
         assert!(store.ready(150, 60));
         assert!(!store.ready(161, 60));
 
-        store.disconnect(170);
+        store.disconnect(170).expect("disconnect persists");
         assert!(!store.ready(170, 60));
         assert!(store.catalog_if_fresh(170, 60).is_none());
-        let reloaded = ProviderConnectionStore::new(Some(path.clone()));
+        let reloaded = ProviderConnectionStore::new(Some(path.clone()))
+            .expect("provider connection store reloads");
         assert_eq!(reloaded.disconnected_at(), Some(170));
         let contents = std::fs::read_to_string(&path).expect("state is persisted");
         assert!(!contents.contains(TOKEN));

@@ -19,11 +19,14 @@ services:
     restart: unless-stopped
     environment:
       PHAROS_ADDR: 0.0.0.0:8080
+      PHAROS_PUBLIC_ADDR: 127.0.0.1:8080
+      PHAROS_ALLOW_OPEN: "true"
       RUST_LOG: info
       PHAROS_DB: /data/pharos.json
       # Optional: mount a local manifest directory and set, for example:
       # PHAROS_MANIFEST_PATHS: /manifests/hsb8.json
-      # OIDC/operator policy is intentionally off in local compose.
+      # OIDC/operator policy is intentionally off. Open mode is explicitly
+      # limited to the loopback-only published port above.
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

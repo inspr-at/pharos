@@ -3,12 +3,12 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const mainSource = readFileSync(
-  new URL("../crates/pharosd/src/main.rs", import.meta.url),
+const fleetRuntimeSource = readFileSync(
+  new URL("../crates/pharosd/assets/ui/foot.html", import.meta.url),
   "utf8",
 );
-const lifecycleStart = mainSource.indexOf("const REFRESH_MS=10000;");
-const lifecycleEnd = mainSource.indexOf(
+const lifecycleStart = fleetRuntimeSource.indexOf("const REFRESH_MS=10000;");
+const lifecycleEnd = fleetRuntimeSource.indexOf(
   "document.addEventListener('visibilitychange'",
   lifecycleStart,
 );
@@ -16,7 +16,7 @@ const lifecycleEnd = mainSource.indexOf(
 assert.notEqual(lifecycleStart, -1, "Fleet refresh lifecycle start must exist");
 assert.notEqual(lifecycleEnd, -1, "Fleet refresh lifecycle end must exist");
 
-const lifecycleSource = mainSource.slice(lifecycleStart, lifecycleEnd);
+const lifecycleSource = fleetRuntimeSource.slice(lifecycleStart, lifecycleEnd);
 const exposeTestApi = `
 globalThis.__fleetTest = {
   refresh,

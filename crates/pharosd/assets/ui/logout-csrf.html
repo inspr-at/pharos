@@ -1,0 +1,15 @@
+<script>
+(()=>{
+  const script=document.currentScript;
+  const form=document.querySelector('[data-logout-form]');
+  const input=form?.querySelector('[data-logout-csrf]');
+  if(!form||!input){script?.remove();return}
+  const prefix='__Host-pharos_logout_csrf=';
+  const value=document.cookie.split(';').map(part=>part.trim()).find(part=>part.startsWith(prefix));
+  if(value)input.value=decodeURIComponent(value.slice(prefix.length));
+  form.addEventListener('submit',event=>{
+    if(!input.value){event.preventDefault();window.location.assign('/auth/login')}
+  });
+  script?.remove();
+})();
+</script>
