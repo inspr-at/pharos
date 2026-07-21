@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.52 - 2026-07-21
+
+- Format provider-plan monthly prices with the browser locale, the catalog currency symbol, and exactly two decimal places.
+- Present a completed connection awaiting installation activation as an amber attention gate instead of a red provider failure, while keeping paid execution disabled.
+
 ## 0.1.51 - 2026-07-21
 
 - Treat a verified provider connection as complete independently from the installation's paid-execution switch, while keeping managed creation locked until explicitly enabled.
