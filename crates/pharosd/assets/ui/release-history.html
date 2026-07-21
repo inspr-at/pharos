@@ -1,0 +1,32 @@
+<script>
+(()=>{
+  const script=document.currentScript;
+  const modal=document.querySelector('[data-release-modal]');
+  const open=document.querySelector('[data-release-open]');
+  if(!modal||!open){script?.remove();return}
+  document.body.appendChild(modal);
+  modal.dataset.releasePortal='body';
+  modal.setAttribute('aria-hidden','true');
+  let opener=null;
+  const closeButton=modal.querySelector('.release-close');
+  function show(){
+    opener=document.activeElement;
+    modal.hidden=false;
+    modal.removeAttribute('aria-hidden');
+    document.body.dataset.releaseOpen='true';
+    closeButton?.focus();
+  }
+  function hide(){
+    modal.hidden=true;
+    modal.setAttribute('aria-hidden','true');
+    delete document.body.dataset.releaseOpen;
+    if(opener&&typeof opener.focus==='function')opener.focus();
+  }
+  open.addEventListener('click',show);
+  modal.querySelectorAll('[data-release-close]').forEach(el=>el.addEventListener('click',hide));
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Escape'&&!modal.hidden){event.preventDefault();hide()}
+  });
+  script?.remove();
+})();
+</script>

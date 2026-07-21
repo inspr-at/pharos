@@ -42,7 +42,7 @@ private_mode() {
     return 1
   fi
   [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
-  (( (8#$mode & 077) == 0 ))
+  (((8#$mode & 077) == 0))
 }
 
 not_writable_by_others() {
@@ -55,7 +55,7 @@ not_writable_by_others() {
     return 1
   fi
   [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
-  (( (8#$mode & 022) == 0 ))
+  (((8#$mode & 022) == 0))
 }
 
 flake=""
@@ -70,24 +70,78 @@ dry_run=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --flake) flake="${2:-}"; shift 2 ;;
-    --flake=*) flake="${1#--flake=}"; shift ;;
-    --target) target="${2:-}"; shift 2 ;;
-    --target=*) target="${1#--target=}"; shift ;;
-    --token-file) token_file="${2:-}"; shift 2 ;;
-    --token-file=*) token_file="${1#--token-file=}"; shift ;;
-    --known-hosts) known_hosts="${2:-}"; shift 2 ;;
-    --known-hosts=*) known_hosts="${1#--known-hosts=}"; shift ;;
-    --identity) identity="${2:-}"; shift 2 ;;
-    --identity=*) identity="${1#--identity=}"; shift ;;
-    --port) port="${2:-}"; shift 2 ;;
-    --port=*) port="${1#--port=}"; shift ;;
-    --nixos-anywhere) nixos_anywhere="${2:-}"; shift 2 ;;
-    --nixos-anywhere=*) nixos_anywhere="${1#--nixos-anywhere=}"; shift ;;
-    --verify-timeout) verify_timeout="${2:-}"; shift 2 ;;
-    --verify-timeout=*) verify_timeout="${1#--verify-timeout=}"; shift ;;
-    --dry-run) dry_run=1; shift ;;
-    -h|--help) usage; exit 0 ;;
+    --flake)
+      flake="${2:-}"
+      shift 2
+      ;;
+    --flake=*)
+      flake="${1#--flake=}"
+      shift
+      ;;
+    --target)
+      target="${2:-}"
+      shift 2
+      ;;
+    --target=*)
+      target="${1#--target=}"
+      shift
+      ;;
+    --token-file)
+      token_file="${2:-}"
+      shift 2
+      ;;
+    --token-file=*)
+      token_file="${1#--token-file=}"
+      shift
+      ;;
+    --known-hosts)
+      known_hosts="${2:-}"
+      shift 2
+      ;;
+    --known-hosts=*)
+      known_hosts="${1#--known-hosts=}"
+      shift
+      ;;
+    --identity)
+      identity="${2:-}"
+      shift 2
+      ;;
+    --identity=*)
+      identity="${1#--identity=}"
+      shift
+      ;;
+    --port)
+      port="${2:-}"
+      shift 2
+      ;;
+    --port=*)
+      port="${1#--port=}"
+      shift
+      ;;
+    --nixos-anywhere)
+      nixos_anywhere="${2:-}"
+      shift 2
+      ;;
+    --nixos-anywhere=*)
+      nixos_anywhere="${1#--nixos-anywhere=}"
+      shift
+      ;;
+    --verify-timeout)
+      verify_timeout="${2:-}"
+      shift 2
+      ;;
+    --verify-timeout=*)
+      verify_timeout="${1#--verify-timeout=}"
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -95,27 +149,27 @@ done
 [[ -n "$flake" && "$flake" == *#* ]] || die "--flake must include #HOST"
 [[ "$flake" != *$'\n'* && "$flake" != *$'\r'* ]] || die "--flake contains a newline"
 case "$flake" in
-  *[Tt][Oo][Kk][Ee][Nn]=*|*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]=*|*[Bb][Ee][Aa][Rr][Ee][Rr]' '*)
+  *[Tt][Oo][Kk][Ee][Nn]=* | *[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]=* | *[Bb][Ee][Aa][Rr][Ee][Rr]' '*)
     die "--flake must not contain credential material"
     ;;
 esac
-[[ "$target" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
-  || die "--target must be USER@HOST using plain hostname characters"
-[[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] \
-  || die "--port must be between 1 and 65535"
-[[ "$verify_timeout" =~ ^[0-9]+$ && "$verify_timeout" -ge 30 && "$verify_timeout" -le 1800 ]] \
-  || die "--verify-timeout must be between 30 and 1800 seconds"
-[[ -f "$token_file" && -r "$token_file" && -s "$token_file" ]] \
-  || die "--token-file must be a readable non-empty regular file"
+[[ "$target" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+  die "--target must be USER@HOST using plain hostname characters"
+[[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] ||
+  die "--port must be between 1 and 65535"
+[[ "$verify_timeout" =~ ^[0-9]+$ && "$verify_timeout" -ge 30 && "$verify_timeout" -le 1800 ]] ||
+  die "--verify-timeout must be between 30 and 1800 seconds"
+[[ -f "$token_file" && -r "$token_file" && -s "$token_file" ]] ||
+  die "--token-file must be a readable non-empty regular file"
 private_mode "$token_file" || die "--token-file must not be group/world accessible"
 token_contents="$(<"$token_file")"
-[[ -n "$token_contents" && ${#token_contents} -le 512 ]] \
-  || die "--token-file does not contain one usable token"
-[[ "$token_contents" != *$'\n'* && "$token_contents" != *$'\r'* && "$token_contents" != *[[:space:]]* ]] \
-  || die "--token-file must contain one token without whitespace"
+[[ -n "$token_contents" && ${#token_contents} -le 512 ]] ||
+  die "--token-file does not contain one usable token"
+[[ "$token_contents" != *$'\n'* && "$token_contents" != *$'\r'* && "$token_contents" != *[[:space:]]* ]] ||
+  die "--token-file must contain one token without whitespace"
 unset token_contents
-[[ -f "$known_hosts" && -r "$known_hosts" && -s "$known_hosts" ]] \
-  || die "--known-hosts must be a readable non-empty regular file"
+[[ -f "$known_hosts" && -r "$known_hosts" && -s "$known_hosts" ]] ||
+  die "--known-hosts must be a readable non-empty regular file"
 not_writable_by_others "$known_hosts" || die "--known-hosts must not be group/world writable"
 if [[ -n "$identity" ]]; then
   [[ -f "$identity" && -r "$identity" ]] || die "--identity must be a readable regular file"
@@ -147,6 +201,7 @@ chmod 0600 "$log_file"
 runtime_base="${XDG_RUNTIME_DIR:-/tmp}"
 extra_root="$(mktemp -d "$runtime_base/pharos-nixos-anywhere.XXXXXX")"
 chmod 0700 "$extra_root"
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap below
 cleanup() {
   if [[ -d "$extra_root" ]]; then
     find "$extra_root" -type f -exec chmod u+w '{}' + 2>/dev/null || true
@@ -205,7 +260,7 @@ if [[ -n "$identity" ]]; then
 fi
 
 deadline=$((SECONDS + verify_timeout))
-while (( SECONDS < deadline )); do
+while ((SECONDS < deadline)); do
   if ssh "${ssh_args[@]}" "$target" 'systemctl is-active --quiet pharos-beacon.service' \
     >/dev/null 2>&1; then
     printf 'nixos_bootstrap=ok\n'

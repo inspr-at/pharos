@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 pharos-core = { workspace = true }
 serde_json = { workspace = true }
-# http-only (no TLS): reports to pharosd over the tailnet. Keeps the beacon
-# C-free so it builds in the slim image alongside pharosd.
-ureq = { version = "2", default-features = false }
+libc = "0.2"
+url = "2"
+# rustls-backed TLS keeps HTTPS available without adding an OpenSSL runtime.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }

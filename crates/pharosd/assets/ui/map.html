@@ -1,0 +1,470 @@
+<script>
+const MAP_DATA_URL='/map/data.json';
+const MAP_LEAFLET_CSS='/assets/vendor/leaflet-1.9.4/leaflet.css';
+const MAP_LEAFLET_JS='/assets/vendor/leaflet-1.9.4/leaflet.js';
+const MAP_D3_JS='/assets/vendor/d3-7.9.0/d3.min.js';
+let MAP_HOSTS=[];
+let applyMapFilterNow=null;
+let pendingMapFilter={q:'',live:'all'};
+function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
+function stateVar(live){return live==='awaiting_first_heartbeat'?'wait':live}
+function locationSourceLabel(source){
+  switch(source){
+    case 'wifi':
+    case 'ip':
+      return 'auto';
+    case 'declared':
+      return 'declared';
+    case 'provider':
+      return 'provider';
+    case 'fallback':
+      return 'fallback';
+    default:
+      return 'unknown';
+  }
+}
+function locationSourceTitle(host){
+  const label=locationSourceLabel(host.location_source);
+  const stale=host.location_stale?'stale ':'';
+  const state=host.location_state&&host.location_state!=='observed'?' · '+host.location_state:'';
+  return stale+label+' location'+state;
+}
+function loadStylesheet(href){
+  if(document.querySelector('link[href="'+href+'"]'))return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    const tag=document.createElement('link');
+    tag.rel='stylesheet';
+    tag.href=href;
+    tag.onload=resolve;
+    tag.onerror=()=>reject(new Error('stylesheet failed'));
+    document.head.appendChild(tag);
+  });
+}
+function loadScript(src,ready){
+  if(ready&&ready())return Promise.resolve();
+  if(document.querySelector('script[src="'+src+'"]')){
+    return new Promise(resolve=>{
+      const check=()=>ready&&ready()?resolve():setTimeout(check,30);
+      check();
+    });
+  }
+  return new Promise((resolve,reject)=>{
+    const tag=document.createElement('script');
+    tag.src=src;
+    tag.async=true;
+    tag.onload=resolve;
+    tag.onerror=()=>reject(new Error('script failed'));
+    document.head.appendChild(tag);
+  });
+}
+async function loadMapAssets(){
+  await loadStylesheet(MAP_LEAFLET_CSS);
+  await loadScript(MAP_LEAFLET_JS,()=>Boolean(window.L));
+  await loadScript(MAP_D3_JS,()=>Boolean(window.d3));
+}
+async function loadMapData(){
+  const res=await fetch(MAP_DATA_URL+'?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin'});
+  if(!res.ok)throw new Error('map data failed');
+  const data=await res.json();
+  if(!data||!Array.isArray(data.hosts))throw new Error('map data malformed');
+  return data;
+}
+function setMapLoading(state,message){
+  const panel=document.getElementById('map-panel');
+  const sitePanel=document.querySelector('[data-site-panel]');
+  const note=document.querySelector('[data-map-note]');
+  const text=document.querySelector('[data-map-status-message]');
+  if(panel)panel.dataset.loading=state==='loading'?'true':'false';
+  if(panel)panel.dataset.mapState=state;
+  if(sitePanel)sitePanel.dataset.loading=state==='loading'?'true':'false';
+  if(note&&message)note.textContent=message;
+  if(text&&message)text.textContent=message;
+}
+function siteSkeleton(){
+  return '<div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div>';
+}
+function siteError(message){
+  return '<div class="site-error"><strong>Locations unavailable</strong><span>'+escapeHtml(message||'Map data could not be loaded. Try refreshing this view.')+'</span></div>';
+}
+function siteHostHtml(host){
+  const style='--host-state:var(--'+escapeHtml(stateVar(host.live))+')';
+  const sourceLabel=locationSourceLabel(host.location_source);
+  const sourceTitle=locationSourceTitle(host);
+  return '<a class="site-host" href="'+escapeHtml(host.settings_href)+'" data-host="'+escapeHtml(host.name)+'" data-live="'+escapeHtml(host.live)+'" data-search="'+escapeHtml(host.search||'')+'" style="'+style+'" title="'+escapeHtml(host.name+': '+host.attention+'; '+sourceTitle+'; '+host.inbound_title+'; '+host.outbound_title)+'"><span class="site-host-name">'+escapeHtml(host.name)+'</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="'+escapeHtml(host.inbound_level)+'">in '+escapeHtml(host.inbound_label)+'</span><span class="site-host-ping" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">out '+escapeHtml(host.outbound_label)+'</span><span class="site-host-source" data-location-source="'+escapeHtml(host.location_source)+'" data-location-state="'+escapeHtml(host.location_state)+'" title="'+escapeHtml(sourceTitle)+'">'+escapeHtml(sourceLabel)+'</span></span></a>';
+}
+function renderSiteList(hosts){
+  const target=document.querySelector('[data-site-list]');
+  if(!target)return;
+  if(!hosts.length){
+    target.innerHTML='<div class="site-error"><strong>No mapped hosts</strong><span>Pharos has no host locations to show yet.</span></div>';
+    return;
+  }
+  const bySite=new Map();
+  hosts.forEach(host=>{
+    const key=host.site_id||'unknown';
+    if(!bySite.has(key))bySite.set(key,[]);
+    bySite.get(key).push(host);
+  });
+  const sections=Array.from(bySite.values()).sort((a,b)=>String(a[0].site_label).localeCompare(String(b[0].site_label))).map(siteHosts=>{
+    siteHosts.sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+    const first=siteHosts[0];
+    return '<section class="site-item"><div class="site-head"><div><strong>'+escapeHtml(first.site_label)+'</strong><p>'+escapeHtml(first.region)+'</p></div><span class="site-count">'+siteHosts.length+'</span></div><div class="site-hosts">'+siteHosts.map(siteHostHtml).join('')+'</div></section>';
+  });
+  target.innerHTML=sections.join('');
+}
+function nodeHtml(host){const sourceLabel=locationSourceLabel(host.location_source);const sourceTitle=locationSourceTitle(host);return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-signals"><span class="map-ping" data-dir="in" data-probe-level="'+escapeHtml(host.inbound_level)+'">'+escapeHtml(host.inbound_label)+'</span><span class="map-ping" data-dir="out" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">'+escapeHtml(host.outbound_label)+'</span></span><span class="map-source" data-location-source="'+escapeHtml(host.location_source)+'" data-location-state="'+escapeHtml(host.location_state)+'" title="'+escapeHtml(sourceTitle)+'">'+escapeHtml(sourceLabel)+'</span>'}
+function groupOffsets(hosts){
+  const groups=new Map();
+  hosts.forEach(host=>{
+    const key=Number(host.lat).toFixed(4)+','+Number(host.lon).toFixed(4);
+    if(!groups.has(key))groups.set(key,[]);
+    groups.get(key).push(host.name);
+  });
+  return groups;
+}
+function seedOffset(index,count){
+  if(count<=1)return {x:34,y:-28};
+  const angle=(-Math.PI/2)+(index/count)*Math.PI*2;
+  const radius=42+Math.min(count,6)*6;
+  return {x:Math.cos(angle)*radius,y:Math.sin(angle)*radius};
+}
+function clamp(value,min,max){return Math.max(min,Math.min(max,value))}
+function forceBounds(nodes,width,height){
+  return function(){
+    for(const d of nodes){
+      d.x=clamp(d.x,d.w/2+8,width-d.w/2-8);
+      d.y=clamp(d.y,d.h/2+8,height-d.h/2-8);
+    }
+  }
+}
+function svgEl(name){return document.createElementNS('http://www.w3.org/2000/svg',name)}
+function curvePath(a,b){
+  const dx=b.ax-a.ax;
+  const dy=b.ay-a.ay;
+  const mx=(a.ax+b.ax)/2;
+  const my=(a.ay+b.ay)/2;
+  const len=Math.max(1,Math.hypot(dx,dy));
+  const bend=Math.min(70,Math.max(18,len*.12));
+  const cx=mx+(-dy/len)*bend;
+  const cy=my+(dx/len)*bend;
+  return 'M '+a.ax.toFixed(1)+' '+a.ay.toFixed(1)+' Q '+cx.toFixed(1)+' '+cy.toFixed(1)+' '+b.ax.toFixed(1)+' '+b.ay.toFixed(1);
+}
+function addPacket(path,id,dir,level,policy,reverse){
+  const circle=svgEl('circle');
+  circle.setAttribute('r','3');
+  circle.classList.add('map-packet',dir);
+  circle.dataset.level=level;
+  circle.dataset.policy=policy||'unknown';
+  const motion=svgEl('animateMotion');
+  motion.setAttribute('dur',dir==='inbound'?'3.6s':'2.8s');
+  motion.setAttribute('repeatCount','indefinite');
+  motion.setAttribute('calcMode','linear');
+  if(reverse){
+    motion.setAttribute('keyPoints','1;0');
+    motion.setAttribute('keyTimes','0;1');
+  }
+  const mpath=svgEl('mpath');
+  mpath.setAttribute('href','#'+id);
+  motion.appendChild(mpath);
+  circle.appendChild(motion);
+  path.parentNode.appendChild(circle);
+  return circle;
+}
+function mapHostMatches(host,q,live){return (q===''||String(host.search||'').includes(q))&&(live==='all'||host.live===live)}
+function buildLabels(map,el){
+  const layer=document.createElement('div');
+  layer.className='map-label-layer';
+  const links=svgEl('svg');
+  links.classList.add('map-links');
+  const leaders=svgEl('svg');
+  leaders.classList.add('map-leaders');
+  layer.appendChild(links);
+  layer.appendChild(leaders);
+  el.appendChild(layer);
+  const groups=groupOffsets(MAP_HOSTS);
+  const seen=new Map();
+  const nodes=MAP_HOSTS.map((host,idx)=>{
+    const key=Number(host.lat).toFixed(4)+','+Number(host.lon).toFixed(4);
+    const groupIndex=seen.get(key)||0;
+    seen.set(key,groupIndex+1);
+    const anchor=document.createElement('span');
+    anchor.className='map-anchor '+escapeHtml(host.live);
+    const link=document.createElement('a');
+    link.className='map-node '+escapeHtml(host.live);
+    link.href=host.settings_href;
+    link.dataset.host=host.name;
+    link.dataset.live=host.live;
+    link.dataset.search=host.search||'';
+    link.dataset.mapLayer='managed';
+    link.innerHTML=nodeHtml(host);
+    link.title=host.name+': '+host.status+'; '+locationSourceTitle(host)+'; '+host.inbound_title+'; '+host.outbound_title;
+    link.setAttribute('aria-label',host.name+', '+host.status+', '+locationSourceTitle(host)+', inbound '+host.inbound_label+', outbound '+host.outbound_label);
+    const line=svgEl('line');
+    leaders.appendChild(line);
+    layer.appendChild(anchor);
+    layer.appendChild(link);
+    return {host,idx,anchor,link,line,groupIndex,groupCount:(groups.get(key)||[]).length,visible:true,w:100,h:38,r:58,x:0,y:0,ax:0,ay:0};
+  });
+  const pharosNode=nodes.find(node=>node.host.is_pharos)||nodes[0];
+  const linksByHost=nodes.filter(node=>node!==pharosNode).map((node,idx)=>{
+    const path=svgEl('path');
+    const id='map-link-'+idx;
+    path.id=id;
+    path.classList.add('map-link');
+    path.dataset.inboundLevel=node.host.inbound_level;
+    path.dataset.outboundLevel=node.host.outbound_level;
+    path.dataset.outboundPolicy=node.host.outbound_policy;
+    links.appendChild(path);
+    const packets=[];
+    if(node.host.inbound_level!=='wait')packets.push(addPacket(path,id,'inbound',node.host.inbound_level,node.host.outbound_policy,true));
+    if(node.host.outbound_level==='good')packets.push(addPacket(path,id,'outbound',node.host.outbound_level,node.host.outbound_policy,false));
+    return {node,path,packets};
+  });
+  let scheduled=false;
+  function layout(){
+    scheduled=false;
+    const width=el.clientWidth||800;
+    const height=el.clientHeight||520;
+    links.setAttribute('viewBox','0 0 '+width+' '+height);
+    leaders.setAttribute('viewBox','0 0 '+width+' '+height);
+    const visibleNodes=nodes.filter(node=>node.visible!==false);
+    nodes.filter(node=>node.visible===false).forEach(node=>{
+      node.anchor.hidden=true;
+      node.link.hidden=true;
+      node.line.style.opacity='0';
+    });
+    visibleNodes.forEach(node=>{
+      const point=map.latLngToContainerPoint([node.host.lat,node.host.lon]);
+      const offset=seedOffset(node.groupIndex,node.groupCount);
+      node.ax=point.x;
+      node.ay=point.y;
+      node.anchor.hidden=false;
+      node.link.hidden=false;
+      node.anchor.style.left=point.x+'px';
+      node.anchor.style.top=point.y+'px';
+      node.link.style.transform='translate(-1000px,-1000px)';
+      const rect=node.link.getBoundingClientRect();
+      node.w=rect.width||110;
+      node.h=rect.height||54;
+      node.r=Math.sqrt(node.w*node.w+node.h*node.h)/2+10;
+      node.x=clamp(point.x+offset.x,node.w/2+8,width-node.w/2-8);
+      node.y=clamp(point.y+offset.y,node.h/2+8,height-node.h/2-8);
+    });
+    if(window.d3&&d3.forceSimulation){
+      const simulation=d3.forceSimulation(visibleNodes)
+        .force('x',d3.forceX(d=>d.ax+seedOffset(d.groupIndex,d.groupCount).x).strength(.18))
+        .force('y',d3.forceY(d=>d.ay+seedOffset(d.groupIndex,d.groupCount).y).strength(.18))
+        .force('collide',d3.forceCollide(d=>d.r).strength(1))
+        .force('bounds',forceBounds(visibleNodes,width,height))
+        .stop();
+      for(let i=0;i<90;i++)simulation.tick();
+    }
+    visibleNodes.forEach(node=>{
+      node.x=clamp(node.x,node.w/2+8,width-node.w/2-8);
+      node.y=clamp(node.y,node.h/2+8,height-node.h/2-8);
+      const left=node.x-node.w/2;
+      const top=node.y-node.h/2;
+      node.link.style.transform='translate('+left.toFixed(1)+'px,'+top.toFixed(1)+'px)';
+      const distance=Math.hypot(node.x-node.ax,node.y-node.ay);
+      node.line.setAttribute('x1',node.ax);
+      node.line.setAttribute('y1',node.ay);
+      node.line.setAttribute('x2',node.x);
+      node.line.setAttribute('y2',node.y);
+      node.line.style.opacity=distance>22?'.55':'0';
+    });
+    if(pharosNode){
+      linksByHost.forEach(link=>{
+        const visible=pharosNode.visible!==false&&link.node.visible!==false;
+        link.path.style.display=visible?'':'none';
+        link.packets.forEach(packet=>{packet.style.display=visible?'':'none'});
+        if(!visible)return;
+        link.path.setAttribute('d',curvePath(pharosNode,link.node));
+      });
+    }
+  }
+  function scheduleLayout(){
+    if(scheduled)return;
+    scheduled=true;
+    requestAnimationFrame(layout);
+  }
+  map.on('move zoom moveend zoomend resize viewreset',scheduleLayout);
+  window.addEventListener('resize',scheduleLayout);
+  applyMapFilterNow=(q='',live='all')=>{
+    nodes.forEach(node=>{
+      node.visible=mapHostMatches(node.host,q,live);
+    });
+    scheduleLayout();
+  };
+  window.pharosMapApplyFilter=(q='',live='all')=>{
+    pendingMapFilter={q,live};
+    applyMapFilterNow(q,live);
+  };
+  applyMapFilterNow(pendingMapFilter.q,pendingMapFilter.live);
+  scheduleLayout();
+  return scheduleLayout;
+}
+function fullscreenElement(){return document.fullscreenElement||document.webkitFullscreenElement||null}
+function requestFullscreen(el){
+  if(el.requestFullscreen)return el.requestFullscreen();
+  if(el.webkitRequestFullscreen)return el.webkitRequestFullscreen();
+  return Promise.reject(new Error('Fullscreen is not supported'));
+}
+function exitFullscreen(){
+  if(document.exitFullscreen)return document.exitFullscreen();
+  if(document.webkitExitFullscreen)return document.webkitExitFullscreen();
+  return Promise.resolve();
+}
+const MAP_VIEWPORT_STORAGE='pharos.map.viewport.v1';
+const MAP_MODE_STORAGE='pharos.map.mode.v1';
+const MAP_LABEL_DENSITY_STORAGE='pharos.map.labelDensity.v1';
+function storageGet(key){try{return window.localStorage.getItem(key)}catch(_){return null}}
+function storageSet(key,value){try{window.localStorage.setItem(key,value)}catch(_){}}
+function storedMapMode(){
+  const value=storageGet(MAP_MODE_STORAGE);
+  return value==='maximized'?'maximized':'standard';
+}
+function storeMapMode(mode){
+  storageSet(MAP_MODE_STORAGE,mode==='standard'?'standard':'maximized');
+}
+function storedMapLabelDensity(){
+  return storageGet(MAP_LABEL_DENSITY_STORAGE)==='compact'?'compact':'normal';
+}
+function storeMapLabelDensity(density){
+  storageSet(MAP_LABEL_DENSITY_STORAGE,density==='compact'?'compact':'normal');
+}
+function storedViewport(){
+  try{
+    const raw=storageGet(MAP_VIEWPORT_STORAGE);
+    if(!raw)return null;
+    const parsed=JSON.parse(raw);
+    const lat=Number(parsed.lat);
+    const lon=Number(parsed.lon);
+    const zoom=Number(parsed.zoom);
+    if(!Number.isFinite(lat)||!Number.isFinite(lon)||!Number.isFinite(zoom))return null;
+    if(lat<-90||lat>90||lon<-180||lon>180||zoom<0||zoom>20)return null;
+    return {lat,lon,zoom};
+  }catch(_){
+    return null;
+  }
+}
+function storeViewport(map){
+  const center=map.getCenter();
+  storageSet(MAP_VIEWPORT_STORAGE,JSON.stringify({
+    lat:Number(center.lat.toFixed(5)),
+    lon:Number(center.lng.toFixed(5)),
+    zoom:map.getZoom()
+  }));
+}
+function setupMapModes(map,el,relayout){
+  const panel=document.getElementById('map-panel');
+  const layout=document.querySelector('[data-map-layout]');
+  const main=document.querySelector('[data-map-view]');
+  const buttons=Array.from(document.querySelectorAll('[data-map-mode-button]'));
+  const densityButton=document.querySelector('[data-map-density-button]');
+  if(!panel||!layout||!main||!buttons.length)return;
+  let mode='standard';
+  let beforeFullscreen='standard';
+  function resizeSoon(){
+    const run=()=>{map.invalidateSize();relayout&&relayout()};
+    requestAnimationFrame(run);
+    window.setTimeout(run,90);
+    window.setTimeout(run,260);
+  }
+  function setPressed(next){
+    buttons.forEach(button=>{
+      const active=button.dataset.mapModeButton===next;
+      button.setAttribute('aria-pressed',active?'true':'false');
+    });
+  }
+  function commit(next){
+    mode=next;
+    panel.dataset.mode=next;
+    layout.dataset.mode=next==='fullscreen'?'maximized':next;
+    main.dataset.mapView=next==='standard'?'standard':'maximized';
+    setPressed(next);
+    storeMapMode(next);
+    resizeSoon();
+  }
+  function setMode(next){
+    if(next==='fullscreen'){
+      beforeFullscreen=mode==='fullscreen'?'standard':mode;
+      commit('fullscreen');
+      requestFullscreen(panel).catch(()=>commit('maximized'));
+      return;
+    }
+    if(fullscreenElement()===panel){
+      exitFullscreen().catch(()=>{});
+    }
+    commit(next);
+  }
+  buttons.forEach(button=>{
+    button.addEventListener('click',()=>setMode(button.dataset.mapModeButton||'standard'));
+  });
+  function setDensity(next){
+    const density=next==='compact'?'compact':'normal';
+    panel.dataset.labelDensity=density;
+    if(densityButton)densityButton.setAttribute('aria-pressed',density==='compact'?'true':'false');
+    storeMapLabelDensity(density);
+    resizeSoon();
+  }
+  densityButton?.addEventListener('click',()=>{
+    setDensity(panel.dataset.labelDensity==='compact'?'normal':'compact');
+  });
+  function onFullscreenChange(){
+    if(fullscreenElement()===panel){
+      commit('fullscreen');
+    }else if(mode==='fullscreen'){
+      commit(beforeFullscreen||'standard');
+    }else{
+      resizeSoon();
+    }
+  }
+  document.addEventListener('fullscreenchange',onFullscreenChange);
+  document.addEventListener('webkitfullscreenchange',onFullscreenChange);
+  commit(storedMapMode());
+  setDensity(storedMapLabelDensity());
+}
+function initMap(){
+  const el=document.getElementById('fleet-map');
+  if(!el||!window.L){document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}
+  const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:true,zoomControl:false});
+  L.control.zoom({position:'topleft'}).addTo(map);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:20,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'}).addTo(map);
+  const bounds=MAP_HOSTS.map(host=>[host.lat,host.lon]);
+  const saved=storedViewport();
+  if(saved){map.setView([saved.lat,saved.lon],saved.zoom)}
+  else if(bounds.length===1){map.setView(bounds[0],5)}
+  else if(bounds.length){map.fitBounds(bounds,{padding:[64,64],maxZoom:5})}
+  else{map.setView([20,0],2)}
+  const relayout=buildLabels(map,el);
+  setupMapModes(map,el,relayout);
+  map.on('moveend zoomend',()=>storeViewport(map));
+  storeViewport(map);
+}
+window.pharosMapApplyFilter=(q='',live='all')=>{
+  pendingMapFilter={q,live};
+  if(applyMapFilterNow)applyMapFilterNow(q,live);
+};
+async function bootMap(){
+  setMapLoading('loading','Loading server locations and reachability checks.');
+  const target=document.querySelector('[data-site-list]');
+  if(target)target.innerHTML=siteSkeleton();
+  try{
+    const [data]=await Promise.all([loadMapData(),loadMapAssets()]);
+    MAP_HOSTS=data.hosts;
+    renderSiteList(MAP_HOSTS);
+    initMap();
+    setMapLoading('ready','All servers stay visible; labels are separated by D3 force layout with leader lines.');
+    if(typeof applySurfaceFilters==='function')applySurfaceFilters(false);
+    else window.pharosMapApplyFilter(pendingMapFilter.q,pendingMapFilter.live);
+  }catch(error){
+    setMapLoading('error','Map data is temporarily unavailable. The rest of Pharos remains usable.');
+    const fallback=document.querySelector('[data-map-fallback]');
+    if(fallback)fallback.style.display='grid';
+    const target=document.querySelector('[data-site-list]');
+    if(target)target.innerHTML=siteError(error&&error.message);
+  }
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bootMap,{once:true});
+else bootMap();
+</script>

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pharos-core", "crates/pharosd", "crates/pharos-beacon"]
 
 [workspace.package]
-version = "0.1.53"
+version = "0.1.54"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Markus Barta"]
@@ -17,6 +17,14 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+# num-bigint-dig 0.8.x enables lazy_static's no-std backend even in std builds.
+# Upstream lazy_static still selects yanked spin 0.9.8, so keep its unchanged
+# implementation locally while moving that backend to the compatible maintained
+# spin release. Remove this patch when rsa/openidconnect accepts num-bigint-dig
+# 0.9 or newer.
+lazy_static = { path = "vendor/lazy_static" }
 
 # Janus crates (token issuance/rotation) are wired in PHAROS-8, not the scaffold:
 # janus-warden = { git = "https://github.com/markus-barta/janus" }

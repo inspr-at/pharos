@@ -1,0 +1,120 @@
+<script>
+(()=>{
+  const script=document.currentScript;
+  const sidebar=document.querySelector('[data-sidebar]');
+  const video=sidebar?.querySelector('[data-sidebar-motion]');
+  if(!sidebar||!video){script?.remove();return}
+  const storageKey='pharos.sidebar.still.v1';
+  const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
+  const desktop=window.matchMedia('(min-width: 901px)');
+  const connection=navigator.connection;
+  let toggle=null;
+  let note=null;
+  let playbackFailed=false;
+  let preferStill=false;
+  try{preferStill=localStorage.getItem(storageKey)==='true'}catch(_error){}
+  video.muted=true;
+
+  function savePreference(){
+    try{localStorage.setItem(storageKey,preferStill?'true':'false')}catch(_error){}
+  }
+  function dataSaverEnabled(){return connection?.saveData===true}
+  function systemRequiresStill(){
+    return preferStill||reducedMotion.matches||!desktop.matches||dataSaverEnabled();
+  }
+  function syncToggle(){
+    if(toggle)toggle.checked=preferStill;
+    if(!note)return
+    if(preferStill)note.textContent='Gentle motion is off.';
+    else if(reducedMotion.matches)note.textContent='Motion is off for reduced-motion.';
+    else if(dataSaverEnabled())note.textContent='Motion is off for data saving.';
+    else if(!desktop.matches)note.textContent='Motion is shown on wider screens.';
+    else if(playbackFailed)note.textContent='Motion could not play; using the still image.';
+    else note.textContent='Gentle motion is on.';
+  }
+  function unloadMotion(){
+    video.pause();
+    if(video.hasAttribute('src')){
+      video.removeAttribute('src');
+      video.load();
+    }
+  }
+  function showStill(){
+    sidebar.dataset.sidebarStill='true';
+    delete sidebar.dataset.motionReady;
+    unloadMotion();
+  }
+  function motionFailed(){
+    playbackFailed=true;
+    sidebar.dataset.motionFallback='true';
+    syncToggle();
+    showStill();
+  }
+  function playRejected(error){
+    if(error?.name==='AbortError')return
+    motionFailed();
+  }
+  function requestMotion(){
+    if(!video.canPlayType('video/mp4')){motionFailed();return}
+    if(document.hidden)return
+    sidebar.dataset.sidebarStill='false';
+    delete sidebar.dataset.motionFallback;
+    if(!video.hasAttribute('src')){
+      video.setAttribute('src',video.dataset.src);
+      video.load();
+    }
+    const playing=video.play();
+    if(playing&&typeof playing.catch==='function')playing.catch(playRejected);
+  }
+  function applyPreference(){
+    syncToggle();
+    if(systemRequiresStill()||playbackFailed)showStill();else requestMotion();
+  }
+  function bindToggle(){
+    toggle=document.querySelector('[data-sidebar-still-toggle]');
+    note=document.querySelector('[data-sidebar-still-note]');
+    if(!toggle)return
+    syncToggle();
+    toggle.addEventListener('change',()=>{
+      preferStill=toggle.checked;
+      playbackFailed=false;
+      savePreference();
+      applyPreference();
+    });
+  }
+  function watchMedia(query){
+    if(typeof query.addEventListener==='function')query.addEventListener('change',applyPreference);
+    else if(typeof query.addListener==='function')query.addListener(applyPreference);
+  }
+
+  video.addEventListener('canplay',()=>{
+    if(!systemRequiresStill()&&!playbackFailed)sidebar.dataset.motionReady='true';
+  });
+  video.addEventListener('playing',()=>{
+    if(!systemRequiresStill()&&!playbackFailed)sidebar.dataset.motionReady='true';
+  });
+  video.addEventListener('error',motionFailed);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden)video.pause();else applyPreference();
+  });
+  window.addEventListener('pagehide',()=>video.pause());
+  window.addEventListener('storage',event=>{
+    if(event.key!==storageKey)return
+    preferStill=event.newValue==='true';
+    playbackFailed=false;
+    applyPreference();
+  });
+  watchMedia(reducedMotion);
+  watchMedia(desktop);
+  if(connection&&typeof connection.addEventListener==='function'){
+    connection.addEventListener('change',applyPreference);
+  }
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',bindToggle,{once:true});
+  }else{
+    bindToggle();
+  }
+  applyPreference();
+  script?.remove();
+})();
+</script>

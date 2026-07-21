@@ -6,15 +6,21 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: fetch release tag object
@@ -22,15 +28,15 @@ jobs:
         run: git fetch --quiet --force --no-tags origin "+${GITHUB_REF}:${GITHUB_REF}"
       - name: release consistency
         run: scripts/check-release-consistency.sh
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: version
         run: echo "value=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ghcr.io/markus-barta/pharos/pharosd
@@ -53,14 +59,53 @@ jobs:
             echo "error: could not prove that the semantic image tag is unused" >&2
             exit 1
           fi
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
         with:
           context: .
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           build-args: |
             GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: scan published image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/markus-barta/pharos/pharosd@${{ steps.build.outputs.digest }}
+          version: v0.72.0
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          scanners: vuln
+      - name: generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/markus-barta/pharos/pharosd@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: pharos.spdx.json
+          artifact-name: pharos-${{ steps.version.outputs.value }}.spdx.json
+          syft-version: v1.49.0
+          upload-artifact: true
+          upload-release-assets: false
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ghcr.io/markus-barta/pharos/pharosd
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v3.1.2
+      - name: sign image digest with GitHub OIDC
+        env:
+          IMAGE: ghcr.io/markus-barta/pharos/pharosd
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"

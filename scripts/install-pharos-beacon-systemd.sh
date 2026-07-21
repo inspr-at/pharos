@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install-pharos-beacon-systemd.sh --binary PATH|--binary-url URL --token-env PATH|--token-file PATH [options]
+Usage: install-pharos-beacon-systemd.sh --binary PATH|--binary-url URL --pharos-url URL --token-env PATH|--token-file PATH [options]
 
 Installs pharos-beacon as a native systemd service on non-Nix Linux hosts.
 The token env/file must already exist unless --allow-legacy is set for the
@@ -12,11 +12,12 @@ Host settings are stored privately in /var/lib/pharos-beacon.
 
 Options:
   --binary PATH          Local pharos-beacon binary to install.
-  --binary-url URL       Download pharos-beacon binary from URL.
+  --binary-url URL       Download from an exact HTTPS URL; redirects are refused.
+  --binary-sha256 HEX    Required SHA-256 for every --binary-url download.
   --token-env PATH       Runtime env file containing PHAROS_TOKEN=...
   --token-file PATH      Runtime file containing only the raw token.
   --allow-legacy         Allow install without token env file.
-  --pharos-url URL       pharosd base URL (default: http://100.64.0.4:8088).
+  --pharos-url URL       Required pharosd HTTP(S) base URL.
   --host NAME            Reported host name (default: hostname -s).
   --role ROLE            Reported host role (default: server).
   --interval SECONDS     Heartbeat interval (default: 60).
@@ -42,6 +43,20 @@ validate_no_newline() {
   [[ "$value" != *$'\n'* ]] || die "$name must not contain a newline"
 }
 
+validate_owned_regular_file() {
+  local path="$1" forbidden_mode="$2" label="$3"
+  [[ -f "$path" && -r "$path" && ! -L "$path" ]] ||
+    die "$label must be a readable regular file, not a symlink"
+  local owner mode current_uid
+  owner="$(stat -c '%u' -- "$path")" || die "could not inspect $label owner"
+  mode="$(stat -c '%a' -- "$path")" || die "could not inspect $label mode"
+  current_uid="$(id -u)"
+  [[ "$owner" = "0" || "$owner" = "$current_uid" ]] ||
+    die "$label has an unexpected owner"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "$label mode is invalid"
+  (((8#$mode & forbidden_mode) == 0)) || die "$label permissions are too broad"
+}
+
 systemd_quote() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -51,10 +66,11 @@ systemd_quote() {
 
 binary=""
 binary_url=""
+binary_sha256=""
 token_env=""
 token_file=""
 allow_legacy=0
-pharos_url="${PHAROS_URL:-http://100.64.0.4:8088}"
+pharos_url="${PHAROS_URL:-}"
 host="${PHAROS_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
 role="${PHAROS_ROLE:-server}"
 interval="${PHAROS_INTERVAL:-60}"
@@ -80,6 +96,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --binary-url=*)
       binary_url="${1#--binary-url=}"
+      shift
+      ;;
+    --binary-sha256)
+      binary_sha256="${2:-}"
+      shift 2
+      ;;
+    --binary-sha256=*)
+      binary_sha256="${1#--binary-sha256=}"
       shift
       ;;
     --token-env)
@@ -166,7 +190,7 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
-    -h|--help)
+    -h | --help)
       usage
       exit 0
       ;;
@@ -178,7 +202,12 @@ done
 
 [[ -n "$binary" || -n "$binary_url" ]] || die "set --binary or --binary-url"
 [[ -z "$binary" || -z "$binary_url" ]] || die "set only one of --binary or --binary-url"
-[[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || die "--interval must be a positive integer"
+[[ -n "$pharos_url" ]] || die "set --pharos-url or PHAROS_URL"
+[[ -z "$binary_url" || "$binary_url" = https://* ]] || die "--binary-url must use https"
+[[ -z "$binary_url" || "$binary_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+  die "--binary-url requires --binary-sha256 with 64 lowercase hex characters"
+[[ -n "$binary_url" || -z "$binary_sha256" ]] || die "--binary-sha256 requires --binary-url"
+[[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 10 && "$interval" -le 3600 ]] || die "--interval must be between 10 and 3600 seconds"
 [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]] || die "--host contains unsupported characters"
 [[ "$service_user" =~ ^[A-Za-z_][A-Za-z0-9_-]*[$]?$ ]] || die "--user contains unsupported characters"
 [[ "$prefix" = /* ]] || die "--prefix must be absolute"
@@ -191,23 +220,33 @@ validate_no_newline "PHAROS_URL" "$pharos_url"
 validate_no_newline "PHAROS_HOSTNAME" "$host"
 validate_no_newline "PHAROS_ROLE" "$role"
 validate_no_newline "NIXCFG_DIR" "$nixcfg_dir"
+validate_no_newline "binary URL" "$binary_url"
 
-if [[ -n "$token_env" && ! -r "$token_env" ]]; then
-  die "token env file is not readable: $token_env"
+need_cmd stat
+if [[ -n "$token_env" ]]; then
+  validate_owned_regular_file "$token_env" "$((8#7077))" "token environment file"
 fi
-if [[ -n "$token_file" && ! -r "$token_file" ]]; then
-  die "token file is not readable: $token_file"
+if [[ -n "$token_file" ]]; then
+  validate_owned_regular_file "$token_file" "$((8#7077))" "token file"
 fi
 if [[ -z "$token_env" && -z "$token_file" && "$allow_legacy" -ne 1 ]]; then
   die "set --token-env, --token-file, or explicitly pass --allow-legacy"
 fi
-if [[ -n "$binary" && ! -x "$binary" ]]; then
-  die "binary is not executable: $binary"
+if [[ -n "$binary" ]]; then
+  validate_owned_regular_file "$binary" "$((8#7022))" "beacon binary"
+  [[ -x "$binary" ]] || die "binary is not executable: $binary"
 fi
 
 service_path="/etc/systemd/system/pharos-beacon.service"
 install_path="$prefix/bin/pharos-beacon"
 tmp_binary=""
+
+cleanup() {
+  if [[ -n "$tmp_binary" && -f "$tmp_binary" ]]; then
+    rm -f -- "$tmp_binary"
+  fi
+}
+trap cleanup EXIT
 
 service_contents() {
   cat <<EOF
@@ -217,7 +256,9 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=$((interval * 3))s
 User=$service_user
 Group=$service_user
 Environment=PHAROS_URL=$(systemd_quote "$pharos_url")
@@ -285,8 +326,14 @@ fi
 install -d -m 0755 "$prefix/bin"
 if [[ -n "$binary_url" ]]; then
   need_cmd curl
+  need_cmd sha256sum
   tmp_binary="$(mktemp)"
-  curl -fsSL "$binary_url" -o "$tmp_binary"
+  http_status="$(curl --proto '=https' --tlsv1.2 --silent --show-error \
+    --output "$tmp_binary" --write-out '%{http_code}' "$binary_url")" ||
+    die "binary download failed"
+  [[ "$http_status" =~ ^2[0-9][0-9]$ ]] || die "binary download returned a non-success response"
+  printf '%s  %s\n' "$binary_sha256" "$tmp_binary" | sha256sum -c - >/dev/null ||
+    die "binary checksum verification failed"
   chmod 0755 "$tmp_binary"
   install -m 0755 "$tmp_binary" "$install_path"
 else

@@ -10,3 +10,8 @@ devenv.local.nix
 .env*.local
 result
 result-*
+
+# Browser QA output
+/node_modules
+/playwright-report
+/test-results

@@ -1,0 +1,43 @@
+<script>
+document.querySelectorAll('[data-ops-page]').forEach(root=>{
+  const search=root.querySelector('[data-search]');
+  const rows=[...root.querySelectorAll('[data-ops-row]')];
+  const empty=root.querySelector('[data-ops-empty]');
+  const requestedHost=new URLSearchParams(window.location.search).get('host')?.trim()||'';
+  let active='all';
+  function setFilter(filter){
+    active=filter||'all';
+    root.querySelectorAll('[data-ops-filter]').forEach(button=>{
+      button.setAttribute('aria-pressed',String((button.dataset.opsFilter||'all')===active));
+    });
+    apply();
+  }
+  function apply(){
+    const query=(search?.value||'').trim().toLowerCase();
+    let visible=0;
+    rows.forEach(row=>{
+      const filterOk=active==='all'||row.dataset.opsLevel===active||row.dataset.opsKind===active;
+      const haystack=(row.dataset.hostSearch||row.textContent||'').toLowerCase();
+      const searchOk=!query||haystack.includes(query);
+      const show=filterOk&&searchOk;
+      row.hidden=!show;
+      if(show)visible++;
+    });
+    if(empty)empty.dataset.visible=String(visible===0&&rows.length>0);
+  }
+  root.querySelectorAll('[data-ops-filter]').forEach(button=>{
+    button.addEventListener('click',()=>setFilter(button.dataset.opsFilter||'all'));
+  });
+  search?.addEventListener('input',apply);
+  if(requestedHost&&search)search.value=requestedHost;
+  setFilter('all');
+  if(requestedHost){
+    const normalized=requestedHost.toLowerCase();
+    const target=rows.find(row=>(row.dataset.host||'').toLowerCase()===normalized);
+    if(target){
+      target.dataset.deepLinked='true';
+      requestAnimationFrame(()=>target.scrollIntoView({block:'center',behavior:'smooth'}));
+    }
+  }
+});
+</script>

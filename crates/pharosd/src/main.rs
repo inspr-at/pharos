@@ -9,19 +9,27 @@
 //! is PHAROS-10.
 
 mod agora;
+mod alerting;
+mod alerts;
 mod auth;
+mod durable_file;
 mod host_actions;
 mod icons;
+mod janus_auth;
 mod manifests;
 mod nixcfg_dispatch;
 mod provider_connections;
+mod provisioning;
+mod routes;
+mod startup;
 mod store;
+mod ui;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,9 +37,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
-use axum::extract::{FromRef, Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRef, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
@@ -52,7 +62,8 @@ use pharos_core::{
     ProvisioningReviewedPaidPlan, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
     SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
     EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
-    HOST_MANIFEST_VERSION, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    HOST_MANIFEST_VERSION, MAX_HOST_REGISTRATION_BYTES, MAX_HOST_REPORT_BYTES,
+    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -62,13 +73,16 @@ use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration, MissedTickBehavior};
 use url::Url;
 
-use crate::auth::{access_for_headers, AccessGrant, Auth, AuthState};
+use crate::alerting::*;
+use crate::alerts::{AlertEvent, AlertStore, AlertWorkerHealth};
+use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 use crate::host_actions::{
     AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
     HostActionState, HostActionStore, HostActionStoreError, HostRemovalPlan,
     HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
     RetiredHostStore, RetirementAgentResultRequest,
 };
+use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::nixcfg_dispatch::NixcfgDispatch;
 use crate::provider_connections::{
@@ -80,13 +94,15 @@ use crate::provider_connections::{
 use crate::provider_connections::{
     HetznerCatalog, HetznerLocation, HetznerServerType, HetznerServerTypeLocation,
 };
+use crate::provisioning::*;
+use crate::routes::build_router;
+use crate::startup::*;
 use crate::store::Store;
+use crate::ui::*;
 
 const SERVER_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 const EXISTING_HOST_SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-const ALERT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
-const ALERT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
-
+const EXISTING_HOST_SSH_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Combined app state. Handlers extract `Arc<Store>` or `AuthState` via `FromRef`.
 #[derive(Clone)]
 struct AppState {
@@ -102,6 +118,7 @@ struct AppState {
     retirement_owner: RetirementOwnerAuth,
     host_actions: Arc<HostActionStore>,
     retired_hosts: Arc<RetiredHostStore>,
+    alert_health: AlertWorkerHealth,
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -122,4086 +139,92 @@ impl FromRef<AppState> for Arc<ManifestRegistry> {
     }
 }
 
-const PROVISIONING_JOB_SNAPSHOT_SCHEMA: &str = "inspr.pharos.provisioning-jobs-snapshot.v1";
-const PROVISIONING_JOB_SNAPSHOT_VERSION: u16 = 1;
-const PROVISIONING_JOB_STORE_MARKER_SCHEMA: &str = "inspr.pharos.provisioning-jobs-store.v1";
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProvisioningJobSnapshot {
-    schema: String,
-    version: u16,
-    store_id: String,
-    jobs: Vec<ProvisioningJob>,
-    content_sha256: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProvisioningJobStoreMarker {
-    schema: String,
-    version: u16,
-    store_id: String,
-}
-
-fn provisioning_job_store_marker_path(path: &Path) -> PathBuf {
-    let mut marker = path.as_os_str().to_os_string();
-    marker.push(".initialized");
-    PathBuf::from(marker)
-}
-
-fn provisioning_snapshot_digest(
-    store_id: &str,
-    jobs: &[ProvisioningJob],
-) -> Result<String, String> {
-    let encoded = serde_json::to_vec(jobs)
-        .map_err(|_| "provisioning jobs could not be encoded".to_string())?;
-    let mut digest = Sha256::new();
-    digest.update(b"pharos.provisioning-jobs-snapshot.v1\0");
-    digest.update(store_id.as_bytes());
-    digest.update(b"\0");
-    digest.update(encoded);
-    Ok(hex(&digest.finalize()))
-}
-
-fn validate_provisioning_jobs(
-    snapshot: Vec<ProvisioningJob>,
-) -> Result<BTreeMap<String, ProvisioningJob>, String> {
-    let mut jobs = BTreeMap::new();
-    let valid = snapshot.into_iter().all(|job| {
-        let valid = job.validate_contract().is_ok()
-            && paid_job_integrity_valid(&job)
-            && !jobs.contains_key(&job.id);
-        if valid {
-            jobs.insert(job.id.clone(), job);
-        }
-        valid
-    });
-    if valid {
-        Ok(jobs)
-    } else {
-        Err("provisioning job snapshot failed validation".to_string())
-    }
-}
-
-fn new_provisioning_store_id() -> Result<String, String> {
-    let mut bytes = [0_u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .map_err(|_| "provisioning store identity could not be generated".to_string())?;
-    Ok(hex(&bytes))
-}
-
-fn atomic_write_provisioning_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|_| "provisioning job directory is unavailable".to_string())?;
-    }
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let temporary = path.with_extension(format!("pharos-tmp-{}-{nonce}", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map_err(|_| "provisioning jobs could not be durably stored".to_string())
-}
-
-fn write_provisioning_snapshot(
-    path: &Path,
-    store_id: &str,
-    jobs: &BTreeMap<String, ProvisioningJob>,
-) -> Result<(), String> {
-    let jobs = jobs.values().cloned().collect::<Vec<_>>();
-    let snapshot = ProvisioningJobSnapshot {
-        schema: PROVISIONING_JOB_SNAPSHOT_SCHEMA.to_string(),
-        version: PROVISIONING_JOB_SNAPSHOT_VERSION,
-        store_id: store_id.to_string(),
-        content_sha256: provisioning_snapshot_digest(store_id, &jobs)?,
-        jobs,
-    };
-    let encoded = serde_json::to_vec_pretty(&snapshot)
-        .map_err(|_| "provisioning jobs could not be encoded".to_string())?;
-    atomic_write_provisioning_file(path, &encoded)
-}
-
-fn ensure_provisioning_store_marker(path: &Path, store_id: &str) -> Result<(), String> {
-    let marker_path = provisioning_job_store_marker_path(path);
-    match std::fs::read(&marker_path) {
-        Ok(bytes) => {
-            let marker = serde_json::from_slice::<ProvisioningJobStoreMarker>(&bytes)
-                .map_err(|_| "provisioning store marker is malformed".to_string())?;
-            if marker.schema != PROVISIONING_JOB_STORE_MARKER_SCHEMA
-                || marker.version != PROVISIONING_JOB_SNAPSHOT_VERSION
-                || marker.store_id != store_id
-                || !is_sha256_hex(&marker.store_id)
-                || marker
-                    .store_id
-                    .bytes()
-                    .any(|byte| byte.is_ascii_uppercase())
-            {
-                return Err("provisioning store marker failed validation".to_string());
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let marker = ProvisioningJobStoreMarker {
-                schema: PROVISIONING_JOB_STORE_MARKER_SCHEMA.to_string(),
-                version: PROVISIONING_JOB_SNAPSHOT_VERSION,
-                store_id: store_id.to_string(),
-            };
-            let encoded = serde_json::to_vec_pretty(&marker)
-                .map_err(|_| "provisioning store marker could not be encoded".to_string())?;
-            atomic_write_provisioning_file(&marker_path, &encoded)
-        }
-        Err(_) => Err("provisioning store marker is unreadable".to_string()),
-    }
-}
-
-fn decode_provisioning_snapshot(
-    bytes: &[u8],
-    expected_store_id: Option<&str>,
-) -> Result<(BTreeMap<String, ProvisioningJob>, String), String> {
-    let snapshot = serde_json::from_slice::<ProvisioningJobSnapshot>(bytes)
-        .map_err(|_| "provisioning job snapshot is malformed".to_string())?;
-    if snapshot.schema != PROVISIONING_JOB_SNAPSHOT_SCHEMA
-        || snapshot.version != PROVISIONING_JOB_SNAPSHOT_VERSION
-        || !is_sha256_hex(&snapshot.store_id)
-        || snapshot
-            .store_id
-            .bytes()
-            .any(|byte| byte.is_ascii_uppercase())
-        || !is_sha256_hex(&snapshot.content_sha256)
-        || snapshot
-            .content_sha256
-            .bytes()
-            .any(|byte| byte.is_ascii_uppercase())
-        || expected_store_id.is_some_and(|expected| expected != snapshot.store_id)
-        || provisioning_snapshot_digest(&snapshot.store_id, &snapshot.jobs)?
-            != snapshot.content_sha256
-    {
-        return Err("provisioning job snapshot failed integrity validation".to_string());
-    }
-    let store_id = snapshot.store_id;
-    let jobs = validate_provisioning_jobs(snapshot.jobs)?;
-    Ok((jobs, store_id))
-}
-
-struct ProvisioningJobStore {
-    path: Option<PathBuf>,
-    store_id: Option<String>,
-    durable_ready: AtomicBool,
-    jobs: RwLock<BTreeMap<String, ProvisioningJob>>,
-    persistence_lock: Mutex<()>,
-    cleanup_claims: Mutex<BTreeSet<String>>,
-    counter: AtomicU64,
-}
-
-impl ProvisioningJobStore {
-    fn new(path: Option<PathBuf>) -> Self {
-        let (jobs, store_id, durable_ready) = match path.as_ref() {
-            None => (BTreeMap::new(), None, false),
-            Some(path) => {
-                let marker_path = provisioning_job_store_marker_path(path);
-                let loaded = (|| -> Result<(BTreeMap<String, ProvisioningJob>, String), String> {
-                    let marker = match std::fs::read(&marker_path) {
-                        Ok(bytes) => {
-                            let marker =
-                                serde_json::from_slice::<ProvisioningJobStoreMarker>(&bytes)
-                                    .map_err(|_| {
-                                        "provisioning store marker is malformed".to_string()
-                                    })?;
-                            if marker.schema != PROVISIONING_JOB_STORE_MARKER_SCHEMA
-                                || marker.version != PROVISIONING_JOB_SNAPSHOT_VERSION
-                                || !is_sha256_hex(&marker.store_id)
-                                || marker
-                                    .store_id
-                                    .bytes()
-                                    .any(|byte| byte.is_ascii_uppercase())
-                            {
-                                return Err(
-                                    "provisioning store marker failed validation".to_string()
-                                );
-                            }
-                            Some(marker)
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(_) => return Err("provisioning store marker is unreadable".to_string()),
-                    };
-                    let marker_expected = marker.as_ref().map(|marker| marker.store_id.as_str());
-                    match std::fs::read(path) {
-                        Ok(bytes) => {
-                            decode_provisioning_snapshot(&bytes, marker_expected).or_else(|_| {
-                                if marker.is_some() {
-                                    return Err(
-                                        "initialized snapshot is not a valid envelope".to_string()
-                                    );
-                                }
-                                let legacy = serde_json::from_slice::<Vec<ProvisioningJob>>(&bytes)
-                                    .map_err(|_| {
-                                        "legacy provisioning snapshot is malformed".to_string()
-                                    })?;
-                                let jobs = validate_provisioning_jobs(legacy)?;
-                                let store_id = new_provisioning_store_id()?;
-                                write_provisioning_snapshot(path, &store_id, &jobs)?;
-                                Ok((jobs, store_id))
-                            })
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            if marker.is_some() {
-                                Err("initialized provisioning snapshot is missing".to_string())
-                            } else {
-                                let jobs = BTreeMap::new();
-                                let store_id = new_provisioning_store_id()?;
-                                write_provisioning_snapshot(path, &store_id, &jobs)?;
-                                Ok((jobs, store_id))
-                            }
-                        }
-                        Err(_) => Err("provisioning job snapshot is unreadable".to_string()),
-                    }
-                })();
-                match loaded {
-                    Ok((jobs, store_id)) => {
-                        if ensure_provisioning_store_marker(path, &store_id).is_ok() {
-                            (jobs, Some(store_id), true)
-                        } else {
-                            tracing::error!(path = %path.display(), "provisioning store marker could not be validated; paid provider actions are disabled");
-                            (BTreeMap::new(), None, false)
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(path = %path.display(), error = %error, "provisioning job snapshot failed validation; paid provider actions are disabled");
-                        (BTreeMap::new(), None, false)
-                    }
-                }
-            }
-        };
-        Self {
-            path,
-            store_id,
-            durable_ready: AtomicBool::new(durable_ready),
-            jobs: RwLock::new(jobs),
-            persistence_lock: Mutex::new(()),
-            cleanup_claims: Mutex::new(BTreeSet::new()),
-            counter: AtomicU64::new(1),
-        }
-    }
-
-    fn durable_ready(&self) -> bool {
-        self.path.is_some() && self.durable_ready.load(Ordering::Acquire)
-    }
-
-    fn require_durable(&self) -> Result<(), ProvisioningPaidStoreError> {
-        if self.durable_ready() {
-            Ok(())
-        } else {
-            Err(ProvisioningPaidStoreError::PersistenceFailed)
-        }
-    }
-
-    fn start(
-        &self,
-        request: &ProvisioningJobStartRequest,
-        now: i64,
-        provider_runtime: &ProviderRuntimeConfig,
-    ) -> Result<ProvisioningJob, ProvisioningJobStartError> {
-        if request.provider == "hetzner-cloud" && !self.durable_ready() {
-            return Err(ProvisioningJobStartError::PersistenceFailed);
-        }
-        if !valid_setup_provider(&request.provider) {
-            return Err(ProvisioningJobStartError::UnsupportedProvider);
-        }
-        if !valid_setup_template(&request.provider, &request.template) {
-            return Err(ProvisioningJobStartError::UnsupportedTemplate);
-        }
-        let id = loop {
-            let candidate = format!(
-                "setup-{now}-{}",
-                self.counter.fetch_add(1, Ordering::Relaxed)
-            );
-            if !self
-                .jobs
-                .read()
-                .expect("provisioning job store lock")
-                .contains_key(&candidate)
-            {
-                break candidate;
-            }
-        };
-        let (state, progress) = provisioning_job_progress(request, provider_runtime, now);
-        let handoff = provisioning_job_handoff(request);
-        let setup_intent = provisioning_setup_intent(request);
-        let backup_proposal = provisioning_backup_proposal(request);
-        let existing_host_context = provisioning_existing_host_context(request);
-        let host_name = request
-            .host_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let role = request
-            .role
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let job = ProvisioningJob {
-            schema: PROVISIONING_JOB_SCHEMA.to_string(),
-            version: PROVISIONING_JOB_VERSION,
-            id,
-            provider: request.provider.to_string(),
-            template: request.template.to_string(),
-            host_name,
-            role,
-            is_nix: request.is_nix,
-            heartbeat_interval_secs: request.heartbeat_interval_secs.filter(|value| *value > 0),
-            existing_host_context,
-            state,
-            terminal_outcome: None,
-            created_at: now,
-            updated_at: now,
-            handoff,
-            setup_intent,
-            backup_proposal,
-            reviewed_plan: None,
-            paid_authorization: None,
-            paid_execution: None,
-            provider_resources: vec![],
-            progress,
-        };
-        job.validate_contract()
-            .map_err(|_| ProvisioningJobStartError::InvalidJob)?;
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let previous = jobs.insert(job.id.clone(), job.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            if let Some(previous) = previous {
-                jobs.insert(job.id.clone(), previous);
-            } else {
-                jobs.remove(&job.id);
-            }
-            return Err(ProvisioningJobStartError::PersistenceFailed);
-        }
-        Ok(job)
-    }
-
-    fn get(&self, id: &str) -> Option<ProvisioningJob> {
-        self.jobs
-            .read()
-            .expect("provisioning job store lock")
-            .get(id)
-            .cloned()
-    }
-
-    fn list(&self) -> Vec<ProvisioningJob> {
-        self.jobs
-            .read()
-            .expect("provisioning job store lock")
-            .values()
-            .cloned()
-            .collect()
-    }
-
-    fn paid_project_blocked(&self, except_id: Option<&str>) -> bool {
-        let jobs = self.jobs.read().expect("provisioning job store lock");
-        paid_project_blocked_in(&jobs, except_id)
-    }
-
-    fn attach_paid_review(
-        &self,
-        id: &str,
-        reviewed_plan: ProvisioningReviewedPaidPlan,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        self.require_durable()?;
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        if paid_project_blocked_in(&jobs, Some(id)) {
-            return Err(ProvisioningPaidStoreError::ProjectBusy);
-        }
-        let previous = jobs
-            .get(id)
-            .cloned()
-            .ok_or(ProvisioningPaidStoreError::NotFound)?;
-        if previous.provider != "hetzner-cloud"
-            || previous.state != ProvisioningJobState::Planning
-            || previous.reviewed_plan.is_some()
-            || previous.paid_authorization.is_some()
-            || previous.paid_execution.is_some()
-        {
-            return Err(ProvisioningPaidStoreError::InvalidState);
-        }
-        let mut updated = previous.clone();
-        updated.reviewed_plan = Some(reviewed_plan);
-        updated.updated_at = now.max(updated.created_at);
-        updated.progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::Planning,
-            message: "Exact paid provider plan stored for separate attended approval; no provider resource was created.".to_string(),
-            observed_at: now,
-        });
-        updated
-            .validate_contract()
-            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
-        if !paid_job_integrity_valid(&updated) {
-            return Err(ProvisioningPaidStoreError::ContractFailed);
-        }
-        jobs.insert(id.to_string(), updated.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            jobs.insert(id.to_string(), previous);
-            return Err(ProvisioningPaidStoreError::PersistenceFailed);
-        }
-        Ok(updated)
-    }
-
-    fn confirm_paid_review(
-        &self,
-        id: &str,
-        plan_sha256: &str,
-        operator_ref: &str,
-        operator_label: &str,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        self.require_durable()?;
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        if paid_project_blocked_in(&jobs, Some(id)) {
-            return Err(ProvisioningPaidStoreError::ProjectBusy);
-        }
-        let previous = jobs
-            .get(id)
-            .cloned()
-            .ok_or(ProvisioningPaidStoreError::NotFound)?;
-        let reviewed = previous
-            .reviewed_plan
-            .as_ref()
-            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
-        if reviewed.plan_sha256 != plan_sha256 || reviewed_paid_plan_digest(reviewed) != plan_sha256
-        {
-            return Err(ProvisioningPaidStoreError::PlanMismatch);
-        }
-        if now >= reviewed.expires_at {
-            return Err(ProvisioningPaidStoreError::Expired);
-        }
-        if let Some(authorization) = &previous.paid_authorization {
-            return if authorization.plan_sha256 == plan_sha256
-                && authorization.operator_ref == operator_ref
-            {
-                Ok(previous)
-            } else {
-                Err(ProvisioningPaidStoreError::OperatorMismatch)
-            };
-        }
-        if previous.state != ProvisioningJobState::Planning || previous.paid_execution.is_some() {
-            return Err(ProvisioningPaidStoreError::InvalidState);
-        }
-        let mut updated = previous.clone();
-        updated.paid_authorization = Some(ProvisioningPaidAuthorization {
-            plan_sha256: plan_sha256.to_string(),
-            operator_ref: operator_ref.to_string(),
-            operator_label: operator_label.to_string(),
-            confirmed_at: now,
-            expires_at: reviewed.expires_at,
-        });
-        updated.updated_at = now;
-        updated.progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::Planning,
-            message: "Attended authorization stored for this exact plan; no provider resource was created and billing has not started.".to_string(),
-            observed_at: now,
-        });
-        updated
-            .validate_contract()
-            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
-        if !paid_job_integrity_valid(&updated) {
-            return Err(ProvisioningPaidStoreError::ContractFailed);
-        }
-        jobs.insert(id.to_string(), updated.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            jobs.insert(id.to_string(), previous);
-            return Err(ProvisioningPaidStoreError::PersistenceFailed);
-        }
-        Ok(updated)
-    }
-
-    fn claim_paid_execution(
-        &self,
-        id: &str,
-        plan_sha256: &str,
-        operator_ref: &str,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        self.require_durable()?;
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        if paid_project_blocked_in(&jobs, Some(id)) {
-            return Err(ProvisioningPaidStoreError::ProjectBusy);
-        }
-        let previous = jobs
-            .get(id)
-            .cloned()
-            .ok_or(ProvisioningPaidStoreError::NotFound)?;
-        let reviewed = previous
-            .reviewed_plan
-            .as_ref()
-            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
-        let authorization = previous
-            .paid_authorization
-            .as_ref()
-            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
-        if reviewed.plan_sha256 != plan_sha256
-            || authorization.plan_sha256 != plan_sha256
-            || reviewed_paid_plan_digest(reviewed) != plan_sha256
-        {
-            return Err(ProvisioningPaidStoreError::PlanMismatch);
-        }
-        if authorization.operator_ref != operator_ref {
-            return Err(ProvisioningPaidStoreError::OperatorMismatch);
-        }
-        if now >= authorization.expires_at {
-            return Err(ProvisioningPaidStoreError::Expired);
-        }
-        if previous.paid_execution.is_some() {
-            return Ok(previous);
-        }
-        if previous.state != ProvisioningJobState::Planning {
-            return Err(ProvisioningPaidStoreError::InvalidState);
-        }
-        let attempt_id = format!("{}-1", previous.id);
-        let mut updated = previous.clone();
-        updated.state = ProvisioningJobState::Provisioning;
-        updated.updated_at = now;
-        updated.paid_execution = Some(ProvisioningPaidExecution {
-            plan_sha256: plan_sha256.to_string(),
-            attempt_id,
-            state: "claimed".to_string(),
-            claimed_at: now,
-            provider_request_started_at: None,
-            provider_id: None,
-        });
-        updated.progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::Provisioning,
-            message: "Single-use paid create claimed durably; final live provider checks are running before any create request.".to_string(),
-            observed_at: now,
-        });
-        updated
-            .validate_contract()
-            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
-        if !paid_job_integrity_valid(&updated) {
-            return Err(ProvisioningPaidStoreError::ContractFailed);
-        }
-        jobs.insert(id.to_string(), updated.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            jobs.insert(id.to_string(), previous);
-            return Err(ProvisioningPaidStoreError::PersistenceFailed);
-        }
-        Ok(updated)
-    }
-
-    fn mark_paid_request_started(
-        &self,
-        id: &str,
-        plan_sha256: &str,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        self.update_paid_execution(id, plan_sha256, now, true, |execution| {
-            if execution.state != "claimed" {
-                return Err(ProvisioningPaidStoreError::InvalidState);
-            }
-            execution.state = "request-started".to_string();
-            execution.provider_request_started_at = Some(now);
-            Ok((
-                ProvisioningJobState::Provisioning,
-                "Final checks passed; the one authorized provider create request has started."
-                    .to_string(),
-            ))
-        })
-    }
-
-    fn fail_paid_execution(
-        &self,
-        id: &str,
-        plan_sha256: &str,
-        uncertain: bool,
-        message: String,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        self.update_paid_execution(id, plan_sha256, now, false, |execution| {
-            execution.state = if uncertain {
-                "uncertain"
-            } else {
-                "failed-closed"
-            }
-            .to_string();
-            Ok((
-                if uncertain {
-                    ProvisioningJobState::CleanupNeeded
-                } else {
-                    ProvisioningJobState::Failed
-                },
-                message,
-            ))
-        })
-    }
-
-    fn update_paid_execution(
-        &self,
-        id: &str,
-        plan_sha256: &str,
-        now: i64,
-        require_unexpired: bool,
-        update: impl FnOnce(
-            &mut ProvisioningPaidExecution,
-        )
-            -> Result<(ProvisioningJobState, String), ProvisioningPaidStoreError>,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        self.require_durable()?;
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let previous = jobs
-            .get(id)
-            .cloned()
-            .ok_or(ProvisioningPaidStoreError::NotFound)?;
-        let mut updated = previous.clone();
-        if require_unexpired
-            && updated
-                .paid_authorization
-                .as_ref()
-                .is_none_or(|authorization| now >= authorization.expires_at)
-        {
-            return Err(ProvisioningPaidStoreError::Expired);
-        }
-        let execution = updated
-            .paid_execution
-            .as_mut()
-            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
-        if execution.plan_sha256 != plan_sha256 {
-            return Err(ProvisioningPaidStoreError::PlanMismatch);
-        }
-        let (state, message) = update(execution)?;
-        updated.state = state;
-        updated.updated_at = now;
-        updated.progress.push(ProvisioningProgressEntry {
-            state,
-            message,
-            observed_at: now,
-        });
-        updated
-            .validate_contract()
-            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
-        if !paid_job_integrity_valid(&updated) {
-            return Err(ProvisioningPaidStoreError::ContractFailed);
-        }
-        jobs.insert(id.to_string(), updated.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            jobs.insert(id.to_string(), previous);
-            return Err(ProvisioningPaidStoreError::PersistenceFailed);
-        }
-        Ok(updated)
-    }
-
-    fn complete_paid_create(
-        &self,
-        id: &str,
-        plan_sha256: &str,
-        resource: ProvisioningProviderResource,
-        handoff: Option<ProvisioningHandoff>,
-        reconciled: bool,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        self.require_durable()?;
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let previous = jobs
-            .get(id)
-            .cloned()
-            .ok_or(ProvisioningPaidStoreError::NotFound)?;
-        let mut updated = previous.clone();
-        let execution = updated
-            .paid_execution
-            .as_mut()
-            .ok_or(ProvisioningPaidStoreError::InvalidState)?;
-        if execution.plan_sha256 != plan_sha256
-            || !matches!(execution.state.as_str(), "request-started" | "uncertain")
-        {
-            return Err(ProvisioningPaidStoreError::InvalidState);
-        }
-        execution.state = if reconciled { "reconciled" } else { "created" }.to_string();
-        execution.provider_id = Some(resource.provider_id.clone());
-        updated.state = if handoff.is_some() {
-            ProvisioningJobState::WaitingForHeartbeat
-        } else {
-            ProvisioningJobState::CleanupNeeded
-        };
-        updated.updated_at = now;
-        updated.provider_resources.clear();
-        updated.provider_resources.push(resource);
-        if handoff.is_some() {
-            updated.handoff = handoff;
-        }
-        updated.progress.push(ProvisioningProgressEntry {
-            state: updated.state,
-            message: if reconciled {
-                "The single provider server was reconciled by its required ownership labels and reviewed server facts; no duplicate request was sent."
-            } else {
-                "The single authorized provider server was created and durably recorded."
-            }
-            .to_string(),
-            observed_at: now,
-        });
-        updated
-            .validate_contract()
-            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
-        if !paid_job_integrity_valid(&updated) {
-            return Err(ProvisioningPaidStoreError::ContractFailed);
-        }
-        jobs.insert(id.to_string(), updated.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            jobs.insert(id.to_string(), previous);
-            return Err(ProvisioningPaidStoreError::PersistenceFailed);
-        }
-        Ok(updated)
-    }
-
-    fn append_progress(
-        &self,
-        id: &str,
-        state: ProvisioningJobState,
-        message: impl Into<String>,
-        now: i64,
-    ) -> Option<ProvisioningJob> {
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let job = jobs.get_mut(id)?;
-        job.state = state;
-        job.updated_at = now;
-        job.progress.push(ProvisioningProgressEntry {
-            state,
-            message: message.into(),
-            observed_at: now,
-        });
-        if job.validate_contract().is_err() {
-            return None;
-        }
-        let job = job.clone();
-        let _ = self.persist_jobs(&jobs);
-        Some(job)
-    }
-
-    fn claim_provider_cleanup(&self, id: &str) -> bool {
-        self.cleanup_claims
-            .lock()
-            .expect("provider cleanup claim lock")
-            .insert(id.to_string())
-    }
-
-    fn release_provider_cleanup(&self, id: &str) {
-        self.cleanup_claims
-            .lock()
-            .expect("provider cleanup claim lock")
-            .remove(id);
-    }
-
-    fn begin_provider_cleanup(
-        &self,
-        id: &str,
-        provider_id: &str,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let current = jobs
-            .get(id)
-            .cloned()
-            .ok_or(ProvisioningPaidStoreError::NotFound)?;
-        if current.reviewed_plan.is_some() {
-            self.require_durable()?;
-        }
-        if !matches!(
-            current.state,
-            ProvisioningJobState::WaitingForHeartbeat | ProvisioningJobState::CleanupNeeded
-        ) {
-            return Err(ProvisioningPaidStoreError::InvalidState);
-        }
-        let matching: Vec<&ProvisioningProviderResource> = current
-            .provider_resources
-            .iter()
-            .filter(|resource| {
-                resource.provider == "hetzner-cloud"
-                    && resource.kind == "server"
-                    && resource.provider_id == provider_id
-                    && matches!(
-                        resource.state.as_str(),
-                        "created" | "created-address-pending"
-                    )
-            })
-            .collect();
-        if current.provider_resources.len() != 1 || matching.len() != 1 {
-            return Err(ProvisioningPaidStoreError::InvalidState);
-        }
-
-        let mut updated = current.clone();
-        updated.state = ProvisioningJobState::CleanupNeeded;
-        updated.terminal_outcome = None;
-        updated.updated_at = now;
-        updated.progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::CleanupNeeded,
-            message:
-                "Confirmed provider cleanup started; waiting for Hetzner Cloud to prove deletion."
-                    .to_string(),
-            observed_at: now,
-        });
-        updated
-            .validate_contract()
-            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
-        if !paid_job_integrity_valid(&updated) {
-            return Err(ProvisioningPaidStoreError::ContractFailed);
-        }
-        jobs.insert(id.to_string(), updated.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            jobs.insert(id.to_string(), current);
-            return Err(ProvisioningPaidStoreError::PersistenceFailed);
-        }
-        Ok(updated)
-    }
-
-    fn complete_provider_cleanup(
-        &self,
-        id: &str,
-        resource: ProvisioningProviderResource,
-        handoff: ProvisioningHandoff,
-        now: i64,
-    ) -> Result<ProvisioningJob, ProvisioningPaidStoreError> {
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let current = jobs
-            .get(id)
-            .cloned()
-            .ok_or(ProvisioningPaidStoreError::NotFound)?;
-        if current.reviewed_plan.is_some() {
-            self.require_durable()?;
-        }
-        if current.state != ProvisioningJobState::CleanupNeeded {
-            return Err(ProvisioningPaidStoreError::InvalidState);
-        }
-        let mut updated = current.clone();
-        updated.state = ProvisioningJobState::Complete;
-        updated.terminal_outcome = Some(ProvisioningTerminalOutcome::RolledBack);
-        updated.updated_at = now;
-        updated.progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::Complete,
-            message:
-                "Tracked Hetzner server deleted; setup ended without an active provider resource."
-                    .to_string(),
-            observed_at: now,
-        });
-        updated
-            .provider_resources
-            .retain(|existing| existing.provider_id != resource.provider_id);
-        updated.provider_resources.push(resource);
-        updated.handoff = Some(handoff);
-        updated
-            .validate_contract()
-            .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
-        if !paid_job_integrity_valid(&updated) {
-            return Err(ProvisioningPaidStoreError::ContractFailed);
-        }
-        jobs.insert(id.to_string(), updated.clone());
-        if self.persist_jobs(&jobs).is_err() {
-            jobs.insert(id.to_string(), current);
-            return Err(ProvisioningPaidStoreError::PersistenceFailed);
-        }
-        Ok(updated)
-    }
-
-    fn transition_existing_host(
-        &self,
-        id: &str,
-        state: ProvisioningJobState,
-        message: impl Into<String>,
-        handoff_status: &str,
-        handoff_summary: &str,
-        now: i64,
-    ) -> Option<ProvisioningJob> {
-        let mut jobs = self.jobs.write().expect("provisioning job store lock");
-        let job = jobs.get_mut(id)?;
-        job.state = state;
-        job.updated_at = now;
-        job.progress.push(ProvisioningProgressEntry {
-            state,
-            message: message.into(),
-            observed_at: now,
-        });
-        if let Some(handoff) = job.handoff.as_mut() {
-            handoff.status = handoff_status.to_string();
-            handoff.summary = handoff_summary.to_string();
-        }
-        if job.validate_contract().is_err() {
-            return None;
-        }
-        let job = job.clone();
-        let _ = self.persist_jobs(&jobs);
-        Some(job)
-    }
-
-    fn persist_jobs(&self, jobs: &BTreeMap<String, ProvisioningJob>) -> Result<(), String> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        let Some(store_id) = &self.store_id else {
-            self.durable_ready.store(false, Ordering::Release);
-            return Err("provisioning store identity is unavailable".to_string());
-        };
-        let _persistence = self
-            .persistence_lock
-            .lock()
-            .map_err(|_| "provisioning persistence lock failed".to_string())?;
-        let result = ensure_provisioning_store_marker(path, store_id)
-            .and_then(|()| write_provisioning_snapshot(path, store_id, jobs));
-        if result.is_err() {
-            self.durable_ready.store(false, Ordering::Release);
-        }
-        result
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProvisioningJobStartRequest {
-    provider: String,
-    template: String,
-    #[serde(default)]
-    apply: bool,
-    #[serde(default)]
-    host_name: Option<String>,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    is_nix: Option<bool>,
-    #[serde(default)]
-    heartbeat_interval_secs: Option<u64>,
-    #[serde(default)]
-    backup_intent: Option<BackupSetupIntent>,
-    #[serde(default)]
-    location_intent: Option<LocationSetupIntent>,
-    #[serde(default)]
-    access_intent: Option<AccessSetupIntent>,
-    #[serde(default)]
-    location: Option<String>,
-    #[serde(default)]
-    server_type: Option<String>,
-    #[serde(default)]
-    image: Option<String>,
-    #[serde(default)]
-    ssh_key_ref: Option<String>,
-    #[serde(default)]
-    ssh: Option<SshAccessIntent>,
-    #[serde(default)]
-    preflight_summary: Option<ExistingHostPreflightSummary>,
-    #[serde(default)]
-    preflight_checks: Vec<ExistingHostPreflightCheck>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProvisioningCleanupRequest {
-    #[serde(default)]
-    confirm: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProvisioningPaidConfirmRequest {
-    plan_sha256: String,
-    attended: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProvisioningPaidCreateRequest {
-    plan_sha256: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProvisioningPaidStoreError {
-    NotFound,
-    InvalidState,
-    PlanMismatch,
-    Expired,
-    OperatorMismatch,
-    ProjectBusy,
-    ContractFailed,
-    PersistenceFailed,
-}
-
-fn reviewed_paid_plan_digest(plan: &ProvisioningReviewedPaidPlan) -> String {
-    let mut material = plan.clone();
-    material.plan_sha256 = "0".repeat(64);
-    let encoded = serde_json::to_vec(&material).unwrap_or_default();
-    hex(&Sha256::digest(encoded))
-}
-
-fn paid_job_integrity_valid(job: &ProvisioningJob) -> bool {
-    let Some(plan) = job.reviewed_plan.as_ref() else {
-        return job.paid_authorization.is_none() && job.paid_execution.is_none();
-    };
-    if reviewed_paid_plan_digest(plan) != plan.plan_sha256
-        || job.host_name.as_deref() != Some(plan.server_name.as_str())
-        || plan.required_labels != paid_required_labels(&job.id, &plan.provider_project)
-    {
-        return false;
-    }
-    let resources = job
-        .provider_resources
-        .iter()
-        .filter(|resource| resource.provider == "hetzner-cloud" && resource.kind == "server")
-        .collect::<Vec<_>>();
-    match job.paid_execution.as_ref() {
-        None => resources.is_empty(),
-        Some(execution) if matches!(execution.state.as_str(), "created" | "reconciled") => {
-            let Some(provider_id) = execution.provider_id.as_deref() else {
-                return false;
-            };
-            provider_id.parse::<u64>().is_ok_and(|id| id > 0)
-                && resources.len() == 1
-                && resources[0].provider_id == provider_id
-                && resources[0].name == plan.server_name
-        }
-        Some(_) => resources.is_empty(),
-    }
-}
-
-fn paid_project_blocked_in(
-    jobs: &BTreeMap<String, ProvisioningJob>,
-    except_id: Option<&str>,
-) -> bool {
-    jobs.iter().any(|(id, job)| {
-        if except_id == Some(id.as_str()) || job.provider != "hetzner-cloud" {
-            return false;
-        }
-        job.paid_execution.as_ref().is_some_and(|execution| {
-            matches!(
-                execution.state.as_str(),
-                "claimed" | "request-started" | "uncertain"
-            )
-        }) || job.provider_resources.iter().any(|resource| {
-            resource.provider == "hetzner-cloud"
-                && resource.kind == "server"
-                && matches!(
-                    resource.state.as_str(),
-                    "created" | "created-address-pending"
-                )
-        })
-    })
-}
-
-#[derive(Clone, Debug, Default)]
-struct ProviderRuntimeConfig {
-    hetzner_cloud: HetznerCloudRuntimeConfig,
-    existing_host: ExistingHostRuntimeConfig,
-    janus_public_url: Option<Url>,
-}
-
-impl ProviderRuntimeConfig {
-    fn from_env() -> Self {
-        Self {
-            hetzner_cloud: HetznerCloudRuntimeConfig::from_env(),
-            existing_host: ExistingHostRuntimeConfig::from_env(),
-            janus_public_url: env_nonempty("PHAROS_JANUS_PUBLIC_URL")
-                .and_then(|value| provider_setup_base_url(&value)),
-        }
-    }
-}
-
-fn provider_setup_base_url(value: &str) -> Option<Url> {
-    let mut url = Url::parse(value).ok()?;
-    let local_http = url.scheme() == "http"
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        });
-    if !(url.scheme() == "https" || local_http)
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(&path);
-    Some(url)
-}
-
-#[derive(Clone, Debug)]
-struct ExistingHostRuntimeConfig {
-    execute_enabled: bool,
-    identity_file: Option<PathBuf>,
-    known_hosts_file: Option<PathBuf>,
-    beacon_binary_path: PathBuf,
-    installer_path: PathBuf,
-    pharos_url: Option<String>,
-}
-
-impl Default for ExistingHostRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            execute_enabled: false,
-            identity_file: None,
-            known_hosts_file: None,
-            beacon_binary_path: PathBuf::from("/usr/local/bin/pharos-beacon"),
-            installer_path: PathBuf::from(
-                "/usr/local/share/pharos/install-pharos-beacon-systemd.sh",
-            ),
-            pharos_url: None,
-        }
-    }
-}
-
-impl ExistingHostRuntimeConfig {
-    fn from_env() -> Self {
-        Self {
-            execute_enabled: env_nonempty("PHAROS_EXISTING_HOST_EXECUTE")
-                .and_then(|value| parse_bool(&value))
-                .unwrap_or(false),
-            identity_file: env_nonempty("PHAROS_EXISTING_HOST_IDENTITY_FILE").map(PathBuf::from),
-            known_hosts_file: env_nonempty("PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE")
-                .map(PathBuf::from),
-            beacon_binary_path: env_nonempty("PHAROS_EXISTING_HOST_BEACON_BINARY")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/usr/local/bin/pharos-beacon")),
-            installer_path: env_nonempty("PHAROS_EXISTING_HOST_INSTALLER")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from("/usr/local/share/pharos/install-pharos-beacon-systemd.sh")
-                }),
-            pharos_url: env_nonempty("PHAROS_EXISTING_HOST_PHAROS_URL"),
-        }
-    }
-
-    fn validate_native_systemd(&self) -> Result<&str, ExistingHostExecutionError> {
-        if !self.execute_enabled {
-            return Err(ExistingHostExecutionError::RuntimeDisabled);
-        }
-        let known_hosts = self
-            .known_hosts_file
-            .as_deref()
-            .ok_or(ExistingHostExecutionError::KnownHostsUnavailable)?;
-        if !trusted_known_hosts_file(known_hosts) {
-            return Err(ExistingHostExecutionError::KnownHostsUnavailable);
-        }
-        if self
-            .identity_file
-            .as_deref()
-            .is_some_and(|path| !private_identity_file(path))
-        {
-            return Err(ExistingHostExecutionError::IdentityUnavailable);
-        }
-        if !self.beacon_binary_path.is_file() {
-            return Err(ExistingHostExecutionError::BeaconBinaryUnavailable);
-        }
-        if !self.installer_path.is_file() {
-            return Err(ExistingHostExecutionError::InstallerUnavailable);
-        }
-        let pharos_url = self
-            .pharos_url
-            .as_deref()
-            .ok_or(ExistingHostExecutionError::PharosUrlUnavailable)?;
-        let parsed =
-            Url::parse(pharos_url).map_err(|_| ExistingHostExecutionError::PharosUrlUnavailable)?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(ExistingHostExecutionError::PharosUrlUnavailable);
-        }
-        Ok(pharos_url)
-    }
-}
-
-fn trusted_known_hosts_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return false;
-    }
-    true
-}
-
-fn private_identity_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return false;
-    }
-    true
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ExistingHostExecutionError {
-    RuntimeDisabled,
-    UnsupportedTokenMode,
-    KnownHostsUnavailable,
-    IdentityUnavailable,
-    BeaconBinaryUnavailable,
-    InstallerUnavailable,
-    PharosUrlUnavailable,
-    InvalidTarget,
-    UnsupportedSshRoute,
-    ArchitectureMismatch,
-    RemoteCommandFailed,
-    RemoteResponseInvalid,
-    ExistingTokenFile,
-    TokenGenerationFailed,
-    ExecutorTaskFailed,
-}
-
-impl ExistingHostExecutionError {
-    fn safe_message(&self) -> &'static str {
-        match self {
-            Self::RuntimeDisabled => {
-                "Existing-host execution is disabled; the safe handoff remains available"
-            }
-            Self::UnsupportedTokenMode => {
-                "Existing-host execution needs local token issuance or a configured Janus credential broker"
-            }
-            Self::KnownHostsUnavailable => {
-                "Existing-host execution needs a readable strict SSH known-hosts file"
-            }
-            Self::IdentityUnavailable => {
-                "Existing-host SSH identity reference is configured but not readable"
-            }
-            Self::BeaconBinaryUnavailable => {
-                "The pharos-beacon runtime artifact is not readable by the executor"
-            }
-            Self::InstallerUnavailable => {
-                "The native systemd installer artifact is not readable by the executor"
-            }
-            Self::PharosUrlUnavailable => {
-                "Existing-host execution needs a target-facing HTTP or HTTPS Pharos URL"
-            }
-            Self::InvalidTarget => "Existing-host SSH target contains unsupported characters",
-            Self::UnsupportedSshRoute => {
-                "This SSH route needs an external bastion handoff and cannot run directly"
-            }
-            Self::ArchitectureMismatch => {
-                "The target architecture does not match the bundled pharos-beacon artifact"
-            }
-            Self::RemoteCommandFailed => {
-                "The remote bootstrap command did not complete; inspect the target before retrying"
-            }
-            Self::RemoteResponseInvalid => {
-                "The remote bootstrap response was not recognized; no credential was exposed"
-            }
-            Self::ExistingTokenFile => {
-                "The target already has a Pharos token file; explicit rotation is required"
-            }
-            Self::TokenGenerationFailed => "Pharos could not generate the one-time beacon token",
-            Self::ExecutorTaskFailed => {
-                "The existing-host executor stopped before it could confirm the result"
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct NativeSystemdBootstrapSpec {
-    host_name: String,
-    role: String,
-    interval: u64,
-    target: String,
-    port: u16,
-}
-
-impl NativeSystemdBootstrapSpec {
-    fn from_request(
-        request: &ProvisioningJobStartRequest,
-    ) -> Result<Self, ExistingHostExecutionError> {
-        if request.is_nix == Some(true) {
-            return Err(ExistingHostExecutionError::InvalidTarget);
-        }
-        let host_name = request
-            .host_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| valid_bootstrap_name(value))
-            .ok_or(ExistingHostExecutionError::InvalidTarget)?;
-        let role = request
-            .role
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| safe_bootstrap_role(value))
-            .unwrap_or("server");
-        let ssh = request
-            .ssh
-            .as_ref()
-            .ok_or(ExistingHostExecutionError::InvalidTarget)?;
-        if !matches!(ssh.route, SshRoute::Direct | SshRoute::Tailnet) {
-            return Err(ExistingHostExecutionError::UnsupportedSshRoute);
-        }
-        let ssh_host = ssh
-            .host
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| valid_ssh_endpoint(value))
-            .ok_or(ExistingHostExecutionError::InvalidTarget)?;
-        let target = match ssh.user.as_deref().map(str::trim) {
-            Some(user) if valid_ssh_user(user) => format!("{user}@{ssh_host}"),
-            Some(_) => return Err(ExistingHostExecutionError::InvalidTarget),
-            None => ssh_host.to_string(),
-        };
-        Ok(Self {
-            host_name: host_name.to_string(),
-            role: role.to_string(),
-            interval: request
-                .heartbeat_interval_secs
-                .unwrap_or(60)
-                .clamp(1, 86_400),
-            target,
-            port: ssh.port.unwrap_or(22),
-        })
-    }
-}
-
-fn valid_bootstrap_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric())
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-}
-
-fn safe_bootstrap_role(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 80
-        && !value.contains('\n')
-        && !value.contains('\r')
-        && !value.to_ascii_lowercase().contains("token=")
-        && !value.to_ascii_lowercase().contains("bearer ")
-}
-
-fn valid_ssh_endpoint(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 253
-        && value
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric())
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-}
-
-fn valid_ssh_user(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-}
-
-fn native_binary_matches_remote_arch(remote_arch: &str) -> bool {
-    match std::env::consts::ARCH {
-        "x86_64" => matches!(remote_arch, "x86_64" | "amd64"),
-        "aarch64" => matches!(remote_arch, "aarch64" | "arm64"),
-        local => remote_arch == local,
-    }
-}
-
-#[derive(Clone, Debug)]
-struct PreparedNativeSystemdBootstrap {
-    remote_dir: String,
-    remote_binary: String,
-    remote_installer: String,
-}
-
-trait ExistingHostSshRunner {
-    fn run(
-        &self,
-        config: &ExistingHostRuntimeConfig,
-        spec: &NativeSystemdBootstrapSpec,
-        remote_command: &str,
-        stdin: Option<&[u8]>,
-    ) -> Result<Vec<u8>, ExistingHostExecutionError>;
-}
-
-struct SystemExistingHostSshRunner;
-
-impl ExistingHostSshRunner for SystemExistingHostSshRunner {
-    fn run(
-        &self,
-        config: &ExistingHostRuntimeConfig,
-        spec: &NativeSystemdBootstrapSpec,
-        remote_command: &str,
-        stdin: Option<&[u8]>,
-    ) -> Result<Vec<u8>, ExistingHostExecutionError> {
-        let known_hosts = config
-            .known_hosts_file
-            .as_deref()
-            .ok_or(ExistingHostExecutionError::KnownHostsUnavailable)?;
-        let mut command = Command::new("ssh");
-        command
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("PasswordAuthentication=no")
-            .arg("-o")
-            .arg("KbdInteractiveAuthentication=no")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=yes")
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
-            .arg("-o")
-            .arg("ConnectTimeout=8")
-            .arg("-o")
-            .arg("ServerAliveInterval=5")
-            .arg("-o")
-            .arg("ServerAliveCountMax=2")
-            .arg("-o")
-            .arg("LogLevel=ERROR");
-        if let Some(identity_file) = &config.identity_file {
-            command
-                .arg("-o")
-                .arg("IdentitiesOnly=yes")
-                .arg("-i")
-                .arg(identity_file);
-        }
-        command
-            .arg("-p")
-            .arg(spec.port.to_string())
-            .arg(&spec.target)
-            .arg(remote_command)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let mut child = command
-            .spawn()
-            .map_err(|_| ExistingHostExecutionError::RemoteCommandFailed)?;
-        if let Some(input) = stdin {
-            child
-                .stdin
-                .take()
-                .ok_or(ExistingHostExecutionError::RemoteCommandFailed)?
-                .write_all(input)
-                .map_err(|_| ExistingHostExecutionError::RemoteCommandFailed)?;
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|_| ExistingHostExecutionError::RemoteCommandFailed)?;
-        if !output.status.success() || output.stdout.len() > 4096 {
-            return Err(ExistingHostExecutionError::RemoteCommandFailed);
-        }
-        Ok(output.stdout)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct HetznerCloudRuntimeConfig {
-    credential_source: Option<ProviderCredentialSource>,
-    execute_enabled: bool,
-    default_ssh_key_ref: Option<String>,
-    firewall_ref: Option<String>,
-    default_location: Option<String>,
-    api_base_url: String,
-    request_timeout: Duration,
-    evidence_ttl_secs: i64,
-    project_label: Option<String>,
-    approval_ttl_secs: i64,
-}
-
-impl Default for HetznerCloudRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            credential_source: None,
-            execute_enabled: false,
-            default_ssh_key_ref: None,
-            firewall_ref: None,
-            default_location: None,
-            api_base_url: "https://api.hetzner.cloud/v1".to_string(),
-            request_timeout: Duration::from_secs(20),
-            evidence_ttl_secs: 60 * 60,
-            project_label: None,
-            approval_ttl_secs: 15 * 60,
-        }
-    }
-}
-
-impl HetznerCloudRuntimeConfig {
-    fn from_env() -> Self {
-        let credential_source = env_nonempty("PHAROS_HCLOUD_API_TOKEN_ENV_FILE")
-            .map(|path| ProviderCredentialSource::EnvFile(PathBuf::from(path)))
-            .or_else(|| {
-                env_nonempty("PHAROS_HCLOUD_API_TOKEN_FILE")
-                    .map(|path| ProviderCredentialSource::File(PathBuf::from(path)))
-            })
-            .or_else(|| {
-                env_nonempty("PHAROS_HCLOUD_API_TOKEN")
-                    .map(|_| ProviderCredentialSource::Environment("PHAROS_HCLOUD_API_TOKEN"))
-            });
-        let execute_enabled = env_nonempty("PHAROS_HCLOUD_EXECUTE")
-            .and_then(|value| parse_bool(&value))
-            .unwrap_or(false);
-        let default_ssh_key_ref = env_nonempty("PHAROS_HCLOUD_SSH_KEY_REF");
-        let firewall_ref = env_nonempty("PHAROS_HCLOUD_FIREWALL_REF");
-        let default_location = env_nonempty("PHAROS_HCLOUD_DEFAULT_LOCATION");
-        let api_base_url = env_nonempty("PHAROS_HCLOUD_API_BASE")
-            .unwrap_or_else(|| "https://api.hetzner.cloud/v1".to_string());
-        let request_timeout = env_nonempty("PHAROS_HCLOUD_TIMEOUT_SECS")
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|seconds| *seconds >= 1)
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(20));
-        let evidence_ttl_secs = env_nonempty("PHAROS_HCLOUD_EVIDENCE_TTL_SECS")
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|seconds| (60..=86_400).contains(seconds))
-            .unwrap_or(60 * 60);
-        let project_label = env_nonempty("PHAROS_HCLOUD_PROJECT_LABEL")
-            .filter(|value| safe_paid_display_text(value, 120));
-        let approval_ttl_secs = env_nonempty("PHAROS_HCLOUD_APPROVAL_TTL_SECS")
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|seconds| (60..=30 * 60).contains(seconds))
-            .unwrap_or(15 * 60);
-        Self {
-            credential_source,
-            execute_enabled,
-            default_ssh_key_ref,
-            firewall_ref,
-            default_location,
-            api_base_url,
-            request_timeout,
-            evidence_ttl_secs,
-            project_label,
-            approval_ttl_secs,
-        }
-    }
-
-    fn is_configured(&self) -> bool {
-        self.credential_source.is_some()
-    }
-
-    fn credential_boundary_ready(&self) -> bool {
-        matches!(
-            self.credential_source,
-            Some(ProviderCredentialSource::File(_) | ProviderCredentialSource::EnvFile(_))
-        )
-    }
-}
-
-/// One operation-scoped credential snapshot. The raw token stays in memory and
-/// is never serialized or logged; only its domain-separated binding is stored
-/// in the reviewed plan so a different provider project cannot be mutated.
-struct HetznerOperationContext {
-    runtime: HetznerCloudRuntimeConfig,
-    token: String,
-    credential_binding_sha256: String,
-}
-
-impl HetznerOperationContext {
-    fn resolve(runtime: HetznerCloudRuntimeConfig) -> Result<Self, HetznerExecutionError> {
-        let token = runtime.api_token()?;
-        let credential_binding_sha256 = hetzner_credential_binding(&token);
-        Ok(Self {
-            runtime,
-            token,
-            credential_binding_sha256,
-        })
-    }
-
-    fn matches_reviewed_plan(&self, reviewed: &ProvisioningReviewedPaidPlan) -> bool {
-        self.credential_binding_sha256 == reviewed.credential_binding_sha256
-    }
-}
-
-fn hetzner_credential_binding(token: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"pharos.hetzner-cloud.credential-binding.v1\0");
-    digest.update(token.as_bytes());
-    hex(&digest.finalize())
-}
-
-fn hetzner_http_client(
-    runtime: &HetznerCloudRuntimeConfig,
-) -> Result<reqwest::Client, HetznerExecutionError> {
-    reqwest::Client::builder()
-        .timeout(runtime.request_timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .build()
-        .map_err(|_| HetznerExecutionError::ClientUnavailable)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ProviderCredentialSource {
-    Environment(&'static str),
-    File(PathBuf),
-    EnvFile(PathBuf),
-}
-
-#[derive(Debug)]
-enum HetznerExecutionError {
-    CredentialUnavailable,
-    ClientUnavailable,
-    PrerequisiteRequestFailed,
-    ImageUnavailable,
-    SshKeyUnavailable,
-    FirewallUnavailable,
-    ApprovalExpired,
-    RequestFailed,
-    HttpStatus(u16),
-    InvalidResponse,
-}
-
-impl HetznerExecutionError {
-    fn safe_message(&self) -> String {
-        match self {
-            Self::CredentialUnavailable => {
-                "Hetzner Cloud credential source was configured but not readable".to_string()
-            }
-            Self::ClientUnavailable => "Hetzner Cloud HTTP client could not be prepared".to_string(),
-            Self::PrerequisiteRequestFailed => {
-                "Hetzner Cloud prerequisite checks did not complete; no provider resources were created"
-                    .to_string()
-            }
-            Self::ImageUnavailable => {
-                "The reviewed Hetzner Cloud image is no longer available; no provider resources were created"
-                    .to_string()
-            }
-            Self::SshKeyUnavailable => {
-                "The configured Hetzner Cloud SSH public key was not found; no provider resources were created"
-                    .to_string()
-            }
-            Self::FirewallUnavailable => {
-                "The configured Hetzner Cloud firewall was not found; no provider resources were created"
-                    .to_string()
-            }
-            Self::ApprovalExpired => {
-                "The paid authorization expired before the provider create request; no provider resources were created"
-                    .to_string()
-            }
-            Self::RequestFailed => {
-                "Hetzner Cloud request did not complete; verify provider console before retry"
-                    .to_string()
-            }
-            Self::HttpStatus(status) => {
-                format!("Hetzner Cloud API returned HTTP status {status}; verify provider console before retry")
-            }
-            Self::InvalidResponse => {
-                "Hetzner Cloud API response could not be parsed; verify provider console before retry"
-                    .to_string()
-            }
-        }
-    }
-
-    fn resource_state_uncertain(&self) -> bool {
-        matches!(
-            self,
-            Self::RequestFailed | Self::HttpStatus(_) | Self::InvalidResponse
-        )
-    }
-}
-
-impl HetznerCloudRuntimeConfig {
-    fn api_token(&self) -> Result<String, HetznerExecutionError> {
-        let Some(source) = &self.credential_source else {
-            return Err(HetznerExecutionError::CredentialUnavailable);
-        };
-        let token = match source {
-            ProviderCredentialSource::Environment(name) => env_nonempty(name),
-            ProviderCredentialSource::File(path) => read_provider_secret_file(path),
-            ProviderCredentialSource::EnvFile(path) => {
-                read_provider_env_file(path, "PHAROS_HCLOUD_API_TOKEN")
-            }
-        };
-        token.ok_or(HetznerExecutionError::CredentialUnavailable)
-    }
-}
-
-fn read_provider_secret_file(path: &Path) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() == 0 || metadata.len() > 4096 {
-        return None;
-    }
-    let value = std::fs::read_to_string(path).ok()?;
-    provider_secret_value(value.trim())
-}
-
-fn read_provider_env_file(path: &Path, expected_name: &str) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() == 0 || metadata.len() > 64 * 1024 {
-        return None;
-    }
-    let contents = std::fs::read_to_string(path).ok()?;
-    contents.lines().find_map(|line| {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            return None;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let (name, raw_value) = line.split_once('=')?;
-        if name.trim() != expected_name {
-            return None;
-        }
-        let raw_value = raw_value.trim();
-        let value = if raw_value.len() >= 2
-            && ((raw_value.starts_with('"') && raw_value.ends_with('"'))
-                || (raw_value.starts_with('\'') && raw_value.ends_with('\'')))
-        {
-            &raw_value[1..raw_value.len() - 1]
-        } else {
-            raw_value
-        };
-        provider_secret_value(value)
-    })
-}
-
-fn provider_secret_value(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > 2048
-        || value.chars().any(|character| character.is_control())
-    {
-        return None;
-    }
-    Some(value.to_string())
-}
-
-#[derive(Debug, Serialize)]
-struct HetznerCreateServerRequest {
-    name: String,
-    server_type: String,
-    image: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    ssh_keys: Vec<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    firewalls: Vec<HetznerCreateFirewall>,
-    #[serde(default)]
-    labels: BTreeMap<String, String>,
-    start_after_create: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct HetznerCreateFirewall {
-    firewall: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerCreateServerResponse {
-    server: HetznerCreatedServer,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerServerListResponse {
-    servers: Vec<HetznerListedServer>,
-    meta: HetznerListMeta,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerListMeta {
-    pagination: HetznerPagination,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerPagination {
-    page: u32,
-    next_page: Option<u32>,
-    last_page: u32,
-    total_entries: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HetznerListedServer {
-    id: u64,
-    name: String,
-    #[serde(default)]
-    labels: BTreeMap<String, String>,
-    #[serde(default)]
-    server_type: Option<HetznerNamedServerFact>,
-    #[serde(default)]
-    image: Option<HetznerNamedServerFact>,
-    #[serde(default)]
-    datacenter: Option<HetznerDatacenterFact>,
-    #[serde(default)]
-    public_net: Option<HetznerPublicNet>,
-}
-
-impl HetznerListedServer {
-    fn matches_labels(&self, required: &BTreeMap<String, String>) -> bool {
-        required
-            .iter()
-            .all(|(key, value)| self.labels.get(key) == Some(value))
-    }
-
-    fn matches_reviewed_plan(&self, reviewed: &ProvisioningReviewedPaidPlan) -> bool {
-        self.name == reviewed.server_name
-            && self.matches_labels(&reviewed.required_labels)
-            && self.server_type.as_ref().map(|fact| fact.name.as_str())
-                == Some(reviewed.server_type.as_str())
-            && self.image.as_ref().map(|fact| fact.name.as_str()) == Some(reviewed.image.as_str())
-            && self
-                .datacenter
-                .as_ref()
-                .map(|fact| fact.location.name.as_str())
-                == Some(reviewed.location.as_str())
-    }
-
-    fn into_created(self) -> HetznerCreatedServer {
-        HetznerCreatedServer {
-            id: self.id,
-            name: self.name,
-            labels: self.labels,
-            server_type: self.server_type,
-            image: self.image,
-            datacenter: self.datacenter,
-            public_net: self.public_net,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerCreatedServer {
-    id: u64,
-    name: String,
-    #[serde(default)]
-    labels: BTreeMap<String, String>,
-    #[serde(default)]
-    server_type: Option<HetznerNamedServerFact>,
-    #[serde(default)]
-    image: Option<HetznerNamedServerFact>,
-    #[serde(default)]
-    datacenter: Option<HetznerDatacenterFact>,
-    #[serde(default)]
-    public_net: Option<HetznerPublicNet>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HetznerNamedServerFact {
-    name: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HetznerDatacenterFact {
-    location: HetznerNamedServerFact,
-}
-
-impl HetznerCreatedServer {
-    fn ssh_address(&self) -> Option<String> {
-        self.public_net
-            .as_ref()
-            .and_then(|network| network.ipv4.as_ref())
-            .and_then(|ipv4| ipv4.ip.parse::<IpAddr>().ok())
-            .filter(IpAddr::is_ipv4)
-            .map(|address| address.to_string())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HetznerPublicNet {
-    #[serde(default)]
-    ipv4: Option<HetznerPublicIp>,
-}
-
-async fn fetch_hetzner_servers(
-    operation: &HetznerOperationContext,
-) -> Result<Vec<HetznerListedServer>, HetznerExecutionError> {
-    let client = hetzner_http_client(&operation.runtime)?;
-    let endpoint = hetzner_api_endpoint(&operation.runtime, "servers")?;
-    let mut page = 1_u32;
-    let mut servers = Vec::new();
-    for _ in 0..20 {
-        let response = client
-            .get(endpoint.clone())
-            .bearer_auth(&operation.token)
-            .query(&[("page", page), ("per_page", 50_u32)])
-            .send()
-            .await
-            .map_err(|_| HetznerExecutionError::PrerequisiteRequestFailed)?;
-        if !response.status().is_success() {
-            return Err(HetznerExecutionError::PrerequisiteRequestFailed);
-        }
-        let payload = response
-            .json::<HetznerServerListResponse>()
-            .await
-            .map_err(|_| HetznerExecutionError::InvalidResponse)?;
-        if payload
-            .servers
-            .iter()
-            .any(|server| server.id == 0 || !valid_bootstrap_name(server.name.trim()))
-        {
-            return Err(HetznerExecutionError::InvalidResponse);
-        }
-        let pagination_page = payload.meta.pagination.page;
-        let last_page = payload.meta.pagination.last_page;
-        let total_entries = usize::try_from(payload.meta.pagination.total_entries)
-            .map_err(|_| HetznerExecutionError::InvalidResponse)?;
-        let next_page = payload.meta.pagination.next_page;
-        let observed_total = servers.len().saturating_add(payload.servers.len());
-        if pagination_page != page
-            || last_page == 0
-            || pagination_page > last_page
-            || observed_total > total_entries
-        {
-            return Err(HetznerExecutionError::InvalidResponse);
-        }
-        servers.extend(payload.servers);
-        let Some(next_page) = next_page else {
-            return if page == last_page && servers.len() == total_entries {
-                Ok(servers)
-            } else {
-                Err(HetznerExecutionError::InvalidResponse)
-            };
-        };
-        if next_page != page.saturating_add(1) || page >= last_page {
-            return Err(HetznerExecutionError::InvalidResponse);
-        }
-        page = next_page;
-    }
-    Err(HetznerExecutionError::InvalidResponse)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HetznerPublicIp {
-    ip: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerSshKeyListResponse {
-    #[serde(default)]
-    ssh_keys: Vec<HetznerNamedResource>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerImageListResponse {
-    #[serde(default)]
-    images: Vec<HetznerNamedResource>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerFirewallListResponse {
-    #[serde(default)]
-    firewalls: Vec<HetznerNamedResource>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HetznerNamedResource {
-    id: u64,
-    name: String,
-}
-
-async fn resolve_hetzner_resource_id<T>(
-    client: &reqwest::Client,
-    endpoint: Url,
-    token: &str,
-    reference: &str,
-    select: impl FnOnce(T) -> Vec<HetznerNamedResource>,
-    missing: HetznerExecutionError,
-) -> Result<u64, HetznerExecutionError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let response = client
-        .get(endpoint)
-        .bearer_auth(token)
-        .query(&[("name", reference)])
-        .send()
-        .await
-        .map_err(|_| HetznerExecutionError::PrerequisiteRequestFailed)?;
-    if !response.status().is_success() {
-        return Err(HetznerExecutionError::PrerequisiteRequestFailed);
-    }
-    let resources = response
-        .json::<T>()
-        .await
-        .map(select)
-        .map_err(|_| HetznerExecutionError::PrerequisiteRequestFailed)?;
-    resources
-        .into_iter()
-        .find(|resource| resource.id > 0 && resource.name == reference)
-        .map(|resource| resource.id)
-        .ok_or(missing)
-}
-
-async fn verify_hetzner_image(
-    operation: &HetznerOperationContext,
-    image: &str,
-) -> Result<(), HetznerExecutionError> {
-    let client = hetzner_http_client(&operation.runtime)?;
-    resolve_hetzner_resource_id::<HetznerImageListResponse>(
-        &client,
-        hetzner_api_endpoint(&operation.runtime, "images")?,
-        &operation.token,
-        image,
-        |response| response.images,
-        HetznerExecutionError::ImageUnavailable,
-    )
-    .await
-    .map(|_| ())
-}
-
-fn hetzner_api_endpoint(
-    config: &HetznerCloudRuntimeConfig,
-    path: &str,
-) -> Result<Url, HetznerExecutionError> {
-    let mut endpoint = safe_hcloud_api_base(&config.api_base_url)
-        .ok_or(HetznerExecutionError::ClientUnavailable)?;
-    let base_path = endpoint.path().trim_end_matches('/').to_string();
-    endpoint.set_path(&format!("{base_path}/{}", path.trim_start_matches('/')));
-    Ok(endpoint)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HetznerCreatePrerequisites {
-    ssh_key_id: u64,
-    firewall_id: u64,
-}
-
-async fn resolve_hetzner_create_prerequisites(
-    plan: &ProvisioningReviewedPaidPlan,
-    operation: &HetznerOperationContext,
-) -> Result<HetznerCreatePrerequisites, HetznerExecutionError> {
-    let client = hetzner_http_client(&operation.runtime)?;
-    let ssh_key_ref = plan.ssh_key_ref.as_str();
-    let firewall_ref = plan.firewall_ref.as_str();
-    verify_hetzner_image(operation, &plan.image).await?;
-    let ssh_key_id = resolve_hetzner_resource_id::<HetznerSshKeyListResponse>(
-        &client,
-        hetzner_api_endpoint(&operation.runtime, "ssh_keys")?,
-        &operation.token,
-        ssh_key_ref,
-        |response| response.ssh_keys,
-        HetznerExecutionError::SshKeyUnavailable,
-    )
-    .await?;
-    let firewall_id = resolve_hetzner_resource_id::<HetznerFirewallListResponse>(
-        &client,
-        hetzner_api_endpoint(&operation.runtime, "firewalls")?,
-        &operation.token,
-        firewall_ref,
-        |response| response.firewalls,
-        HetznerExecutionError::FirewallUnavailable,
-    )
-    .await?;
-    Ok(HetznerCreatePrerequisites {
-        ssh_key_id,
-        firewall_id,
-    })
-}
-
-async fn send_hetzner_create(
-    plan: &ProvisioningReviewedPaidPlan,
-    prerequisites: HetznerCreatePrerequisites,
-    operation: &HetznerOperationContext,
-) -> Result<HetznerCreatedServer, HetznerExecutionError> {
-    if now_unix() >= plan.expires_at {
-        return Err(HetznerExecutionError::ApprovalExpired);
-    }
-    let client = hetzner_http_client(&operation.runtime)?;
-    let endpoint = hetzner_api_endpoint(&operation.runtime, "servers")?;
-    let payload = HetznerCreateServerRequest {
-        name: plan.server_name.clone(),
-        server_type: plan.server_type.clone(),
-        image: plan.image.clone(),
-        location: Some(plan.location.clone()),
-        ssh_keys: vec![prerequisites.ssh_key_id],
-        firewalls: vec![HetznerCreateFirewall {
-            firewall: prerequisites.firewall_id,
-        }],
-        labels: plan.required_labels.clone(),
-        start_after_create: true,
-    };
-    let response = client
-        .post(endpoint)
-        .bearer_auth(&operation.token)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|_| HetznerExecutionError::RequestFailed)?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(HetznerExecutionError::HttpStatus(status.as_u16()));
-    }
-    let server = response
-        .json::<HetznerCreateServerResponse>()
-        .await
-        .map(|payload| payload.server)
-        .map_err(|_| HetznerExecutionError::InvalidResponse)?;
-    if server.id == 0
-        || server.name.trim() != plan.server_name
-        || server.server_type.as_ref().map(|value| value.name.as_str())
-            != Some(plan.server_type.as_str())
-        || server.image.as_ref().map(|value| value.name.as_str()) != Some(plan.image.as_str())
-        || server
-            .datacenter
-            .as_ref()
-            .map(|value| value.location.name.as_str())
-            != Some(plan.location.as_str())
-        || !plan
-            .required_labels
-            .iter()
-            .all(|(key, value)| server.labels.get(key) == Some(value))
-    {
-        return Err(HetznerExecutionError::InvalidResponse);
-    }
-    Ok(server)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HetznerDeleteResult {
-    Deleted,
-    AlreadyAbsent,
-}
-
-async fn delete_hetzner_server(
-    provider_id: u64,
-    operation: &HetznerOperationContext,
-) -> Result<HetznerDeleteResult, HetznerExecutionError> {
-    let client = hetzner_http_client(&operation.runtime)?;
-    let endpoint = hetzner_api_endpoint(&operation.runtime, &format!("servers/{provider_id}"))?;
-    let response = client
-        .delete(endpoint)
-        .bearer_auth(&operation.token)
-        .send()
-        .await
-        .map_err(|_| HetznerExecutionError::RequestFailed)?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(HetznerDeleteResult::AlreadyAbsent);
-    }
-    if response.status() == reqwest::StatusCode::NO_CONTENT {
-        return Ok(HetznerDeleteResult::Deleted);
-    }
-    if response.status().is_success() {
-        return Err(HetznerExecutionError::InvalidResponse);
-    }
-    Err(HetznerExecutionError::HttpStatus(
-        response.status().as_u16(),
-    ))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProvisioningCleanupError {
-    UnsupportedJob,
-    CleanupNotAllowed,
-    ResourceMissing,
-    ResourceAmbiguous,
-    ResourceInvalid,
-    OwnershipMismatch,
-    RuntimeDisabled,
-    ProviderUnavailable,
-    ProviderUncertain,
-    CleanupInProgress,
-    PersistenceFailed,
-}
-
-impl ProvisioningCleanupError {
-    fn status_code(self) -> StatusCode {
-        match self {
-            Self::UnsupportedJob | Self::ResourceInvalid => StatusCode::BAD_REQUEST,
-            Self::CleanupNotAllowed
-            | Self::ResourceMissing
-            | Self::ResourceAmbiguous
-            | Self::OwnershipMismatch
-            | Self::CleanupInProgress => StatusCode::CONFLICT,
-            Self::RuntimeDisabled | Self::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::ProviderUncertain => StatusCode::BAD_GATEWAY,
-            Self::PersistenceFailed => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-
-    fn safe_message(self) -> &'static str {
-        match self {
-            Self::UnsupportedJob => {
-                "Cleanup is available only for a tracked Hetzner Cloud setup job."
-            }
-            Self::CleanupNotAllowed => {
-                "This setup job is no longer eligible for provider cleanup."
-            }
-            Self::ResourceMissing => {
-                "The setup job has no tracked Hetzner server to delete."
-            }
-            Self::ResourceAmbiguous => {
-                "The setup job does not identify exactly one provider server; no deletion was attempted."
-            }
-            Self::ResourceInvalid => {
-                "The tracked provider server is not valid for guarded cleanup; no deletion was attempted."
-            }
-            Self::OwnershipMismatch => {
-                "The live provider server does not match the reviewed ownership labels and name; no deletion was attempted."
-            }
-            Self::RuntimeDisabled => {
-                "Hetzner Cloud execution is disabled; no deletion was attempted."
-            }
-            Self::ProviderUnavailable => {
-                "Hetzner Cloud cleanup is unavailable; the server remains tracked for recovery."
-            }
-            Self::ProviderUncertain => {
-                "Hetzner Cloud did not prove deletion; cleanup is still required."
-            }
-            Self::CleanupInProgress => {
-                "Cleanup is already running for this setup job."
-            }
-            Self::PersistenceFailed => {
-                "Provider cleanup could not be recorded safely; review the tracked job before retrying."
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ProvisioningCleanupFailure {
-    error: ProvisioningCleanupError,
-    job: Option<ProvisioningJob>,
-}
-
-impl ProvisioningCleanupFailure {
-    fn new(error: ProvisioningCleanupError, job: Option<ProvisioningJob>) -> Self {
-        Self { error, job }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct HetznerCleanupTarget {
-    provider_id: u64,
-    resource: ProvisioningProviderResource,
-    already_deleted: bool,
-}
-
-fn hetzner_cleanup_target(
-    job: &ProvisioningJob,
-) -> Result<HetznerCleanupTarget, ProvisioningCleanupError> {
-    if job.provider != "hetzner-cloud" {
-        return Err(ProvisioningCleanupError::UnsupportedJob);
-    }
-    if job.provider_resources.is_empty() {
-        return Err(ProvisioningCleanupError::ResourceMissing);
-    }
-    if job.provider_resources.len() != 1 {
-        return Err(ProvisioningCleanupError::ResourceAmbiguous);
-    }
-    let resource = job
-        .provider_resources
-        .first()
-        .cloned()
-        .ok_or(ProvisioningCleanupError::ResourceMissing)?;
-    if resource.provider != "hetzner-cloud" || resource.kind != "server" {
-        return Err(ProvisioningCleanupError::ResourceInvalid);
-    }
-    let provider_id = resource
-        .provider_id
-        .parse::<u64>()
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or(ProvisioningCleanupError::ResourceInvalid)?;
-    if resource.state == "deleted"
-        && job.state == ProvisioningJobState::Complete
-        && job.terminal_outcome == Some(ProvisioningTerminalOutcome::RolledBack)
-    {
-        return Ok(HetznerCleanupTarget {
-            provider_id,
-            resource,
-            already_deleted: true,
-        });
-    }
-    if !matches!(
-        job.state,
-        ProvisioningJobState::WaitingForHeartbeat | ProvisioningJobState::CleanupNeeded
-    ) {
-        return Err(ProvisioningCleanupError::CleanupNotAllowed);
-    }
-    if !matches!(
-        resource.state.as_str(),
-        "created" | "created-address-pending"
-    ) {
-        return Err(ProvisioningCleanupError::ResourceInvalid);
-    }
-    Ok(HetznerCleanupTarget {
-        provider_id,
-        resource,
-        already_deleted: false,
-    })
-}
-
-fn provisioning_job_progress(
-    request: &ProvisioningJobStartRequest,
-    provider_runtime: &ProviderRuntimeConfig,
-    now: i64,
-) -> (ProvisioningJobState, Vec<ProvisioningProgressEntry>) {
-    let mut progress = vec![ProvisioningProgressEntry {
-        state: ProvisioningJobState::Planning,
-        message: "Plan accepted; tracked job created.".to_string(),
-        observed_at: now,
-    }];
-
-    match request.provider.as_str() {
-        "hetzner-cloud" => {
-            let hetzner = &provider_runtime.hetzner_cloud;
-            if !hetzner.is_configured() {
-                progress.push(ProvisioningProgressEntry {
-                    state: ProvisioningJobState::Failed,
-                    message: "Hetzner Cloud executor is not configured; no provider resources were created.".to_string(),
-                    observed_at: now,
-                });
-                return (ProvisioningJobState::Failed, progress);
-            }
-            if request.apply {
-                progress.push(ProvisioningProgressEntry {
-                    state: ProvisioningJobState::Failed,
-                    message: "Direct Hetzner Cloud apply is not accepted; review, authorize, and create must be separate requests. No provider resources were created.".to_string(),
-                    observed_at: now,
-                });
-                return (ProvisioningJobState::Failed, progress);
-            }
-            if !hetzner.execute_enabled {
-                progress.push(ProvisioningProgressEntry {
-                    state: ProvisioningJobState::Failed,
-                    message: "Hetzner Cloud executor is configured but live execution is disabled; no provider resources were created.".to_string(),
-                    observed_at: now,
-                });
-                return (ProvisioningJobState::Failed, progress);
-            }
-            if missing_hetzner_create_inputs(request, hetzner) {
-                progress.push(ProvisioningProgressEntry {
-                    state: ProvisioningJobState::Failed,
-                    message: "Hetzner Cloud executor needs host, location, server type, image, an SSH public-key reference, and a configured firewall before create/apply; no provider resources were created.".to_string(),
-                    observed_at: now,
-                });
-                return (ProvisioningJobState::Failed, progress);
-            }
-            if invalid_hetzner_create_inputs(request, hetzner) {
-                progress.push(ProvisioningProgressEntry {
-                    state: ProvisioningJobState::Failed,
-                    message: "Hetzner Cloud create inputs contain unsupported characters; no provider resources were created.".to_string(),
-                    observed_at: now,
-                });
-                return (ProvisioningJobState::Failed, progress);
-            }
-            progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::Planning,
-                message: "Hetzner Cloud inputs accepted for an immutable paid-plan review; no provider resource was created.".to_string(),
-                observed_at: now,
-            });
-            (ProvisioningJobState::Planning, progress)
-        }
-        "manual-import" => {
-            progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::Failed,
-                message: "Manual import is routed to the existing-host flow; no provider resources were created.".to_string(),
-                observed_at: now,
-            });
-            (ProvisioningJobState::Failed, progress)
-        }
-        "existing-host" => existing_host_job_progress(request, now, progress),
-        _ => (ProvisioningJobState::Failed, progress),
-    }
-}
-
-fn existing_host_job_progress(
-    request: &ProvisioningJobStartRequest,
-    now: i64,
-    mut progress: Vec<ProvisioningProgressEntry>,
-) -> (ProvisioningJobState, Vec<ProvisioningProgressEntry>) {
-    if request
-        .host_name
-        .as_deref()
-        .is_none_or(|host_name| host_name.trim().is_empty())
-    {
-        progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::Failed,
-            message: "Existing-host setup needs a host name; no token files or host services were changed.".to_string(),
-            observed_at: now,
-        });
-        return (ProvisioningJobState::Failed, progress);
-    }
-    if !request.apply {
-        progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::Failed,
-            message: "Existing-host setup needs explicit confirmation; no token files or host services were changed.".to_string(),
-            observed_at: now,
-        });
-        return (ProvisioningJobState::Failed, progress);
-    }
-
-    match request.template.as_str() {
-        "manual-deferred" => {
-            progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::Bootstrapping,
-                message: "Manual existing-host path recorded; no automated host changes were made."
-                    .to_string(),
-                observed_at: now,
-            });
-            progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::WaitingForHeartbeat,
-                message: "Waiting for file/env-file beacon handoff and first heartbeat; keep existing token files unchanged unless rotation is explicit.".to_string(),
-                observed_at: now,
-            });
-            (ProvisioningJobState::WaitingForHeartbeat, progress)
-        }
-        "nixos-anywhere" | "native-systemd" => {
-            if let Some(message) = existing_host_automated_handoff_blocker(request) {
-                progress.push(ProvisioningProgressEntry {
-                    state: ProvisioningJobState::Failed,
-                    message: message.to_string(),
-                    observed_at: now,
-                });
-                return (ProvisioningJobState::Failed, progress);
-            }
-            progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::Bootstrapping,
-                message: "Existing-host bootstrap handoff prepared; no raw beacon credential was generated, rendered, or installed by Pharos.".to_string(),
-                observed_at: now,
-            });
-            progress.push(ProvisioningProgressEntry {
-                state: ProvisioningJobState::WaitingForHeartbeat,
-                message: "Waiting for Janus-backed or dev-local runtime credential handoff, beacon start, and first heartbeat.".to_string(),
-                observed_at: now,
-            });
-            (ProvisioningJobState::WaitingForHeartbeat, progress)
-        }
-        _ => (ProvisioningJobState::Failed, progress),
-    }
-}
-
-fn existing_host_has_ssh_target(request: &ProvisioningJobStartRequest) -> bool {
-    request.ssh.as_ref().is_some_and(|ssh| {
-        !matches!(ssh.route, SshRoute::None | SshRoute::Unknown)
-            && ssh
-                .host
-                .as_deref()
-                .is_some_and(|host| !host.trim().is_empty())
-    })
-}
-
-fn existing_host_automated_handoff_blocker(
-    request: &ProvisioningJobStartRequest,
-) -> Option<&'static str> {
-    if !existing_host_has_ssh_target(request) {
-        return Some(
-            "Existing-host automated bootstrap needs a non-secret SSH target before any handoff is recorded.",
-        );
-    }
-    let Some(summary) = &request.preflight_summary else {
-        return Some(
-            "Existing-host automated bootstrap needs a completed preflight before any handoff is recorded.",
-        );
-    };
-    if summary.state == PreflightCheckState::Fail {
-        return Some(
-            "Existing-host automated bootstrap cannot proceed while preflight has failed checks.",
-        );
-    }
-
-    const REQUIRED_CHECKS: &[&str] = &[
-        "ssh-reachability",
-        "ssh-authentication",
-        "privilege",
-        "os-family",
-        "disk-space",
-        "pharos-reachability",
-    ];
-    for key in REQUIRED_CHECKS {
-        match request
-            .preflight_checks
-            .iter()
-            .find(|check| check.key == *key)
-            .map(|check| check.state)
-        {
-            Some(PreflightCheckState::Pass | PreflightCheckState::Warn) => {}
-            Some(PreflightCheckState::Fail) => {
-                return Some(
-                    "Existing-host automated bootstrap cannot proceed while a blocking preflight check is failing.",
-                );
-            }
-            Some(PreflightCheckState::Unknown) | None => {
-                return Some(
-                    "Existing-host automated bootstrap needs verified SSH, privilege, OS, disk, and outbound Pharos checks before handoff.",
-                );
-            }
-        }
-    }
-    None
-}
-
-const REMOTE_NATIVE_SYSTEMD_READINESS: &str = r#"set -eu
-for tool in systemctl install getent groupadd useradd; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    printf 'runtime-unavailable'
-    exit 0
-  fi
-done
-if [ "$(id -u)" -eq 0 ]; then
-  if [ -e /etc/pharos/pharos-beacon.env ] || [ -e /etc/pharos/pharos-beacon.token ]; then
-    printf 'existing-token'
-  else
-    printf 'ready:%s' "$(uname -m 2>/dev/null || printf unknown)"
-  fi
-elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-  if sudo -n test -e /etc/pharos/pharos-beacon.env || sudo -n test -e /etc/pharos/pharos-beacon.token; then
-    printf 'existing-token'
-  else
-    printf 'ready:%s' "$(uname -m 2>/dev/null || printf unknown)"
-  fi
-else
-  printf 'privilege-unavailable'
-fi
-"#;
-
-const REMOTE_NATIVE_SYSTEMD_TOKEN_WRITE: &str = r#"set -eu
-if [ "$(id -u)" -eq 0 ]; then
-  install -d -m 0700 -o root -g root /etc/pharos
-  test ! -e /etc/pharos/pharos-beacon.env
-  test ! -e /etc/pharos/pharos-beacon.token
-  umask 077
-  cat > /etc/pharos/pharos-beacon.env
-  chmod 0600 /etc/pharos/pharos-beacon.env
-elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-  sudo -n install -d -m 0700 -o root -g root /etc/pharos
-  sudo -n sh -c 'set -eu; test ! -e /etc/pharos/pharos-beacon.env; test ! -e /etc/pharos/pharos-beacon.token; umask 077; cat > /etc/pharos/pharos-beacon.env; chmod 0600 /etc/pharos/pharos-beacon.env'
-else
-  exit 77
-fi
-"#;
-
-fn valid_remote_bootstrap_dir(value: &str) -> bool {
-    value.starts_with("/tmp/pharos-bootstrap.")
-        && value.len() <= 128
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
-}
-
-fn remote_upload_command(path: &str) -> String {
-    let path = shell_single_quote(path);
-    format!("set -eu; umask 077; cat > {path}; chmod 0700 {path}")
-}
-
-fn cleanup_native_systemd_bootstrap<R: ExistingHostSshRunner>(
-    runner: &R,
-    config: &ExistingHostRuntimeConfig,
-    spec: &NativeSystemdBootstrapSpec,
-    prepared: &PreparedNativeSystemdBootstrap,
-) {
-    let binary = shell_single_quote(&prepared.remote_binary);
-    let installer = shell_single_quote(&prepared.remote_installer);
-    let dir = shell_single_quote(&prepared.remote_dir);
-    let command =
-        format!("rm -f {binary} {installer} 2>/dev/null || true; rmdir {dir} 2>/dev/null || true");
-    let _ = runner.run(config, spec, &command, None);
-}
-
-fn prepare_native_systemd_bootstrap<R: ExistingHostSshRunner>(
-    runner: &R,
-    config: &ExistingHostRuntimeConfig,
-    spec: &NativeSystemdBootstrapSpec,
-) -> Result<PreparedNativeSystemdBootstrap, ExistingHostExecutionError> {
-    config.validate_native_systemd()?;
-    let beacon_binary = fs::read(&config.beacon_binary_path)
-        .map_err(|_| ExistingHostExecutionError::BeaconBinaryUnavailable)?;
-    let installer = fs::read(&config.installer_path)
-        .map_err(|_| ExistingHostExecutionError::InstallerUnavailable)?;
-    let remote_dir = String::from_utf8(runner.run(
-        config,
-        spec,
-        "set -eu; umask 077; mktemp -d /tmp/pharos-bootstrap.XXXXXX",
-        None,
-    )?)
-    .map_err(|_| ExistingHostExecutionError::RemoteResponseInvalid)?;
-    let remote_dir = remote_dir.trim();
-    if !valid_remote_bootstrap_dir(remote_dir) {
-        return Err(ExistingHostExecutionError::RemoteResponseInvalid);
-    }
-    let prepared = PreparedNativeSystemdBootstrap {
-        remote_dir: remote_dir.to_string(),
-        remote_binary: format!("{remote_dir}/pharos-beacon"),
-        remote_installer: format!("{remote_dir}/install-pharos-beacon-systemd.sh"),
-    };
-    if runner
-        .run(
-            config,
-            spec,
-            &remote_upload_command(&prepared.remote_binary),
-            Some(&beacon_binary),
-        )
-        .is_err()
-        || runner
-            .run(
-                config,
-                spec,
-                &remote_upload_command(&prepared.remote_installer),
-                Some(&installer),
-            )
-            .is_err()
-    {
-        cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
-        return Err(ExistingHostExecutionError::RemoteCommandFailed);
-    }
-    let readiness = match runner.run(config, spec, REMOTE_NATIVE_SYSTEMD_READINESS, None) {
-        Ok(readiness) => readiness,
-        Err(error) => {
-            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
-            return Err(error);
-        }
-    };
-    match std::str::from_utf8(&readiness).map(str::trim) {
-        Ok(value)
-            if value
-                .strip_prefix("ready:")
-                .is_some_and(native_binary_matches_remote_arch) =>
-        {
-            Ok(prepared)
-        }
-        Ok(value) if value.starts_with("ready:") => {
-            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
-            Err(ExistingHostExecutionError::ArchitectureMismatch)
-        }
-        Ok("existing-token") => {
-            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
-            Err(ExistingHostExecutionError::ExistingTokenFile)
-        }
-        Ok("runtime-unavailable" | "privilege-unavailable") => {
-            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
-            Err(ExistingHostExecutionError::RemoteCommandFailed)
-        }
-        _ => {
-            cleanup_native_systemd_bootstrap(runner, config, spec, &prepared);
-            Err(ExistingHostExecutionError::RemoteResponseInvalid)
-        }
-    }
-}
-
-fn install_native_systemd_bootstrap<R: ExistingHostSshRunner>(
-    runner: &R,
-    config: &ExistingHostRuntimeConfig,
-    spec: &NativeSystemdBootstrapSpec,
-    prepared: &PreparedNativeSystemdBootstrap,
-    token: &str,
-) -> Result<(), ExistingHostExecutionError> {
-    let pharos_url = config.validate_native_systemd()?;
-    let token_payload = format!("PHAROS_TOKEN={token}\n");
-    if runner
-        .run(
-            config,
-            spec,
-            REMOTE_NATIVE_SYSTEMD_TOKEN_WRITE,
-            Some(token_payload.as_bytes()),
-        )
-        .is_err()
-    {
-        cleanup_native_systemd_bootstrap(runner, config, spec, prepared);
-        return Err(ExistingHostExecutionError::RemoteCommandFailed);
-    }
-
-    let installer = shell_single_quote(&prepared.remote_installer);
-    let binary = shell_single_quote(&prepared.remote_binary);
-    let pharos_url = shell_single_quote(pharos_url);
-    let host_name = shell_single_quote(&spec.host_name);
-    let role = shell_single_quote(&spec.role);
-    let interval = spec.interval;
-    let install_command = format!(
-        "{installer} --binary {binary} --token-env /etc/pharos/pharos-beacon.env --pharos-url {pharos_url} --host {host_name} --role {role} --interval {interval}"
-    );
-    let remote_command = format!(
-        "set -eu; if [ \"$(id -u)\" -eq 0 ]; then exec {install_command}; elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then exec sudo -n {install_command}; else exit 77; fi"
-    );
-    let result = runner.run(config, spec, &remote_command, None);
-    cleanup_native_systemd_bootstrap(runner, config, spec, prepared);
-    result.map(|_| ())
-}
-
-fn provisioning_existing_host_context(
-    request: &ProvisioningJobStartRequest,
-) -> Option<ExistingHostSetupContext> {
-    if request.provider != "existing-host" {
-        return None;
-    }
-    let selected_bootstrap = match request.template.as_str() {
-        "nixos-anywhere" => BootstrapMethod::NixosAnywhere,
-        "native-systemd" => BootstrapMethod::NativeSystemd,
-        "manual-deferred" => BootstrapMethod::Manual,
-        _ => return None,
-    };
-    if matches!(
-        selected_bootstrap,
-        BootstrapMethod::NixosAnywhere | BootstrapMethod::NativeSystemd
-    ) && !existing_host_has_ssh_target(request)
-    {
-        return None;
-    }
-    let ssh = request.ssh.clone().unwrap_or(SshAccessIntent {
-        route: SshRoute::None,
-        user: None,
-        host: None,
-        port: None,
-    });
-    let host = request
-        .host_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .unwrap_or("the host");
-    let method_label = match selected_bootstrap {
-        BootstrapMethod::NixosAnywhere => "NixOS declarative bootstrap",
-        BootstrapMethod::NativeSystemd => "native systemd beacon install",
-        BootstrapMethod::Manual | BootstrapMethod::Deferred => "manual beacon handoff",
-    };
-    let verification_steps = vec![
-        format!("Confirm the selected path for {host}: {method_label}."),
-        "Install or reference the beacon credential through the runtime secret target only."
-            .to_string(),
-        "Start pharos-beacon and wait until Pharos records the first heartbeat.".to_string(),
-        "Finish backup and location decisions according to the recorded setup intent.".to_string(),
-    ];
-    Some(ExistingHostSetupContext {
-        ssh,
-        selected_bootstrap,
-        preflight_summary: request.preflight_summary.clone(),
-        preflight_checks: request.preflight_checks.iter().take(12).cloned().collect(),
-        verification_steps,
-    })
-}
-
-fn provisioning_job_handoff(request: &ProvisioningJobStartRequest) -> Option<ProvisioningHandoff> {
-    if request.provider != "existing-host" {
-        return None;
-    }
-    let method = match request.template.as_str() {
-        "nixos-anywhere" => BootstrapMethod::NixosAnywhere,
-        "native-systemd" => BootstrapMethod::NativeSystemd,
-        "manual-deferred" => BootstrapMethod::Manual,
-        _ => return None,
-    };
-    if matches!(
-        method,
-        BootstrapMethod::NixosAnywhere | BootstrapMethod::NativeSystemd
-    ) && existing_host_automated_handoff_blocker(request).is_some()
-    {
-        return None;
-    }
-    let interval = request.heartbeat_interval_secs.unwrap_or(60).max(1);
-    let backup_steps = backup_enrollment_steps(request, method);
-    match method {
-        BootstrapMethod::NixosAnywhere => {
-            let mut next_steps = vec![
-                "Prepare the target flake so services.pharos-beacon imports the Pharos module and reads /etc/pharos/pharos-beacon.token for first bootstrap.".to_string(),
-                "From a Linux executor, run scripts/bootstrap-pharos-nixos-anywhere.sh with a private token file and pinned SSH known-hosts file.".to_string(),
-                "Wait for the first heartbeat, then migrate the bootstrap token file to the target's long-term agenix or Janus runtime secret path.".to_string(),
-            ];
-            next_steps.extend(backup_steps);
-            Some(ProvisioningHandoff {
-                method,
-                status: "runtime-credential-required".to_string(),
-                title: "NixOS bootstrap handoff".to_string(),
-                summary: "Declarative bootstrap is selected; the helper copies the token through nixos-anywhere extra-files and Pharos waits for the first heartbeat.".to_string(),
-                token_policy: "The helper accepts a private token file path and copies its value outside Nix evaluation; raw credentials never enter command arguments or the Nix store.".to_string(),
-                secret_target: Some("/etc/pharos/pharos-beacon.token".to_string()),
-                command_ref: Some("scripts/bootstrap-pharos-nixos-anywhere.sh".to_string()),
-                next_steps,
-            })
-        }
-        BootstrapMethod::NativeSystemd => {
-            let mut next_steps = vec![
-                "Create the env file through an approved secret channel before starting the service.".to_string(),
-                format!(
-                    "Run the native installer with the selected host, role, and {interval}s heartbeat interval."
-                ),
-                "Start pharos-beacon and wait for the first heartbeat before marking onboarding complete.".to_string(),
-            ];
-            next_steps.extend(backup_steps);
-            Some(ProvisioningHandoff {
-                method,
-                status: "runtime-credential-required".to_string(),
-                title: "Native systemd beacon handoff".to_string(),
-                summary: "Portable beacon install is selected; Pharos prepared the non-secret handoff and is waiting for a root-owned runtime env file plus the first heartbeat.".to_string(),
-                token_policy: "Beacon credentials belong in a root-owned env file or token file and must not be pasted into shell history.".to_string(),
-                secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
-                command_ref: Some("scripts/install-pharos-beacon-systemd.sh".to_string()),
-                next_steps,
-            })
-        }
-        BootstrapMethod::Manual | BootstrapMethod::Deferred => {
-            let mut next_steps = vec![
-                "Install or enable pharos-beacon using the appropriate NixOS or native systemd path.".to_string(),
-                format!("Configure the beacon to report with a {interval}s heartbeat interval."),
-                "Confirm the first heartbeat appears in Pharos, then continue backup and location decisions.".to_string(),
-            ];
-            next_steps.extend(backup_steps);
-            Some(ProvisioningHandoff {
-                method: BootstrapMethod::Manual,
-                status: "manual-handoff".to_string(),
-                title: "Manual beacon handoff".to_string(),
-                summary: "No automated host changes were made; Pharos is waiting for the operator-managed beacon install.".to_string(),
-                token_policy: "Use a file or env-file secret handoff; never place the beacon credential in command arguments, chat, PPM, or logs.".to_string(),
-                secret_target: Some("/etc/pharos/pharos-beacon.env".to_string()),
-                command_ref: Some("scripts/install-pharos-beacon-systemd.sh or nixosModules.pharos-beacon".to_string()),
-                next_steps,
-            })
-        }
-    }
-}
-
-fn backup_enrollment_steps(
-    request: &ProvisioningJobStartRequest,
-    method: BootstrapMethod,
-) -> Vec<String> {
-    let intent = request.backup_intent.unwrap_or(BackupSetupIntent::Deferred);
-    let nix_path = request
-        .is_nix
-        .unwrap_or(matches!(method, BootstrapMethod::NixosAnywhere));
-    match intent {
-        BackupSetupIntent::Required => {
-            let mut steps = vec![
-                "Backup required: keep onboarding open after first heartbeat until Pharos observes a first successful backup or a concrete failure.".to_string(),
-            ];
-            if nix_path {
-                steps.push("For NixOS, prepare a declarative backup module proposal that reads repository and password material from agenix or Janus-rendered runtime files; do not embed secret values in Nix options or the Nix store.".to_string());
-            } else {
-                steps.push("For non-Nix hosts, install or observe a native backup job through a runtime secret file, then let pharos-beacon report sanitized backup evidence.".to_string());
-            }
-            steps
-        }
-        BackupSetupIntent::Optional => vec![
-            "Backup optional: offer enrollment after first heartbeat, but allow onboarding to finish if the operator explicitly defers protection.".to_string(),
-        ],
-        BackupSetupIntent::External => vec![
-            "Backups managed elsewhere: keep Pharos read-only and observe external backup evidence when the beacon can detect it.".to_string(),
-        ],
-        BackupSetupIntent::EnrollLater => vec![
-            "Backup enrollment later: create a backup-pending follow-up after first heartbeat and do not block beacon onboarding.".to_string(),
-        ],
-        BackupSetupIntent::Absent => vec![
-            "No backups requested: record the host as intentionally unprotected until the operator changes backup intent.".to_string(),
-        ],
-        BackupSetupIntent::Deferred => vec![
-            "Backup decision pending: ask for backup intent again before considering onboarding complete.".to_string(),
-        ],
-    }
-}
-
-fn provisioning_setup_intent(
-    request: &ProvisioningJobStartRequest,
-) -> Option<ProvisioningSetupIntent> {
-    Some(ProvisioningSetupIntent {
-        backup: request.backup_intent.unwrap_or(BackupSetupIntent::Deferred),
-        location: request.location_intent.unwrap_or(LocationSetupIntent::Auto),
-        access: request
-            .access_intent
-            .unwrap_or(AccessSetupIntent::OperatorOnly),
-    })
-}
-
-fn provisioning_backup_proposal(
-    request: &ProvisioningJobStartRequest,
-) -> Option<ProvisioningBackupProposal> {
-    let intent = request.backup_intent.unwrap_or(BackupSetupIntent::Deferred);
-    if !matches!(
-        intent,
-        BackupSetupIntent::Required | BackupSetupIntent::Optional | BackupSetupIntent::EnrollLater
-    ) {
-        return None;
-    }
-
-    let nix_path = request.is_nix.unwrap_or_else(|| {
-        request.provider == "hetzner-cloud" || request.template == "nixos-anywhere"
-    });
-    if !nix_path {
-        return None;
-    }
-
-    let host_slug = request
-        .host_name
-        .as_deref()
-        .map(secret_ref_slug)
-        .filter(|slug| !slug.is_empty())
-        .unwrap_or_else(|| "pharos-host".to_string());
-    let repository_file = format!("/run/agenix/{host_slug}-restic-repository");
-    let password_file = format!("/run/agenix/{host_slug}-restic-password");
-    let nix_module = format!(
-        r#"{{
-  config,
-  lib,
-  ...
-}}:
-
-{{
-  services.pharos-beacon.extraEnvironment = {{
-    PHAROS_BACKUP_MODE = "restic";
-    PHAROS_BACKUP_ID = "restic-main";
-    PHAROS_BACKUP_LABEL = "Restic backup";
-    PHAROS_BACKUP_TARGET_LABEL = "off-box repository";
-    PHAROS_BACKUP_SCHEDULE = "daily";
-    PHAROS_BACKUP_STALE_AFTER_SECS = "129600";
-    RESTIC_REPOSITORY_FILE = "{repository_file}";
-    RESTIC_PASSWORD_FILE = "{password_file}";
-  }};
-
-  systemd.services.pharos-beacon.serviceConfig.ReadOnlyPaths = [
-    "{repository_file}"
-    "{password_file}"
-  ];
-}}
-"#
-    );
-
-    Some(ProvisioningBackupProposal {
-        kind: ProvisioningBackupProposalKind::NixosResticBeaconObservation,
-        title: "NixOS restic backup proposal".to_string(),
-        summary: "Declarative beacon backup observation using runtime agenix files for repository and password material.".to_string(),
-        module_attribute: "services.pharos-beacon.extraEnvironment".to_string(),
-        nix_module,
-        secret_files: vec![
-            ProvisioningBackupSecretFile {
-                key: "restic-repository-file".to_string(),
-                owner: SecretOwner::Agenix,
-                path: repository_file,
-                purpose: "Restic repository location, stored outside the Nix store.".to_string(),
-            },
-            ProvisioningBackupSecretFile {
-                key: "restic-password-file".to_string(),
-                owner: SecretOwner::Agenix,
-                path: password_file,
-                purpose: "Restic repository password, readable only by pharos-beacon.".to_string(),
-            },
-        ],
-        next_steps: vec![
-            "Create or reference the agenix files before deployment.".to_string(),
-            "Review the NixOS module snippet in nixcfg and keep raw values out of Nix options.".to_string(),
-            "Deploy the host, wait for the first heartbeat, then verify first backup evidence in Pharos.".to_string(),
-        ],
-    })
-}
-
-fn secret_ref_slug(value: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in value.trim().chars() {
-        let next = if ch.is_ascii_alphanumeric() {
-            last_dash = false;
-            Some(ch.to_ascii_lowercase())
-        } else if !last_dash {
-            last_dash = true;
-            Some('-')
-        } else {
-            None
-        };
-        if let Some(next) = next {
-            out.push(next);
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-fn missing_hetzner_create_inputs(
-    request: &ProvisioningJobStartRequest,
-    config: &HetznerCloudRuntimeConfig,
-) -> bool {
-    [
-        request.host_name.as_deref(),
-        request.location.as_deref(),
-        request.server_type.as_deref(),
-        request.image.as_deref(),
-    ]
-    .iter()
-    .any(|value| value.is_none_or(|value| value.trim().is_empty()))
-        || request
-            .ssh_key_ref
-            .as_deref()
-            .or(config.default_ssh_key_ref.as_deref())
-            .is_none_or(|value| value.trim().is_empty())
-        || config
-            .firewall_ref
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-}
-
-fn valid_provider_selector(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && value.len() <= 160
-        && value
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric())
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '/'))
-        && !value.to_ascii_lowercase().contains("token=")
-        && !value.to_ascii_lowercase().contains("password=")
-}
-
-fn valid_provider_resource_name(value: &str) -> bool {
-    safe_paid_display_text(value, 160)
-}
-
-fn safe_paid_display_text(value: &str, max_chars: usize) -> bool {
-    let value = value.trim();
-    let lowered = value.to_ascii_lowercase();
-    !value.is_empty()
-        && value.chars().count() <= max_chars
-        && !value.chars().any(char::is_control)
-        && !lowered.contains("bearer ")
-        && !lowered.contains("token=")
-        && !lowered.contains("token:")
-        && !lowered.contains("password=")
-        && !lowered.contains("secret=")
-}
-
-fn valid_hcloud_server_name(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && value.len() <= 63
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && value
-            .bytes()
-            .last()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-fn invalid_hetzner_create_inputs(
-    request: &ProvisioningJobStartRequest,
-    config: &HetznerCloudRuntimeConfig,
-) -> bool {
-    request
-        .host_name
-        .as_deref()
-        .is_none_or(|value| !valid_hcloud_server_name(value))
-        || request
-            .role
-            .as_deref()
-            .is_some_and(|value| !safe_bootstrap_role(value.trim()))
-        || [
-            request.location.as_deref(),
-            request.server_type.as_deref(),
-            request.image.as_deref(),
-        ]
-        .iter()
-        .any(|value| value.is_none_or(|value| !valid_provider_selector(value)))
-        || request
-            .ssh_key_ref
-            .as_deref()
-            .or(config.default_ssh_key_ref.as_deref())
-            .is_none_or(|value| !valid_provider_resource_name(value))
-        || config
-            .firewall_ref
-            .as_deref()
-            .is_none_or(|value| !valid_provider_resource_name(value))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ProvisioningJobStartError {
-    UnsupportedProvider,
-    UnsupportedTemplate,
-    InvalidJob,
-    PersistenceFailed,
-}
-
-impl std::fmt::Display for ProvisioningJobStartError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedProvider => write!(f, "unsupported setup provider"),
-            Self::UnsupportedTemplate => write!(f, "unsupported setup template"),
-            Self::InvalidJob => write!(f, "provisioning job contract failed validation"),
-            Self::PersistenceFailed => {
-                write!(f, "provisioning job could not be durably stored")
-            }
-        }
-    }
-}
-
-fn valid_setup_provider(provider: &str) -> bool {
-    matches!(
-        provider,
-        "hetzner-cloud" | "manual-import" | "existing-host"
-    )
-}
-
-fn valid_setup_template(provider: &str, template: &str) -> bool {
-    matches!(
-        (provider, template),
-        ("hetzner-cloud", "hetzner-small-nixos")
-            | ("hetzner-cloud", "hetzner-lab")
-            | ("hetzner-cloud", "bring-own-plan")
-            | ("manual-import", "manual-import")
-            | ("manual-import", "netcup-manual-import")
-            | ("manual-import", "oracle-always-free-lab")
-            | ("manual-import", "gcp-free-tier-lab")
-            | ("existing-host", "nixos-anywhere")
-            | ("existing-host", "native-systemd")
-            | ("existing-host", "manual-deferred")
-    )
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SetupProviderPlan {
-    schema: &'static str,
-    version: u16,
-    provider: &'static str,
-    template: &'static str,
-    strategy: &'static str,
-    approach: &'static str,
-    summary: &'static str,
-    docs: Vec<SetupProviderPlanDoc>,
-    resources: Vec<SetupProviderPlanResource>,
-    steps: Vec<SetupProviderPlanStep>,
-    secret_boundary: Vec<SetupProviderPlanSecretBoundary>,
-    handoffs: Vec<SetupProviderPlanHandoff>,
-    runtime_checks: Vec<&'static str>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SetupProviderPlanDoc {
-    label: &'static str,
-    url: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SetupProviderPlanResource {
-    key: &'static str,
-    kind: &'static str,
-    required: bool,
-    api: &'static str,
-    detail: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SetupProviderPlanStep {
-    key: &'static str,
-    title: &'static str,
-    detail: &'static str,
-    status: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SetupProviderPlanSecretBoundary {
-    key: &'static str,
-    source: &'static str,
-    rule: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SetupProviderPlanHandoff {
-    key: &'static str,
-    target: &'static str,
-    detail: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SetupProviderRuntimeReadiness {
-    credential_configured: bool,
-    credential_boundary_ready: bool,
-    execution_enabled: bool,
-    project_label_configured: bool,
-    default_ssh_key_configured: bool,
-    firewall_configured: bool,
-    default_location_configured: bool,
-    connection_tested: bool,
-    evidence_fresh: bool,
-    api_access: bool,
-    connection_ready: bool,
-    provider_ready: bool,
-    ready_with_defaults: bool,
-    tested_at: Option<i64>,
-    message: String,
-}
-
-fn effective_hetzner_runtime(
-    config: &HetznerCloudRuntimeConfig,
-    store: &ProviderConnectionStore,
-) -> HetznerCloudRuntimeConfig {
-    let preferences = store.preferences();
-    let mut effective = config.clone();
-    if preferences.default_location.is_some() {
-        effective.default_location = preferences.default_location;
-    }
-    if preferences.ssh_key_ref.is_some() {
-        effective.default_ssh_key_ref = preferences.ssh_key_ref;
-    }
-    if preferences.firewall_ref.is_some() {
-        effective.firewall_ref = preferences.firewall_ref;
-    }
-    effective
-}
-
-fn hetzner_runtime_readiness(
-    config: &HetznerCloudRuntimeConfig,
-    store: &ProviderConnectionStore,
-    now: i64,
-) -> SetupProviderRuntimeReadiness {
-    let config = effective_hetzner_runtime(config, store);
-    let credential_configured = config.api_token().is_ok();
-    let credential_boundary_ready = config.credential_boundary_ready();
-    let execution_enabled = config.execute_enabled;
-    let project_label_configured = config
-        .project_label
-        .as_deref()
-        .is_some_and(|value| safe_paid_display_text(value, 120));
-    let default_ssh_key_configured = config
-        .default_ssh_key_ref
-        .as_deref()
-        .is_some_and(valid_provider_resource_name);
-    let firewall_configured = config
-        .firewall_ref
-        .as_deref()
-        .is_some_and(valid_provider_resource_name);
-    let default_location_configured = config
-        .default_location
-        .as_deref()
-        .is_some_and(valid_provider_selector);
-    let attempt = store.last_attempt();
-    let connection_tested = attempt.is_some();
-    let evidence_fresh = attempt
-        .as_ref()
-        .is_some_and(|attempt| evidence_is_fresh(attempt.tested_at, now, config.evidence_ttl_secs))
-        && store.catalog().is_some_and(|catalog| {
-            evidence_is_fresh(catalog.refreshed_at, now, config.evidence_ttl_secs)
-        });
-    let api_access = evidence_fresh && attempt.as_ref().is_some_and(|attempt| attempt.api_access);
-    let connection_ready = credential_configured
-        && credential_boundary_ready
-        && project_label_configured
-        && api_access
-        && default_ssh_key_configured
-        && firewall_configured
-        && default_location_configured
-        && attempt.as_ref().is_some_and(|attempt| {
-            attempt.ssh_key_ready
-                && attempt.firewall_ready
-                && attempt.default_location_ready
-                && attempt.catalog_ready
-        });
-    let provider_ready = credential_configured
-        && credential_boundary_ready
-        && execution_enabled
-        && store.ready(now, config.evidence_ttl_secs);
-    let ready_with_defaults = provider_ready
-        && project_label_configured
-        && default_ssh_key_configured
-        && firewall_configured
-        && default_location_configured;
-    let message = if store.disconnected_at().is_some() {
-        HetznerConnectionCode::Disconnected.safe_message()
-    } else if !credential_configured {
-        "Hetzner Cloud is not connected. Start secure setup before creating a server."
-    } else if !credential_boundary_ready {
-        HetznerConnectionCode::CredentialBoundaryRequired.safe_message()
-    } else if !project_label_configured {
-        "Set a safe provider project label before reviewing paid work."
-    } else if !connection_tested {
-        "The secure credential is available. Test the connection to continue."
-    } else if !evidence_fresh {
-        "The last connection test is stale. Test again before creating a server."
-    } else if !execution_enabled
-        && attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.code == HetznerConnectionCode::Ready)
-    {
-        HetznerConnectionCode::ExecutionDisabled.safe_message()
-    } else if let Some(attempt) = attempt.as_ref() {
-        attempt.code.safe_message()
-    } else {
-        HetznerConnectionCode::InvalidResponse.safe_message()
-    };
-    SetupProviderRuntimeReadiness {
-        credential_configured,
-        credential_boundary_ready,
-        execution_enabled,
-        project_label_configured,
-        default_ssh_key_configured,
-        firewall_configured,
-        default_location_configured,
-        connection_tested,
-        evidence_fresh,
-        api_access,
-        connection_ready,
-        provider_ready,
-        ready_with_defaults,
-        tested_at: attempt.map(|attempt| attempt.tested_at),
-        message: message.to_string(),
-    }
-}
-
-const PROVIDER_CONNECTIONS_SCHEMA: &str = "inspr.pharos.provider-connections.v1";
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum ProviderConnectionCapability {
-    Managed,
-    Guided,
-}
-
-impl ProviderConnectionCapability {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Managed => "Managed",
-            Self::Guided => "Guided",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum ProviderConnectionState {
-    Ready,
-    NeedsAttention,
-    NotConnected,
-    Guided,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct ProviderConnectionSummary {
-    key: &'static str,
-    name: &'static str,
-    description: &'static str,
-    capability: ProviderConnectionCapability,
-    state: ProviderConnectionState,
-    state_label: &'static str,
-    note: String,
-    detail_href: &'static str,
-    action_label: &'static str,
-    available_in_add_server: bool,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct ProviderConnectionsPayload {
-    schema: &'static str,
-    version: u16,
-    providers: Vec<ProviderConnectionSummary>,
-}
-
-fn provider_connections(
-    runtime: &ProviderRuntimeConfig,
-    store: &ProviderConnectionStore,
-    now: i64,
-) -> ProviderConnectionsPayload {
-    let hetzner = hetzner_runtime_readiness(&runtime.hetzner_cloud, store, now);
-    let (hetzner_state, hetzner_label, hetzner_action) = if hetzner.ready_with_defaults {
-        (ProviderConnectionState::Ready, "Ready", "Review")
-    } else if hetzner.credential_configured {
-        (
-            ProviderConnectionState::NeedsAttention,
-            "Needs attention",
-            "Continue",
-        )
-    } else {
-        (
-            ProviderConnectionState::NotConnected,
-            "Not connected",
-            "Connect",
-        )
-    };
-    ProviderConnectionsPayload {
-        schema: PROVIDER_CONNECTIONS_SCHEMA,
-        version: 1,
-        providers: vec![
-            ProviderConnectionSummary {
-                key: "hetzner-cloud",
-                name: "Hetzner Cloud",
-                description: "Create and set up servers automatically.",
-                capability: ProviderConnectionCapability::Managed,
-                state: hetzner_state,
-                state_label: hetzner_label,
-                note: hetzner.message,
-                detail_href: "/settings/providers/hetzner-cloud",
-                action_label: hetzner_action,
-                available_in_add_server: hetzner.ready_with_defaults,
-            },
-            ProviderConnectionSummary {
-                key: "netcup",
-                name: "netcup",
-                description: "Order there, then continue setup in Pharos.",
-                capability: ProviderConnectionCapability::Guided,
-                state: ProviderConnectionState::Guided,
-                state_label: "No connection needed",
-                note: "Pharos does not claim unsupported server-order automation.".to_string(),
-                detail_href: "/settings/providers/netcup",
-                action_label: "Start",
-                available_in_add_server: false,
-            },
-            ProviderConnectionSummary {
-                key: "aws",
-                name: "AWS",
-                description: "Credits may cover initial use.",
-                capability: ProviderConnectionCapability::Guided,
-                state: ProviderConnectionState::Guided,
-                state_label: "Credits expire",
-                note: "AWS credits and free-plan eligibility are time-limited.".to_string(),
-                detail_href: "/settings/providers/aws",
-                action_label: "Start",
-                available_in_add_server: false,
-            },
-            ProviderConnectionSummary {
-                key: "google-cloud",
-                name: "Google Cloud",
-                description: "Eligible small servers in selected regions.",
-                capability: ProviderConnectionCapability::Guided,
-                state: ProviderConnectionState::Guided,
-                state_label: "Eligibility varies",
-                note: "Free-tier eligibility depends on region, machine, disk, and account."
-                    .to_string(),
-                detail_href: "/settings/providers/google-cloud",
-                action_label: "Start",
-                available_in_add_server: false,
-            },
-            ProviderConnectionSummary {
-                key: "oracle-cloud",
-                name: "Oracle Cloud",
-                description: "Eligible capacity in your home region.",
-                capability: ProviderConnectionCapability::Guided,
-                state: ProviderConnectionState::Guided,
-                state_label: "Capacity varies",
-                note: "Always Free capacity is not guaranteed and has no paid fallback."
-                    .to_string(),
-                detail_href: "/settings/providers/oracle-cloud",
-                action_label: "Start",
-                available_in_add_server: false,
-            },
-        ],
-    }
-}
-
-fn provider_connection(
-    runtime: &ProviderRuntimeConfig,
-    store: &ProviderConnectionStore,
-    key: &str,
-    now: i64,
-) -> Option<ProviderConnectionSummary> {
-    provider_connections(runtime, store, now)
-        .providers
-        .into_iter()
-        .find(|provider| provider.key == key)
-}
-
-fn provider_official_destination(key: &str) -> Option<(&'static str, &'static str)> {
-    match key {
-        "netcup" => Some(("Open netcup", "https://www.netcup.com/en/server/")),
-        "aws" => Some(("Open AWS Free Tier", "https://aws.amazon.com/free/")),
-        "google-cloud" => Some((
-            "Open Google Cloud free program",
-            "https://cloud.google.com/free/docs/free-cloud-features",
-        )),
-        "oracle-cloud" => Some((
-            "Open Oracle Cloud Free Tier",
-            "https://www.oracle.com/cloud/free/",
-        )),
-        _ => None,
-    }
-}
-
-fn hetzner_janus_setup_url(runtime: &ProviderRuntimeConfig, host: &str) -> Option<String> {
-    if !valid_action_host_name(host) {
-        return None;
-    }
-    let mut url = runtime.janus_public_url.clone()?;
-    url.set_path("/vault/new");
-    url.query_pairs_mut()
-        .append_pair("service", "Hetzner Cloud provider")
-        .append_pair("host", host)
-        .append_pair("env", "PHAROS_HCLOUD_API_TOKEN")
-        .append_pair("display", "Hetzner Cloud API token for Pharos")
-        .append_pair("classification", "high")
-        .append_pair("rotation", "180")
-        .append_pair("tags", "pharos,provider,hetzner");
-    Some(url.to_string())
-}
-
-fn setup_provider_plan(
-    provider: &str,
-    template: &str,
-) -> Result<SetupProviderPlan, ProvisioningJobStartError> {
-    if !valid_setup_provider(provider) {
-        return Err(ProvisioningJobStartError::UnsupportedProvider);
-    }
-    if !valid_setup_template(provider, template) {
-        return Err(ProvisioningJobStartError::UnsupportedTemplate);
-    }
-    match (provider, template) {
-        ("hetzner-cloud", "hetzner-small-nixos")
-        | ("hetzner-cloud", "hetzner-lab")
-        | ("hetzner-cloud", "bring-own-plan") => Ok(hetzner_cloud_setup_plan(template)),
-        ("manual-import", "manual-import")
-        | ("manual-import", "netcup-manual-import")
-        | ("manual-import", "oracle-always-free-lab")
-        | ("manual-import", "gcp-free-tier-lab") => Ok(manual_import_setup_plan(template)),
-        _ => Err(ProvisioningJobStartError::UnsupportedTemplate),
-    }
-}
-
-fn hetzner_cloud_setup_plan(template: &str) -> SetupProviderPlan {
-    SetupProviderPlan {
-        schema: "inspr.pharos.setup-provider-plan.v1",
-        version: 1,
-        provider: "hetzner-cloud",
-        template: match template {
-            "hetzner-lab" => "hetzner-lab",
-            "bring-own-plan" => "bring-own-plan",
-            _ => "hetzner-small-nixos",
-        },
-        strategy: "hcloud-api-plus-nixos-anywhere",
-        approach: "Use direct Hetzner Cloud API execution for live jobs; keep the hcloud Terraform/OpenTofu provider as the plan-compatible reference, not as a required state backend.",
-        summary: "Plan Hetzner Cloud resources through the Cloud API, then bootstrap NixOS with nixos-anywhere before waiting for the first beacon heartbeat.",
-        docs: vec![
-            SetupProviderPlanDoc {
-                label: "Hetzner Cloud API reference",
-                url: "https://docs.hetzner.cloud/reference/cloud",
-            },
-            SetupProviderPlanDoc {
-                label: "Hetzner Cloud API getting started",
-                url: "https://docs.hetzner.cloud/",
-            },
-            SetupProviderPlanDoc {
-                label: "Hetzner Cloud Terraform provider",
-                url: "https://registry.terraform.io/providers/hetznercloud/hcloud/latest/docs",
-            },
-            SetupProviderPlanDoc {
-                label: "nixos-anywhere quickstart",
-                url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
-            },
-        ],
-        resources: vec![
-            SetupProviderPlanResource {
-                key: "server",
-                kind: "hetzner-cloud-server",
-                required: true,
-                api: "GET /server_types, GET /locations, GET /images, POST /servers",
-                detail: "Select server type, location, and bootstrap-capable base image at plan time, then create the server only after operator confirmation.",
-            },
-            SetupProviderPlanResource {
-                key: "ssh_key",
-                kind: "hetzner-cloud-ssh-key",
-                required: true,
-                api: "GET /ssh_keys",
-                detail: "Resolve and attach an existing SSH public key before server creation; private key material stays outside provider state and Pharos job records.",
-            },
-            SetupProviderPlanResource {
-                key: "firewall",
-                kind: "hetzner-cloud-firewall",
-                required: true,
-                api: "GET /firewalls, POST /servers",
-                detail: "Resolve a pre-reviewed firewall and attach it in the server create request; Pharos refuses to create an unprotected server when the firewall is missing.",
-            },
-            SetupProviderPlanResource {
-                key: "volume",
-                kind: "hetzner-cloud-volume",
-                required: false,
-                api: "GET /volumes, POST /volumes",
-                detail: "Optional data volume; availability, size, attachment, and cost are verified at plan time before inclusion.",
-            },
-            SetupProviderPlanResource {
-                key: "backup_or_snapshot",
-                kind: "hetzner-cloud-backup-snapshot",
-                required: false,
-                api: "GET /pricing, POST /servers/{id}/actions/create_image",
-                detail: "Optional provider backup or initial snapshot handoff; pricing and support are runtime checks, not hardcoded promises.",
-            },
-        ],
-        steps: vec![
-            SetupProviderPlanStep {
-                key: "provider_resources",
-                title: "Provider resources",
-                detail: "Create the server with an existing SSH public key, reviewed firewall, and Pharos management labels through Hetzner Cloud API calls.",
-                status: "planned",
-            },
-            SetupProviderPlanStep {
-                key: "runtime_verify",
-                title: "Runtime verification",
-                detail: "Fetch server types, images, locations, and prices at plan time; do not hardcode price or availability promises.",
-                status: "required",
-            },
-            SetupProviderPlanStep {
-                key: "bootstrap",
-                title: "NixOS bootstrap",
-                detail: "Boot a runtime-verified Linux base with SSH access, then run nixos-anywhere from a Pharos/nixcfg flake profile.",
-                status: "planned",
-            },
-            SetupProviderPlanStep {
-                key: "beacon_handoff",
-                title: "Beacon handoff",
-                detail: "Install pharos-beacon using a token file or secret reference; raw tokens never appear in job progress, logs, or URLs.",
-                status: "protected",
-            },
-            SetupProviderPlanStep {
-                key: "observable_finish",
-                title: "Observable finish",
-                detail: "Wait for the first valid heartbeat, then mark backup enrollment and location source as complete or explicitly pending.",
-                status: "waiting",
-            },
-        ],
-        secret_boundary: vec![
-            SetupProviderPlanSecretBoundary {
-                key: "provider_api_token",
-                source: "runtime secret reference",
-                rule: "Use only for the provider executor call; never serialize into plan JSON, PPM notes, logs, progress messages, URLs, or OpenTofu state.",
-            },
-            SetupProviderPlanSecretBoundary {
-                key: "ssh_private_key",
-                source: "operator or agent runtime",
-                rule: "Only public keys may be sent to Hetzner Cloud; private key material must stay in the runtime secret store.",
-            },
-            SetupProviderPlanSecretBoundary {
-                key: "pharos_registration_and_beacon",
-                source: "Pharos/Janus handoff",
-                rule: "Registration and per-host beacon values are one-time or secret-store handoffs; job output may show refs and states only.",
-            },
-        ],
-        handoffs: vec![
-            SetupProviderPlanHandoff {
-                key: "provider_executor",
-                target: "Hetzner Cloud executor",
-                detail: "Consumes this plan contract, validates required references before create, and persists safe resource identifiers plus cleanup guidance.",
-            },
-            SetupProviderPlanHandoff {
-                key: "nixos_bootstrap",
-                target: "nixos-anywhere",
-                detail: "Runs against the freshly reachable server using a reviewed flake profile and generated hardware facts.",
-            },
-            SetupProviderPlanHandoff {
-                key: "beacon_token",
-                target: "Pharos/Janus",
-                detail: "Installs pharos-beacon with a token file or managed secret ref, then waits for first heartbeat before live state.",
-            },
-            SetupProviderPlanHandoff {
-                key: "backup_location",
-                target: "PHAROS-83/86",
-                detail: "Leaves backup enrollment and location source as explicit pending work when they are not completed during provisioning.",
-            },
-        ],
-        runtime_checks: vec![
-            "server_type availability",
-            "location availability",
-            "image/base OS availability",
-            "current provider price",
-            "SSH key and firewall compatibility",
-            "backup/snapshot option availability",
-        ],
-    }
-}
-
-fn manual_import_setup_plan(template: &str) -> SetupProviderPlan {
-    let netcup = template == "netcup-manual-import";
-    let oracle = template == "oracle-always-free-lab";
-    let gcp = template == "gcp-free-tier-lab";
-    let (strategy, approach, summary, docs, resources, steps, runtime_checks) = if netcup {
-        (
-            "netcup-manual-import",
-            "Treat Netcup as an externally-created server first: buy/create and prepare the VPS or root server outside Pharos, then import it through existing-host onboarding.",
-            "Use Netcup for the server, but keep ordering, cancellation, billing, image choice, rescue/ISO work, snapshots, and SSH preparation explicit operator steps before Pharos imports the host.",
-            vec![
-                SetupProviderPlanDoc {
-                    label: "netcup server REST API",
-                    url: "https://www.netcup.com/en/helpcenter/documentation/server/rest-api",
-                },
-                SetupProviderPlanDoc {
-                    label: "nixos-anywhere quickstart",
-                    url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
-                },
-            ],
-            vec![
-                SetupProviderPlanResource {
-                    key: "netcup_server",
-                    kind: "externally-created-netcup-server",
-                    required: true,
-                    api: "operator / Netcup SCP",
-                    detail: "Create or select the Netcup VPS/root server outside Pharos; Pharos does not order, cancel, resize, or bill provider resources for this path.",
-                },
-                SetupProviderPlanResource {
-                    key: "base_os_or_rescue",
-                    kind: "provider-image-or-rescue",
-                    required: true,
-                    api: "operator / Netcup SCP",
-                    detail: "Install a Debian/Ubuntu or NixOS-capable base, or prepare the rescue/ISO route before running Pharos preflight.",
-                },
-                SetupProviderPlanResource {
-                    key: "ssh_access",
-                    kind: "ssh-route",
-                    required: true,
-                    api: "preflight",
-                    detail: "Verify SSH address, user, privilege level, and firewall/reachability before bootstrap; private keys remain outside Pharos records.",
-                },
-                SetupProviderPlanResource {
-                    key: "backup_snapshot_expectation",
-                    kind: "operator-decision",
-                    required: true,
-                    api: "runtime check",
-                    detail: "Confirm current Netcup backup/snapshot options and pricing separately; Pharos records backup intent and later observes runtime backup evidence.",
-                },
-            ],
-            vec![
-                SetupProviderPlanStep {
-                    key: "provider_resources",
-                    title: "Netcup server prepared externally",
-                    detail: "Buy/create or select the server in Netcup, verify current billing/pricing, choose the base image or rescue/ISO path, and keep provider credentials out of Pharos.",
-                    status: "external",
-                },
-                SetupProviderPlanStep {
-                    key: "bootstrap",
-                    title: "Import through existing-host onboarding",
-                    detail: "Run Pharos existing-host read-only preflight, then choose NixOS/nixos-anywhere, portable systemd beacon, or manual/deferred bootstrap.",
-                    status: "handoff",
-                },
-                SetupProviderPlanStep {
-                    key: "observable_finish",
-                    title: "Observable finish",
-                    detail: "Wait for first heartbeat, then record backup/snapshot expectation and location decisions explicitly.",
-                    status: "waiting",
-                },
-            ],
-            vec![
-                "current Netcup product price and billing state",
-                "SSH reachability and firewall access",
-                "OS/bootstrap capability",
-                "rescue or ISO path if reinstall is needed",
-                "backup/snapshot availability and expectations",
-                "Pharos endpoint reachability",
-            ],
-        )
-    } else if oracle {
-        (
-            "oracle-always-free-lab-import",
-            "Treat Oracle Always Free as an externally-created lab VM first: create the VM in Oracle Cloud, verify current free-tier eligibility, quota, and capacity, then import it through existing-host onboarding.",
-            "Use Oracle Cloud only as a lab/demo host source. Pharos does not promise permanent zero cost, does not manage Oracle tenancy resources, and does not store Oracle credentials.",
-            vec![
-                SetupProviderPlanDoc {
-                    label: "Oracle Always Free resources",
-                    url: "https://docs.oracle.com/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm",
-                },
-                SetupProviderPlanDoc {
-                    label: "nixos-anywhere quickstart",
-                    url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
-                },
-            ],
-            vec![
-                SetupProviderPlanResource {
-                    key: "oracle_vm",
-                    kind: "externally-created-oracle-vm",
-                    required: true,
-                    api: "operator / Oracle Cloud Console",
-                    detail: "Create or select an Oracle Cloud VM outside Pharos; verify Always Free eligibility, region capacity, shape availability, boot image, and current cost before import.",
-                },
-                SetupProviderPlanResource {
-                    key: "network_access",
-                    kind: "cloud-network-rule",
-                    required: true,
-                    api: "operator / Oracle Cloud Console",
-                    detail: "Prepare ingress and egress rules for SSH and beacon reporting; Pharos records only the SSH route and runtime heartbeat.",
-                },
-                SetupProviderPlanResource {
-                    key: "ssh_access",
-                    kind: "ssh-route",
-                    required: true,
-                    api: "preflight",
-                    detail: "Verify SSH user, host, privilege level, and bootstrap capability before install; private keys remain outside Pharos records.",
-                },
-                SetupProviderPlanResource {
-                    key: "backup_expectation",
-                    kind: "operator-decision",
-                    required: true,
-                    api: "runtime check",
-                    detail: "Decide whether Oracle snapshots, external backup, or Pharos-observed backup jobs are expected; pricing and retention must be checked at setup time.",
-                },
-            ],
-            vec![
-                SetupProviderPlanStep {
-                    key: "provider_resources",
-                    title: "Oracle lab VM prepared externally",
-                    detail: "Create the VM in Oracle Cloud, verify Always Free assumptions, region capacity, boot image, and billing before Pharos imports anything.",
-                    status: "external",
-                },
-                SetupProviderPlanStep {
-                    key: "bootstrap",
-                    title: "Import through existing-host onboarding",
-                    detail: "Run Pharos existing-host read-only preflight, then choose NixOS/nixos-anywhere, portable systemd beacon, or manual/deferred bootstrap.",
-                    status: "handoff",
-                },
-                SetupProviderPlanStep {
-                    key: "observable_finish",
-                    title: "Observable finish",
-                    detail: "Wait for first heartbeat, then record backup and location decisions explicitly.",
-                    status: "waiting",
-                },
-            ],
-            vec![
-                "current Oracle Always Free eligibility",
-                "region capacity and VM shape availability",
-                "current billing and quota state",
-                "SSH reachability and cloud firewall rules",
-                "OS/bootstrap capability",
-                "backup/snapshot expectation",
-                "Pharos endpoint reachability",
-            ],
-        )
-    } else if gcp {
-        (
-            "gcp-free-tier-lab-import",
-            "Treat Google Cloud free tier as an externally-created lab VM first: create the VM in Google Cloud, verify current free-tier limits, region eligibility, and billing state, then import it through existing-host onboarding.",
-            "Use Google Cloud only as a lab/demo host source. Pharos does not promise a permanently free VM, does not manage Google Cloud projects, and does not store Google Cloud credentials.",
-            vec![
-                SetupProviderPlanDoc {
-                    label: "Google Cloud free program",
-                    url: "https://cloud.google.com/free/docs/free-cloud-features",
-                },
-                SetupProviderPlanDoc {
-                    label: "nixos-anywhere quickstart",
-                    url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
-                },
-            ],
-            vec![
-                SetupProviderPlanResource {
-                    key: "gcp_vm",
-                    kind: "externally-created-gcp-vm",
-                    required: true,
-                    api: "operator / Google Cloud Console",
-                    detail: "Create or select the Google Cloud VM outside Pharos; verify current free-tier eligibility, eligible region, machine type, boot image, and billing state before import.",
-                },
-                SetupProviderPlanResource {
-                    key: "network_access",
-                    kind: "cloud-firewall-rule",
-                    required: true,
-                    api: "operator / Google Cloud Console",
-                    detail: "Prepare firewall and egress access for SSH and beacon reporting; Pharos stores no Google Cloud project credentials for this path.",
-                },
-                SetupProviderPlanResource {
-                    key: "ssh_access",
-                    kind: "ssh-route",
-                    required: true,
-                    api: "preflight",
-                    detail: "Verify SSH user, host, privilege level, and bootstrap capability before install; private keys remain outside Pharos records.",
-                },
-                SetupProviderPlanResource {
-                    key: "backup_expectation",
-                    kind: "operator-decision",
-                    required: true,
-                    api: "runtime check",
-                    detail: "Decide whether provider snapshots, external backup, or Pharos-observed backup jobs are expected; pricing and retention must be checked at setup time.",
-                },
-            ],
-            vec![
-                SetupProviderPlanStep {
-                    key: "provider_resources",
-                    title: "Google Cloud lab VM prepared externally",
-                    detail: "Create the VM in Google Cloud, verify free-tier assumptions, eligible region, machine type, boot image, and billing before Pharos imports anything.",
-                    status: "external",
-                },
-                SetupProviderPlanStep {
-                    key: "bootstrap",
-                    title: "Import through existing-host onboarding",
-                    detail: "Run Pharos existing-host read-only preflight, then choose NixOS/nixos-anywhere, portable systemd beacon, or manual/deferred bootstrap.",
-                    status: "handoff",
-                },
-                SetupProviderPlanStep {
-                    key: "observable_finish",
-                    title: "Observable finish",
-                    detail: "Wait for first heartbeat, then record backup and location decisions explicitly.",
-                    status: "waiting",
-                },
-            ],
-            vec![
-                "current Google Cloud free-tier limits",
-                "eligible region and machine type",
-                "current billing and quota state",
-                "SSH reachability and cloud firewall rules",
-                "OS/bootstrap capability",
-                "backup/snapshot expectation",
-                "Pharos endpoint reachability",
-            ],
-        )
-    } else {
-        (
-            "operator-managed-import",
-            "Keep provider creation external; Pharos plans the import/bootstrap checks and records only safe runtime observations.",
-            "Keep provider creation outside Pharos, then import and bootstrap the already-created host.",
-            vec![SetupProviderPlanDoc {
-                label: "nixos-anywhere quickstart",
-                url: "https://github.com/nix-community/nixos-anywhere/blob/main/docs/quickstart.md",
-            }],
-            vec![
-                SetupProviderPlanResource {
-                    key: "existing_server",
-                    kind: "operator-owned-server",
-                    required: true,
-                    api: "external",
-                    detail: "Operator supplies an already-created host and SSH route; Pharos does not create provider resources for this path.",
-                },
-                SetupProviderPlanResource {
-                    key: "ssh_access",
-                    kind: "ssh-route",
-                    required: true,
-                    api: "preflight",
-                    detail: "Verify reachability and privilege level before bootstrap; private keys remain outside Pharos records.",
-                },
-            ],
-            vec![
-                SetupProviderPlanStep {
-                    key: "provider_resources",
-                    title: "Provider resources",
-                    detail: "Operator creates or keeps the server with the external provider; Pharos stores no provider credentials for this path.",
-                    status: "external",
-                },
-                SetupProviderPlanStep {
-                    key: "bootstrap",
-                    title: "Bootstrap",
-                    detail: "Run existing-host preflight, then choose NixOS, portable beacon, or manual/deferred bootstrap.",
-                    status: "handoff",
-                },
-                SetupProviderPlanStep {
-                    key: "observable_finish",
-                    title: "Observable finish",
-                    detail: "Wait for first heartbeat and record backup/location decisions explicitly.",
-                    status: "waiting",
-                },
-            ],
-            vec![
-                "SSH reachability",
-                "OS/bootstrap capability",
-                "Pharos endpoint reachability",
-            ],
-        )
-    };
-
-    SetupProviderPlan {
-        schema: "inspr.pharos.setup-provider-plan.v1",
-        version: 1,
-        provider: "manual-import",
-        template: if netcup {
-            "netcup-manual-import"
-        } else if oracle {
-            "oracle-always-free-lab"
-        } else if gcp {
-            "gcp-free-tier-lab"
-        } else {
-            "manual-import"
-        },
-        strategy,
-        approach,
-        summary,
-        docs,
-        resources,
-        steps,
-        secret_boundary: vec![
-            SetupProviderPlanSecretBoundary {
-                key: "ssh_private_key",
-                source: "operator runtime",
-                rule: "Use only for preflight/bootstrap; never serialize private key material into Pharos job state.",
-            },
-            SetupProviderPlanSecretBoundary {
-                key: "pharos_registration_and_beacon",
-                source: "Pharos/Janus handoff",
-                rule: "Registration and beacon values stay in runtime secret handling; UI and progress text show states only.",
-            },
-        ],
-        handoffs: vec![
-            SetupProviderPlanHandoff {
-                key: "existing_host_preflight",
-                target: "PHAROS-84/85",
-                detail: "Chooses SSH/bootstrap method and validates the host before installing or configuring the beacon.",
-            },
-            SetupProviderPlanHandoff {
-                key: "backup_location",
-                target: "PHAROS-86",
-                detail: "Records backup and location setup decisions after the imported host reports.",
-            },
-        ],
-        runtime_checks,
-    }
-}
-
-fn provisioning_jobs_path(host_store_path: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("PHAROS_PROVISIONING_JOBS_DB") {
-        let path = path.trim();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    host_store_path.map(derived_provisioning_jobs_path)
-}
-
-fn derived_provisioning_jobs_path(host_store_path: &Path) -> PathBuf {
-    let file_name = host_store_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("pharos.json");
-    host_store_path.with_file_name(format!("{file_name}.provisioning-jobs.json"))
-}
-
 #[derive(Clone)]
 struct BeaconAuth {
     registration_token: Option<String>,
     require_report_token: bool,
     report_token_mode: BeaconTokenMode,
-    janus_token_hash_sources: Vec<JanusTokenHashSource>,
+    janus_tokens: Option<JanusTokenStore>,
     local_register_enabled: bool,
 }
 
 impl BeaconAuth {
-    fn from_env() -> Self {
+    fn from_env() -> Result<Self, String> {
         let registration_token = env_nonempty("PHAROS_REGISTRATION_TOKEN");
-        let janus_token_hash_sources = janus_token_hash_sources_from_env();
-        let report_token_mode = env_nonempty("PHAROS_BEACON_TOKEN_MODE")
-            .and_then(|s| parse_beacon_token_mode(&s))
-            .unwrap_or({
-                if !janus_token_hash_sources.is_empty() {
+        let janus_tokens = janus_token_generation_root_from_env()?
+            .map(JanusTokenStore::load)
+            .transpose()
+            .map_err(|error| {
+                format!("Janus token generation failed startup validation: {error}")
+            })?;
+        let report_token_mode = match env_nonempty("PHAROS_BEACON_TOKEN_MODE") {
+            Some(value) => parse_beacon_token_mode(&value)?,
+            None => {
+                if janus_tokens.is_some() {
                     BeaconTokenMode::Dual
                 } else {
                     BeaconTokenMode::Local
                 }
-            });
-        let require_report_token = std::env::var("PHAROS_REQUIRE_BEACON_TOKEN")
-            .ok()
-            .and_then(|s| parse_bool(&s))
-            .unwrap_or(
-                registration_token.is_some()
-                    || !janus_token_hash_sources.is_empty()
-                    || report_token_mode == BeaconTokenMode::Janus,
-            );
-        let local_register_enabled = std::env::var("PHAROS_ALLOW_LOCAL_REGISTER")
-            .ok()
-            .and_then(|s| parse_bool(&s))
+            }
+        };
+        let require_report_token = env_bool("PHAROS_REQUIRE_BEACON_TOKEN")?.unwrap_or(
+            registration_token.is_some()
+                || janus_tokens.is_some()
+                || report_token_mode == BeaconTokenMode::Janus,
+        );
+        let local_register_enabled = env_bool("PHAROS_ALLOW_LOCAL_REGISTER")?
             .unwrap_or(report_token_mode != BeaconTokenMode::Janus);
-        Self {
+
+        Self::validated(
             registration_token,
             require_report_token,
             report_token_mode,
-            janus_token_hash_sources,
+            janus_tokens,
             local_register_enabled,
+        )
+    }
+
+    fn validated(
+        registration_token: Option<String>,
+        require_report_token: bool,
+        report_token_mode: BeaconTokenMode,
+        janus_tokens: Option<JanusTokenStore>,
+        local_register_enabled: bool,
+    ) -> Result<Self, String> {
+        if report_token_mode == BeaconTokenMode::Janus {
+            if !require_report_token {
+                return Err(
+                    "PHAROS_BEACON_TOKEN_MODE=janus requires PHAROS_REQUIRE_BEACON_TOKEN=true"
+                        .to_string(),
+                );
+            }
+            if local_register_enabled {
+                return Err(
+                    "PHAROS_BEACON_TOKEN_MODE=janus requires PHAROS_ALLOW_LOCAL_REGISTER=false"
+                        .to_string(),
+                );
+            }
+            if registration_token.is_some() {
+                return Err(
+                    "PHAROS_REGISTRATION_TOKEN must be absent when PHAROS_BEACON_TOKEN_MODE=janus"
+                        .to_string(),
+                );
+            }
+            if janus_tokens.is_none() {
+                return Err(
+                    "PHAROS_BEACON_TOKEN_MODE=janus requires a Janus token generation root"
+                        .to_string(),
+                );
+            }
         }
+
+        Ok(Self {
+            registration_token,
+            require_report_token,
+            report_token_mode,
+            janus_tokens,
+            local_register_enabled,
+        })
     }
 
     fn registration_status(&self, headers: &HeaderMap) -> RegistrationAuth {
@@ -4250,17 +273,26 @@ impl BeaconAuth {
         host: &str,
         expected_hash: &str,
     ) -> Result<bool, JanusTokenHashError> {
-        let hashes = load_janus_token_hashes(&self.janus_token_hash_sources)?;
-        Ok(hashes
-            .get(host)
-            .is_some_and(|stored| constant_time_eq(stored, expected_hash)))
+        self.janus_tokens
+            .as_ref()
+            .ok_or(JanusTokenHashError::NotConfigured)?
+            .token_matches(host, expected_hash)
     }
 
     fn janus_manages_host(&self, host: &str) -> Result<bool, JanusTokenHashError> {
         if self.report_token_mode == BeaconTokenMode::Local {
             return Ok(false);
         }
-        Ok(load_janus_token_hashes(&self.janus_token_hash_sources)?.contains_key(host))
+        self.janus_tokens
+            .as_ref()
+            .ok_or(JanusTokenHashError::NotConfigured)?
+            .manages_host(host)
+    }
+
+    fn janus_readiness(&self) -> Option<JanusTokenReadiness> {
+        self.janus_tokens
+            .as_ref()
+            .map(JanusTokenStore::refresh_readiness)
     }
 }
 
@@ -4291,12 +323,6 @@ impl RetirementOwnerAuth {
     }
 }
 
-#[derive(Clone)]
-enum JanusTokenHashSource {
-    File(PathBuf),
-    Dir(PathBuf),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BeaconTokenMode {
     Local,
@@ -4316,3768 +342,6 @@ enum ReportTokenAuth {
     Denied,
     Unavailable(JanusTokenHashError),
 }
-
-#[derive(Clone)]
-struct AlertNotifier {
-    webhook_url: Option<String>,
-    client: reqwest::Client,
-    notified_down_hosts: Arc<Mutex<BTreeSet<String>>>,
-    check_interval: Duration,
-}
-
-impl AlertNotifier {
-    fn from_env() -> Self {
-        let webhook_url = alert_webhook_url(
-            std::env::var("PHAROS_ALERT_WEBHOOK_URL").ok(),
-            std::env::var("WATCHTOWER_NOTIFICATION_URL").ok(),
-            std::env::var("PHAROS_ALERT_WEBHOOK_ENV_FILE").ok(),
-        );
-        let check_interval = std::env::var("PHAROS_ALERT_CHECK_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|seconds| *seconds >= 5)
-            .map(Duration::from_secs)
-            .unwrap_or(ALERT_CHECK_INTERVAL);
-        let timeout = std::env::var("PHAROS_ALERT_WEBHOOK_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|seconds| *seconds >= 1)
-            .map(Duration::from_secs)
-            .unwrap_or(ALERT_WEBHOOK_TIMEOUT);
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            webhook_url,
-            client,
-            notified_down_hosts: Arc::new(Mutex::new(BTreeSet::new())),
-            check_interval,
-        }
-    }
-
-    fn enabled(&self) -> bool {
-        self.webhook_url.is_some()
-    }
-
-    async fn check_store(&self, store: &Store, now: i64) {
-        let alerts = silent_beacon_alerts(&store.list(), now);
-        let down_hosts = alerts
-            .iter()
-            .map(|alert| alert.host.clone())
-            .collect::<BTreeSet<_>>();
-        let candidates = {
-            let mut notified = self
-                .notified_down_hosts
-                .lock()
-                .expect("alert notifier mutex poisoned");
-            notified.retain(|host| down_hosts.contains(host));
-            alerts
-                .into_iter()
-                .filter(|alert| !notified.contains(&alert.host))
-                .collect::<Vec<_>>()
-        };
-
-        for alert in candidates {
-            if self.send(&alert).await {
-                self.notified_down_hosts
-                    .lock()
-                    .expect("alert notifier mutex poisoned")
-                    .insert(alert.host.clone());
-            }
-        }
-    }
-
-    async fn send(&self, alert: &SilentBeaconAlert) -> bool {
-        let Some(url) = self.webhook_url.as_deref() else {
-            return false;
-        };
-        let Ok(parsed_url) = Url::parse(url) else {
-            tracing::warn!(host = %alert.host, "silent beacon alert target URL is invalid");
-            return false;
-        };
-        match parsed_url.scheme() {
-            "http" | "https" => self.send_http_alert(url, alert).await,
-            "telegram" => self.send_telegram_alert(&parsed_url, alert).await,
-            _ => {
-                tracing::warn!(
-                    host = %alert.host,
-                    scheme = %parsed_url.scheme(),
-                    "silent beacon alert target URL scheme is unsupported"
-                );
-                false
-            }
-        }
-    }
-
-    async fn send_http_alert(&self, url: &str, alert: &SilentBeaconAlert) -> bool {
-        match self.client.post(url).json(alert).send().await {
-            Ok(response) if response.status().is_success() => {
-                tracing::warn!(
-                    host = %alert.host,
-                    age_seconds = alert.age_seconds,
-                    "silent beacon alert notification sent"
-                );
-                true
-            }
-            Ok(response) => {
-                tracing::warn!(
-                    host = %alert.host,
-                    status = %response.status(),
-                    "silent beacon alert webhook returned non-success"
-                );
-                false
-            }
-            Err(_) => {
-                tracing::warn!(
-                    host = %alert.host,
-                    "silent beacon alert webhook request failed"
-                );
-                false
-            }
-        }
-    }
-
-    async fn send_telegram_alert(&self, url: &Url, alert: &SilentBeaconAlert) -> bool {
-        let Some(target) = TelegramAlertTarget::from_url(url) else {
-            tracing::warn!(host = %alert.host, "silent beacon Telegram alert target is invalid");
-            return false;
-        };
-        let endpoint = format!("https://api.telegram.org/bot{}/sendMessage", target.token);
-        let text = telegram_alert_text(alert);
-        let mut sent_all = true;
-
-        for chat_id in target.chats {
-            let payload = json!({
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": true,
-            });
-            match self.client.post(&endpoint).json(&payload).send().await {
-                Ok(response) if response.status().is_success() => {
-                    tracing::warn!(
-                        host = %alert.host,
-                        age_seconds = alert.age_seconds,
-                        "silent beacon Telegram alert notification sent"
-                    );
-                }
-                Ok(response) => {
-                    tracing::warn!(
-                        host = %alert.host,
-                        status = %response.status(),
-                        "silent beacon Telegram alert returned non-success"
-                    );
-                    sent_all = false;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        host = %alert.host,
-                        "silent beacon Telegram alert request failed"
-                    );
-                    sent_all = false;
-                }
-            }
-        }
-
-        sent_all
-    }
-}
-
-fn spawn_alert_loop(state: AppState, notifier: AlertNotifier) {
-    if !notifier.enabled() {
-        tracing::info!("silent beacon alert webhook not configured; notifications disabled");
-        return;
-    }
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(notifier.check_interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            notifier.check_store(&state.store, now_unix()).await;
-        }
-    });
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct SilentBeaconAlert {
-    schema: &'static str,
-    level: &'static str,
-    kind: &'static str,
-    host: String,
-    role: String,
-    last_seen: i64,
-    age_seconds: i64,
-    heartbeat_interval_secs: u64,
-    as_of: i64,
-    summary: String,
-    next_action: &'static str,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct TelegramAlertTarget {
-    token: String,
-    chats: Vec<String>,
-}
-
-impl TelegramAlertTarget {
-    fn from_url(url: &Url) -> Option<Self> {
-        if url.scheme() != "telegram" {
-            return None;
-        }
-        let username = url.username();
-        if username.is_empty() {
-            return None;
-        }
-        let token = match url.password() {
-            Some(password) if !password.is_empty() => format!("{username}:{password}"),
-            _ => username.to_string(),
-        };
-        let chats = url
-            .query_pairs()
-            .find_map(|(key, value)| {
-                if key == "chats" || key == "channels" {
-                    Some(
-                        value
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|chat| !chat.is_empty())
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    None
-                }
-            })
-            .filter(|chats| !chats.is_empty())?;
-
-        Some(Self { token, chats })
-    }
-}
-
-fn telegram_alert_text(alert: &SilentBeaconAlert) -> String {
-    format!(
-        "Pharos critical alert\nHost: {}\nProblem: {}\nAge: {}\nNext: {}",
-        alert.host,
-        alert.summary,
-        duration_label(alert.age_seconds),
-        alert.next_action
-    )
-}
-
-fn silent_beacon_alerts(hosts: &[Host], now: i64) -> Vec<SilentBeaconAlert> {
-    let mut alerts = hosts
-        .iter()
-        .filter_map(|host| {
-            if host.preferences.suppresses_down_alerts() {
-                return None;
-            }
-            let last_seen = host.last_seen?;
-            if liveness(host.last_seen, host.heartbeat_interval_secs, now) != Liveness::Down {
-                return None;
-            }
-            let age_seconds = now.saturating_sub(last_seen);
-            let interval = host.heartbeat_interval_secs.unwrap_or(60);
-            Some(SilentBeaconAlert {
-                schema: "inspr.pharos.alert.v1",
-                level: "critical",
-                kind: "silent_heartbeat",
-                host: host.name.clone(),
-                role: host.role.clone(),
-                last_seen,
-                age_seconds,
-                heartbeat_interval_secs: interval,
-                as_of: now,
-                summary: format!(
-                    "{} has not reported to Pharos for {}.",
-                    host.name,
-                    duration_label(age_seconds)
-                ),
-                next_action: "Check host power, network, and pharos-beacon.",
-            })
-        })
-        .collect::<Vec<_>>();
-    alerts.sort_by(|left, right| left.host.cmp(&right.host));
-    alerts
-}
-
-fn non_empty_env_value(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn alert_webhook_url(
-    pharos_url: Option<String>,
-    watchtower_url: Option<String>,
-    env_file: Option<String>,
-) -> Option<String> {
-    pharos_url
-        .as_deref()
-        .and_then(non_empty_env_value)
-        .or_else(|| watchtower_url.as_deref().and_then(non_empty_env_value))
-        .or_else(|| {
-            env_file
-                .as_deref()
-                .and_then(alert_webhook_url_from_env_file)
-        })
-}
-
-fn alert_webhook_url_from_env_file(path: &str) -> Option<String> {
-    let path = non_empty_env_value(path)?;
-    let contents = fs::read_to_string(path).ok()?;
-    env_file_value(&contents, "WATCHTOWER_NOTIFICATION_URL")
-        .as_deref()
-        .and_then(non_empty_env_value)
-}
-
-fn env_file_value(contents: &str, key: &str) -> Option<String> {
-    contents.lines().find_map(|line| {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            return None;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        let (name, value) = line.split_once('=')?;
-        if name.trim() != key {
-            return None;
-        }
-        Some(unquote_env_value(value.trim()).to_string())
-    })
-}
-
-fn unquote_env_value(value: &str) -> &str {
-    if value.len() < 2 {
-        return value;
-    }
-    let bytes = value.as_bytes();
-    let quoted = (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
-        || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'');
-    if quoted {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    }
-}
-
-const FLEET_HORIZON_PNG: &[u8] = include_bytes!("../assets/fleet-horizon.png");
-const SIDEBAR_LIGHTHOUSE_PNG: &[u8] = include_bytes!("../assets/sidebar-lighthouse.png");
-const SIDEBAR_LIGHTHOUSE_MOTION_MP4: &[u8] =
-    include_bytes!("../assets/sidebar-lighthouse-motion-v1.mp4");
-const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="5" fill="#f7fbfc"/><path d="M10.5 5 12 2.5 13.5 5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="10" y="5" width="4" height="3" rx=".5" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 8 8.6 20M14 8l1.4 12M9.2 13.5h5.6M7 20h10M6 22h12M16.6 6.4l2.4-1M7.4 6.4l-2.4-1" stroke="#d69b31" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
-const APP_VERSION: &str = env!("PHAROS_APP_VERSION");
-const GIT_COMMIT: &str = env!("PHAROS_GIT_COMMIT");
-const CHANGELOG_MD: &str = include_str!("../../../docs/CHANGELOG.md");
-
-const HEAD: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
-:root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--card:#ffffff;--card-soft:rgba(255,255,255,.82);--accent:#1f7fb5;--sea:#159e99;--sun:#d69b31;--live:#25845f;--stale:#b26a00;--down:#bf3a35;--wait:#8997a3;--side:232px}
-*{box-sizing:border-box}
-body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%);min-height:100vh;overflow-x:hidden}
-body:before{content:"";position:fixed;inset:0;z-index:-3;background:radial-gradient(circle at 86% 5%,rgba(214,155,49,.16),transparent 12rem),radial-gradient(circle at 18% 28%,rgba(21,158,153,.08),transparent 18rem),linear-gradient(180deg,rgba(255,255,255,.94),rgba(239,249,250,.82));pointer-events:none}
-.app-shell{min-height:100vh;display:grid;grid-template-columns:var(--side) minmax(0,1fr)}
-.sidebar{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:24px;padding:30px 18px 18px;border-right:1px solid rgba(211,225,233,.78);background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(247,252,253,.82));box-shadow:12px 0 38px rgba(45,75,95,.05);overflow:hidden}
-.sidebar:before,.sidebar-motion{position:absolute;left:-18%;right:-20%;bottom:-10%;height:66%;pointer-events:none;-webkit-mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%);mask-image:radial-gradient(ellipse at 35% 76%,#000 0 24%,rgba(0,0,0,.82) 39%,rgba(0,0,0,.30) 61%,transparent 82%);transition:opacity .55s ease}
-.sidebar:before{content:"";background:url('/assets/sidebar-lighthouse.png') left bottom/118% auto no-repeat;opacity:.78}
-.sidebar-motion{overflow:hidden;opacity:0}.sidebar-motion video{position:absolute;left:0;bottom:0;width:118%;height:auto;display:block}.sidebar[data-motion-ready="true"][data-sidebar-still="false"]:before{opacity:0}.sidebar[data-motion-ready="true"][data-sidebar-still="false"] .sidebar-motion{opacity:.78}
-.side-brand,.side-nav,.side-foot{position:relative;z-index:1}.side-brand{display:flex;align-items:center;gap:13px;padding:0 12px}.side-mark{display:grid;place-items:center;width:36px;height:50px;color:var(--sun)}.side-mark .ico{width:31px;height:31px}.side-logo{font-family:Georgia,"Times New Roman",serif;font-size:22px;letter-spacing:.18em;color:#14304b;text-transform:uppercase}
-.side-nav{display:grid;gap:7px}.side-link{display:grid;grid-template-columns:23px minmax(0,1fr) auto;align-items:center;gap:11px;min-height:46px;padding:0 13px;border-radius:7px;color:#294761;text-decoration:none;font-weight:520}.side-link[aria-current="page"]{background:rgba(223,241,249,.76);color:#0f4f80}.side-link .ico{width:18px;height:18px}.side-badge{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:#ffe7bb;color:#9a5b00;font-size:12px;font-weight:700}
-.side-bottom{position:relative;z-index:1;margin-top:auto;display:grid;gap:8px}.side-version{appearance:none;display:flex;align-items:center;justify-content:center;gap:7px;min-height:32px;width:100%;border:1px solid rgba(211,225,233,.70);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.68),rgba(247,252,253,.54));box-shadow:0 8px 20px rgba(45,75,95,.08);-webkit-backdrop-filter:blur(10px) saturate(1.05);backdrop-filter:blur(10px) saturate(1.05);color:#4c6780;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.side-version:hover,.side-version:focus-visible{color:#0f4f80;background:rgba(223,241,249,.72);outline:0}.side-version .ico{width:14px;height:14px}.side-foot{display:flex;align-items:center;justify-content:space-between;gap:9px;min-height:48px;padding:7px 8px 7px 11px;border:1px solid rgba(211,225,233,.70);border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.78),rgba(247,252,253,.62));box-shadow:0 10px 26px rgba(45,75,95,.12);-webkit-backdrop-filter:blur(10px) saturate(1.08);backdrop-filter:blur(10px) saturate(1.08);color:#294761;font-size:13px}.side-user{min-width:0;display:flex;align-items:center;gap:9px;font-weight:650;text-shadow:0 1px 0 rgba(255,255,255,.76)}.side-user:before{content:"";flex:0 0 auto;width:24px;height:24px;border-radius:50%;border:1px solid rgba(214,155,49,.38);background:radial-gradient(circle,#fff 0 33%,rgba(214,155,49,.18) 36%,transparent 68%)}.side-user span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.side-logout{display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border-radius:50%;color:#4c6780;text-decoration:none}.side-logout:hover{background:rgba(223,241,249,.78);color:#0f4f80}.side-logout .ico{width:16px;height:16px}
-body[data-release-open="true"]{overflow:hidden}.release-overlay{position:fixed;inset:0;z-index:6000;display:grid;place-items:center;padding:28px;background:rgba(20,48,75,.18);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}.release-backdrop{position:absolute;inset:0}.release-sheet{position:relative;width:min(660px,calc(100vw - 36px));max-height:min(720px,calc(100vh - 42px));display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.94);box-shadow:0 24px 70px rgba(45,75,95,.22);overflow:hidden}.release-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 22px 16px;border-bottom:1px solid rgba(214,226,234,.72);background:linear-gradient(180deg,rgba(247,252,253,.86),rgba(255,255,255,.72))}.release-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500;color:#12304b}.release-head p{margin:4px 0 0;color:var(--muted);font-size:12px}.release-close{appearance:none;border:1px solid rgba(210,226,234,.86);border-radius:7px;background:#fff;color:#294761;font:inherit;font-size:12px;font-weight:760;padding:8px 11px;cursor:pointer}.release-close:hover,.release-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}.release-body{padding:18px 22px 22px;overflow:auto;color:var(--ink)}.release-body h2{display:none}.release-body h3{margin:0 0 8px;font-family:Georgia,"Times New Roman",serif;font-size:21px;font-weight:500;color:#12304b}.release-body ul{margin:0 0 18px;padding-left:20px}.release-body li{margin:6px 0;color:#294761}.release-body p{margin:0 0 14px;color:var(--muted)}
-main{width:min(1280px,100%);margin:0;padding:34px 34px 56px}
-.ico{width:16px;height:16px;display:inline-block;vertical-align:middle;flex:0 0 auto}
-.top{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:22px;min-height:118px;margin:-10px 0 20px;padding:10px 0 18px;overflow:hidden}
-.top-art{position:absolute;inset:0;z-index:0;opacity:.84;pointer-events:none;--edge-fade-x:30%;--edge-fade-y:20%;-webkit-mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%);mask-image:linear-gradient(to right,transparent 0,#000 var(--edge-fade-x),#000 calc(100% - var(--edge-fade-x)),transparent 100%)}
-.top-art:before{content:"";position:absolute;inset:0;background:url('/assets/fleet-horizon.png') center center/100% auto no-repeat;-webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 var(--edge-fade-y),#000 calc(100% - var(--edge-fade-y)),transparent 100%);mask-image:linear-gradient(to bottom,transparent 0,#000 var(--edge-fade-y),#000 calc(100% - var(--edge-fade-y)),transparent 100%)}
-.top>:not(.top-art){position:relative;z-index:1}.top-art{z-index:0}.brand{display:flex;align-items:center;gap:12px;margin:0 0 4px}
-.brand h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:31px;line-height:1.05;font-weight:500;letter-spacing:0;color:#12304b}
-.fleet{display:flex;align-items:center;gap:10px;margin:8px 0 0;color:var(--muted);font-size:14px}
-.wave{width:44px;height:10px;color:var(--sea);opacity:.78}
-.asof{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);white-space:nowrap;padding-top:22px;transition:color .16s ease}
-.asof[data-refresh-state]:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.09)}
-.asof[data-refresh-state="syncing"]{color:#0f4f80}.asof[data-refresh-state="syncing"]:before{background:var(--sea);box-shadow:0 0 0 4px rgba(21,158,153,.10);animation:fleet-sync-pulse 1s ease-in-out infinite}
-.asof[data-refresh-state="stale"]{color:#8a5700;font-weight:720}.asof[data-refresh-state="stale"]:before{background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.11)}
-main[data-fleet-sync-state="syncing"] .summary,main[data-fleet-sync-state="syncing"] [data-grid],main[data-fleet-sync-state="syncing"] .list-wrap{opacity:.72;transition:opacity .16s ease}
-@keyframes fleet-sync-pulse{0%,100%{opacity:.45;transform:scale(.82)}50%{opacity:1;transform:scale(1)}}
-.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
-.metric{appearance:none;position:relative;min-width:0;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;text-align:left;background:rgba(255,255,255,.82);border:1px solid rgba(210,226,234,.78);border-radius:8px;padding:14px 16px;box-shadow:0 12px 30px rgba(54,88,108,.06);backdrop-filter:blur(10px);cursor:pointer}
-.metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color,var(--wait)) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color,var(--wait)) 20%,transparent)}
-.metric b{display:block;font-family:Georgia,"Times New Roman",serif;font-size:29px;line-height:1;font-weight:500;color:var(--ink)}
-.metric span{display:block;font-size:12px;color:var(--muted);margin-top:2px}
-.metric.live{--metric-color:var(--sea)}.metric.stale{--metric-color:var(--sun)}.metric.down{--metric-color:var(--down)}
-.metric.live{border-color:rgba(37,132,95,.22)}.metric.stale{border-color:rgba(178,106,0,.24)}.metric.down{border-color:rgba(191,58,53,.24)}
-.metric:hover,.metric[aria-pressed="true"]{border-color:color-mix(in srgb,var(--metric-color,var(--accent)) 38%,rgba(210,226,234,.78));box-shadow:0 14px 32px rgba(54,88,108,.08),0 0 0 3px color-mix(in srgb,var(--metric-color,var(--accent)) 9%,transparent);transform:translateY(-1px)}
-.metric:focus-visible{outline:2px solid color-mix(in srgb,var(--metric-color,var(--accent)) 38%,transparent);outline-offset:3px}
-.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 18px;padding:9px;background:rgba(255,255,255,.72);border:1px solid rgba(210,226,234,.78);border-radius:8px;box-shadow:0 12px 30px rgba(54,88,108,.05);backdrop-filter:blur(10px)}
-.toolbar-left,.toolbar-right{display:flex;align-items:center;gap:10px;min-width:0}
-.seg{display:inline-flex;align-items:center;padding:3px;border:1px solid rgba(210,226,234,.86);border-radius:7px;background:rgba(244,250,251,.76)}
-.seg button{appearance:none;border:0;background:transparent;color:var(--muted);display:grid;place-items:center;width:30px;height:28px;border-radius:6px;cursor:pointer}
-.seg button[aria-pressed="true"]{background:#fff;color:var(--accent);box-shadow:0 1px 5px rgba(45,75,95,.12)}
-.seg .ico{width:16px;height:16px}
-.arrange{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;white-space:nowrap}
-.arrange select{appearance:none;border:0;background:transparent;color:var(--ink);font:inherit;font-weight:600;outline:none;padding-right:2px;cursor:pointer}
-.search{position:relative;min-width:210px;color:var(--muted)}
-.search .ico{position:absolute;left:10px;top:50%;width:15px;height:15px;transform:translateY(-50%)}
-.search input{width:100%;height:34px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px 0 32px;outline:none}
-.search input:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:18px}
-.card{--state:var(--wait);position:relative;min-height:264px;display:flex;flex-direction:column;background:rgba(255,255,255,.88);border:1px solid rgba(211,225,233,.86);border-radius:8px;padding:15px 16px 14px;box-shadow:0 14px 32px rgba(45,75,95,.08);overflow:visible}
-.card:before{content:"";position:absolute;left:16px;right:16px;top:58px;height:1px;background:linear-gradient(90deg,transparent,rgba(31,127,181,.16),transparent);pointer-events:none}
-.onboard-tile{appearance:none;position:relative;min-height:264px;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px;border:1px dashed rgba(214,155,49,.48);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.82),rgba(240,250,250,.74));box-shadow:0 14px 32px rgba(45,75,95,.05),inset 0 0 0 1px rgba(255,255,255,.52);color:var(--ink);text-align:left;cursor:pointer;overflow:hidden}
-.onboard-tile:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 72% 22%,rgba(214,155,49,.12),transparent 34%),linear-gradient(160deg,transparent 48%,rgba(21,158,153,.08));pointer-events:none}
-.onboard-tile>*{position:relative;z-index:1}.onboard-tile:hover,.onboard-tile:focus-visible{border-style:solid;border-color:rgba(214,155,49,.64);box-shadow:0 18px 38px rgba(45,75,95,.09),0 0 0 4px rgba(214,155,49,.08);outline:0;transform:translateY(-1px)}
-.onboard-mark{display:grid;place-items:center;width:42px;height:42px;border:1px solid rgba(214,155,49,.30);border-radius:50%;background:rgba(255,255,255,.78);color:var(--sun);box-shadow:0 0 0 8px rgba(214,155,49,.06)}.onboard-mark .ico{width:20px;height:20px}
-.onboard-copy strong{display:block;margin:0 0 4px;font-size:18px;line-height:1.15;color:var(--ink)}.onboard-copy span{display:block;color:var(--muted);font-size:13px}
-.onboard-foot{display:flex;align-items:center;gap:8px;color:#0f4f80;font-size:12px;font-weight:760}.onboard-foot:after{content:"";width:24px;height:1px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.60),transparent)}
-[data-live="live"]{--state:var(--live)}[data-live="stale"]{--state:var(--stale)}[data-live="down"]{--state:var(--down)}[data-live="awaiting_first_heartbeat"]{--state:var(--wait)}
-.card.light{border-color:rgba(214,155,49,.28);box-shadow:0 14px 32px rgba(45,75,95,.08),inset 0 0 0 1px rgba(214,155,49,.08)}
-.pharos-mark{position:absolute;left:50%;top:7px;transform:translateX(-50%);z-index:0;display:grid;place-items:center;width:58px;height:58px;color:rgba(214,155,49,.14);pointer-events:none}
-.pharos-mark .ico{width:50px;height:50px;stroke-width:1.35}
-.card-head{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
-.card-actions{position:relative;z-index:2;display:flex;align-items:center;gap:5px;flex:0 0 auto}
-.host{display:flex;align-items:center;gap:9px;min-width:0}
-.nix{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(102,121,139,.18);border-radius:50%;color:var(--accent);background:rgba(241,248,250,.72);transition:border-color .2s ease,box-shadow .2s ease}
-.card.has-settings .nix,.list tr.has-settings .nix{border-width:2px;border-color:var(--host-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-color) 13%,transparent),0 0 17px color-mix(in srgb,var(--host-color) 18%,transparent);background:linear-gradient(180deg,rgba(255,255,255,.92),color-mix(in srgb,var(--host-color) 8%,#f5fbfc))}
-.name{font-weight:650;font-size:16px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.role{font-size:12px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.signal{--signal-color:var(--wait);display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:52px;min-height:24px;color:var(--signal-color);font-size:13px;font-weight:720;white-space:nowrap;text-align:center}
-.signal[data-signal-level="good"]{--signal-color:var(--live)}.signal[data-signal-level="warn"]{--signal-color:var(--stale)}.signal[data-signal-level="down"]{--signal-color:var(--down)}.signal[data-signal-level="wait"]{--signal-color:var(--wait)}
-.signal-window{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11px;font-weight:700;padding:0 1px;cursor:pointer}
-.signal-window:hover{color:var(--ink);text-decoration:underline;text-underline-offset:2px}.signal-window:focus-visible{outline:2px solid color-mix(in srgb,var(--signal-color) 34%,transparent);outline-offset:2px;border-radius:4px}
-.signal-orb{width:12px;height:12px;border-radius:50%;background:radial-gradient(circle,#fff 0 28%,var(--signal-color) 33% 63%,transparent 66%);box-shadow:0 0 0 4px color-mix(in srgb,var(--signal-color) 12%,transparent),0 0 12px color-mix(in srgb,var(--signal-color) 18%,transparent);opacity:.92}
-.reason{--reason-color:var(--muted);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;gap:8px;min-height:22px;margin:-2px 0 10px;color:var(--muted);font-size:12px;line-height:1.25}
-.reason:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--reason-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--reason-color) 12%,transparent)}
-.reason.ok{--reason-color:var(--live)}.reason.warn{--reason-color:var(--stale)}.reason.down{--reason-color:var(--down)}.reason.wait{--reason-color:var(--wait)}.reason.self{--reason-color:var(--sun)}
-.reason[hidden]{display:none}.reason span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.kernel-slot{position:relative;z-index:20;min-height:20px;margin:-4px 0 9px}.kernel-slot[hidden]{display:none}
-.kernel-posture{position:relative;color:#9a5b00;font-size:11px}.kernel-posture summary{display:inline-flex;align-items:center;gap:6px;min-height:20px;list-style:none;color:#9a5b00;font-weight:760;cursor:pointer}.kernel-posture summary::-webkit-details-marker{display:none}.kernel-posture summary .ico{width:13px;height:13px;transition:transform .18s ease}.kernel-posture[open] summary .ico{transform:rotate(35deg)}.kernel-posture summary:hover,.kernel-posture summary:focus-visible{color:#734500;outline:0;text-decoration:underline;text-underline-offset:3px}
-.kernel-detail{position:absolute;left:0;top:calc(100% + 7px);z-index:80;width:min(272px,calc(100vw - 44px));padding:12px 13px;border:1px solid rgba(214,155,49,.42);border-radius:7px;background:#fffdf8;box-shadow:0 18px 38px rgba(71,74,65,.16),0 0 0 4px rgba(214,155,49,.06);color:var(--ink);font-size:11px;line-height:1.4}.kernel-detail:before{content:"";position:absolute;left:13px;top:-5px;width:8px;height:8px;border-left:1px solid rgba(214,155,49,.42);border-top:1px solid rgba(214,155,49,.42);background:#fffdf8;transform:rotate(45deg)}.kernel-detail>strong{display:block;margin:0 0 5px;color:#8b5700;font-size:12px}.kernel-detail p{margin:0 0 9px;color:#435e74}.kernel-detail dl{display:grid;gap:4px;margin:0 0 9px}.kernel-detail dl div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.kernel-detail dt{color:var(--muted)}.kernel-detail dd{margin:0;color:var(--ink);font-weight:720}.kernel-detail .kernel-boundary{margin:0;padding-top:7px;border-top:1px solid rgba(214,226,234,.74);color:var(--muted)}
-.card:has(.kernel-posture[open]){z-index:60}.list tr:has(.kernel-posture[open]){position:relative;z-index:60}.list .kernel-slot{min-width:118px;margin:0}.list .kernel-detail{left:auto;right:0}
-.mute-note{display:flex;align-items:center;gap:6px;min-height:18px;margin:-7px 0 9px;color:#7b6b56;font-size:11px}.mute-note[hidden]{display:none}.mute-note .ico{width:13px;height:13px;color:var(--sun)}.mute-note span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.list .mute-note{margin:4px 0 0}
-.fresh{min-height:52px;margin:4px 0 11px;font-size:13px;line-height:1.45;color:var(--ink)}
-.fresh-row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:10px;min-height:23px;border-bottom:1px solid rgba(214,226,234,.58)}
-.fresh-row:last-child{border-bottom:0}
-.fresh-row span{color:var(--muted);font-size:12px}
-.fresh-row strong{font-size:12px;font-weight:650;color:var(--ink)}
-.fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
-.header-chip{position:relative;appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:0;width:25px;height:25px;min-width:25px;margin:0;padding:0;border:1px solid rgba(210,226,234,.76);border-radius:999px;background:rgba(255,255,255,.58);font-size:11px;font-weight:760;line-height:1;text-decoration:none;white-space:nowrap;box-sizing:border-box;overflow:visible;transition:width .2s cubic-bezier(.2,.75,.3,1),padding .2s cubic-bezier(.2,.75,.3,1),gap .2s ease,background-color .16s ease,border-color .16s ease,box-shadow .16s ease,transform .16s ease}
-.header-chip:hover,.header-chip:focus-visible{width:86px;padding:0 8px;gap:5px;transform:translateY(-1px);outline:0}
-.header-chip-label{display:block;max-width:0;opacity:0;overflow:hidden;color:inherit;line-height:1;transform:translateX(-3px);transition:max-width .2s cubic-bezier(.2,.75,.3,1),opacity .14s ease,transform .2s ease}
-.header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1;transform:translateX(0)}
-.backup-chip{--backup-color:var(--wait);border-color:color-mix(in srgb,var(--backup-color) 38%,rgba(210,226,234,.82));background:color-mix(in srgb,var(--backup-color) 9%,rgba(255,255,255,.94));color:var(--backup-color);box-shadow:0 5px 12px color-mix(in srgb,var(--backup-color) 7%,transparent)}
-.backup-chip.clear{--backup-color:var(--live)}.backup-chip.warning{--backup-color:var(--stale)}.backup-chip.critical{--backup-color:var(--down)}.backup-chip.watch{--backup-color:var(--wait)}
-.backup-chip:hover{background:color-mix(in srgb,var(--backup-color) 14%,white);border-color:color-mix(in srgb,var(--backup-color) 55%,rgba(210,226,234,.82));box-shadow:0 7px 16px color-mix(in srgb,var(--backup-color) 12%,transparent);transform:translateY(-1px)}
-.backup-chip:focus-visible{outline:2px solid color-mix(in srgb,var(--backup-color) 34%,transparent);outline-offset:2px}
-.backup-chip-glyphs{display:grid;place-items:center;width:13px;height:13px;flex:0 0 13px}.backup-chip-glyph{display:none;place-items:center;width:13px;height:13px}.backup-chip-glyph .ico{width:13px;height:13px;stroke-width:2.15}
-.backup-chip[data-backup-glyph="check"] .backup-chip-glyph.check,.backup-chip[data-backup-glyph="question"] .backup-chip-glyph.question,.backup-chip[data-backup-glyph="alert"] .backup-chip-glyph.alert,.backup-chip[data-backup-glyph="x"] .backup-chip-glyph.x{display:grid}
-.protection-onboard{--protect-color:var(--wait);display:grid;grid-template-columns:8px minmax(0,1fr);align-items:center;column-gap:8px;min-height:30px;margin:-3px 0 10px;padding:7px 8px;border:1px solid color-mix(in srgb,var(--protect-color) 18%,rgba(210,226,234,.82));border-radius:7px;background:linear-gradient(135deg,rgba(255,255,255,.76),color-mix(in srgb,var(--protect-color) 5%,white));color:var(--ink)}
-.protection-onboard:before{content:"";grid-row:1/3;width:8px;height:8px;border-radius:50%;background:var(--protect-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--protect-color) 10%,transparent)}
-.protection-onboard strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;color:var(--ink)}
-.protection-onboard span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;line-height:1.2}
-.protection-onboard.clear{--protect-color:var(--live)}.protection-onboard.warning{--protect-color:var(--stale)}.protection-onboard.critical{--protect-color:var(--down)}.protection-onboard.watch{--protect-color:var(--wait)}
-.protection-list{min-width:150px;margin:6px 0 0}
-.setup-card{border-color:rgba(214,155,49,.34);background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(247,252,253,.82));box-shadow:0 14px 32px rgba(45,75,95,.08),inset 0 0 0 1px rgba(214,155,49,.08)}
-.setup-card[data-setup-level="warning"]{border-color:rgba(178,106,0,.32)}
-.setup-card .nix{color:var(--sun);border-color:rgba(214,155,49,.24);box-shadow:0 0 0 5px rgba(214,155,49,.06)}
-.setup-intent{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
-.setup-chip{display:inline-flex;align-items:center;min-height:25px;max-width:100%;padding:4px 8px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:720;white-space:nowrap}
-.setup-chip.backup{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.72);color:#9a5b00}
-.setup-chip.location{border-color:rgba(103,177,196,.30);background:rgba(223,241,249,.62);color:#0f4f80}
-.setup-detail{min-height:40px;margin:2px 0 10px;color:var(--muted);font-size:12px;line-height:1.35}
-.setup-action{display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:6px 10px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;text-decoration:none;font-size:12px;font-weight:760;box-shadow:0 8px 18px rgba(18,48,75,.12)}
-.setup-action:hover,.setup-action:focus-visible{background:#0f2941;box-shadow:0 10px 22px rgba(18,48,75,.16);outline:0}
-.setup-row td{border-color:rgba(214,155,49,.30);background:linear-gradient(135deg,rgba(255,255,255,.90),rgba(247,252,253,.78))}
-.setup-row[data-setup-level="warning"] td{border-color:rgba(178,106,0,.32)}
-.meta{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:auto;border-top:1px solid rgba(214,226,234,.72);padding-top:10px;font-size:11px;color:var(--muted)}
-.meta strong{font-weight:600;color:var(--ink)}
-.card-tools{display:flex;align-items:center;justify-content:center;min-height:25px;margin-top:5px}
-.drag-handle{appearance:none;display:none;place-items:center;width:25px;height:25px;margin:0;border:0;border-radius:50%;background:transparent;color:var(--muted);cursor:grab}
-main[data-arrange="freeform"] .drag-handle{display:grid}
-.drag-handle:hover,.drag-handle:focus-visible{background:rgba(223,241,249,.78);color:var(--accent);box-shadow:0 7px 16px rgba(45,75,95,.08);outline:0}
-.drag-handle:active{cursor:grabbing}
-.drag-handle .ico{width:13px;height:13px}
-.card[data-dragging="true"]{z-index:20;transform:scale(1.015);box-shadow:0 20px 44px rgba(45,75,95,.18);cursor:grabbing}
-.grid[data-freeform-dragging="true"] .card:not([data-dragging]){transition:transform .12s ease,box-shadow .12s ease}
-.settings-card{color:var(--accent);box-shadow:none}
-.settings-card:hover{background:rgba(223,241,249,.78);box-shadow:0 7px 16px rgba(45,75,95,.08);transform:translateY(-1px)}
-.settings-card:focus-visible{outline:2px solid rgba(31,127,181,.24);outline-offset:2px}
-.settings-card.unavailable{--host-color:#aebac3;color:var(--muted);opacity:.72;box-shadow:none}
-.settings-card.unavailable:hover{background:rgba(241,247,250,.92);box-shadow:0 7px 16px rgba(45,75,95,.05);opacity:1}
-.settings-card.unavailable .settings-icon{color:var(--muted)}
-.settings-icon{display:grid;place-items:center;width:13px;height:13px;flex:0 0 13px;color:inherit}
-.settings-icon .ico{width:13px;height:13px}
-.settings-swatch{display:none}
-.settings-card[data-settings-state="request_pending"],.settings-card[data-settings-state="declared_not_applied"]{color:#9a5b00;border-color:rgba(214,155,49,.34);background:rgba(255,248,234,.82);box-shadow:0 0 0 3px rgba(214,155,49,.08)}
-.settings-card[data-settings-state="request_pending"]:hover,.settings-card[data-settings-state="declared_not_applied"]:hover{background:rgba(255,245,222,.96);box-shadow:0 7px 16px rgba(178,106,0,.10)}
-.settings-card[data-settings-state="request_pending"] .settings-swatch,.settings-card[data-settings-state="declared_not_applied"] .settings-swatch{display:block;position:absolute;right:-1px;bottom:-1px;width:7px;height:7px;border:1px solid #fff;border-radius:50%;background:var(--pending-color,var(--sun));box-shadow:0 0 0 2px color-mix(in srgb,var(--pending-color,var(--sun)) 12%,transparent)}
-.host-actions{position:relative;display:inline-flex;flex:0 0 auto}.host-actions-trigger{color:#4c6780;box-shadow:none}.host-actions-trigger:hover{border-color:rgba(31,127,181,.30);background:rgba(241,248,250,.92);color:var(--accent);box-shadow:0 7px 16px rgba(45,75,95,.08)}.host-actions-trigger:focus-visible{outline:2px solid rgba(31,127,181,.24);outline-offset:2px}.host-actions-trigger .ico{width:13px;height:13px}.host-action-dot{display:block;position:absolute;right:-1px;bottom:-1px;width:7px;height:7px;border:1px solid #fff;border-radius:50%;background:var(--sun);box-shadow:0 0 0 2px rgba(214,155,49,.10)}.host-action-dot[hidden]{display:none}
-.host-actions-menu{position:fixed;z-index:5800;width:min(280px,calc(100vw - 24px));padding:7px;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 20px 48px rgba(45,75,95,.20);color:var(--ink);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}.host-actions-menu[hidden]{display:none}.host-actions-title{display:block;padding:6px 8px 8px;color:#294761;font-size:12px;font-weight:780}.host-actions-separator{height:1px;margin:5px 2px;background:rgba(214,226,234,.78)}.host-action-item{appearance:none;width:100%;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;column-gap:9px;min-height:47px;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:#294761;font:inherit;text-align:left;text-decoration:none;cursor:pointer}.host-action-item[hidden]{display:none}.host-action-item:hover,.host-action-item:focus-visible{background:rgba(223,241,249,.62);color:#0f4f80;outline:0}.host-action-item>.ico{grid-row:1/3;width:16px;height:16px;justify-self:center}.host-action-item strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.25}.host-action-item span{display:block;min-width:0;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:10px;line-height:1.25}.host-action-item.restart{color:#9a5b00}.host-action-item.restart:hover,.host-action-item.restart:focus-visible{background:rgba(255,245,222,.86);color:#7b4900}.host-action-item.remove{color:#a1322e}.host-action-item.remove:hover,.host-action-item.remove:focus-visible{background:rgba(255,232,229,.66);color:#842824}.host-actions-safety{display:flex;align-items:center;gap:8px;min-height:34px;padding:7px 8px 3px;color:var(--muted);font-size:10px}.host-actions-safety .ico{width:14px;height:14px;color:#4c6780}.card:has(.host-actions-menu:not([hidden])),.list tr:has(.host-actions-menu:not([hidden])){z-index:90}.card:has(.host-actions-menu:not([hidden])) .card-head{z-index:100}
-body[data-host-action-dialog-open="true"]{overflow:hidden}.host-action-overlay{position:fixed;inset:0;z-index:6100;display:grid;place-items:center;padding:24px;background:rgba(20,48,75,.28);-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px)}.host-action-overlay[hidden]{display:none}.host-action-backdrop{position:absolute;inset:0}.host-action-dialog{position:relative;width:min(470px,calc(100vw - 28px));max-height:calc(100vh - 40px);display:flex;flex-direction:column;border:1px solid rgba(211,225,233,.92);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 26px 78px rgba(32,61,82,.28);overflow:hidden}.host-action-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 21px 15px;border-bottom:1px solid rgba(214,226,234,.72)}.host-action-heading{display:flex;align-items:center;gap:10px;min-width:0}.host-action-heading>[data-action-icon]{display:grid;place-items:center;flex:0 0 auto;width:20px;height:20px;color:var(--accent)}.host-action-heading>[data-action-icon][hidden]{display:none}.host-action-heading>[data-action-icon] .ico{width:20px;height:20px}.host-action-dialog[data-action="remove"] .host-action-heading>[data-action-icon]{color:var(--down)}.host-action-heading h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;line-height:1.2;color:#12304b}.host-action-dialog-close{appearance:none;display:grid;place-items:center;flex:0 0 auto;width:30px;height:30px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);cursor:pointer}.host-action-dialog-close:hover,.host-action-dialog-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}.host-action-dialog-close .ico{width:15px;height:15px}.host-action-dialog-body{padding:17px 21px 19px;overflow:auto}.host-action-dialog-body>p{margin:0 0 14px;color:#435e74;font-size:13px;line-height:1.5}.host-action-info{display:grid;grid-template-columns:20px minmax(0,1fr);gap:9px;padding:11px 12px;border:1px solid rgba(188,211,222,.82);border-radius:7px;background:rgba(247,251,252,.82)}.host-action-info[hidden]{display:none}.host-action-info>.ico{grid-row:1/3;width:17px;height:17px;margin-top:1px;color:#4c6780}.host-action-info strong{font-size:12px}.host-action-info span{color:var(--muted);font-size:11px;line-height:1.35}.host-action-facts{display:grid;gap:0;margin:14px 0 0;border-top:1px solid rgba(214,226,234,.72)}.host-action-fact{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;min-height:38px;align-items:center;border-bottom:1px solid rgba(214,226,234,.58);font-size:12px}.host-action-fact[hidden]{display:none}.host-action-fact span{color:var(--muted)}.host-action-fact strong{max-width:260px;overflow-wrap:anywhere;color:var(--ink);font-weight:720;text-align:right}.host-action-technical{margin:14px 0 0;padding:12px;border:1px solid rgba(188,211,222,.72);border-radius:7px;background:#f8fbfc;color:#294761;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.host-action-technical[hidden]{display:none}.host-remove-confirm{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-confirm[hidden]{display:none}.host-remove-confirm input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-confirm input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}.host-attended-confirm{display:flex;align-items:flex-start;gap:9px;margin-top:12px;padding:10px 11px;border:1px solid rgba(214,155,49,.24);border-radius:7px;background:rgba(255,248,234,.64);color:#6e5527;font-size:11px;line-height:1.4;cursor:pointer}.host-attended-confirm[hidden]{display:none}.host-attended-confirm input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:#9a5b00}.host-action-dialog-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 21px;border-top:1px solid rgba(214,226,234,.72);background:rgba(250,252,253,.78)}.host-action-safe-note{display:flex;align-items:center;gap:7px;min-width:0;color:var(--muted);font-size:10px}.host-action-safe-note .ico{width:14px;height:14px;flex:0 0 auto;color:#4c6780}.host-action-dialog-buttons{display:flex;align-items:center;gap:8px;margin-left:auto}.host-action-dialog-button{appearance:none;min-height:36px;padding:0 13px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:#294761;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.host-action-dialog-button[hidden]{display:none}.host-action-dialog-button:hover,.host-action-dialog-button:focus-visible{background:rgba(223,241,249,.66);outline:0}.host-action-dialog-button.primary{border-color:#12304b;background:#12304b;color:#fff}.host-action-dialog-button.danger{border-color:var(--down);background:var(--down);color:#fff}.host-action-dialog-button:disabled{cursor:not-allowed;border-color:rgba(137,151,163,.18);background:rgba(137,151,163,.12);color:rgba(100,119,138,.55)}.host-action-status{margin:12px 0 0;color:var(--muted);font-size:11px}.host-action-status:empty{display:none}
-.host-action-dialog[data-workflow="true"]{width:min(760px,calc(100vw - 28px))}.host-workflow[hidden]{display:none}.host-workflow{margin-top:15px}.host-workflow-summary{border-top:1px solid rgba(214,226,234,.72)}.host-workflow-group{display:grid;grid-template-columns:88px minmax(0,1fr);border-bottom:1px solid rgba(214,226,234,.72)}.host-workflow-group h3{margin:0;padding:13px 10px 0 0;color:#48657d;font-size:10px;line-height:1.3;font-weight:760;letter-spacing:0}.host-workflow-steps{min-width:0}.host-workflow-step{display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:start;gap:9px;min-height:45px;padding:9px 0;border-top:1px solid rgba(214,226,234,.50)}.host-workflow-step:first-child{border-top:0}.host-workflow-step[data-current="true"]{margin:0 -9px;padding-left:9px;padding-right:9px;background:rgba(255,248,234,.62)}.host-workflow-marker{position:relative;display:grid;place-items:center;width:17px;height:17px;margin-top:1px;border:1.5px solid #91a3b1;border-radius:50%;color:#fff}.host-workflow-marker:after{font-size:10px;font-weight:800;line-height:1}.host-workflow-step[data-step-state="passed"] .host-workflow-marker,.host-workflow-step[data-step-state="recovered"] .host-workflow-marker{border-color:var(--live);background:var(--live)}.host-workflow-step[data-step-state="passed"] .host-workflow-marker:after,.host-workflow-step[data-step-state="recovered"] .host-workflow-marker:after{content:"\2713"}.host-workflow-step[data-step-state="recovered"] .host-workflow-marker{box-shadow:0 0 0 4px rgba(37,132,95,.10)}.host-workflow-step[data-step-state="running"] .host-workflow-marker{border-color:rgba(50,167,164,.24);background:#fff;box-shadow:0 0 0 4px rgba(50,167,164,.10)}.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{content:"";position:absolute;inset:-3px;border:2px solid rgba(50,167,164,.18);border-top-color:var(--sea);border-right-color:var(--sea);border-radius:50%;animation:host-workflow-spin .8s linear infinite;will-change:transform}.host-workflow-step[data-step-state="running"] .host-workflow-marker:after{content:"";width:5px;height:5px;border-radius:50%;background:var(--sea)}.host-workflow-step[data-step-state="waiting"] .host-workflow-marker,.host-workflow-step[data-step-state="queued"] .host-workflow-marker{border-color:#91a3b1;background:#fff}.host-workflow-step[data-step-state="waiting"] .host-workflow-marker:after{content:"";width:5px;height:5px;border-radius:50%;background:#91a3b1}.host-workflow-step[data-step-state="confirmation_required"] .host-workflow-marker,.host-workflow-step[data-step-state="action_required"] .host-workflow-marker{border-color:var(--stale);background:#fff;box-shadow:0 0 0 4px rgba(214,155,49,.10)}.host-workflow-step[data-step-state="failed"] .host-workflow-marker{border-color:var(--down);background:var(--down)}.host-workflow-step[data-step-state="failed"] .host-workflow-marker:after{content:"!"}.host-workflow-step[data-step-state="skipped"] .host-workflow-marker,.host-workflow-step[data-step-state="cancelled"] .host-workflow-marker{border-color:#c7d2d9;background:#edf2f4}.host-workflow-step-copy{min-width:0}.host-workflow-step-copy strong,.host-workflow-step-copy span{display:block}.host-workflow-step-copy strong{color:var(--ink);font-size:12px;line-height:1.35}.host-workflow-step-copy span{margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35}.host-workflow-step-state{padding-top:1px;color:var(--muted);font-size:10px;line-height:1.3;text-align:right;white-space:nowrap}.host-workflow-step[data-step-state="passed"] .host-workflow-step-state,.host-workflow-step[data-step-state="recovered"] .host-workflow-step-state{color:var(--live)}.host-workflow-step[data-step-state="confirmation_required"] .host-workflow-step-state,.host-workflow-step[data-step-state="action_required"] .host-workflow-step-state{color:#9a5b00;font-weight:720}.host-workflow-step[data-step-state="failed"] .host-workflow-step-state{color:var(--down);font-weight:720}.host-workflow-advanced{border-bottom:1px solid rgba(214,226,234,.72)}.host-workflow-advanced summary{padding:11px 0;color:#294761;font-size:11px;font-weight:720;cursor:pointer}.host-workflow-advanced>div{padding:0 0 12px}.host-workflow-advanced p{margin:0 0 8px;color:var(--muted);font-size:10px;line-height:1.4}.host-workflow-advanced ol{display:grid;gap:7px;margin:0;padding:0;list-style:none}.host-workflow-advanced li{display:grid;grid-template-columns:64px minmax(0,1fr);gap:9px;color:#294761;font-size:10px}.host-workflow-advanced time{color:var(--muted);font-variant-numeric:tabular-nums}.host-workflow-advanced li span,.host-workflow-advanced li strong,.host-workflow-advanced li small{display:block}.host-workflow-advanced li small{margin-top:1px;color:var(--muted)}.host-workflow-persisted{position:relative;margin:10px 0 0!important;padding-left:20px;color:var(--muted)!important;font-size:10px!important}.host-workflow-persisted:before{content:"i";position:absolute;left:0;top:0;display:grid;place-items:center;width:13px;height:13px;border:1px solid #7890a2;border-radius:50%;color:#526e83;font-size:9px;font-weight:800}
-@keyframes host-workflow-spin{to{transform:rotate(1turn)}}
-.host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation-duration:3.2s;animation-timing-function:steps(4,end)}
-.host-action-overlay[data-suspended="true"] .host-workflow-step[data-step-state="running"] .host-workflow-marker:before{animation-play-state:paused}
-.host-workflow-meta{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:10px}.host-workflow-meta strong{color:#294761;font-weight:720}.host-workflow-step-state{display:grid;justify-items:end}.host-workflow-step-state small{margin-top:2px;color:#48657d;font-size:9px;font-weight:650}
-.host-workflow-evidence{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(0,1.3fr);margin:10px 0 13px;border-top:1px solid rgba(214,226,234,.58);font-size:10px}.host-workflow-evidence dt,.host-workflow-evidence dd{min-width:0;margin:0;padding:6px 0;border-bottom:1px solid rgba(214,226,234,.45)}.host-workflow-evidence dt{padding-right:10px;color:var(--muted)}.host-workflow-evidence dd{color:#294761;font-weight:680;overflow-wrap:anywhere}
-.settings-wait-note{display:flex;align-items:center;gap:6px;width:max-content;max-width:100%;min-height:18px;margin:-6px 0 8px;color:#8b620f;font-size:11px;font-weight:680;text-decoration:none;cursor:pointer}.settings-wait-note[hidden]{display:none}.settings-wait-note .ico{width:13px;height:13px;flex:0 0 13px}.settings-wait-note:hover,.settings-wait-note:focus-visible{color:#734500;text-decoration:underline;text-underline-offset:3px;outline:0}
-.host-remove-disposition,.host-remove-successor{display:grid;gap:7px;margin-top:16px;color:var(--ink);font-size:12px;font-weight:720}.host-remove-disposition[hidden],.host-remove-successor[hidden]{display:none}.host-remove-successor{margin-top:11px}.host-remove-successor small{color:var(--muted);font-size:10px;font-weight:500}.host-remove-disposition select,.host-remove-successor input{width:100%;height:40px;border:1px solid rgba(188,211,222,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;padding:0 11px;outline:none}.host-remove-disposition select:focus,.host-remove-successor input:focus{border-color:rgba(191,58,53,.42);box-shadow:0 0 0 3px rgba(191,58,53,.07)}
-.host-action-note{appearance:none;padding:0;border:0;background:transparent;font:inherit}.host-action-note[data-action-level="critical"]{color:var(--down)}.host-action-note[data-action-level="clear"]{color:var(--live)}
-.beat{--beat-color:var(--state);--now-x:0%;--history-start-x:0%;--expect-x:64%;--stale-x:82%;--fill-color:var(--sea);--expect-fill:0deg;--expect-alpha:.55;--target-ring:3px;--late-alpha:.3;margin-top:10px;color:var(--beat-color)}
-.beat-stage{position:relative;height:50px;overflow:visible}
-.beat-floor{position:absolute;left:0;right:0;top:21px;height:4px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.16) 0 var(--expect-x),rgba(214,155,49,.16) var(--expect-x) var(--stale-x),rgba(191,58,53,.12) var(--stale-x) 100%);box-shadow:inset 0 0 0 1px rgba(137,151,163,.18)}
-.beat-fill{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:22px;z-index:2;height:2px;border-radius:999px;background:linear-gradient(90deg,rgba(21,158,153,.12),var(--fill-color));transition:background-color .2s ease}
-.beat-now{position:absolute;left:var(--now-x);top:23px;z-index:8;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle,#fff 0 29%,var(--fill-color) 32% 62%,transparent 64%);box-shadow:0 0 0 5px color-mix(in srgb,var(--fill-color) 12%,transparent),0 0 14px color-mix(in srgb,var(--fill-color) 26%,transparent);transform:translate(-50%,-50%);pointer-events:none}
-.beat-current{--pulse-left:min(var(--history-start-x),var(--now-x));--pulse-right:max(var(--history-start-x),var(--now-x));position:absolute;left:max(0px,calc(var(--pulse-left) - 4px));right:max(0px,calc(100% - var(--pulse-right)));top:21px;z-index:6;height:4px;border-radius:999px;background:linear-gradient(90deg,transparent 0,color-mix(in srgb,var(--fill-color) 30%,transparent) 16%,color-mix(in srgb,var(--fill-color) 64%,transparent) 72%,var(--fill-color) 100%);opacity:.86;pointer-events:none}
-.beat-marks{position:absolute;inset:0}
-.beat-mark{--mark-color:var(--sea);position:absolute;left:clamp(4px,var(--mark-x),calc(100% - 4px));top:23px;z-index:4;width:6px;height:6px;border-radius:50%;background:var(--mark-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--mark-color) 10%,transparent);opacity:.82;transform:translate(-50%,-50%);cursor:help}
-.beat-mark[data-history-level="late"]{--mark-color:var(--sun)}.beat-mark[data-history-level="stale"]{--mark-color:var(--stale)}.beat-mark[data-history-level="down"]{--mark-color:var(--down)}.beat-mark[data-history-level="first"]{--mark-color:var(--wait)}
-.beat-mark:hover,.beat-mark:focus-visible{opacity:1;box-shadow:0 0 0 5px color-mix(in srgb,var(--mark-color) 18%,transparent),0 0 14px color-mix(in srgb,var(--mark-color) 24%,transparent);outline:0}
-.beat[data-count="0"] .beat-mark{display:none}
-.beat-threshold{position:absolute;top:15px;bottom:15px;width:1px;background:rgba(137,151,163,.25)}
-.beat-threshold.expected{left:var(--expect-x)}.beat-threshold.stale{left:var(--stale-x)}
-.beat-hit{position:absolute;left:var(--hit-x,0%);top:23px;z-index:9;width:9px;height:9px;border-radius:50%;background:currentColor;opacity:0;transform:translate(-50%,-50%) scale(.7);pointer-events:none}
-.beat[data-flash="true"] .beat-hit{animation:beat-hit .9s ease-out}
-.beat-zones{position:absolute;left:0;right:0;bottom:0;color:var(--muted);font-size:10px}
-.beat-zones span{position:absolute;bottom:0;white-space:nowrap}.beat-zones span:first-child{left:0}.beat-zones span:nth-child(2){left:var(--expect-x);transform:translateX(-50%)}.beat-zones span:nth-child(3){right:0;color:var(--stale)}
-.beat[data-beat="late"]{--beat-color:var(--stale)}.beat[data-beat="stale"]{--beat-color:var(--stale)}.beat[data-beat="down"]{--beat-color:var(--down)}.beat[data-beat="waiting"]{--beat-color:var(--wait)}.beat[data-beat="lit"]{--beat-color:var(--sun)}
-@keyframes beat-hit{0%{opacity:.9;transform:translate(-50%,-50%) scale(.55);box-shadow:0 0 0 0 color-mix(in srgb,currentColor 28%,transparent)}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4);box-shadow:0 0 0 12px transparent}}
-@keyframes tide{from{background-position:100% 0}to{background-position:0 0}}
-.list-wrap{display:none}
-main[data-view="list"] .grid{display:none}
-main[data-view="list"] .list-wrap{display:block}
-.list{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 6px}
-.list col.host-col{width:18%}.list col.attention-col{width:20%}.list col.freshness-col{width:15%}.list col.seen-col{width:10%}.list col.heartbeat-col{width:27%}.list col.actions-col{width:10%}
-.list th{padding:0 12px 7px;text-align:left;color:var(--muted);font-size:11px;font-weight:650;white-space:nowrap}
-.list th:last-child{text-align:right}
-.list td{height:84px;padding:10px 12px;background:rgba(255,255,255,.88);border-top:1px solid rgba(211,225,233,.86);border-bottom:1px solid rgba(211,225,233,.86);vertical-align:middle;transition:background-color .16s ease,border-color .16s ease,box-shadow .16s ease}
-.list td:first-child{border-left:1px solid rgba(211,225,233,.86);border-radius:7px 0 0 7px}
-.list td:last-child{overflow:visible;border-right:1px solid rgba(211,225,233,.86);border-radius:0 7px 7px 0}
-.list tbody tr:not(.onboard-row):hover td{background:rgba(255,255,255,.96);border-color:rgba(188,211,222,.92);box-shadow:0 10px 24px rgba(54,88,108,.035)}
-.list tr.light td{border-color:rgba(214,155,49,.34)}
-.list tr:has(.header-chip:hover),.list tr:has(.header-chip:focus-visible){position:relative;z-index:40}
-.list .host{min-width:0}.list .nix{width:34px;height:34px;flex:0 0 34px}.list .name{font-size:15px}.list .role{font-size:11px}
-.list-attention{display:grid;align-content:center;gap:3px;min-width:0;min-height:44px}
-.list-attention .settings-wait-note{min-height:18px;margin:0;font-size:11px}
-.list-attention .reason{min-width:0;min-height:18px;margin:0;font-size:11px}
-.list-attention .kernel-slot{min-width:0;min-height:18px;margin:0}.list-attention .kernel-posture summary{min-height:18px}
-.list-attention .mute-note{min-height:18px;margin:0}.list-attention .protection-list{min-width:0;margin:2px 0 0;padding:5px 7px}
-.list .fresh{min-height:0;margin:0;white-space:normal}.list .fresh-row{min-height:20px}.list .fresh-row span,.list .fresh-row strong{font-size:11px}
-.list-seen{display:grid;align-content:center;gap:2px;min-height:44px;white-space:nowrap}.list-seen [data-seen]{color:var(--ink);font-size:12px;font-weight:650}.list-seen-detail{display:none;color:var(--muted);font-size:10px}.list tr[data-history-hint="true"] .list-seen-detail{display:block}
-.list-heartbeat{display:grid;grid-template-columns:minmax(170px,1fr) auto;align-items:center;gap:10px;min-width:0}.list-heartbeat .beat{min-width:0;width:auto;margin:0}.list-heartbeat .signal{justify-self:end}
-.list-actions{position:relative;z-index:10;display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:89px}.list-actions .header-chip{flex:0 0 auto;margin:0}.list .settings-icon{width:13px;height:13px}
-.list-setup-intent{display:flex;flex-wrap:wrap;gap:5px}.list-setup-intent .setup-chip{min-height:23px;padding:3px 7px;font-size:10px}.list-setup-state{display:inline-flex;align-items:center;min-height:25px;color:var(--muted);font-size:11px;font-weight:720}
-.list tr.onboard-row td{border:1px dashed rgba(214,155,49,.42);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.86),rgba(240,250,250,.72));box-shadow:0 10px 24px rgba(45,75,95,.05)}
-.onboard-row button{appearance:none;width:100%;display:flex;align-items:center;gap:12px;border:0;background:transparent;color:var(--ink);font:inherit;text-align:left;cursor:pointer}.onboard-row button:hover strong,.onboard-row button:focus-visible strong{color:#0f4f80}.onboard-row button:focus-visible{outline:0}
-.onboard-row .onboard-mark{width:32px;height:32px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.onboard-row .onboard-mark .ico{width:16px;height:16px}.onboard-row strong{display:block;font-size:13px}.onboard-row span:last-child{display:block;color:var(--muted);font-size:12px}
-.ops-main{width:min(1280px,100%)}
-.ops-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:0 0 18px}
-.ops-metric{--metric-color:var(--wait);appearance:none;width:100%;display:grid;grid-template-columns:50px minmax(0,1fr);align-items:center;column-gap:12px;min-height:78px;padding:14px 16px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.82);box-shadow:0 12px 30px rgba(54,88,108,.06);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);text-align:left;cursor:pointer}
-.ops-metric:before{content:"";grid-row:1/3;width:38px;height:38px;border-radius:50%;background:color-mix(in srgb,var(--metric-color) 14%,white);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--metric-color) 20%,transparent)}
-.ops-metric b{display:block;font-family:Georgia,"Times New Roman",serif;font-size:28px;line-height:1;font-weight:500;color:var(--ink)}
-.ops-metric span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
-.ops-metric:hover,.ops-metric:focus-visible{border-color:color-mix(in srgb,var(--metric-color) 38%,rgba(210,226,234,.86));box-shadow:0 16px 34px rgba(54,88,108,.09),0 0 0 3px color-mix(in srgb,var(--metric-color) 9%,transparent);outline:0}
-.ops-metric[aria-pressed="true"]{border-color:color-mix(in srgb,var(--metric-color) 46%,rgba(210,226,234,.86));background:linear-gradient(135deg,rgba(255,255,255,.94),color-mix(in srgb,var(--metric-color) 8%,white));box-shadow:0 16px 34px rgba(54,88,108,.10),0 0 0 3px color-mix(in srgb,var(--metric-color) 12%,transparent)}
-.ops-metric.critical{--metric-color:var(--down);border-color:rgba(191,58,53,.24)}.ops-metric.warning{--metric-color:var(--stale);border-color:rgba(178,106,0,.24)}.ops-metric.watch{--metric-color:var(--sun);border-color:rgba(214,155,49,.24)}.ops-metric.clear,.ops-metric.info,.ops-metric.recovery{--metric-color:var(--live);border-color:rgba(37,132,95,.22)}
-.ops-toolbar{margin-bottom:18px}
-.ops-layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:18px;align-items:start}
-.ops-panel,.ops-side-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
-.ops-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:17px 18px;border-bottom:1px solid rgba(214,226,234,.72);background:rgba(251,253,254,.74)}
-.ops-panel-head h2,.ops-side-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;letter-spacing:0;color:#12304b}
-.ops-panel-head p,.ops-side-panel p{margin:3px 0 0;color:var(--muted);font-size:12px}
-.ops-count{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:27px;border-radius:999px;background:rgba(223,241,249,.78);color:#0f4f80;font-size:12px;font-weight:760}
-.alert-list,.activity-list{display:grid}
-.alert-row,.activity-row{--row-color:var(--wait);position:relative;display:grid;gap:12px;align-items:center;min-width:0;border-bottom:1px solid rgba(214,226,234,.66);background:rgba(255,255,255,.72);color:var(--ink)}
-.alert-row:last-child,.activity-row:last-child{border-bottom:0}
-.activity-row{text-decoration:none}.activity-row[href]:hover,.activity-row[href]:focus-visible{background:rgba(247,252,253,.96);box-shadow:inset 3px 0 0 var(--row-color);outline:0}
-.alert-row{grid-template-columns:minmax(116px,.58fr) auto minmax(180px,1.25fr) minmax(66px,.36fr) minmax(74px,.42fr) minmax(124px,.7fr);gap:10px;padding:13px 16px}
-.activity-row{grid-template-columns:86px minmax(110px,.55fr) 92px minmax(260px,1.5fr) 94px;align-items:start;padding:14px 16px}
-.alert-row.critical,.activity-row.critical{--row-color:var(--down)}.alert-row.warning,.activity-row.warning{--row-color:var(--stale)}.alert-row.watch,.activity-row.watch{--row-color:var(--sun)}.alert-row.clear,.activity-row.clear,.activity-row.recovery{--row-color:var(--live)}.activity-row.info{--row-color:var(--accent)}
-.alert-host,.activity-host{display:flex;align-items:center;gap:9px;min-width:0}
-.alert-dot,.activity-dot{flex:0 0 auto;width:9px;height:9px;border-radius:50%;background:var(--row-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-color) 12%,transparent)}
-.alert-host strong,.activity-host strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
-.alert-host span:last-child,.activity-host span:last-child{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}
-.alert-status{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0}
-.alert-repeat{display:inline-flex;align-items:center;min-height:23px;padding:3px 8px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:720}
-.severity{display:inline-flex;align-items:center;justify-content:center;width:max-content;min-height:25px;padding:4px 9px;border:1px solid color-mix(in srgb,var(--row-color) 25%,transparent);border-radius:999px;background:color-mix(in srgb,var(--row-color) 9%,white);color:var(--row-color);font-size:11px;font-weight:760;text-transform:lowercase}
-.alert-issue strong,.activity-copy strong{display:block;color:var(--ink);font-size:13px}
-.alert-issue p,.activity-copy p{margin:2px 0 0;color:var(--muted);font-size:12px;line-height:1.35}
-.ops-source,.ops-time{color:var(--muted);font-size:12px}.ops-time{white-space:nowrap}
-.next-action{min-width:0;color:#0f4f80;font-size:12px;font-weight:720;line-height:1.35;overflow-wrap:anywhere}
-.ops-side-panel{display:grid;gap:14px;padding:16px}
-.posture-ring{--posture-color:var(--live);appearance:none;position:relative;display:grid;place-items:center;width:126px;height:126px;margin:2px auto 4px;border:0;border-radius:50%;background:conic-gradient(var(--posture-color) var(--posture-fill),rgba(214,226,234,.72) 0);box-shadow:0 0 0 10px color-mix(in srgb,var(--posture-color) 8%,transparent);cursor:pointer;text-align:center}
-.posture-ring:before{content:"";position:absolute;inset:18px;border-radius:50%;background:#fff;box-shadow:inset 0 0 0 1px rgba(210,226,234,.72)}
-.posture-ring:hover,.posture-ring:focus-visible{box-shadow:0 0 0 10px color-mix(in srgb,var(--posture-color) 11%,transparent),0 12px 28px rgba(45,75,95,.10);outline:0}
-.posture-ring strong{position:relative;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;color:var(--ink)}
-.posture-ring span{position:relative;color:var(--muted);font-size:11px}
-.posture-list,.activity-filters{display:flex;flex-wrap:wrap;gap:7px}
-.posture-chip,.activity-filter{appearance:none;display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:5px 9px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:650;cursor:pointer}
-.posture-chip:before,.activity-filter:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--chip-color,var(--wait));box-shadow:0 0 0 3px color-mix(in srgb,var(--chip-color,var(--wait)) 10%,transparent)}
-.posture-chip.critical,.activity-filter.critical{--chip-color:var(--down)}.posture-chip.warning,.activity-filter.warning{--chip-color:var(--stale)}.posture-chip.watch,.activity-filter.watch{--chip-color:var(--sun)}.posture-chip.clear,.activity-filter.clear,.activity-filter.recovery{--chip-color:var(--live)}.posture-chip.info,.activity-filter.info{--chip-color:var(--accent)}
-.posture-chip:hover,.posture-chip:focus-visible,.activity-filter:hover,.activity-filter:focus-visible{border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.58);outline:0}
-.posture-chip[aria-pressed="true"],.activity-filter[aria-pressed="true"]{color:#0f4f80;border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.76)}
-.ops-action{display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:8px 12px;border:1px solid rgba(103,177,196,.42);border-radius:7px;background:rgba(223,241,249,.72);color:#0f4f80;text-decoration:none;font-size:12px;font-weight:760;box-shadow:0 8px 20px rgba(45,75,95,.07)}
-.ops-action:hover,.ops-action:focus-visible{background:rgba(207,235,244,.92);box-shadow:0 10px 24px rgba(45,75,95,.10);outline:0}
-.ops-empty{padding:34px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
-.ops-empty h2{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:25px;font-weight:500}.ops-empty p{margin:0;color:var(--muted)}
-.ops-note{padding:11px 13px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.78);color:var(--muted);font-size:12px}
-.ops-filter-empty{display:none;margin:0;padding:22px;border-top:1px solid rgba(214,226,234,.66);color:var(--muted);font-size:13px;background:rgba(255,255,255,.64)}
-.ops-filter-empty[data-visible="true"]{display:block}
-.backup-page .ops-panel{overflow:auto}
-.backup-list-full{display:grid;min-width:920px}
-.backup-row{--row-color:var(--wait);display:grid;grid-template-columns:minmax(150px,.9fr) 104px minmax(190px,1.15fr) minmax(96px,.58fr) minmax(92px,.52fr) minmax(132px,.72fr) minmax(120px,.68fr);gap:12px;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.66);background:rgba(255,255,255,.72)}
-.backup-row:last-child{border-bottom:0}
-.backup-row.critical{--row-color:var(--down)}.backup-row.warning{--row-color:var(--stale)}.backup-row.watch{--row-color:var(--wait)}.backup-row.clear{--row-color:var(--live)}
-.backup-row[data-deep-linked="true"]{position:relative;background:color-mix(in srgb,var(--row-color) 6%,white);box-shadow:inset 3px 0 0 var(--row-color),0 8px 22px color-mix(in srgb,var(--row-color) 8%,transparent)}
-.backup-host{display:grid;grid-template-columns:9px minmax(0,1fr);align-items:center;gap:8px;min-width:0}
-.backup-host:before{content:"";width:9px;height:9px;border-radius:50%;background:var(--row-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--row-color) 12%,transparent)}
-.backup-host strong,.backup-issue strong,.backup-field strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-size:13px}
-.backup-host span,.backup-issue p,.backup-field span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;line-height:1.3}
-.backup-state{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
-.backup-count{display:inline-flex;align-items:center;min-height:22px;padding:0 7px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:11px;font-weight:720}
-.backup-issue{min-width:0}
-.backup-issue p{font-size:12px;white-space:normal}
-.backup-field{min-width:0}
-[hidden]{display:none!important}
-.empty-state,.lone-state{position:relative;overflow:hidden;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(239,249,250,.78));box-shadow:0 16px 38px rgba(54,88,108,.08)}
-.empty-state{min-height:430px;margin-top:18px;padding:36px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(240px,.95fr);align-items:center;gap:30px}
-.empty-state:before,.lone-state:before{content:"";position:absolute;inset:auto -8% -30% -8%;height:50%;background:repeating-linear-gradient(178deg,rgba(31,127,181,.12) 0 1px,transparent 1px 28px);opacity:.72;pointer-events:none}
-.empty-copy{position:relative;max-width:440px}
-.empty-kicker,.lone-kicker{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--sun);font-weight:700}
-.empty-copy h2{margin:8px 0 9px;font-size:30px;line-height:1.12;letter-spacing:0}
-.empty-copy p,.lone-copy p{margin:0;color:var(--muted);font-size:14px}
-.empty-visual{position:relative;min-height:285px;display:grid;place-items:center;color:var(--sun)}
-.empty-sun{position:absolute;right:14%;top:8%;width:66px;height:66px;border-radius:50%;background:radial-gradient(circle,#fff 0 34%,rgba(214,155,49,.26) 36% 58%,transparent 60%);box-shadow:0 0 0 12px rgba(214,155,49,.06),0 0 42px rgba(214,155,49,.20)}
-.empty-line{position:absolute;left:7%;right:7%;top:57%;height:2px;border-radius:999px;background:linear-gradient(90deg,transparent,rgba(21,158,153,.42),rgba(214,155,49,.46),transparent)}
-.empty-line:after{content:"";position:absolute;left:0;top:50%;width:26%;height:3px;border-radius:999px;background:linear-gradient(90deg,transparent,var(--sea),transparent);animation:tide 3.2s linear infinite;transform:translateY(-50%)}
-.empty-lighthouse{position:relative;display:grid;place-items:center;width:150px;height:150px;border-radius:50%;background:radial-gradient(circle,rgba(214,155,49,.18),rgba(255,255,255,.66) 54%,transparent 70%);color:var(--sun)}
-.empty-lighthouse .ico{width:68px;height:68px}
-.empty-await{position:absolute;left:50%;bottom:16%;transform:translateX(-50%);font-size:11px;color:var(--muted);white-space:nowrap}
-.lone-state{margin-top:14px;padding:17px 18px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:16px}
-.lone-mark{position:relative;display:grid;place-items:center;width:46px;height:46px;border-radius:50%;border:1px solid rgba(214,155,49,.28);background:rgba(255,255,255,.74);color:var(--sun)}
-.lone-mark .ico{width:24px;height:24px}
-.lone-copy{position:relative;min-width:0}.lone-copy strong{display:block;font-size:15px}.lone-copy p{font-size:12px}
-.onboard-primary{appearance:none;position:relative;display:inline-flex;align-items:center;justify-content:center;gap:9px;min-height:38px;margin-top:18px;padding:0 14px;border:1px solid rgba(103,177,196,.42);border-radius:7px;background:rgba(223,241,249,.74);color:#0f4f80;text-decoration:none;font:inherit;font-size:13px;font-weight:760;box-shadow:0 8px 20px rgba(45,75,95,.07);cursor:pointer}.onboard-primary:hover,.onboard-primary:focus-visible{background:rgba(207,235,244,.92);box-shadow:0 10px 24px rgba(45,75,95,.10);outline:0}.onboard-primary .ico{width:15px;height:15px}
-.lone-state .onboard-primary{margin:0}
-.assistant-overlay{position:fixed;inset:0;z-index:5000;display:grid;place-items:center;padding:24px;overflow:auto;background:rgba(20,43,63,.20);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
-.assistant-sheet{width:min(760px,100%);max-height:calc(100vh - 48px);border:1px solid rgba(210,226,234,.92);border-radius:8px;background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(247,252,253,.94));box-shadow:0 28px 70px rgba(31,61,82,.22);overflow:auto}
-.assistant-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 22px 16px;border-bottom:1px solid rgba(214,226,234,.72)}.assistant-head h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:27px;font-weight:500;color:#12304b}.assistant-head p{margin:5px 0 0;color:var(--muted);font-size:13px}
-.assistant-close{appearance:none;display:grid;place-items:center;min-width:34px;height:34px;border:1px solid rgba(210,226,234,.86);border-radius:50%;background:#fff;color:var(--muted);font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-close:hover,.assistant-close:focus-visible{background:rgba(223,241,249,.72);color:#0f4f80;outline:0}
-.assistant-body{display:grid;gap:13px;padding:18px 22px 22px}.assistant-paths{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.assistant-path{appearance:none;display:grid;gap:11px;min-height:150px;padding:15px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer;box-shadow:0 12px 28px rgba(45,75,95,.06)}.assistant-path:hover,.assistant-path:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-path[aria-pressed="true"]{border-color:rgba(21,158,153,.68);background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(232,248,248,.76));box-shadow:0 16px 34px rgba(45,75,95,.09),0 0 0 3px rgba(21,158,153,.10)}.assistant-path .onboard-mark{width:34px;height:34px;box-shadow:0 0 0 6px rgba(214,155,49,.05)}.assistant-path[aria-pressed="true"] .onboard-mark{border-color:rgba(21,158,153,.34);color:var(--sea);box-shadow:0 0 0 7px rgba(21,158,153,.08)}.assistant-path strong{display:block;font-size:16px;color:var(--ink)}.assistant-path span{display:block;color:var(--muted);font-size:12px;line-height:1.4}
-.assistant-provider-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="new"] .assistant-provider-step{display:grid}.assistant-step-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-top:1px}.assistant-step-head strong{font-size:13px;color:var(--ink)}.assistant-step-head span{font-size:11px;color:var(--muted)}.assistant-providers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-provider{appearance:none;display:grid;gap:8px;padding:13px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.78);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-provider:hover,.assistant-provider:focus-visible,.assistant-template:hover,.assistant-template:focus-visible{border-color:rgba(103,177,196,.52);box-shadow:0 0 0 3px rgba(103,177,196,.09);outline:0}.assistant-provider[aria-pressed="true"]{border-color:rgba(21,158,153,.64);background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(232,248,248,.72));box-shadow:0 0 0 3px rgba(21,158,153,.09)}.assistant-provider-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.assistant-provider-title strong{font-size:15px}.assistant-badge{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(214,155,49,.28);border-radius:999px;background:rgba(255,246,228,.76);color:#9a5b00;font-size:11px;font-weight:760}.assistant-provider p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.assistant-facts span{min-width:0;padding:7px 8px;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.76);font-size:11px;color:var(--muted)}.assistant-facts b{display:block;margin-bottom:2px;color:var(--ink);font-size:11px}.assistant-templates{display:grid;gap:8px}.assistant-template{appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;min-height:62px;padding:11px 12px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;cursor:pointer}.assistant-template[hidden]{display:none}.assistant-template[aria-pressed="true"]{border-color:rgba(21,158,153,.62);background:rgba(233,249,248,.74);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-template strong{display:block;font-size:13px}.assistant-template span{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-template em{font-style:normal;color:var(--sun);font-size:11px;font-weight:760;white-space:nowrap}
-.assistant-existing-step{display:none;gap:12px}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-step{display:grid}.assistant-preflight-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;align-items:end;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(255,255,255,.78)}.assistant-preflight-form label,.assistant-preflight-facts label{display:grid;gap:5px;min-width:0}.assistant-preflight-form label span,.assistant-preflight-facts label span{color:var(--muted);font-size:11px;font-weight:650}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-preflight-form input:focus,.assistant-preflight-form select:focus,.assistant-preflight-facts input:focus,.assistant-preflight-facts select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}.assistant-preflight-details{grid-column:1/-1;border:1px solid rgba(214,226,234,.66);border-radius:7px;background:rgba(247,252,253,.74);padding:8px 10px}.assistant-preflight-details summary{cursor:pointer;color:#0f4f80;font-size:12px;font-weight:760}.assistant-preflight-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}.assistant-check{align-self:end;min-height:36px;padding:0 13px;border:1px solid rgba(21,48,75,.88);border-radius:7px;background:#12304b;color:#fff;font:inherit;font-size:12px;font-weight:760;white-space:nowrap;cursor:pointer}.assistant-check:disabled{border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-preflight-result{display:grid;gap:10px;padding:13px;border:1px solid rgba(210,226,234,.82);border-radius:8px;background:rgba(247,252,253,.78)}.assistant-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.assistant-result-head strong{font-size:14px;color:var(--ink)}.assistant-result-head span{max-width:430px;color:var(--muted);font-size:12px;line-height:1.35;text-align:right}.assistant-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.assistant-check-row{--check-color:var(--wait);display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start;min-height:42px;padding:8px 9px;border:1px solid rgba(214,226,234,.70);border-radius:7px;background:rgba(255,255,255,.72)}.assistant-check-row:before{content:"";width:8px;height:8px;margin-top:4px;border-radius:50%;background:var(--check-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--check-color) 10%,transparent)}.assistant-check-row[data-state="pass"]{--check-color:var(--live)}.assistant-check-row[data-state="warn"]{--check-color:var(--stale)}.assistant-check-row[data-state="fail"]{--check-color:var(--down)}.assistant-check-row strong{display:block;font-size:12px;color:var(--ink)}.assistant-check-row span{display:block;margin-top:1px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.assistant-bootstrap-option{--option-color:var(--wait);appearance:none;display:block;width:100%;min-height:72px;padding:10px;border:1px solid rgba(214,226,234,.74);border-radius:7px;background:rgba(255,255,255,.74);color:var(--ink);font:inherit;text-align:left;opacity:.72}.assistant-bootstrap-option[data-available="true"]{--option-color:var(--sea);opacity:1;border-color:rgba(21,158,153,.26);background:rgba(233,249,248,.62);cursor:pointer}.assistant-bootstrap-option[data-selected="true"]{border-color:rgba(21,158,153,.58);box-shadow:0 0 0 3px rgba(21,158,153,.10),0 10px 22px rgba(45,75,95,.08)}.assistant-bootstrap-option:disabled{cursor:not-allowed}.assistant-bootstrap-option strong{display:block;color:var(--ink);font-size:12px}.assistant-bootstrap-option span{display:block;margin-top:3px;color:var(--muted);font-size:11px;line-height:1.35}.assistant-bootstrap-option:before{content:"";display:block;width:8px;height:8px;margin-bottom:7px;border-radius:50%;background:var(--option-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--option-color) 10%,transparent)}
-.assistant-plan{display:none;gap:14px;padding:14px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.70)}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-overlay[data-assistant-stage="plan"] .assistant-paths,.assistant-overlay[data-assistant-stage="plan"] .assistant-provider-step,.assistant-overlay[data-assistant-stage="plan"] .assistant-existing-step{display:none}.assistant-plan-head{display:flex;justify-content:space-between;align-items:end;gap:12px}.assistant-plan-head strong{font-size:15px}.assistant-plan-head span{font-size:12px;color:var(--muted)}.assistant-review-summary{display:grid;gap:16px}.assistant-review-identity{display:grid;grid-template-columns:42px minmax(0,1fr);column-gap:12px;align-items:center;padding:4px 1px 15px;border-bottom:1px solid rgba(210,226,234,.88)}.assistant-review-identity>.ico{grid-row:1/3;width:38px;height:38px;color:var(--sun)}.assistant-review-identity label{display:grid;gap:2px}.assistant-review-identity label span{font-size:10px;color:var(--muted)}.assistant-review-identity input{width:100%;min-width:0;height:38px;padding:0;border:0;border-bottom:1px solid transparent;background:transparent;color:var(--ink);font-family:Georgia,"Times New Roman",serif;font-size:28px;letter-spacing:0;outline:0}.assistant-review-identity input:focus{border-bottom-color:rgba(31,127,181,.36)}.assistant-review-identity>span{grid-column:2;color:var(--muted);font-size:12px}.assistant-review-rows{display:grid}.assistant-review-row{display:grid;grid-template-columns:28px minmax(0,1fr);align-items:center;gap:11px;min-height:58px;border-bottom:1px solid rgba(210,226,234,.78)}.assistant-review-row:last-child{border-bottom:0}.assistant-review-row>.ico{width:22px;height:22px;color:#315d7c}.assistant-review-row>span{display:flex;align-items:center;justify-content:space-between;gap:18px;min-width:0}.assistant-review-row strong{font-size:13px}.assistant-review-row small{min-width:0;color:var(--ink);font-size:12px;text-align:right;overflow-wrap:anywhere}.assistant-review-details{border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.assistant-review-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:46px;padding:0 4px;color:var(--ink);font-size:13px;font-weight:720;cursor:pointer;list-style:none}.assistant-review-details>summary::-webkit-details-marker{display:none}.assistant-review-details>summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-review-details[open]>summary .ico{transform:rotate(180deg)}.assistant-review-technical{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:4px 0 12px}.assistant-provider-readiness{grid-column:1/-1;display:grid;grid-template-columns:10px minmax(0,1fr);align-items:center;gap:8px;min-height:36px;padding:8px 10px;border:1px solid rgba(210,226,234,.78);border-radius:7px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-provider-readiness i{width:9px;height:9px;border-radius:50%;background:var(--wait);box-shadow:0 0 0 4px rgba(214,155,49,.10)}.assistant-provider-readiness[data-state="ready"] i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.10)}.assistant-provider-readiness[data-state="blocked"] i{background:var(--down);box-shadow:0 0 0 4px rgba(191,58,53,.10)}.assistant-plan-list{grid-column:1/-1;display:grid;gap:7px}.assistant-plan-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:42px;padding:8px 10px;border:1px solid rgba(214,226,234,.68);border-radius:7px;background:rgba(255,255,255,.74)}.assistant-plan-row strong{display:block;font-size:12px}.assistant-plan-row span{display:block;color:var(--muted);font-size:11px}.assistant-plan-chip{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(210,226,234,.88);background:#fff;color:var(--muted);font-size:11px;font-weight:760}.assistant-plan-chip[data-kind="protected"]{border-color:rgba(21,158,153,.24);background:rgba(233,249,248,.72);color:var(--live)}.assistant-plan-chip[data-kind="later"]{border-color:rgba(214,155,49,.28);background:rgba(255,246,228,.70);color:#9a5b00}.assistant-setup-intent{grid-column:1/-1;display:none;gap:9px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-overlay[data-assistant-stage="plan"] .assistant-setup-intent{display:grid}.assistant-choice-group{display:grid;gap:7px}.assistant-choice-group strong{font-size:12px;color:var(--ink)}.assistant-choice-options{display:flex;flex-wrap:wrap;gap:6px}.assistant-choice{position:relative;display:inline-flex;align-items:center;min-height:30px;padding:0 10px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:760;cursor:pointer}.assistant-choice:hover{border-color:rgba(103,177,196,.48);color:#0f4f80}.assistant-choice input{position:absolute;opacity:0;pointer-events:none}.assistant-choice:has(input:checked){border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.72);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-intent-note{display:flex;flex-wrap:wrap;gap:6px;color:var(--muted);font-size:11px}.assistant-intent-note span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:999px;border:1px solid rgba(214,226,234,.72);background:rgba(247,252,253,.76)}.assistant-confirm{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 2px 0;font-size:12px;color:var(--ink)}.assistant-confirm>label{display:flex;align-items:center;gap:9px;min-width:0}.assistant-confirm input{flex:0 0 auto;width:16px;height:16px;accent-color:var(--sea)}.assistant-confirm-actions{display:flex;align-items:center;gap:8px}.assistant-back{min-height:34px;padding:0 10px;border:0;background:transparent;color:#315d7c;font:inherit;font-size:12px;font-weight:720;cursor:pointer}.assistant-start{min-height:36px;padding:0 14px;border:1px solid #c98316;border-radius:7px;background:#e4a42f;color:#15324a;font:inherit;font-size:12px;font-weight:780;cursor:pointer}.assistant-start:disabled{cursor:not-allowed;border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad}.assistant-progress{display:flex;flex-wrap:wrap;gap:6px}.assistant-progress span{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid rgba(210,226,234,.70);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:11px}.assistant-progress span[data-risk="fail"]{border-color:rgba(198,40,40,.22);background:rgba(255,236,236,.62);color:#a23a3a}.assistant-progress span[data-risk="ok"]{border-color:rgba(21,158,153,.22);background:rgba(233,249,248,.62);color:var(--live)}
-.assistant-plan-field{display:grid;gap:5px;padding:10px;border:1px solid rgba(214,226,234,.70);border-radius:8px;background:rgba(255,255,255,.76)}.assistant-plan-field span{color:var(--muted);font-size:11px;font-weight:650}.assistant-plan-field input,.assistant-plan-field select{width:100%;height:36px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;padding:0 10px;outline:0}.assistant-plan-field input:focus,.assistant-plan-field select:focus{border-color:rgba(31,127,181,.45);box-shadow:0 0 0 3px rgba(31,127,181,.08)}
-.assistant-job{display:grid;gap:2px;padding:9px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(255,255,255,.78)}.assistant-job[hidden]{display:none}.assistant-job strong{font-size:12px;color:var(--ink)}.assistant-job span{font-size:11px;color:var(--muted);line-height:1.4}.assistant-progress span[data-active="true"]{border-color:rgba(21,158,153,.42);background:rgba(233,249,248,.82);color:var(--live);box-shadow:0 0 0 3px rgba(21,158,153,.08)}.assistant-progress span[data-active="true"][data-risk="fail"]{border-color:rgba(198,40,40,.34);background:rgba(255,236,236,.82);color:#a23a3a;box-shadow:0 0 0 3px rgba(198,40,40,.07)}
-.assistant-created{display:grid;gap:20px;padding:12px 2px 2px}.assistant-created[hidden]{display:none}.assistant-overlay[data-provider-created="true"] .assistant-sheet{width:min(560px,100%)}.assistant-overlay[data-provider-created="true"] .assistant-body>:not(.assistant-created){display:none}.assistant-overlay[data-provider-created="true"] .assistant-created{display:grid}.assistant-created h3{margin:0;font-family:Georgia,serif;font-size:28px;font-weight:500;color:var(--ink);letter-spacing:0}.assistant-created-summary{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(0,1fr);align-items:center;gap:14px}.assistant-created-fact{display:flex;align-items:center;min-width:0;gap:10px;color:var(--ink)}.assistant-created-fact+.assistant-created-fact{padding-left:14px;border-left:1px solid rgba(210,226,234,.9)}.assistant-created-fact .ico{width:24px;height:24px;color:#53718a;flex:0 0 auto}.assistant-created-host .ico{width:34px;height:34px;color:#2d668e}.assistant-created-fact strong{overflow:hidden;text-overflow:ellipsis;font-size:18px;white-space:nowrap}.assistant-created-fact span{overflow:hidden;text-overflow:ellipsis;font-size:13px;white-space:nowrap}.assistant-created-ready::before{content:"";width:12px;height:12px;border-radius:50%;background:var(--live);box-shadow:0 0 0 5px rgba(21,158,153,.11);flex:0 0 auto}.assistant-created-progress{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;margin-top:2px}.assistant-created-step{position:relative;display:grid;gap:7px;padding-top:30px;color:var(--muted);font-size:12px}.assistant-created-step::before{content:"";position:absolute;top:9px;left:0;right:0;height:2px;background:#dce7ec}.assistant-created-step:first-child::before{left:12px}.assistant-created-step:last-child::before{right:calc(100% - 12px)}.assistant-created-step i{position:absolute;z-index:1;top:1px;left:0;width:20px;height:20px;border:2px solid #c8d6de;border-radius:50%;background:#fff}.assistant-created-step[data-state="done"]{color:var(--live)}.assistant-created-step[data-state="done"]::before{background:var(--live)}.assistant-created-step[data-state="done"] i{border-color:var(--live);background:var(--live);box-shadow:inset 0 0 0 5px #fff}.assistant-created-step[data-state="current"]{color:var(--ink);font-weight:760}.assistant-created-step[data-state="current"] i{border-color:var(--live);box-shadow:inset 0 0 0 5px #fff,0 0 0 5px rgba(21,158,153,.09);background:var(--live)}.assistant-created-actions{display:flex;align-items:center;gap:16px}.assistant-finish{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-height:40px;padding:0 16px;border:1px solid #c98316;border-radius:7px;background:#e4a42f;color:#15324a;font:inherit;font-size:13px;font-weight:780;cursor:pointer}.assistant-finish .ico{width:17px;height:17px}.assistant-later{border:0;background:transparent;color:#315d7c;font:inherit;font-size:12px;text-decoration:underline;text-underline-offset:3px;cursor:pointer}.assistant-created details{border-top:1px solid rgba(210,226,234,.9);padding-top:12px}.assistant-created details summary{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:38px;padding:0 10px;border:1px solid rgba(210,226,234,.9);border-radius:7px;background:rgba(255,255,255,.76);color:var(--ink);font-size:12px;font-weight:720;cursor:pointer;list-style:none}.assistant-created details summary::-webkit-details-marker{display:none}.assistant-created details summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-created details[open] summary .ico{transform:rotate(180deg)}.assistant-created-advanced{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 2px 0}.assistant-created-advanced div{min-width:0}.assistant-created-advanced dt{font-size:10px;color:var(--muted)}.assistant-created-advanced dd{margin:2px 0 0;overflow-wrap:anywhere;font-size:11px;color:var(--ink)}
-.assistant-next{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;margin-top:2px;padding:14px 15px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(247,252,253,.82);color:var(--ink)}.assistant-next strong{display:block;font-size:14px}.assistant-next span{display:block;margin-top:2px;color:var(--muted);font-size:12px}.assistant-next button{min-width:112px;min-height:40px;border:1px solid rgba(210,226,234,.88);border-radius:7px;background:rgba(238,244,247,.88);color:#93a1ad;font:inherit;font-size:13px;font-weight:760}
-.assistant-next button:not(:disabled){border-color:rgba(21,48,75,.88);background:#12304b;color:#fff;cursor:pointer;box-shadow:0 10px 22px rgba(18,48,75,.14)}
-.assistant-close .ico{width:16px;height:16px}.assistant-overlay[data-assistant-stage="plan"] .assistant-next{display:none}.assistant-overlay[data-assistant-stage="plan"]:not([data-assistant-job-id]) .assistant-progress{display:none}.assistant-overlay[data-assistant-stage="plan"][data-assistant-selected-path="new"] .assistant-plan{padding:0;border:0;background:transparent}.assistant-overlay[data-assistant-stage="plan"][data-assistant-selected-path="new"] .assistant-plan>.assistant-plan-head{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-review-summary{display:none}
-.assistant-review-technical>.assistant-plan-field{padding:2px 0;border:0;background:transparent}.assistant-start{display:inline-flex;align-items:center;justify-content:center;gap:8px}.assistant-start .ico{width:15px;height:15px}
-body[data-assistant-open="true"]{overflow:hidden}
-@media (max-width:640px){.assistant-overlay{padding:14px}.assistant-paths,.assistant-providers,.assistant-preflight-form,.assistant-preflight-facts,.assistant-checks,.assistant-bootstrap,.assistant-review-technical{grid-template-columns:1fr}.assistant-head{padding:18px}.assistant-body{padding:16px 18px 18px}.assistant-facts{grid-template-columns:1fr}.assistant-template{grid-template-columns:1fr}.assistant-template em{white-space:normal}.assistant-result-head{display:grid}.assistant-result-head span{text-align:left}.assistant-review-row>span{display:grid;gap:3px}.assistant-review-row small{text-align:left}.assistant-confirm{grid-template-columns:1fr}.assistant-confirm-actions{justify-content:flex-end}.assistant-start{flex:1}.assistant-review-identity input{font-size:24px}}
-@media (max-width:640px){.assistant-created-summary{grid-template-columns:1fr}.assistant-created-fact+.assistant-created-fact{padding:10px 0 0;border-top:1px solid rgba(210,226,234,.9);border-left:0}.assistant-created-actions{align-items:stretch;flex-direction:column}.assistant-finish{width:100%}.assistant-created-advanced{grid-template-columns:1fr}}
-/* PHAROS-136: one decision per setup-assistant screen. */
-.assistant-sheet{width:min(900px,100%);background:rgba(255,255,255,.97)}
-.assistant-overlay:not([data-assistant-stage="choose"]) .assistant-sheet{width:min(700px,100%)}
-.assistant-head{align-items:center;padding:28px 32px 24px}.assistant-head-copy{display:flex;align-items:center;gap:16px;min-width:0}.assistant-head h2{font-size:32px}.assistant-head p{margin-top:7px;font-size:14px}.assistant-close{width:42px;height:42px;min-width:42px}.assistant-close .ico{width:20px;height:20px}
-.assistant-nav-back{appearance:none;display:inline-flex;align-items:center;gap:6px;min-height:36px;padding:0 8px 0 2px;border:0;background:transparent;color:#315d7c;font:inherit;font-size:13px;font-weight:720;cursor:pointer}.assistant-nav-back:hover,.assistant-nav-back:focus-visible{color:#0f4f80;outline:0}.assistant-nav-back .ico{width:18px;height:18px}
-.assistant-body{gap:20px;padding:30px 32px 34px}.assistant-overlay[data-assistant-stage] .assistant-paths,.assistant-overlay[data-assistant-stage] .assistant-provider-step,.assistant-overlay[data-assistant-stage] .assistant-existing-step,.assistant-overlay[data-assistant-stage] .assistant-preflight-result,.assistant-overlay[data-assistant-stage] .assistant-plan,.assistant-overlay[data-assistant-stage] .assistant-job{display:none}
-.assistant-overlay[data-assistant-stage="choose"] .assistant-paths{display:grid}.assistant-overlay[data-assistant-stage="template"] .assistant-provider-step{display:grid}.assistant-overlay[data-assistant-stage="existing"] .assistant-existing-step{display:grid}.assistant-overlay[data-assistant-stage="bootstrap"] .assistant-preflight-result{display:grid}.assistant-overlay[data-assistant-stage="plan"] .assistant-plan{display:grid}.assistant-overlay[data-assistant-stage="job"] .assistant-job{display:grid}
-.assistant-paths{grid-template-columns:repeat(2,minmax(0,1fr));gap:22px}.assistant-path{place-items:center;align-content:center;gap:26px;min-height:300px;padding:34px;text-align:center;box-shadow:none}.assistant-path:hover,.assistant-path:focus-visible{transform:translateY(-1px);box-shadow:0 14px 32px rgba(45,75,95,.08),0 0 0 3px rgba(103,177,196,.09)}.assistant-path .onboard-mark{display:grid;place-items:center;width:86px;height:86px;justify-self:center;border-color:rgba(21,158,153,.36);color:#218f91;box-shadow:0 0 0 12px rgba(21,158,153,.07)}.assistant-path:nth-child(2) .onboard-mark{border-color:rgba(214,155,49,.38);color:#be7d19;box-shadow:0 0 0 12px rgba(214,155,49,.07)}.assistant-path .onboard-mark .ico{width:38px;height:38px}.assistant-path-copy{display:grid!important;gap:8px}.assistant-path strong{font-size:23px}.assistant-path .assistant-path-copy>span{font-size:15px}
-.assistant-provider-step{gap:20px}.assistant-step-copy{display:grid;gap:5px}.assistant-step-copy strong{font-size:16px}.assistant-step-copy span{color:var(--muted);font-size:13px;line-height:1.45}.assistant-providers{display:none}.assistant-templates{gap:10px}.assistant-template{min-height:82px;padding:16px 18px}.assistant-template strong{font-size:15px}.assistant-template span{font-size:12px}.assistant-template em{padding-left:12px;color:#9a5b00;font-size:12px}.assistant-template:hover,.assistant-template:focus-visible{transform:translateY(-1px)}
-.assistant-preflight-form{display:grid;grid-template-columns:1fr;gap:18px;padding:0;border:0;background:transparent}.assistant-primary-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.assistant-preflight-form label,.assistant-preflight-facts label{gap:7px}.assistant-preflight-form label span,.assistant-preflight-facts label span{font-size:12px}.assistant-preflight-form input,.assistant-preflight-form select,.assistant-preflight-facts input,.assistant-preflight-facts select{height:44px;font-size:14px}.assistant-preflight-details,.assistant-check-details{border-top:1px solid rgba(214,226,234,.82);border-right:0;border-bottom:1px solid rgba(214,226,234,.82);border-left:0;border-radius:0;background:transparent;padding:0}.assistant-preflight-details summary,.assistant-check-details summary{display:flex;align-items:center;justify-content:space-between;min-height:46px;color:#315d7c;cursor:pointer;font-size:13px;font-weight:720;list-style:none}.assistant-preflight-details summary::-webkit-details-marker,.assistant-check-details summary::-webkit-details-marker{display:none}.assistant-preflight-details summary .ico,.assistant-check-details summary .ico{width:16px;height:16px;transition:transform .16s ease}.assistant-preflight-details[open] summary .ico,.assistant-check-details[open] summary .ico{transform:rotate(180deg)}.assistant-preflight-facts{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:4px 0 16px;margin:0}.assistant-check{justify-self:end;min-height:42px;padding:0 18px;font-size:13px}
-.assistant-preflight-result{gap:18px;padding:0;border:0;background:transparent}.assistant-result-head{display:grid;gap:4px}.assistant-result-head strong{font-size:17px}.assistant-result-head span{max-width:none;text-align:left;font-size:13px}.assistant-bootstrap{grid-template-columns:1fr;gap:10px}.assistant-bootstrap-option{min-height:76px;padding:14px 16px;opacity:.58}.assistant-bootstrap-option[data-available="true"]{opacity:1;background:#fff}.assistant-bootstrap-option:before{display:none}.assistant-bootstrap-option strong{font-size:14px}.assistant-bootstrap-option span{font-size:12px}.assistant-check-details{margin-top:2px}.assistant-checks{grid-template-columns:1fr;gap:7px;padding:0 0 14px}
-.assistant-plan{gap:20px;padding:0;border:0;background:transparent}.assistant-plan>.assistant-plan-head{display:none}.assistant-review-summary{gap:12px}.assistant-existing-review{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-review-summary{display:none}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-existing-review{display:grid}.assistant-overlay[data-assistant-selected-path="existing"] .assistant-provider-readiness,.assistant-overlay[data-assistant-selected-path="existing"] .assistant-plan-field,.assistant-overlay[data-assistant-selected-path="existing"] [data-provider-plan-resources]{display:none}.assistant-review-identity{padding-bottom:12px}.assistant-review-identity input{font-size:26px}.assistant-review-details{margin-top:2px}.assistant-review-technical{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.assistant-setup-intent{display:grid;padding:8px 0 2px;border:0;background:transparent}.assistant-choice-options{gap:7px}.assistant-confirm{border-top:1px solid rgba(210,226,234,.84);padding-top:18px}.assistant-confirm-actions{display:none}.assistant-start{min-height:42px;padding:0 17px;font-size:13px}.assistant-start .ico{width:16px;height:16px}
-.assistant-paid-review{display:none;gap:16px}.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-paid-review,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-paid-review{display:grid}.assistant-overlay[data-assistant-selected-path="new"] .assistant-confirm>label{display:none}.assistant-overlay[data-assistant-selected-path="new"] .assistant-confirm{grid-template-columns:1fr}.assistant-overlay[data-assistant-selected-path="new"] .assistant-start{justify-self:end}.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="reviewed"] .assistant-review-details,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-review-details{display:none}.assistant-paid-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.assistant-paid-head strong{font-family:Georgia,"Times New Roman",serif;font-size:21px;font-weight:500;color:var(--ink)}.assistant-paid-head span{display:inline-flex;align-items:center;min-height:26px;padding:0 9px;border:1px solid rgba(214,155,49,.30);border-radius:999px;background:rgba(255,246,228,.76);color:#8d5707;font-size:11px;font-weight:780}.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-paid-head span{border-color:rgba(21,158,153,.28);background:rgba(233,249,248,.76);color:var(--live)}.assistant-paid-boundary{margin:0;padding:11px 13px;border-left:3px solid var(--sun);background:rgba(255,246,228,.58);color:#694a18;font-size:12px;line-height:1.45}.assistant-overlay[data-assistant-paid-stage="authorized"] .assistant-paid-boundary{border-left-color:var(--sea);background:rgba(233,249,248,.62);color:#195b5c}.assistant-paid-policy{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin:0;border-top:1px solid rgba(210,226,234,.86);border-left:1px solid rgba(210,226,234,.86);border-radius:8px;overflow:hidden}.assistant-paid-policy>div{min-width:0;padding:10px 12px;border-right:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86);background:rgba(255,255,255,.76)}.assistant-paid-policy>div[data-paid-wide]{grid-column:1/-1}.assistant-paid-policy dt{color:var(--muted);font-size:10px;font-weight:720;text-transform:uppercase;letter-spacing:.045em}.assistant-paid-policy dd{margin:4px 0 0;color:var(--ink);font-size:12px;line-height:1.4;overflow-wrap:anywhere}.assistant-paid-policy code{font-size:10px;color:#315d7c}.assistant-paid-label-list{display:flex;flex-wrap:wrap;gap:6px;margin:0;padding:0;list-style:none}.assistant-paid-label-list li{padding:3px 7px;border:1px solid rgba(210,226,234,.88);border-radius:999px;background:rgba(247,252,253,.92);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px}.assistant-paid-next{display:grid;gap:3px;padding:11px 13px;border:1px solid rgba(210,226,234,.84);border-radius:8px;background:rgba(247,252,253,.74)}.assistant-paid-next strong{font-size:12px}.assistant-paid-next p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}.assistant-paid-authorization{margin:0;color:var(--muted);font-size:11px}.assistant-paid-authorization strong{color:var(--ink)}
-.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-paid-review{display:grid}.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-review-details{display:none}.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-paid-head span{border-color:rgba(21,158,153,.28);background:rgba(233,249,248,.76);color:var(--live)}.assistant-overlay[data-assistant-paid-stage="reconcile"] .assistant-paid-boundary{border-left-color:var(--sea);background:rgba(233,249,248,.62);color:#195b5c}
-.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-paid-review{display:grid}.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-review-summary,.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-provider-readiness,.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-review-details{display:none}.assistant-overlay[data-assistant-paid-stage="claimed"] .assistant-paid-head span{border-color:rgba(214,155,49,.30);background:rgba(255,246,228,.76);color:#8d5707}
-.assistant-job{grid-template-columns:28px minmax(0,1fr);align-items:start;gap:12px;padding:18px;border:1px solid rgba(103,177,196,.34);border-radius:8px;background:rgba(239,249,250,.72)}.assistant-job>div{display:grid;gap:4px}.assistant-job strong{font-size:15px}.assistant-job span{font-size:12px}.assistant-job-spinner{width:22px;height:22px;border:2px solid rgba(21,158,153,.18);border-top-color:var(--sea);border-radius:50%;animation:assistantSpin .8s linear infinite}.assistant-error{padding:11px 13px;border:1px solid rgba(191,58,53,.24);border-radius:7px;background:rgba(255,238,235,.72);color:#8f312d;font-size:12px;line-height:1.4}.assistant-next,.assistant-progress{display:none!important}
-@supports (height:100dvh){.assistant-overlay{min-height:100dvh}.assistant-sheet{max-height:calc(100dvh - 48px)}}
-@keyframes assistantSpin{to{transform:rotate(360deg)}}
-@media (max-width:640px){.assistant-overlay{padding:10px 10px max(10px,env(safe-area-inset-bottom))}.assistant-sheet{max-height:calc(100dvh - 20px)}.assistant-head{padding:20px}.assistant-head-copy{gap:10px}.assistant-head h2{font-size:27px}.assistant-head p{font-size:13px}.assistant-nav-back span{display:none}.assistant-body{padding:22px 20px max(24px,env(safe-area-inset-bottom))}.assistant-paths,.assistant-primary-fields,.assistant-preflight-facts,.assistant-review-technical,.assistant-paid-policy{grid-template-columns:1fr}.assistant-paid-policy>div[data-paid-wide]{grid-column:auto}.assistant-path{min-height:190px;padding:24px}.assistant-path .onboard-mark{width:68px;height:68px;box-shadow:0 0 0 9px rgba(21,158,153,.07)}.assistant-path:nth-child(2) .onboard-mark{box-shadow:0 0 0 9px rgba(214,155,49,.07)}.assistant-path .onboard-mark .ico{width:30px;height:30px}.assistant-path strong{font-size:20px}.assistant-confirm{grid-template-columns:1fr}.assistant-start,.assistant-overlay[data-assistant-selected-path="new"] .assistant-start{width:100%;min-height:44px;justify-self:stretch}}
-.map-main{width:min(1380px,100%)}
-.map-main[data-map-view="maximized"]{width:100%}
-.map-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:18px;align-items:stretch}
-.map-panel,.site-panel{border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.84);box-shadow:0 16px 38px rgba(54,88,108,.08);overflow:hidden}
-.map-panel{position:relative;display:flex;min-height:560px}
-.fleet-map{flex:1 1 auto;height:100%;min-height:560px;background:linear-gradient(135deg,#f7fbfc,#edf6f7)}
-.map-layout[data-mode="maximized"]{grid-template-columns:minmax(0,1fr)}
-.map-layout[data-mode="maximized"] .site-panel{display:none}
-.map-layout[data-mode="maximized"] .map-panel{height:calc(100vh - 258px);min-height:640px}
-.map-panel:fullscreen{width:100vw;height:100vh;min-height:100vh;border:0;border-radius:0;background:#f7fbfc}
-.map-panel:fullscreen .fleet-map{min-height:100vh}
-.map-panel:-webkit-full-screen{width:100vw;height:100vh;min-height:100vh;border:0;border-radius:0;background:#f7fbfc}
-.map-panel:-webkit-full-screen .fleet-map{min-height:100vh}
-.map-mode-controls{position:absolute;right:12px;top:12px;z-index:1001;display:flex;align-items:center;gap:4px;padding:4px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 12px 28px rgba(45,75,95,.14);-webkit-backdrop-filter:blur(10px) saturate(1.06);backdrop-filter:blur(10px) saturate(1.06)}
-.map-mode-control{display:grid;place-items:center;width:34px;height:34px;border:1px solid transparent;border-radius:6px;background:transparent;color:#44637f;cursor:pointer}
-.map-mode-control:hover{border-color:rgba(173,205,220,.72);background:rgba(223,241,249,.56);color:#17304a}
-.map-mode-control[aria-pressed="true"]{border-color:rgba(103,177,196,.52);background:rgba(223,241,249,.82);color:#187fb9;box-shadow:0 0 0 3px rgba(103,177,196,.10)}
-.map-mode-control .ico{width:17px;height:17px}
-.map-density-control{margin-left:5px;border-left:1px solid rgba(210,226,234,.86)}
-.map-panel:fullscreen .map-mode-controls,.map-panel:-webkit-full-screen .map-mode-controls{right:14px;top:14px}
-.map-fallback{display:none;position:absolute;inset:0;place-items:center;padding:28px;text-align:center;color:var(--muted);background:rgba(255,255,255,.82);z-index:2}
-.map-fallback strong{display:block;color:var(--ink);font-size:18px}
-.map-loading{position:absolute;inset:0;z-index:900;display:grid;place-items:center;padding:26px;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.82),rgba(239,249,250,.54))}
-.map-panel[data-loading="false"] .map-loading{display:none;opacity:0;visibility:hidden}
-.map-load-card{width:min(420px,calc(100% - 40px));padding:18px;border:1px solid rgba(210,226,234,.86);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 16px 38px rgba(54,88,108,.12);-webkit-backdrop-filter:blur(10px) saturate(1.06);backdrop-filter:blur(10px) saturate(1.06)}
-.map-load-card strong{display:block;margin-bottom:5px;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;color:var(--ink)}
-.map-load-card p{margin:0;color:var(--muted);font-size:12px}
-.map-load-rail{position:relative;height:6px;margin-top:14px;overflow:hidden;border-radius:999px;background:rgba(214,226,234,.68)}
-.map-load-rail:after{content:"";position:absolute;inset:0;width:38%;border-radius:999px;background:linear-gradient(90deg,transparent,rgba(21,158,153,.68),transparent);animation:mapShimmer 1.2s linear infinite}
-.fleet-map:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 22% 42%,rgba(21,158,153,.10),transparent 20%),radial-gradient(circle at 72% 38%,rgba(214,155,49,.10),transparent 18%),linear-gradient(135deg,#f7fbfc,#edf6f7);opacity:0;transition:opacity .18s ease}
-.map-panel[data-loading="true"] .fleet-map{position:relative}
-.map-panel[data-loading="true"] .fleet-map:before{opacity:1}
-.site-loading,.site-error{display:grid;gap:8px;padding:11px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.74)}
-.site-skel-line{height:11px;border-radius:999px;background:linear-gradient(90deg,rgba(222,234,240,.58),rgba(247,252,253,.96),rgba(222,234,240,.58));background-size:220% 100%;animation:siteShimmer 1.4s linear infinite}
-.site-skel-line.short{width:46%}.site-skel-line.medium{width:68%}.site-skel-line.long{width:86%}
-.site-error strong{font-size:13px;color:var(--ink)}.site-error span{color:var(--muted);font-size:12px}
-@keyframes mapShimmer{from{transform:translateX(-100%)}to{transform:translateX(265%)}}
-@keyframes siteShimmer{from{background-position:120% 0}to{background-position:-120% 0}}
-.site-panel{padding:16px;display:flex;flex-direction:column;gap:14px}
-.site-panel h2{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:22px;font-weight:500;letter-spacing:0}
-.site-panel p{margin:0;color:var(--muted);font-size:12px}
-.site-list{display:grid;gap:9px;overflow:auto;padding-right:2px}
-.site-item{display:grid;gap:8px;padding:11px;border:1px solid rgba(210,226,234,.78);border-radius:8px;background:rgba(255,255,255,.74)}
-.site-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.site-head strong{font-size:13px}
-.site-count{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:22px;border-radius:999px;background:rgba(223,241,249,.78);color:#0f4f80;font-size:12px;font-weight:700}
-.site-hosts{display:flex;flex-wrap:wrap;gap:6px}
-.site-host{--host-state:var(--wait);display:grid;grid-template-columns:7px minmax(0,1fr);align-items:center;column-gap:6px;min-height:42px;padding:5px 8px;border:1px solid color-mix(in srgb,var(--host-state) 22%,transparent);border-radius:8px;background:color-mix(in srgb,var(--host-state) 8%,white);color:var(--ink);font-size:12px;text-decoration:none}
-.site-host:before{content:"";grid-row:1/4;width:7px;height:7px;border-radius:50%;background:var(--host-state);box-shadow:0 0 0 4px color-mix(in srgb,var(--host-state) 12%,transparent)}
-.site-host-name{line-height:1.1;font-weight:650;white-space:nowrap}
-.site-host-signals{display:flex;flex-wrap:wrap;gap:5px;margin-top:2px}
-.site-host-ping{line-height:1.1;font-size:10px;color:var(--muted);white-space:nowrap}
-.site-host-ping[data-probe-level="good"]{color:var(--live)}.site-host-ping[data-probe-level="warn"]{color:var(--stale)}.site-host-ping[data-probe-level="down"]{color:var(--down)}.site-host-ping[data-policy="blocked"]{color:var(--muted)}
-.site-host-source{display:inline-flex;align-items:center;gap:4px;margin-left:auto;padding:2px 6px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:rgba(255,255,255,.78);color:#546b80;font-size:10px;line-height:1.1;white-space:nowrap}
-.site-host-source:before{content:"";width:5px;height:5px;border-radius:50%;background:#8aa0b2;box-shadow:0 0 0 3px rgba(138,160,178,.10)}
-.site-host-source[data-location-source="declared"]:before{background:#2d87bf}.site-host-source[data-location-source="wifi"]:before,.site-host-source[data-location-source="ip"]:before{background:var(--live)}.site-host-source[data-location-source="provider"]:before{background:var(--sea)}.site-host-source[data-location-source="fallback"]:before{background:var(--sun)}
-.map-note{margin-top:auto;padding-top:8px;border-top:1px solid rgba(214,226,234,.72);color:var(--muted);font-size:11px}
-.leaflet-container{height:100%;font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
-.leaflet-control-zoom a{color:var(--ink)!important}
-.map-label-layer{position:absolute;inset:0;z-index:650;pointer-events:none;overflow:hidden}
-.map-links{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
-.map-link{fill:none;stroke:rgba(21,158,153,.36);stroke-width:1.15;opacity:.72;vector-effect:non-scaling-stroke}
-.map-link[data-inbound-level="warn"]{stroke:rgba(214,155,49,.38)}.map-link[data-inbound-level="down"]{stroke:rgba(191,58,53,.30);stroke-dasharray:4 7}.map-link[data-outbound-policy="blocked"]{stroke:rgba(137,151,163,.34);stroke-dasharray:3 6;opacity:.42}
-.map-packet{r:3;opacity:.78}.map-packet.inbound{fill:var(--sea)}.map-packet.outbound{fill:var(--accent)}.map-packet[data-level="warn"]{fill:var(--sun)}.map-packet[data-level="down"]{fill:var(--down)}.map-packet[data-policy="blocked"]{fill:var(--wait);opacity:.38}
-.map-leaders{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
-.map-leaders line{stroke:#7a8c9c;stroke-width:1.2;stroke-dasharray:2 4;opacity:.52;vector-effect:non-scaling-stroke}
-.map-anchor{--node-color:var(--wait);position:absolute;width:12px;height:12px;border-radius:50%;background:radial-gradient(circle,#fff 0 27%,var(--node-color) 33% 68%,transparent 70%);box-shadow:0 0 0 5px color-mix(in srgb,var(--node-color) 11%,transparent),0 6px 12px rgba(45,75,95,.14);transform:translate(-50%,-50%);pointer-events:none}
-.map-anchor.live,.map-node.live{--node-color:var(--live)}.map-anchor.stale,.map-node.stale{--node-color:var(--stale)}.map-anchor.down,.map-node.down{--node-color:var(--down)}.map-anchor.awaiting_first_heartbeat,.map-node.awaiting_first_heartbeat{--node-color:var(--wait)}
-.map-node{--node-color:var(--wait);position:absolute;display:grid;grid-template-columns:9px minmax(0,1fr);column-gap:7px;align-items:start;min-width:106px;max-width:154px;padding:6px 8px 7px 7px;border:1px solid color-mix(in srgb,var(--node-color) 30%,rgba(210,226,234,.92));border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 10px 22px rgba(45,75,95,.14),0 0 0 4px color-mix(in srgb,var(--node-color) 7%,transparent);-webkit-backdrop-filter:blur(8px) saturate(1.05);backdrop-filter:blur(8px) saturate(1.05);color:var(--ink);text-decoration:none;pointer-events:auto}
-.map-node:hover{box-shadow:0 14px 28px rgba(45,75,95,.18),0 0 0 5px color-mix(in srgb,var(--node-color) 12%,transparent);transform:translateY(-1px)}
-.map-status-dot{grid-row:1/4;width:9px;height:9px;margin-top:4px;border-radius:50%;background:var(--node-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--node-color) 13%,transparent)}
-.map-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.15;font-weight:760;color:#17304a}
-.map-signals{grid-column:2;display:grid;gap:2px;margin-top:2px}
-.map-ping{display:flex;align-items:center;gap:4px;font-size:10px;line-height:1.15;color:var(--muted);white-space:nowrap}
-.map-ping:before{content:attr(data-dir);width:17px;color:var(--muted);font-weight:700;text-transform:uppercase;font-size:8px;letter-spacing:.03em}
-.map-ping[data-probe-level="good"]{color:var(--live)}.map-ping[data-probe-level="warn"]{color:var(--stale)}.map-ping[data-probe-level="down"]{color:var(--down)}.map-ping[data-policy="blocked"]{color:var(--muted)}
-.map-source{grid-column:2;justify-self:start;display:inline-flex;align-items:center;gap:4px;margin-top:4px;padding:2px 6px;border:1px solid rgba(210,226,234,.86);border-radius:999px;background:rgba(255,255,255,.76);color:#546b80;font-size:10px;line-height:1.1;white-space:nowrap}
-.map-source:before{content:"";width:5px;height:5px;border-radius:50%;background:#8aa0b2;box-shadow:0 0 0 3px rgba(138,160,178,.10)}
-.map-source[data-location-source="declared"]:before{background:#2d87bf}.map-source[data-location-source="wifi"]:before,.map-source[data-location-source="ip"]:before{background:var(--live)}.map-source[data-location-source="provider"]:before{background:var(--sea)}.map-source[data-location-source="fallback"]:before{background:var(--sun)}
-.map-panel[data-label-density="compact"] .map-node{grid-template-columns:8px max-content;align-items:center;min-width:0;max-width:132px;padding:5px 8px 5px 7px}
-.map-panel[data-label-density="compact"] .map-status-dot{grid-row:auto;margin-top:0;width:8px;height:8px}
-.map-panel[data-label-density="compact"] .map-name{font-size:12px}
-.map-panel[data-label-density="compact"] .map-signals,.map-panel[data-label-density="compact"] .map-source{display:none}
-@media (max-width:900px){.app-shell{display:block}.sidebar{position:relative;height:auto;min-height:0;display:grid;grid-template-columns:1fr;gap:14px;padding:18px;border-right:0;border-bottom:1px solid rgba(211,225,233,.78)}.sidebar:before,.sidebar-motion{display:none}.side-brand{padding:0}.side-nav{grid-template-columns:repeat(3,minmax(0,1fr))}.side-link{min-height:38px;padding:0 10px}.side-bottom{display:none}main{padding:28px 18px 42px}.top{display:block;min-height:112px}.asof{padding-top:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.toolbar{align-items:stretch;flex-direction:column}.toolbar-left,.toolbar-right{justify-content:space-between}.search{min-width:0;width:100%}.grid{grid-template-columns:1fr}.list-wrap{overflow-x:auto}.list{min-width:1050px}}
-@media (max-width:1100px){.map-layout{grid-template-columns:1fr}.site-panel{display:block}.site-list{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-top:12px}.map-note{margin-top:12px}.map-layout[data-mode="maximized"] .site-panel{display:none}}
-@media (max-width:1100px){.ops-layout{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr 92px}.alert-issue{grid-column:1/-1}.ops-source,.ops-time,.next-action{font-size:11px}.activity-row{grid-template-columns:78px minmax(0,1fr)}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:2}.ops-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:720px){.empty-state{grid-template-columns:1fr;min-height:0;padding:24px}.empty-copy h2{font-size:24px}.empty-visual{min-height:210px;order:-1}.lone-state{grid-template-columns:auto 1fr}.lone-state .onboard-primary{grid-column:1/-1;width:100%}.map-panel{min-height:420px}.fleet-map{min-height:420px}.map-mode-controls{top:10px;right:10px}.ops-summary{grid-template-columns:1fr}.alert-row{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr}.activity-host,.activity-copy,.activity-row .severity,.activity-row .ops-source{grid-column:auto}}
-.assistant-created-setup{display:grid;gap:10px;padding:13px 14px;border:1px solid rgba(210,226,234,.84);border-radius:8px;background:rgba(247,252,253,.82)}
-.assistant-created-setup h4{margin:0;color:var(--ink);font-size:14px}.assistant-created-setup ol{display:grid;gap:7px;margin:0;padding-left:20px;color:#315d7c;font-size:12px;line-height:1.4}.assistant-created-setup li::marker{color:var(--sea);font-weight:760}
-.assistant-created-guidance{margin:0;color:var(--muted);font-size:11px;line-height:1.45}
-.assistant-created-danger{display:grid;gap:12px;margin-top:10px;padding:14px;border:1px solid rgba(191,58,53,.28);border-radius:8px;background:linear-gradient(135deg,rgba(255,249,248,.96),rgba(255,238,235,.72))}
-.assistant-created-danger-head{display:flex;align-items:flex-start;gap:10px}.assistant-created-danger-head>.ico{flex:0 0 auto;width:20px;height:20px;margin-top:1px;color:var(--down)}.assistant-created-danger-head strong{display:block;color:#7f2926;font-size:13px}.assistant-created-danger-head p{margin:3px 0 0;color:#765b59;font-size:11px;line-height:1.4}
-.assistant-delete-confirm{display:flex;align-items:flex-start;gap:9px;color:#604f4d;font-size:11px;line-height:1.4;cursor:pointer}.assistant-delete-confirm input{flex:0 0 auto;width:16px;height:16px;margin:0;accent-color:var(--down)}
-.assistant-delete-actions{display:flex;align-items:center;gap:11px;min-height:38px}.assistant-delete{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:38px;padding:0 13px;border:1px solid var(--down);border-radius:7px;background:#fff;color:#a1322e;font:inherit;font-size:12px;font-weight:760;cursor:pointer}.assistant-delete .ico{width:15px;height:15px}.assistant-delete:hover:not(:disabled),.assistant-delete:focus-visible:not(:disabled){background:rgba(255,232,229,.78);box-shadow:0 0 0 3px rgba(191,58,53,.08);outline:0}.assistant-delete:disabled{cursor:not-allowed;border-color:rgba(191,58,53,.20);color:rgba(161,50,46,.42);background:rgba(255,255,255,.58)}.assistant-delete-actions span{min-width:0;color:#765b59;font-size:11px;line-height:1.35}
-.assistant-created[data-state="deleted"] .assistant-created-ready::before{background:var(--wait);box-shadow:0 0 0 5px rgba(137,151,163,.10)}.assistant-created[data-state="deleted"] .assistant-created-host .ico{color:#6d8293}
-.assistant-overlay[data-provider-created="true"] .assistant-next,.assistant-overlay[data-provider-created="true"] .assistant-created>h3{display:none}
-@media (max-width:640px){.assistant-delete-actions{align-items:stretch;flex-direction:column}.assistant-delete{width:100%}.assistant-delete-actions span{width:100%;text-align:center}.host-action-overlay{padding:10px}.host-action-dialog{width:100%;max-height:calc(100vh - 20px)}.host-action-dialog-head,.host-action-dialog-body{padding-left:16px;padding-right:16px}.host-action-dialog-foot{align-items:stretch;flex-direction:column;padding-left:16px;padding-right:16px}.host-action-dialog-buttons{width:100%;margin-left:0}.host-action-dialog-button{flex:1}.host-action-safe-note{justify-content:center}.host-action-fact strong{max-width:55vw}.host-workflow-group{grid-template-columns:1fr}.host-workflow-group h3{padding:11px 0 3px}.host-workflow-step{grid-template-columns:18px minmax(0,1fr)}.host-workflow-step-state{grid-column:2;text-align:left}.host-workflow-step[data-current="true"]{margin:0 -6px;padding-left:6px;padding-right:6px}}
-@media (max-width:640px){.host-workflow-meta{align-items:flex-start;flex-direction:column;gap:3px}.host-workflow-step-state{justify-items:start}}
-.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr) auto}.assistant-provider-readiness[data-state="attention"] i{background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.10)}.assistant-provider-readiness a{color:#0f4f80;font-weight:760;text-decoration:none;white-space:nowrap}.assistant-provider-readiness a:hover,.assistant-provider-readiness a:focus-visible{text-decoration:underline;text-underline-offset:2px;outline:0}
-.providers-main{width:min(1120px,100%)}
-.settings-section-title{margin:0 0 9px;font-family:Georgia,"Times New Roman",serif;font-size:20px;font-weight:500;color:#12304b}.appearance-settings{margin:0 0 26px}.appearance-row{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:72px;padding:12px 2px;border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.appearance-copy strong{display:block;color:var(--ink);font-size:14px}.appearance-copy span{display:block;margin-top:3px;color:var(--muted);font-size:12px}.appearance-toggle{position:relative;display:inline-flex;align-items:center;flex:0 0 auto;width:42px;height:24px;cursor:pointer}.appearance-toggle input{position:absolute;width:1px;height:1px;opacity:0}.appearance-switch{position:absolute;inset:0;border:1px solid rgba(137,151,163,.42);border-radius:999px;background:rgba(226,234,238,.86);transition:background .18s ease,border-color .18s ease,box-shadow .18s ease}.appearance-switch:after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 2px 5px rgba(45,75,95,.22);transition:transform .18s ease}.appearance-toggle input:checked+.appearance-switch{border-color:rgba(21,158,153,.56);background:rgba(21,158,153,.72)}.appearance-toggle input:checked+.appearance-switch:after{transform:translateX(18px)}.appearance-toggle input:focus-visible+.appearance-switch{box-shadow:0 0 0 3px rgba(31,127,181,.15)}
-.provider-list{overflow:hidden;border:1px solid rgba(210,226,234,.90);border-radius:8px;background:rgba(255,255,255,.78);box-shadow:0 16px 38px rgba(54,88,108,.06)}
-.provider-row{--provider-color:var(--wait);display:grid;grid-template-columns:52px minmax(250px,1.7fr) minmax(84px,.55fr) minmax(136px,.75fr) minmax(92px,.48fr);align-items:center;gap:14px;min-height:92px;padding:15px 22px;border-bottom:1px solid rgba(210,226,234,.82)}.provider-row:last-child{border-bottom:0}.provider-row[data-provider-state="ready"]{--provider-color:var(--live)}.provider-row[data-provider-state="needs-attention"]{--provider-color:var(--stale)}.provider-row[data-provider-state="not-connected"]{--provider-color:var(--wait)}.provider-row[data-provider-state="guided"]{--provider-color:var(--accent)}
-.provider-mark{display:grid;place-items:center;width:42px;height:42px;color:#48627a}.provider-mark .ico{width:28px;height:28px;stroke-width:1.7}
-.provider-copy{min-width:0}.provider-copy strong{display:block;color:var(--ink);font-size:15px}.provider-copy span{display:block;margin-top:3px;color:var(--muted);font-size:12px;line-height:1.35}.provider-capability{color:#315d7c;font-size:12px}.provider-state{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.provider-state:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--provider-color);box-shadow:0 0 0 4px color-mix(in srgb,var(--provider-color) 10%,transparent)}
-.provider-action,.provider-primary,.provider-secondary{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:38px;border-radius:7px;font-size:12px;font-weight:760;text-decoration:none}.provider-action{justify-self:end;color:#0f5f95;padding:0 8px}.provider-action:hover,.provider-action:focus-visible{text-decoration:underline;text-underline-offset:3px;outline:0}.provider-action-muted{justify-self:end;color:var(--muted);font-size:11px;text-align:right}.providers-footnote{margin:17px 0 0;color:var(--muted);font-size:12px}
-.provider-detail{padding-top:36px}.provider-back{display:inline-flex;align-items:center;gap:7px;margin-bottom:26px;color:#315d7c;font-size:13px;font-weight:720;text-decoration:none}.provider-back:hover{text-decoration:underline;text-underline-offset:3px}.provider-back .ico{width:15px;height:15px}.provider-detail-head{display:flex;align-items:center;gap:16px;margin-bottom:26px}.provider-detail-mark{display:grid;place-items:center;width:54px;height:54px;border:1px solid rgba(214,155,49,.28);border-radius:50%;background:rgba(255,255,255,.74);color:var(--sun);box-shadow:0 0 0 8px rgba(214,155,49,.06)}.provider-detail-mark .ico{width:27px;height:27px}.provider-detail-head h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:32px;line-height:1.05;font-weight:500;letter-spacing:0;color:#12304b}.provider-detail-head p{margin:7px 0 0;color:var(--muted);font-size:14px}
-.provider-step-list{overflow:hidden;border-top:1px solid rgba(210,226,234,.88);border-bottom:1px solid rgba(210,226,234,.88);background:rgba(255,255,255,.46)}.provider-step{display:grid;grid-template-columns:34px minmax(0,1fr) auto;align-items:center;gap:17px;min-height:116px;padding:20px 8px;border-bottom:1px solid rgba(210,226,234,.78)}.provider-step:last-child{border-bottom:0}.provider-step>span{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(103,177,196,.36);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:17px}.provider-step strong{display:block;font-size:15px}.provider-step p{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.45}.provider-primary,.provider-secondary{font:inherit;cursor:pointer}.provider-primary{min-width:142px;padding:0 15px;border:1px solid #12304b;background:#12304b;color:#fff}.provider-primary:hover,.provider-primary:focus-visible{background:#1c4363;outline:0}.provider-secondary{min-width:142px;padding:0 15px;border:1px solid rgba(103,177,196,.48);background:rgba(255,255,255,.82);color:#0f5f80}.provider-secondary:hover,.provider-secondary:focus-visible{background:rgba(223,241,249,.74);outline:0}.provider-primary .ico,.provider-secondary .ico{width:15px;height:15px}.provider-primary[aria-busy="true"],.provider-secondary[aria-busy="true"]{cursor:wait;opacity:.66}
-.provider-connection-head{position:relative}.provider-head-state{display:inline-flex;align-items:center;gap:8px;margin-left:auto;padding:7px 10px;border:1px solid rgba(210,226,234,.9);border-radius:999px;background:rgba(255,255,255,.72);color:var(--muted);font-size:12px;font-weight:720}.provider-head-state i{width:8px;height:8px;border-radius:50%;background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.08)}.provider-head-state[data-ready="true"]{color:var(--live)}.provider-head-state[data-ready="true"] i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.09)}
-.provider-connection-card{overflow:visible;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:rgba(255,255,255,.82);box-shadow:0 16px 38px rgba(54,88,108,.07)}.provider-connection-copy{display:flex;align-items:center;justify-content:space-between;gap:22px;min-height:92px;padding:18px 22px;border-bottom:1px solid rgba(210,226,234,.78)}.provider-connection-copy strong{display:block;color:var(--ink);font-size:17px}.provider-connection-copy p{max-width:630px;margin:5px 0 0;color:var(--muted);font-size:12px;line-height:1.45}.provider-connection-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;flex:0 0 auto}.provider-admin-note{max-width:300px;margin:0;color:var(--muted);font-size:12px;line-height:1.45}
-.provider-checks{display:grid}.provider-check{display:grid;grid-template-columns:42px minmax(0,1fr) auto;align-items:center;gap:14px;min-height:74px;padding:10px 22px;border-bottom:1px solid rgba(210,226,234,.70)}.provider-check-icon{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(210,226,234,.9);border-radius:50%;background:rgba(247,252,253,.86);color:#45647e}.provider-check-icon .ico{width:19px;height:19px}.provider-check-copy strong{display:block;font-size:14px}.provider-check-copy small{display:block;margin-top:3px;overflow:hidden;color:var(--muted);font-size:11px;text-overflow:ellipsis;white-space:nowrap}.provider-check-state{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;font-weight:720}.provider-check-state i{width:8px;height:8px;border-radius:50%;background:var(--stale);box-shadow:0 0 0 4px rgba(178,106,0,.08)}.provider-check[data-state="ready"] .provider-check-icon,.provider-check[data-state="ready"] .provider-check-state{color:var(--live)}.provider-check[data-state="ready"] .provider-check-state i{background:var(--live);box-shadow:0 0 0 4px rgba(37,132,95,.09)}
-.provider-menu{position:relative}.provider-menu>summary{display:grid;place-items:center;width:38px;height:38px;border:1px solid rgba(173,205,220,.68);border-radius:50%;background:rgba(255,255,255,.82);color:#47657e;cursor:pointer;list-style:none}.provider-menu>summary::-webkit-details-marker{display:none}.provider-menu>summary .ico{width:17px;height:17px}.provider-menu>div{position:absolute;z-index:6;right:0;top:46px;min-width:150px;padding:5px;border:1px solid rgba(210,226,234,.94);border-radius:8px;background:#fff;box-shadow:0 14px 34px rgba(45,75,95,.16)}.provider-menu button{width:100%;min-height:36px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:#9a332f;font:inherit;font-size:12px;text-align:left;cursor:pointer}.provider-menu button:hover,.provider-menu button:focus-visible{background:rgba(255,232,229,.72);outline:0}
-.provider-details{border-bottom:1px solid rgba(210,226,234,.76)}.provider-details>summary{display:flex;align-items:center;justify-content:space-between;min-height:58px;padding:0 22px;color:#315d7c;font-size:13px;font-weight:760;cursor:pointer;list-style:none}.provider-details>summary::-webkit-details-marker{display:none}.provider-details>summary .ico{width:17px;height:17px;transition:transform .18s ease}.provider-details[open]>summary .ico{transform:rotate(180deg)}.provider-details form{padding:2px 22px 20px}.provider-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider-fields label{display:grid;gap:6px;color:#526d82;font-size:11px;font-weight:720}.provider-fields select{width:100%;height:40px;padding:0 32px 0 10px;border:1px solid rgba(173,205,220,.72);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px}.provider-details-action{display:flex;align-items:center;gap:12px;margin-top:14px}.provider-details-action span,.provider-action-feedback{color:var(--muted);font-size:11px}.provider-details>p{margin:0;padding:0 22px 18px;color:var(--muted);font-size:11px;line-height:1.45}.provider-action-feedback{min-height:0;margin:0;padding:0 22px}.provider-action-feedback:not(:empty){min-height:40px;padding-top:12px;padding-bottom:12px;color:#8d3430}.provider-details+.provider-action-feedback:not(:empty){border-top:0}
-.provider-help{overflow:hidden;margin-top:20px;border:1px solid rgba(210,226,234,.92);border-radius:8px;background:rgba(255,255,255,.70);box-shadow:0 14px 34px rgba(54,88,108,.05)}.provider-help-toggle{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:72px;padding:14px 24px;color:#12304b;cursor:pointer;list-style:none}.provider-help-toggle::-webkit-details-marker{display:none}.provider-help-toggle>span{display:grid;gap:3px}.provider-help-toggle strong{font-size:13px}.provider-help-toggle small{color:var(--muted);font-size:11px;font-weight:500}.provider-help-toggle .ico{width:18px;height:18px;flex:0 0 auto;color:#315d7c;transition:transform .18s ease}.provider-help[open]>.provider-help-toggle{border-bottom:1px solid rgba(210,226,234,.76)}.provider-help[open]>.provider-help-toggle .ico{transform:rotate(180deg)}.provider-help-body{padding:22px 24px 24px}.provider-help-head{display:grid;gap:7px;max-width:760px}.provider-help-kicker{color:#0f5f80;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.provider-help h2{margin:0;font-family:Georgia,"Times New Roman",serif;color:#12304b;font-size:24px;font-weight:500}.provider-help-head p,.provider-help-step p,.provider-help-finish p{margin:0;color:var(--muted);font-size:12px;line-height:1.55}.provider-help-steps{display:grid;margin:22px 0 0;padding:0;list-style:none}.provider-help-step{display:grid;grid-template-columns:32px minmax(0,1fr);gap:14px;padding:18px 0;border-top:1px solid rgba(210,226,234,.76)}.provider-help-number{display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(103,177,196,.36);border-radius:50%;color:#0f5f80;font-family:Georgia,"Times New Roman",serif;font-size:16px}.provider-help-step h3{margin:4px 0 6px;color:var(--ink);font-size:14px}.provider-help-step ul{display:grid;gap:5px;margin:10px 0 0;padding-left:18px;color:#526d82;font-size:11px;line-height:1.5}.provider-help-links{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-top:12px}.provider-help-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-help-links .ico{width:13px;height:13px}.provider-help-secret-note{color:#8a5b13;font-size:11px;line-height:1.45}.provider-help-finish{padding:16px 18px;border-radius:7px;background:rgba(223,241,249,.48)}.provider-help-finish strong{display:block;margin-bottom:4px;color:#12304b;font-size:13px}
-.provider-guide-language{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-top:14px;padding:10px 12px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(246,250,251,.78)}.provider-guide-language>strong{color:#294761;font-size:11px}.provider-guide-language-options{display:flex;gap:6px}.provider-guide-language button{min-height:30px;padding:0 10px;border:1px solid rgba(173,205,220,.76);border-radius:6px;background:#fff;color:#315d7c;font:inherit;font-size:10px;font-weight:760;cursor:pointer}.provider-guide-language button[aria-pressed="true"]{border-color:#0f5f80;background:rgba(223,241,249,.70);color:#12304b}.provider-guide-language p{flex:1 1 280px;margin:0;color:#526d82;font-size:10px;line-height:1.45}.provider-guide-route-note{padding:10px 12px;border-radius:6px;background:rgba(223,241,249,.44)}.provider-guide-progress{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:22px 0 0;padding:0;list-style:none}.provider-guide-progress button{display:flex;align-items:center;gap:9px;width:100%;min-height:46px;padding:8px 10px;border:1px solid rgba(173,205,220,.66);border-radius:7px;background:rgba(255,255,255,.74);color:#526d82;font:inherit;font-size:11px;font-weight:720;text-align:left;cursor:pointer}.provider-guide-progress button:hover,.provider-guide-progress button:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-progress button[aria-current="step"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-progress i{display:grid;place-items:center;width:24px;height:24px;flex:0 0 auto;border-radius:50%;background:#e5f1f5;color:#315d7c;font-size:13px;font-style:normal}.provider-guide-progress [data-complete="true"] i{background:var(--live);color:#fff}.provider-guide-panel{display:grid;gap:18px;margin-top:18px;padding:22px;border:1px solid rgba(210,226,234,.88);border-radius:8px;background:#fff}.provider-guide-panel[hidden],.provider-guide-platform-panel[hidden]{display:none}.provider-guide-panel-head{display:grid;gap:6px}.provider-guide-panel-head span{color:#0f5f80;font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}.provider-guide-panel h3{margin:0;color:#12304b;font-size:18px}.provider-guide-panel p{margin:0;color:#526d82;font-size:12px;line-height:1.55}.provider-guide-state{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:7px;background:rgba(255,245,224,.64);color:#80560f;font-size:11px;font-weight:720}.provider-guide-state[data-ready="true"]{background:rgba(225,244,235,.72);color:var(--live)}.provider-guide-state i{width:8px;height:8px;border-radius:50%;background:currentColor}.provider-guide-tasks{display:grid;gap:10px;margin:0;padding:0;counter-reset:guide-task;list-style:none}.provider-guide-task{display:grid;grid-template-columns:28px minmax(0,1fr);column-gap:12px;row-gap:5px;min-height:34px;counter-increment:guide-task}.provider-guide-task::before{content:counter(guide-task);display:grid;grid-column:1;grid-row:1;place-items:center;width:26px;height:26px;border:1px solid rgba(103,177,196,.38);border-radius:50%;color:#0f5f80;font-size:13px}.provider-guide-task>*{grid-column:2}.provider-guide-task strong{color:var(--ink);font-size:12px}.provider-guide-task p{font-size:11px}.provider-guide-task a{color:#0f5f80;font-weight:720;text-underline-offset:3px}.provider-step>span,.provider-help-number,.provider-guide-progress i,.provider-guide-task::before{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums;line-height:1}.provider-guide-secret{padding:12px 14px;border-left:3px solid #d89a2f;border-radius:4px;background:rgba(255,245,224,.58);color:#71501a;font-size:11px;line-height:1.5}.provider-guide-platforms{display:flex;flex-wrap:wrap;gap:8px}.provider-guide-platforms button{min-height:36px;padding:0 13px;border:1px solid rgba(173,205,220,.76);border-radius:7px;background:#fff;color:#315d7c;font:inherit;font-size:11px;font-weight:720;cursor:pointer}.provider-guide-platforms button[aria-pressed="true"]{border-color:#0f5f80;background:rgba(223,241,249,.62);color:#12304b}.provider-guide-platform-panel{display:grid;gap:14px;padding:16px;border-radius:7px;background:rgba(246,250,251,.92)}.provider-guide-command{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin-top:6px}.provider-guide-command code{display:block;overflow-x:auto;padding:10px 12px;border:1px solid rgba(210,226,234,.92);border-radius:6px;background:#f4f8fa;color:#18354c;font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word}.provider-guide-copy{min-height:34px;padding:0 11px;border:1px solid rgba(173,205,220,.76);border-radius:6px;background:#fff;color:#0f5f80;font:inherit;font-size:10px;font-weight:760;cursor:pointer}.provider-guide-copy:hover,.provider-guide-copy:focus-visible{border-color:#67b1c4;outline:0}.provider-guide-copy-status{min-height:18px;color:var(--live);font-size:10px}.provider-guide-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding-top:4px}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:auto}.provider-guide-links{display:flex;align-items:center;flex-wrap:wrap;gap:14px}.provider-guide-links a{display:inline-flex;align-items:center;gap:5px;color:#0f5f80;font-size:11px;font-weight:720;text-underline-offset:3px}.provider-guide-links .ico{width:13px;height:13px}.provider-guide-finish{display:grid;gap:8px;padding:14px 16px;border-radius:7px;background:rgba(223,241,249,.48)}
-.provider-guide-screen-help{display:grid;gap:10px;margin-top:7px;padding:14px 16px;border:1px solid rgba(103,177,196,.34);border-radius:7px;background:rgba(246,250,251,.92)}.provider-guide-screen-help>strong{color:#12304b;font-size:12px}.provider-guide-screen-help ol{display:grid;gap:8px;margin:0;padding-left:20px;color:#526d82;font-size:11px;line-height:1.55}.provider-guide-screen-help code{padding:1px 4px;border-radius:3px;background:#e8f1f4;color:#18354c}.provider-guide-ready-check{padding:11px 13px;border-left:3px solid var(--live);border-radius:4px;background:rgba(225,244,235,.58);color:#286c53;font-size:11px;line-height:1.5}.provider-guide-actions .provider-primary:disabled{cursor:not-allowed;border-color:rgba(210,226,234,.88);background:rgba(238,244,247,.88);color:#93a1ad;box-shadow:none}
-@media (max-width:760px){.provider-row{grid-template-columns:42px minmax(0,1fr) auto;gap:10px;min-height:112px;padding:14px}.provider-mark{width:36px;height:36px}.provider-mark .ico{width:23px;height:23px}.provider-copy{grid-column:2/4}.provider-capability{grid-column:2}.provider-state{grid-column:2}.provider-action,.provider-action-muted{grid-column:3;grid-row:3;align-self:center}.provider-detail-head{align-items:flex-start}.provider-detail-head h1{font-size:27px}.provider-head-state{margin-top:8px}.provider-step{grid-template-columns:30px minmax(0,1fr);padding:18px 4px}.provider-step .provider-primary,.provider-step .provider-secondary{grid-column:2;width:100%;margin-top:4px}.provider-connection-copy{align-items:stretch;flex-direction:column;padding:18px}.provider-connection-actions{justify-content:stretch;flex-wrap:wrap}.provider-connection-actions>.provider-primary,.provider-connection-actions>.provider-secondary{flex:1 1 150px}.provider-check{grid-template-columns:38px minmax(0,1fr);padding:10px 18px}.provider-check-state{grid-column:2;justify-self:start}.provider-check-copy small{white-space:normal}.provider-fields{grid-template-columns:1fr}.provider-details form,.provider-details>p{padding-left:18px;padding-right:18px}.provider-help-toggle{padding:13px 18px}.provider-help-body{padding:20px 18px}.provider-help-step{grid-template-columns:30px minmax(0,1fr);gap:11px}.provider-primary,.provider-secondary{width:100%}.assistant-provider-readiness{grid-template-columns:10px minmax(0,1fr)}.assistant-provider-readiness a{grid-column:2;justify-self:start}}
-@media (max-width:760px){.provider-guide-progress{grid-template-columns:1fr}.provider-guide-panel{padding:18px 14px}.provider-guide-command{grid-template-columns:1fr}.provider-guide-copy{justify-self:start}.provider-guide-actions{align-items:stretch;flex-direction:column}.provider-guide-actions .provider-primary,.provider-guide-actions .provider-secondary{width:100%}}
-@media (prefers-reduced-motion:reduce){.sidebar-motion{display:none}.beat-current,.beat[data-flash="true"] .beat-hit,.host-workflow-step[data-step-state="running"] .host-workflow-marker:before,.asof[data-refresh-state="syncing"]:before{animation:none}}
-</style></head><body><div class="app-shell">"#;
-
-const FOOT: &str = r#"</div><script>
-const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awaiting'};
-const HISTORY_DOTS=12;
-const EXPECT_X=64;
-const STALE_X=82;
-const HISTORY_STEP=EXPECT_X/HISTORY_DOTS;
-const SIGNAL_WINDOWS=[{key:'10m',label:'10m',secs:10*60},{key:'1h',label:'1h',secs:60*60},{key:'24h',label:'24h',secs:24*60*60}];
-let signalWindow=SIGNAL_WINDOWS[0];
-let activeSearch='';
-let activeLiveFilter='all';
-function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
-function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
-const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
-function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
-function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(name+'='))?.split('=').slice(1).join('=')||''}
-function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
-function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host-surface="runtime"]')).filter(el=>el.dataset.host===name)}
-let openHostActionsRoot=null;
-let hostActionContext=null;
-let hostActionReturnFocus=null;
-const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:''};
-function setHostActionPollSuspended(suspended){
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  if(overlay)overlay.dataset.suspended=suspended?'true':'false';
-}
-function pauseHostActionPoll(){
-  if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
-  hostActionPoll.timer=null;
-  hostActionPoll.controller?.abort();
-  hostActionPoll.controller=null;
-  setHostActionPollSuspended(true);
-}
-function stopHostActionPoll(){
-  pauseHostActionPoll();
-  hostActionPoll.id=null;
-  hostActionPoll.failures=0;
-  hostActionPoll.lastRevision='';
-}
-function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
-function closeHostActions(root=openHostActionsRoot,restore=false){
-  if(!root)return;
-  const trigger=root.querySelector('[data-host-actions-trigger]');
-  const menu=root.querySelector('[data-host-actions-menu]');
-  if(menu){menu.hidden=true;menu.style.removeProperty('left');menu.style.removeProperty('top')}
-  if(trigger)trigger.setAttribute('aria-expanded','false');
-  if(openHostActionsRoot===root)openHostActionsRoot=null;
-  if(restore)trigger?.focus();
-}
-function positionHostActions(root){
-  const trigger=root.querySelector('[data-host-actions-trigger]');
-  const menu=root.querySelector('[data-host-actions-menu]');
-  if(!trigger||!menu||menu.hidden)return;
-  const anchor=trigger.getBoundingClientRect();
-  const box=menu.getBoundingClientRect();
-  const margin=12;
-  const left=Math.max(margin,Math.min(window.innerWidth-box.width-margin,anchor.right-box.width));
-  const below=anchor.bottom+7;
-  const above=anchor.top-box.height-7;
-  const top=below+box.height<=window.innerHeight-margin?below:Math.max(margin,above);
-  menu.style.left=left+'px';
-  menu.style.top=top+'px';
-}
-function openHostActions(root){
-  if(openHostActionsRoot&&openHostActionsRoot!==root)closeHostActions(openHostActionsRoot);
-  const trigger=root.querySelector('[data-host-actions-trigger]');
-  const menu=root.querySelector('[data-host-actions-menu]');
-  if(!trigger||!menu)return;
-  const opening=menu.hidden;
-  if(!opening){closeHostActions(root,true);return}
-  menu.hidden=false;
-  trigger.setAttribute('aria-expanded','true');
-  openHostActionsRoot=root;
-  positionHostActions(root);
-  visibleHostActionItems(menu)[0]?.focus();
-}
-function setHostActionFact(name,value,visible=true){
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  const row=overlay?.querySelector('[data-host-action-fact-row="'+name+'"]');
-  const target=overlay?.querySelector('[data-host-action-fact="'+name+'"]');
-  if(row)row.hidden=!visible;
-  if(target)target.textContent=value||'not reported';
-}
-function hostActionTechnicalText(root){
-  const surface=root.closest('[data-host-surface="runtime"]');
-  const live=surface?.dataset.live||'unknown';
-  const kernel=root.dataset.kernelState==='reboot_required'
-    ? root.dataset.kernelRunning+' running; '+root.dataset.kernelExpected+' expected'
-    : root.dataset.kernelState.replaceAll('_',' ');
-  return [
-    'Host: '+root.dataset.host,
-    'Role: '+root.dataset.role,
-    'System: '+(root.dataset.isNix==='true'?'Nix':'non-Nix'),
-    'Live state: '+live.replaceAll('_',' '),
-    'Declared: '+(root.dataset.declared==='true'?'yes':'no'),
-    'Privileged actions: '+(root.dataset.janusReady==='true'?'Janus guarded':'not prepared'),
-    'Settings: '+root.dataset.settingsState.replaceAll('_',' '),
-    'Backup: '+root.dataset.backupLabel,
-    'Kernel: '+kernel
-  ].join('\n');
-}
-function closeHostActionDialog(restore=true){
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  if(!overlay)return;
-  stopHostActionPoll();
-  if(overlay.hidden)return;
-  overlay.hidden=true;
-  document.body.removeAttribute('data-host-action-dialog-open');
-  resumeBeatClock();
-  resumeRefresh('dialog-close');
-  const input=overlay.querySelector('[data-host-remove-input]');
-  if(input)input.value='';
-  const disposition=overlay.querySelector('[data-host-remove-disposition]');
-  if(disposition)disposition.value='';
-  const successor=overlay.querySelector('[data-host-remove-successor-input]');
-  if(successor)successor.value='';
-  const attended=overlay.querySelector('[data-host-attended-input]');
-  if(attended)attended.checked=false;
-  hostActionContext=null;
-  if(restore)hostActionReturnFocus?.focus();
-  hostActionReturnFocus=null;
-}
-function openHostActionDialog(action,root,returnFocus){
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  const dialog=overlay?.querySelector('[data-host-action-dialog]');
-  if(!overlay||!dialog)return;
-  stopHostActionPoll();
-  closeHostActions(root);
-  hostActionContext={action,root,host:root.dataset.host};
-  hostActionReturnFocus=returnFocus||root.querySelector('[data-host-actions-trigger]');
-  dialog.dataset.action=action;
-  dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{icon.hidden=icon.dataset.actionIcon!==action});
-  const title=dialog.querySelector('[data-host-action-title]');
-  const copy=dialog.querySelector('[data-host-action-copy]');
-  const infoTitle=dialog.querySelector('[data-host-action-info-title]');
-  const infoCopy=dialog.querySelector('[data-host-action-info-copy]');
-  const primary=dialog.querySelector('[data-host-action-primary]');
-  const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
-  const cancelRequest=dialog.querySelector('[data-host-action-cancel]');
-  const confirm=dialog.querySelector('[data-host-remove-confirm]');
-  const removeName=dialog.querySelector('[data-host-remove-name]');
-  const input=dialog.querySelector('[data-host-remove-input]');
-  const dispositionField=dialog.querySelector('[data-host-remove-disposition-field]');
-  const disposition=dialog.querySelector('[data-host-remove-disposition]');
-  const successorField=dialog.querySelector('[data-host-remove-successor]');
-  const successorInput=dialog.querySelector('[data-host-remove-successor-input]');
-  const attendedConfirm=dialog.querySelector('[data-host-attended-confirm]');
-  const attendedInput=dialog.querySelector('[data-host-attended-input]');
-  const technical=dialog.querySelector('[data-host-action-technical]');
-  const facts=dialog.querySelector('[data-host-action-facts]');
-  const workflow=dialog.querySelector('[data-host-workflow]');
-  const status=dialog.querySelector('[data-host-action-status]');
-  dialog.dataset.workflow='false';
-  if(status)status.textContent='';
-  if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
-  if(cancel)cancel.textContent='Cancel';
-  if(cancelRequest){cancelRequest.hidden=true;cancelRequest.disabled=false}
-  if(confirm)confirm.hidden=true;
-  if(dispositionField)dispositionField.hidden=true;
-  if(successorField)successorField.hidden=true;
-  if(attendedConfirm)attendedConfirm.hidden=true;
-  if(input)input.value='';
-  if(disposition)disposition.value='';
-  if(successorInput)successorInput.value='';
-  if(attendedInput)attendedInput.checked=false;
-  if(technical)technical.hidden=true;
-  if(workflow){workflow.hidden=true;workflow.replaceChildren()}
-  if(facts)facts.hidden=false;
-  setHostActionFact('host',root.dataset.host,true);
-  setHostActionFact('state',(root.closest('[data-host-surface="runtime"]')?.dataset.live||'unknown').replaceAll('_',' '),true);
-  setHostActionFact('backup',root.dataset.backupLabel,true);
-  setHostActionFact('kernel',root.dataset.kernelState==='reboot_required'?root.dataset.kernelRunning+' → '+root.dataset.kernelExpected:root.dataset.kernelState.replaceAll('_',' '),true);
-  if(action==='system-update'){
-    title.textContent='Check for system updates';
-    copy.textContent='Prepare an isolated nixcfg proposal and validate every configured host. Nothing is merged or deployed.';
-    infoTitle.textContent='Fleet-wide review';
-    infoCopy.textContent='A shared flake update can affect every Nix host, even when launched from '+root.dataset.host+'.';
-    setHostActionFact('scope','all configured Nix hosts',true);
-    primary.textContent='Create update review';
-  }else if(action==='update-restart'){
-    title.textContent='Apply update and restart '+root.dataset.host;
-    copy.textContent='First prepare a target-local review. The final switch remains blocked until backup, validation, Janus authorization, and attended confirmation pass.';
-    infoTitle.textContent='No immediate restart';
-    infoCopy.textContent='This step only prepares the guarded plan. You confirm again immediately before any live change.';
-    setHostActionFact('scope',root.dataset.host+' only',true);
-    primary.textContent='Prepare guarded review';
-  }else if(action==='technical'){
-    title.textContent=root.dataset.host+' technical details';
-    copy.textContent='Sanitized runtime and declaration facts used by Pharos. Credentials, store paths, and opaque identifiers are excluded.';
-    infoTitle.textContent='Safe details only';
-    infoCopy.textContent='These values are observational and do not grant access to the host.';
-    setHostActionFact('scope','',false);
-    if(facts)facts.hidden=true;
-    if(technical){technical.hidden=false;technical.textContent=hostActionTechnicalText(root)}
-    if(primary)primary.hidden=true;
-    if(cancel)cancel.textContent='Close';
-  }else if(action==='workflow'){
-    title.textContent=root.dataset.host+' workflow';
-    copy.textContent='Loading the saved execution checklist...';
-    if(infoTitle)infoTitle.textContent='Saved workflow';
-    if(infoCopy)infoCopy.textContent='The current state comes from the persisted server record.';
-    if(primary)primary.hidden=true;
-    if(cancel)cancel.textContent='Close';
-  }else if(action==='remove'){
-    if(root.dataset.retired==='true'){
-      title.textContent='Removal pending for '+root.dataset.host;
-      copy.textContent='Pharos has revoked this host’s reporting access. The server and its data remain untouched while declarative cleanup is reviewed and applied.';
-      infoTitle.textContent='Beacon access revoked';
-      infoCopy.textContent='The host remains visible so this unfinished removal cannot be mistaken for completion.';
-      const dispositionLabel={destroyed:'Host no longer exists',unmanaged:'Host remains unmanaged',rebuilt:'Replaced by '+root.dataset.retirementSuccessor}[root.dataset.retirementDisposition]||'Lifecycle recorded';
-      setHostActionFact('scope',dispositionLabel+' · waiting for nixcfg removal',true);
-      if(primary)primary.hidden=true;
-      if(cancel)cancel.textContent='Close';
-      if(status)status.textContent='Removal is still pending.';
-    }else{
-    title.textContent='Remove '+root.dataset.host+' from Pharos?';
-    copy.textContent='Pharos will stop managing and accepting reports from this host. The server, disks, services, and application data stay untouched.';
-    const needsCleanup=root.dataset.declared==='true';
-    infoTitle.textContent=needsCleanup?'Nix cleanup review required':'Runtime-only removal';
-    infoCopy.textContent=needsCleanup
-      ?'A nixcfg proposal must remove the declaration. Until it is applied, Pharos keeps the removal visibly pending.'
-      :'The runtime registration and beacon access will be revoked after confirmation.';
-    setHostActionFact('scope',needsCleanup?'Pharos registration + nixcfg review':'Pharos registration only',true);
-    if(dispositionField)dispositionField.hidden=false;
-    if(confirm)confirm.hidden=false;
-    if(removeName)removeName.textContent=root.dataset.host;
-    if(primary){primary.textContent='Remove host';primary.classList.add('danger');primary.disabled=true}
-    }
-  }
-  overlay.hidden=false;
-  document.body.dataset.hostActionDialogOpen='true';
-  stopBeatClock();
-  scheduleRefresh(DIALOG_REFRESH_MS);
-  requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
-  const storedKind=root.dataset.actionKind;
-  const storedMatches=action==='workflow'
-    ||(action==='update-restart'&&storedKind==='update_restart');
-  if(action!=='technical'&&root.dataset.actionJobId&&storedMatches)pollHostActionJob(root.dataset.actionJobId,true);
-}
-async function requestHostAction(path,body){
-  const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},body:JSON.stringify(body||{})});
-  const payload=await response.json().catch(()=>({}));
-  if(!response.ok&&!payload.job)throw new Error(payload.error||payload.message||'The guarded action could not be requested.');
-  return payload;
-}
-function hostActionStateLabel(state){
-  return ({proposal_requested:'review requested',queued_review:'review queued',reviewing:'reviewing on host',awaiting_confirmation:'ready for confirmation',queued_apply:'confirmed',applying:'applying on host',rebooting:'restarting and verifying',removal_pending:'removal pending',succeeded:'completed',failed:'failed',cancelled:'cancelled safely'})[state]||String(state||'recorded').replaceAll('_',' ');
-}
-function updateHostRemovalForm(){
-  if(hostActionContext?.action!=='remove')return;
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  const disposition=overlay?.querySelector('[data-host-remove-disposition]')?.value||'';
-  const successorField=overlay?.querySelector('[data-host-remove-successor]');
-  const successor=overlay?.querySelector('[data-host-remove-successor-input]');
-  const infoTitle=overlay?.querySelector('[data-host-action-info-title]');
-  const infoCopy=overlay?.querySelector('[data-host-action-info-copy]');
-  const primary=overlay?.querySelector('[data-host-action-primary]');
-  const rebuilt=disposition==='rebuilt';
-  if(successorField)successorField.hidden=!rebuilt;
-  if(!rebuilt&&successor)successor.value='';
-  const copy={
-    destroyed:['Host no longer exists','Pharos stops monitoring it and keeps a retirement record. The server provider and any disks are never touched.'],
-    unmanaged:['Host still exists','Pharos stops monitoring and managing it. The machine, services, disks, and application data remain unchanged.'],
-    rebuilt:['Host was replaced','The old record is retired and linked to an already onboarded successor. Nothing is deleted from either machine.']
-  }[disposition];
-  if(copy&&infoTitle)infoTitle.textContent=copy[0];
-  if(copy&&infoCopy)infoCopy.textContent=copy[1];
-  if(primary)primary.disabled=!hostActionConfirmationReady();
-}
-function hostActionConfirmationReady(){
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  const input=overlay?.querySelector('[data-host-remove-input]');
-  if(hostActionContext?.action==='remove'){
-    const disposition=overlay?.querySelector('[data-host-remove-disposition]')?.value||'';
-    const successor=(overlay?.querySelector('[data-host-remove-successor-input]')?.value||'').trim();
-    return input?.value===hostActionContext.host
-      &&['destroyed','unmanaged','rebuilt'].includes(disposition)
-      &&(disposition!=='rebuilt'||(successor.length>0&&successor!==hostActionContext.host));
-  }
-  const attended=overlay?.querySelector('[data-host-attended-input]');
-  return input?.value===hostActionContext?.host&&attended?.checked===true;
-}
-function scheduleHostActionPoll(id,delay=2000){
-  if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
-  hostActionPoll.timer=null;
-  hostActionPoll.id=id;
-  const suspended=document.hidden||!navigator.onLine||!hostActionContext;
-  setHostActionPollSuspended(suspended);
-  if(suspended)return;
-  hostActionPoll.timer=setTimeout(()=>{
-    hostActionPoll.timer=null;
-    pollHostActionJob(id,false);
-  },delay);
-}
-function hostActionPollDelay(job){
-  const kind=job?.workflow?.kind;
-  if(kind==='settings_change'||kind==='remove_host')return 10000;
-  return job?.state==='rebooting'?5000:2000;
-}
-function renderHostActionJob(job,message,workflowHtml){
-  if(!hostActionContext||!job)return;
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  const dialog=overlay?.querySelector('[data-host-action-dialog]');
-  const primary=overlay?.querySelector('[data-host-action-primary]');
-  const cancel=overlay?.querySelector('.host-action-dialog-buttons [data-host-action-close]');
-  const cancelRequest=overlay?.querySelector('[data-host-action-cancel]');
-  const status=overlay?.querySelector('[data-host-action-status]');
-  const copy=overlay?.querySelector('[data-host-action-copy]');
-  const title=overlay?.querySelector('[data-host-action-title]');
-  const info=overlay?.querySelector('[data-host-action-info]');
-  const facts=overlay?.querySelector('[data-host-action-facts]');
-  const workflowRoot=overlay?.querySelector('[data-host-workflow]');
-  const safeNote=overlay?.querySelector('[data-host-action-safe-note]');
-  const confirm=overlay?.querySelector('[data-host-remove-confirm]');
-  const removeName=overlay?.querySelector('[data-host-remove-name]');
-  const attended=overlay?.querySelector('[data-host-attended-confirm]');
-  const workflow=job.workflow||{};
-  const workflowKind=String(workflow.kind||job.kind||'');
-  const primaryAction=workflow.primary_action||null;
-  hostActionContext.jobId=job.id;
-  hostActionContext.action=workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':workflowKind==='system_update_proposal'?'system-update':'workflow';
-  hostActionContext.root.dataset.actionJobId=job.id;
-  hostActionContext.root.dataset.actionKind=workflowKind;
-  hostActionContext.root.dataset.actionState=job.state;
-  hostActionPoll.lastRevision=[job.id,job.state,job.updated_at].join(':');
-  if(dialog){dialog.dataset.workflow='true';dialog.dataset.action=workflowKind.replaceAll('_','-')}
-  dialog?.querySelectorAll('[data-action-icon]').forEach(icon=>{
-    const iconKind=workflowKind==='settings_change'?'settings-change':workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':'system-update';
-    icon.hidden=icon.dataset.actionIcon!==iconKind;
-  });
-  if(title)title.textContent=workflow.title||hostActionContext.host+' workflow';
-  if(copy)copy.textContent=workflow.guidance||message||hostActionStateLabel(job.state)+'.';
-  if(info)info.hidden=true;
-  if(facts)facts.hidden=true;
-  if(workflowRoot){workflowRoot.hidden=false;workflowRoot.innerHTML=workflowHtml||''}
-  if(safeNote)safeNote.textContent='Persisted and reviewable';
-  if(status)status.textContent=message||'';
-  if(cancel)cancel.textContent='Close';
-  if(cancelRequest){cancelRequest.hidden=workflow.can_cancel!==true;cancelRequest.disabled=false}
-  if(confirm)confirm.hidden=primaryAction?.kind!=='confirm';
-  if(attended)attended.hidden=primaryAction?.kind!=='confirm';
-  if(removeName)removeName.textContent=hostActionContext.host;
-  hostActionContext.stage=primaryAction?.kind||'observe';
-  if(primaryAction&&primary){
-    primary.hidden=false;
-    primary.classList.remove('danger');
-    primary.textContent=primaryAction.label||'Continue';
-    primary.disabled=primaryAction.kind==='confirm'?!hostActionConfirmationReady():false;
-  }else if(primary){
-    primary.hidden=true;
-  }
-  const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
-    ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
-    ||(workflowKind==='remove_host'&&job.state==='removal_pending');
-  if(active)scheduleHostActionPoll(job.id,hostActionPollDelay(job));
-}
-async function pollHostActionJob(id,immediate=false){
-  if(!hostActionContext||hostActionContext.jobId&&hostActionContext.jobId!==id)return;
-  hostActionPoll.timer=null;
-  if(document.hidden||!navigator.onLine){hostActionPoll.id=id;setHostActionPollSuspended(true);return}
-  setHostActionPollSuspended(false);
-  hostActionPoll.controller?.abort();
-  const controller=new AbortController();
-  hostActionPoll.controller=controller;
-  try{
-    const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{credentials:'same-origin',cache:'no-store',signal:controller.signal});
-    const payload=await response.json().catch(()=>({}));
-    if(!response.ok)throw new Error(payload.error||'Could not refresh guarded action state.');
-    hostActionPoll.failures=0;
-    const revision=[payload.job?.id,payload.job?.state,payload.job?.updated_at].join(':');
-    if(immediate||revision!==hostActionPoll.lastRevision)renderHostActionJob(payload.job,payload.message,payload.workflow_html);
-    else scheduleHostActionPoll(id,hostActionPollDelay(payload.job));
-  }catch(error){
-    if(error?.name==='AbortError')return;
-    const status=document.querySelector('[data-host-action-status]');
-    if(status)status.textContent=error instanceof Error?error.message:'Could not refresh guarded action state.';
-    hostActionPoll.failures=Math.min(hostActionPoll.failures+1,4);
-    scheduleHostActionPoll(id,Math.min(30000,3000*(2**hostActionPoll.failures)));
-  }finally{
-    if(hostActionPoll.controller===controller)hostActionPoll.controller=null;
-  }
-}
-async function submitHostAction(){
-  if(!hostActionContext)return;
-  const {action,root,host}=hostActionContext;
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  const primary=overlay?.querySelector('[data-host-action-primary]');
-  const status=overlay?.querySelector('[data-host-action-status]');
-  if(!primary||!status)return;
-  primary.disabled=true;
-  status.textContent=action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
-    :action==='remove'?'Recording retirement and revoking reports…'
-    :hostActionContext.stage==='recover'?'Queueing target-local recovery checks…'
-    :hostActionContext.stage==='confirm'?'Recording attended confirmation…'
-    :'Requesting a guarded review…';
-  try{
-    let result;
-    if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
-    else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
-    else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
-    else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
-    else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
-    else if(action==='remove'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry-retirement',{});
-    else if(action==='remove'){
-      const disposition=overlay.querySelector('[data-host-remove-disposition]')?.value||'';
-      const successor=(overlay.querySelector('[data-host-remove-successor-input]')?.value||'').trim();
-      result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/remove',{confirmation:host,disposition,successor:successor||null});
-    }
-    else return;
-    status.textContent=result.message||'Request recorded.';
-    if(result?.job)renderHostActionJob(result.job,result.message,result.workflow_html);
-    else primary.hidden=true;
-  }catch(error){
-    status.textContent=error instanceof Error?error.message:'The guarded action could not be requested.';
-    primary.disabled=false;
-  }
-}
-async function submitHostActionCancellation(){
-  if(!hostActionContext?.jobId)return;
-  const overlay=document.querySelector('[data-host-action-overlay]');
-  const button=overlay?.querySelector('[data-host-action-cancel]');
-  const status=overlay?.querySelector('[data-host-action-status]');
-  if(!button||!status)return;
-  button.disabled=true;
-  status.textContent='Cancelling before any live change…';
-  try{
-    const result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/cancel',{});
-    renderHostActionJob(result.job,result.message,result.workflow_html);
-  }catch(error){
-    status.textContent=error instanceof Error?error.message:'The safe cancellation could not be recorded.';
-    button.disabled=false;
-  }
-}
-function updateHostActionState(surface,host,backup){
-  const root=surface.querySelector('[data-host-actions]');
-  if(!root)return;
-  const state=String(host.preferences_state||'applied');
-  const kernel=host.kernel||{};
-  const kernelState=String(kernel.state||'unknown');
-  const commitsBehind=Number(host.freshness?.commits_behind||0);
-  const canManage=root.dataset.canManage==='true';
-  const systemUpdateAvailable=root.dataset.systemUpdateAvailable==='true';
-  const hostRemovalAvailable=root.dataset.hostRemovalAvailable==='true';
-  const job=host.host_action||null;
-  const workflow=job?.workflow||null;
-  const retirement=host.retirement||null;
-  root.dataset.settingsState=state;
-  root.dataset.kernelState=kernelState;
-  root.dataset.kernelRunning=String(kernel.running_version||'not reported');
-  root.dataset.kernelExpected=String(kernel.expected_version||'not reported');
-  root.dataset.retired=retirement?.pending===true?'true':'false';
-  root.dataset.retirementDisposition=String(retirement?.disposition||'');
-  root.dataset.retirementSuccessor=String(retirement?.successor||'');
-  if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(workflow?.kind||job.kind||'');root.dataset.actionState=String(job.state||'')}
-  else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
-  if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
-  const review=root.querySelector('[data-host-action="review-pending"]');
-  const update=root.querySelector('[data-host-action="system-update"]');
-  const restart=root.querySelector('[data-host-action="update-restart"]');
-  const remove=root.querySelector('[data-host-action="remove"]');
-  const primarySeparator=root.querySelector('[data-primary-separator]');
-  const removeSeparator=root.querySelector('[data-remove-separator]');
-  if(review)review.hidden=state==='applied';
-  const updateJobActive=workflow?.kind==='update_restart'&&!['succeeded','cancelled'].includes(job.state);
-  const updatePending=kernelState==='reboot_required'||commitsBehind>0;
-  root.dataset.updatePending=updatePending?'true':'false';
-  const retired=retirement?.pending===true;
-  const removalReady=root.dataset.declared!=='true'||hostRemovalAvailable;
-  if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
-  if(restart){
-    restart.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&(updatePending||updateJobActive));
-    const strong=restart.querySelector('strong');
-    if(strong)strong.textContent=updateJobActive?'Continue update workflow':'Apply update and restart';
-  }
-  if(remove)remove.hidden=!removalReady||!canManage||retired;
-  if(primarySeparator)primarySeparator.hidden=[review,update,restart].every(item=>!item||item.hidden);
-  if(removeSeparator)removeSeparator.hidden=!removalReady||!canManage||retired;
-  const note=surface.querySelector('[data-host-action-note]');
-  const noteCopy=note?.querySelector('[data-host-action-note-copy]');
-  if(note){
-    const show=retired||(job&&!['succeeded','cancelled'].includes(job.state));
-    note.hidden=!show;
-    note.dataset.actionLevel=retired?'warning':String(workflow?.status_level||'warning');
-    if(noteCopy)noteCopy.textContent=retired?'removal pending':String(workflow?.status_label||hostActionStateLabel(job?.state));
-  }
-  const dot=root.querySelector('[data-host-action-dot]');
-  if(dot)dot.hidden=state==='applied'&&kernelState!=='reboot_required'&&!retired&&!(job&&!['succeeded','cancelled'].includes(job.state));
-  if(openHostActionsRoot===root)positionHostActions(root);
-}
-function initHostActions(){
-  document.addEventListener('click',event=>{
-    const trigger=event.target.closest('[data-host-actions-trigger]');
-    if(trigger){event.preventDefault();openHostActions(trigger.closest('[data-host-actions]'));return}
-    const actionNote=event.target.closest('[data-host-action-note]');
-    if(actionNote){
-      event.preventDefault();
-      const surface=actionNote.closest('[data-host-surface="runtime"]');
-      const root=surface?.querySelector('[data-host-actions]');
-      if(root){
-        const kind=root.dataset.actionKind;
-        const action=kind==='update_restart'?'update-restart':'workflow';
-        openHostActionDialog(action,root,actionNote);
-      }
-      return;
-    }
-    const actionItem=event.target.closest('[data-host-action]');
-    if(actionItem&&actionItem.closest('[data-host-actions-menu]')&&!actionItem.matches('a')){
-      event.preventDefault();
-      const root=actionItem.closest('[data-host-actions]');
-      openHostActionDialog(actionItem.dataset.hostAction,root,actionItem);
-      return;
-    }
-    if(event.target.closest('[data-host-action-close]')){event.preventDefault();closeHostActionDialog();return}
-    if(openHostActionsRoot&&!event.target.closest('[data-host-actions]'))closeHostActions(openHostActionsRoot);
-  });
-  document.addEventListener('keydown',event=>{
-    const overlay=document.querySelector('[data-host-action-overlay]');
-    if(overlay&&!overlay.hidden){
-      if(event.key==='Escape'){event.preventDefault();closeHostActionDialog();return}
-      if(event.key==='Tab'){
-        const focusable=Array.from(overlay.querySelectorAll('button:not([hidden]):not(:disabled),input:not([hidden]):not(:disabled),select:not([hidden]):not(:disabled)')).filter(el=>el.offsetParent!==null);
-        if(focusable.length){const first=focusable[0],last=focusable[focusable.length-1];if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}}
-      }
-      return;
-    }
-    if(!openHostActionsRoot)return;
-    const menu=openHostActionsRoot.querySelector('[data-host-actions-menu]');
-    const items=visibleHostActionItems(menu);
-    const index=items.indexOf(document.activeElement);
-    if(event.key==='Escape'){event.preventDefault();closeHostActions(openHostActionsRoot,true)}
-    else if(event.key==='ArrowDown'){event.preventDefault();items[(index+1+items.length)%items.length]?.focus()}
-    else if(event.key==='ArrowUp'){event.preventDefault();items[(index-1+items.length)%items.length]?.focus()}
-    else if(event.key==='Home'){event.preventDefault();items[0]?.focus()}
-    else if(event.key==='End'){event.preventDefault();items[items.length-1]?.focus()}
-    else if(event.key==='Tab')closeHostActions(openHostActionsRoot);
-  });
-  document.querySelector('[data-host-remove-input]')?.addEventListener('input',event=>{
-    const primary=document.querySelector('[data-host-action-primary]');
-    if(!primary||!hostActionContext)return;
-    if(hostActionContext.action==='remove')primary.disabled=!hostActionConfirmationReady();
-    else if(hostActionContext.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
-  });
-  document.querySelector('[data-host-remove-disposition]')?.addEventListener('change',updateHostRemovalForm);
-  document.querySelector('[data-host-remove-successor-input]')?.addEventListener('input',updateHostRemovalForm);
-  document.querySelector('[data-host-attended-input]')?.addEventListener('change',()=>{
-    const primary=document.querySelector('[data-host-action-primary]');
-    if(primary&&hostActionContext?.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
-  });
-  document.querySelector('[data-host-action-cancel]')?.addEventListener('click',submitHostActionCancellation);
-  document.querySelector('[data-host-action-primary]')?.addEventListener('click',submitHostAction);
-  document.addEventListener('visibilitychange',()=>{
-    if(document.hidden){pauseHostActionPoll();return}
-    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
-  });
-  window.addEventListener('focus',()=>{
-    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
-  });
-  window.addEventListener('online',()=>{
-    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
-  });
-  window.addEventListener('offline',()=>{
-    pauseHostActionPoll();
-    const status=document.querySelector('[data-host-action-status]');
-    if(status&&hostActionContext)status.textContent='Offline. The saved workflow will refresh when connectivity returns.';
-  });
-  window.addEventListener('pagehide',stopHostActionPoll);
-  window.addEventListener('resize',()=>closeHostActions(openHostActionsRoot));
-  window.addEventListener('scroll',()=>closeHostActions(openHostActionsRoot),true);
-}
-function openRequestedWorkflow(){
-  const params=new URLSearchParams(location.search);
-  const host=(params.get('host')||'').trim();
-  const workflowId=(params.get('workflow')||'').trim();
-  if(!/^[a-z0-9-]{1,63}$/.test(host)||!/^[A-Za-z0-9_-]{8,128}$/.test(workflowId))return;
-  const surfaces=hostSurfaces(host);
-  const surface=surfaces.find(item=>item.offsetParent!==null)||surfaces[0];
-  const root=surface?.querySelector('[data-host-actions]');
-  if(!root)return;
-  root.dataset.actionJobId=workflowId;
-  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));
-}
-function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
-function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
-function historyWindowMeta(samples,windowDef){
-  if(samples.length<2)return {start:0,latest:0,span:1,candidates:[]};
-  const latest=samples[samples.length-1];
-  const start=Math.max(latest-windowDef.secs,samples[0]);
-  const span=Math.max(1,latest-start);
-  const candidates=samples.map((stamp,index)=>({stamp,index})).filter(item=>item.index>0&&item.stamp>=start&&item.stamp<=latest);
-  return {start,latest,span,candidates};
-}
-function visibleHistory(samples,windowDef){
-  const meta=historyWindowMeta(samples,windowDef);
-  if(meta.candidates.length<=HISTORY_DOTS)return {...meta,visible:meta.candidates};
-  const buckets=Array(HISTORY_DOTS).fill(null);
-  for(const item of meta.candidates){
-    const bucket=Math.min(HISTORY_DOTS-1,Math.max(0,Math.floor(((item.stamp-meta.start)/meta.span)*HISTORY_DOTS)));
-    buckets[bucket]=item;
-  }
-  return {...meta,visible:buckets.filter(Boolean)};
-}
-function historyInfo(beats,index,interval){
-  const stamp=beats[index];
-  const previous=index>0?beats[index-1]:null;
-  if(previous==null)return {level:'first',label:'first heartbeat',detail:'at '+clock(stamp)};
-  const gap=Math.max(0,stamp-previous);
-  if(gap<=interval)return {level:'ok',label:'on cadence',detail:dur(gap)+' after previous · '+clock(stamp)};
-  if(gap<=interval*2)return {level:'late',label:'late heartbeat',detail:dur(gap)+' after previous · '+clock(stamp)};
-  if(gap<=interval*5)return {level:'stale',label:'stale gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
-  return {level:'down',label:'offline gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
-}
-function freshRow(label,value,klass){return '<div class="fresh-row"><span>'+esc(label)+'</span><strong class="'+klass+'">'+esc(value)+'</strong></div>'}
-function freshValue(v,zero){
-  const n=Number(v);
-  if(v==null||!Number.isFinite(n))return {value:'unknown',klass:'na'};
-  if(n===0)return {value:zero,klass:'ok'};
-  return {value:String(n),klass:'warn'};
-}
-function freshHtml(f){
-  if(!f||f.applicable===false)return freshRow('Flake.lock age','n/a','na')+freshRow('Commits behind','n/a','na');
-  const age=freshValue(f.flake_lock_age_days,'fresh');
-  const commits=freshValue(f.commits_behind,'0');
-  if(age.klass==='warn')age.value=age.value+'d';
-  return freshRow('Flake.lock age',age.value,age.klass)+freshRow('Commits behind',commits.value,commits.klass);
-}
-function kernelNeedsRestart(kernel){
-  return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
-}
-function kernelSearch(kernel){
-  return kernelNeedsRestart(kernel)?'restart needed kernel reboot required '+kernel.running_version+' '+kernel.expected_version:'';
-}
-function updateKernel(surface,host){
-  const slot=surface.querySelector('[data-kernel-slot]');
-  if(!slot)return;
-  const required=kernelNeedsRestart(host.kernel);
-  slot.hidden=!required;
-  const reason=surface.querySelector('[data-reason]');
-  if(reason)reason.hidden=required;
-  const details=slot.querySelector('[data-kernel-posture]');
-  if(!required){
-    if(details)details.open=false;
-    return;
-  }
-  const healthy=host.liveness==='live';
-  const explanation=healthy
-    ? String(host.name||'This host')+' is healthy. A newer system kernel is ready for its next planned restart.'
-    : String(host.name||'This host')+' has a newer system kernel ready for its next planned restart.';
-  const explanationNode=slot.querySelector('[data-kernel-explanation]');
-  const running=slot.querySelector('[data-kernel-running]');
-  const expected=slot.querySelector('[data-kernel-expected]');
-  if(explanationNode)explanationNode.textContent=explanation;
-  if(running)running.textContent=host.kernel.running_version;
-  if(expected)expected.textContent=host.kernel.expected_version;
-}
-function freshnessAttention(f){
-  if(!f||f.applicable===false)return null;
-  const age=Number(f.flake_lock_age_days);
-  const commits=Number(f.commits_behind);
-  const hasAge=f.flake_lock_age_days!=null&&Number.isFinite(age);
-  const hasCommits=f.commits_behind!=null&&Number.isFinite(commits);
-  const ageWarn=hasAge&&age>0;
-  const commitsWarn=hasCommits&&commits>0;
-  if(ageWarn&&commitsWarn)return {label:'nix drift: '+age+'d · '+commits+' commits',level:'warn',rank:3};
-  if(ageWarn)return {label:'flake.lock '+age+'d',level:'warn',rank:3};
-  if(commitsWarn)return {label:commits+' commits behind',level:'warn',rank:3};
-  if(!hasAge||!hasCommits)return {label:'freshness unknown',level:'wait',rank:3};
-  return null;
-}
-function downAlertsSuppressed(preferences){
-  return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
-}
-function attentionFor(live,f,preferences){
-  if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
-  if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
-  if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
-  const freshness=freshnessAttention(f);
-  if(freshness)return freshness;
-  if(live==='down')return {label:preferences?.kind==='workstation'?'offline as expected':'down alerts muted',level:'ok',rank:4};
-  return {label:'all clear',level:'ok',rank:4};
-}
-const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
-const BACKUP_LEVEL={failed:'critical',missing:'critical',stale:'warning',warning:'warning',unknown:'watch','not-configured':'watch',healthy:'clear'};
-const BACKUP_LABEL={failed:'Backup failed',missing:'Backup missing',stale:'Backup stale',warning:'Review backup',unknown:'Backup pending','not-configured':'No backup',healthy:'Protected'};
-function backupRunLabel(state){
-  return ({succeeded:'succeeded',failed:'failed',running:'running',unknown:'unknown'})[state]||String(state||'unknown');
-}
-function backupDetail(obs,now){
-  if(!obs)return 'No backup signal yet';
-  if(obs.state==='healthy'&&Number.isFinite(Number(obs.last_success_at)))return 'last success '+dur(now-Number(obs.last_success_at))+' ago';
-  if(Number.isFinite(Number(obs.last_attempt_at))&&obs.last_attempt_state)return backupRunLabel(obs.last_attempt_state)+' · '+dur(now-Number(obs.last_attempt_at))+' ago';
-  return String(obs.summary||'backup status reported');
-}
-function backupInfo(host,now){
-  const observations=Array.isArray(host.backup_observations)?host.backup_observations:[];
-  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0};
-  const primary=[...observations].sort((a,b)=>(BACKUP_RANK[a.state]??4)-(BACKUP_RANK[b.state]??4))[0];
-  const state=primary.state||'unknown';
-  const label=BACKUP_LABEL[state]||'Backup pending';
-  const detail=backupDetail(primary,now);
-  const last=Number.isFinite(Number(primary.last_success_at))?dur(now-Number(primary.last_success_at))+' ago':'not yet';
-  const schedule=String(primary.schedule||'not declared');
-  const target=String(primary.target_label||'not declared');
-  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' ')};
-}
-function updateBackup(surface,info){
-  const el=surface.querySelector('[data-backup-state]');
-  if(!el)return;
-  if(el.classList.contains('backup-chip')){
-    const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
-    const host=surface.dataset.host||'';
-    el.classList.remove('clear','watch','warning','critical');
-    el.classList.add(info.level);
-    el.dataset.backupState=info.state;
-    el.dataset.backupLevel=info.level;
-    el.dataset.backupGlyph=glyph;
-    el.href='/backups?host='+encodeURIComponent(host);
-    el.title='Backup: '+info.label+' - '+info.detail;
-    el.setAttribute('aria-label','Backup for '+host+': '+info.label+', '+info.detail);
-  }
-}
-function setReason(surface,reason){
-  const el=surface.querySelector('[data-reason]');
-  if(!el)return;
-  el.className='reason '+reason.level;
-  const text=el.querySelector('span');
-  if(text)text.textContent=reason.label;
-}
-function mutedInfo(preferences){
-  const alerts=preferences?.alerts||{};
-  const labels=[];
-  const workstation=preferences?.kind==='workstation';
-  if(!workstation&&alerts.suppress_down)labels.push('down');
-  if(alerts.suppress_backup)labels.push('backup');
-  if(alerts.suppress_nix_freshness)labels.push('Nix freshness');
-  const label=workstation
-    ? ['down alerts off for workstation',labels.length?labels.join(', ')+' muted':''].filter(Boolean).join(' · ')
-    : (labels.length?labels.join(', ')+' muted':'');
-  const search=label?(workstation?'workstation expected offline down alerts suppressed ':'muted alert preferences ')+label:'';
-  return {label,search};
-}
-function updateMuted(surface,info){
-  const el=surface.querySelector('[data-mute-note]');
-  if(!el)return;
-  el.hidden=!info.label;
-  el.title=info.label;
-  const text=el.querySelector('span');
-  if(text)text.textContent=info.label;
-}
-function updatePreferenceState(surface,host){
-  const applied=host.preferences||{};
-  const declared=host.declared_preferences||null;
-  const requested=host.requested_preferences||null;
-  const state=String(host.preferences_state||'applied');
-  const appliedColor=String(applied.accent||'');
-  const pendingSource=state==='request_pending'?requested:(declared||requested);
-  const pendingColor=String(pendingSource?.accent||'');
-  const validColor=value=>/^#[0-9a-fA-F]{6}$/.test(value);
-  surface.classList.toggle('has-settings',validColor(appliedColor));
-  if(validColor(appliedColor))surface.style.setProperty('--host-color',appliedColor);
-  else surface.style.removeProperty('--host-color');
-  if(validColor(pendingColor))surface.style.setProperty('--pending-color',pendingColor);
-  else surface.style.removeProperty('--pending-color');
-  const link=surface.querySelector('[data-settings-state]');
-  const label=state==='declared_not_applied'?'change waiting':state==='request_pending'?'change requested':'';
-  const name=surface.dataset.host||'host';
-  const title=label?label+' for '+name:'Open host settings for '+name;
-  if(link){
-    link.dataset.settingsState=state;
-    link.title=title;
-    link.setAttribute('aria-label',title);
-  }
-  const note=surface.querySelector('[data-settings-note]');
-  if(note){
-    note.hidden=!label;
-    note.dataset.settingsState=state;
-    const copy=note.querySelector('[data-settings-note-copy]');
-    if(copy)copy.textContent=label;
-  }
-}
-function markHtml(beats,interval,windowDef=signalWindow){
-  const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
-  if(kept.length<2)return '';
-  const cadence=Math.max(1,Number(interval)||60);
-  const newestX=EXPECT_X-HISTORY_STEP;
-  const view=visibleHistory(kept,windowDef);
-  return view.visible.map(item=>{
-    const x=((item.stamp-view.start)/view.span)*newestX;
-    const info=historyInfo(kept,item.index,cadence);
-    const title=info.label+' · '+info.detail;
-    return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
-  }).join('');
-}
-function syncHistoryStart(beat){
-  const first=beat.querySelector('.beat-mark');
-  const start=first?.style.getPropertyValue('--mark-x').trim()||'0%';
-  beat.style.setProperty('--history-start-x',start);
-}
-function signalInfo(beats,last,interval,now,windowDef=signalWindow){
-  const cadence=Math.max(1,Number(interval)||60);
-  const samples=Array.from(new Set(beats.concat(Number.isFinite(last)&&last>0?[last]:[]))).filter(Number.isFinite).filter(n=>n>0).sort((a,b)=>a-b);
-  if(!samples.length)return {text:'new',level:'wait',window:windowDef.label,title:'Signal over '+windowDef.label+': waiting for first heartbeat'};
-  const requestedStart=now-windowDef.secs;
-  const retainedStart=Math.max(requestedStart,samples[0]);
-  const span=Math.max(cadence,Math.min(windowDef.secs,now-retainedStart));
-  const expected=Math.max(1,Math.ceil(span/cadence));
-  const received=samples.filter(stamp=>stamp>=retainedStart&&stamp<=now).length;
-  let longestGap=Math.max(0,Math.min(now-samples[samples.length-1],span));
-  let previous=retainedStart;
-  for(const stamp of samples){
-    if(stamp<retainedStart||stamp>now)continue;
-    longestGap=Math.max(longestGap,stamp-previous);
-    previous=stamp;
-  }
-  longestGap=Math.max(longestGap,now-previous);
-  const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
-  const level=percent>=95?'good':percent>=75?'warn':'down';
-  const coverage=retainedStart>requestedStart?' · retained '+dur(span):'';
-  return {text:percent+'%',level,window:windowDef.label,title:'Signal over '+windowDef.label+': '+received+' of '+expected+' expected heartbeats received · longest gap '+dur(longestGap)+coverage};
-}
-function updateSignal(surface,info){
-  const signal=surface?.querySelector('[data-signal]');
-  if(!signal)return;
-  signal.dataset.signalLevel=info.level;
-  signal.dataset.signalWindowKey=info.window;
-  signal.title=info.title;
-  signal.setAttribute('aria-label',info.title);
-  const text=signal.querySelector('[data-signal-percent]');
-  if(text)text.textContent=info.text;
-  const windowLabel=signal.querySelector('[data-signal-window]');
-  if(windowLabel){
-    const next=SIGNAL_WINDOWS[(SIGNAL_WINDOWS.findIndex(w=>w.label===info.window)+1)%SIGNAL_WINDOWS.length]||SIGNAL_WINDOWS[0];
-    windowLabel.textContent=info.window;
-    windowLabel.title=info.title+'; click for '+next.label;
-    windowLabel.setAttribute('aria-label',info.title+'; click for '+next.label);
-  }
-}
-function setHistoryHint(mark,show){
-  const surface=mark.closest('[data-host]');
-  if(!surface)return;
-  const seen=surface.querySelector('[data-seen]');
-  const asof=surface.querySelector('[data-card-asof]');
-  if(!seen)return;
-  if(show){
-    surface.dataset.historyHint='true';
-    seen.textContent=mark.dataset.historyLabel||'historic heartbeat';
-    if(asof)asof.textContent=mark.dataset.historyDetail||'';
-  }else{
-    delete surface.dataset.historyHint;
-    seen.textContent=seen.dataset.defaultText||seen.textContent;
-    if(asof)asof.textContent=asof.dataset.defaultText||asof.textContent;
-  }
-}
-function bindHistoryHints(root=document){
-  root.querySelectorAll('.beat-mark').forEach(mark=>{
-    if(mark.dataset.hintBound==='true')return;
-    mark.dataset.hintBound='true';
-    mark.addEventListener('mouseenter',()=>setHistoryHint(mark,true));
-    mark.addEventListener('mouseleave',()=>setHistoryHint(mark,false));
-    mark.addEventListener('focus',()=>setHistoryHint(mark,true));
-    mark.addEventListener('blur',()=>setHistoryHint(mark,false));
-  });
-}
-function setBeatHistory(beat,beats,interval){
-  const all=Array.from(new Set(beats)).sort((a,b)=>a-b);
-  const view=visibleHistory(all,signalWindow);
-  const kept=view.visible.map(item=>item.stamp);
-  const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
-  beat.dataset.signalBeats=all.join(',');
-  beat.dataset.beats=kept.join(',');
-  beat.dataset.count=String(kept.length);
-  beat.dataset.historyWindow=signalWindow.label;
-  const windowLabel=beat.querySelector('[data-history-window-label]');
-  if(windowLabel)windowLabel.textContent=signalWindow.label;
-  const marks=beat.querySelector('.beat-marks');
-  if(marks){
-    marks.innerHTML=markHtml(all,cadence,signalWindow);
-    syncHistoryStart(beat);
-    bindHistoryHints(marks);
-  }
-}
-function flashBeat(beat){
-  beat.dataset.flash='true';
-  window.setTimeout(()=>{delete beat.dataset.flash},950);
-}
-function heartbeatX(age,interval){
-  if(age<=interval)return (age/interval)*EXPECT_X;
-  if(age<=interval*2)return EXPECT_X+((age-interval)/interval)*(STALE_X-EXPECT_X);
-  if(age<=interval*5)return STALE_X+((age-interval*2)/(interval*3))*(100-STALE_X);
-  return 100;
-}
-function updateBeatClock(beat,now){
-  const last=Number(beat.dataset.last);
-  const interval=Math.max(1,Number(beat.dataset.interval)||60);
-  const surface=beat.closest('[data-host]');
-  if(!Number.isFinite(last)||last<=0){
-    beat.style.setProperty('--expect-alpha','.22');
-    beat.style.setProperty('--now-x','0%');
-    beat.style.setProperty('--fill-color','var(--wait)');
-    beat.style.setProperty('--expect-fill','0deg');
-    beat.style.setProperty('--target-ring','3px');
-    beat.style.setProperty('--late-alpha','.3');
-    beat.dataset.beat='waiting';
-    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats),last,interval,now));
-    return;
-  }
-  const age=Math.max(0,now-last);
-  const expect=Math.max(0,Math.min(1,age/interval));
-  const x=heartbeatX(age,interval);
-  beat.style.setProperty('--now-x',x.toFixed(2)+'%');
-  beat.style.setProperty('--expect-alpha',(.34+expect*.45).toFixed(3));
-  beat.style.setProperty('--expect-fill',(expect*360).toFixed(1)+'deg');
-  beat.style.setProperty('--target-ring',(3+expect*5).toFixed(1)+'px');
-  if(age<=interval){
-    beat.style.setProperty('--fill-color',beat.dataset.self==='true'?'var(--sun)':'var(--sea)');
-    beat.dataset.beat=beat.dataset.self==='true'?'lit':'tracking';
-  }else if(age<=interval*2){
-    beat.style.setProperty('--fill-color','var(--sun)');
-    beat.style.setProperty('--expect-alpha','.79');
-    beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
-    beat.dataset.beat='late';
-  }else if(age<=interval*5){
-    beat.style.setProperty('--fill-color','var(--stale)');
-    beat.style.setProperty('--expect-alpha','.86');
-    beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
-    beat.dataset.beat='stale';
-  }else{
-    beat.style.setProperty('--fill-color','var(--down)');
-    beat.style.setProperty('--expect-alpha','.86');
-    beat.style.setProperty('--expect-fill','360deg');
-    beat.style.setProperty('--target-ring','8px');
-    beat.dataset.beat='down';
-  }
-  updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now));
-}
-let beatClockTimer=null;
-function stopBeatClock(){
-  if(beatClockTimer!=null)clearTimeout(beatClockTimer);
-  beatClockTimer=null;
-}
-function frame(){
-  stopBeatClock();
-  if(document.hidden||document.body.dataset.hostActionDialogOpen==='true')return;
-  if(!fleetSnapshotFresh()){
-    setFleetSyncState('stale');
-    if(typeof document.hasFocus!=='function'||document.hasFocus())recoverFleet('watchdog');
-    return;
-  }
-  const now=Date.now()/1000;
-  document.querySelectorAll('.beat').forEach(beat=>{
-    updateBeatClock(beat,now);
-  });
-  beatClockTimer=setTimeout(frame,1000);
-}
-function resumeBeatClock(){
-  stopBeatClock();
-  const main=fleetMain();
-  if(main?.dataset.fleetSyncState!=='current')return;
-  if(!document.hidden&&(typeof document.hasFocus!=='function'||document.hasFocus())&&document.body.dataset.hostActionDialogOpen!=='true')frame();
-}
-function setSeen(card,last,now){
-  const seen=card.querySelector('[data-seen]');
-  if(!seen)return;
-  const compact=seen.hasAttribute('data-seen-compact');
-  const text=last==null?(compact?'never':'never seen'):(compact?dur(now-last)+' ago':'last seen '+dur(now-last)+' ago');
-  seen.dataset.defaultText=text;
-  if(card.dataset.historyHint!=='true')seen.textContent=text;
-}
-function setCardAsOf(card,now){
-  const asof=card.querySelector('[data-card-asof]');
-  if(!asof)return;
-  const text='as of '+clock(now);
-  asof.dataset.defaultText=text;
-  if(card.dataset.historyHint!=='true')asof.textContent=text;
-}
-function sevFor(live){return live==='down'?0:live==='stale'?1:live==='awaiting_first_heartbeat'?2:3}
-function cmp(a,b,mode){
-  if(mode==='name')return a.dataset.sortName.localeCompare(b.dataset.sortName);
-  if(mode==='last')return Number(b.dataset.last||0)-Number(a.dataset.last||0)||a.dataset.sortName.localeCompare(b.dataset.sortName);
-  return Number(a.dataset.sev)-Number(b.dataset.sev)||a.dataset.sortName.localeCompare(b.dataset.sortName);
-}
-const FREEFORM_ORDER_KEY='pharos_freeform_order_v1';
-function readFreeformOrder(){
-  try{
-    const parsed=JSON.parse(window.localStorage.getItem(FREEFORM_ORDER_KEY)||'[]');
-    return Array.isArray(parsed)?parsed.filter(v=>typeof v==='string'&&v):[];
-  }catch(_){return []}
-}
-function writeFreeformOrder(){
-  const grid=document.querySelector('[data-grid]');
-  if(!grid)return;
-  try{
-    const order=Array.from(grid.querySelectorAll('.card')).map(el=>el.dataset.host).filter(Boolean);
-    window.localStorage.setItem(FREEFORM_ORDER_KEY,JSON.stringify(order));
-  }catch(_){}
-}
-function clearFreeformOrder(){
-  try{window.localStorage.removeItem(FREEFORM_ORDER_KEY)}catch(_){}
-}
-function sortByFreeformOrder(items,order){
-  const index=new Map(order.map((name,idx)=>[name,idx]));
-  return items.sort((a,b)=>{
-    const ai=index.has(a.dataset.host)?index.get(a.dataset.host):Number.MAX_SAFE_INTEGER;
-    const bi=index.has(b.dataset.host)?index.get(b.dataset.host):Number.MAX_SAFE_INTEGER;
-    return ai-bi||a.dataset.sortName.localeCompare(b.dataset.sortName);
-  });
-}
-function keepOnboardAffordanceLast(){
-  const grid=document.querySelector('[data-grid]');
-  const tile=document.querySelector('[data-onboard-tile]');
-  if(grid&&tile)grid.appendChild(tile);
-}
-function applyFreeformOrder(){
-  const grid=document.querySelector('[data-grid]');
-  const body=document.querySelector('[data-list-body]');
-  const order=readFreeformOrder();
-  if(!order.length){
-    writeFreeformOrder();
-    keepOnboardAffordanceLast();
-    return;
-  }
-  if(grid)sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order).forEach(el=>grid.appendChild(el));
-  if(body)sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order).forEach(el=>body.appendChild(el));
-  keepOnboardAffordanceLast();
-}
-function setArrangeMode(mode){
-  const main=document.querySelector('main');
-  if(main)main.dataset.arrange=mode;
-}
-function applySort(mode,write=true){
-  mode=['attention','name','last','freeform'].includes(mode)?mode:'attention';
-  const grid=document.querySelector('[data-grid]');
-  const body=document.querySelector('[data-list-body]');
-  setArrangeMode(mode);
-  if(mode==='freeform'){
-    applyFreeformOrder();
-  }else{
-    if(write)clearFreeformOrder();
-    if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
-    if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
-  }
-  keepOnboardAffordanceLast();
-  const select=document.querySelector('[data-sort]');
-  if(select)select.value=mode;
-  if(write)setCookie('pharos_sort',mode);
-}
-function applyView(view,write=true){
-  view=view==='list'?'list':'grid';
-  const main=document.querySelector('main');
-  if(main)main.dataset.view=view;
-  document.querySelectorAll('[data-view-button]').forEach(btn=>btn.setAttribute('aria-pressed',String(btn.dataset.viewButton===view)));
-  if(write)setCookie('pharos_view',view);
-}
-function hostMatchesSurface(el,q,live){
-  const text=q===''||String(el.dataset.search||'').includes(q);
-  const state=live==='all'||el.dataset.live===live;
-  return text&&state;
-}
-function updateGroupVisibility(){
-  document.querySelectorAll('.site-item').forEach(site=>{
-    const visible=Array.from(site.querySelectorAll('.site-host')).some(host=>!host.hidden);
-    site.hidden=!visible;
-  });
-}
-function updateSummaryFilterButtons(){
-  document.querySelectorAll('[data-live-filter]').forEach(btn=>{
-    const active=btn.dataset.liveFilter===activeLiveFilter;
-    btn.setAttribute('aria-pressed',active?'true':'false');
-  });
-}
-function applySurfaceFilters(write=true){
-  const q=activeSearch.trim().toLowerCase();
-  document.querySelectorAll('[data-host]').forEach(el=>{
-    if(el.dataset.mapLayer==='managed')return;
-    el.hidden=!hostMatchesSurface(el,q,activeLiveFilter);
-  });
-  updateGroupVisibility();
-  if(typeof window.pharosMapApplyFilter==='function')window.pharosMapApplyFilter(q,activeLiveFilter);
-  updateSummaryFilterButtons();
-  if(write){
-    setCookie('pharos_search',activeSearch);
-    setCookie('pharos_live_filter',activeLiveFilter);
-  }
-}
-function applyFilter(query,write=true){
-  activeSearch=query;
-  const input=document.querySelector('[data-search]');
-  if(input&&input.value!==query)input.value=query;
-  applySurfaceFilters(write);
-}
-function applyLiveFilter(filter,write=true){
-  activeLiveFilter=['all','live','stale','down','awaiting_first_heartbeat'].includes(filter)?filter:'all';
-  applySurfaceFilters(write);
-}
-function applySignalWindow(key,write=true){
-  signalWindow=signalWindowByKey(key);
-  document.querySelectorAll('.beat').forEach(beat=>{
-    const surface=beat.closest('[data-host]');
-    const last=Number(beat.dataset.last);
-    const interval=Math.max(1,Number(beat.dataset.interval)||60);
-    setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),interval);
-    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,Date.now()/1000,signalWindow));
-  });
-  if(write)setCookie('pharos_signal_window',signalWindow.key);
-}
-function cycleSignalWindow(){
-  const idx=SIGNAL_WINDOWS.findIndex(w=>w.key===signalWindow.key);
-  applySignalWindow(SIGNAL_WINDOWS[(idx+1)%SIGNAL_WINDOWS.length].key);
-  updateUrlState();
-}
-function freeformTarget(grid,x,y){
-  let best=null;
-  let bestDistance=Infinity;
-  let bestAfter=false;
-  grid.querySelectorAll('.card:not([data-dragging]):not([hidden])').forEach(card=>{
-    const box=card.getBoundingClientRect();
-    const cx=box.left+box.width/2;
-    const cy=box.top+box.height/2;
-    const distance=Math.hypot(x-cx,(y-cy)*1.35);
-    if(distance<bestDistance){
-      best=card;
-      bestDistance=distance;
-      bestAfter=y>cy||Math.abs(y-cy)<box.height*.42&&x>cx;
-    }
-  });
-  return {card:best,after:bestAfter};
-}
-function bindFreeformDrag(){
-  const grid=document.querySelector('[data-grid]');
-  if(!grid||grid.dataset.freeformBound==='true')return;
-  grid.dataset.freeformBound='true';
-  let drag=null;
-  function finish(){
-    if(!drag)return;
-    delete drag.card.dataset.dragging;
-    drag.card.style.zIndex='';
-    delete grid.dataset.freeformDragging;
-    writeFreeformOrder();
-    applyFreeformOrder();
-    drag=null;
-  }
-  grid.addEventListener('pointerdown',event=>{
-    const handle=event.target.closest('[data-drag-handle]');
-    if(!handle||!grid.contains(handle))return;
-    if(document.querySelector('main')?.dataset.arrange!=='freeform')return;
-    if(event.button!==0)return;
-    const card=handle.closest('.card');
-    if(!card)return;
-    event.preventDefault();
-    handle.setPointerCapture?.(event.pointerId);
-    drag={card,pointerId:event.pointerId};
-    card.dataset.dragging='true';
-    card.style.zIndex='20';
-    grid.dataset.freeformDragging='true';
-  });
-  grid.addEventListener('pointermove',event=>{
-    if(!drag||event.pointerId!==drag.pointerId)return;
-    event.preventDefault();
-    const target=freeformTarget(grid,event.clientX,event.clientY);
-    if(!target.card){
-      grid.appendChild(drag.card);
-      return;
-    }
-    const before=target.after?target.card.nextSibling:target.card;
-    if(before!==drag.card)grid.insertBefore(drag.card,before);
-  });
-  grid.addEventListener('pointerup',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
-  grid.addEventListener('pointercancel',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
-  window.addEventListener('blur',finish);
-}
-const ASSISTANT_SETUP_PARAM='setup';
-const ASSISTANT_PATH_PARAM='setup_path';
-const ASSISTANT_PROVIDER_PARAM='setup_provider';
-const ASSISTANT_TEMPLATE_PARAM='setup_template';
-const ASSISTANT_STAGE_PARAM='setup_stage';
-const ASSISTANT_JOB_PARAM='setup_job';
-const ASSISTANT_TEMPLATE_PROVIDERS={
-	  'hetzner-small-nixos':'hetzner-cloud',
-	  'hetzner-lab':'hetzner-cloud',
-	  'bring-own-plan':'hetzner-cloud',
-	  'manual-import':'manual-import',
-	  'netcup-manual-import':'manual-import',
-	  'oracle-always-free-lab':'manual-import',
-	  'gcp-free-tier-lab':'manual-import',
-	  'nixos-anywhere':'existing-host',
-  'native-systemd':'existing-host',
-  'manual-deferred':'existing-host'
-};
-function assistantPath(path){
-  return ['new','existing'].includes(path)?path:'';
-}
-function assistantProvider(provider){
-  return ['hetzner-cloud','manual-import','existing-host'].includes(provider)?provider:'';
-}
-function assistantTemplate(template){
-  return Object.prototype.hasOwnProperty.call(ASSISTANT_TEMPLATE_PROVIDERS,template)?template:'';
-}
-function assistantStage(stage){
-  return ['choose','template','existing','bootstrap','plan','job'].includes(stage)?stage:'choose';
-}
-function assistantState(overlay){
-  return {
-    path: assistantPath(overlay?.dataset.assistantSelectedPath||''),
-    provider: assistantProvider(overlay?.dataset.assistantSelectedProvider||''),
-    template: assistantTemplate(overlay?.dataset.assistantSelectedTemplate||''),
-    stage: assistantStage(overlay?.dataset.assistantStage||'choose')
-  };
-}
-function writeAssistantUrl(open,path='',provider='',template='',stage='choose'){
-  const params=new URLSearchParams(location.search);
-  if(open){
-    params.set(ASSISTANT_SETUP_PARAM,'add-server');
-    const safePath=assistantPath(path);
-    if(safePath)params.set(ASSISTANT_PATH_PARAM,safePath);
-    else params.delete(ASSISTANT_PATH_PARAM);
-    const safeProvider=safePath==='new'?assistantProvider(provider):'';
-    const safeTemplate=safePath==='new'?assistantTemplate(template):'';
-    if(safeProvider)params.set(ASSISTANT_PROVIDER_PARAM,safeProvider);
-    else params.delete(ASSISTANT_PROVIDER_PARAM);
-    if(safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===safeProvider)params.set(ASSISTANT_TEMPLATE_PARAM,safeTemplate);
-    else params.delete(ASSISTANT_TEMPLATE_PARAM);
-    let safeStage='choose';
-    if(safePath==='new')safeStage=safeTemplate&&assistantStage(stage)==='plan'?'plan':'template';
-    if(safePath==='existing')safeStage=['bootstrap','plan'].includes(assistantStage(stage))?assistantStage(stage):'existing';
-    const jobId=(document.querySelector('[data-setup-assistant]')?.dataset.assistantJobId||'').trim();
-    if(jobId&&jobId.length<=128){
-      const paidStage=document.querySelector('[data-setup-assistant]')?.dataset.assistantPaidStage||'';
-      safeStage=['reviewed','authorized','claimed','reconcile'].includes(paidStage)?'plan':'job';
-      params.set(ASSISTANT_JOB_PARAM,jobId);
-    }else{
-      params.delete(ASSISTANT_JOB_PARAM);
-    }
-    if(safeStage!=='choose')params.set(ASSISTANT_STAGE_PARAM,safeStage);
-    else params.delete(ASSISTANT_STAGE_PARAM);
-  }else{
-    params.delete(ASSISTANT_SETUP_PARAM);
-    params.delete(ASSISTANT_PATH_PARAM);
-    params.delete(ASSISTANT_PROVIDER_PARAM);
-    params.delete(ASSISTANT_TEMPLATE_PARAM);
-    params.delete(ASSISTANT_STAGE_PARAM);
-    params.delete(ASSISTANT_JOB_PARAM);
-  }
-  const query=params.toString();
-  history.replaceState(null,'',location.pathname+(query?'?'+query:''));
-}
-function syncAssistantNext(overlay){
-  const {path,provider,stage}=assistantState(overlay);
-  overlay.dataset.assistantStage=stage;
-  const title=overlay.querySelector('#setup-assistant-title');
-  const copy=title?.parentElement?.querySelector('p');
-  const back=overlay.querySelector('[data-assistant-step-back]');
-  if(back)back.hidden=stage==='choose'||stage==='job'||overlay.dataset.providerCreated==='true'||Boolean(overlay.dataset.assistantJobId);
-  if(stage==='template'){
-    if(title)title.textContent=provider==='manual-import'?'Connect a server':'New server';
-    if(copy)copy.textContent=provider==='manual-import'?'Choose the provider handoff.':'Choose a starting point.';
-  }else if(stage==='existing'){
-    if(title)title.textContent='Existing server';
-    if(copy)copy.textContent='Enter the server you already control.';
-  }else if(stage==='bootstrap'){
-    if(title)title.textContent='Choose setup';
-    if(copy)copy.textContent='Pick the available installation method.';
-  }else if(stage==='plan'&&path==='new'){
-    const paidStage=overlay.dataset.assistantPaidStage||'';
-    if(title)title.textContent=paidStage==='reconcile'?'Check provider result':paidStage==='claimed'?'Continue authorized create':paidStage==='authorized'?'Create authorized server':paidStage==='reviewed'?'Authorize paid plan':'Review server';
-    if(copy)copy.textContent=paidStage==='reconcile'?'Pharos will inspect exact ownership labels without replaying the paid request.':paidStage==='claimed'?'The create is durably claimed, but the provider request has not started.':paidStage?'The exact provider plan is persisted. Nothing has been created yet.':'Nothing has been created yet.';
-  }else if(stage==='plan'&&path==='existing'){
-    if(title)title.textContent='Review setup';
-    if(copy)copy.textContent='No host changes have been started yet.';
-  }else if(stage!=='job'){
-    if(title)title.textContent='Add a server';
-    if(copy)copy.textContent='What would you like to add?';
-  }
-  updateAssistantReview(overlay);
-  syncAssistantStart(overlay);
-}
-function showAssistantError(overlay,message=''){
-  const error=overlay?.querySelector('[data-assistant-error]');
-  if(!error)return;
-  error.textContent=message;
-  error.hidden=!message;
-}
-function provisioningJobTerminal(state){
-  return ['complete','failed','cleanup-needed'].includes(state||'');
-}
-function provisioningJobLabel(state){
-  return String(state||'pending').replace(/-/g,' ');
-}
-function latestProvisioningMessage(job){
-  const progress=Array.isArray(job?.progress)?job.progress:[];
-  const latest=progress[progress.length-1];
-  return latest?.message||'Tracked setup job is waiting for progress.';
-}
-const BACKUP_INTENT_COPY={
-  'required':['backup required','observe existing jobs or queue Pharos enrollment'],
-  'optional':['backup optional','offer enrollment, but do not block onboarding'],
-  'external':['managed elsewhere','observe external backup evidence when available'],
-  'enroll-later':['enroll later','queue backup enrollment after first heartbeat'],
-  'absent':['no backups','record that backups are intentionally absent'],
-  'deferred':['backup decision pending','ask again before marking onboarding complete']
-};
-const LOCATION_INTENT_COPY={
-  'auto':['auto location','use runtime auto-detection when the beacon reports'],
-  'manual':['manual location','collect declared coordinates outside runtime facts'],
-  'site-fallback':['site fallback','use provider or site fallback when runtime is missing'],
-  'hidden':['hidden location','keep host coordinates hidden']
-};
-const ACCESS_INTENT_COPY={
-  'operator-only':['operator only','keep visibility scoped to the onboarding operator until review'],
-  'all-operators':['all operators','grant the normal operator group after the host reports'],
-  'limited-users':['limited users','create an explicit host access grant before broadening visibility'],
-  'deferred':['access decision pending','ask again before making the host broadly visible']
-};
-function setupIntentChoice(overlay,name,fallback){
-  return overlay.querySelector(`input[name="${name}"]:checked`)?.value||fallback;
-}
-const SETUP_TEMPLATE_REVIEW={
-  'hetzner-small-nixos':'Small NixOS',
-  'hetzner-lab':'Lab NixOS',
-  'bring-own-plan':'Custom NixOS'
-};
-function assistantReviewValue(overlay,selector,fallback=''){
-  return (overlay.querySelector(selector)?.value||fallback).trim();
-}
-function assistantStartLabel(start){
-  return start?.querySelector('[data-assistant-start-label]')?.textContent||start?.textContent||'';
-}
-function setAssistantStartLabel(start,label){
-  const node=start?.querySelector('[data-assistant-start-label]');
-  if(node)node.textContent=label;
-  else if(start)start.textContent=label;
-}
-function updateAssistantReview(overlay){
-  if(!overlay||overlay.dataset.providerCreated==='true')return;
-  const state=assistantState(overlay);
-  const reviewing=state.stage==='plan';
-  const details=overlay.querySelector('[data-assistant-review-details]');
-  const advancedLabel=overlay.querySelector('[data-assistant-advanced-label]');
-  const confirmCopy=overlay.querySelector('[data-assistant-confirm-copy]');
-  const start=overlay.querySelector('[data-assistant-start]');
-  if(reviewing&&state.path==='new'&&!['reviewed','authorized'].includes(overlay.dataset.assistantPaidStage||'')){
-    if(advancedLabel)advancedLabel.textContent='Advanced server options';
-    if(assistantStartLabel(start)!=='Saving review')setAssistantStartLabel(start,'Review paid plan');
-    const location=assistantReviewValue(overlay,'[data-new-location]');
-    const serverType=assistantReviewValue(overlay,'[data-new-server-type]');
-    const template=SETUP_TEMPLATE_REVIEW[state.template]||'NixOS server';
-    const provider=overlay.querySelector('[data-review-provider]');
-    const server=overlay.querySelector('[data-review-server]');
-    const setup=overlay.querySelector('[data-review-setup]');
-    const after=overlay.querySelector('[data-review-after]');
-    if(provider)provider.textContent=`Hetzner Cloud · ${providerLocationLabel(location)}`;
-    if(server)server.textContent=`${template} · ${serverType.toUpperCase()}`;
-    if(setup)setup.textContent='NixOS + Pharos';
-    if(after){
-      const backup=BACKUP_INTENT_COPY[setupIntentChoice(overlay,'backup_intent','deferred')]?.[0]||'backup decision pending';
-      const locationIntent=LOCATION_INTENT_COPY[setupIntentChoice(overlay,'location_intent','auto')]?.[0]||'auto location';
-      const access=ACCESS_INTENT_COPY[setupIntentChoice(overlay,'access_intent','operator-only')]?.[0]||'operator only';
-      after.textContent=[backup,locationIntent,access]
-        .map(value=>value.charAt(0).toUpperCase()+value.slice(1))
-        .join(' · ');
-    }
-  }else if(reviewing&&state.path==='existing'){
-    if(advancedLabel)advancedLabel.textContent='Advanced setup';
-    if(confirmCopy)confirmCopy.textContent='I reviewed this setup path.';
-    if(assistantStartLabel(start)!=='Starting setup')setAssistantStartLabel(start,'Record setup path');
-    const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'Existing server').trim()||'Existing server';
-    const request=existingPreflightRequest(overlay);
-    const connection=request.ssh.route==='none'?'Manual handoff':`${request.ssh.route}${request.ssh.host?` · ${request.ssh.host}`:''}`;
-    const selected=overlay.querySelector('[data-bootstrap-option][data-selected="true"] strong');
-    const values={
-      '[data-existing-review-host]':hostName,
-      '[data-existing-review-connection]':connection,
-      '[data-existing-review-method]':selected?.textContent||'Selected setup method'
-    };
-    Object.entries(values).forEach(([selector,value])=>{
-      const node=overlay.querySelector(selector);
-      if(node)node.textContent=value;
-    });
-  }
-  if(details&&state.stage!=='plan')details.open=false;
-}
-function providerPlanResourceTitle(resource){
-  return String(resource?.key||'provider resource').replace(/_/g,' ').replace(/\b\w/g,letter=>letter.toUpperCase());
-}
-let currentProviderCatalog=null;
-let assistantReturnFocus=null;
-function providerPlanAvailability(serverType,location){
-  return (Array.isArray(serverType?.locations)?serverType.locations:[]).find(item=>item?.name===location&&item?.available&&item?.monthly_gross);
-}
-function providerMoneyLabel(value,currency){
-  const amount=Number(value);
-  const code=String(currency||'').trim().toUpperCase();
-  if(!Number.isFinite(amount)||amount<0)return [String(value||''),code].filter(Boolean).join(' ');
-  try{
-    return new Intl.NumberFormat(undefined,{style:'currency',currency:code,minimumFractionDigits:2,maximumFractionDigits:2}).format(amount);
-  }catch(_error){
-    return `${new Intl.NumberFormat(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}).format(amount)}${code?` ${code}`:''}`;
-  }
-}
-function providerPlanLabel(serverType,location,currency){
-  const availability=providerPlanAvailability(serverType,location);
-  const price=availability?.monthly_gross?` · ${providerMoneyLabel(availability.monthly_gross,currency)}/month`:'';
-  return `${serverType?.name||'Plan'} · ${serverType?.cores||0} vCPU · ${serverType?.memory_gb||0} GB${price}`;
-}
-function recommendedProviderPlan(catalog,location){
-  return (Array.isArray(catalog?.server_types)?catalog.server_types:[])
-    .filter(serverType=>serverType?.architecture==='x86'&&Number(serverType?.cores)>=2&&Number(serverType?.memory_gb)>=4&&providerPlanAvailability(serverType,location))
-    .sort((left,right)=>Number(providerPlanAvailability(left,location)?.monthly_gross)-Number(providerPlanAvailability(right,location)?.monthly_gross)||String(left?.name).localeCompare(String(right?.name)))[0]||null;
-}
-function populateProviderPlanChoices(overlay,catalog,defaults){
-  currentProviderCatalog=catalog||null;
-  overlay.pharosProviderCatalog=catalog||null;
-  overlay.pharosProviderDefaults=defaults||null;
-  const locationSelect=overlay.querySelector('[data-new-location]');
-  const planSelect=overlay.querySelector('[data-new-server-type]');
-  const sshSelect=overlay.querySelector('[data-new-ssh-key]');
-  const locations=(Array.isArray(catalog?.locations)?catalog.locations:[]).filter(location=>(catalog?.server_types||[]).some(serverType=>providerPlanAvailability(serverType,location.name)));
-  if(locationSelect){
-    const previous=locationSelect.value;
-    locationSelect.replaceChildren(...locations.map(location=>new Option(`${location.city} (${location.name})`,location.name)));
-    const preferred=[previous,defaults?.location].find(value=>value&&locations.some(location=>location.name===value));
-    if(preferred)locationSelect.value=preferred;
-  }
-  const populatePlans=()=>{
-    if(!planSelect)return;
-    const location=locationSelect?.value||'';
-    const plans=(Array.isArray(catalog?.server_types)?catalog.server_types:[]).filter(serverType=>providerPlanAvailability(serverType,location));
-    const previous=planSelect.value;
-    planSelect.replaceChildren(...plans.map(serverType=>new Option(providerPlanLabel(serverType,location,catalog?.currency||''),serverType.name)));
-    const recommended=recommendedProviderPlan(catalog,location)?.name;
-    const preferred=[previous,defaults?.server_type,recommended].find(value=>value&&plans.some(serverType=>serverType.name===value));
-    if(preferred)planSelect.value=preferred;
-    updateAssistantReview(overlay);
-    syncAssistantStart(overlay);
-  };
-  populatePlans();
-  if(locationSelect&&locationSelect.dataset.catalogBound!=='true'){
-    locationSelect.dataset.catalogBound='true';
-    locationSelect.addEventListener('change',populatePlans);
-  }
-  if(sshSelect){
-    const defaultLabel=defaults?.ssh_key_ref?`Use connection default (${defaults.ssh_key_ref})`:'Use connection default';
-    const options=[new Option(defaultLabel,'')].concat((catalog?.ssh_keys||[]).map(value=>new Option(value,value)));
-    sshSelect.replaceChildren(...options);
-  }
-}
-function renderProviderPlanReview(overlay,payload){
-  const plan=payload?.plan||null;
-  const runtime=payload?.runtime||null;
-  overlay.pharosProviderPlan=plan;
-  overlay.pharosProviderRuntime=runtime;
-  populateProviderPlanChoices(overlay,payload?.catalog||null,payload?.defaults||null);
-  const list=overlay.querySelector('[data-provider-plan-resources]');
-  if(list&&plan){
-    list.replaceChildren();
-    (Array.isArray(plan.resources)?plan.resources:[]).filter(resource=>resource?.required).forEach(resource=>{
-      const row=document.createElement('div');
-      row.className='assistant-plan-row';
-      const copy=document.createElement('span');
-      const title=document.createElement('strong');
-      title.textContent=providerPlanResourceTitle(resource);
-      const detail=document.createElement('span');
-      detail.textContent=resource.detail||'Required before server creation.';
-      copy.append(title,detail);
-      const status=document.createElement('em');
-      status.className='assistant-plan-chip';
-      status.textContent='required';
-      row.append(copy,status);
-      list.append(row);
-    });
-  }
-  updateProviderReadiness(overlay);
-}
-function updateProviderReadiness(overlay){
-  const runtime=overlay?.pharosProviderRuntime||null;
-  const readiness=overlay?.querySelector('[data-provider-readiness]');
-  const sshKey=assistantReviewValue(overlay,'[data-new-ssh-key]');
-  const keyReady=Boolean(runtime?.default_ssh_key_configured||sshKey);
-  const planReady=Boolean(assistantReviewValue(overlay,'[data-new-location]')&&assistantReviewValue(overlay,'[data-new-server-type]'));
-  const durableReady=runtime?.durable_job_store_ready===true;
-  const projectAvailable=runtime?.paid_project_available===true;
-  const ready=Boolean(runtime?.provider_ready&&durableReady&&projectAvailable&&keyReady&&planReady);
-  const activationRequired=runtime?.connection_ready===true&&runtime?.execution_enabled===false;
-  if(readiness){
-    readiness.dataset.state=ready?'ready':activationRequired?'attention':'blocked';
-    const message=readiness.querySelector('span');
-    if(message){
-      message.textContent=ready
-        ? 'Provider connection, SSH public key, and firewall are ready.'
-        : activationRequired
-          ? 'Provider setup is complete. This Pharos installation must enable managed creation before paid review can begin.'
-        : !durableReady
-          ? 'Configure durable Pharos persistence before reviewing a paid server.'
-          : !projectAvailable
-            ? 'Resolve the existing paid attempt or tracked server before starting another.'
-            : runtime?.message||'Provider readiness could not be verified.';
-    }
-    const setup=readiness.querySelector('[data-provider-setup]');
-    if(setup){
-      setup.hidden=ready;
-      setup.textContent=activationRequired?'Review activation step':'Set up provider';
-      const params=new URLSearchParams();
-      params.set('return',location.pathname+location.search);
-      setup.href='/settings/providers/hetzner-cloud?'+params.toString();
-    }
-  }
-  syncAssistantStart(overlay);
-}
-function syncAssistantStart(overlay){
-  const state=assistantState(overlay);
-  const start=overlay.querySelector('[data-assistant-start]');
-  const confirmed=Boolean(overlay.querySelector('[data-assistant-confirm]')?.checked);
-  if(!start)return;
-  if(state.path==='new'){
-    const paidStage=overlay.dataset.assistantPaidStage||'';
-    if(['reviewed','authorized','claimed','reconcile'].includes(paidStage)){
-      start.disabled=overlay.dataset.assistantPaidActionPending==='true'||!overlay.pharosProvisioningJob?.reviewed_plan;
-      return;
-    }
-    const runtime=overlay.pharosProviderRuntime||null;
-    const keyReady=Boolean(runtime?.default_ssh_key_configured||assistantReviewValue(overlay,'[data-new-ssh-key]'));
-    const inputsReady=[
-      '[data-new-host-name]',
-      '[data-new-role]',
-      '[data-new-location]',
-      '[data-new-server-type]',
-      '[data-new-image]'
-    ].every(selector=>Boolean(assistantReviewValue(overlay,selector)));
-    start.disabled=!(runtime?.provider_ready&&runtime?.durable_job_store_ready===true&&runtime?.paid_project_available===true&&runtime?.project_label_configured&&keyReady&&inputsReady);
-  }else{
-    start.disabled=!confirmed;
-  }
-}
-async function loadProviderPlanReview(overlay){
-  const state=assistantState(overlay);
-  if(state.path!=='new'||state.provider!=='hetzner-cloud'||!state.template)return;
-  overlay.pharosProviderRuntime=null;
-  updateProviderReadiness(overlay);
-  const params=new URLSearchParams({provider:state.provider,template:state.template});
-  const response=await fetch(`/setup/provider-plan.json?${params.toString()}`,{
-    credentials:'same-origin',
-    headers:{'accept':'application/json'},
-    cache:'no-store'
-  });
-  const payload=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(payload.error||'provider plan could not be loaded');
-  renderProviderPlanReview(overlay,payload);
-}
-function primaryProviderResource(job){
-  const resources=Array.isArray(job?.provider_resources)?job.provider_resources:[];
-  return resources.find(resource=>resource?.provider==='hetzner-cloud'&&resource?.kind==='server')||null;
-}
-function providerLocationLabel(location){
-  const value=String(location||'').trim();
-  const match=(currentProviderCatalog?.locations||[]).find(item=>item?.name===value);
-  return match?.city||value.toUpperCase()||'Provider location';
-}
-function providerSshLabel(resource){
-  const ssh=resource?.ssh||{};
-  if(!ssh.host)return 'Not available';
-  const user=ssh.user?`${ssh.user}@`:'';
-  const port=ssh.port&&Number(ssh.port)!==22?`:${ssh.port}`:'';
-  return `${user}${ssh.host}${port}`;
-}
-function paidPlanExpired(job){
-  const expiresAt=Number(job?.reviewed_plan?.expires_at||0);
-  return !Number.isFinite(expiresAt)||expiresAt<=Math.floor(Date.now()/1000);
-}
-function paidPlanTimeLabel(seconds){
-  const instant=new Date(Number(seconds)*1000);
-  if(!Number.isFinite(instant.getTime()))return 'Invalid expiry';
-  return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(instant);
-}
-function setPaidPlanTime(overlay,selector,seconds,fallback='not recorded'){
-  const node=overlay.querySelector(selector);
-  if(!node)return;
-  const instant=new Date(Number(seconds)*1000);
-  if(!Number.isFinite(instant.getTime())||Number(seconds)<=0){
-    node.textContent=fallback;
-    node.removeAttribute('datetime');
-    return;
-  }
-  node.textContent=paidPlanTimeLabel(seconds);
-  node.dateTime=instant.toISOString();
-}
-function setPaidPlanText(overlay,selector,value){
-  const node=overlay.querySelector(selector);
-  if(node)node.textContent=String(value||'not recorded');
-}
-function renderPaidPlanReview(overlay,job,authoritative=false){
-  const plan=job?.reviewed_plan;
-  if(!overlay||!job?.id||!plan)return false;
-  if(authoritative)delete overlay.dataset.assistantPaidActionPending;
-  delete overlay.dataset.providerCreated;
-  overlay.dataset.assistantSelectedPath='new';
-  overlay.dataset.assistantSelectedProvider='hetzner-cloud';
-  overlay.dataset.assistantSelectedTemplate=assistantTemplate(job.template||'')||'hetzner-small-nixos';
-  overlay.dataset.assistantStage='plan';
-  overlay.dataset.assistantJobId=job.id;
-  const executionState=String(job.paid_execution?.state||'');
-  const claimed=executionState==='claimed';
-  const reconciling=['request-started','uncertain'].includes(executionState);
-  overlay.dataset.assistantPaidStage=reconciling?'reconcile':claimed?'claimed':job.paid_authorization?'authorized':'reviewed';
-  overlay.pharosProvisioningJob=job;
-  const jobBox=overlay.querySelector('[data-assistant-job]');
-  const created=overlay.querySelector('[data-assistant-created]');
-  if(jobBox)jobBox.hidden=true;
-  if(created)created.hidden=true;
-  const hostName=overlay.querySelector('[data-new-host-name]');
-  if(hostName&&job.host_name)hostName.value=job.host_name;
-  const currency=plan.price_currency||'';
-  setPaidPlanText(overlay,'[data-paid-server-name]',plan.server_name);
-  setPaidPlanText(overlay,'[data-paid-provider-project]',plan.provider_project);
-  setPaidPlanText(overlay,'[data-paid-region]',[plan.location_label,plan.location].filter(Boolean).join(' · '));
-  setPaidPlanText(overlay,'[data-paid-server-type]',[plan.server_type_label,plan.server_type].filter(Boolean).join(' · '));
-  setPaidPlanText(overlay,'[data-paid-image]',plan.image);
-  setPaidPlanText(overlay,'[data-paid-price-hourly]',`${plan.price_hourly_gross} ${currency} / hour`);
-  setPaidPlanText(overlay,'[data-paid-price-monthly]',`${plan.price_monthly_gross} ${currency} / month`);
-  setPaidPlanText(overlay,'[data-paid-cap-hourly]',`${plan.max_hourly_gross} ${currency} / hour`);
-  setPaidPlanText(overlay,'[data-paid-cap-monthly]',`${plan.max_monthly_gross} ${currency} / month`);
-  setPaidPlanText(overlay,'[data-paid-max-active]',`${plan.max_active_servers} maximum · ${plan.observed_active_servers} currently observed`);
-  setPaidPlanText(overlay,'[data-paid-ssh-key]',plan.ssh_key_ref);
-  setPaidPlanText(overlay,'[data-paid-firewall]',plan.firewall_ref);
-  setPaidPlanText(overlay,'[data-paid-operations]',(Array.isArray(plan.allowed_operations)?plan.allowed_operations:[]).join(', '));
-  setPaidPlanText(overlay,'[data-paid-cleanup]',plan.cleanup_policy);
-  setPaidPlanText(overlay,'[data-paid-plan-hash]',plan.plan_sha256);
-  setPaidPlanTime(overlay,'[data-paid-catalog-refreshed]',plan.catalog_refreshed_at);
-  setPaidPlanTime(overlay,'[data-paid-expiry]',plan.expires_at);
-  setPaidPlanTime(overlay,'[data-paid-confirmed-at]',job.paid_authorization?.confirmed_at,'not authorized');
-  const executionFacts=[];
-  if(executionState)executionFacts.push(executionState);
-  if(job.paid_execution?.claimed_at)executionFacts.push(`claimed ${paidPlanTimeLabel(job.paid_execution.claimed_at)}`);
-  if(job.paid_execution?.provider_request_started_at)executionFacts.push(`provider request started ${paidPlanTimeLabel(job.paid_execution.provider_request_started_at)}`);
-  setPaidPlanText(overlay,'[data-paid-execution-state]',executionFacts.join(' · ')||'not started');
-  const labels=overlay.querySelector('[data-paid-labels]');
-  if(labels){
-    labels.replaceChildren();
-    Object.entries(plan.required_labels||{}).sort(([left],[right])=>left.localeCompare(right)).forEach(([key,value])=>{
-      const item=document.createElement('li');
-      item.textContent=`${key}=${value}`;
-      labels.append(item);
-    });
-  }
-  const authorized=Boolean(job.paid_authorization);
-  const expired=paidPlanExpired(job)&&!claimed;
-  const stage=overlay.querySelector('[data-paid-stage-status]');
-  const boundary=overlay.querySelector('[data-paid-billing-boundary]');
-  const next=overlay.querySelector('[data-paid-next-step]');
-  const authorization=overlay.querySelector('[data-paid-authorization]');
-  const operator=overlay.querySelector('[data-paid-operator]');
-  if(stage)stage.textContent=reconciling?'Create result check required':expired?'Review expired':claimed?'Authorized create claimed':authorized?'Authorized':'Persisted review';
-  if(boundary){
-    boundary.textContent=reconciling
-      ? 'The paid attempt is already claimed. Pharos will check exact ownership labels and reviewed server facts and will not send a duplicate create request.'
-      : expired
-        ? 'This review expired without creating a server or starting billing.'
-      : claimed
-        ? 'The paid create is durably claimed, but no provider request has started. Continuing may send the one authorized create request after fresh live checks.'
-      : authorized
-        ? 'Authorization is stored, but no server exists yet. Billing can begin only after Create sends the one allowed provider request and Hetzner accepts it.'
-        : 'Token enrollment, read-only testing, review, and authorization create nothing. Billing begins only when Hetzner accepts server creation.';
-  }
-  if(next){
-    next.textContent=reconciling
-      ? 'Check the provider result. One exact ownership-and-server-fact match is adopted; zero or multiple matches stop for manual review.'
-      : expired
-        ? 'Return to the editable choices and persist a fresh current review.'
-      : claimed
-        ? 'Continue the authorized create. The server enforces the authorization expiry, then rechecks the exact plan before it may send the one allowed provider request.'
-      : authorized
-        ? 'Create this exact server before the authorization expires. Pharos rechecks price and inventory first.'
-        : 'Authorize this exact persisted plan before it expires. Authorization still does not create the server.';
-  }
-  if(authorization){
-    authorization.hidden=!authorized;
-    if(operator)operator.textContent=job.paid_authorization?.operator_label||'the authenticated operator';
-  }
-  syncAssistantNext(overlay);
-  const start=overlay.querySelector('[data-assistant-start]');
-  setAssistantStartLabel(start,reconciling?'Check provider result':expired?'Review again':claimed?'Continue authorized create':authorized?'Create server':'Allow one paid server');
-  syncAssistantStart(overlay);
-  const state=assistantState(overlay);
-  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
-  const paidReview=overlay.querySelector('[data-paid-review]');
-  paidReview?.scrollIntoView({block:'nearest'});
-  if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
-    paidReview?.focus({preventScroll:true});
-  }
-  window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
-  if(!expired&&!claimed&&!reconciling){
-    const delay=Math.max(0,Math.min(2147483000,Number(plan.expires_at)*1000-Date.now()+25));
-    window.pharosAssistantPaidExpiryTimer=window.setTimeout(()=>{
-      if(!overlay.hidden&&overlay.pharosProvisioningJob?.id===job.id)renderPaidPlanReview(overlay,overlay.pharosProvisioningJob);
-    },delay);
-  }
-  return true;
-}
-function renderAssistantProvisioningJob(overlay,job){
-  const executionState=String(job?.paid_execution?.state||'');
-  if(job?.provider==='hetzner-cloud'&&job?.reviewed_plan&&(!executionState||['claimed','request-started','uncertain'].includes(executionState))){
-    return renderPaidPlanReview(overlay,job,true);
-  }
-  renderProvisioningJob(overlay,job);
-  return false;
-}
-function resetPaidPlanReview(overlay){
-  window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
-  delete overlay.dataset.assistantPaidActionPending;
-  delete overlay.dataset.assistantJobId;
-  delete overlay.dataset.assistantPaidStage;
-  overlay.pharosProvisioningJob=null;
-  overlay.dataset.assistantStage='plan';
-  showAssistantError(overlay);
-  syncAssistantNext(overlay);
-  const state=assistantState(overlay);
-  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
-}
-function renderProviderCreatedResult(overlay,job){
-  const result=overlay?.querySelector('[data-assistant-created]');
-  if(!overlay||!result)return false;
-  const resource=primaryProviderResource(job);
-  const handoff=job?.handoff;
-  const deleted=Boolean(
-    resource?.state==='deleted'&&
-    handoff?.status==='provider-resource-deleted'&&
-    job?.state==='complete'&&
-    job?.terminal_outcome==='rolled-back'
-  );
-  const activeResource=Boolean(
-    resource&&['created','created-address-pending'].includes(resource.state)
-  );
-  const visible=deleted||Boolean(
-    activeResource&&['bootstrapping','waiting-for-heartbeat','cleanup-needed'].includes(job?.state)
-  );
-  if(!visible){
-    delete overlay.dataset.providerCreated;
-    overlay.pharosProvisioningJob=null;
-    result.hidden=true;
-    return false;
-  }
-  overlay.dataset.providerCreated='true';
-  overlay.pharosProvisioningJob=job;
-  result.hidden=false;
-  result.dataset.state=deleted?'deleted':'active';
-  const cleanupNeeded=!deleted&&job?.state==='cleanup-needed';
-  const viewTitle=deleted?'Server deleted':cleanupNeeded?'Server needs attention':'Server created';
-  const headTitle=overlay.querySelector('#setup-assistant-title');
-  const headCopy=headTitle?.parentElement?.querySelector('p');
-  if(headTitle)headTitle.textContent=viewTitle;
-  if(headCopy)headCopy.textContent=deleted?'The provider resource is no longer active.':cleanupNeeded?'Review recovery before making another provider change.':'Install Pharos to finish setup.';
-  const back=overlay.querySelector('[data-assistant-step-back]');
-  if(back)back.hidden=true;
-  const setupReady=!cleanupNeeded&&handoff?.status==='provider-created-bootstrap-required';
-  const title=result.querySelector('[data-created-title]');
-  const ready=result.querySelector('[data-created-ready-text]');
-  if(title)title.textContent=viewTitle;
-  if(ready)ready.textContent=deleted?'Removed':cleanupNeeded?'Recovery required':'Ready for setup';
-  const progress=result.querySelector('[data-created-progress]');
-  const actions=result.querySelector('[data-created-actions]');
-  const setup=result.querySelector('[data-created-setup]');
-  const recovery=result.querySelector('[data-created-recovery]');
-  if(progress)progress.hidden=deleted||cleanupNeeded;
-  if(actions)actions.hidden=deleted||!setupReady;
-  if(recovery)recovery.hidden=deleted;
-  const viewKey=`${job?.id||''}:${deleted?'deleted':job?.state||'active'}`;
-  const viewChanged=result.dataset.jobViewKey!==viewKey;
-  result.dataset.jobViewKey=viewKey;
-  if(viewChanged){
-    if(setup)setup.hidden=true;
-    if(recovery)recovery.open=cleanupNeeded;
-    const confirm=result.querySelector('[data-created-delete-confirm]');
-    const remove=result.querySelector('[data-created-delete]');
-    const status=result.querySelector('[data-created-delete-status]');
-    if(confirm)confirm.checked=false;
-    if(remove)remove.disabled=true;
-    if(status)status.textContent='';
-  }
-  const values={
-    '[data-created-host]':resource.name||job.host_name||'new server',
-    '[data-created-location]':providerLocationLabel(resource.location),
-    '[data-created-resource]':`Hetzner server ${resource.provider_id||'created'}${deleted?' · deleted':''}`,
-    '[data-created-ssh]':deleted?'No active destination':providerSshLabel(resource),
-    '[data-created-secret]':deleted?'Not applicable':handoff?.secret_target||'private runtime file',
-    '[data-created-command]':deleted?'Not applicable':handoff?.command_ref||'prepared bootstrap handoff',
-    '[data-created-guidance]':handoff?.summary||'Review recovery before making another provider change.'
-  };
-  Object.entries(values).forEach(([selector,value])=>{
-    const node=result.querySelector(selector);
-    if(node)node.textContent=value;
-  });
-  const nextSteps=result.querySelector('[data-created-next-steps]');
-  if(nextSteps){
-    nextSteps.replaceChildren();
-    const steps=Array.isArray(handoff?.next_steps)?handoff.next_steps:[];
-    steps.forEach(step=>{
-      const item=document.createElement('li');
-      item.textContent=step;
-      nextSteps.append(item);
-    });
-    nextSteps.hidden=steps.length===0;
-  }
-  result.scrollIntoView({block:'nearest'});
-  return true;
-}
-function renderProvisioningJob(overlay,job){
-  if(!overlay||!job)return;
-  delete overlay.dataset.assistantPaidActionPending;
-  delete overlay.dataset.assistantPaidStage;
-  overlay.dataset.assistantJobId=job.id||'';
-  overlay.dataset.assistantStage='job';
-  const title=overlay.querySelector('#setup-assistant-title');
-  const copy=title?.parentElement?.querySelector('p');
-  const jobBox=overlay.querySelector('[data-assistant-job]');
-  const jobTitle=overlay.querySelector('[data-assistant-job-title]');
-  const jobMessage=overlay.querySelector('[data-assistant-job-message]');
-  const spinner=overlay.querySelector('.assistant-job-spinner');
-  const label=provisioningJobLabel(job.state);
-  const message=latestProvisioningMessage(job);
-  const providerCreated=renderProviderCreatedResult(overlay,job);
-  const rolledBack=job.state==='complete'&&job.terminal_outcome==='rolled-back';
-  if(!providerCreated){
-    if(title)title.textContent=rolledBack?'Setup rolled back':job.state==='failed'?'Setup did not start':job.state==='complete'?'Setup complete':'Setting up server';
-    if(copy)copy.textContent=provisioningJobTerminal(job.state)?`Setup ${label}.`:'This may take a few minutes.';
-  }
-  if(jobBox){
-    jobBox.hidden=false;
-    jobBox.dataset.state=job.state||'pending';
-    if(!providerCreated)jobBox.scrollIntoView({block:'nearest'});
-  }
-  if(spinner)spinner.hidden=provisioningJobTerminal(job.state);
-  const jobHeading={
-    planning:'Preparing setup',
-    provisioning:'Creating server',
-    bootstrapping:'Installing Pharos',
-    'waiting-for-heartbeat':'Waiting for the first heartbeat',
-    'backup-pending':'Finishing backup setup',
-    complete:'Setup complete',
-    failed:'Setup failed',
-    'cleanup-needed':'Setup needs attention'
-  }[job.state]||`Setup ${label}`;
-  if(jobTitle)jobTitle.textContent=jobHeading;
-  if(jobMessage)jobMessage.textContent=message;
-  const state=assistantState(overlay);
-  writeAssistantUrl(true,state.path,state.provider,state.template,'job');
-  if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
-    const focusTarget=providerCreated?overlay.querySelector('[data-assistant-created]'):jobBox;
-    focusTarget?.setAttribute('tabindex','-1');
-    focusTarget?.focus({preventScroll:true});
-  }
-}
-function preflightBoolValue(overlay,name){
-  const value=overlay.querySelector(`[data-preflight-fact="${name}"]`)?.value||'';
-  if(value==='true')return true;
-  if(value==='false')return false;
-  return undefined;
-}
-function existingHostRole(overlay){
-  return (overlay.querySelector('[data-preflight-role]')?.value||'server').trim()||'server';
-}
-function existingHostType(overlay){
-  return overlay.querySelector('[data-preflight-host-type]')?.value||'';
-}
-function existingHostIsNix(overlay){
-  const type=existingHostType(overlay);
-  if(type==='nixos')return true;
-  if(type==='linux-beacon')return false;
-  return undefined;
-}
-function existingHeartbeatInterval(overlay){
-  const raw=(overlay.querySelector('[data-preflight-heartbeat]')?.value||'60').trim();
-  const parsed=Number(raw);
-  if(Number.isFinite(parsed)&&parsed>0)return Math.max(10,Math.min(3600,Math.floor(parsed)));
-  return 60;
-}
-function existingPreflightRequest(overlay){
-  const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
-  const hostType=existingHostType(overlay);
-  const route=overlay.querySelector('[data-preflight-route]')?.value||'tailnet';
-  const sshUser=(overlay.querySelector('[data-preflight-ssh-user]')?.value||'').trim();
-  const sshHost=(overlay.querySelector('[data-preflight-ssh-host]')?.value||'').trim();
-  const admin=overlay.querySelector('[data-preflight-admin]')?.value||'';
-  const os=overlay.querySelector('[data-preflight-os]')?.value||'';
-  const diskRaw=(overlay.querySelector('[data-preflight-disk]')?.value||'').trim();
-  const facts={};
-  const sshAuthenticated=preflightBoolValue(overlay,'ssh_authenticated');
-  const nixAvailable=preflightBoolValue(overlay,'nix_available');
-  const pharosReachable=preflightBoolValue(overlay,'pharos_reachable');
-  if(hostType==='nixos'){facts.os_family='nixos';facts.nixos=true;facts.nix_available=true}
-  else if(hostType==='linux-beacon'){facts.os_family='linux';facts.nixos=false}
-  if(sshAuthenticated!==undefined)facts.ssh_authenticated=sshAuthenticated;
-  if(nixAvailable!==undefined)facts.nix_available=nixAvailable;
-  if(pharosReachable!==undefined)facts.pharos_reachable=pharosReachable;
-  if(admin==='root'){facts.root=true;facts.sudo=false}
-  else if(admin==='sudo'){facts.root=false;facts.sudo=true}
-  else if(admin==='none'){facts.root=false;facts.sudo=false}
-  if(os==='nixos'){facts.os_family='nixos';facts.nixos=true;facts.nix_available=true}
-  else if(os==='linux'){facts.os_family='linux';facts.nixos=false}
-  else if(os==='other'){facts.os_family='other';facts.nixos=false}
-  if(diskRaw){
-    const disk=Number(diskRaw);
-    if(Number.isFinite(disk)&&disk>=0)facts.free_disk_gib=Math.floor(disk);
-  }
-  return {
-    host_name:hostName,
-    ssh:{
-      route,
-      user:sshUser||undefined,
-      host:route==='none'?undefined:sshHost||undefined
-    },
-    facts,
-    pharos_url:location.origin
-  };
-}
-function preflightStateTitle(state){
-  return String(state||'unknown').replace(/-/g,' ');
-}
-function selectExistingBootstrap(overlay,option,button){
-  overlay.dataset.existingBootstrapMethod=option.method||'';
-  overlay.querySelectorAll('[data-bootstrap-option]').forEach(item=>{
-    item.dataset.selected=String(item===button);
-  });
-  overlay.dataset.assistantStage='plan';
-  const confirm=overlay.querySelector('[data-assistant-confirm]');
-  if(confirm)confirm.checked=false;
-  const details=overlay.querySelector('[data-assistant-review-details]');
-  if(details)details.open=false;
-  showAssistantError(overlay);
-  syncAssistantNext(overlay);
-  const state=assistantState(overlay);
-  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
-}
-function existingBootstrapTemplate(method){
-  if(method==='nixos-anywhere')return 'nixos-anywhere';
-  if(method==='native-systemd')return 'native-systemd';
-  if(method==='manual')return 'manual-deferred';
-  if(method==='deferred')return 'manual-deferred';
-  return '';
-}
-function renderExistingPreflight(overlay,preflight){
-  const box=overlay.querySelector('[data-preflight-result]');
-  const summary=overlay.querySelector('[data-preflight-summary]');
-  const message=overlay.querySelector('[data-preflight-message]');
-  const checks=overlay.querySelector('[data-preflight-checks]');
-  const bootstrap=overlay.querySelector('[data-preflight-bootstrap]');
-  if(!box||!preflight)return;
-  box.hidden=false;
-  overlay.pharosExistingPreflight=preflight;
-  overlay.dataset.existingBootstrapMethod='';
-  if(summary)summary.textContent=preflight.summary?.label||'Preflight';
-  if(message)message.textContent=preflight.summary?.message||preflight.next_action||'Review checks before continuing.';
-  if(checks){
-    checks.replaceChildren();
-    (Array.isArray(preflight.checks)?preflight.checks:[]).forEach(check=>{
-      const row=document.createElement('div');
-      row.className='assistant-check-row';
-      row.dataset.state=check.state||'unknown';
-      const copy=document.createElement('div');
-      const title=document.createElement('strong');
-      title.textContent=check.label||preflightStateTitle(check.key);
-      const text=document.createElement('span');
-      text.textContent=check.message||preflightStateTitle(check.state);
-      copy.append(title,text);
-      row.append(copy);
-      checks.append(row);
-    });
-  }
-  if(bootstrap){
-    bootstrap.replaceChildren();
-    const options=Array.isArray(preflight.bootstrap_options)?preflight.bootstrap_options:[];
-    options.forEach(option=>{
-      const row=document.createElement('button');
-      row.type='button';
-      row.className='assistant-bootstrap-option';
-      row.dataset.bootstrapOption=option.method||'';
-      row.dataset.available=String(Boolean(option.available));
-      row.disabled=!option.available;
-      const title=document.createElement('strong');
-      title.textContent=option.label||preflightStateTitle(option.method);
-      const text=document.createElement('span');
-      text.textContent=option.message||'Review this path before applying changes.';
-      const detail=document.createElement('span');
-      const changes=Array.isArray(option.changes)?option.changes:[];
-      const detailParts=[
-        changes.join(' '),
-        option.token_handoff||'',
-        option.existing_token_policy||'',
-        option.next_state?`Next: ${option.next_state}.`:''
-      ].filter(Boolean);
-      detail.textContent=detailParts.join(' ');
-      row.append(title,text);
-      if(detail.textContent)row.append(detail);
-      row.addEventListener('click',()=>selectExistingBootstrap(overlay,option,row));
-      bootstrap.append(row);
-    });
-    bootstrap.hidden=options.length===0;
-  }
-  overlay.dataset.assistantStage='bootstrap';
-  showAssistantError(overlay);
-  const state=assistantState(overlay);
-  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'bootstrap');
-  syncAssistantNext(overlay);
-}
-async function runExistingPreflight(overlay,button){
-  const request=existingPreflightRequest(overlay);
-  if(!request.host_name)throw new Error('Enter a server name first.');
-  if(request.ssh.route!=='none'&&!request.ssh.host)throw new Error('Enter an SSH address or choose Manual.');
-  if(button){
-    button.disabled=true;
-    button.textContent='Checking';
-  }
-  const result=overlay.querySelector('[data-preflight-result]');
-  const summary=overlay.querySelector('[data-preflight-summary]');
-  const message=overlay.querySelector('[data-preflight-message]');
-  if(result)result.hidden=false;
-  if(summary)summary.textContent='Checking server';
-  if(message)message.textContent='Running read-only checks from Pharos.';
-  const response=await fetch('/setup/existing-host/preflight',{
-    method:'POST',
-    headers:{'content-type':'application/json','accept':'application/json'},
-    body:JSON.stringify(request),
-    cache:'no-store'
-  });
-  const payload=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(payload.error||'preflight could not be completed');
-  renderExistingPreflight(overlay,payload.preflight);
-}
-async function fetchProvisioningJob(id){
-  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(id)}`,{
-    credentials:'same-origin',
-    headers:{'accept':'application/json'},
-    cache:'no-store'
-  });
-  const payload=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(payload.error||'setup job could not be loaded');
-  return payload.job;
-}
-async function recoverPaidJobAfterActionError(overlay){
-  const job=overlay?.pharosProvisioningJob;
-  if(!job?.id||!job?.reviewed_plan)return false;
-  try{
-    const latest=await fetchProvisioningJob(job.id);
-    renderAssistantProvisioningJob(overlay,latest);
-  }catch(_error){
-    window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
-    overlay.dataset.assistantPaidActionPending='true';
-    const title=overlay.querySelector('#setup-assistant-title');
-    const copy=title?.parentElement?.querySelector('p');
-    const start=overlay.querySelector('[data-assistant-start]');
-    if(title)title.textContent='Create result unknown';
-    if(copy)copy.textContent='Pharos could not reload the durable attempt. Do not retry the paid action until status can be checked.';
-    if(start){start.disabled=true;setAssistantStartLabel(start,'Reload status to continue')}
-    syncAssistantStart(overlay);
-  }
-  return true;
-}
-async function confirmPaidProvisioningJob(overlay,start){
-  const job=overlay?.pharosProvisioningJob;
-  const plan=job?.reviewed_plan;
-  if(!job?.id||!plan?.plan_sha256)throw new Error('Persist the exact paid plan before authorizing it.');
-  if(paidPlanExpired(job)&&overlay.dataset.assistantPaidStage!=='reconcile'){
-    resetPaidPlanReview(overlay);
-    await loadProviderPlanReview(overlay);
-    return;
-  }
-  overlay.dataset.assistantPaidActionPending='true';
-  setAssistantStartLabel(start,'Authorizing');
-  start.disabled=true;
-  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/confirm`,{
-    method:'POST',
-    credentials:'same-origin',
-    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
-    body:JSON.stringify({plan_sha256:plan.plan_sha256,attended:true}),
-    cache:'no-store'
-  });
-  const payload=await response.json().catch(()=>({}));
-  if(!response.ok){
-    if(response.status===409){resetPaidPlanReview(overlay);await loadProviderPlanReview(overlay)}
-    throw new Error(payload.error||'The exact paid plan could not be authorized.');
-  }
-  if(!renderPaidPlanReview(overlay,payload.job,true))throw new Error('The authorized plan response was incomplete.');
-}
-async function createPaidProvisioningJob(overlay,start){
-  const job=overlay?.pharosProvisioningJob;
-  const plan=job?.reviewed_plan;
-  const executionState=String(job?.paid_execution?.state||'');
-  if(!job?.id||!plan?.plan_sha256||!job?.paid_authorization){
-    throw new Error('Authorize the exact persisted plan before creating the server.');
-  }
-  if(paidPlanExpired(job)&&overlay.dataset.assistantPaidStage!=='reconcile'&&executionState!=='claimed'){
-    resetPaidPlanReview(overlay);
-    await loadProviderPlanReview(overlay);
-    return;
-  }
-  overlay.dataset.assistantPaidActionPending='true';
-  setAssistantStartLabel(start,'Creating server');
-  start.disabled=true;
-  const title=overlay.querySelector('#setup-assistant-title');
-  const copy=title?.parentElement?.querySelector('p');
-  if(title)title.textContent='Creating authorized server';
-  if(copy)copy.textContent='Pharos is rechecking the exact plan before sending one provider request.';
-  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/create`,{
-    method:'POST',
-    credentials:'same-origin',
-    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
-    body:JSON.stringify({plan_sha256:plan.plan_sha256}),
-    cache:'no-store'
-  });
-  const payload=await response.json().catch(()=>({}));
-  if(!response.ok){
-    if(payload.job?.paid_execution?.state==='failed-closed'){
-      resetPaidPlanReview(overlay);
-      await loadProviderPlanReview(overlay);
-      return;
-    }
-    if(payload.job?.reviewed_plan)renderAssistantProvisioningJob(overlay,payload.job);
-    else if(response.status===409){resetPaidPlanReview(overlay);await loadProviderPlanReview(overlay)}
-    throw new Error(payload.error||'The authorized server could not be created.');
-  }
-  if(!payload.job)throw new Error('The provider create response was incomplete.');
-  renderProvisioningJob(overlay,payload.job);
-  if(payload.job.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
-}
-async function deleteTrackedProviderServer(overlay,button){
-  const job=overlay?.pharosProvisioningJob;
-  if(!job?.id)throw new Error('The tracked setup job is not available.');
-  const confirm=overlay.querySelector('[data-created-delete-confirm]');
-  const status=overlay.querySelector('[data-created-delete-status]');
-  if(!confirm?.checked)throw new Error('Confirm permanent deletion first.');
-  button.disabled=true;
-  button.setAttribute('aria-busy','true');
-  if(status)status.textContent='Deleting the tracked server…';
-  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/cleanup`,{
-    method:'POST',
-    credentials:'same-origin',
-    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
-    body:JSON.stringify({confirm:true}),
-    cache:'no-store'
-  });
-  const payload=await response.json().catch(()=>({}));
-  if(payload.job)renderProvisioningJob(overlay,payload.job);
-  if(!response.ok)throw new Error(payload.error||'Provider deletion could not be confirmed.');
-  return payload.cleanup||{};
-}
-function scheduleProvisioningPoll(overlay,id){
-  if(!id)return;
-  window.clearTimeout(window.pharosAssistantJobTimer);
-  window.pharosAssistantJobTimer=window.setTimeout(async()=>{
-    try{
-      const job=await fetchProvisioningJob(id);
-      renderProvisioningJob(overlay,job);
-      if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,id);
-    }catch(error){
-      showAssistantError(overlay,error.message||'Setup status could not be refreshed.');
-    }
-  },1500);
-}
-async function startProvisioningJob(overlay,start){
-  const state=assistantState(overlay);
-  const paidJob=overlay.pharosProvisioningJob;
-  if(state.path==='new'&&state.provider==='hetzner-cloud'&&paidJob?.reviewed_plan){
-    if(paidJob.paid_authorization)await createPaidProvisioningJob(overlay,start);
-    else await confirmPaidProvisioningJob(overlay,start);
-    return;
-  }
-  const body={provider:state.provider,template:state.template};
-  body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
-  body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
-  body.access_intent=setupIntentChoice(overlay,'access_intent','operator-only');
-  if(state.path==='new'){
-    const hostName=(overlay.querySelector('[data-new-host-name]')?.value||'').trim();
-    const role=(overlay.querySelector('[data-new-role]')?.value||'server').trim()||'server';
-    const location=(overlay.querySelector('[data-new-location]')?.value||'').trim();
-    const serverType=(overlay.querySelector('[data-new-server-type]')?.value||'').trim();
-    const image=(overlay.querySelector('[data-new-image]')?.value||'').trim();
-    const sshKey=(overlay.querySelector('[data-new-ssh-key]')?.value||'').trim();
-    if(!hostName)throw new Error('Enter a server name first.');
-    if(state.provider==='hetzner-cloud'){
-      if(!location)throw new Error('Enter a Hetzner location first.');
-      if(!serverType)throw new Error('Enter a Hetzner server type first.');
-      if(!image)throw new Error('Enter a Hetzner image first.');
-      if(!sshKey&&!overlay.pharosProviderRuntime?.default_ssh_key_configured){
-        throw new Error('Enter an existing Hetzner SSH public-key name first.');
-      }
-    }
-    body.host_name=hostName;
-    body.role=role;
-    body.is_nix=state.provider==='hetzner-cloud';
-    body.heartbeat_interval_secs=60;
-    if(location)body.location=location;
-    if(serverType)body.server_type=serverType;
-    if(image)body.image=image;
-    if(sshKey)body.ssh_key_ref=sshKey;
-    body.apply=false;
-  }else if(state.path==='existing'){
-    const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
-    const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
-    const preflight=overlay.pharosExistingPreflight||{};
-    if(!hostName)throw new Error('Enter a server name first.');
-    if(!template)throw new Error('Choose a bootstrap path first.');
-    body.provider='existing-host';
-    body.template=template;
-    body.host_name=hostName;
-    body.role=existingHostRole(overlay);
-    const isNix=existingHostIsNix(overlay);
-    if(isNix!==undefined)body.is_nix=isNix;
-    body.heartbeat_interval_secs=existingHeartbeatInterval(overlay);
-    body.ssh=existingPreflightRequest(overlay).ssh;
-    if(preflight.summary)body.preflight_summary=preflight.summary;
-    if(Array.isArray(preflight.checks)){
-      body.preflight_checks=preflight.checks.slice(0,12).map(check=>({
-        key:String(check.key||'check'),
-        label:String(check.label||check.key||'Check'),
-        state:String(check.state||'unknown'),
-        message:String(check.message||'No detail recorded.')
-      }));
-    }
-    body.apply=true;
-  }
-  setAssistantStartLabel(start,state.path==='new'?'Saving review':'Starting setup');
-  start.disabled=true;
-  const headers={'content-type':'application/json','accept':'application/json'};
-  if(state.path==='new'&&state.provider==='hetzner-cloud')headers['X-Pharos-Action']='1';
-  const response=await fetch('/setup/provisioning-jobs',{
-    method:'POST',
-    credentials:'same-origin',
-    headers,
-    body:JSON.stringify(body),
-    cache:'no-store'
-  });
-  const payload=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(payload.error||'setup job could not be started');
-  if(state.path==='new'&&state.provider==='hetzner-cloud'){
-    if(!renderPaidPlanReview(overlay,payload.job,true))throw new Error('The persisted paid-plan response was incomplete.');
-  }else{
-    renderProvisioningJob(overlay,payload.job);
-    setAssistantStartLabel(start,'Setup job recorded');
-    if(payload.job?.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
-  }
-}
-function setAssistantTemplate(template,write=true){
-  const overlay=document.querySelector('[data-setup-assistant]');
-  if(!overlay)return;
-  const provider=assistantProvider(overlay.dataset.assistantSelectedProvider||'');
-  const safeTemplate=assistantTemplate(template);
-  const nextTemplate=safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===provider?safeTemplate:'';
-  overlay.dataset.assistantSelectedTemplate=nextTemplate;
-  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
-    const visible=!btn.hidden&&btn.dataset.assistantTemplateProvider===provider;
-    btn.setAttribute('aria-pressed',String(visible&&btn.dataset.assistantTemplate===nextTemplate));
-  });
-  syncAssistantNext(overlay);
-  if(write){
-    const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
-  }
-}
-function setAssistantProvider(provider,write=true){
-  const overlay=document.querySelector('[data-setup-assistant]');
-  if(!overlay)return;
-  const safeProvider=assistantProvider(provider);
-  overlay.dataset.assistantSelectedProvider=safeProvider;
-  overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>{
-    btn.setAttribute('aria-pressed',String(btn.dataset.assistantProvider===safeProvider));
-  });
-  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
-    btn.hidden=!(safeProvider&&btn.dataset.assistantTemplateProvider===safeProvider);
-  });
-  if(ASSISTANT_TEMPLATE_PROVIDERS[assistantTemplate(overlay.dataset.assistantSelectedTemplate||'')]!==safeProvider){
-    setAssistantTemplate('',false);
-  }else{
-    setAssistantTemplate(overlay.dataset.assistantSelectedTemplate,false);
-  }
-  syncAssistantNext(overlay);
-  if(write){
-    const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
-  }
-}
-function setAssistantPath(path,write=true){
-  const overlay=document.querySelector('[data-setup-assistant]');
-  if(!overlay)return;
-  const safePath=assistantPath(path);
-  const previousPath=assistantPath(overlay.dataset.assistantSelectedPath||'');
-  overlay.dataset.assistantSelectedPath=safePath;
-  if(safePath!==previousPath){
-    delete overlay.dataset.assistantJobId;
-    delete overlay.dataset.assistantPaidStage;
-    overlay.dataset.existingBootstrapMethod='';
-    overlay.pharosProvisioningJob=null;
-    overlay.pharosExistingPreflight=null;
-    overlay.pharosProviderPlan=null;
-    overlay.pharosProviderRuntime=null;
-    showAssistantError(overlay);
-    const reviewDetails=overlay.querySelector('[data-assistant-review-details]');
-    if(reviewDetails)reviewDetails.open=false;
-  }
-  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>{
-    btn.setAttribute('aria-pressed',String(btn.dataset.assistantPath===safePath));
-  });
-  if(safePath!==previousPath){
-    const backupValue=safePath==='new'?'enroll-later':'deferred';
-    const backup=overlay.querySelector(`input[name="backup_intent"][value="${backupValue}"]`);
-    if(backup)backup.checked=true;
-    const confirm=overlay.querySelector('[data-assistant-confirm]');
-    if(confirm)confirm.checked=false;
-  }
-  if(safePath==='new'){
-    overlay.dataset.assistantStage='template';
-    setAssistantProvider('hetzner-cloud',false);
-    setAssistantTemplate('',false);
-  }else if(safePath==='existing'){
-    overlay.dataset.assistantStage='existing';
-    setAssistantProvider('',false);
-    setAssistantTemplate('',false);
-  }else{
-    overlay.dataset.assistantStage='choose';
-    setAssistantProvider('',false);
-    setAssistantTemplate('',false);
-  }
-  syncAssistantNext(overlay);
-  if(write){
-    const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
-  }
-}
-function setAssistantOpen(open,write=true){
-  const overlay=document.querySelector('[data-setup-assistant]');
-  if(!overlay)return;
-  const wasHidden=overlay.hidden;
-  if(open&&wasHidden&&document.activeElement instanceof HTMLElement)assistantReturnFocus=document.activeElement;
-  overlay.hidden=!open;
-  document.body.dataset.assistantOpen=open?'true':'false';
-  if(!open){
-    window.clearTimeout(window.pharosAssistantJobTimer);
-    window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
-    delete overlay.dataset.providerCreated;
-    delete overlay.dataset.assistantJobId;
-    delete overlay.dataset.assistantPaidStage;
-    overlay.pharosProvisioningJob=null;
-    const created=overlay.querySelector('[data-assistant-created]');
-    if(created)created.hidden=true;
-    const job=overlay.querySelector('[data-assistant-job]');
-    if(job)job.hidden=true;
-    showAssistantError(overlay);
-    setAssistantPath('',false);
-  }else if(!overlay.dataset.assistantStage){
-    overlay.dataset.assistantStage='choose';
-    syncAssistantNext(overlay);
-  }
-  if(write){
-    const state=assistantState(overlay);
-    writeAssistantUrl(open,state.path,state.provider,state.template,state.stage);
-  }
-  if(open)overlay.querySelector('[data-assistant-path]')?.focus();
-  else if(!wasHidden&&assistantReturnFocus?.isConnected){
-    assistantReturnFocus.focus();
-    assistantReturnFocus=null;
-  }
-}
-function restoreAssistantFromUrl(){
-  const overlay=document.querySelector('[data-setup-assistant]');
-  if(!overlay)return;
-  const params=new URLSearchParams(location.search);
-  const open=params.get(ASSISTANT_SETUP_PARAM)==='add-server';
-  setAssistantOpen(open,false);
-  if(!open){
-    setAssistantPath('',false);
-    return;
-  }
-  const path=assistantPath(params.get(ASSISTANT_PATH_PARAM));
-  setAssistantPath(path,false);
-  if(path==='new'){
-    setAssistantProvider(assistantProvider(params.get(ASSISTANT_PROVIDER_PARAM))||'hetzner-cloud',false);
-    setAssistantTemplate(params.get(ASSISTANT_TEMPLATE_PARAM),false);
-  }
-  const jobId=(params.get(ASSISTANT_JOB_PARAM)||'').trim();
-  if(jobId&&jobId.length<=128){
-    fetchProvisioningJob(jobId).then(job=>{
-      const paidReview=renderAssistantProvisioningJob(overlay,job);
-      if(!paidReview&&!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,job.id);
-    }).catch(error=>{
-      showAssistantError(overlay,error.message||'The setup job could not be loaded.');
-      if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
-        overlay.querySelector('[data-assistant-close]')?.focus();
-      }
-    });
-    return;
-  }
-  if(path==='new'){
-    const requestedStage=assistantStage(params.get(ASSISTANT_STAGE_PARAM));
-    overlay.dataset.assistantStage=assistantState(overlay).template&&requestedStage==='plan'?'plan':'template';
-    syncAssistantNext(overlay);
-    if(overlay.dataset.assistantStage==='plan'){
-      loadProviderPlanReview(overlay).catch(()=>updateProviderReadiness(overlay));
-    }
-  }else if(path==='existing'){
-    overlay.dataset.assistantStage='existing';
-    syncAssistantNext(overlay);
-  }
-}
-function initSetupAssistant(){
-  const overlay=document.querySelector('[data-setup-assistant]');
-  if(!overlay)return;
-  document.querySelectorAll('[data-onboard-open]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(true)));
-  overlay.querySelectorAll('[data-assistant-close]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(false)));
-  overlay.addEventListener('click',event=>{if(event.target===overlay)setAssistantOpen(false)});
-  document.addEventListener('keydown',event=>{
-    if(overlay.hidden)return;
-    if(event.key==='Escape'){
-      setAssistantOpen(false);
-      return;
-    }
-    if(event.key!=='Tab')return;
-    const focusable=[...overlay.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])')]
-      .filter(node=>node.getClientRects().length>0&&!node.closest('[hidden]'));
-    if(!focusable.length){
-      event.preventDefault();
-      overlay.querySelector('[data-assistant-close]')?.focus();
-      return;
-    }
-    const first=focusable[0];
-    const last=focusable[focusable.length-1];
-    if(!focusable.includes(document.activeElement)){
-      event.preventDefault();
-      (event.shiftKey?last:first).focus();
-      return;
-    }
-    if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}
-    else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}
-  });
-  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>setAssistantPath(btn.dataset.assistantPath)));
-  overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>btn.addEventListener('click',()=>setAssistantProvider(btn.dataset.assistantProvider)));
-  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>btn.addEventListener('click',()=>{
-    setAssistantTemplate(btn.dataset.assistantTemplate,false);
-    const selected=assistantState(overlay);
-    if(selected.provider==='manual-import'){
-      setAssistantPath('existing');
-      overlay.querySelector('[data-preflight-host-name]')?.focus();
-      return;
-    }
-    overlay.dataset.assistantStage='plan';
-    const confirm=overlay.querySelector('[data-assistant-confirm]');
-    if(confirm)confirm.checked=false;
-    const details=overlay.querySelector('[data-assistant-review-details]');
-    if(details)details.open=false;
-    showAssistantError(overlay);
-    syncAssistantNext(overlay);
-    const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
-    loadProviderPlanReview(overlay).catch(error=>{
-      updateProviderReadiness(overlay);
-      showAssistantError(overlay,error.message||'Provider readiness could not be checked.');
-    });
-  }));
-  overlay.querySelector('[data-preflight-form]')?.addEventListener('submit',async event=>{
-    event.preventDefault();
-    const button=overlay.querySelector('[data-preflight-check]');
-    const summary=overlay.querySelector('[data-preflight-summary]');
-    const message=overlay.querySelector('[data-preflight-message]');
-    try{
-      await runExistingPreflight(overlay,button);
-    }catch(error){
-      if(summary)summary.textContent='Preflight could not run';
-      if(message)message.textContent=error.message||'Check the server details and try again.';
-      showAssistantError(overlay,error.message||'Check the server details and try again.');
-      syncAssistantNext(overlay);
-    }finally{
-      if(button){
-        button.disabled=false;
-        button.textContent='Check server';
-      }
-    }
-  });
-  overlay.querySelector('[data-assistant-confirm]')?.addEventListener('change',event=>{
-    syncAssistantStart(overlay);
-  });
-  overlay.querySelectorAll('input[name="backup_intent"],input[name="location_intent"],input[name="access_intent"]').forEach(input=>{
-    input.addEventListener('change',()=>{
-      syncAssistantNext(overlay);
-      updateAssistantReview(overlay);
-    });
-  });
-  overlay.querySelectorAll('[data-new-host-name],[data-new-role],[data-new-location],[data-new-server-type],[data-new-image],[data-new-ssh-key]').forEach(input=>{
-    input.addEventListener('input',()=>{
-      updateAssistantReview(overlay);
-      updateProviderReadiness(overlay);
-    });
-  });
-  overlay.querySelector('[data-assistant-step-back]')?.addEventListener('click',()=>{
-    const before=assistantState(overlay);
-    const confirm=overlay.querySelector('[data-assistant-confirm]');
-    if(confirm)confirm.checked=false;
-    const details=overlay.querySelector('[data-assistant-review-details]');
-    if(details)details.open=false;
-    if(before.stage==='template'||before.stage==='existing'){
-      setAssistantPath('',false);
-    }else if(before.stage==='bootstrap'){
-      overlay.dataset.assistantStage='existing';
-    }else if(before.stage==='plan'){
-      overlay.dataset.assistantStage=before.path==='new'?'template':'bootstrap';
-    }
-    showAssistantError(overlay);
-    syncAssistantNext(overlay);
-    const state=assistantState(overlay);
-    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
-    if(state.stage==='template'){
-      overlay.querySelector(`[data-assistant-template="${state.template}"]`)?.focus();
-    }else if(state.stage==='existing'){
-      overlay.querySelector('[data-preflight-host-name]')?.focus();
-    }else if(state.stage==='bootstrap'){
-      overlay.querySelector('[data-bootstrap-option][data-available="true"]')?.focus();
-    }else{
-      overlay.querySelector('[data-assistant-path]')?.focus();
-    }
-  });
-  overlay.querySelector('[data-assistant-finish]')?.addEventListener('click',()=>{
-    const setup=overlay.querySelector('[data-created-setup]');
-    if(setup){
-      setup.hidden=false;
-      setup.scrollIntoView({block:'nearest'});
-    }
-  });
-  overlay.querySelector('[data-created-delete-confirm]')?.addEventListener('change',event=>{
-    const remove=overlay.querySelector('[data-created-delete]');
-    if(remove)remove.disabled=!event.currentTarget.checked;
-  });
-  overlay.querySelector('[data-created-delete]')?.addEventListener('click',async event=>{
-    const button=event.currentTarget;
-    const status=overlay.querySelector('[data-created-delete-status]');
-    try{
-      await deleteTrackedProviderServer(overlay,button);
-    }catch(error){
-      if(status)status.textContent=error.message||'Provider deletion could not be confirmed.';
-    }finally{
-      button.removeAttribute('aria-busy');
-      const deleted=overlay.pharosProvisioningJob?.terminal_outcome==='rolled-back';
-      const confirm=overlay.querySelector('[data-created-delete-confirm]');
-      button.disabled=deleted||!confirm?.checked;
-    }
-  });
-  overlay.querySelector('[data-assistant-later]')?.addEventListener('click',()=>setAssistantOpen(false));
-  overlay.querySelector('[data-assistant-start]')?.addEventListener('click',async event=>{
-    if(event.currentTarget.disabled)return;
-    const start=event.currentTarget;
-    showAssistantError(overlay);
-    try{
-      await startProvisioningJob(overlay,start);
-    }catch(error){
-      const paidRecovered=await recoverPaidJobAfterActionError(overlay);
-      if(!paidRecovered){
-        updateAssistantReview(overlay);
-        syncAssistantStart(overlay);
-      }
-      showAssistantError(overlay,error.message||'The setup job could not be created.');
-    }
-  });
-  window.addEventListener('popstate',restoreAssistantFromUrl);
-  restoreAssistantFromUrl();
-}
-function setProviderActionStatus(message,error=false){
-  document.querySelectorAll('[data-provider-action-status]').forEach(status=>{
-    status.textContent=message||'';
-    status.dataset.error=error?'true':'false';
-  });
-}
-async function runProviderAction(button,url,body){
-  const original=button?.innerHTML||'';
-  if(button){
-    button.disabled=true;
-    button.setAttribute('aria-busy','true');
-  }
-  setProviderActionStatus('Working…');
-  try{
-    const options={method:'POST',credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json','X-Pharos-Action':'1'}};
-    if(body!==undefined){
-      options.headers['Content-Type']='application/json';
-      options.body=JSON.stringify(body);
-    }
-    const response=await fetch(url,options);
-    const payload=await response.json().catch(()=>({}));
-    if(!response.ok)throw new Error(payload.error||'The provider action did not complete.');
-    location.reload();
-  }catch(error){
-    setProviderActionStatus(error.message||'The provider action did not complete.',true);
-    if(button){
-      button.disabled=false;
-      button.removeAttribute('aria-busy');
-      button.innerHTML=original;
-    }
-  }
-}
-function showProviderGuidePanel(guide,name){
-  const panel=guide.querySelector(`[data-guide-panel="${name}"]`);
-  if(!panel)return;
-  guide.querySelectorAll('[data-guide-panel]').forEach(item=>{item.hidden=item!==panel});
-  guide.querySelectorAll('[data-guide-nav]').forEach(button=>{
-    if(button.dataset.guideNav===name)button.setAttribute('aria-current','step');
-    else button.removeAttribute('aria-current');
-  });
-  panel.focus({preventScroll:true});
-  panel.scrollIntoView({behavior:'smooth',block:'nearest'});
-}
-function setProviderGuideLanguage(guide,language){
-  const selected=language==='de'?'de':'en';
-  guide.dataset.guideLanguage=selected;
-  guide.querySelectorAll('[data-guide-language]').forEach(button=>{
-    button.setAttribute('aria-pressed',button.dataset.guideLanguage===selected?'true':'false');
-  });
-  guide.querySelectorAll('[data-guide-text-en][data-guide-text-de]').forEach(node=>{
-    node.textContent=selected==='de'?node.dataset.guideTextDe:node.dataset.guideTextEn;
-    node.lang=selected;
-  });
-  guide.querySelectorAll('[data-guide-href-en][data-guide-href-de]').forEach(link=>{
-    link.href=selected==='de'?link.dataset.guideHrefDe:link.dataset.guideHrefEn;
-  });
-  try{localStorage.setItem('pharos-provider-guide-language',selected)}catch(_error){}
-}
-function showProviderGuideNetwork(guide,network){
-  const selected=['fixed','dynamic','tailscale'].includes(network)?network:'';
-  guide.querySelectorAll('[data-guide-network]').forEach(button=>{
-    button.setAttribute('aria-pressed',button.dataset.guideNetwork===selected?'true':'false');
-  });
-  guide.querySelectorAll('[data-guide-network-panel]').forEach(panel=>{
-    panel.hidden=panel.dataset.guideNetworkPanel!==selected;
-  });
-  const workflow=guide.querySelector('[data-guide-network-workflow]');
-  if(workflow)workflow.hidden=selected!=='fixed'&&selected!=='dynamic';
-  const finish=guide.querySelector('[data-guide-firewall-finish]');
-  if(finish)finish.disabled=selected!=='fixed'&&selected!=='dynamic';
-  guide.querySelector(`[data-guide-network-panel="${selected}"]`)?.focus({preventScroll:true});
-}
-function initProviderSetupGuide(){
-  const guide=document.querySelector('[data-provider-setup-guide]');
-  if(!guide)return;
-  let storedLanguage='';
-  try{storedLanguage=localStorage.getItem('pharos-provider-guide-language')||''}catch(_error){}
-  const initialLanguage=storedLanguage==='de'||storedLanguage==='en'
-    ?storedLanguage
-    :(navigator.language||'').toLowerCase().startsWith('de')?'de':'en';
-  setProviderGuideLanguage(guide,initialLanguage);
-  guide.querySelectorAll('[data-guide-language]').forEach(button=>button.addEventListener('click',()=>{
-    setProviderGuideLanguage(guide,button.dataset.guideLanguage);
-  }));
-  showProviderGuidePanel(guide,guide.dataset.initialStep||'api');
-  guide.querySelectorAll('[data-guide-nav]').forEach(button=>button.addEventListener('click',()=>{
-    showProviderGuidePanel(guide,button.dataset.guideNav);
-  }));
-  guide.querySelectorAll('[data-guide-next]').forEach(button=>button.addEventListener('click',()=>{
-    showProviderGuidePanel(guide,button.dataset.guideNext);
-  }));
-  guide.querySelectorAll('[data-guide-platform]').forEach(button=>button.addEventListener('click',()=>{
-    const platform=button.dataset.guidePlatform;
-    guide.querySelectorAll('[data-guide-platform]').forEach(choice=>choice.setAttribute('aria-pressed',choice===button?'true':'false'));
-    guide.querySelectorAll('[data-guide-platform-panel]').forEach(panel=>{panel.hidden=panel.dataset.guidePlatformPanel!==platform});
-    guide.querySelector(`[data-guide-platform-panel="${platform}"]`)?.focus({preventScroll:true});
-  }));
-  guide.querySelectorAll('[data-guide-network]').forEach(button=>button.addEventListener('click',()=>{
-    showProviderGuideNetwork(guide,button.dataset.guideNetwork||'');
-  }));
-  guide.querySelectorAll('[data-copy-command]').forEach(button=>button.addEventListener('click',async()=>{
-    const command=document.getElementById(button.dataset.copyCommand||'');
-    const status=button.closest('[data-guide-panel]')?.querySelector('[data-guide-copy-status]');
-    if(!command||!navigator.clipboard?.writeText){
-      if(status)status.textContent='Copy is unavailable here. Select the command text manually.';
-      return;
-    }
-    try{
-      await navigator.clipboard.writeText(command.textContent||'');
-      if(status)status.textContent='Safe command copied. No key or credential was copied.';
-    }catch(_error){
-      if(status)status.textContent='Copy was blocked by the browser. Select the command text manually.';
-    }
-  }));
-  guide.querySelectorAll('[data-guide-provider-test]').forEach(button=>button.addEventListener('click',()=>{
-    runProviderAction(button,'/settings/providers/hetzner-cloud/test');
-  }));
-  guide.querySelectorAll('[data-guide-open-details]').forEach(button=>button.addEventListener('click',()=>{
-    const details=document.querySelector('[data-provider-details]');
-    if(!details){
-      setProviderActionStatus('Refresh the provider choices first.',true);
-      return;
-    }
-    details.open=true;
-    details.scrollIntoView({behavior:'smooth',block:'nearest'});
-    setTimeout(()=>details.querySelector('select')?.focus(),180);
-  }));
-}
-function initProviderConnection(){
-  const details=document.querySelector('[data-provider-details]');
-  document.querySelectorAll('[data-provider-open-details]').forEach(button=>button.addEventListener('click',()=>{
-    if(!details){
-      setProviderActionStatus('Test the connection first to load current choices.',true);
-      return;
-    }
-    details.open=true;
-    details.scrollIntoView({behavior:'smooth',block:'nearest'});
-    setTimeout(()=>details.querySelector('select')?.focus(),180);
-  }));
-  document.querySelectorAll('[data-provider-test]').forEach(button=>button.addEventListener('click',()=>{
-    runProviderAction(button,'/settings/providers/hetzner-cloud/test');
-  }));
-  document.querySelector('[data-provider-preferences]')?.addEventListener('submit',event=>{
-    event.preventDefault();
-    const form=event.currentTarget;
-    if(!form.reportValidity())return;
-    const values=new FormData(form);
-    runProviderAction(form.querySelector('button[type="submit"]'),'/settings/providers/hetzner-cloud/preferences',{
-      default_location:String(values.get('default_location')||''),
-      ssh_key_ref:String(values.get('ssh_key_ref')||''),
-      firewall_ref:String(values.get('firewall_ref')||'')
-    });
-  });
-  document.querySelector('[data-provider-disconnect]')?.addEventListener('click',event=>{
-    if(!window.confirm('Disconnect Hetzner Cloud from Pharos? The encrypted credential remains in Janus.'))return;
-    runProviderAction(event.currentTarget,'/settings/providers/hetzner-cloud/disconnect',{confirm:true});
-  });
-}
-function updateUrlState(){
-  const main=document.querySelector('main');
-  const sort=document.querySelector('[data-sort]')?.value||'attention';
-  const params=new URLSearchParams(location.search);
-  params.set('view',main?.dataset.view||'grid');
-  params.set('sort',sort);
-  params.set('filter',activeLiveFilter);
-  params.set('signal',signalWindow.key);
-  const url=location.pathname+'?'+params.toString();
-  history.replaceState(null,'',url);
-}
-function initControls(){
-  const params=new URLSearchParams(location.search);
-  const view=params.get('view')||decodeURIComponent(cookie('pharos_view'))||'grid';
-  const sort=params.get('sort')||decodeURIComponent(cookie('pharos_sort'))||'attention';
-  const search=decodeURIComponent(cookie('pharos_search'));
-  const liveFilter=params.get('filter')||decodeURIComponent(cookie('pharos_live_filter'))||'all';
-  const selectedSignalWindow=params.get('signal')||decodeURIComponent(cookie('pharos_signal_window'))||SIGNAL_WINDOWS[0].key;
-  applyView(view,false);
-  applySort(sort,false);
-  applyFilter(search,false);
-  applyLiveFilter(liveFilter,false);
-  applySignalWindow(selectedSignalWindow,false);
-  document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
-  document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
-  document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
-  document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
-  document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
-  bindFreeformDrag();
-  initHostActions();
-  openRequestedWorkflow();
-  initSetupAssistant();
-}
-const REFRESH_MS=10000;
-const DIALOG_REFRESH_MS=60000;
-const FETCH_TIMEOUT_MS=9000;
-const MAX_SNAPSHOT_AGE_MS=REFRESH_MS*2+FETCH_TIMEOUT_MS;
-let refreshTimer=null;
-let refreshPromise=null;
-let refreshAbort=null;
-let refreshGeneration=0;
-let recoveryPromise=null;
-let lastSuccessfulRefreshAt=Date.now();
-function fleetMain(){return document.querySelector('main[data-fleet-sync-state]')}
-function fleetSnapshotFresh(at=Date.now()){
-  return !fleetMain()||at-lastSuccessfulRefreshAt<=MAX_SNAPSHOT_AGE_MS;
-}
-function fleetSnapshotLabel(asof){
-  const label=asof?.dataset.snapshotLabel||asof?.textContent||'last update unavailable';
-  return label.startsWith('as of ')?'last update '+label.slice(6):label;
-}
-function setFleetSyncState(state){
-  const main=fleetMain();
-  if(!main)return;
-  main.dataset.fleetSyncState=state;
-  const asof=main.querySelector('[data-as-of]');
-  if(!asof)return;
-  if(!asof.dataset.snapshotLabel)asof.dataset.snapshotLabel=asof.textContent||'';
-  asof.dataset.refreshState=state;
-  if(state==='syncing')asof.textContent='Syncing\u2026 \u00b7 '+fleetSnapshotLabel(asof);
-  else if(state==='stale')asof.textContent='Data out of date \u00b7 '+fleetSnapshotLabel(asof);
-  else asof.textContent=asof.dataset.snapshotLabel;
-}
-function setFleetSnapshotLabel(now){
-  const asof=fleetMain()?.querySelector('[data-as-of]');
-  if(!asof)return;
-  asof.dataset.snapshotLabel='as of '+clock(now);
-}
-function updateFleetSummary(hosts){
-  const counts={all:hosts.length,live:0,stale:0,down:0};
-  hosts.forEach(host=>{if(['live','stale','down'].includes(host.liveness))counts[host.liveness]++});
-  Object.entries(counts).forEach(([key,value])=>{
-    const target=document.querySelector('[data-summary-count="'+key+'"]');
-    if(target)target.textContent=String(value);
-  });
-}
-function validFleetSnapshot(data){
-  if(!data||!Number.isFinite(Number(data.as_of))||!Array.isArray(data.hosts))return false;
-  const names=data.hosts.map(host=>host?.name);
-  return new Set(names).size===names.length&&data.hosts.every(host=>host&&typeof host.name==='string'&&host.name&&['live','stale','down','awaiting_first_heartbeat'].includes(host.liveness));
-}
-function fleetMembershipMatches(hosts){
-  const grid=document.querySelector('[data-grid]');
-  if(!grid)return true;
-  const rendered=new Set(Array.from(grid.querySelectorAll('.card[data-host][data-host-surface="runtime"]')).map(card=>card.dataset.host));
-  const incoming=new Set(hosts.map(host=>host.name));
-  return rendered.size===incoming.size&&Array.from(rendered).every(name=>incoming.has(name));
-}
-function applyFleetSnapshot(data){
-  if(!validFleetSnapshot(data))return false;
-  const hosts=data.hosts;
-  if(!fleetMembershipMatches(hosts)){
-    window.location.reload();
-    return false;
-  }
-  const now=Number(data.as_of);
-  for(const h of hosts){
-    const surfaces=hostSurfaces(h.name);
-    for(const card of surfaces){
-      const live=h.liveness;
-      card.dataset.live=live;
-      const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences);
-      const backup=backupInfo(h,now);
-      const muted=mutedInfo(h.preferences);
-      card.dataset.sev=String(attention.rank ?? sevFor(live));
-      card.dataset.last=h.last_seen ?? 0;
-      card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+kernelSearch(h.kernel)+' '+muted.search).toLowerCase().trim();
-      const word=card.querySelector('[data-status-word]');
-      if(word)word.textContent=words[h.liveness]||h.liveness;
-      setReason(card,attention);
-      updateKernel(card,h);
-      updateMuted(card,muted);
-      updatePreferenceState(card,h);
-      updateHostActionState(card,h,backup);
-      const fresh=card.querySelector('[data-fresh]');
-      if(fresh)fresh.innerHTML=freshHtml(h.freshness);
-      updateBackup(card,backup);
-      setSeen(card,h.last_seen,now);
-      setCardAsOf(card,now);
-      const beat=card.querySelector('.beat');
-      if(beat){
-        const previous=Number(beat.dataset.last);
-        const last=h.last_seen == null ? NaN : Number(h.last_seen);
-        const interval=h.heartbeat_interval_secs || 60;
-        const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
-        const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
-        beat.dataset.interval=interval;
-        setBeatHistory(beat,beats,interval);
-        updateSignal(card,signalInfo(beats,last,interval,now));
-        if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
-          beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
-          flashBeat(beat);
-        }
-        beat.dataset.ready='true';
-        beat.dataset.last=Number.isFinite(last)?String(last):'';
-        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
-      }
-    }
-  }
-  updateFleetSummary(hosts);
-  applySort(document.querySelector('[data-sort]')?.value||'attention',false);
-  applySurfaceFilters(false);
-  setFleetSnapshotLabel(now);
-  return true;
-}
-function clearRefreshTimer(){
-  if(refreshTimer!=null){
-    clearTimeout(refreshTimer);
-    refreshTimer=null;
-  }
-}
-function nextRefreshDelay(){
-  return document.body.dataset.hostActionDialogOpen==='true'?DIALOG_REFRESH_MS:REFRESH_MS;
-}
-function scheduleRefresh(delay=nextRefreshDelay()){
-  clearRefreshTimer();
-  if(!fleetMain()||document.hidden||(typeof document.hasFocus==='function'&&!document.hasFocus()))return;
-  refreshTimer=setTimeout(()=>refresh('timer'),delay);
-}
-function abandonRefresh(){
-  clearRefreshTimer();
-  if(refreshAbort)refreshAbort.abort();
-  refreshGeneration++;
-  refreshAbort=null;
-  refreshPromise=null;
-}
-async function refresh(reason='manual',options={}){
-  if(!fleetMain())return false;
-  clearRefreshTimer();
-  if(options.force===true&&refreshPromise)abandonRefresh();
-  if(refreshPromise)return refreshPromise;
-  const controller=new AbortController();
-  const generation=++refreshGeneration;
-  refreshAbort=controller;
-  const timeout=setTimeout(()=>controller.abort(),FETCH_TIMEOUT_MS);
-  refreshPromise=(async()=>{
-  try{
-    const res=await fetch('/hosts.json?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin',signal:controller.signal});
-    const contentType=String(res.headers.get('content-type')||'').toLowerCase();
-    if(!res.ok||res.redirected||!contentType.includes('application/json'))throw new Error('fleet snapshot unavailable');
-    const data=await res.json();
-    if(generation!==refreshGeneration)return false;
-    if(!validFleetSnapshot(data))throw new Error('fleet snapshot invalid');
-    if(!applyFleetSnapshot(data))return false;
-    lastSuccessfulRefreshAt=Date.now();
-    setFleetSyncState('current');
-    resumeBeatClock();
-    return true;
-  }catch(error){
-    if(generation===refreshGeneration&&(options.recovery===true||!fleetSnapshotFresh()))setFleetSyncState('stale');
-    return false;
-  }
-  finally{
-    clearTimeout(timeout);
-    if(generation===refreshGeneration){
-      if(refreshAbort===controller)refreshAbort=null;
-      refreshPromise=null;
-      scheduleRefresh();
-    }
-  }
-  })();
-  return refreshPromise;
-}
-function suspendFleet(){
-  stopBeatClock();
-  abandonRefresh();
-  recoveryPromise=null;
-}
-function recoverFleet(reason='foreground'){
-  if(!fleetMain()||document.hidden)return Promise.resolve(false);
-  if(recoveryPromise)return recoveryPromise;
-  stopBeatClock();
-  setFleetSyncState('syncing');
-  let recoveryRun;
-  recoveryRun=refresh(reason,{force:true,recovery:true}).finally(()=>{if(recoveryPromise===recoveryRun)recoveryPromise=null});
-  recoveryPromise=recoveryRun;
-  return recoveryPromise;
-}
-function resumeRefresh(reason){
-  if(document.hidden){
-    suspendFleet();
-    return Promise.resolve(false);
-  }
-  return recoverFleet(reason);
-}
-document.addEventListener('visibilitychange',()=>{if(document.hidden)suspendFleet();else recoverFleet('visible')});
-window.addEventListener('blur',suspendFleet);
-window.addEventListener('focus',()=>recoverFleet('focus'));
-window.addEventListener('pageshow',event=>{if(event.persisted||!fleetSnapshotFresh())recoverFleet('pageshow')});
-window.addEventListener('online',()=>recoverFleet('online'));
-document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
-document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
-initControls();
-initProviderConnection();
-initProviderSetupGuide();
-setFleetSyncState('current');
-resumeBeatClock();
-scheduleRefresh(3000);
-</script></body></html>"#;
-
-const HEARTBEAT_HISTORY_DOTS: usize = 12;
-const HEARTBEAT_EXPECT_X: f64 = 64.0;
-const HEARTBEAT_STALE_X: f64 = 82.0;
-const SIGNAL_DEFAULT_WINDOW_LABEL: &str = "10m";
-const SIGNAL_DEFAULT_WINDOW_SECS: i64 = 10 * 60;
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -8106,50 +370,39 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_beacon_token_mode(value: &str) -> Option<BeaconTokenMode> {
+fn env_bool(name: &str) -> Result<Option<bool>, String> {
+    let Some(value) = env_nonempty(name) else {
+        return Ok(None);
+    };
+    parse_bool(&value)
+        .map(Some)
+        .ok_or_else(|| format!("{name} must be one of true/false, 1/0, yes/no, or on/off"))
+}
+
+fn parse_beacon_token_mode(value: &str) -> Result<BeaconTokenMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "local" | "mvp" => Some(BeaconTokenMode::Local),
-        "dual" | "migration" => Some(BeaconTokenMode::Dual),
-        "janus" | "forge" | "warden" => Some(BeaconTokenMode::Janus),
-        _ => None,
+        "local" | "mvp" => Ok(BeaconTokenMode::Local),
+        "dual" | "migration" => Ok(BeaconTokenMode::Dual),
+        "janus" | "forge" | "warden" => Ok(BeaconTokenMode::Janus),
+        _ => Err(format!(
+            "unknown PHAROS_BEACON_TOKEN_MODE value {value:?}; expected local, dual, or janus"
+        )),
     }
 }
 
-fn janus_token_hash_sources_from_env() -> Vec<JanusTokenHashSource> {
-    let mut sources = Vec::new();
-    if let Some(value) = env_nonempty("PHAROS_BEACON_TOKEN_HASH_FILES") {
-        sources.extend(
-            parse_path_list(&value)
-                .into_iter()
-                .map(JanusTokenHashSource::File),
-        );
-    }
+fn janus_token_generation_root_from_env() -> Result<Option<PathBuf>, String> {
     for name in [
+        "PHAROS_BEACON_TOKEN_HASH_FILES",
         "PHAROS_BEACON_TOKEN_HASH_FILE",
         "PHAROS_JANUS_BEACON_TOKEN_HASH_FILE",
     ] {
-        if let Some(path) = env_nonempty(name) {
-            sources.push(JanusTokenHashSource::File(PathBuf::from(path)));
+        if env_nonempty(name).is_some() {
+            return Err(format!(
+                "{name} uses the retired v1 per-file contract; configure PHAROS_BEACON_TOKEN_HASH_DIR with a v2 generation root"
+            ));
         }
     }
-    if let Some(path) = env_nonempty("PHAROS_BEACON_TOKEN_HASH_DIR") {
-        sources.push(JanusTokenHashSource::Dir(PathBuf::from(path)));
-    }
-    sources
-}
-
-fn parse_path_list(value: &str) -> Vec<PathBuf> {
-    value
-        .split(',')
-        .filter_map(|path| {
-            let path = path.trim();
-            if path.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(path))
-            }
-        })
-        .collect()
+    Ok(env_nonempty("PHAROS_BEACON_TOKEN_HASH_DIR").map(PathBuf::from))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -8188,6 +441,13 @@ fn token_hash(token: &str) -> String {
     hex(&Sha256::digest(token.as_bytes()))
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn local_token_matches(store: &Store, host: &str, expected_hash: &str) -> bool {
     store
         .token_hash_for(host)
@@ -8199,369 +459,6 @@ fn new_beacon_token() -> std::io::Result<String> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(format!("pharos_{}", hex(&bytes)))
 }
-
-const JANUS_BEACON_TOKEN_HASH_SCHEMA: &str = "inspr.pharos.beacon-token-hashes.v1";
-
-#[derive(Debug, Deserialize)]
-struct JanusTokenHashFile {
-    #[serde(default)]
-    schema: Option<String>,
-    #[serde(default)]
-    hosts: Vec<JanusTokenHashHost>,
-    #[serde(default)]
-    tokens: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct JanusTokenHashHost {
-    name: String,
-    #[serde(alias = "tokenHash", alias = "token_hash", alias = "sha256")]
-    token_sha256: String,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum JanusTokenHashError {
-    NotConfigured,
-    Read,
-    Parse,
-    UnsupportedSchema,
-    EmptyHost,
-    InvalidHash,
-    DuplicateHost,
-}
-
-impl std::fmt::Display for JanusTokenHashError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotConfigured => write!(f, "janus token hash file is not configured"),
-            Self::Read => write!(f, "janus token hash source could not be read"),
-            Self::Parse => write!(f, "janus token hash file could not be parsed"),
-            Self::UnsupportedSchema => write!(f, "janus token hash file schema is unsupported"),
-            Self::EmptyHost => write!(f, "janus token hash file contains an empty host"),
-            Self::InvalidHash => write!(f, "janus token hash file contains an invalid hash"),
-            Self::DuplicateHost => write!(f, "janus token hash file contains a duplicate host"),
-        }
-    }
-}
-
-fn load_janus_token_hashes(
-    sources: &[JanusTokenHashSource],
-) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
-    if sources.is_empty() {
-        return Err(JanusTokenHashError::NotConfigured);
-    }
-    let mut hashes = BTreeMap::new();
-    for source in sources {
-        match source {
-            JanusTokenHashSource::File(path) => {
-                merge_janus_token_hashes(&mut hashes, load_janus_token_hash_file(path)?)?;
-            }
-            JanusTokenHashSource::Dir(path) => {
-                for path in janus_token_hash_dir_files(path)? {
-                    merge_janus_token_hashes(&mut hashes, load_janus_token_hash_file(&path)?)?;
-                }
-            }
-        }
-    }
-    if hashes.is_empty() {
-        return Err(JanusTokenHashError::NotConfigured);
-    }
-    Ok(hashes)
-}
-
-fn janus_token_hash_dir_files(path: &Path) -> Result<Vec<PathBuf>, JanusTokenHashError> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(path).map_err(|_| JanusTokenHashError::Read)? {
-        let entry = entry.map_err(|_| JanusTokenHashError::Read)?;
-        let metadata = entry.metadata().map_err(|_| JanusTokenHashError::Read)?;
-        if !metadata.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Err(JanusTokenHashError::Read);
-        };
-        if file_name.starts_with('.') {
-            continue;
-        }
-        let is_json = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
-        if is_json {
-            files.push(path);
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn merge_janus_token_hashes(
-    target: &mut BTreeMap<String, String>,
-    next: BTreeMap<String, String>,
-) -> Result<(), JanusTokenHashError> {
-    for (host, hash) in next {
-        if target.insert(host.clone(), hash).is_some() {
-            return Err(JanusTokenHashError::DuplicateHost);
-        }
-    }
-    Ok(())
-}
-
-fn load_janus_token_hash_file(
-    path: &Path,
-) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
-    let contents = fs::read_to_string(path).map_err(|_| JanusTokenHashError::Read)?;
-    parse_janus_token_hashes(&contents)
-}
-
-fn parse_janus_token_hashes(
-    contents: &str,
-) -> Result<BTreeMap<String, String>, JanusTokenHashError> {
-    let payload: JanusTokenHashFile =
-        serde_json::from_str(contents).map_err(|_| JanusTokenHashError::Parse)?;
-    if let Some(schema) = payload.schema.as_deref() {
-        if schema != JANUS_BEACON_TOKEN_HASH_SCHEMA {
-            return Err(JanusTokenHashError::UnsupportedSchema);
-        }
-    }
-
-    let mut hashes = BTreeMap::new();
-    for (host, hash) in payload.tokens.into_iter().chain(
-        payload
-            .hosts
-            .into_iter()
-            .map(|host| (host.name, host.token_sha256)),
-    ) {
-        let host = host.trim().to_string();
-        let hash = hash.trim().to_ascii_lowercase();
-        if host.is_empty() {
-            return Err(JanusTokenHashError::EmptyHost);
-        }
-        if !is_sha256_hex(&hash) {
-            return Err(JanusTokenHashError::InvalidHash);
-        }
-        if hashes.insert(host.clone(), hash).is_some() {
-            return Err(JanusTokenHashError::DuplicateHost);
-        }
-    }
-    Ok(hashes)
-}
-
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn release_label() -> String {
-    format!("v{APP_VERSION}")
-}
-
-fn changelog_html() -> String {
-    let mut html = String::new();
-    let mut in_list = false;
-    for line in CHANGELOG_MD.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if in_list {
-                html.push_str("</ul>");
-                in_list = false;
-            }
-            continue;
-        }
-        if let Some(text) = trimmed.strip_prefix("## ") {
-            if in_list {
-                html.push_str("</ul>");
-                in_list = false;
-            }
-            html.push_str(&format!("<h3>{}</h3>", html_escape(text)));
-        } else if let Some(text) = trimmed.strip_prefix("# ") {
-            if in_list {
-                html.push_str("</ul>");
-                in_list = false;
-            }
-            html.push_str(&format!("<h2>{}</h2>", html_escape(text)));
-        } else if let Some(text) = trimmed.strip_prefix("- ") {
-            if !in_list {
-                html.push_str("<ul>");
-                in_list = true;
-            }
-            html.push_str(&format!("<li>{}</li>", html_escape(text)));
-        } else {
-            if in_list {
-                html.push_str("</ul>");
-                in_list = false;
-            }
-            html.push_str(&format!("<p>{}</p>", html_escape(trimmed)));
-        }
-    }
-    if in_list {
-        html.push_str("</ul>");
-    }
-    html
-}
-
-fn release_dialog() -> String {
-    format!(
-        r#"<section class="release-overlay" data-release-modal hidden aria-label="release history"><div class="release-backdrop" data-release-close></div><div class="release-sheet" role="dialog" aria-modal="true" aria-labelledby="release-history-title"><header class="release-head"><div><h2 id="release-history-title">Release history</h2><p>Running {version} · build {commit}</p></div><button class="release-close" type="button" data-release-close>Close</button></header><div class="release-body">{history}</div></div></section>"#,
-        version = html_escape(&release_label()),
-        commit = html_escape(GIT_COMMIT),
-        history = changelog_html()
-    )
-}
-
-const RELEASE_HISTORY_PORTAL: &str = r#"<script>
-(()=>{
-  const script=document.currentScript;
-  const modal=document.querySelector('[data-release-modal]');
-  const open=document.querySelector('[data-release-open]');
-  if(!modal||!open){script?.remove();return}
-  document.body.appendChild(modal);
-  modal.dataset.releasePortal='body';
-  modal.setAttribute('aria-hidden','true');
-  let opener=null;
-  const closeButton=modal.querySelector('.release-close');
-  function show(){
-    opener=document.activeElement;
-    modal.hidden=false;
-    modal.removeAttribute('aria-hidden');
-    document.body.dataset.releaseOpen='true';
-    closeButton?.focus();
-  }
-  function hide(){
-    modal.hidden=true;
-    modal.setAttribute('aria-hidden','true');
-    delete document.body.dataset.releaseOpen;
-    if(opener&&typeof opener.focus==='function')opener.focus();
-  }
-  open.addEventListener('click',show);
-  modal.querySelectorAll('[data-release-close]').forEach(el=>el.addEventListener('click',hide));
-  document.addEventListener('keydown',event=>{
-    if(event.key==='Escape'&&!modal.hidden){event.preventDefault();hide()}
-  });
-  script?.remove();
-})();
-</script>"#;
-
-const SIDEBAR_MOTION_RUNTIME: &str = r#"<script>
-(()=>{
-  const script=document.currentScript;
-  const sidebar=document.querySelector('[data-sidebar]');
-  const video=sidebar?.querySelector('[data-sidebar-motion]');
-  if(!sidebar||!video){script?.remove();return}
-  const storageKey='pharos.sidebar.still.v1';
-  const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
-  const desktop=window.matchMedia('(min-width: 901px)');
-  const connection=navigator.connection;
-  let toggle=null;
-  let note=null;
-  let playbackFailed=false;
-  let preferStill=false;
-  try{preferStill=localStorage.getItem(storageKey)==='true'}catch(_error){}
-  video.muted=true;
-
-  function savePreference(){
-    try{localStorage.setItem(storageKey,preferStill?'true':'false')}catch(_error){}
-  }
-  function dataSaverEnabled(){return connection?.saveData===true}
-  function systemRequiresStill(){
-    return preferStill||reducedMotion.matches||!desktop.matches||dataSaverEnabled();
-  }
-  function syncToggle(){
-    if(toggle)toggle.checked=preferStill;
-    if(!note)return
-    if(preferStill)note.textContent='Gentle motion is off.';
-    else if(reducedMotion.matches)note.textContent='Motion is off for reduced-motion.';
-    else if(dataSaverEnabled())note.textContent='Motion is off for data saving.';
-    else if(!desktop.matches)note.textContent='Motion is shown on wider screens.';
-    else if(playbackFailed)note.textContent='Motion could not play; using the still image.';
-    else note.textContent='Gentle motion is on.';
-  }
-  function unloadMotion(){
-    video.pause();
-    if(video.hasAttribute('src')){
-      video.removeAttribute('src');
-      video.load();
-    }
-  }
-  function showStill(){
-    sidebar.dataset.sidebarStill='true';
-    delete sidebar.dataset.motionReady;
-    unloadMotion();
-  }
-  function motionFailed(){
-    playbackFailed=true;
-    sidebar.dataset.motionFallback='true';
-    syncToggle();
-    showStill();
-  }
-  function playRejected(error){
-    if(error?.name==='AbortError')return
-    motionFailed();
-  }
-  function requestMotion(){
-    if(!video.canPlayType('video/mp4')){motionFailed();return}
-    if(document.hidden)return
-    sidebar.dataset.sidebarStill='false';
-    delete sidebar.dataset.motionFallback;
-    if(!video.hasAttribute('src')){
-      video.setAttribute('src',video.dataset.src);
-      video.load();
-    }
-    const playing=video.play();
-    if(playing&&typeof playing.catch==='function')playing.catch(playRejected);
-  }
-  function applyPreference(){
-    syncToggle();
-    if(systemRequiresStill()||playbackFailed)showStill();else requestMotion();
-  }
-  function bindToggle(){
-    toggle=document.querySelector('[data-sidebar-still-toggle]');
-    note=document.querySelector('[data-sidebar-still-note]');
-    if(!toggle)return
-    syncToggle();
-    toggle.addEventListener('change',()=>{
-      preferStill=toggle.checked;
-      playbackFailed=false;
-      savePreference();
-      applyPreference();
-    });
-  }
-  function watchMedia(query){
-    if(typeof query.addEventListener==='function')query.addEventListener('change',applyPreference);
-    else if(typeof query.addListener==='function')query.addListener(applyPreference);
-  }
-
-  video.addEventListener('canplay',()=>{
-    if(!systemRequiresStill()&&!playbackFailed)sidebar.dataset.motionReady='true';
-  });
-  video.addEventListener('playing',()=>{
-    if(!systemRequiresStill()&&!playbackFailed)sidebar.dataset.motionReady='true';
-  });
-  video.addEventListener('error',motionFailed);
-  document.addEventListener('visibilitychange',()=>{
-    if(document.hidden)video.pause();else applyPreference();
-  });
-  window.addEventListener('pagehide',()=>video.pause());
-  window.addEventListener('storage',event=>{
-    if(event.key!==storageKey)return
-    preferStill=event.newValue==='true';
-    playbackFailed=false;
-    applyPreference();
-  });
-  watchMedia(reducedMotion);
-  watchMedia(desktop);
-  if(connection&&typeof connection.addEventListener==='function'){
-    connection.addEventListener('change',applyPreference);
-  }
-  if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded',bindToggle,{once:true});
-  }else{
-    bindToggle();
-  }
-  applyPreference();
-  script?.remove();
-})();
-</script>"#;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9421,7 +1318,14 @@ async fn request_host_removal(
         }
     };
     if !declaration_pending {
-        state.store.remove(&host);
+        if let Err(error) = state.store.remove(&host) {
+            tracing::error!(host = %host, error = %error, "retired host could not be removed from the durable fleet store");
+            return action_response_with_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &job,
+                "Beacon access is revoked, but durable fleet cleanup must be retried",
+            );
+        }
     }
     tracing::info!(host = %host, actor = %actor, declaration_pending, disposition = ?removal_plan.disposition, successor = ?removal_plan.successor, ticket = "PHAROS-127", "host removal requested and beacon access revoked");
     action_response(StatusCode::ACCEPTED, &job)
@@ -9528,7 +1432,10 @@ fn reconcile_completed_removals(state: &AppState, now: i64) {
             tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "declarative removal completion could not be persisted");
             continue;
         }
-        state.store.remove(&retired.host);
+        if let Err(error) = state.store.remove(&retired.host) {
+            tracing::warn!(host = %retired.host, error = %error, ticket = "PHAROS-163", "declarative host removal could not be persisted");
+            continue;
+        }
         match state
             .host_actions
             .complete_removal(&retired.removal_job_id, now)
@@ -9624,7 +1531,10 @@ async fn record_retirement_action_result(
     {
         Ok(job) => {
             if job.state == HostActionState::Succeeded {
-                state.store.remove(&host);
+                if let Err(error) = state.store.remove(&host) {
+                    tracing::error!(host = %host, error = %error, "completed retirement could not be removed from the durable fleet store");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -9731,6 +1641,127 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+async fn readyz(State(state): State<AppState>) -> Response {
+    let readiness = state.beacon_auth.janus_readiness();
+    let alert_worker = state.alert_health.snapshot(now_unix());
+    let ready = readiness.as_ref().is_none_or(|status| status.ready) && alert_worker.ready;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        no_store_headers(),
+        Json(json!({
+            "ready": ready,
+            "janus_sidecar": readiness,
+            "alert_worker": alert_worker,
+        })),
+    )
+        .into_response()
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let readiness = state.beacon_auth.janus_readiness();
+    let mut body = String::from(
+        "# HELP pharos_janus_sidecar_ready Whether the active Janus credential generation is usable.\n\
+# TYPE pharos_janus_sidecar_ready gauge\n",
+    );
+    match readiness {
+        Some(readiness) => {
+            body.push_str(&format!(
+                "pharos_janus_sidecar_ready {}\n",
+                usize::from(readiness.ready)
+            ));
+            body.push_str(
+                "# HELP pharos_janus_sidecar_hosts Hosts in the active Janus credential generation.\n\
+# TYPE pharos_janus_sidecar_hosts gauge\n",
+            );
+            body.push_str(&format!(
+                "pharos_janus_sidecar_hosts {}\n",
+                readiness.host_count
+            ));
+            if let Some(generation) = readiness.generation {
+                body.push_str(
+                    "# HELP pharos_janus_sidecar_generation_info Active immutable Janus credential generation.\n\
+# TYPE pharos_janus_sidecar_generation_info gauge\n",
+                );
+                body.push_str(&format!(
+                    "pharos_janus_sidecar_generation_info{{generation=\"{generation}\"}} 1\n"
+                ));
+            }
+            if let Some(last_success) = readiness.last_success_unix {
+                body.push_str(
+                    "# HELP pharos_janus_sidecar_last_success_unixtime Last successful Janus generation load.\n\
+# TYPE pharos_janus_sidecar_last_success_unixtime gauge\n",
+                );
+                body.push_str(&format!(
+                    "pharos_janus_sidecar_last_success_unixtime {last_success}\n"
+                ));
+            }
+        }
+        None => body.push_str("pharos_janus_sidecar_ready 1\n"),
+    }
+    let alerts = state.alert_health.snapshot(now_unix());
+    body.push_str(
+        "# HELP pharos_alert_worker_ready Whether the configured alert worker is running and completing durable sweeps.\n\
+# TYPE pharos_alert_worker_ready gauge\n",
+    );
+    body.push_str(&format!(
+        "pharos_alert_worker_ready {}\n",
+        usize::from(alerts.ready)
+    ));
+    body.push_str(
+        "# HELP pharos_alert_outbox_pending Durable alert events awaiting delivery.\n\
+# TYPE pharos_alert_outbox_pending gauge\n",
+    );
+    body.push_str(&format!(
+        "pharos_alert_outbox_pending {}\n",
+        alerts.pending_events
+    ));
+    body.push_str(
+        "# HELP pharos_alert_deliveries_total Durable alert events marked delivered.\n\
+# TYPE pharos_alert_deliveries_total counter\n",
+    );
+    body.push_str(&format!(
+        "pharos_alert_deliveries_total {}\n",
+        alerts.deliveries_total
+    ));
+    body.push_str(
+        "# HELP pharos_alert_delivery_failures_total Alert delivery attempts that remain pending.\n\
+# TYPE pharos_alert_delivery_failures_total counter\n",
+    );
+    body.push_str(&format!(
+        "pharos_alert_delivery_failures_total {}\n",
+        alerts.delivery_failures_total
+    ));
+    body.push_str(
+        "# HELP pharos_alert_worker_restarts_total Unexpected alert-worker exits supervised and restarted.\n\
+# TYPE pharos_alert_worker_restarts_total counter\n",
+    );
+    body.push_str(&format!(
+        "pharos_alert_worker_restarts_total {}\n",
+        alerts.restarts_total
+    ));
+    if let Some(last_success) = alerts.last_success_unix {
+        body.push_str(
+            "# HELP pharos_alert_worker_last_success_unixtime Last successful durable alert sweep.\n\
+# TYPE pharos_alert_worker_last_success_unixtime gauge\n",
+        );
+        body.push_str(&format!(
+            "pharos_alert_worker_last_success_unixtime {last_success}\n"
+        ));
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
 async fn version() -> Json<serde_json::Value> {
     Json(json!({
         "name": "pharosd",
@@ -9738,2467 +1769,6 @@ async fn version() -> Json<serde_json::Value> {
         "git_commit": GIT_COMMIT,
         "display_version": release_label()
     }))
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupProviderPlanQuery {
-    provider: String,
-    template: String,
-}
-
-fn hetzner_setup_defaults(state: &AppState, now: i64) -> Option<serde_json::Value> {
-    let runtime = effective_hetzner_runtime(
-        &state.provider_runtime.hetzner_cloud,
-        &state.provider_connections,
-    );
-    let catalog = state
-        .provider_connections
-        .catalog_if_fresh(now, runtime.evidence_ttl_secs)?;
-    let location = runtime
-        .default_location
-        .as_deref()
-        .filter(|location| catalog.supports_location(location))
-        .or_else(|| {
-            catalog
-                .locations
-                .iter()
-                .map(|location| location.name.as_str())
-                .find(|location| catalog.supports_location(location))
-        })?;
-    let server_type = catalog.recommended_plan(location)?.name.as_str();
-    Some(json!({
-        "location": location,
-        "server_type": server_type,
-        "ssh_key_ref": runtime.default_ssh_key_ref,
-    }))
-}
-
-fn paid_setup_runtime_readiness(state: &AppState, now: i64) -> serde_json::Value {
-    let readiness = hetzner_runtime_readiness(
-        &state.provider_runtime.hetzner_cloud,
-        &state.provider_connections,
-        now,
-    );
-    let mut value = serde_json::to_value(readiness).unwrap_or_else(|_| json!({}));
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "durable_job_store_ready".to_string(),
-            json!(state.provisioning_jobs.durable_ready()),
-        );
-        object.insert(
-            "paid_project_available".to_string(),
-            json!(!state.provisioning_jobs.paid_project_blocked(None)),
-        );
-    }
-    value
-}
-
-async fn setup_provider_plan_json(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<SetupProviderPlanQuery>,
-) -> impl IntoResponse {
-    if !access_for_headers(&state.auth, &headers).can_agora() {
-        return (
-            StatusCode::FORBIDDEN,
-            no_store_headers(),
-            Json(json!({ "error": "Agora access is not granted for this account" })),
-        );
-    }
-    let now = now_unix();
-    match setup_provider_plan(&query.provider, &query.template) {
-        Ok(plan) => (
-            StatusCode::OK,
-            no_store_headers(),
-            Json(json!({
-                "plan": plan,
-                "runtime": if query.provider == "hetzner-cloud" {
-                    Some(paid_setup_runtime_readiness(&state, now))
-                } else {
-                    None
-                },
-                "catalog": if query.provider == "hetzner-cloud" {
-                    state.provider_connections.catalog_if_fresh(
-                        now,
-                        state.provider_runtime.hetzner_cloud.evidence_ttl_secs,
-                    )
-                } else {
-                    None
-                },
-                "defaults": if query.provider == "hetzner-cloud" {
-                    hetzner_setup_defaults(&state, now)
-                } else {
-                    None
-                },
-            })),
-        ),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            no_store_headers(),
-            Json(json!({ "error": error.to_string() })),
-        ),
-    }
-}
-
-async fn create_provisioning_job(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ProvisioningJobStartRequest>,
-) -> impl IntoResponse {
-    if request.provider == "hetzner-cloud" && request.apply {
-        return (
-            StatusCode::BAD_REQUEST,
-            no_store_headers(),
-            Json(json!({
-                "error": "Direct apply is not allowed. Persist a reviewed plan, authorize that exact plan, then create it in a separate request."
-            })),
-        );
-    }
-    if !access_for_headers(&state.auth, &headers).can_agora() {
-        return (
-            StatusCode::FORBIDDEN,
-            no_store_headers(),
-            Json(json!({ "error": "Agora access is not granted for this account" })),
-        );
-    }
-    let mut provider_runtime = state.provider_runtime.clone();
-    if request.provider == "hetzner-cloud" {
-        let _serialized_paid_review = state.paid_create_lock.lock().await;
-        if let Err((status, message)) = paid_operator(&state, &headers) {
-            return (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            );
-        }
-        if !state.provisioning_jobs.durable_ready() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                no_store_headers(),
-                Json(json!({
-                    "error": "Paid provider actions require a valid durable provisioning-job store. Configure PHAROS_DB or PHAROS_PROVISIONING_JOBS_DB and restart Pharos."
-                })),
-            );
-        }
-        if state.provisioning_jobs.paid_project_blocked(None) {
-            return (
-                StatusCode::CONFLICT,
-                no_store_headers(),
-                Json(json!({
-                    "error": "Another paid server attempt or tracked server still owns the project gate. Resolve it before starting a new paid review."
-                })),
-            );
-        }
-        let now = now_unix();
-        run_hetzner_connection_test_for(
-            &state,
-            now,
-            request.ssh_key_ref.as_deref(),
-            request.location.as_deref(),
-        )
-        .await;
-        match guarded_hetzner_runtime(&state, &request, now) {
-            Ok(runtime) => provider_runtime.hetzner_cloud = runtime,
-            Err((status, message)) => {
-                return (
-                    status,
-                    no_store_headers(),
-                    Json(json!({ "error": message })),
-                );
-            }
-        }
-        let review_operation = match HetznerOperationContext::resolve(
-            provider_runtime.hetzner_cloud.clone(),
-        ) {
-            Ok(operation) => operation,
-            Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    no_store_headers(),
-                    Json(json!({
-                        "error": "The secure provider credential could not be pinned for this review. No provider resource was created."
-                    })),
-                );
-            }
-        };
-        if verify_hetzner_image(
-            &review_operation,
-            request.image.as_deref().unwrap_or_default(),
-        )
-        .await
-        .is_err()
-        {
-            return (
-                StatusCode::CONFLICT,
-                no_store_headers(),
-                Json(json!({
-                    "error": "The selected Hetzner Cloud image is not currently available. No provider resource was created."
-                })),
-            );
-        }
-        let active_servers = match fetch_hetzner_servers(&review_operation).await {
-            Ok(servers) => servers,
-            Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    no_store_headers(),
-                    Json(json!({
-                        "error": "Current Hetzner Cloud server inventory could not be verified. No provider resource was created."
-                    })),
-                );
-            }
-        };
-        if !active_servers.is_empty() {
-            return (
-                StatusCode::CONFLICT,
-                no_store_headers(),
-                Json(json!({
-                    "error": "This Hetzner Cloud project already has an active server; the Phase 1 maximum is one. No provider resource was created."
-                })),
-            );
-        }
-        let job = match state
-            .provisioning_jobs
-            .start(&request, now, &provider_runtime)
-        {
-            Ok(job) => job,
-            Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    no_store_headers(),
-                    Json(json!({ "error": error.to_string() })),
-                );
-            }
-        };
-        let reviewed_plan = match build_reviewed_paid_plan(
-            &job,
-            &request,
-            &review_operation,
-            &state.provider_connections,
-            now,
-        ) {
-            Ok(plan) => plan,
-            Err((status, message)) => {
-                return (
-                    status,
-                    no_store_headers(),
-                    Json(json!({ "error": message })),
-                );
-            }
-        };
-        return match state
-            .provisioning_jobs
-            .attach_paid_review(&job.id, reviewed_plan, now)
-        {
-            Ok(job) => (
-                StatusCode::CREATED,
-                no_store_headers(),
-                Json(json!({ "job": job })),
-            ),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                no_store_headers(),
-                Json(json!({
-                    "error": "The reviewed plan could not be durably stored. No provider resource was created."
-                })),
-            ),
-        };
-    }
-    match state
-        .provisioning_jobs
-        .start(&request, now_unix(), &provider_runtime)
-    {
-        Ok(job) => {
-            let job = if should_run_existing_host_executor(&state, &request, &job) {
-                execute_existing_host_setup_job(&state, &request, job).await
-            } else {
-                job
-            };
-            (
-                StatusCode::CREATED,
-                no_store_headers(),
-                Json(json!({ "job": job })),
-            )
-        }
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            no_store_headers(),
-            Json(json!({ "error": error.to_string() })),
-        ),
-    }
-}
-
-fn paid_operator(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(String, String), (StatusCode, &'static str)> {
-    if !action_request_header(headers) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "A fresh attended action confirmation is required.",
-        ));
-    }
-    if !access_for_headers(&state.auth, headers).can_manage_fleet() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Fleet management access is required for paid provider actions.",
-        ));
-    }
-    let Some(auth) = state.auth.as_ref() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Paid provider actions require configured OIDC authentication.",
-        ));
-    };
-    let Some(user) = auth.current_user(headers) else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Sign in again before reviewing or authorizing paid provider work.",
-        ));
-    };
-    if !safe_paid_display_text(&user.display_name, 200) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "The authenticated operator identity is not safe to record.",
-        ));
-    }
-    Ok((user.operator_ref, user.display_name))
-}
-
-fn build_reviewed_paid_plan(
-    job: &ProvisioningJob,
-    request: &ProvisioningJobStartRequest,
-    operation: &HetznerOperationContext,
-    connections: &ProviderConnectionStore,
-    now: i64,
-) -> Result<ProvisioningReviewedPaidPlan, (StatusCode, &'static str)> {
-    let runtime = &operation.runtime;
-    let catalog = connections
-        .catalog_if_fresh(now, runtime.evidence_ttl_secs)
-        .ok_or((
-            StatusCode::CONFLICT,
-            "Current Hetzner Cloud catalog evidence is not available.",
-        ))?;
-    let location = request
-        .location
-        .as_deref()
-        .ok_or((StatusCode::BAD_REQUEST, "Choose a server location."))?;
-    let server_type = request
-        .server_type
-        .as_deref()
-        .ok_or((StatusCode::BAD_REQUEST, "Choose a current server plan."))?;
-    let selection = catalog.exact_selection(location, server_type).ok_or((
-        StatusCode::CONFLICT,
-        "That exact server plan is no longer available at the reviewed price.",
-    ))?;
-    let project = runtime.project_label.as_deref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Set the safe Hetzner Cloud project label before paid plan review.",
-    ))?;
-    let ssh_key_ref = request
-        .ssh_key_ref
-        .as_deref()
-        .or(runtime.default_ssh_key_ref.as_deref())
-        .ok_or((StatusCode::CONFLICT, "Choose a current SSH public key."))?;
-    let firewall_ref = runtime
-        .firewall_ref
-        .as_deref()
-        .ok_or((StatusCode::CONFLICT, "Choose a current provider firewall."))?;
-    let image = request
-        .image
-        .as_deref()
-        .ok_or((StatusCode::BAD_REQUEST, "Choose the reviewed server image."))?;
-    let required_labels = paid_required_labels(&job.id, project);
-    let server_name = job.host_name.as_deref().ok_or((
-        StatusCode::BAD_REQUEST,
-        "Choose the exact provider server name.",
-    ))?;
-    let mut reviewed = ProvisioningReviewedPaidPlan {
-        provider_project: project.to_string(),
-        credential_binding_sha256: operation.credential_binding_sha256.clone(),
-        server_name: server_name.to_string(),
-        location: selection.location,
-        location_label: selection.location_label,
-        server_type: selection.server_type,
-        server_type_label: format!(
-            "{} · {}",
-            selection.server_type_label, selection.hardware_summary
-        ),
-        image: image.to_string(),
-        price_currency: selection.currency,
-        price_hourly_gross: selection.hourly_gross.clone(),
-        price_monthly_gross: selection.monthly_gross.clone(),
-        max_hourly_gross: selection.hourly_gross,
-        max_monthly_gross: selection.monthly_gross,
-        observed_active_servers: 0,
-        max_active_servers: 1,
-        catalog_refreshed_at: selection.catalog_refreshed_at,
-        expires_at: now.saturating_add(runtime.approval_ttl_secs),
-        ssh_key_ref: ssh_key_ref.to_string(),
-        firewall_ref: firewall_ref.to_string(),
-        required_labels,
-        allowed_operations: vec!["create-server".to_string(), "delete-server".to_string()],
-        cleanup_policy: "No silent retry or automatic deletion. If setup fails, Pharos keeps the tracked server visible and requires separately confirmed cleanup.".to_string(),
-        plan_sha256: "0".repeat(64),
-    };
-    reviewed.plan_sha256 = reviewed_paid_plan_digest(&reviewed);
-    reviewed.validate_contract().map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "The paid plan contract is invalid.",
-        )
-    })?;
-    Ok(reviewed)
-}
-
-fn paid_required_labels(job_id: &str, project: &str) -> BTreeMap<String, String> {
-    let owner_digest = hex(&Sha256::digest(project.as_bytes()));
-    BTreeMap::from([
-        ("managed-by".to_string(), "pharos".to_string()),
-        ("pharos-setup".to_string(), "tracked-job".to_string()),
-        ("pharos-owner".to_string(), owner_digest[..16].to_string()),
-        ("pharos-job".to_string(), job_id.to_string()),
-        ("pharos-attempt".to_string(), format!("{job_id}-1")),
-    ])
-}
-
-fn paid_store_error_response(error: ProvisioningPaidStoreError) -> (StatusCode, &'static str) {
-    match error {
-        ProvisioningPaidStoreError::NotFound => {
-            (StatusCode::NOT_FOUND, "The reviewed plan was not found.")
-        }
-        ProvisioningPaidStoreError::PlanMismatch => (
-            StatusCode::CONFLICT,
-            "The request does not match the exact persisted plan. Review current details again.",
-        ),
-        ProvisioningPaidStoreError::Expired => (
-            StatusCode::CONFLICT,
-            "This paid authorization has expired. Review current details again.",
-        ),
-        ProvisioningPaidStoreError::OperatorMismatch => (
-            StatusCode::FORBIDDEN,
-            "The authenticated operator does not match this paid authorization.",
-        ),
-        ProvisioningPaidStoreError::ProjectBusy => (
-            StatusCode::CONFLICT,
-            "Another paid attempt or tracked server still owns the provider project gate.",
-        ),
-        ProvisioningPaidStoreError::InvalidState => (
-            StatusCode::CONFLICT,
-            "This paid setup is not in the required state for that action.",
-        ),
-        ProvisioningPaidStoreError::ContractFailed
-        | ProvisioningPaidStoreError::PersistenceFailed => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "The paid action could not be durably recorded. No new provider request was sent.",
-        ),
-    }
-}
-
-fn validate_paid_job_binding(
-    job: &ProvisioningJob,
-    plan_sha256: &str,
-    operator_ref: &str,
-) -> Result<(), ProvisioningPaidStoreError> {
-    let plan = job
-        .reviewed_plan
-        .as_ref()
-        .ok_or(ProvisioningPaidStoreError::InvalidState)?;
-    let authorization = job
-        .paid_authorization
-        .as_ref()
-        .ok_or(ProvisioningPaidStoreError::InvalidState)?;
-    if plan.plan_sha256 != plan_sha256
-        || authorization.plan_sha256 != plan_sha256
-        || reviewed_paid_plan_digest(plan) != plan_sha256
-    {
-        return Err(ProvisioningPaidStoreError::PlanMismatch);
-    }
-    let recovery_only = job.paid_execution.as_ref().is_some_and(|execution| {
-        matches!(
-            execution.state.as_str(),
-            "request-started" | "uncertain" | "created" | "reconciled" | "failed-closed"
-        )
-    });
-    if !recovery_only && authorization.operator_ref != operator_ref {
-        return Err(ProvisioningPaidStoreError::OperatorMismatch);
-    }
-    Ok(())
-}
-
-async fn revalidate_reviewed_paid_plan(
-    state: &AppState,
-    job: &ProvisioningJob,
-    now: i64,
-) -> Result<(HetznerOperationContext, Vec<HetznerListedServer>), (StatusCode, &'static str)> {
-    let reviewed = job.reviewed_plan.as_ref().ok_or((
-        StatusCode::CONFLICT,
-        "The immutable paid plan is missing. Review current details again.",
-    ))?;
-    if reviewed.validate_contract().is_err()
-        || reviewed_paid_plan_digest(reviewed) != reviewed.plan_sha256
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "The persisted paid plan no longer validates. Review current details again.",
-        ));
-    }
-    if now >= reviewed.expires_at {
-        return Err((
-            StatusCode::CONFLICT,
-            "This paid plan has expired. Review current details again.",
-        ));
-    }
-
-    run_hetzner_connection_test_for(
-        state,
-        now,
-        Some(&reviewed.ssh_key_ref),
-        Some(&reviewed.location),
-    )
-    .await;
-    let runtime = effective_hetzner_runtime(
-        &state.provider_runtime.hetzner_cloud,
-        &state.provider_connections,
-    );
-    if !runtime.credential_boundary_ready()
-        || !runtime.execute_enabled
-        || !state
-            .provider_connections
-            .ready(now, runtime.evidence_ttl_secs)
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The live Hetzner Cloud credential and execution gate are not ready. No provider resource was created.",
-        ));
-    }
-    if runtime.project_label.as_deref() != Some(reviewed.provider_project.as_str()) {
-        return Err((
-            StatusCode::CONFLICT,
-            "The configured provider project label changed. Review current details again.",
-        ));
-    }
-    let catalog = state
-        .provider_connections
-        .catalog_if_fresh(now, runtime.evidence_ttl_secs)
-        .ok_or((
-            StatusCode::CONFLICT,
-            "A fresh live provider catalog is not available. Review current details again.",
-        ))?;
-    let selection = catalog
-        .exact_selection(&reviewed.location, &reviewed.server_type)
-        .ok_or((
-            StatusCode::CONFLICT,
-            "The reviewed region and server type are no longer available. Review current details again.",
-        ))?;
-    let current_server_type_label = format!(
-        "{} · {}",
-        selection.server_type_label, selection.hardware_summary
-    );
-    if selection.location != reviewed.location
-        || selection.location_label != reviewed.location_label
-        || selection.server_type != reviewed.server_type
-        || current_server_type_label != reviewed.server_type_label
-        || selection.currency != reviewed.price_currency
-        || selection.hourly_gross != reviewed.price_hourly_gross
-        || selection.monthly_gross != reviewed.price_monthly_gross
-        || compare_gross_prices(&selection.hourly_gross, &reviewed.max_hourly_gross)
-            .is_none_or(|ordering| ordering == std::cmp::Ordering::Greater)
-        || compare_gross_prices(&selection.monthly_gross, &reviewed.max_monthly_gross)
-            .is_none_or(|ordering| ordering == std::cmp::Ordering::Greater)
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "Provider availability, hardware, currency, or exact gross price changed. Review current details again.",
-        ));
-    }
-    if !catalog
-        .ssh_keys
-        .iter()
-        .any(|value| value == &reviewed.ssh_key_ref)
-        || !catalog
-            .firewalls
-            .iter()
-            .any(|value| value == &reviewed.firewall_ref)
-        || runtime.firewall_ref.as_deref() != Some(reviewed.firewall_ref.as_str())
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "The reviewed SSH key or firewall changed. Review current details again.",
-        ));
-    }
-    if reviewed.required_labels != paid_required_labels(&job.id, reviewed.provider_project.as_str())
-        || reviewed.allowed_operations
-            != vec!["create-server".to_string(), "delete-server".to_string()]
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "The required ownership policy changed. Review current details again.",
-        ));
-    }
-    let operation = HetznerOperationContext::resolve(runtime).map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The secure provider credential could not be pinned. No provider resource was created.",
-        )
-    })?;
-    if !operation.matches_reviewed_plan(reviewed) {
-        return Err((
-            StatusCode::CONFLICT,
-            "The provider credential/project binding changed. Review current details again.",
-        ));
-    }
-    verify_hetzner_image(&operation, &reviewed.image)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::CONFLICT,
-                "The reviewed provider image is no longer available. Review current details again.",
-            )
-        })?;
-    let servers = fetch_hetzner_servers(&operation).await.map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Current provider server inventory could not be verified. No provider resource was created.",
-        )
-    })?;
-    Ok((operation, servers))
-}
-
-async fn paid_reconciliation_inventory(
-    state: &AppState,
-    reviewed: &ProvisioningReviewedPaidPlan,
-) -> Result<Vec<HetznerListedServer>, (StatusCode, &'static str)> {
-    let runtime = effective_hetzner_runtime(
-        &state.provider_runtime.hetzner_cloud,
-        &state.provider_connections,
-    );
-    if !runtime.credential_boundary_ready()
-        || runtime.project_label.as_deref() != Some(reviewed.provider_project.as_str())
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The secure provider credential is unavailable for reconciliation. Pharos will not replay the paid request.",
-        ));
-    }
-    let operation = HetznerOperationContext::resolve(runtime).map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The secure provider credential is unavailable for reconciliation. Pharos will not replay the paid request.",
-        )
-    })?;
-    fetch_hetzner_servers(&operation).await.map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Provider inventory could not be read for reconciliation. Pharos will not replay the paid request.",
-        )
-    })
-}
-
-async fn confirm_paid_provisioning_job(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<ProvisioningPaidConfirmRequest>,
-) -> impl IntoResponse {
-    let (operator_ref, operator_label) = match paid_operator(&state, &headers) {
-        Ok(operator) => operator,
-        Err((status, message)) => {
-            return (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            );
-        }
-    };
-    if !state.provisioning_jobs.durable_ready() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            no_store_headers(),
-            Json(
-                json!({ "error": "The durable provisioning-job store is unavailable; no paid action was taken." }),
-            ),
-        );
-    }
-    if state.provisioning_jobs.paid_project_blocked(Some(&id)) {
-        return (
-            StatusCode::CONFLICT,
-            no_store_headers(),
-            Json(
-                json!({ "error": "Another paid attempt or tracked server still owns the provider project gate." }),
-            ),
-        );
-    }
-    if !request.attended {
-        return (
-            StatusCode::BAD_REQUEST,
-            no_store_headers(),
-            Json(json!({ "error": "Attended confirmation is required." })),
-        );
-    }
-    let Some(job) = state.provisioning_jobs.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            no_store_headers(),
-            Json(json!({ "error": "The reviewed plan was not found." })),
-        );
-    };
-    if job.reviewed_plan.as_ref().is_none_or(|plan| {
-        plan.plan_sha256 != request.plan_sha256
-            || reviewed_paid_plan_digest(plan) != request.plan_sha256
-    }) {
-        return (
-            StatusCode::CONFLICT,
-            no_store_headers(),
-            Json(json!({
-                "error": "The confirmation does not match the exact persisted plan. Review current details again."
-            })),
-        );
-    }
-    let now = now_unix();
-    let (_, servers) = match revalidate_reviewed_paid_plan(&state, &job, now).await {
-        Ok(result) => result,
-        Err((status, message)) => {
-            return (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            );
-        }
-    };
-    if !servers.is_empty() {
-        return (
-            StatusCode::CONFLICT,
-            no_store_headers(),
-            Json(json!({
-                "error": "The provider project already has an active server; the reviewed active-count limit no longer holds. Review current details again."
-            })),
-        );
-    }
-    match state.provisioning_jobs.confirm_paid_review(
-        &id,
-        &request.plan_sha256,
-        &operator_ref,
-        &operator_label,
-        now,
-    ) {
-        Ok(job) => (
-            StatusCode::OK,
-            no_store_headers(),
-            Json(json!({ "job": job })),
-        ),
-        Err(error) => {
-            let (status, message) = paid_store_error_response(error);
-            (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            )
-        }
-    }
-}
-
-fn reviewed_hetzner_provider_resource(
-    plan: &ProvisioningReviewedPaidPlan,
-    server: &HetznerCreatedServer,
-) -> ProvisioningProviderResource {
-    let ssh_address = server.ssh_address();
-    ProvisioningProviderResource {
-        provider: "hetzner-cloud".to_string(),
-        kind: "server".to_string(),
-        provider_id: server.id.to_string(),
-        name: plan.server_name.clone(),
-        state: if ssh_address.is_some() {
-            "created".to_string()
-        } else {
-            "created-address-pending".to_string()
-        },
-        location: Some(plan.location.clone()),
-        ssh: ssh_address.map(|address| SshAccessIntent {
-            route: SshRoute::Direct,
-            user: Some("root".to_string()),
-            host: Some(address),
-            port: Some(22),
-        }),
-    }
-}
-
-async fn create_paid_provisioning_job(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<ProvisioningPaidCreateRequest>,
-) -> impl IntoResponse {
-    let (operator_ref, _) = match paid_operator(&state, &headers) {
-        Ok(operator) => operator,
-        Err((status, message)) => {
-            return (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            );
-        }
-    };
-    let _serialized_create = state.paid_create_lock.lock().await;
-    if !state.provisioning_jobs.durable_ready() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            no_store_headers(),
-            Json(
-                json!({ "error": "The durable provisioning-job store is unavailable; no paid provider request was sent." }),
-            ),
-        );
-    }
-    if state.provisioning_jobs.paid_project_blocked(Some(&id)) {
-        return (
-            StatusCode::CONFLICT,
-            no_store_headers(),
-            Json(
-                json!({ "error": "Another paid attempt or tracked server still owns the provider project gate." }),
-            ),
-        );
-    }
-    let Some(initial_job) = state.provisioning_jobs.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            no_store_headers(),
-            Json(json!({ "error": "The reviewed plan was not found." })),
-        );
-    };
-    if let Err(error) = validate_paid_job_binding(&initial_job, &request.plan_sha256, &operator_ref)
-    {
-        let (status, message) = paid_store_error_response(error);
-        return (
-            status,
-            no_store_headers(),
-            Json(json!({ "error": message })),
-        );
-    }
-    if initial_job
-        .paid_execution
-        .as_ref()
-        .is_some_and(|execution| matches!(execution.state.as_str(), "created" | "reconciled"))
-    {
-        return (
-            StatusCode::OK,
-            no_store_headers(),
-            Json(json!({ "job": initial_job, "idempotent": true })),
-        );
-    }
-    let reviewed = initial_job
-        .reviewed_plan
-        .as_ref()
-        .expect("paid binding requires reviewed plan")
-        .clone();
-    if initial_job
-        .paid_execution
-        .as_ref()
-        .is_some_and(|execution| {
-            matches!(execution.state.as_str(), "request-started" | "uncertain")
-        })
-    {
-        let servers = match paid_reconciliation_inventory(&state, &reviewed).await {
-            Ok(servers) => servers,
-            Err((status, message)) => {
-                return (
-                    status,
-                    no_store_headers(),
-                    Json(json!({ "error": message })),
-                );
-            }
-        };
-        let matches = servers
-            .iter()
-            .filter(|server| server.matches_reviewed_plan(&reviewed))
-            .cloned()
-            .collect::<Vec<_>>();
-        if matches.len() == 1 {
-            let server = matches.into_iter().next().expect("one reconciled server");
-            let resource = reviewed_hetzner_provider_resource(&reviewed, &server.into_created());
-            let handoff = hetzner_bootstrap_handoff(&resource);
-            return match state.provisioning_jobs.complete_paid_create(
-                &id,
-                &request.plan_sha256,
-                resource,
-                handoff,
-                true,
-                now_unix(),
-            ) {
-                Ok(job) => (
-                    StatusCode::OK,
-                    no_store_headers(),
-                    Json(json!({ "job": job, "idempotent": true })),
-                ),
-                Err(error) => {
-                    let (status, message) = paid_store_error_response(error);
-                    (
-                        status,
-                        no_store_headers(),
-                        Json(json!({ "error": message })),
-                    )
-                }
-            };
-        }
-        let message = if matches.is_empty() {
-            "The earlier provider create result is uncertain and no server matching the exact ownership and reviewed facts was found. Pharos will not replay the paid request; inspect the provider project and check this same attempt again before any new review."
-        } else {
-            "Multiple servers match the exact paid-attempt ownership and reviewed facts. Pharos will not create or choose between them; manual provider review is required."
-        };
-        let job = state
-            .provisioning_jobs
-            .fail_paid_execution(
-                &id,
-                &request.plan_sha256,
-                true,
-                message.to_string(),
-                now_unix(),
-            )
-            .unwrap_or(initial_job);
-        return (
-            StatusCode::CONFLICT,
-            no_store_headers(),
-            Json(json!({ "error": message, "job": job })),
-        );
-    }
-    let now = now_unix();
-    let authorization = initial_job
-        .paid_authorization
-        .as_ref()
-        .expect("paid binding requires authorization");
-    if now >= authorization.expires_at {
-        if initial_job
-            .paid_execution
-            .as_ref()
-            .is_some_and(|execution| execution.state == "claimed")
-        {
-            let message = "This paid authorization expired before the provider request started. The durable attempt was closed without creating a server; review current details again.";
-            let job = state
-                .provisioning_jobs
-                .fail_paid_execution(&id, &request.plan_sha256, false, message.to_string(), now)
-                .unwrap_or(initial_job);
-            return (
-                StatusCode::CONFLICT,
-                no_store_headers(),
-                Json(json!({ "error": message, "job": job })),
-            );
-        }
-        return (
-            StatusCode::CONFLICT,
-            no_store_headers(),
-            Json(
-                json!({ "error": "This paid authorization expired. Review current details again." }),
-            ),
-        );
-    }
-    let (initial_runtime, _) = match revalidate_reviewed_paid_plan(&state, &initial_job, now).await
-    {
-        Ok(result) => result,
-        Err((status, message)) => {
-            return (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            );
-        }
-    };
-    let prerequisites =
-        match resolve_hetzner_create_prerequisites(&reviewed, &initial_runtime).await {
-            Ok(prerequisites) => prerequisites,
-            Err(error) => {
-                let message = format!(
-                    "{}; the provider create request was not sent.",
-                    error.safe_message()
-                );
-                return (
-                    StatusCode::CONFLICT,
-                    no_store_headers(),
-                    Json(json!({ "error": message, "job": initial_job })),
-                );
-            }
-        };
-    let final_check_at = now_unix();
-    let (runtime, servers) =
-        match revalidate_reviewed_paid_plan(&state, &initial_job, final_check_at).await {
-            Ok(result) => result,
-            Err((status, message)) => {
-                return (
-                    status,
-                    no_store_headers(),
-                    Json(json!({ "error": message, "job": initial_job })),
-                );
-            }
-        };
-    let boundary_now = now_unix();
-    if boundary_now >= authorization.expires_at {
-        let message = "This paid authorization expired during the final live checks. No provider create request was sent; review current details again.";
-        let job = if initial_job
-            .paid_execution
-            .as_ref()
-            .is_some_and(|execution| execution.state == "claimed")
-        {
-            state
-                .provisioning_jobs
-                .fail_paid_execution(
-                    &id,
-                    &request.plan_sha256,
-                    false,
-                    message.to_string(),
-                    boundary_now,
-                )
-                .unwrap_or(initial_job)
-        } else {
-            initial_job
-        };
-        return (
-            StatusCode::CONFLICT,
-            no_store_headers(),
-            Json(json!({ "error": message, "job": job })),
-        );
-    }
-    if let Some(execution) = initial_job.paid_execution.as_ref() {
-        match execution.state.as_str() {
-            "claimed" => {
-                if !servers.is_empty() {
-                    let message = "Provider inventory changed after authorization. The durable attempt was stopped before the provider create request; review current details again.";
-                    let job = state
-                        .provisioning_jobs
-                        .fail_paid_execution(
-                            &id,
-                            &request.plan_sha256,
-                            false,
-                            message.to_string(),
-                            now_unix(),
-                        )
-                        .unwrap_or(initial_job);
-                    return (
-                        StatusCode::CONFLICT,
-                        no_store_headers(),
-                        Json(json!({ "error": message, "job": job })),
-                    );
-                }
-            }
-            "failed-closed" => {
-                return (
-                    StatusCode::CONFLICT,
-                    no_store_headers(),
-                    Json(
-                        json!({ "error": "The paid attempt is closed and cannot be replayed. Review current details again." }),
-                    ),
-                );
-            }
-            _ => {
-                return (
-                    StatusCode::CONFLICT,
-                    no_store_headers(),
-                    Json(json!({ "error": "The paid attempt is not safe to run." })),
-                );
-            }
-        }
-    } else {
-        if !servers.is_empty() {
-            return (
-                StatusCode::CONFLICT,
-                no_store_headers(),
-                Json(json!({
-                    "error": "The provider project already has an active server; the reviewed maximum no longer holds. Review current details again."
-                })),
-            );
-        }
-        if let Err(error) = state.provisioning_jobs.claim_paid_execution(
-            &id,
-            &request.plan_sha256,
-            &operator_ref,
-            boundary_now,
-        ) {
-            let (status, message) = paid_store_error_response(error);
-            return (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            );
-        }
-    }
-
-    let started = match state.provisioning_jobs.mark_paid_request_started(
-        &id,
-        &request.plan_sha256,
-        now_unix(),
-    ) {
-        Ok(job) => job,
-        Err(error) => {
-            let (status, message) = paid_store_error_response(error);
-            return (
-                status,
-                no_store_headers(),
-                Json(json!({ "error": message })),
-            );
-        }
-    };
-    match send_hetzner_create(&reviewed, prerequisites, &runtime).await {
-        Ok(server) => {
-            let resource = reviewed_hetzner_provider_resource(&reviewed, &server);
-            let handoff = hetzner_bootstrap_handoff(&resource);
-            match state.provisioning_jobs.complete_paid_create(
-                &id,
-                &request.plan_sha256,
-                resource,
-                handoff,
-                false,
-                now_unix(),
-            ) {
-                Ok(job) => (
-                    StatusCode::CREATED,
-                    no_store_headers(),
-                    Json(json!({ "job": job })),
-                ),
-                Err(ProvisioningPaidStoreError::PersistenceFailed) => {
-                    let message = "Hetzner accepted the create response, but Pharos could not durably record it. The result is uncertain; restart with the valid durable store and reconcile by exact ownership labels. Pharos will not replay the paid request.";
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        no_store_headers(),
-                        Json(json!({
-                            "error": message,
-                            "job": state.provisioning_jobs.get(&id)
-                        })),
-                    )
-                }
-                Err(error) => {
-                    let (status, message) = paid_store_error_response(error);
-                    (
-                        status,
-                        no_store_headers(),
-                        Json(json!({ "error": message })),
-                    )
-                }
-            }
-        }
-        Err(error) => {
-            let uncertain = error.resource_state_uncertain();
-            let message = if uncertain {
-                format!(
-                    "{}. The result is uncertain; Pharos will reconcile by exact ownership labels and will not replay this paid request.",
-                    error.safe_message()
-                )
-            } else {
-                format!(
-                    "{}; no provider create request was accepted.",
-                    error.safe_message()
-                )
-            };
-            let job = state
-                .provisioning_jobs
-                .fail_paid_execution(
-                    &id,
-                    &request.plan_sha256,
-                    uncertain,
-                    message.clone(),
-                    now_unix(),
-                )
-                .unwrap_or(started);
-            (
-                StatusCode::BAD_GATEWAY,
-                no_store_headers(),
-                Json(json!({ "error": message, "job": job })),
-            )
-        }
-    }
-}
-
-fn guarded_hetzner_runtime(
-    state: &AppState,
-    request: &ProvisioningJobStartRequest,
-    now: i64,
-) -> Result<HetznerCloudRuntimeConfig, (StatusCode, &'static str)> {
-    let runtime = effective_hetzner_runtime(
-        &state.provider_runtime.hetzner_cloud,
-        &state.provider_connections,
-    );
-    if runtime.api_token().is_err() || !runtime.credential_boundary_ready() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The secure Hetzner Cloud connection is not available.",
-        ));
-    }
-    if !runtime.execute_enabled {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Managed Hetzner Cloud execution is disabled.",
-        ));
-    }
-    if runtime.project_label.is_none() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Set the safe Hetzner Cloud project label before paid plan review.",
-        ));
-    }
-    if missing_hetzner_create_inputs(request, &runtime)
-        || invalid_hetzner_create_inputs(request, &runtime)
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Host, image, region, server type, SSH key, or firewall selection is invalid.",
-        ));
-    }
-    if !state
-        .provider_connections
-        .ready(now, runtime.evidence_ttl_secs)
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "Test the Hetzner Cloud connection again before creating a server.",
-        ));
-    }
-    let Some(catalog) = state
-        .provider_connections
-        .catalog_if_fresh(now, runtime.evidence_ttl_secs)
-    else {
-        return Err((
-            StatusCode::CONFLICT,
-            "Current Hetzner Cloud locations, server plans, and prices are not available.",
-        ));
-    };
-    let Some(location) = request.location.as_deref() else {
-        return Err((StatusCode::BAD_REQUEST, "Choose a server location."));
-    };
-    let Some(server_type) = request.server_type.as_deref() else {
-        return Err((StatusCode::BAD_REQUEST, "Choose a current server plan."));
-    };
-    if !catalog.supports_plan(location, server_type) {
-        return Err((
-            StatusCode::CONFLICT,
-            "That server plan is not currently available and priced in the selected location.",
-        ));
-    }
-    let ssh_key = request
-        .ssh_key_ref
-        .as_deref()
-        .or(runtime.default_ssh_key_ref.as_deref());
-    if ssh_key.is_none_or(|reference| !catalog.ssh_keys.iter().any(|item| item == reference)) {
-        return Err((
-            StatusCode::CONFLICT,
-            "The selected SSH public key is not in the current Hetzner Cloud catalog.",
-        ));
-    }
-    if runtime
-        .firewall_ref
-        .as_deref()
-        .is_none_or(|reference| !catalog.firewalls.iter().any(|item| item == reference))
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "The selected firewall is not in the current Hetzner Cloud catalog.",
-        ));
-    }
-    Ok(runtime)
-}
-
-#[cfg(test)]
-fn should_run_hetzner_executor(
-    request: &ProvisioningJobStartRequest,
-    job: &ProvisioningJob,
-) -> bool {
-    request.provider == "hetzner-cloud"
-        && request.apply
-        && job.state == ProvisioningJobState::Provisioning
-}
-
-fn should_run_existing_host_executor(
-    state: &AppState,
-    request: &ProvisioningJobStartRequest,
-    job: &ProvisioningJob,
-) -> bool {
-    request.provider == "existing-host"
-        && request.template == "native-systemd"
-        && request.apply
-        && job.state == ProvisioningJobState::WaitingForHeartbeat
-        && state.provider_runtime.existing_host.execute_enabled
-}
-
-fn fail_existing_host_setup_job(
-    state: &AppState,
-    job: ProvisioningJob,
-    error: ExistingHostExecutionError,
-) -> ProvisioningJob {
-    state
-        .provisioning_jobs
-        .transition_existing_host(
-            &job.id,
-            ProvisioningJobState::Failed,
-            format!("{}; no beacon credential was installed.", error.safe_message()),
-            "bootstrap-failed",
-            "Automated bootstrap stopped before credential installation; review the safe error and retry only after the target is ready.",
-            now_unix(),
-        )
-        .unwrap_or(job)
-}
-
-async fn execute_existing_host_setup_job(
-    state: &AppState,
-    request: &ProvisioningJobStartRequest,
-    job: ProvisioningJob,
-) -> ProvisioningJob {
-    if matches!(state.beacon_auth.report_token_mode, BeaconTokenMode::Janus)
-        || !state.beacon_auth.local_register_enabled
-    {
-        return fail_existing_host_setup_job(
-            state,
-            job,
-            ExistingHostExecutionError::UnsupportedTokenMode,
-        );
-    }
-    let spec = match NativeSystemdBootstrapSpec::from_request(request) {
-        Ok(spec) => spec,
-        Err(error) => return fail_existing_host_setup_job(state, job, error),
-    };
-    if let Err(error) = state
-        .provider_runtime
-        .existing_host
-        .validate_native_systemd()
-    {
-        return fail_existing_host_setup_job(state, job, error);
-    }
-
-    let runtime = state.provider_runtime.existing_host.clone();
-    let prepare_spec = spec.clone();
-    let prepared = match tokio::task::spawn_blocking(move || {
-        prepare_native_systemd_bootstrap(&SystemExistingHostSshRunner, &runtime, &prepare_spec)
-    })
-    .await
-    {
-        Ok(Ok(prepared)) => prepared,
-        Ok(Err(error)) => return fail_existing_host_setup_job(state, job, error),
-        Err(_) => {
-            return fail_existing_host_setup_job(
-                state,
-                job,
-                ExistingHostExecutionError::ExecutorTaskFailed,
-            )
-        }
-    };
-
-    let bootstrapping = state
-        .provisioning_jobs
-        .transition_existing_host(
-            &job.id,
-            ProvisioningJobState::Bootstrapping,
-            "SSH trust, privilege, destination, and installer artifacts verified; installing the native beacon through the protected runtime channel.",
-            "installing",
-            "The target passed the fail-closed execution gate; Pharos is installing the beacon without placing its credential in command arguments or job output.",
-            now_unix(),
-        )
-        .unwrap_or_else(|| job.clone());
-
-    let token = match new_beacon_token() {
-        Ok(token) => token,
-        Err(_) => {
-            let runtime = state.provider_runtime.existing_host.clone();
-            let cleanup_spec = spec.clone();
-            let cleanup_prepared = prepared.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                cleanup_native_systemd_bootstrap(
-                    &SystemExistingHostSshRunner,
-                    &runtime,
-                    &cleanup_spec,
-                    &cleanup_prepared,
-                );
-            })
-            .await;
-            return fail_existing_host_setup_job(
-                state,
-                bootstrapping,
-                ExistingHostExecutionError::TokenGenerationFailed,
-            );
-        }
-    };
-    state.store.register(
-        HostRegistration {
-            name: spec.host_name.clone(),
-            role: spec.role.clone(),
-            is_nix: false,
-            heartbeat_interval_secs: spec.interval,
-        },
-        token_hash(&token),
-    );
-
-    let runtime = state.provider_runtime.existing_host.clone();
-    let install_spec = spec.clone();
-    let install_prepared = prepared.clone();
-    let install_result = tokio::task::spawn_blocking(move || {
-        install_native_systemd_bootstrap(
-            &SystemExistingHostSshRunner,
-            &runtime,
-            &install_spec,
-            &install_prepared,
-            &token,
-        )
-    })
-    .await;
-    match install_result {
-        Ok(Ok(())) => state
-            .provisioning_jobs
-            .transition_existing_host(
-                &bootstrapping.id,
-                ProvisioningJobState::WaitingForHeartbeat,
-                "Native pharos-beacon installation completed; waiting for the first authenticated heartbeat.",
-                "installed-waiting-for-heartbeat",
-                "The native beacon and root-owned runtime credential file were installed; onboarding will reconcile after the first authenticated heartbeat.",
-                now_unix(),
-            )
-            .unwrap_or(bootstrapping),
-        Ok(Err(error)) => state
-            .provisioning_jobs
-            .transition_existing_host(
-                &bootstrapping.id,
-                ProvisioningJobState::CleanupNeeded,
-                format!(
-                    "{}. The target may contain a matching root-owned token file; inspect service state before retrying.",
-                    error.safe_message()
-                ),
-                "cleanup-needed",
-                "Credential handoff began but installation was not confirmed; inspect the target and do not rotate or retry blindly.",
-                now_unix(),
-            )
-            .unwrap_or(bootstrapping),
-        Err(_) => state
-            .provisioning_jobs
-            .transition_existing_host(
-                &bootstrapping.id,
-                ProvisioningJobState::CleanupNeeded,
-                "The executor stopped after credential handoff began; inspect the target service and token file before retrying.",
-                "cleanup-needed",
-                "Credential handoff may have completed but the result is unknown; inspect the target and do not rotate or retry blindly.",
-                now_unix(),
-            )
-            .unwrap_or(bootstrapping),
-    }
-}
-
-fn hetzner_bootstrap_handoff(
-    resource: &ProvisioningProviderResource,
-) -> Option<ProvisioningHandoff> {
-    let ssh = resource.ssh.as_ref()?;
-    let address = ssh.host.as_deref()?;
-    Some(ProvisioningHandoff {
-        method: BootstrapMethod::NixosAnywhere,
-        status: "provider-created-bootstrap-required".to_string(),
-        title: "Server created".to_string(),
-        summary: "The provider server is ready; finish setup to install NixOS, start pharos-beacon, and wait for the first heartbeat.".to_string(),
-        token_policy: "Use a private runtime token file with the guarded nixos-anywhere helper; raw credentials never enter job output, command arguments, or the Nix store.".to_string(),
-        secret_target: Some("/etc/pharos/pharos-beacon.token".to_string()),
-        command_ref: Some("scripts/bootstrap-pharos-nixos-anywhere.sh".to_string()),
-        next_steps: vec![
-            format!("Prepare the reviewed NixOS flake for {}.", resource.name),
-            format!("Run the bootstrap helper against root@{address} from an approved Linux executor."),
-            "Keep setup open until the first authenticated heartbeat confirms the new host.".to_string(),
-        ],
-    })
-}
-
-fn provider_deleted_handoff(resource: &ProvisioningProviderResource) -> ProvisioningHandoff {
-    ProvisioningHandoff {
-        method: BootstrapMethod::Deferred,
-        status: "provider-resource-deleted".to_string(),
-        title: "Server deleted".to_string(),
-        summary: format!(
-            "{} was removed from Hetzner Cloud and is no longer an active provider resource.",
-            resource.name
-        ),
-        token_policy: "No credential handoff remains because the provider resource was deleted."
-            .to_string(),
-        secret_target: None,
-        command_ref: None,
-        next_steps: vec![
-            "Start a new setup only when the provider plan and bootstrap path are ready."
-                .to_string(),
-        ],
-    }
-}
-
-async fn execute_hetzner_cleanup_job(
-    state: &AppState,
-    job: ProvisioningJob,
-) -> Result<(ProvisioningJob, bool), ProvisioningCleanupFailure> {
-    let target = hetzner_cleanup_target(&job)
-        .map_err(|error| ProvisioningCleanupFailure::new(error, Some(job.clone())))?;
-    if target.already_deleted {
-        return Ok((job, true));
-    }
-    let reviewed = job.reviewed_plan.clone().ok_or_else(|| {
-        ProvisioningCleanupFailure::new(
-            ProvisioningCleanupError::OwnershipMismatch,
-            Some(job.clone()),
-        )
-    })?;
-    if !state.provisioning_jobs.durable_ready()
-        || job.validate_contract().is_err()
-        || !paid_job_integrity_valid(&job)
-    {
-        return Err(ProvisioningCleanupFailure::new(
-            ProvisioningCleanupError::OwnershipMismatch,
-            Some(job),
-        ));
-    }
-    if !state.provider_runtime.hetzner_cloud.execute_enabled {
-        return Err(ProvisioningCleanupFailure::new(
-            ProvisioningCleanupError::RuntimeDisabled,
-            Some(job),
-        ));
-    }
-    let runtime = effective_hetzner_runtime(
-        &state.provider_runtime.hetzner_cloud,
-        &state.provider_connections,
-    );
-    if !runtime.credential_boundary_ready()
-        || runtime.project_label.as_deref() != Some(reviewed.provider_project.as_str())
-        || target.resource.name != reviewed.server_name
-    {
-        return Err(ProvisioningCleanupFailure::new(
-            ProvisioningCleanupError::OwnershipMismatch,
-            Some(job),
-        ));
-    }
-    let operation = HetznerOperationContext::resolve(runtime).map_err(|_| {
-        ProvisioningCleanupFailure::new(
-            ProvisioningCleanupError::ProviderUnavailable,
-            Some(job.clone()),
-        )
-    })?;
-    let credential_binding_matches = operation.matches_reviewed_plan(&reviewed);
-    let servers = fetch_hetzner_servers(&operation).await.map_err(|_| {
-        ProvisioningCleanupFailure::new(
-            ProvisioningCleanupError::ProviderUnavailable,
-            Some(job.clone()),
-        )
-    })?;
-    let provider_already_absent = match servers
-        .iter()
-        .find(|server| server.id == target.provider_id)
-    {
-        None if credential_binding_matches => true,
-        None => {
-            return Err(ProvisioningCleanupFailure::new(
-                ProvisioningCleanupError::ProviderUnavailable,
-                Some(job),
-            ));
-        }
-        Some(server)
-            if server.name == reviewed.server_name
-                && server.matches_labels(&reviewed.required_labels) =>
-        {
-            false
-        }
-        Some(_) => {
-            return Err(ProvisioningCleanupFailure::new(
-                ProvisioningCleanupError::OwnershipMismatch,
-                Some(job),
-            ));
-        }
-    };
-    if !state.provisioning_jobs.claim_provider_cleanup(&job.id) {
-        return Err(ProvisioningCleanupFailure::new(
-            ProvisioningCleanupError::CleanupInProgress,
-            state.provisioning_jobs.get(&job.id),
-        ));
-    }
-
-    let started = match state.provisioning_jobs.begin_provider_cleanup(
-        &job.id,
-        &target.resource.provider_id,
-        now_unix(),
-    ) {
-        Ok(started) => started,
-        Err(error) => {
-            state.provisioning_jobs.release_provider_cleanup(&job.id);
-            return Err(ProvisioningCleanupFailure::new(
-                if error == ProvisioningPaidStoreError::PersistenceFailed {
-                    ProvisioningCleanupError::PersistenceFailed
-                } else {
-                    ProvisioningCleanupError::CleanupNotAllowed
-                },
-                state.provisioning_jobs.get(&job.id),
-            ));
-        }
-    };
-
-    let provider_result = if provider_already_absent {
-        Ok(HetznerDeleteResult::AlreadyAbsent)
-    } else {
-        delete_hetzner_server(target.provider_id, &operation).await
-    };
-    let outcome = match provider_result {
-        Ok(delete_result) => {
-            let mut deleted_resource = target.resource;
-            deleted_resource.state = "deleted".to_string();
-            deleted_resource.ssh = None;
-            let handoff = provider_deleted_handoff(&deleted_resource);
-            state
-                .provisioning_jobs
-                .complete_provider_cleanup(&job.id, deleted_resource, handoff, now_unix())
-                .map(|job| (job, delete_result == HetznerDeleteResult::AlreadyAbsent))
-                .map_err(|_| {
-                    ProvisioningCleanupFailure::new(
-                        ProvisioningCleanupError::PersistenceFailed,
-                        state.provisioning_jobs.get(&job.id),
-                    )
-                })
-        }
-        Err(error) => {
-            let cleanup_error = match &error {
-                HetznerExecutionError::CredentialUnavailable
-                | HetznerExecutionError::ClientUnavailable => {
-                    ProvisioningCleanupError::ProviderUnavailable
-                }
-                _ => ProvisioningCleanupError::ProviderUncertain,
-            };
-            let message = format!(
-                "{}. Cleanup remains required because deletion was not proven; verify Hetzner Cloud before retrying.",
-                error.safe_message()
-            );
-            let persisted = state
-                .provisioning_jobs
-                .append_progress(
-                    &job.id,
-                    ProvisioningJobState::CleanupNeeded,
-                    message,
-                    now_unix(),
-                )
-                .unwrap_or(started);
-            Err(ProvisioningCleanupFailure::new(
-                cleanup_error,
-                Some(persisted),
-            ))
-        }
-    };
-    state.provisioning_jobs.release_provider_cleanup(&job.id);
-    outcome
-}
-
-async fn provisioning_job_json(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> impl IntoResponse {
-    reconcile_provisioning_jobs_with_runtime(
-        &state.provisioning_jobs,
-        &state.store.list(),
-        now_unix(),
-    );
-    let access = access_for_headers(&state.auth, &headers);
-    match state.provisioning_jobs.get(&id) {
-        Some(job)
-            if provisioning_job_host_name(&job)
-                .map(|host| access.allows_host(host))
-                .unwrap_or_else(|| access.can_agora()) =>
-        {
-            (
-                StatusCode::OK,
-                no_store_headers(),
-                Json(json!({ "job": job })),
-            )
-        }
-        Some(_) => (
-            StatusCode::FORBIDDEN,
-            no_store_headers(),
-            Json(json!({ "error": "this provisioning job is not granted to this account" })),
-        ),
-        None => (
-            StatusCode::NOT_FOUND,
-            no_store_headers(),
-            Json(json!({ "error": "provisioning job not found" })),
-        ),
-    }
-}
-
-async fn cleanup_provisioning_job(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<ProvisioningCleanupRequest>,
-) -> impl IntoResponse {
-    if !access_for_headers(&state.auth, &headers).can_agora() {
-        return (
-            StatusCode::FORBIDDEN,
-            no_store_headers(),
-            Json(json!({ "error": "Agora access is not granted for this account" })),
-        );
-    }
-    if !request.confirm {
-        return (
-            StatusCode::BAD_REQUEST,
-            no_store_headers(),
-            Json(json!({ "error": "Explicit cleanup confirmation is required." })),
-        );
-    }
-    reconcile_provisioning_jobs_with_runtime(
-        &state.provisioning_jobs,
-        &state.store.list(),
-        now_unix(),
-    );
-    let Some(job) = state.provisioning_jobs.get(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            no_store_headers(),
-            Json(json!({ "error": "Provisioning job not found." })),
-        );
-    };
-    if let Err((status, message)) = paid_operator(&state, &headers) {
-        return (
-            status,
-            no_store_headers(),
-            Json(json!({ "error": message })),
-        );
-    }
-    if !state.provisioning_jobs.durable_ready() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            no_store_headers(),
-            Json(
-                json!({ "error": "The durable provisioning-job store is unavailable; no provider deletion was sent." }),
-            ),
-        );
-    }
-
-    match execute_hetzner_cleanup_job(&state, job).await {
-        Ok((job, already_absent)) => (
-            StatusCode::OK,
-            no_store_headers(),
-            Json(json!({
-                "job": job,
-                "cleanup": {
-                    "state": "deleted",
-                    "already_absent": already_absent
-                }
-            })),
-        ),
-        Err(failure) => (
-            failure.error.status_code(),
-            no_store_headers(),
-            Json(json!({
-                "error": failure.error.safe_message(),
-                "job": failure.job
-            })),
-        ),
-    }
-}
-
-async fn existing_host_preflight_json(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ExistingHostPreflightRequest>,
-) -> impl IntoResponse {
-    if !access_for_headers(&state.auth, &headers).can_agora() {
-        return (
-            StatusCode::FORBIDDEN,
-            no_store_headers(),
-            Json(json!({ "error": "Agora access is not granted for this account" })),
-        );
-    }
-    if let Err(error) = request.validate_contract() {
-        return (
-            StatusCode::BAD_REQUEST,
-            no_store_headers(),
-            Json(json!({ "error": error })),
-        );
-    }
-    let report = existing_host_preflight_report(&request, now_unix()).await;
-    match report.validate_contract() {
-        Ok(()) => (
-            StatusCode::OK,
-            no_store_headers(),
-            Json(json!({ "preflight": report })),
-        ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            no_store_headers(),
-            Json(json!({ "error": error })),
-        ),
-    }
-}
-
-async fn existing_host_preflight_report(
-    request: &ExistingHostPreflightRequest,
-    now: i64,
-) -> ExistingHostPreflightReport {
-    let mut checks = Vec::new();
-    let facts = if needs_existing_host_ssh_fact_probe(&request.facts) {
-        merge_preflight_facts(
-            request.facts.clone(),
-            existing_host_ssh_fact_probe(request).await,
-        )
-    } else {
-        request.facts.clone()
-    };
-    let ssh_tcp_state = match preflight_ssh_endpoint(request) {
-        Some((host, port)) => {
-            let started = Instant::now();
-            match timeout(
-                SERVER_PROBE_TIMEOUT,
-                TcpStream::connect((host.as_str(), port)),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    let elapsed_ms = started.elapsed().as_millis().max(1);
-                    PreflightCheckState::Pass.with_message(format!(
-                        "SSH port is reachable from Pharos in {elapsed_ms} ms."
-                    ))
-                }
-                Ok(Err(_)) => PreflightCheckState::Fail
-                    .with_message("Pharos cannot open the SSH port for this host.".to_string()),
-                Err(_) => PreflightCheckState::Fail
-                    .with_message("Pharos timed out while checking the SSH port.".to_string()),
-            }
-        }
-        None => PreflightCheckState::Unknown
-            .with_message("Add an SSH target before automated bootstrap is offered.".to_string()),
-    };
-    checks.push(preflight_check(
-        "ssh-reachability",
-        "SSH reachability",
-        ssh_tcp_state.0,
-        ssh_tcp_state.1,
-    ));
-    checks.push(preflight_bool_check(
-        "ssh-authentication",
-        "SSH authentication",
-        facts.ssh_authenticated,
-        "SSH authentication has been verified.",
-        "SSH authentication failed or is not available.",
-        "Verify SSH login without sending any password or key material to Pharos.",
-    ));
-    checks.push(privilege_check(&facts));
-    checks.push(os_family_check(&facts));
-    checks.push(nix_capability_check(&facts));
-    checks.push(disk_check(&facts));
-    checks.push(preflight_bool_check(
-        "pharos-reachability",
-        "Host can reach Pharos",
-        facts.pharos_reachable,
-        "The host can reach the Pharos report endpoint.",
-        "The host cannot reach Pharos yet.",
-        "Confirm outbound HTTPS from the host to Pharos before registering a beacon.",
-    ));
-    checks.push(backup_observation_check(&facts));
-
-    let bootstrap_options = bootstrap_options(&facts, &checks);
-    let summary = preflight_summary(&checks);
-    let next_action = preflight_next_action(&summary, &bootstrap_options).to_string();
-    ExistingHostPreflightReport {
-        schema: EXISTING_HOST_PREFLIGHT_SCHEMA.to_string(),
-        version: EXISTING_HOST_PREFLIGHT_VERSION,
-        host_name: request.host_name.trim().to_string(),
-        checked_at: now,
-        summary,
-        checks,
-        bootstrap_options,
-        next_action,
-    }
-}
-
-fn preflight_ssh_endpoint(request: &ExistingHostPreflightRequest) -> Option<(String, u16)> {
-    if matches!(request.ssh.route, SshRoute::None | SshRoute::Unknown) {
-        return None;
-    }
-    request
-        .ssh
-        .host
-        .as_deref()
-        .and_then(|host| split_probe_host_port(host, request.ssh.port.unwrap_or(22)))
-}
-
-fn needs_existing_host_ssh_fact_probe(facts: &ExistingHostPreflightFacts) -> bool {
-    facts.ssh_authenticated.is_none()
-        || facts.root.is_none()
-        || facts.sudo.is_none()
-        || facts.os_family.is_none()
-        || facts.nixos.is_none()
-        || facts.nix_available.is_none()
-        || facts.free_disk_gib.is_none()
-        || facts.pharos_reachable.is_none()
-        || facts.backup_tools.is_empty()
-}
-
-async fn existing_host_ssh_fact_probe(
-    request: &ExistingHostPreflightRequest,
-) -> ExistingHostPreflightFacts {
-    let Some((host, port)) = preflight_ssh_endpoint(request) else {
-        return ExistingHostPreflightFacts::default();
-    };
-    let user = request.ssh.user.clone();
-    let pharos_url = request.pharos_url.clone();
-    match timeout(
-        EXISTING_HOST_SSH_PROBE_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            run_existing_host_ssh_probe(host, port, user, pharos_url)
-        }),
-    )
-    .await
-    {
-        Ok(Ok(facts)) => facts,
-        _ => ExistingHostPreflightFacts {
-            ssh_authenticated: Some(false),
-            ..ExistingHostPreflightFacts::default()
-        },
-    }
-}
-
-fn run_existing_host_ssh_probe(
-    host: String,
-    port: u16,
-    user: Option<String>,
-    pharos_url: Option<String>,
-) -> ExistingHostPreflightFacts {
-    let target = match user
-        .as_deref()
-        .map(str::trim)
-        .filter(|user| !user.is_empty())
-    {
-        Some(user) => format!("{user}@{host}"),
-        None => host,
-    };
-    let mut remote = String::new();
-    if let Some(url) = pharos_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-    {
-        remote.push_str("PHAROS_PREFLIGHT_URL=");
-        remote.push_str(&shell_single_quote(url));
-        remote.push_str("; export PHAROS_PREFLIGHT_URL; ");
-    }
-    remote.push_str("sh -c ");
-    remote.push_str(&shell_single_quote(EXISTING_HOST_SSH_PROBE_SCRIPT));
-
-    let output = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("PasswordAuthentication=no")
-        .arg("-o")
-        .arg("KbdInteractiveAuthentication=no")
-        .arg("-o")
-        .arg("ConnectTimeout=4")
-        .arg("-o")
-        .arg("ServerAliveInterval=2")
-        .arg("-o")
-        .arg("ServerAliveCountMax=1")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg(target)
-        .arg(remote)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            parse_existing_host_ssh_probe_stdout(&output.stdout)
-        }
-        Ok(_) => ExistingHostPreflightFacts {
-            ssh_authenticated: Some(false),
-            ..ExistingHostPreflightFacts::default()
-        },
-        Err(_) => ExistingHostPreflightFacts::default(),
-    }
-}
-
-const EXISTING_HOST_SSH_PROBE_SCRIPT: &str = r#"uid=$(id -u 2>/dev/null || printf unknown)
-case "$uid" in
-  0) root=true ;;
-  *) root=false ;;
-esac
-if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-  sudo=true
-else
-  sudo=false
-fi
-if [ -r /etc/os-release ]; then
-  os=$(. /etc/os-release >/dev/null 2>&1; printf '%s' "${ID:-linux}")
-else
-  os=$(uname -s 2>/dev/null || printf unknown)
-fi
-if [ -e /etc/NIXOS ]; then nixos=true; else nixos=false; fi
-if command -v nix >/dev/null 2>&1; then nix=true; else nix=false; fi
-disk=$(df -Pk / 2>/dev/null | awk 'NR==2 { printf "%d", $4 / 1048576 }')
-case "$disk" in ''|*[!0-9]*) disk=0 ;; esac
-pharos=unknown
-if [ -n "${PHAROS_PREFLIGHT_URL:-}" ]; then
-  if command -v curl >/dev/null 2>&1; then
-    if curl -fsS --max-time 4 "${PHAROS_PREFLIGHT_URL%/}/healthz" >/dev/null 2>&1; then pharos=true; else pharos=false; fi
-  elif command -v wget >/dev/null 2>&1; then
-    if wget -q -T 4 -O /dev/null "${PHAROS_PREFLIGHT_URL%/}/healthz" >/dev/null 2>&1; then pharos=true; else pharos=false; fi
-  fi
-fi
-backup_tools=
-add_backup_tool() {
-  case ",$backup_tools," in
-    *,"$1",*) ;;
-    *) if [ -n "$backup_tools" ]; then backup_tools="$backup_tools,$1"; else backup_tools="$1"; fi ;;
-  esac
-}
-for tool in restic borg kopia duplicity duplicacy rclone; do
-  if command -v "$tool" >/dev/null 2>&1; then add_backup_tool "$tool"; fi
-done
-if command -v systemctl >/dev/null 2>&1; then
-  if systemctl list-timers --all --no-legend 2>/dev/null | grep -Eiq 'backup|restic|borg|kopia|duplicity|duplicacy|rclone'; then
-    add_backup_tool systemd-timer
-  fi
-  if systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -Eiq 'backup|restic|borg|kopia|duplicity|duplicacy|rclone'; then
-    add_backup_tool systemd-service
-  fi
-fi
-printf 'ssh_authenticated=true\n'
-printf 'root=%s\n' "$root"
-printf 'sudo=%s\n' "$sudo"
-printf 'os_family=%s\n' "$os"
-printf 'nixos=%s\n' "$nixos"
-printf 'nix_available=%s\n' "$nix"
-printf 'free_disk_gib=%s\n' "$disk"
-printf 'pharos_reachable=%s\n' "$pharos"
-printf 'backup_tools=%s\n' "$backup_tools"
-"#;
-
-fn parse_existing_host_ssh_probe_stdout(stdout: &[u8]) -> ExistingHostPreflightFacts {
-    let mut facts = ExistingHostPreflightFacts::default();
-    let text = String::from_utf8_lossy(stdout);
-    for line in text.lines().take(32) {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "ssh_authenticated" => facts.ssh_authenticated = parse_probe_bool(value),
-            "root" => facts.root = parse_probe_bool(value),
-            "sudo" => facts.sudo = parse_probe_bool(value),
-            "os_family" => facts.os_family = sanitize_probe_text(value),
-            "nixos" => facts.nixos = parse_probe_bool(value),
-            "nix_available" => facts.nix_available = parse_probe_bool(value),
-            "free_disk_gib" => facts.free_disk_gib = value.parse::<u32>().ok(),
-            "pharos_reachable" => facts.pharos_reachable = parse_probe_bool(value),
-            "backup_tools" => facts.backup_tools = parse_backup_tools(value),
-            _ => {}
-        }
-    }
-    facts
-}
-
-fn parse_probe_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Some(true),
-        "false" | "0" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn sanitize_probe_text(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > 80
-        || value.contains('\n')
-        || value.contains('\r')
-        || value.to_ascii_lowercase().contains("token=")
-        || value.to_ascii_lowercase().contains("bearer ")
-    {
-        return None;
-    }
-    Some(value.to_string())
-}
-
-fn parse_backup_tools(value: &str) -> Vec<String> {
-    let mut tools = Vec::new();
-    for raw in value.split(',').take(12) {
-        let Some(tool) = sanitize_probe_text(raw) else {
-            continue;
-        };
-        if tool
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-            && !tools.iter().any(|existing| existing == &tool)
-        {
-            tools.push(tool);
-        }
-    }
-    tools
-}
-
-fn merge_preflight_facts(
-    mut base: ExistingHostPreflightFacts,
-    probe: ExistingHostPreflightFacts,
-) -> ExistingHostPreflightFacts {
-    base.ssh_authenticated = base.ssh_authenticated.or(probe.ssh_authenticated);
-    base.root = base.root.or(probe.root);
-    base.sudo = base.sudo.or(probe.sudo);
-    base.os_family = base.os_family.or(probe.os_family);
-    base.nixos = base.nixos.or(probe.nixos);
-    base.nix_available = base.nix_available.or(probe.nix_available);
-    base.free_disk_gib = base.free_disk_gib.or(probe.free_disk_gib);
-    base.pharos_reachable = base.pharos_reachable.or(probe.pharos_reachable);
-    if base.backup_tools.is_empty() {
-        base.backup_tools = probe.backup_tools;
-    }
-    base
-}
-
-fn shell_single_quote(value: &str) -> String {
-    let mut quoted = String::from("'");
-    for ch in value.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\"'\"'");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
-fn preflight_check(
-    key: &str,
-    label: &str,
-    state: PreflightCheckState,
-    message: String,
-) -> ExistingHostPreflightCheck {
-    ExistingHostPreflightCheck {
-        key: key.to_string(),
-        label: label.to_string(),
-        state,
-        message,
-    }
-}
-
-trait PreflightStateMessage {
-    fn with_message(self, message: String) -> (PreflightCheckState, String);
-}
-
-impl PreflightStateMessage for PreflightCheckState {
-    fn with_message(self, message: String) -> (PreflightCheckState, String) {
-        (self, message)
-    }
-}
-
-fn preflight_bool_check(
-    key: &str,
-    label: &str,
-    value: Option<bool>,
-    pass: &str,
-    fail: &str,
-    unknown: &str,
-) -> ExistingHostPreflightCheck {
-    match value {
-        Some(true) => preflight_check(key, label, PreflightCheckState::Pass, pass.to_string()),
-        Some(false) => preflight_check(key, label, PreflightCheckState::Fail, fail.to_string()),
-        None => preflight_check(
-            key,
-            label,
-            PreflightCheckState::Unknown,
-            unknown.to_string(),
-        ),
-    }
-}
-
-fn privilege_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
-    match (facts.root, facts.sudo) {
-        (Some(true), _) => preflight_check(
-            "privilege",
-            "Privilege model",
-            PreflightCheckState::Pass,
-            "Root access is available for bootstrap.".to_string(),
-        ),
-        (_, Some(true)) => preflight_check(
-            "privilege",
-            "Privilege model",
-            PreflightCheckState::Pass,
-            "The SSH user can elevate with sudo.".to_string(),
-        ),
-        (Some(false), Some(false)) => preflight_check(
-            "privilege",
-            "Privilege model",
-            PreflightCheckState::Fail,
-            "Automated bootstrap needs root or sudo access.".to_string(),
-        ),
-        _ => preflight_check(
-            "privilege",
-            "Privilege model",
-            PreflightCheckState::Unknown,
-            "Verify root or sudo capability before choosing an automated path.".to_string(),
-        ),
-    }
-}
-
-fn os_family_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
-    let Some(os) = facts.os_family.as_deref().map(str::trim) else {
-        return preflight_check(
-            "os-family",
-            "Operating system",
-            PreflightCheckState::Unknown,
-            "Identify the host operating system before bootstrap.".to_string(),
-        );
-    };
-    let lowered = os.to_ascii_lowercase();
-    if lowered.contains("linux") || lowered.contains("nixos") {
-        preflight_check(
-            "os-family",
-            "Operating system",
-            PreflightCheckState::Pass,
-            format!("{os} is a supported existing-host target."),
-        )
-    } else if lowered.contains("darwin")
-        || lowered.contains("macos")
-        || lowered.contains("windows")
-        || lowered.contains("bsd")
-    {
-        preflight_check(
-            "os-family",
-            "Operating system",
-            PreflightCheckState::Fail,
-            format!("{os} is not supported by the automated existing-host bootstrap path."),
-        )
-    } else {
-        preflight_check(
-            "os-family",
-            "Operating system",
-            PreflightCheckState::Warn,
-            format!("{os} needs manual review before automated bootstrap."),
-        )
-    }
-}
-
-fn nix_capability_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
-    match (facts.nixos, facts.nix_available) {
-        (Some(true), _) => preflight_check(
-            "nix-capability",
-            "Nix capability",
-            PreflightCheckState::Pass,
-            "NixOS is already detected.".to_string(),
-        ),
-        (Some(false), Some(true)) => preflight_check(
-            "nix-capability",
-            "Nix capability",
-            PreflightCheckState::Warn,
-            "Nix is available, but the host is not confirmed as NixOS.".to_string(),
-        ),
-        (Some(false), Some(false)) => preflight_check(
-            "nix-capability",
-            "Nix capability",
-            PreflightCheckState::Warn,
-            "Nix is not detected; use native beacon or manual bootstrap unless converting the host.".to_string(),
-        ),
-        _ => preflight_check(
-            "nix-capability",
-            "Nix capability",
-            PreflightCheckState::Unknown,
-            "Check whether the host is NixOS or can run the portable beacon.".to_string(),
-        ),
-    }
-}
-
-fn disk_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
-    match facts.free_disk_gib {
-        Some(gib) if gib >= 8 => preflight_check(
-            "disk-space",
-            "Disk headroom",
-            PreflightCheckState::Pass,
-            format!("{gib} GiB free is enough for setup checks."),
-        ),
-        Some(gib) if gib >= 4 => preflight_check(
-            "disk-space",
-            "Disk headroom",
-            PreflightCheckState::Warn,
-            format!("{gib} GiB free is tight; review before bootstrap."),
-        ),
-        Some(gib) => preflight_check(
-            "disk-space",
-            "Disk headroom",
-            PreflightCheckState::Fail,
-            format!("{gib} GiB free is too little for a safe bootstrap."),
-        ),
-        None => preflight_check(
-            "disk-space",
-            "Disk headroom",
-            PreflightCheckState::Unknown,
-            "Check free disk space before installing or converting the host.".to_string(),
-        ),
-    }
-}
-
-fn backup_observation_check(facts: &ExistingHostPreflightFacts) -> ExistingHostPreflightCheck {
-    if facts.backup_tools.is_empty() {
-        return preflight_check(
-            "backup-observation",
-            "Backup signal",
-            PreflightCheckState::Warn,
-            "No existing backup job was detected during read-only preflight; choose backup intent before finishing onboarding.".to_string(),
-        );
-    }
-
-    preflight_check(
-        "backup-observation",
-        "Backup signal",
-        PreflightCheckState::Pass,
-        format!(
-            "Detected backup signal: {}. Choose managed elsewhere to observe it, or required to enroll Pharos-managed backups.",
-            facts.backup_tools.join(", ")
-        ),
-    )
-}
-
-fn bootstrap_options(
-    facts: &ExistingHostPreflightFacts,
-    checks: &[ExistingHostPreflightCheck],
-) -> Vec<ExistingHostBootstrapOption> {
-    let ssh_reachable = check_passed(checks, "ssh-reachability");
-    let auth_ok = facts.ssh_authenticated == Some(true);
-    let privilege_ok = facts.root == Some(true) || facts.sudo == Some(true);
-    let disk_ok = !check_failed(checks, "disk-space");
-    let os_supported = check_passed(checks, "os-family") || facts.os_family.is_none();
-    let linuxish = facts
-        .os_family
-        .as_deref()
-        .map(|os| {
-            let os = os.to_ascii_lowercase();
-            os.contains("linux") || os.contains("nixos")
-        })
-        .unwrap_or(false);
-    let automated_ready = ssh_reachable && auth_ok && privilege_ok && disk_ok && os_supported;
-    vec![
-        ExistingHostBootstrapOption {
-            method: BootstrapMethod::NixosAnywhere,
-            label: "NixOS / declarative".to_string(),
-            available: automated_ready && linuxish,
-            message: if automated_ready && linuxish {
-                "Use this when the host should be managed declaratively.".to_string()
-            } else {
-                "Needs reachable SSH, authentication, privilege, Linux/NixOS facts, and enough disk."
-                    .to_string()
-            },
-            changes: vec![
-                "Review and apply a declarative NixOS bootstrap.".to_string(),
-                "Install or update pharos-beacon through managed system configuration.".to_string(),
-            ],
-            token_handoff: Some(
-                "Beacon token handoff uses a managed file or env-file, never a command-line argument."
-                    .to_string(),
-            ),
-            existing_token_policy: Some(
-                "Existing beacon token files are rotation-sensitive and must be reviewed before replacement."
-                    .to_string(),
-            ),
-            next_state: Some("awaiting-first-heartbeat after setup starts".to_string()),
-        },
-        ExistingHostBootstrapOption {
-            method: BootstrapMethod::NativeSystemd,
-            label: "Native beacon".to_string(),
-            available: automated_ready && linuxish,
-            message: if automated_ready && linuxish {
-                "Use this when the host should keep its current OS and only report to Pharos."
-                    .to_string()
-            } else {
-                "Needs verified Linux SSH access with root or sudo.".to_string()
-            },
-            changes: vec![
-                "Install the portable pharos-beacon service on the existing OS.".to_string(),
-                "Create a least-surprise service environment file for beacon configuration.".to_string(),
-            ],
-            token_handoff: Some(
-                "Beacon token handoff uses a local env-file path owned by the service user."
-                    .to_string(),
-            ),
-            existing_token_policy: Some(
-                "Existing token files are rotation-sensitive and preserved until explicit rotation is confirmed.".to_string(),
-            ),
-            next_state: Some("awaiting-first-heartbeat after setup starts".to_string()),
-        },
-        ExistingHostBootstrapOption {
-            method: BootstrapMethod::Manual,
-            label: "Manual / deferred".to_string(),
-            available: true,
-            message:
-                "Always available; the operator completes setup without automated host changes."
-                    .to_string(),
-            changes: vec![
-                "No automated host changes are made by Pharos.".to_string(),
-                "Show manual instructions and wait for the first heartbeat.".to_string(),
-            ],
-            token_handoff: Some(
-                "Token handoff stays file/env-file based; do not paste raw tokens into shell history."
-                    .to_string(),
-            ),
-            existing_token_policy: Some(
-                "If a token already exists, treat it as rotation-sensitive state.".to_string(),
-            ),
-            next_state: Some("manual setup or awaiting-first-heartbeat".to_string()),
-        },
-    ]
-}
-
-fn check_passed(checks: &[ExistingHostPreflightCheck], key: &str) -> bool {
-    checks
-        .iter()
-        .any(|check| check.key == key && check.state == PreflightCheckState::Pass)
-}
-
-fn check_failed(checks: &[ExistingHostPreflightCheck], key: &str) -> bool {
-    checks
-        .iter()
-        .any(|check| check.key == key && check.state == PreflightCheckState::Fail)
-}
-
-fn preflight_summary(checks: &[ExistingHostPreflightCheck]) -> ExistingHostPreflightSummary {
-    if checks
-        .iter()
-        .any(|check| check.state == PreflightCheckState::Fail)
-    {
-        ExistingHostPreflightSummary {
-            state: PreflightCheckState::Fail,
-            label: "Needs attention".to_string(),
-            message: "Fix failed checks before registering a beacon token.".to_string(),
-        }
-    } else if checks
-        .iter()
-        .any(|check| check.state == PreflightCheckState::Unknown)
-    {
-        ExistingHostPreflightSummary {
-            state: PreflightCheckState::Unknown,
-            label: "Needs details".to_string(),
-            message: "Collect the missing read-only facts before automated bootstrap.".to_string(),
-        }
-    } else if checks
-        .iter()
-        .any(|check| check.state == PreflightCheckState::Warn)
-    {
-        ExistingHostPreflightSummary {
-            state: PreflightCheckState::Warn,
-            label: "Review first".to_string(),
-            message: "Bootstrap may be possible, but one check needs operator review.".to_string(),
-        }
-    } else {
-        ExistingHostPreflightSummary {
-            state: PreflightCheckState::Pass,
-            label: "Ready".to_string(),
-            message: "Choose a bootstrap method; no token has been registered yet.".to_string(),
-        }
-    }
-}
-
-fn preflight_next_action(
-    summary: &ExistingHostPreflightSummary,
-    options: &[ExistingHostBootstrapOption],
-) -> &'static str {
-    match summary.state {
-        PreflightCheckState::Fail => "Fix failed checks, then run preflight again.",
-        PreflightCheckState::Unknown => {
-            "Collect SSH, privilege, OS, disk, and host-to-Pharos facts."
-        }
-        PreflightCheckState::Warn => "Review warnings, then choose a bootstrap method.",
-        PreflightCheckState::Pass => {
-            if options
-                .iter()
-                .any(|option| option.available && option.method != BootstrapMethod::Manual)
-            {
-                "Choose NixOS/declarative or native beacon bootstrap."
-            } else {
-                "Use manual/deferred setup or collect more automation facts."
-            }
-        }
-    }
 }
 
 /// Beacon ingestion (PHAROS-9): upsert the host, stamping server receive time.
@@ -12212,13 +1782,7 @@ async fn report(
         return StatusCode::GONE.into_response();
     }
     if let Err(error) = rep.validate_contract() {
-        tracing::warn!(
-            host = %rep.name,
-            schema = %rep.schema,
-            version = rep.version,
-            error = %error,
-            "report rejected: invalid report contract"
-        );
+        tracing::warn!(error = %error, "report rejected: invalid report contract");
         return StatusCode::BAD_REQUEST.into_response();
     }
     if let Some(token) = bearer_token(&headers) {
@@ -12274,7 +1838,10 @@ async fn report(
         );
     }
     let now = now_unix();
-    state.store.record(rep, now);
+    if let Err(error) = state.store.record(rep, now) {
+        tracing::error!(host = %host_name, error = %error, "report could not be durably recorded");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     if settings_applied {
         match state.host_actions.complete_settings_change(&host_name, now) {
             Ok(Some(_)) => {
@@ -12308,35 +1875,42 @@ async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(registration): Json<HostRegistration>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
+    if let Err(error) = registration.validate_contract() {
+        tracing::warn!(error = %error, "registration rejected: invalid contract");
+        return register_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid registration contract" }),
+        );
+    }
     if state.retired_hosts.is_retired(&registration.name) {
-        return (
+        return register_response(
             StatusCode::CONFLICT,
-            Json(json!({
+            json!({
                 "error": "host was removed; clear the retirement through explicit re-onboarding first"
-            })),
+            }),
         );
     }
     match state.beacon_auth.registration_status(&headers) {
         RegistrationAuth::Allowed => {}
         RegistrationAuth::Disabled => {
-            return (
+            return register_response(
                 StatusCode::GONE,
-                Json(json!({
+                json!({
                     "error": "local registration disabled; use Janus-managed beacon token issuance"
-                })),
+                }),
             );
         }
         RegistrationAuth::Denied => {
-            return (
+            return register_response(
                 StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "registration token invalid" })),
+                json!({ "error": "registration token invalid" }),
             );
         }
         RegistrationAuth::NotConfigured => {
-            return (
+            return register_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "PHAROS_REGISTRATION_TOKEN not configured" })),
+                json!({ "error": "PHAROS_REGISTRATION_TOKEN not configured" }),
             );
         }
     }
@@ -12345,9 +1919,9 @@ async fn register(
         Ok(token) => token,
         Err(err) => {
             tracing::error!("failed to generate beacon token: {err}");
-            return (
+            return register_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "token generation failed" })),
+                json!({ "error": "token generation failed" }),
             );
         }
     };
@@ -12355,12 +1929,25 @@ async fn register(
         name: registration.name.clone(),
         token: token.clone(),
     };
-    let host = state.store.register(registration, token_hash(&token));
+    let host = match state.store.register(registration, token_hash(&token)) {
+        Ok(host) => host,
+        Err(error) => {
+            tracing::error!(error = %error, "registration could not be durably recorded");
+            return register_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": "registration could not be durably recorded" }),
+            );
+        }
+    };
     tracing::info!(host = %host.name, "beacon token issued");
-    (
+    register_response(
         StatusCode::CREATED,
-        Json(serde_json::to_value(response).expect("registration response serializes")),
+        serde_json::to_value(response).expect("registration response serializes"),
     )
+}
+
+fn register_response(status: StatusCode, payload: serde_json::Value) -> Response {
+    (status, no_store_headers(), Json(payload)).into_response()
 }
 
 async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -12593,6 +2180,134 @@ fn no_store_headers() -> [(header::HeaderName, &'static str); 3] {
     ]
 }
 
+const MAX_RENDERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+async fn security_headers(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let auth_response = request.uri().path().starts_with("/auth/");
+    let mut response = secure_response(next.run(request).await).await;
+    if auth_response {
+        for (name, value) in no_store_headers() {
+            response
+                .headers_mut()
+                .insert(name, axum::http::HeaderValue::from_static(value));
+        }
+    }
+    response
+}
+
+async fn secure_response(response: Response) -> Response {
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+
+    let nonce = if is_html {
+        match content_security_nonce() {
+            Ok(nonce) => Some(nonce),
+            Err(()) => {
+                return security_policy_failure_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut response = if let Some(nonce) = nonce.as_deref() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, MAX_RENDERED_RESPONSE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => return security_policy_failure_response(),
+        };
+        let html = match String::from_utf8(bytes.to_vec()) {
+            Ok(html) => html,
+            Err(_) => return security_policy_failure_response(),
+        };
+        let script_open = format!(r#"<script nonce="{nonce}""#);
+        let style_open = format!(r#"<style nonce="{nonce}""#);
+        let html = html
+            .replace("<script", &script_open)
+            .replace("<style", &style_open);
+        parts.headers.remove(header::CONTENT_LENGTH);
+        Response::from_parts(parts, axum::body::Body::from(html))
+    } else {
+        response
+    };
+
+    apply_security_headers(response.headers_mut(), nonce.as_deref());
+    response
+}
+
+fn content_security_nonce() -> Result<String, ()> {
+    let mut random = [0_u8; 16];
+    getrandom::getrandom(&mut random).map_err(|_| ())?;
+    let mut nonce = String::with_capacity(random.len() * 2);
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(nonce, "{byte:02x}").map_err(|_| ())?;
+    }
+    Ok(nonce)
+}
+
+fn apply_security_headers(headers: &mut HeaderMap, nonce: Option<&str>) {
+    use axum::http::{HeaderName, HeaderValue};
+
+    let csp = nonce.map_or_else(
+        || "default-src 'none'; base-uri 'none'; frame-ancestors 'none'".to_string(),
+        |nonce| {
+            format!(
+                "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'nonce-{nonce}'; script-src-attr 'none'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data: https://*.basemaps.cartocdn.com; connect-src 'self'; font-src 'self'; media-src 'self'; frame-src 'none'; worker-src 'none'; manifest-src 'self'"
+            )
+        },
+    );
+    let csp = HeaderValue::from_str(&csp).expect("generated CSP is a valid header");
+    headers.insert(HeaderName::from_static("content-security-policy"), csp);
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static(
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()",
+        ),
+    );
+    headers.insert(
+        HeaderName::from_static("strict-transport-security"),
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-permitted-cross-domain-policies"),
+        HeaderValue::from_static("none"),
+    );
+}
+
+fn security_policy_failure_response() -> Response {
+    let mut response = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "response security policy unavailable",
+    )
+        .into_response();
+    apply_security_headers(response.headers_mut(), None);
+    response
+}
+
 fn no_store_html(body: String) -> impl IntoResponse {
     (no_store_headers(), Html(body))
 }
@@ -12642,21 +2357,6 @@ fn filter_jobs_by_access(jobs: Vec<ProvisioningJob>, access: &AccessGrant) -> Ve
         .collect()
 }
 
-pub(crate) fn render_no_access_page(
-    title: &str,
-    subtitle: &str,
-    shell: ShellContext<'_>,
-    active: &str,
-) -> String {
-    format!(
-        r#"{HEAD}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div><section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, active),
-        title = html_escape(title),
-        subtitle = html_escape(subtitle),
-        as_of = clock_label(now_unix()),
-    )
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct ProviderSettingsQuery {
     #[serde(default, rename = "return")]
@@ -12689,8 +2389,11 @@ fn unavailable_hetzner_test_result(
     }
 }
 
-async fn run_hetzner_connection_test(state: &AppState, now: i64) {
-    run_hetzner_connection_test_for(state, now, None, None).await;
+async fn run_hetzner_connection_test(
+    state: &AppState,
+    now: i64,
+) -> Result<(), provider_connections::ProviderConnectionStoreError> {
+    run_hetzner_connection_test_for(state, now, None, None).await
 }
 
 async fn run_hetzner_connection_test_for(
@@ -12698,7 +2401,7 @@ async fn run_hetzner_connection_test_for(
     now: i64,
     ssh_key_override: Option<&str>,
     location_override: Option<&str>,
-) {
+) -> Result<(), provider_connections::ProviderConnectionStoreError> {
     let runtime = effective_hetzner_runtime(
         &state.provider_runtime.hetzner_cloud,
         &state.provider_connections,
@@ -12722,7 +2425,7 @@ async fn run_hetzner_connection_test_for(
         }
         Err(_) => unavailable_hetzner_test_result(&runtime, now),
     };
-    state.provider_connections.record_test(result);
+    state.provider_connections.record_test(result)
 }
 
 fn hetzner_connection_response(state: &AppState, now: i64) -> Json<serde_json::Value> {
@@ -12758,7 +2461,14 @@ async fn test_hetzner_provider_connection(
         );
     }
     let now = now_unix();
-    run_hetzner_connection_test(&state, now).await;
+    if let Err(error) = run_hetzner_connection_test(&state, now).await {
+        tracing::error!(error = %error, "provider test result could not be durably recorded");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store_headers(),
+            Json(json!({ "error": "Provider state could not be durably recorded" })),
+        );
+    }
     (
         StatusCode::OK,
         no_store_headers(),
@@ -12785,13 +2495,25 @@ async fn update_hetzner_provider_preferences(
         now,
         state.provider_runtime.hetzner_cloud.evidence_ttl_secs,
     ) {
+        let status = if error == provider_connections::HetznerPreferenceError::PersistenceFailed {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        };
         return (
-            StatusCode::CONFLICT,
+            status,
             no_store_headers(),
             Json(json!({ "error": error.safe_message() })),
         );
     }
-    run_hetzner_connection_test(&state, now).await;
+    if let Err(error) = run_hetzner_connection_test(&state, now).await {
+        tracing::error!(error = %error, "provider retest result could not be durably recorded");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store_headers(),
+            Json(json!({ "error": "Provider state could not be durably recorded" })),
+        );
+    }
     (
         StatusCode::OK,
         no_store_headers(),
@@ -12820,7 +2542,14 @@ async fn disconnect_hetzner_provider(
         );
     }
     let now = now_unix();
-    state.provider_connections.disconnect(now);
+    if let Err(error) = state.provider_connections.disconnect(now) {
+        tracing::error!(error = %error, "provider disconnection could not be durably recorded");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store_headers(),
+            Json(json!({ "error": "Provider disconnection could not be durably recorded" })),
+        );
+    }
     (
         StatusCode::OK,
         no_store_headers(),
@@ -12828,6185 +2557,53 @@ async fn disconnect_hetzner_provider(
     )
 }
 
-async fn provider_settings_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let user_label = sidebar_user_label(&state.auth, &headers);
-    let access = access_for_headers(&state.auth, &headers);
-    no_store_html(render_provider_connections_page(
-        &provider_connections(
-            &state.provider_runtime,
-            &state.provider_connections,
-            now_unix(),
-        ),
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-        access.can_manage_fleet(),
-    ))
-}
-
-async fn provider_settings_detail_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(provider_key): AxumPath<String>,
-    Query(query): Query<ProviderSettingsQuery>,
-) -> Response {
-    let user_label = sidebar_user_label(&state.auth, &headers);
-    let access = access_for_headers(&state.auth, &headers);
-    let shell = ShellContext {
-        user_label: &user_label,
-        logout_enabled: state.auth.is_some(),
-    };
-    let Some(provider) = provider_connection(
-        &state.provider_runtime,
-        &state.provider_connections,
-        &provider_key,
-        now_unix(),
-    ) else {
-        return (
-            StatusCode::NOT_FOUND,
-            no_store_headers(),
-            Html(render_no_access_page(
-                "Provider not found",
-                "Return to Provider connections and choose an available path.",
-                shell,
-                "platform-settings",
-            )),
-        )
-            .into_response();
-    };
-    let return_path = safe_provider_return_path(query.return_path.as_deref());
-    let body = if provider.key == "hetzner-cloud" {
-        render_hetzner_connection_page(
-            &state.provider_runtime,
-            &state.provider_connections,
-            shell,
-            access.can_manage_fleet(),
-            return_path.as_deref(),
-        )
-    } else {
-        render_guided_provider_page(
-            &provider,
-            shell,
-            access.can_manage_fleet(),
-            return_path.as_deref(),
-        )
-    };
-    no_store_html(body).into_response()
-}
-
-async fn provider_connections_json(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let access = access_for_headers(&state.auth, &headers);
-    let catalog = provider_connections(
-        &state.provider_runtime,
-        &state.provider_connections,
-        now_unix(),
-    );
-    no_store_json(json!({
-        "schema": catalog.schema,
-        "version": catalog.version,
-        "can_manage": access.can_manage_fleet(),
-        "providers": catalog.providers,
-    }))
-}
-
-async fn home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_label = sidebar_user_label(&state.auth, &headers);
-    let access = access_for_headers(&state.auth, &headers);
-    if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Fleet",
-            "All hosts at a glance",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "fleet",
-        ));
-    }
-    let all_hosts = state.store.list();
-    reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now_unix());
-    let hosts = filter_hosts_by_access(all_hosts, &access);
-    let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
-    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let declared_preferences =
-        filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    no_store_html(render_home_with_capabilities(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            declared_preferences: Some(&declared_preferences),
-        },
-        &self_host(),
-        now_unix(),
-        &manifests,
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-        FleetCapabilities {
-            can_onboard: access.can_agora(),
-            can_manage_fleet: access.can_manage_fleet(),
-            system_update_available: state.nixcfg_dispatch.system_update_available(),
-            host_removal_available: state.nixcfg_dispatch.host_removal_available()
-                && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
-                    || state.retirement_owner.configured()),
-        },
-    ))
-}
-
-async fn map_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_label = sidebar_user_label(&state.auth, &headers);
-    let access = access_for_headers(&state.auth, &headers);
-    if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Map",
-            "Server locations",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "map",
-        ));
-    }
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
-    no_store_html(render_map(
-        &hosts,
-        &self_host(),
-        now_unix(),
-        &user_label,
-        state.auth.is_some(),
-    ))
-}
-
-async fn map_data_json(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let access = access_for_headers(&state.auth, &headers);
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
-    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let now = now_unix();
-    let probes = map_connectivity_probes(&hosts, &manifests).await;
-    let payload = map_data_payload(&hosts, &self_host(), now, &manifests, &probes);
-    no_store_json(serde_json::to_value(payload).expect("map data serializes"))
-}
-
-async fn alerts_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_label = sidebar_user_label(&state.auth, &headers);
-    let access = access_for_headers(&state.auth, &headers);
-    if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Alerts",
-            "Needs attention",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "alerts",
-        ));
-    }
-    let now = now_unix();
-    let all_hosts = state.store.list();
-    reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now);
-    let hosts = filter_hosts_by_access(all_hosts, &access);
-    let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
-    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let probes = server_probe_overlays(&manifests, now).await;
-    let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
-        state.manifests.load_errors()
-    } else {
-        &[]
-    };
-    no_store_html(render_alerts(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            declared_preferences: None,
-        },
-        &self_host(),
-        now,
-        &manifests,
-        load_errors,
-        &probes,
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-    ))
-}
-
-async fn activity_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_label = sidebar_user_label(&state.auth, &headers);
-    let access = access_for_headers(&state.auth, &headers);
-    if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Activity",
-            "Operational timeline",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "activity",
-        ));
-    }
-    let now = now_unix();
-    let all_hosts = state.store.list();
-    reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now);
-    let hosts = filter_hosts_by_access(all_hosts, &access);
-    let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
-    let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let probes = server_probe_overlays(&manifests, now).await;
-    let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
-        state.manifests.load_errors()
-    } else {
-        &[]
-    };
-    let action_jobs: Vec<_> = state
-        .host_actions
-        .list()
-        .into_iter()
-        .filter(|job| access.allows_host(&job.host))
-        .collect();
-    no_store_html(render_activity_with_actions(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            declared_preferences: None,
-        },
-        &self_host(),
-        now,
-        ActivitySources {
-            manifests: &manifests,
-            load_errors,
-            server_probes: &probes,
-            action_jobs: &action_jobs,
-        },
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-    ))
-}
-
-async fn backups_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let user_label = sidebar_user_label(&state.auth, &headers);
-    let access = access_for_headers(&state.auth, &headers);
-    if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Backups",
-            "Protection at a glance",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "backups",
-        ));
-    }
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
-    no_store_html(render_backups(
-        &hosts,
-        now_unix(),
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-    ))
-}
-
-async fn fleet_horizon_asset() -> impl axum::response::IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
-        FLEET_HORIZON_PNG,
-    )
-}
-
-async fn sidebar_lighthouse_asset() -> impl axum::response::IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
-        SIDEBAR_LIGHTHOUSE_PNG,
-    )
-}
-
-async fn sidebar_lighthouse_motion_asset() -> impl axum::response::IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "video/mp4"),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-        ],
-        SIDEBAR_LIGHTHOUSE_MOTION_MP4,
-    )
-}
-
-async fn favicon_svg() -> impl axum::response::IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        FAVICON_SVG,
-    )
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn url_query_escape(s: &str) -> String {
-    let mut encoded = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-fn freshness_row(label: &str, value: &str, class: &str) -> String {
-    format!(
-        r#"<div class="fresh-row"><span>{}</span><strong class="{}">{}</strong></div>"#,
-        html_escape(label),
-        html_escape(class),
-        html_escape(value)
-    )
-}
-
-fn freshness_value(value: Option<u32>, zero_label: &str) -> (String, &'static str) {
-    match value {
-        Some(0) => (zero_label.to_string(), "ok"),
-        Some(v) => (v.to_string(), "warn"),
-        None => ("unknown".to_string(), "na"),
-    }
-}
-
-fn freshness_markup(freshness: &NixFreshness) -> String {
-    if !freshness.applicable {
-        return format!(
-            "{}{}",
-            freshness_row("Flake.lock age", "n/a", "na"),
-            freshness_row("Commits behind", "n/a", "na")
-        );
-    }
-
-    let (mut age, age_class) = freshness_value(freshness.flake_lock_age_days, "fresh");
-    if age_class == "warn" {
-        age.push('d');
-    }
-    let (commits, commits_class) = freshness_value(freshness.commits_behind, "0");
-    format!(
-        "{}{}",
-        freshness_row("Flake.lock age", &age, age_class),
-        freshness_row("Commits behind", &commits, commits_class)
-    )
-}
-
-fn kernel_reboot_required(kernel: Option<&KernelPosture>) -> Option<&KernelPosture> {
-    kernel.filter(|posture| posture.state == KernelPostureState::RebootRequired)
-}
-
-fn kernel_posture_markup(kernel: Option<&KernelPosture>, host: &str, live: Liveness) -> String {
-    let reboot = kernel_reboot_required(kernel);
-    let explanation = reboot
-        .map(|_| {
-            if live == Liveness::Live {
-                format!(
-                    "{} is healthy. A newer system kernel is ready for its next planned restart.",
-                    host
-                )
-            } else {
-                format!(
-                    "{} has a newer system kernel ready for its next planned restart.",
-                    host
-                )
-            }
-        })
-        .unwrap_or_default();
-    let running = reboot
-        .and_then(|posture| posture.running_version.as_deref())
-        .unwrap_or_default();
-    let expected = reboot
-        .and_then(|posture| posture.expected_version.as_deref())
-        .unwrap_or_default();
-    let hidden = if reboot.is_none() { " hidden" } else { "" };
-    format!(
-        r#"<div class="kernel-slot" data-kernel-slot{hidden}><details class="kernel-posture" data-kernel-posture><summary>{icon}<span>Restart needed</span></summary><div class="kernel-detail"><strong>Restart needed</strong><p data-kernel-explanation>{explanation}</p><dl><div><dt>Running</dt><dd data-kernel-running>{running}</dd></div><div><dt>Ready after restart</dt><dd data-kernel-expected>{expected}</dd></div></dl><p class="kernel-boundary">Pharos will not restart this host.</p></div></details></div>"#,
-        icon = icons::REFRESH_CW,
-        explanation = html_escape(&explanation),
-        running = html_escape(running),
-        expected = html_escape(expected),
-    )
-}
-
-struct AttentionReason {
-    label: String,
-    level: &'static str,
-    rank: u8,
-}
-
-fn self_attention_reason() -> AttentionReason {
-    AttentionReason {
-        label: "Pharos host".to_string(),
-        level: "self",
-        rank: 4,
-    }
-}
-
-fn freshness_attention_reason(freshness: &NixFreshness) -> Option<AttentionReason> {
-    if !freshness.applicable {
-        return None;
-    }
-
-    let age_warn = freshness.flake_lock_age_days.filter(|d| *d > 0);
-    let commits_warn = freshness.commits_behind.filter(|c| *c > 0);
-    let label = match (age_warn, commits_warn) {
-        (Some(days), Some(commits)) => format!("nix drift: {days}d · {commits} commits"),
-        (Some(days), None) => format!("flake.lock {days}d"),
-        (None, Some(commits)) => format!("{commits} commits behind"),
-        (None, None) => {
-            if freshness.flake_lock_age_days.is_none() || freshness.commits_behind.is_none() {
-                "freshness unknown".to_string()
-            } else {
-                return None;
-            }
-        }
-    };
-
-    Some(AttentionReason {
-        label,
-        level: if age_warn.is_some() || commits_warn.is_some() {
-            "warn"
-        } else {
-            "wait"
-        },
-        rank: 3,
-    })
-}
-
-fn service_observation_attention_reason(
-    observations: &[ServiceObservation],
-    suppress_nix_freshness: bool,
-) -> Option<AttentionReason> {
-    if observations.is_empty() {
-        return None;
-    }
-
-    let warnings = observations
-        .iter()
-        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
-        .filter(|obs| obs.state == ServiceObservationState::Warning)
-        .count();
-    if warnings > 0 {
-        return Some(AttentionReason {
-            label: format!(
-                "{warnings} service warning{}",
-                if warnings == 1 { "" } else { "s" }
-            ),
-            level: "warn",
-            rank: 3,
-        });
-    }
-
-    let stale = observations
-        .iter()
-        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
-        .filter(|obs| obs.state == ServiceObservationState::Stale)
-        .count();
-    if stale > 0 {
-        return Some(AttentionReason {
-            label: format!("{stale} service stale{}", if stale == 1 { "" } else { "s" }),
-            level: "warn",
-            rank: 3,
-        });
-    }
-
-    let unknown = observations
-        .iter()
-        .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
-        .filter(|obs| obs.state == ServiceObservationState::Unknown)
-        .count();
-    if unknown > 0 {
-        return Some(AttentionReason {
-            label: format!("{unknown} service unknown"),
-            level: "wait",
-            rank: 3,
-        });
-    }
-
-    None
-}
-
-fn service_observations_summary(observations: &[ServiceObservation]) -> serde_json::Value {
-    let mut healthy = 0;
-    let mut warning = 0;
-    let mut stale = 0;
-    let mut unknown = 0;
-    for observation in observations {
-        match observation.state {
-            ServiceObservationState::Healthy => healthy += 1,
-            ServiceObservationState::Warning => warning += 1,
-            ServiceObservationState::Stale => stale += 1,
-            ServiceObservationState::Unknown => unknown += 1,
-        }
-    }
-    let label = if observations.is_empty() {
-        "not observed".to_string()
-    } else if warning > 0 {
-        format!("{warning} warning{}", if warning == 1 { "" } else { "s" })
-    } else if stale > 0 {
-        format!("{stale} stale")
-    } else if unknown > 0 {
-        format!("{unknown} unknown")
-    } else {
-        "healthy".to_string()
-    };
-    json!({
-        "label": label,
-        "healthy": healthy,
-        "warning": warning,
-        "stale": stale,
-        "unknown": unknown,
-    })
-}
-
-fn backup_observations_summary(observations: &[BackupObservation]) -> serde_json::Value {
-    let mut healthy = 0;
-    let mut warning = 0;
-    let mut stale = 0;
-    let mut failed = 0;
-    let mut unknown = 0;
-    let mut missing = 0;
-    let mut not_configured = 0;
-    for observation in observations {
-        match observation.state {
-            BackupPostureState::Healthy => healthy += 1,
-            BackupPostureState::Warning => warning += 1,
-            BackupPostureState::Stale => stale += 1,
-            BackupPostureState::Failed => failed += 1,
-            BackupPostureState::Unknown => unknown += 1,
-            BackupPostureState::Missing => missing += 1,
-            BackupPostureState::NotConfigured => not_configured += 1,
-        }
-    }
-    let (state, label) = if observations.is_empty() {
-        ("unknown", "not observed".to_string())
-    } else if failed > 0 {
-        ("failed", format!("{failed} failed"))
-    } else if missing > 0 {
-        ("missing", format!("{missing} missing"))
-    } else if stale > 0 {
-        ("stale", format!("{stale} stale"))
-    } else if warning > 0 {
-        (
-            "warning",
-            format!("{warning} warning{}", if warning == 1 { "" } else { "s" }),
-        )
-    } else if unknown > 0 {
-        ("unknown", format!("{unknown} unknown"))
-    } else if not_configured > 0 {
-        ("not-configured", format!("{not_configured} not configured"))
-    } else {
-        ("healthy", "healthy".to_string())
-    };
-    json!({
-        "state": state,
-        "label": label,
-        "healthy": healthy,
-        "warning": warning,
-        "stale": stale,
-        "failed": failed,
-        "unknown": unknown,
-        "missing": missing,
-        "not_configured": not_configured,
-        "total": observations.len(),
-    })
-}
-
-#[derive(Debug, Clone)]
-struct BackupUiSummary {
-    state: &'static str,
-    level: &'static str,
-    label: String,
-    detail: String,
-    last_success: String,
-    schedule: String,
-    target: String,
-    validation: String,
-    total: usize,
-    rank: usize,
-}
-
-fn backup_posture_rank(state: BackupPostureState) -> usize {
-    match state {
-        BackupPostureState::Failed => 0,
-        BackupPostureState::Missing => 1,
-        BackupPostureState::Stale => 2,
-        BackupPostureState::Warning => 3,
-        BackupPostureState::Unknown => 4,
-        BackupPostureState::NotConfigured => 5,
-        BackupPostureState::Healthy => 6,
-    }
-}
-
-fn backup_level(state: BackupPostureState) -> &'static str {
-    match state {
-        BackupPostureState::Failed | BackupPostureState::Missing => "critical",
-        BackupPostureState::Stale | BackupPostureState::Warning => "warning",
-        BackupPostureState::Unknown | BackupPostureState::NotConfigured => "watch",
-        BackupPostureState::Healthy => "clear",
-    }
-}
-
-fn backup_state_key(state: BackupPostureState) -> &'static str {
-    match state {
-        BackupPostureState::Healthy => "healthy",
-        BackupPostureState::Warning => "warning",
-        BackupPostureState::Stale => "stale",
-        BackupPostureState::Failed => "failed",
-        BackupPostureState::Unknown => "unknown",
-        BackupPostureState::Missing => "missing",
-        BackupPostureState::NotConfigured => "not-configured",
-    }
-}
-
-fn backup_state_label(state: BackupPostureState) -> &'static str {
-    match state {
-        BackupPostureState::Healthy => "Protected",
-        BackupPostureState::Warning => "Review backup",
-        BackupPostureState::Stale => "Backup stale",
-        BackupPostureState::Failed => "Backup failed",
-        BackupPostureState::Unknown => "Backup pending",
-        BackupPostureState::Missing => "Backup missing",
-        BackupPostureState::NotConfigured => "No backup",
-    }
-}
-
-fn backup_run_label(state: pharos_core::BackupRunState) -> &'static str {
-    match state {
-        pharos_core::BackupRunState::Succeeded => "succeeded",
-        pharos_core::BackupRunState::Failed => "failed",
-        pharos_core::BackupRunState::Running => "running",
-        pharos_core::BackupRunState::Unknown => "unknown",
-    }
-}
-
-fn backup_validation_state_label(state: pharos_core::BackupValidationState) -> &'static str {
-    match state {
-        pharos_core::BackupValidationState::Passed => "passed",
-        pharos_core::BackupValidationState::Failed => "failed",
-        pharos_core::BackupValidationState::Stale => "stale",
-        pharos_core::BackupValidationState::Unknown => "unknown",
-    }
-}
-
-fn backup_validation_level_label(level: pharos_core::BackupValidationLevel) -> &'static str {
-    match level {
-        pharos_core::BackupValidationLevel::SnapshotExists => "snapshot",
-        pharos_core::BackupValidationLevel::RepositoryCheck => "repo check",
-        pharos_core::BackupValidationLevel::MountList => "mount/list",
-        pharos_core::BackupValidationLevel::RestoreSample => "restore sample",
-        pharos_core::BackupValidationLevel::DiffHash => "diff/hash",
-        pharos_core::BackupValidationLevel::OperatorTest => "operator test",
-    }
-}
-
-fn backup_last_success_label(observation: &BackupObservation, now: i64) -> String {
-    observation
-        .last_success_at
-        .map(|timestamp| format!("{} ago", duration_label(now - timestamp)))
-        .unwrap_or_else(|| "not yet".to_string())
-}
-
-fn backup_validation_label(observation: &BackupObservation, now: i64) -> String {
-    if let Some(restore) = &observation.restore_validation {
-        let label = restore
-            .evidence_label
-            .as_deref()
-            .unwrap_or_else(|| backup_validation_level_label(restore.level));
-        return restore
-            .checked_at
-            .map(|timestamp| {
-                format!(
-                    "{} {} · {} ago",
-                    label,
-                    backup_validation_state_label(restore.state),
-                    duration_label(now - timestamp)
-                )
-            })
-            .unwrap_or_else(|| {
-                format!("{} {}", label, backup_validation_state_label(restore.state))
-            });
-    }
-
-    if let (Some(timestamp), Some(state)) =
-        (observation.last_check_at, observation.last_check_state)
-    {
-        return format!(
-            "check {} · {} ago",
-            backup_validation_state_label(state),
-            duration_label(now - timestamp)
-        );
-    }
-
-    "not checked".to_string()
-}
-
-fn backup_attempt_detail(observation: &BackupObservation, now: i64) -> String {
-    if observation.state == BackupPostureState::Healthy {
-        return observation
-            .last_success_at
-            .map(|timestamp| format!("last success {} ago", duration_label(now - timestamp)))
-            .unwrap_or_else(|| observation.summary.clone());
-    }
-
-    if let (Some(timestamp), Some(state)) =
-        (observation.last_attempt_at, observation.last_attempt_state)
-    {
-        return format!(
-            "{} · {} ago",
-            backup_run_label(state),
-            duration_label(now - timestamp)
-        );
-    }
-
-    observation.summary.clone()
-}
-
-fn backup_ui_summary(observations: &[BackupObservation], now: i64) -> BackupUiSummary {
-    let Some(primary) = observations
-        .iter()
-        .min_by_key(|observation| backup_posture_rank(observation.state))
-    else {
-        return BackupUiSummary {
-            state: "unknown",
-            level: "watch",
-            label: "Not observed".to_string(),
-            detail: "No backup signal yet".to_string(),
-            last_success: "not observed".to_string(),
-            schedule: "not declared".to_string(),
-            target: "not declared".to_string(),
-            validation: "not checked".to_string(),
-            total: 0,
-            rank: backup_posture_rank(BackupPostureState::Unknown),
-        };
-    };
-
-    BackupUiSummary {
-        state: backup_state_key(primary.state),
-        level: backup_level(primary.state),
-        label: backup_state_label(primary.state).to_string(),
-        detail: backup_attempt_detail(primary, now),
-        last_success: backup_last_success_label(primary, now),
-        schedule: primary
-            .schedule
-            .clone()
-            .unwrap_or_else(|| "not declared".to_string()),
-        target: primary
-            .target_label
-            .clone()
-            .unwrap_or_else(|| "not declared".to_string()),
-        validation: backup_validation_label(primary, now),
-        total: observations.len(),
-        rank: backup_posture_rank(primary.state),
-    }
-}
-
-fn backup_glyph(level: &str) -> &'static str {
-    match level {
-        "clear" => "check",
-        "warning" => "alert",
-        "critical" => "x",
-        _ => "question",
-    }
-}
-
-fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
-    let title = format!("Backup: {} - {}", summary.label, summary.detail);
-    let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
-    format!(
-        r#"<a class="header-chip backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
-        level = html_escape(summary.level),
-        host_query = html_escape(&url_query_escape(host)),
-        state = html_escape(summary.state),
-        glyph = backup_glyph(summary.level),
-        title = html_escape(&title),
-        aria_label = html_escape(&aria_label),
-        check = icons::SHIELD_CHECK,
-        question = icons::SHIELD_QUESTION,
-        alert = icons::SHIELD_ALERT,
-        x = icons::SHIELD_X,
-    )
-}
-
-fn host_actions_markup(host: &Host, context: HostActionRenderContext<'_>) -> String {
-    let capabilities = context.capabilities;
-    let name = html_escape(&host.name);
-    let role = html_escape(&host.role);
-    let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
-    let title = html_escape(&format!("Actions for {}", host.name));
-    let settings_href = html_escape(context.settings_href);
-    let review_hidden = if context.settings_state == HostPreferencesState::Applied {
-        " hidden"
-    } else {
-        ""
-    };
-    let update_hidden =
-        if host.is_nix && capabilities.can_manage_fleet && capabilities.system_update_available {
-            ""
-        } else {
-            " hidden"
-        };
-    let janus_ready = context.manifest.is_some_and(|manifest| {
-        manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
-            && manifest.policy.privileged_actions.janus_required
-    });
-    let reboot = kernel_reboot_required(host.kernel.as_ref());
-    let update_pending = reboot.is_some() || host.freshness.commits_behind.unwrap_or(0) > 0;
-    let restart_hidden =
-        if host.is_nix && capabilities.can_manage_fleet && janus_ready && update_pending {
-            ""
-        } else {
-            " hidden"
-        };
-    let remove_hidden = if capabilities.can_manage_fleet
-        && (!context.declared || capabilities.host_removal_available)
-    {
-        ""
-    } else {
-        " hidden"
-    };
-    let primary_separator_hidden =
-        if review_hidden.is_empty() || update_hidden.is_empty() || restart_hidden.is_empty() {
-            ""
-        } else {
-            " hidden"
-        };
-    let dot_hidden = if context.settings_state != HostPreferencesState::Applied || reboot.is_some()
-    {
-        ""
-    } else {
-        " hidden"
-    };
-    let kernel_state = host
-        .kernel
-        .as_ref()
-        .map(|kernel| match kernel.state {
-            KernelPostureState::Current => "current",
-            KernelPostureState::RebootRequired => "reboot_required",
-            KernelPostureState::Unknown => "unknown",
-            KernelPostureState::NotApplicable => "not_applicable",
-        })
-        .unwrap_or("unknown");
-    let running_kernel = host
-        .kernel
-        .as_ref()
-        .and_then(|kernel| kernel.running_version.as_deref())
-        .unwrap_or("not reported");
-    let expected_kernel = host
-        .kernel
-        .as_ref()
-        .and_then(|kernel| kernel.expected_version.as_deref())
-        .unwrap_or("not reported");
-
-    format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-settings-href="{settings_href}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong><a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending" href="{settings_href}"{review_hidden}>{clock}<span><strong>Review pending change</strong><span>See what is waiting for this host</span></span></a><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
-        is_nix = host.is_nix,
-        declared = context.declared,
-        janus_ready = janus_ready,
-        can_manage_fleet = capabilities.can_manage_fleet,
-        system_update_available = capabilities.system_update_available,
-        host_removal_available = capabilities.host_removal_available,
-        update_pending = update_pending,
-        settings_state = context.settings_state.key(),
-        backup_state = html_escape(context.backup.state),
-        backup_label = html_escape(&context.backup.label),
-        kernel_state = html_escape(kernel_state),
-        running_kernel = html_escape(running_kernel),
-        expected_kernel = html_escape(expected_kernel),
-        ellipsis = icons::ELLIPSIS,
-        clock = icons::CLOCK_3,
-        package = icons::PACKAGE_SEARCH,
-        power = icons::POWER,
-        file = icons::FILE_TEXT,
-        trash = icons::TRASH_2,
-        shield = icons::SHIELD_CHECK,
-    )
-}
-
-pub(crate) fn host_action_dialog() -> String {
-    format!(
-        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="settings-change" hidden>{sliders}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><div class="host-workflow" data-host-workflow hidden></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel request</button><button class="host-action-dialog-button" type="button" data-host-action-close>Cancel</button><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button></span></footer></section></section>"#,
-        package = icons::PACKAGE_SEARCH,
-        power = icons::POWER,
-        sliders = icons::SLIDERS,
-        file = icons::FILE_TEXT,
-        trash = icons::TRASH_2,
-        close = icons::X,
-        shield = icons::SHIELD_CHECK,
-    )
-}
-
-fn backup_search_text(summary: &BackupUiSummary) -> Option<String> {
-    (summary.total > 0).then(|| {
-        format!(
-            "{} {} {} {} {} {}",
-            summary.label,
-            summary.detail,
-            summary.last_success,
-            summary.schedule,
-            summary.target,
-            summary.validation
-        )
-    })
-}
-
-const FIRST_BACKUP_PENDING_GRACE_SECS: i64 = 24 * 60 * 60;
-
-#[derive(Debug, Clone)]
-struct ProtectionOnboardingStatus {
-    state: &'static str,
-    level: &'static str,
-    label: String,
-    detail: String,
-    sort_time: i64,
-}
-
-impl ProtectionOnboardingStatus {
-    fn search_text(&self) -> String {
-        format!("{} {} {}", self.state, self.label, self.detail)
-    }
-}
-
-fn protection_setup_job_for_host<'a>(
-    host_name: &str,
-    jobs: &'a [ProvisioningJob],
-) -> Option<&'a ProvisioningJob> {
-    jobs.iter()
-        .filter(|job| {
-            !matches!(
-                job.state,
-                ProvisioningJobState::Failed | ProvisioningJobState::CleanupNeeded
-            ) && !provisioning_job_rolled_back(job)
-                && provisioning_job_host_name(job).is_some_and(|name| name == host_name)
-        })
-        .max_by_key(|job| job.updated_at)
-}
-
-fn first_runtime_seen_at(host: &Host, job: &ProvisioningJob) -> i64 {
-    host.heartbeat_log
-        .iter()
-        .copied()
-        .filter(|stamp| *stamp >= job.created_at)
-        .min()
-        .or(host.last_seen)
-        .unwrap_or(job.updated_at)
-}
-
-fn backup_observation_success_at(observation: &BackupObservation) -> Option<i64> {
-    if observation.state == BackupPostureState::Healthy
-        || observation.last_attempt_state == Some(pharos_core::BackupRunState::Succeeded)
-        || observation.last_success_at.is_some()
-    {
-        return observation
-            .last_success_at
-            .or(observation.last_attempt_at)
-            .or(observation.last_check_at);
-    }
-    None
-}
-
-fn protection_onboarding_status(
-    host: &Host,
-    jobs: &[ProvisioningJob],
-    now: i64,
-) -> Option<ProtectionOnboardingStatus> {
-    let job = protection_setup_job_for_host(&host.name, jobs)?;
-    let intent = provisioning_job_setup_intent(job);
-    let first_seen = first_runtime_seen_at(host, job);
-
-    if let Some(failed) = host.backup_observations.iter().find(|observation| {
-        matches!(
-            observation.state,
-            BackupPostureState::Failed | BackupPostureState::Missing
-        ) || observation.last_attempt_state == Some(pharos_core::BackupRunState::Failed)
-    }) {
-        return Some(ProtectionOnboardingStatus {
-            state: "first-backup-failed",
-            level: "critical",
-            label: "First backup failed".to_string(),
-            detail: failed.summary.clone(),
-            sort_time: failed
-                .last_attempt_at
-                .or(failed.last_check_at)
-                .unwrap_or(now),
-        });
-    }
-
-    if let Some(review) = host.backup_observations.iter().find(|observation| {
-        matches!(
-            observation.state,
-            BackupPostureState::Stale | BackupPostureState::Warning
-        )
-    }) {
-        return Some(ProtectionOnboardingStatus {
-            state: "first-backup-review",
-            level: "warning",
-            label: "First backup needs review".to_string(),
-            detail: review.summary.clone(),
-            sort_time: backup_sort_time(host, review, now),
-        });
-    }
-
-    if let Some(success_at) = host
-        .backup_observations
-        .iter()
-        .filter_map(backup_observation_success_at)
-        .max()
-    {
-        return Some(ProtectionOnboardingStatus {
-            state: "first-backup-succeeded",
-            level: "clear",
-            label: "First backup succeeded".to_string(),
-            detail: format!(
-                "Successful backup observed {} ago",
-                duration_label(now - success_at)
-            ),
-            sort_time: success_at,
-        });
-    }
-
-    match intent.backup {
-        BackupSetupIntent::Required => {
-            let age = now.saturating_sub(first_seen);
-            if age > FIRST_BACKUP_PENDING_GRACE_SECS {
-                Some(ProtectionOnboardingStatus {
-                    state: "first-backup-overdue",
-                    level: "warning",
-                    label: "First backup overdue".to_string(),
-                    detail: format!(
-                        "No successful backup after {} from first heartbeat",
-                        duration_label(FIRST_BACKUP_PENDING_GRACE_SECS)
-                    ),
-                    sort_time: first_seen + FIRST_BACKUP_PENDING_GRACE_SECS,
-                })
-            } else {
-                Some(ProtectionOnboardingStatus {
-                    state: "first-backup-pending",
-                    level: "watch",
-                    label: "First backup pending".to_string(),
-                    detail: "First heartbeat seen; waiting for backup evidence".to_string(),
-                    sort_time: first_seen,
-                })
-            }
-        }
-        BackupSetupIntent::Optional => Some(ProtectionOnboardingStatus {
-            state: "backup-optional",
-            level: "clear",
-            label: "Backup optional".to_string(),
-            detail: "Not required to finish onboarding".to_string(),
-            sort_time: job.updated_at,
-        }),
-        BackupSetupIntent::External => Some(ProtectionOnboardingStatus {
-            state: "backup-external",
-            level: "watch",
-            label: "Managed elsewhere".to_string(),
-            detail: "External evidence will appear when detected".to_string(),
-            sort_time: job.updated_at,
-        }),
-        BackupSetupIntent::EnrollLater => Some(ProtectionOnboardingStatus {
-            state: "backup-enroll-later",
-            level: "watch",
-            label: "Backup enrollment queued".to_string(),
-            detail: "Follow up after onboarding is stable".to_string(),
-            sort_time: job.updated_at,
-        }),
-        BackupSetupIntent::Absent => Some(ProtectionOnboardingStatus {
-            state: "backup-absent",
-            level: "clear",
-            label: "Backups intentionally absent".to_string(),
-            detail: "Host is recorded as intentionally unprotected".to_string(),
-            sort_time: job.updated_at,
-        }),
-        BackupSetupIntent::Deferred => Some(ProtectionOnboardingStatus {
-            state: "backup-deferred",
-            level: "watch",
-            label: "Backup decision pending".to_string(),
-            detail: "Ask again before closing onboarding".to_string(),
-            sort_time: job.updated_at,
-        }),
-    }
-}
-
-fn protection_onboarding_markup(status: &ProtectionOnboardingStatus, extra_class: &str) -> String {
-    let extra_class = if extra_class.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", html_escape(extra_class))
-    };
-    format!(
-        r#"<div class="protection-onboard{extra_class} {level}" data-protection-state="{state}" title="{title}"><strong>{label}</strong><span>{detail}</span></div>"#,
-        extra_class = extra_class,
-        level = html_escape(status.level),
-        state = html_escape(status.state),
-        title = html_escape(&format!(
-            "Protection onboarding: {} - {}",
-            status.label, status.detail
-        )),
-        label = html_escape(&status.label),
-        detail = html_escape(&status.detail)
-    )
-}
-
-fn protection_onboarding_alert(
-    host: &Host,
-    jobs: &[ProvisioningJob],
-    now: i64,
-) -> Option<AlertItem> {
-    let status = protection_onboarding_status(host, jobs, now)?;
-    if status.level == "clear" {
-        return None;
-    }
-    let action = match status.state {
-        "first-backup-overdue" => "Inspect backup enrollment and run or observe the first backup.",
-        "first-backup-failed" => "Fix the backup job, then confirm the next successful run.",
-        "first-backup-review" => "Review backup evidence before closing onboarding.",
-        "first-backup-pending" => "Keep onboarding open until the first backup is observed.",
-        "backup-deferred" => "Choose whether this host should be protected.",
-        "backup-enroll-later" => "Schedule or start backup enrollment after the host is stable.",
-        "backup-external" => "Confirm external backup evidence can be observed when available.",
-        _ => "Review protection onboarding.",
-    };
-    Some(AlertItem {
-        level: status.level,
-        host: host.name.clone(),
-        role: host.role.clone(),
-        issue: status.label,
-        detail: status.detail,
-        source: "setup",
-        seen: format!("as of {}", clock_label(now)),
-        next_action: action.to_string(),
-        sort_time: status.sort_time,
-    })
-}
-
-fn push_protection_onboarding_activity(
-    events: &mut Vec<ActivityEvent>,
-    host: &Host,
-    jobs: &[ProvisioningJob],
-    now: i64,
-) {
-    let Some(status) = protection_onboarding_status(host, jobs, now) else {
-        return;
-    };
-    let level = match status.level {
-        "clear" => "recovery",
-        level => level,
-    };
-    events.push(ActivityEvent::new(
-        status.sort_time,
-        host.name.clone(),
-        level,
-        "setup",
-        status.label,
-        status.detail,
-        "setup",
-    ));
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct ServerProbeObservation {
-    id: String,
-    service: String,
-    source: &'static str,
-    policy: &'static str,
-    kind: &'static str,
-    target: Option<String>,
-    state: ServiceObservationState,
-    server_reachable: Option<bool>,
-    client_reachable: Option<bool>,
-    summary: String,
-    checked_at: i64,
-}
-
-async fn server_probe_overlays(
-    manifests: &[HostManifest],
-    now: i64,
-) -> BTreeMap<String, Vec<ServerProbeObservation>> {
-    let mut overlays = BTreeMap::new();
-    for manifest in manifests {
-        let mut observations = Vec::new();
-        for service in &manifest.services {
-            if should_server_probe(service) {
-                observations.push(server_probe_service(service, now).await);
-            }
-        }
-        if !observations.is_empty() {
-            overlays.insert(manifest.host.name.clone(), observations);
-        }
-    }
-    overlays
-}
-
-async fn server_probe_service(service: &ManifestService, now: i64) -> ServerProbeObservation {
-    let Some(raw_url) = server_probe_url(service) else {
-        return server_probe_observation(
-            service,
-            None,
-            ServiceObservationState::Unknown,
-            None,
-            "no server-probe URL declared".to_string(),
-            now,
-        );
-    };
-
-    let url = match Url::parse(&raw_url) {
-        Ok(url) => url,
-        Err(_) => {
-            return server_probe_observation(
-                service,
-                Some(raw_url),
-                ServiceObservationState::Unknown,
-                None,
-                "server-probe URL is invalid".to_string(),
-                now,
-            );
-        }
-    };
-    let target = sanitized_probe_target(&url);
-
-    if !matches!(url.scheme(), "http" | "https") {
-        return server_probe_observation(
-            service,
-            Some(target),
-            ServiceObservationState::Unknown,
-            None,
-            "server probe supports http/https targets only".to_string(),
-            now,
-        );
-    }
-
-    let Some(host) = url.host_str() else {
-        return server_probe_observation(
-            service,
-            Some(target),
-            ServiceObservationState::Unknown,
-            None,
-            "server-probe URL has no host".to_string(),
-            now,
-        );
-    };
-    let Some(port) = url.port_or_known_default() else {
-        return server_probe_observation(
-            service,
-            Some(target),
-            ServiceObservationState::Unknown,
-            None,
-            "server-probe URL has no port".to_string(),
-            now,
-        );
-    };
-
-    match timeout(SERVER_PROBE_TIMEOUT, TcpStream::connect((host, port))).await {
-        Ok(Ok(_)) => server_probe_observation(
-            service,
-            Some(target),
-            ServiceObservationState::Healthy,
-            Some(true),
-            format!("server can reach {host}:{port}"),
-            now,
-        ),
-        Ok(Err(_)) => server_probe_observation(
-            service,
-            Some(target),
-            ServiceObservationState::Warning,
-            Some(false),
-            format!("server cannot reach {host}:{port}"),
-            now,
-        ),
-        Err(_) => server_probe_observation(
-            service,
-            Some(target),
-            ServiceObservationState::Warning,
-            Some(false),
-            format!("server probe timed out for {host}:{port}"),
-            now,
-        ),
-    }
-}
-
-fn server_probe_observation(
-    service: &ManifestService,
-    target: Option<String>,
-    state: ServiceObservationState,
-    server_reachable: Option<bool>,
-    summary: String,
-    checked_at: i64,
-) -> ServerProbeObservation {
-    ServerProbeObservation {
-        id: service_probe_id(service),
-        service: service.name.clone(),
-        source: "server",
-        policy: "pharos-runtime",
-        kind: "tcp-connect",
-        target,
-        state,
-        server_reachable,
-        client_reachable: None,
-        summary,
-        checked_at,
-    }
-}
-
-fn should_server_probe(service: &ManifestService) -> bool {
-    explicit_server_probe_policy_opt(service.probe.as_ref())
-        || (service.status_policy.source == ManifestStatusSource::PharosRuntime
-            && !service.passive
-            && server_probe_url(service).is_some())
-}
-
-fn explicit_server_probe_policy_opt(policy: Option<&ManifestProbePolicy>) -> bool {
-    policy.is_some_and(explicit_server_probe_policy)
-}
-
-fn explicit_server_probe_policy(policy: &ManifestProbePolicy) -> bool {
-    match policy {
-        ManifestProbePolicy::Named(name) => matches!(
-            name.trim().to_ascii_lowercase().as_str(),
-            "server" | "server-probe" | "pharos" | "pharos-runtime"
-        ),
-        ManifestProbePolicy::Enabled(_) => false,
-    }
-}
-
-fn server_probe_url(service: &ManifestService) -> Option<String> {
-    ["tailnet", "lanHostname", "lanIp"]
-        .into_iter()
-        .find_map(|key| service.urls.get(key).filter(|url| !url.is_empty()).cloned())
-        .or_else(|| service.url.as_ref().filter(|url| !url.is_empty()).cloned())
-}
-
-fn sanitized_probe_target(url: &Url) -> String {
-    let host = url.host_str().unwrap_or("unknown");
-    let port = url
-        .port()
-        .map(|port| format!(":{port}"))
-        .unwrap_or_default();
-    let path = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
-    format!("{}://{host}{port}{path}", url.scheme())
-}
-
-fn server_probe_summary(observations: &[ServerProbeObservation]) -> serde_json::Value {
-    let mut healthy = 0;
-    let mut warning = 0;
-    let mut stale = 0;
-    let mut unknown = 0;
-    for observation in observations {
-        match observation.state {
-            ServiceObservationState::Healthy => healthy += 1,
-            ServiceObservationState::Warning => warning += 1,
-            ServiceObservationState::Stale => stale += 1,
-            ServiceObservationState::Unknown => unknown += 1,
-        }
-    }
-    let label = if observations.is_empty() {
-        "not probed".to_string()
-    } else if warning > 0 {
-        format!("{warning} unreachable")
-    } else if stale > 0 {
-        format!("{stale} stale")
-    } else if unknown > 0 {
-        format!("{unknown} unknown")
-    } else {
-        "server reachable".to_string()
-    };
-    json!({
-        "label": label,
-        "healthy": healthy,
-        "warning": warning,
-        "stale": stale,
-        "unknown": unknown,
-    })
-}
-
-fn service_probe_id(service: &ManifestService) -> String {
-    let mut id = String::new();
-    for ch in service.name.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            id.push(ch);
-        } else if !id.ends_with('-') {
-            id.push('-');
-        }
-    }
-    id.trim_matches('-').to_string()
-}
-
-fn attention_reason(
-    live: Liveness,
-    freshness: &NixFreshness,
-    kernel: Option<&KernelPosture>,
-    observations: &[ServiceObservation],
-    preferences: &HostPreferences,
-) -> AttentionReason {
-    match live {
-        Liveness::Down if !preferences.suppresses_down_alerts() => AttentionReason {
-            label: "silent heartbeat".to_string(),
-            level: "down",
-            rank: 0,
-        },
-        Liveness::Stale => AttentionReason {
-            label: "stale heartbeat".to_string(),
-            level: "warn",
-            rank: 1,
-        },
-        Liveness::AwaitingFirstHeartbeat => AttentionReason {
-            label: "awaiting first beat".to_string(),
-            level: "wait",
-            rank: 2,
-        },
-        Liveness::Down | Liveness::Live => kernel_reboot_required(kernel)
-            .map(|_| AttentionReason {
-                label: "restart needed".to_string(),
-                level: "warn",
-                rank: 2,
-            })
-            .or_else(|| {
-                (!preferences.alerts.suppress_nix_freshness)
-                    .then(|| freshness_attention_reason(freshness))
-                    .flatten()
-            })
-            .or_else(|| {
-                service_observation_attention_reason(
-                    observations,
-                    preferences.alerts.suppress_nix_freshness,
-                )
-            })
-            .unwrap_or_else(|| AttentionReason {
-                label: if live == Liveness::Down {
-                    if preferences.kind == HostKind::Workstation {
-                        "offline as expected"
-                    } else {
-                        "down alerts muted"
-                    }
-                } else {
-                    "all clear"
-                }
-                .to_string(),
-                level: "ok",
-                rank: 4,
-            }),
-    }
-}
-
-fn reason_markup(reason: &AttentionReason, hidden: bool) -> String {
-    let hidden = if hidden { " hidden" } else { "" };
-    format!(
-        r#"<div class="reason {}" data-reason{hidden}><span>{}</span></div>"#,
-        html_escape(reason.level),
-        html_escape(&reason.label),
-    )
-}
-
-fn muted_preferences_markup(preferences: &HostPreferences) -> String {
-    let mut muted = Vec::new();
-    let workstation = preferences.kind == HostKind::Workstation;
-    if !workstation && preferences.alerts.suppress_down {
-        muted.push("down");
-    }
-    if preferences.alerts.suppress_backup {
-        muted.push("backup");
-    }
-    if preferences.alerts.suppress_nix_freshness {
-        muted.push("Nix freshness");
-    }
-    let label = if workstation {
-        if muted.is_empty() {
-            "down alerts off for workstation".to_string()
-        } else {
-            format!(
-                "down alerts off for workstation · {} muted",
-                muted.join(", ")
-            )
-        }
-    } else if muted.is_empty() {
-        String::new()
-    } else {
-        format!("{} muted", muted.join(", "))
-    };
-    format!(
-        r#"<div class="mute-note" data-mute-note title="{label}"{hidden}>{icon}<span>{label}</span></div>"#,
-        label = html_escape(&label),
-        hidden = if label.is_empty() { " hidden" } else { "" },
-        icon = icons::BELL_OFF,
-    )
-}
-
-fn live_key(live: Liveness) -> &'static str {
-    match live {
-        Liveness::Live => "live",
-        Liveness::Stale => "stale",
-        Liveness::Down => "down",
-        Liveness::AwaitingFirstHeartbeat => "awaiting_first_heartbeat",
-    }
-}
-
-fn duration_label(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m {:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60)
-    }
-}
-
-fn clock_label(timestamp: i64) -> String {
-    let seconds = timestamp.rem_euclid(86_400);
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60
-    )
-}
-
-fn summary_cards(hosts: &[Host], _self_name: &str, now: i64) -> String {
-    let total = hosts.len();
-    let mut live = 0;
-    let mut stale = 0;
-    let mut down = 0;
-    for h in hosts {
-        let live_state = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        match live_state {
-            Liveness::Live => live += 1,
-            Liveness::Stale => stale += 1,
-            Liveness::Down => down += 1,
-            Liveness::AwaitingFirstHeartbeat => {}
-        }
-    }
-    format!(
-        r#"<section class="summary" aria-label="host summary"><button class="metric" type="button" data-live-filter="all" aria-pressed="true"><b data-summary-count="all">{total}</b><span>All hosts</span></button><button class="metric live" type="button" data-live-filter="live" aria-pressed="false"><b data-summary-count="live">{live}</b><span>Live</span></button><button class="metric stale" type="button" data-live-filter="stale" aria-pressed="false"><b data-summary-count="stale">{stale}</b><span>Stale</span></button><button class="metric down" type="button" data-live-filter="down" aria-pressed="false"><b data-summary-count="down">{down}</b><span>Down</span></button></section>"#
-    )
-}
-
-fn sidebar_user_label(auth: &AuthState, headers: &HeaderMap) -> String {
-    auth.as_ref()
-        .and_then(|auth| auth.current_user(headers))
-        .map(|user| user.display_name)
-        .unwrap_or_else(|| {
-            if auth.is_some() {
-                "signed in".to_string()
-            } else {
-                "local access".to_string()
-            }
-        })
-}
-
-fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
-    let logout = if logout_enabled {
-        format!(
-            r#"<a class="side-logout" href="/auth/logout" title="Log out of Pharos" aria-label="Log out of Pharos">{}</a>"#,
-            icons::LOG_OUT
-        )
-    } else {
-        String::new()
-    };
-    let fleet_current = if active == "fleet" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
-    let map_current = if active == "map" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
-    let alerts_current = if active == "alerts" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
-    let backups_current = if active == "backups" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
-    let activity_current = if active == "activity" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
-    let host_settings_current = if active == "settings" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
-    let platform_settings_current = if active == "platform-settings" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
-    format!(
-        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="/assets/sidebar-lighthouse-motion-v1.mp4" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{host_settings_current}>{host_settings}<span>Host settings</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{sidebar_motion}"##,
-        lighthouse = icons::LIGHTHOUSE,
-        fleet = icons::GRID,
-        map = icons::SERVER,
-        alerts = icons::status_svg(Liveness::Stale),
-        backups = icons::SHIELD_CHECK,
-        activity = icons::LIST,
-        host_settings = icons::SLIDERS,
-        platform_settings = icons::SETTINGS,
-        history = icons::HISTORY,
-        version = html_escape(&release_label()),
-        release_dialog = release_dialog(),
-        release_portal = RELEASE_HISTORY_PORTAL,
-        sidebar_motion = SIDEBAR_MOTION_RUNTIME,
-        fleet_current = fleet_current,
-        map_current = map_current,
-        alerts_current = alerts_current,
-        backups_current = backups_current,
-        activity_current = activity_current,
-        host_settings_current = host_settings_current,
-        platform_settings_current = platform_settings_current,
-        user_label = html_escape(user_label),
-        user_title = html_escape(user_label),
-        logout = logout
-    )
-}
-
-fn page_header(title: &str, subtitle: &str, now: i64) -> String {
-    format!(
-        r#"<div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof" data-as-of>as of {as_of}</div></div>"#,
-        title = html_escape(title),
-        subtitle = html_escape(subtitle),
-        as_of = clock_label(now)
-    )
-}
-
-fn provider_icon(key: &str) -> &'static str {
-    match key {
-        "hetzner-cloud" => icons::CLOUD,
-        "netcup" => icons::SHOPPING_CART,
-        "aws" => icons::BOX,
-        "google-cloud" => icons::HEXAGON,
-        "oracle-cloud" => icons::DATABASE,
-        _ => icons::SERVER,
-    }
-}
-
-fn render_provider_connection_row(
-    provider: &ProviderConnectionSummary,
-    can_manage: bool,
-) -> String {
-    let action = if can_manage {
-        format!(
-            r#"<a class="provider-action" href="{href}">{label}</a>"#,
-            href = html_escape(provider.detail_href),
-            label = html_escape(provider.action_label),
-        )
-    } else {
-        r#"<span class="provider-action-muted">Ask an administrator</span>"#.to_string()
-    };
-    format!(
-        r#"<article class="provider-row" data-provider="{key}" data-provider-state="{state}"><span class="provider-mark" aria-hidden="true">{icon}</span><span class="provider-copy"><strong>{name}</strong><span>{description}</span></span><span class="provider-capability">{capability}</span><span class="provider-state" title="{note}">{state_label}</span>{action}</article>"#,
-        key = html_escape(provider.key),
-        state = match provider.state {
-            ProviderConnectionState::Ready => "ready",
-            ProviderConnectionState::NeedsAttention => "needs-attention",
-            ProviderConnectionState::NotConnected => "not-connected",
-            ProviderConnectionState::Guided => "guided",
-        },
-        icon = provider_icon(provider.key),
-        name = html_escape(provider.name),
-        description = html_escape(provider.description),
-        capability = html_escape(provider.capability.label()),
-        state_label = html_escape(provider.state_label),
-        note = html_escape(&provider.note),
-        action = action,
-    )
-}
-
-fn render_provider_connections_page(
-    providers: &ProviderConnectionsPayload,
-    shell: ShellContext<'_>,
-    can_manage: bool,
-) -> String {
-    let rows = providers
-        .providers
-        .iter()
-        .map(|provider| render_provider_connection_row(provider, can_manage))
-        .collect::<String>();
-    format!(
-        r#"{HEAD}{sidebar}<main class="providers-main">{header}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
-        header = page_header(
-            "Settings",
-            "Appearance and provider connections.",
-            now_unix(),
-        ),
-        rows = rows,
-    )
-}
-
-fn safe_provider_return_path(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty()
-        || value.len() > 2048
-        || !value.starts_with('/')
-        || value.starts_with("//")
-        || value.contains('\\')
-        || value.chars().any(char::is_control)
-    {
-        return None;
-    }
-    Some(value.to_string())
-}
-
-fn guided_provider_import_href(provider: &str) -> String {
-    format!(
-        "/?setup=add-server&setup_path=existing&setup_stage=existing&setup_source={}",
-        provider
-    )
-}
-
-fn render_guided_provider_page(
-    provider: &ProviderConnectionSummary,
-    shell: ShellContext<'_>,
-    can_manage: bool,
-    return_path: Option<&str>,
-) -> String {
-    let (external_label, external_url) = provider_official_destination(provider.key)
-        .unwrap_or(("Open provider", "https://pharos.barta.cm/"));
-    let external_action = if can_manage {
-        format!(
-            r#"<a class="provider-primary" href="{url}" target="_blank" rel="noopener noreferrer">{label}{external}</a>"#,
-            url = html_escape(external_url),
-            label = html_escape(external_label),
-            external = icons::EXTERNAL_LINK,
-        )
-    } else {
-        r#"<span class="provider-action-muted">Ask an administrator</span>"#.to_string()
-    };
-    let import_action = if can_manage {
-        format!(
-            r#"<a class="provider-secondary" href="{href}">Continue in Pharos{arrow}</a>"#,
-            href = html_escape(&guided_provider_import_href(provider.key)),
-            arrow = icons::ARROW_RIGHT,
-        )
-    } else {
-        String::new()
-    };
-    let back_href =
-        safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
-    format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a><header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
-        back_href = html_escape(&back_href),
-        back = icons::ARROW_LEFT,
-        icon = provider_icon(provider.key),
-        name = html_escape(provider.name),
-        description = html_escape(provider.description),
-        note = html_escape(&provider.note),
-        external_action = external_action,
-        import_action = import_action,
-    )
-}
-
-fn provider_connection_check(
-    icon: &str,
-    label: &str,
-    detail: &str,
-    state: &str,
-    state_label: &str,
-) -> String {
-    format!(
-        r#"<div class="provider-check" data-state="{state}"><span class="provider-check-icon" aria-hidden="true">{icon}</span><span class="provider-check-copy"><strong>{label}</strong><small>{detail}</small></span><span class="provider-check-state"><i aria-hidden="true"></i>{state_label}</span></div>"#,
-        icon = icon,
-        label = html_escape(label),
-        detail = html_escape(detail),
-        state = html_escape(state),
-        state_label = html_escape(state_label),
-    )
-}
-
-fn provider_select_option(value: &str, label: &str, selected: Option<&str>) -> String {
-    format!(
-        r#"<option value="{value}"{selected}>{label}</option>"#,
-        value = html_escape(value),
-        label = html_escape(label),
-        selected = if selected == Some(value) {
-            " selected"
-        } else {
-            ""
-        },
-    )
-}
-
-fn render_hetzner_setup_help(
-    can_manage: bool,
-    secure_setup_url: Option<&str>,
-    api_ready: bool,
-    ssh_available: bool,
-    firewall_available: bool,
-    choices_ready: bool,
-    execution_enabled: bool,
-) -> String {
-    let secure_setup = if can_manage {
-        secure_setup_url
-            .map(|url| {
-                format!(
-                    r#"<a class="provider-secondary" href="{url}" target="_blank" rel="noopener noreferrer">Open secure credential setup{external}</a>"#,
-                    url = html_escape(url),
-                    external = icons::EXTERNAL_LINK,
-                )
-            })
-            .unwrap_or_else(|| {
-                r#"<span class="provider-help-secret-note">Use the secure secret-management workflow documented by this installation before returning here.</span>"#.to_string()
-            })
-    } else {
-        r#"<span class="provider-help-secret-note">An administrator must complete the installation's secure credential workflow.</span>"#.to_string()
-    };
-    let initial_step = if !api_ready {
-        "api"
-    } else if !ssh_available {
-        "ssh"
-    } else if !firewall_available {
-        "firewall"
-    } else {
-        "finish"
-    };
-    let api_action = if api_ready {
-        r#"<button class="provider-primary" type="button" data-guide-next="ssh">Continue to SSH key</button>"#.to_string()
-    } else if can_manage {
-        format!(
-            r#"{secure_setup}<button class="provider-primary" type="button" data-guide-provider-test>Test connection</button>"#
-        )
-    } else {
-        secure_setup.clone()
-    };
-    let (finish_title, finish_intro, finish_tasks, finish_followup) = if choices_ready {
-        if execution_enabled {
-            (
-                "Provider setup complete",
-                "The connection is ready. Continue in the server assistant; it keeps every paid action behind its own review and confirmation.",
-                r#"<li class="provider-guide-task"><strong>Open the server assistant.</strong><p>Choose Continue to server assistant below. No server is created by opening it.</p></li><li class="provider-guide-task"><strong>Choose a starting point.</strong><p>The assistant loads current regions, plans, and prices before it prepares an exact review.</p></li><li class="provider-guide-task"><strong>Review before any paid action.</strong><p>Review, authorization, and creation remain separate attended steps. Billing can begin only after the final create step is separately approved and accepted.</p></li>"#,
-                r#"<div class="provider-guide-finish"><strong>Next: prepare the first server</strong><p>The Hetzner project work is complete. Continue in Pharos; do not create the server manually in the provider portal.</p></div>"#,
-            )
-        } else {
-            (
-                "Provider setup complete",
-                "The connection is ready. One installation-level safety lock remains before the paid server assistant can continue.",
-                r#"<li class="provider-guide-task"><strong>No more provider-portal work is needed.</strong><p>The API connection, location, SSH public key, and firewall are verified.</p></li><li class="provider-guide-task"><strong>Enable managed creation in this Pharos installation.</strong><p>An installation administrator must enable managed provider creation in the deployment configuration and redeploy Pharos.</p></li><li class="provider-guide-task"><strong>Return to the server assistant.</strong><p>Enabling the capability does not create a server or start billing. The assistant still requires an exact current review, separate authorization, and a separate create action.</p></li>"#,
-                r#"<div class="provider-guide-finish"><strong>Next: installation activation</strong><p>This provider connection is complete. Managed server creation is still locked by the Pharos deployment, so the next action belongs to the installation administrator—not the provider portal.</p></div>"#,
-            )
-        }
-    } else {
-        (
-            "Refresh and select the resources",
-            "This final check reads the current Hetzner catalog. It does not create a server or start billing.",
-            r#"<li class="provider-guide-task"><strong>Refresh provider choices.</strong><p>Choose Test connection below. Pharos reloads the page after the safe read-only check.</p></li><li class="provider-guide-task"><strong>Open Connection details above.</strong><p>Choose a default location, the SSH key you added, and the firewall you created.</p></li><li class="provider-guide-task"><strong>Choose Save and test.</strong><p>The three checks above should read API connection: Connected, SSH key: Ready, and Firewall: Ready. Paid execution remains a separate approval.</p></li>"#,
-            r#"<div class="provider-guide-finish"><strong>If a dropdown is empty</strong><p>Confirm the resource was created in the same Hetzner project as the API token, then choose Test connection again.</p></div>"#,
-        )
-    };
-    let finish_actions = if choices_ready && can_manage {
-        r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Continue to server assistant</a>"#
-    } else if choices_ready {
-        r#"<span class="provider-help-secret-note">Ask an installation administrator to continue.</span>"#
-    } else {
-        r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><button class="provider-primary" type="button" data-guide-open-details>Open Connection details</button>"#
-    };
-    let guide_open = if choices_ready { "" } else { " open" };
-    let guide_summary = if choices_ready {
-        "Provider setup complete — expand for details and next steps"
-    } else {
-        "Prepare the Hetzner project — expand or collapse this guide"
-    };
-    format!(
-        r#"<details class="provider-help" data-provider-setup-guide data-initial-step="{initial_step}"{guide_open}><summary class="provider-help-toggle"><span><strong>Guided setup</strong><small>{guide_summary}</small></span>{chevron}</summary><div class="provider-help-body"><header class="provider-help-head"><span class="provider-help-kicker">Guided setup</span><h2 id="hetzner-setup-help-title">Prepare the Hetzner project</h2><p>Follow one small task at a time. This assistant never asks for a token, private key, passphrase, or IP address, and it sends none of them to Pharos.</p></header><div class="provider-guide-language"><strong>Hetzner portal language / Portal-Sprache</strong><div class="provider-guide-language-options" role="group" aria-label="Hetzner portal language"><button type="button" data-guide-language="en" aria-pressed="true">English</button><button type="button" data-guide-language="de" aria-pressed="false">Deutsch</button></div><p data-guide-text-en="The portal paths, button names, and official guide links below follow your selection." data-guide-text-de="Die Portal-Pfade, Schaltflächen und offiziellen Anleitungen unten folgen deiner Auswahl.">The portal paths, button names, and official guide links below follow your selection.</p></div><ol class="provider-guide-progress" aria-label="Hetzner setup progress"><li><button type="button" data-guide-nav="api" data-complete="{api_ready}"><i aria-hidden="true">1</i>API connection</button></li><li><button type="button" data-guide-nav="ssh" data-complete="{ssh_available}"><i aria-hidden="true">2</i>SSH key</button></li><li><button type="button" data-guide-nav="firewall" data-complete="{firewall_available}"><i aria-hidden="true">3</i>Firewall</button></li><li><button type="button" data-guide-nav="finish" data-complete="{choices_ready}"><i aria-hidden="true">4</i>Finish</button></li></ol>
-
-<section class="provider-guide-panel" data-guide-panel="api" tabindex="-1"><header class="provider-guide-panel-head"><span>Step 1 of 4</span><h3>Connect the Hetzner API</h3><p>The token lets Pharos read this project and, only after a separate paid approval, create or remove its tracked server.</p></header><div class="provider-guide-state" data-ready="{api_ready}"><i aria-hidden="true"></i>{api_state}</div><p class="provider-guide-route-note" data-guide-text-en="Hetzner puts the project number inside exact console URLs. Pharos intentionally does not store that identifier, so the console link opens Projects; choose the project, then follow the bold path." data-guide-text-de="Hetzner verwendet die Projektnummer in exakten Console-URLs. Pharos speichert diese Kennung bewusst nicht. Der Console-Link öffnet deshalb Projekte; wähle das Projekt und folge dann dem fett gedruckten Pfad.">Hetzner puts the project number inside exact console URLs. Pharos intentionally does not store that identifier, so the console link opens Projects; choose the project, then follow the bold path.</p><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong data-guide-text-en="Open the correct Hetzner project." data-guide-text-de="Öffne das richtige Hetzner-Projekt.">Open the correct Hetzner project.</strong><p><a href="https://console.hetzner.com/projects" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Open Hetzner projects" data-guide-text-de="Hetzner-Projekte öffnen">Open Hetzner projects</span>{external}</a></p></li><li class="provider-guide-task"><strong data-guide-text-en="Open Security → API tokens." data-guide-text-de="Öffne Sicherheit → API-Tokens.">Open Security → API tokens.</strong><p data-guide-text-en="Choose Generate API token. Use a recognizable name such as “Pharos provider access.”" data-guide-text-de="Wähle API-Token hinzufügen. Verwende einen erkennbaren Namen wie „Pharos provider access“.">Choose Generate API token. Use a recognizable name such as “Pharos provider access.”</p></li><li class="provider-guide-task"><strong data-guide-text-en="Select Read &amp; Write, then generate the token." data-guide-text-de="Wähle Lesen &amp; Schreiben und erstelle dann den Token.">Select Read &amp; Write, then generate the token.</strong><p>Read-only access cannot perform a separately approved server create or cleanup.</p></li><li class="provider-guide-task"><strong>Move it directly into secure setup.</strong><p>The token is shown once. Copy it straight into this installation's approved credential workflow, then close the Hetzner token screen.</p></li></ol><div class="provider-guide-secret"><strong>Stop if you are about to paste the token into Pharos, chat, a ticket, Terminal, source code, or logs.</strong> If it was exposed or lost, revoke it in Hetzner and make a replacement.</div><div class="provider-guide-links"><a href="https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/" data-guide-href-en="https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/" data-guide-href-de="https://docs.hetzner.com/de/cloud/api/getting-started/generating-api-token/" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Official API-token guide" data-guide-text-de="Offizielle API-Token-Anleitung">Official API-token guide</span>{external}</a></div><div class="provider-guide-actions">{api_action}</div></section>
-
-<section class="provider-guide-panel" data-guide-panel="ssh" tabindex="-1" hidden><header class="provider-guide-panel-head"><span>Step 2 of 4</span><h3>Add an SSH public key</h3><p>An SSH key pair has two halves: Hetzner receives the public <code>.pub</code> half; the private half never leaves the computer or automation executor that will make the first login.</p></header><div class="provider-guide-state" data-ready="{ssh_available}"><i aria-hidden="true"></i>{ssh_state}</div><div><p><strong>Where will the first server login come from?</strong></p><div class="provider-guide-platforms" role="group" aria-label="SSH key computer"><button type="button" data-guide-platform="macos" aria-pressed="false">My Mac</button><button type="button" data-guide-platform="linux" aria-pressed="false">Linux or automation executor</button></div></div>
-<section class="provider-guide-platform-panel" data-guide-platform-panel="macos" tabindex="-1" hidden><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Open Terminal on the Mac.</strong><p>Press Command-Space, type Terminal, and press Return. Every copied snippet starts Bash itself, so it also works when your normal shell is Fish or Zsh.</p></li><li class="provider-guide-task"><strong>Check for the normal Ed25519 key pair.</strong><p>Copy and run this safe command. It copies only the public <code>.pub</code> file when both halves exist and prints only a result message.</p><div class="provider-guide-command"><code id="provider-command-mac-check">bash -c 'if test -f "$HOME/.ssh/id_ed25519" &amp;&amp; test -f "$HOME/.ssh/id_ed25519.pub"; then pbcopy &lt; "$HOME/.ssh/id_ed25519.pub"; echo "PUBLIC KEY COPIED"; else echo "NO KEY FOUND"; fi'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-mac-check">Copy command</button></div></li><li class="provider-guide-task"><strong>If it says NO KEY FOUND, create a dedicated key.</strong><p>Run the first command and choose a strong passphrase when asked. Then run the second command to copy only its public half.</p><div class="provider-guide-command"><code id="provider-command-mac-create">bash -c 'ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/pharos_bootstrap_ed25519" -C "Pharos bootstrap"'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-mac-create">Copy command</button></div><div class="provider-guide-command"><code id="provider-command-mac-copy">bash -c 'pbcopy &lt; "$HOME/.ssh/pharos_bootstrap_ed25519.pub" &amp;&amp; echo "PUBLIC KEY COPIED"'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-mac-copy">Copy command</button></div></li></ol></section>
-<section class="provider-guide-platform-panel" data-guide-platform-panel="linux" tabindex="-1" hidden><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong>Open a terminal on the Linux computer or executor.</strong><p>Use the machine that will actually connect to and bootstrap the new server. Every copied snippet starts Bash itself, so the login shell can be Fish, Zsh, or Bash.</p></li><li class="provider-guide-task"><strong>Check for the normal Ed25519 key pair.</strong><div class="provider-guide-command"><code id="provider-command-linux-check">bash -c 'if test -f "$HOME/.ssh/id_ed25519" &amp;&amp; test -f "$HOME/.ssh/id_ed25519.pub"; then echo "KEY FOUND"; else echo "NO KEY FOUND"; fi'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-linux-check">Copy command</button></div></li><li class="provider-guide-task"><strong>If needed, create a dedicated key.</strong><p>Follow the installation's key-store and passphrase policy. Never place the private file in Pharos.</p><div class="provider-guide-command"><code id="provider-command-linux-create">bash -c 'ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/pharos_bootstrap_ed25519" -C "Pharos bootstrap"'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-linux-create">Copy command</button></div></li><li class="provider-guide-task"><strong>Copy only the public line.</strong><p>The command displays only the public <code>.pub</code> half. Copy that one line locally. Never run it without the <code>.pub</code> suffix.</p><div class="provider-guide-command"><code id="provider-command-linux-public">bash -c 'if test -f "$HOME/.ssh/id_ed25519" &amp;&amp; test -f "$HOME/.ssh/id_ed25519.pub"; then cat "$HOME/.ssh/id_ed25519.pub"; else cat "$HOME/.ssh/pharos_bootstrap_ed25519.pub"; fi'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-linux-public">Copy command</button></div></li></ol></section>
-<p class="provider-guide-copy-status" data-guide-copy-status aria-live="polite"></p><ol class="provider-guide-tasks"><li class="provider-guide-task"><strong data-guide-text-en="Return to the same Hetzner project." data-guide-text-de="Kehre zum selben Hetzner-Projekt zurück.">Return to the same Hetzner project.</strong><p data-guide-text-en="Open Security → SSH Keys → Add SSH key." data-guide-text-de="Öffne Sicherheit → SSH-Keys → SSH-Key hinzufügen.">Open Security → SSH Keys → Add SSH key.</p></li><li class="provider-guide-task"><strong data-guide-text-en="Name and add the public key." data-guide-text-de="Benenne und füge den öffentlichen Schlüssel hinzu.">Name and add the public key.</strong><p data-guide-text-en="Use a recognizable non-secret name such as “pharos-bootstrap,” paste the copied public line into Public key, and choose Add SSH key." data-guide-text-de="Verwende einen erkennbaren, nicht geheimen Namen wie „pharos-bootstrap“, füge die kopierte öffentliche Zeile in Öffentlicher Schlüssel ein und wähle SSH-Key hinzufügen.">Use a recognizable non-secret name such as “pharos-bootstrap,” paste the copied public line into Public key, and choose Add SSH key.</p></li></ol><div class="provider-guide-secret">A public key normally begins with <code>ssh-ed25519</code>. A private key file has no <code>.pub</code> suffix and must never be opened, pasted, uploaded, or sent to Pharos.</div><div class="provider-guide-links"><a href="https://console.hetzner.com/projects" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Open Hetzner projects — then Security → SSH Keys" data-guide-text-de="Hetzner-Projekte öffnen — dann Sicherheit → SSH-Keys">Open Hetzner projects — then Security → SSH Keys</span>{external}</a><a href="https://docs.hetzner.com/cloud/servers/getting-started/connecting-to-the-server/" data-guide-href-en="https://docs.hetzner.com/cloud/servers/getting-started/connecting-to-the-server/" data-guide-href-de="https://docs.hetzner.com/de/cloud/servers/getting-started/connecting-to-the-server/" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Official SSH guide" data-guide-text-de="Offizielle SSH-Anleitung">Official SSH guide</span>{external}</a></div><div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="api">Back</button><button class="provider-primary" type="button" data-guide-next="firewall">SSH key added — continue</button></div></section>
-
-<section class="provider-guide-panel" data-guide-panel="firewall" tabindex="-1" hidden>
-<header class="provider-guide-panel-head"><span>Step 3 of 4</span><h3>Create the bootstrap firewall</h3><p>The firewall admits SSH only from the trusted computer or executor you just chose. Pharos stores the firewall name, not its source address.</p></header>
-<div class="provider-guide-state" data-ready="{firewall_available}"><i aria-hidden="true"></i>{firewall_state}</div>
-<p class="provider-guide-route-note" data-guide-text-en="Firewalls is a separate item in the left Cloud menu, directly below Floating IPs. It is not inside Security." data-guide-text-de="Firewalls ist links ein eigener Punkt im Menü Cloud, direkt unter Floating IPs. Er befindet sich nicht unter Sicherheit.">Firewalls is a separate item in the left Cloud menu, directly below Floating IPs. It is not inside Security.</p>
-<div><p><strong data-guide-text-en="Choose the network path that will make the first SSH connection." data-guide-text-de="Wähle den Netzwerkweg für die erste SSH-Verbindung.">Choose the network path that will make the first SSH connection.</strong></p><div class="provider-guide-platforms" role="group" aria-label="Bootstrap network path"><button type="button" data-guide-network="fixed" aria-pressed="false"><span data-guide-text-en="Static IP / executor" data-guide-text-de="Statische IP / Executor">Static IP / executor</span></button><button type="button" data-guide-network="dynamic" aria-pressed="false"><span data-guide-text-en="Dynamic IP" data-guide-text-de="Dynamische IP">Dynamic IP</span></button><button type="button" data-guide-network="tailscale" aria-pressed="false"><span data-guide-text-en="Tailscale goal" data-guide-text-de="Tailscale als Ziel">Tailscale goal</span></button></div></div>
-<section class="provider-guide-platform-panel" data-guide-network-panel="fixed" tabindex="-1" hidden><strong data-guide-text-en="Recommended for unattended or later bootstrap" data-guide-text-de="Empfohlen für unbeaufsichtigtes oder späteres Bootstrap">Recommended for unattended or later bootstrap</strong><p data-guide-text-en="Use the public egress range of the approved Linux executor that will actually run the bootstrap. That executor must also be able to use the private half of the SSH key selected in Hetzner. A stable /32 can remain valid between project setup and the later paid server approval." data-guide-text-de="Verwende den öffentlichen Ausgangsbereich des freigegebenen Linux-Executors, der das Bootstrap tatsächlich ausführt. Dieser Executor muss auch den privaten Teil des in Hetzner ausgewählten SSH-Schlüssels verwenden können. Eine feste /32 kann zwischen Projekteinrichtung und späterer kostenpflichtiger Serverfreigabe gültig bleiben.">Use the public egress range of the approved Linux executor that will actually run the bootstrap. That executor must also be able to use the private half of the SSH key selected in Hetzner. A stable /32 can remain valid between project setup and the later paid server approval.</p></section>
-<section class="provider-guide-platform-panel" data-guide-network-panel="dynamic" tabindex="-1" hidden><strong data-guide-text-en="Temporary, attended bootstrap only" data-guide-text-de="Nur für temporäres, begleitetes Bootstrap">Temporary, attended bootstrap only</strong><p data-guide-text-en="A connection without a static public IP can change its public egress address. The current /32 can allow an outbound SSH connection now, even behind CGNAT, but it may stop matching without warning and can represent a shared provider egress. Re-copy and replace the source immediately before server creation and bootstrap. Keep the SSH key mandatory, and never replace the source with Any IPv4 or Any IPv6." data-guide-text-de="Ein Anschluss ohne statische öffentliche IP kann seine öffentliche Ausgangsadresse ändern. Die aktuelle /32 kann jetzt eine ausgehende SSH-Verbindung erlauben, auch hinter CGNAT; sie kann aber ohne Warnung nicht mehr passen und einen gemeinsam genutzten Provider-Ausgang darstellen. Kopiere die Quelle unmittelbar vor Server-Erstellung und Bootstrap erneut und ersetze sie bei Bedarf. Der SSH-Schlüssel bleibt Pflicht; ersetze die Quelle niemals durch Any IPv4 oder Any IPv6.">A connection without a static public IP can change its public egress address. The current /32 can allow an outbound SSH connection now, even behind CGNAT, but it may stop matching without warning and can represent a shared provider egress. Re-copy and replace the source immediately before server creation and bootstrap. Keep the SSH key mandatory, and never replace the source with Any IPv4 or Any IPv6.</p></section>
-<section class="provider-guide-platform-panel" data-guide-network-panel="tailscale" tabindex="-1" hidden><strong data-guide-text-en="Tailscale is the safer end state, not the initial Hetzner source" data-guide-text-de="Tailscale ist das sicherere Ziel, aber nicht die anfängliche Hetzner-Quelle">Tailscale is the safer end state, not the initial Hetzner source</strong><p data-guide-text-en="Do not enter a Tailscale 100.x address in Hetzner Source IPs. It is private to the tailnet and will not arrive as the source of traffic on the server's public interface. The new server must join the tailnet before that address works." data-guide-text-de="Trage keine Tailscale-Adresse mit 100.x bei Hetzner unter Quell-IPs ein. Sie ist nur im Tailnet gültig und kommt nicht als Quelle am öffentlichen Interface des Servers an. Der neue Server muss zuerst dem Tailnet beitreten.">Do not enter a Tailscale 100.x address in Hetzner Source IPs. It is private to the tailnet and will not arrive as the source of traffic on the server's public interface. The new server must join the tailnet before that address works.</p><p data-guide-text-en="Current Pharos provisioning needs an initial SSH bootstrap before Tailscale is available. Select Static IP / executor above, or select Dynamic IP for an immediate attended bootstrap. After the reviewed system configuration joins Tailscale, verify tailnet SSH and then delete the public TCP port 22 rule. Stop here if your policy requires Tailscale-first provisioning with no public SSH; that path is not implemented yet." data-guide-text-de="Die aktuelle Pharos-Bereitstellung benötigt ein anfängliches SSH-Bootstrap, bevor Tailscale verfügbar ist. Wähle oben Statische IP / Executor oder Dynamische IP für ein sofortiges begleitetes Bootstrap. Nachdem die geprüfte Systemkonfiguration Tailscale beigetreten ist, prüfe SSH im Tailnet und lösche danach die öffentliche TCP-Regel für Port 22. Stoppe hier, falls deine Richtlinie Tailscale-first ohne öffentliches SSH verlangt; dieser Weg ist noch nicht implementiert.">Current Pharos provisioning needs an initial SSH bootstrap before Tailscale is available. Select Static IP / executor above, or select Dynamic IP for an immediate attended bootstrap. After the reviewed system configuration joins Tailscale, verify tailnet SSH and then delete the public TCP port 22 rule. Stop here if your policy requires Tailscale-first provisioning with no public SSH; that path is not implemented yet.</p><div class="provider-guide-links"><a href="https://tailscale.com/docs/concepts/tailscale-ip-addresses" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Why Tailscale 100.x is private" data-guide-text-de="Warum Tailscale 100.x privat ist">Why Tailscale 100.x is private</span>{external}</a><a href="https://tailscale.com/docs/reference/faq/firewall-ports" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Official Tailscale firewall guide" data-guide-text-de="Offizielle Tailscale-Firewall-Anleitung">Official Tailscale firewall guide</span>{external}</a></div></section>
-<div data-guide-network-workflow hidden>
-<ol class="provider-guide-tasks">
-<li class="provider-guide-task"><strong data-guide-text-en="Copy the public IPv4 range from the exact SSH origin you chose." data-guide-text-de="Kopiere den öffentlichen IPv4-Bereich genau von der gewählten SSH-Quelle.">Copy the public IPv4 range from the exact SSH origin you chose.</strong><p data-guide-text-en="Run the lookup on the computer or Linux executor that will make the first SSH connection—not on a different device. If your organization provides an approved egress CIDR, use that instead of the lookup." data-guide-text-de="Führe die Abfrage auf genau dem Computer oder Linux-Executor aus, der die erste SSH-Verbindung herstellt — nicht auf einem anderen Gerät. Falls deine Organisation einen freigegebenen Ausgangs-CIDR vorgibt, verwende diesen statt der Abfrage.">Run the lookup on the computer or Linux executor that will make the first SSH connection—not on a different device. If your organization provides an approved egress CIDR, use that instead of the lookup.</p><p data-guide-text-en="On macOS, copy the command, paste it into Terminal, and press Return. Terminal prints only PUBLIC IPv4 RANGE COPIED; the address ending in /32 stays in your clipboard. The command starts Bash itself, so it works from Fish or Zsh." data-guide-text-de="Unter macOS: Kopiere den Befehl, füge ihn in Terminal ein und drücke Return. Terminal zeigt nur PUBLIC IPv4 RANGE COPIED; die Adresse mit /32 am Ende bleibt in deiner Zwischenablage. Der Befehl startet Bash selbst und funktioniert deshalb auch aus Fish oder Zsh.">On macOS, copy the command, paste it into Terminal, and press Return. Terminal prints only PUBLIC IPv4 RANGE COPIED; the address ending in /32 stays in your clipboard. The command starts Bash itself, so it works from Fish or Zsh.</p><div class="provider-guide-command"><code id="provider-command-firewall-mac">bash -c 'printf "%s/32" "$(curl -4fsS https://icanhazip.com)" | pbcopy &amp;&amp; echo "PUBLIC IPv4 RANGE COPIED"'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-firewall-mac"><span data-guide-text-en="Copy macOS command" data-guide-text-de="macOS-Befehl kopieren">Copy macOS command</span></button></div><p data-guide-text-en="On Linux, run the command locally and copy its one result without putting it into chat, a ticket, or logs. The lookup goes directly to icanhazip.com." data-guide-text-de="Unter Linux: Führe den Befehl lokal aus und kopiere das einzelne Ergebnis, ohne es in Chat, Tickets oder Logs einzufügen. Die Abfrage geht direkt an icanhazip.com.">On Linux, run the command locally and copy its one result without putting it into chat, a ticket, or logs. The lookup goes directly to icanhazip.com.</p><div class="provider-guide-command"><code id="provider-command-firewall-linux">bash -c 'printf "%s/32\n" "$(curl -4fsS https://icanhazip.com)"'</code><button class="provider-guide-copy" type="button" data-copy-command="provider-command-firewall-linux"><span data-guide-text-en="Copy Linux command" data-guide-text-de="Linux-Befehl kopieren">Copy Linux command</span></button></div></li>
-<li class="provider-guide-task"><strong data-guide-text-en="In the left Cloud menu, open Firewalls → Create Firewall." data-guide-text-de="Öffne links im Menü Cloud: Firewalls → Firewall erstellen.">In the left Cloud menu, open Firewalls → Create Firewall.</strong><p data-guide-text-en="Use a recognizable name such as “pharos-bootstrap.”" data-guide-text-de="Verwende einen erkennbaren Namen wie „pharos-bootstrap“.">Use a recognizable name such as “pharos-bootstrap.”</p></li>
-<li class="provider-guide-task"><strong data-guide-text-en="Set the first incoming rule exactly." data-guide-text-de="Stelle die erste eingehende Regel genau ein.">Set the first incoming rule exactly.</strong><div class="provider-guide-screen-help"><strong data-guide-text-en="On Hetzner's Create Firewall screen" data-guide-text-de="Auf der Hetzner-Seite „Firewall erstellen“">On Hetzner's Create Firewall screen</strong><ol><li data-guide-text-en="Keep Protocol set to TCP and Port set to 22. TCP is the connection type; port 22 is the door used by SSH." data-guide-text-de="Lass Protokoll auf TCP und Port auf 22. TCP ist die Verbindungsart; Port 22 ist die von SSH verwendete Tür.">Keep Protocol set to TCP and Port set to 22. TCP is the connection type; port 22 is the door used by SSH.</li><li data-guide-text-en="Click inside Source IPs. Hetzner initially shows the gray entries Any IPv4 and Any IPv6. Press Backspace until both are gone. If a selection menu opens, click both entries there to deselect them." data-guide-text-de="Klicke in das Feld Quell-IPs. Hetzner zeigt dort anfangs die grauen Einträge Any IPv4 und Any IPv6. Drücke die Rückschritttaste, bis beide entfernt sind. Falls sich ein Auswahlmenü öffnet, klicke dort beide Einträge an, um sie abzuwählen.">Click inside Source IPs. Hetzner initially shows the gray entries Any IPv4 and Any IPv6. Press Backspace until both are gone. If a selection menu opens, click both entries there to deselect them.</li><li data-guide-text-en="Paste from the clipboard and press Return. One gray entry ending in /32 should appear. A shape such as x.x.x.x/32 means exactly one IPv4 address; the x text is only an illustration and must not be entered." data-guide-text-de="Füge aus der Zwischenablage ein und drücke Return. Es soll ein einzelner grauer Eintrag mit /32 am Ende erscheinen. Die Form x.x.x.x/32 bedeutet genau eine IPv4-Adresse; der Text mit den x ist nur ein Beispiel und darf nicht eingegeben werden.">Paste from the clipboard and press Return. One gray entry ending in /32 should appear. A shape such as x.x.x.x/32 means exactly one IPv4 address; the x text is only an illustration and must not be entered.</li><li data-guide-text-en="If Hetzner shows a second ICMP rule, remove that entire row with its × button at the upper right. Finish with exactly one incoming rule." data-guide-text-de="Falls Hetzner eine zweite ICMP-Regel zeigt, entferne die ganze Zeile mit ihrem × oben rechts. Am Ende darf genau eine eingehende Regel übrig sein.">If Hetzner shows a second ICMP rule, remove that entire row with its × button at the upper right. Finish with exactly one incoming rule.</li><li data-guide-text-en="Stop if Any IPv4 or Any IPv6 is still visible. Those choices expose SSH to connection attempts from the whole internet." data-guide-text-de="Stoppe, falls Any IPv4 oder Any IPv6 noch sichtbar ist. Diese Auswahl erlaubt SSH-Verbindungsversuche aus dem gesamten Internet.">Stop if Any IPv4 or Any IPv6 is still visible. Those choices expose SSH to connection attempts from the whole internet.</li></ol></div><div class="provider-guide-ready-check" data-guide-text-en="Ready check: one source entry ending in /32 · TCP · port 22 · no second incoming rule. Do not paste or send the real source address anywhere else." data-guide-text-de="Bereit-Check: ein Quell-Eintrag mit /32 am Ende · TCP · Port 22 · keine zweite eingehende Regel. Füge die echte Quelladresse nirgendwo anders ein und sende sie nicht weiter.">Ready check: one source entry ending in /32 · TCP · port 22 · no second incoming rule. Do not paste or send the real source address anywhere else.</div><div class="provider-guide-secret" data-guide-text-en="Dynamic IP: this ready check is temporary. Repeat the lookup and replace the source immediately before the later paid creation and SSH bootstrap. If Tailscale is your goal, remove this public SSH rule only after tailnet access has been verified." data-guide-text-de="Dynamische IP: Dieser Bereit-Check gilt nur vorübergehend. Wiederhole die Abfrage unmittelbar vor der späteren kostenpflichtigen Erstellung und dem SSH-Bootstrap und ersetze die Quelle bei Bedarf. Wenn Tailscale dein Ziel ist, entferne diese öffentliche SSH-Regel erst, nachdem der Zugriff im Tailnet geprüft wurde.">Dynamic IP: this ready check is temporary. Repeat the lookup and replace the source immediately before the later paid creation and SSH bootstrap. If Tailscale is your goal, remove this public SSH rule only after tailnet access has been verified.</div></li>
-<li class="provider-guide-task"><strong data-guide-text-en="Keep outbound access available." data-guide-text-de="Lass ausgehenden Zugriff verfügbar.">Keep outbound access available.</strong><p data-guide-text-en="Leave outbound rules empty when unrestricted outbound traffic is intended; initial setup needs package sources and the Pharos endpoint." data-guide-text-de="Lass ausgehende Regeln leer, wenn ausgehender Datenverkehr erlaubt sein soll; die Ersteinrichtung benötigt Paketquellen und den Pharos-Endpunkt.">Leave outbound rules empty when unrestricted outbound traffic is intended; initial setup needs package sources and the Pharos endpoint.</p></li>
-<li class="provider-guide-task"><strong data-guide-text-en="Create it without attaching a resource." data-guide-text-de="Erstelle sie, ohne eine Ressource zuzuweisen.">Create it without attaching a resource.</strong><p data-guide-text-en="The firewall can remain unattached. Pharos attaches the selected firewall during the separately approved server create." data-guide-text-de="Die Firewall darf ohne zugewiesene Ressource bleiben. Pharos weist sie erst bei der separat genehmigten Server-Erstellung zu.">The firewall can remain unattached. Pharos attaches the selected firewall during the separately approved server create.</p></li>
-</ol>
-</div>
-<p class="provider-guide-copy-status" data-guide-copy-status aria-live="polite"></p><div class="provider-guide-links"><a href="https://console.hetzner.com/projects" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Open Hetzner projects — then Firewalls" data-guide-text-de="Hetzner-Projekte öffnen — dann Firewalls">Open Hetzner projects — then Firewalls</span>{external}</a><a href="https://docs.hetzner.com/cloud/firewalls/getting-started/creating-a-firewall/" data-guide-href-en="https://docs.hetzner.com/cloud/firewalls/getting-started/creating-a-firewall/" data-guide-href-de="https://docs.hetzner.com/de/cloud/firewalls/getting-started/creating-a-firewall/" target="_blank" rel="noopener noreferrer"><span data-guide-text-en="Official Firewall guide" data-guide-text-de="Offizielle Firewall-Anleitung">Official Firewall guide</span>{external}</a></div><div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="ssh">Back</button><button class="provider-primary" type="button" data-guide-firewall-finish data-guide-next="finish" disabled>Firewall created — finish</button></div>
-</section>
-
-<section class="provider-guide-panel" data-guide-panel="finish" tabindex="-1" hidden><header class="provider-guide-panel-head"><span>Step 4 of 4</span><h3>{finish_title}</h3><p>{finish_intro}</p></header><div class="provider-guide-state" data-ready="{choices_ready}"><i aria-hidden="true"></i>{finish_state}</div><div class="provider-guide-route-note"><strong>How the SSH-key dropdown works</strong><p>Pharos asks the Hetzner API for the names of public SSH keys already stored in this project. It never uploads or reads a private key. Selecting a name tells Hetzner which existing public key to place on a later, separately approved server.</p></div><ol class="provider-guide-tasks">{finish_tasks}</ol>{finish_followup}<div class="provider-guide-actions"><button class="provider-secondary" type="button" data-guide-next="firewall">Back</button>{finish_actions}</div></section></div></details>"#,
-        external = icons::EXTERNAL_LINK,
-        chevron = icons::CHEVRON_DOWN,
-        initial_step = initial_step,
-        guide_open = guide_open,
-        guide_summary = guide_summary,
-        api_ready = api_ready,
-        ssh_available = ssh_available,
-        firewall_available = firewall_available,
-        choices_ready = choices_ready,
-        finish_title = finish_title,
-        finish_intro = finish_intro,
-        finish_tasks = finish_tasks,
-        finish_followup = finish_followup,
-        finish_actions = finish_actions,
-        api_state = if api_ready {
-            "Pharos already detects a working API connection. Do not replace its token."
-        } else {
-            "No working API connection is currently detected."
-        },
-        ssh_state = if ssh_available {
-            "At least one SSH public key is available in this Hetzner project."
-        } else {
-            "No SSH public key is currently available in the refreshed project catalog."
-        },
-        firewall_state = if firewall_available {
-            "At least one firewall is available in this Hetzner project."
-        } else {
-            "No firewall is currently available in the refreshed project catalog."
-        },
-        finish_state = if choices_ready {
-            "The location, SSH key, and firewall selections have been verified."
-        } else {
-            "Refresh the catalog, then select and verify all three choices."
-        },
-        api_action = api_action,
-    )
-}
-
-fn render_hetzner_connection_page(
-    runtime: &ProviderRuntimeConfig,
-    store: &ProviderConnectionStore,
-    shell: ShellContext<'_>,
-    can_manage: bool,
-    return_path: Option<&str>,
-) -> String {
-    let now = now_unix();
-    let readiness = hetzner_runtime_readiness(&runtime.hetzner_cloud, store, now);
-    let effective = effective_hetzner_runtime(&runtime.hetzner_cloud, store);
-    let attempt = store.last_attempt();
-    let catalog = store.catalog_if_fresh(now, effective.evidence_ttl_secs);
-    let api_ready = readiness.api_access && readiness.evidence_fresh;
-    let ssh_ready = api_ready && attempt.as_ref().is_some_and(|item| item.ssh_key_ready);
-    let firewall_ready = api_ready && attempt.as_ref().is_some_and(|item| item.firewall_ready);
-    let location_ready = api_ready
-        && attempt
-            .as_ref()
-            .is_some_and(|item| item.default_location_ready);
-    let connection_ready = readiness.connection_ready;
-    let ssh_available = api_ready
-        && catalog
-            .as_ref()
-            .is_some_and(|catalog| !catalog.ssh_keys.is_empty());
-    let firewall_available = api_ready
-        && catalog
-            .as_ref()
-            .is_some_and(|catalog| !catalog.firewalls.is_empty());
-    let tested_label = readiness
-        .tested_at
-        .map(|tested_at| {
-            format!(
-                "Tested {} ago",
-                duration_label(now.saturating_sub(tested_at))
-            )
-        })
-        .unwrap_or_else(|| "Not tested yet".to_string());
-    let ssh_detail = if can_manage {
-        effective
-            .default_ssh_key_ref
-            .clone()
-            .unwrap_or_else(|| "Choose after connecting".to_string())
-    } else if readiness.default_ssh_key_configured {
-        "Configured".to_string()
-    } else {
-        "Administrator setup required".to_string()
-    };
-    let firewall_detail = if can_manage {
-        effective
-            .firewall_ref
-            .clone()
-            .unwrap_or_else(|| "Choose after connecting".to_string())
-    } else if readiness.firewall_configured {
-        "Configured".to_string()
-    } else {
-        "Administrator setup required".to_string()
-    };
-    let checks = [
-        provider_connection_check(
-            icons::LINK,
-            "API connection",
-            if readiness.credential_configured {
-                &tested_label
-            } else {
-                "Secure credential needed"
-            },
-            if api_ready { "ready" } else { "attention" },
-            if api_ready {
-                "Connected"
-            } else if readiness.credential_configured {
-                "Test"
-            } else {
-                "Set up"
-            },
-        ),
-        provider_connection_check(
-            icons::KEY_ROUND,
-            "SSH key",
-            &ssh_detail,
-            if ssh_ready { "ready" } else { "attention" },
-            if ssh_ready { "Ready" } else { "Choose" },
-        ),
-        provider_connection_check(
-            icons::SHIELD_CHECK,
-            "Firewall",
-            &firewall_detail,
-            if firewall_ready { "ready" } else { "attention" },
-            if firewall_ready { "Ready" } else { "Choose" },
-        ),
-    ]
-    .join("");
-    let back_href =
-        safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
-    let janus_url = hetzner_janus_setup_url(runtime, &self_host());
-    let setup_link = janus_url.as_ref().map(|url| {
-        format!(
-            r#"<a class="provider-primary" href="{url}" target="_blank" rel="noopener noreferrer">Open secure setup{external}</a>"#,
-            url = html_escape(url),
-            external = icons::EXTERNAL_LINK,
-        )
-    });
-    let primary_action = if !can_manage {
-        r#"<p class="provider-admin-note">Ask a Pharos administrator to connect this provider.</p>"#
-            .to_string()
-    } else if connection_ready {
-        r#"<a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Continue to server assistant<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a>"#.to_string()
-    } else if !readiness.credential_configured || !readiness.credential_boundary_ready {
-        setup_link.unwrap_or_else(|| {
-            r#"<p class="provider-admin-note">Secure setup is not connected to Janus on this Pharos installation.</p>"#.to_string()
-        })
-    } else if !readiness.execution_enabled {
-        format!(
-            r#"<button class="provider-primary" type="button" data-provider-test>{refresh}Test connection</button>"#,
-            refresh = icons::REFRESH_CW,
-        )
-    } else if api_ready && catalog.is_some() && !(ssh_ready && firewall_ready && location_ready) {
-        r#"<button class="provider-primary" type="button" data-provider-open-details>Finish setup</button>"#
-            .to_string()
-    } else {
-        format!(
-            r#"<button class="provider-primary" type="button" data-provider-test>{refresh}Test connection</button>"#,
-            refresh = icons::REFRESH_CW,
-        )
-    };
-    let secondary_action = if can_manage && readiness.credential_configured {
-        format!(
-            r#"<button class="provider-secondary" type="button" data-provider-test>{refresh}Test connection</button>"#,
-            refresh = icons::REFRESH_CW,
-        )
-    } else {
-        String::new()
-    };
-    let menu = if can_manage && (readiness.credential_configured || readiness.connection_tested) {
-        format!(
-            r#"<details class="provider-menu"><summary aria-label="Connection actions" title="Connection actions">{ellipsis}</summary><div><button type="button" data-provider-disconnect>Disconnect</button></div></details>"#,
-            ellipsis = icons::ELLIPSIS,
-        )
-    } else {
-        String::new()
-    };
-    let details = can_manage
-        .then_some(catalog.as_ref())
-        .flatten()
-        .map(|catalog| {
-            let current_location = effective.default_location.as_deref();
-            let current_ssh_key = effective.default_ssh_key_ref.as_deref();
-            let current_firewall = effective.firewall_ref.as_deref();
-            let location_options = catalog
-                .locations
-                .iter()
-                .filter(|location| catalog.supports_location(&location.name))
-                .map(|location| {
-                    provider_select_option(
-                        &location.name,
-                        &format!("{} ({})", location.city, location.name),
-                        current_location,
-                    )
-                })
-                .collect::<String>();
-            let ssh_key_options = catalog
-                .ssh_keys
-                .iter()
-                .map(|value| provider_select_option(value, value, current_ssh_key))
-                .collect::<String>();
-            let firewall_options = catalog
-                .firewalls
-                .iter()
-                .map(|value| provider_select_option(value, value, current_firewall))
-                .collect::<String>();
-            let open = if connection_ready {
-                ""
-            } else {
-                " open"
-            };
-            format!(
-                r#"<details class="provider-details" data-provider-details{open}><summary><span>Connection details</span>{chevron}</summary><form data-provider-preferences><div class="provider-fields"><label><span>Default location</span><select name="default_location" required><option value="">Choose a location</option>{location_options}</select></label><label><span>SSH key</span><select name="ssh_key_ref" required><option value="">Choose an SSH key</option>{ssh_key_options}</select></label><label><span>Firewall</span><select name="firewall_ref" required><option value="">Choose a firewall</option>{firewall_options}</select></label></div><div class="provider-details-action"><button class="provider-secondary" type="submit">Save and test</button><span data-provider-action-status aria-live="polite"></span></div></form><p>Only names and current provider catalog data are stored here. The token stays in the Janus and agenix boundary.</p></details>"#,
-                open = open,
-                chevron = icons::CHEVRON_DOWN,
-                location_options = location_options,
-                ssh_key_options = ssh_key_options,
-                firewall_options = firewall_options,
-            )
-        })
-        .unwrap_or_default();
-    let setup_note = if readiness.credential_boundary_ready {
-        "The provider token is never displayed or persisted in this UI."
-    } else {
-        "Janus and agenix must mount the provider token before Pharos can test it."
-    };
-    let setup_help = render_hetzner_setup_help(
-        can_manage,
-        janus_url.as_deref(),
-        api_ready,
-        ssh_available,
-        firewall_available,
-        ssh_ready && firewall_ready && location_ready,
-        readiness.execution_enabled,
-    );
-    let connection_message = if connection_ready && !readiness.execution_enabled {
-        "Provider setup is complete. Continue below for the installation-level activation step; no more provider-portal work is needed."
-    } else {
-        &readiness.message
-    };
-    format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a><header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
-        back_href = html_escape(&back_href),
-        back = icons::ARROW_LEFT,
-        cloud = icons::CLOUD,
-        ready = connection_ready,
-        status = if connection_ready {
-            "Connected"
-        } else if api_ready {
-            "Setup needed"
-        } else {
-            "Not connected"
-        },
-        headline = if connection_ready {
-            "Provider setup complete"
-        } else if api_ready {
-            "Finish the connection"
-        } else {
-            "Connect Hetzner Cloud"
-        },
-        message = html_escape(connection_message),
-        checks = checks,
-        primary_action = primary_action,
-        secondary_action = if connection_ready {
-            secondary_action
-        } else {
-            String::new()
-        },
-        menu = menu,
-        details = details,
-        setup_help = setup_help,
-        setup_note = html_escape(setup_note),
-    )
-}
-
-fn header(now: i64) -> String {
-    page_header("Fleet", "All hosts at a glance", now)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ShellContext<'a> {
-    user_label: &'a str,
-    logout_enabled: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RuntimeSnapshot<'a> {
-    hosts: &'a [Host],
-    jobs: &'a [ProvisioningJob],
-    declared_preferences: Option<&'a BTreeMap<String, HostPreferences>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FleetCapabilities {
-    can_onboard: bool,
-    can_manage_fleet: bool,
-    system_update_available: bool,
-    host_removal_available: bool,
-}
-
-struct HostActionRenderContext<'a> {
-    manifest: Option<&'a HostManifest>,
-    declared: bool,
-    settings_state: HostPreferencesState,
-    settings_href: &'a str,
-    backup: &'a BackupUiSummary,
-    surface: &'a str,
-    capabilities: FleetCapabilities,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ActivitySources<'a> {
-    manifests: &'a [HostManifest],
-    load_errors: &'a [ManifestLoadIssue],
-    server_probes: &'a BTreeMap<String, Vec<ServerProbeObservation>>,
-    action_jobs: &'a [HostActionJob],
-}
-
-fn search_box(placeholder: &str) -> String {
-    format!(
-        r#"<label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="{placeholder}"></label>"#,
-        search = icons::SEARCH,
-        placeholder = html_escape(placeholder)
-    )
-}
-
-fn toolbar() -> String {
-    format!(
-        r#"<section class="toolbar" aria-label="fleet controls"><div class="toolbar-left"><div class="seg" role="group" aria-label="view"><button type="button" data-view-button="grid" aria-pressed="true" title="Grid view">{grid}</button><button type="button" data-view-button="list" aria-pressed="false" title="List view">{list}</button></div><label class="arrange">Arrange by <select data-sort aria-label="arrange by"><option value="attention">Needs attention</option><option value="name">Name</option><option value="last">Last change</option><option value="freeform">Freeform</option></select></label></div><div class="toolbar-right">{search}</div></section>"#,
-        grid = icons::GRID,
-        list = icons::LIST,
-        search = search_box("Search hosts...")
-    )
-}
-
-fn map_toolbar() -> String {
-    format!(
-        r#"<section class="toolbar" aria-label="map controls"><div class="toolbar-left"><span class="arrange">All servers stay visible unless filtered</span></div><div class="toolbar-right">{search}</div></section>"#,
-        search = search_box("Search hosts...")
-    )
-}
-
-fn onboard_primary(label: &str) -> String {
-    format!(
-        r#"<button class="onboard-primary" type="button" data-onboard-open>{icon}<span>{label}</span></button>"#,
-        icon = icons::PLUS,
-        label = html_escape(label)
-    )
-}
-
-fn onboard_tile() -> String {
-    format!(
-        r#"<button class="onboard-tile" type="button" data-onboard-open data-onboard-tile aria-label="Add server"><span class="onboard-mark">{icon}</span><span class="onboard-copy"><strong>Add server</strong><span>Provision or onboard</span></span><span class="onboard-foot">Open setup assistant</span></button>"#,
-        icon = icons::PLUS
-    )
-}
-
-fn onboard_row() -> String {
-    format!(
-        r#"<tr class="onboard-row" data-sev="9" data-sort-name="zzzz-onboard" data-last="0"><td colspan="6"><button type="button" data-onboard-open aria-label="Add server"><span class="onboard-mark">{icon}</span><span><strong>Add server</strong><span>Provision a new host or onboard an existing one.</span></span></button></td></tr>"#,
-        icon = icons::PLUS
-    )
-}
-
-fn setup_assistant() -> String {
-    format!(
-        r#"<section class="assistant-overlay" data-setup-assistant data-assistant-stage="choose" hidden aria-label="setup assistant"><div class="assistant-sheet" role="dialog" aria-modal="true" aria-labelledby="setup-assistant-title"><header class="assistant-head"><div class="assistant-head-copy"><button class="assistant-nav-back" type="button" data-assistant-step-back hidden>{arrow_left}<span>Back</span></button><div><h2 id="setup-assistant-title">Add a server</h2><p>What would you like to add?</p></div></div><button class="assistant-close" type="button" data-assistant-close title="Close" aria-label="Close">{close}</button></header><div class="assistant-body">
-
-<section class="assistant-paths" data-assistant-step="choose"><button class="assistant-path" type="button" data-assistant-path="new" aria-pressed="false"><span class="onboard-mark">{plus}</span><span class="assistant-path-copy"><strong>New server</strong><span>Create a new server</span></span></button><button class="assistant-path" type="button" data-assistant-path="existing" aria-pressed="false"><span class="onboard-mark">{server}</span><span class="assistant-path-copy"><strong>Existing server</strong><span>Connect a server you already have</span></span></button></section>
-
-<section class="assistant-provider-step" data-assistant-step="template"><div class="assistant-step-copy"><strong>Choose a starting point</strong><span>Pharos creates this server in Hetzner Cloud. You review everything before it starts.</span></div><div class="assistant-templates" aria-label="server templates"><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-small-nixos" aria-pressed="false"><span><strong>Small server</strong><span>Recommended for most uses</span></span><em>Recommended</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="hetzner-lab" aria-pressed="false"><span><strong>Lab server</strong><span>The smallest practical option</span></span><em>Lower cost</em></button><button class="assistant-template" type="button" data-assistant-template-provider="hetzner-cloud" data-assistant-template="bring-own-plan" aria-pressed="false"><span><strong>Custom server</strong><span>Choose size and region during review</span></span><em>Custom</em></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="netcup-manual-import" aria-pressed="false" hidden><span><strong>Netcup server</strong><span>Create it with Netcup, then connect it to Pharos</span></span></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="oracle-always-free-lab" aria-pressed="false" hidden><span><strong>Oracle lab server</strong><span>Create it externally, then connect it to Pharos</span></span></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="gcp-free-tier-lab" aria-pressed="false" hidden><span><strong>Google Cloud lab server</strong><span>Create it externally, then connect it to Pharos</span></span></button><button class="assistant-template" type="button" data-assistant-template-provider="manual-import" data-assistant-template="manual-import" aria-pressed="false" hidden><span><strong>Another provider</strong><span>Create it externally, then connect it to Pharos</span></span></button></div></section>
-
-<section class="assistant-existing-step" data-assistant-step="existing"><form class="assistant-preflight-form" data-preflight-form><div class="assistant-primary-fields"><label><span>Server name</span><input data-preflight-host-name autocomplete="off" placeholder="my-server"></label><label><span>SSH address</span><input data-preflight-ssh-host autocomplete="off" placeholder="host or host:22"></label></div><details class="assistant-preflight-details"><summary>Advanced {chevron}</summary><div class="assistant-preflight-facts"><label><span>SSH user</span><input data-preflight-ssh-user autocomplete="username" placeholder="root"></label><label><span>Connection</span><select data-preflight-route><option value="tailnet">Tailnet</option><option value="direct">Direct</option><option value="bastion">Bastion</option><option value="none">Manual</option></select></label><label><span>Role</span><input data-preflight-role autocomplete="off" placeholder="server"></label><label><span>Host type</span><select data-preflight-host-type><option value="">Detect automatically</option><option value="nixos">NixOS</option><option value="linux-beacon">Linux</option></select></label><label><span>Heartbeat seconds</span><input data-preflight-heartbeat type="number" min="10" max="3600" step="10" inputmode="numeric" value="60"></label><label><span>Login works</span><select data-preflight-fact="ssh_authenticated"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Admin access</span><select data-preflight-admin><option value="">Unknown</option><option value="sudo">sudo</option><option value="root">root</option><option value="none">No</option></select></label><label><span>Operating system</span><select data-preflight-os><option value="">Unknown</option><option value="linux">Linux</option><option value="nixos">NixOS</option><option value="other">Other</option></select></label><label><span>Nix available</span><select data-preflight-fact="nix_available"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label><label><span>Disk free</span><input data-preflight-disk type="number" min="0" step="1" inputmode="numeric" placeholder="GiB"></label><label><span>Can reach Pharos</span><select data-preflight-fact="pharos_reachable"><option value="">Unknown</option><option value="true">Yes</option><option value="false">No</option></select></label></div></details><button class="assistant-check" type="submit" data-preflight-check>Check server</button></form></section>
-
-<section class="assistant-preflight-result" data-assistant-step="bootstrap" data-preflight-result><div class="assistant-result-head"><strong data-preflight-summary>Connection checked</strong><span data-preflight-message>Choose how Pharos should be installed.</span></div><div class="assistant-bootstrap" data-preflight-bootstrap></div><details class="assistant-check-details"><summary>Technical checks {chevron}</summary><div class="assistant-checks" data-preflight-checks></div></details></section>
-
-<section class="assistant-plan" data-assistant-step="plan" data-assistant-plan><section class="assistant-review-summary" data-assistant-review><div class="assistant-review-identity">{server}<label><span>Server name</span><input data-new-host-name autocomplete="off" placeholder="lab-01" aria-label="Server name"></label><span data-review-provider>Hetzner Cloud</span></div><div class="assistant-review-rows"><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-review-server>Current recommended plan</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-review-setup>NixOS + Pharos</small></span></div><div class="assistant-review-row">{after}<span><strong>After setup</strong><small data-review-after>Backups later · Auto location · Operator only</small></span></div></div></section><section class="assistant-existing-review" data-existing-review><div class="assistant-review-row">{server}<span><strong>Server</strong><small data-existing-review-host>Existing server</small></span></div><div class="assistant-review-row">{link}<span><strong>Connection</strong><small data-existing-review-connection>SSH connection</small></span></div><div class="assistant-review-row">{setup}<span><strong>Setup</strong><small data-existing-review-method>Selected method</small></span></div></section><div class="assistant-provider-readiness" data-provider-readiness data-state="checking"><i aria-hidden="true"></i><span>Checking provider connection…</span><a data-provider-setup href="/settings/providers/hetzner-cloud">Set up provider</a></div><details class="assistant-review-details" data-assistant-review-details><summary><span data-assistant-advanced-label>Advanced setup</span>{chevron}</summary><div class="assistant-review-technical"><label class="assistant-plan-field"><span>Role</span><input data-new-role autocomplete="off" value="server" placeholder="server"></label><label class="assistant-plan-field"><span>Location</span><select data-new-location aria-label="Location"><option value="">Loading current locations…</option></select></label><label class="assistant-plan-field"><span>Server plan</span><select data-new-server-type aria-label="Server plan"><option value="">Loading current plans…</option></select></label><label class="assistant-plan-field"><span>Image</span><input data-new-image autocomplete="off" value="debian-12" placeholder="debian-12"></label><label class="assistant-plan-field"><span>SSH public key</span><select data-new-ssh-key aria-label="SSH public key"><option value="">Use connection default</option></select></label><div class="assistant-plan-list" data-provider-plan-resources></div><div class="assistant-setup-intent" data-existing-setup-intent><div class="assistant-choice-group"><strong>Backups</strong><div class="assistant-choice-options" role="radiogroup" aria-label="backup setup intent"><label class="assistant-choice"><input type="radio" name="backup_intent" value="required">Required</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="optional">Optional</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="external">Managed elsewhere</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="enroll-later">Enroll later</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="absent">None</label><label class="assistant-choice"><input type="radio" name="backup_intent" value="deferred" checked>Decide later</label></div></div><div class="assistant-choice-group"><strong>Location</strong><div class="assistant-choice-options" role="radiogroup" aria-label="location setup intent"><label class="assistant-choice"><input type="radio" name="location_intent" value="auto" checked>Auto</label><label class="assistant-choice"><input type="radio" name="location_intent" value="manual">Manual</label><label class="assistant-choice"><input type="radio" name="location_intent" value="site-fallback">Site fallback</label><label class="assistant-choice"><input type="radio" name="location_intent" value="hidden">Hidden</label></div></div><div class="assistant-choice-group"><strong>Access</strong><div class="assistant-choice-options" role="radiogroup" aria-label="access setup intent"><label class="assistant-choice"><input type="radio" name="access_intent" value="operator-only" checked>Operator only</label><label class="assistant-choice"><input type="radio" name="access_intent" value="all-operators">All operators</label><label class="assistant-choice"><input type="radio" name="access_intent" value="limited-users">Limited users</label><label class="assistant-choice"><input type="radio" name="access_intent" value="deferred">Decide later</label></div></div></div></div></details><section class="assistant-paid-review" data-paid-review tabindex="-1"><div class="assistant-paid-head"><strong>Exact paid plan</strong><span data-paid-stage-status role="status" aria-live="polite">Persisted review</span></div><p class="assistant-paid-boundary" data-paid-billing-boundary>Review and authorization do not create a server or start billing.</p><dl class="assistant-paid-policy" data-paid-policy data-paid-plan-details><div><dt>Server name</dt><dd data-paid-server-name>not reviewed</dd></div><div><dt>Provider project</dt><dd data-paid-provider-project data-paid-plan-project>not reviewed</dd></div><div><dt>Region</dt><dd data-paid-region data-paid-plan-location>not reviewed</dd></div><div><dt>Server type</dt><dd data-paid-server-type data-paid-plan-server>not reviewed</dd></div><div><dt>Catalog checked</dt><dd><time data-paid-catalog-refreshed>not reviewed</time></dd></div><div><dt>Image</dt><dd data-paid-image data-paid-plan-image>not reviewed</dd></div><div><dt>Hourly gross price</dt><dd data-paid-price-hourly>not reviewed</dd></div><div><dt>Monthly gross price</dt><dd data-paid-price-monthly data-paid-plan-price>not reviewed</dd></div><div><dt>Hourly authorization cap</dt><dd data-paid-cap-hourly>not reviewed</dd></div><div><dt>Monthly authorization cap</dt><dd data-paid-cap-monthly>not reviewed</dd></div><div><dt>Active-server limit</dt><dd data-paid-max-active data-paid-plan-limit>not reviewed</dd></div><div><dt>Review expires</dt><dd><time data-paid-expiry data-paid-plan-expiry>not reviewed</time></dd></div><div><dt>Authorized at</dt><dd><time data-paid-confirmed-at>not authorized</time></dd></div><div><dt>Execution state</dt><dd data-paid-execution-state>not started</dd></div><div><dt>SSH public key</dt><dd data-paid-ssh-key data-paid-plan-ssh-key>not reviewed</dd></div><div><dt>Firewall</dt><dd data-paid-firewall data-paid-plan-firewall>not reviewed</dd></div><div data-paid-wide><dt>Allowed provider operations</dt><dd data-paid-operations data-paid-plan-operations>not reviewed</dd></div><div data-paid-wide><dt>Required ownership labels</dt><dd><ul class="assistant-paid-label-list" data-paid-labels data-paid-plan-labels></ul></dd></div><div data-paid-wide><dt>Failure and cleanup policy</dt><dd data-paid-cleanup data-paid-plan-cleanup>not reviewed</dd></div><div data-paid-wide><dt>Exact plan fingerprint</dt><dd><code data-paid-plan-hash>not reviewed</code></dd></div></dl><p class="assistant-paid-authorization" data-paid-authorization hidden>Authorized by <strong data-paid-operator>this operator</strong>.</p><div class="assistant-paid-next"><strong>Next step</strong><p data-paid-next-step data-paid-plan-next-step>Authorize this exact persisted plan.</p></div></section><div class="assistant-confirm"><label><input type="checkbox" data-assistant-confirm><span data-assistant-confirm-copy>I reviewed this setup path.</span></label><button class="assistant-start" type="button" data-assistant-start disabled><span data-assistant-start-label>Review paid plan</span>{arrow_right}</button></div></section>
-
-<section class="assistant-job" data-assistant-step="job" data-assistant-job hidden aria-live="polite"><span class="assistant-job-spinner" aria-hidden="true"></span><div><strong data-assistant-job-title>Starting setup</strong><span data-assistant-job-message>Pharos is preparing the server.</span></div></section><section class="assistant-created" data-assistant-created data-state="active" hidden aria-live="polite"><h3 data-created-title>Server created</h3><div class="assistant-created-summary"><div class="assistant-created-fact assistant-created-host">{server}<strong data-created-host>new server</strong></div><div class="assistant-created-fact">{map_pin}<span data-created-location>provider location</span></div><div class="assistant-created-fact assistant-created-ready" data-created-ready><span data-created-ready-text>Ready for setup</span></div></div><div class="assistant-created-progress" data-created-progress aria-label="setup progress"><span class="assistant-created-step" data-state="done"><i aria-hidden="true"></i>Created</span><span class="assistant-created-step" data-state="current"><i aria-hidden="true"></i>Install Pharos</span><span class="assistant-created-step"><i aria-hidden="true"></i>First heartbeat</span></div><div class="assistant-created-actions" data-created-actions><button class="assistant-finish" type="button" data-assistant-finish>Continue setup {arrow_right}</button><button class="assistant-later" type="button" data-assistant-later>Do this later</button></div><section class="assistant-created-setup" data-created-setup hidden><h4>Finish installation</h4><ol data-created-next-steps></ol><p class="assistant-created-guidance" data-created-guidance>The server exists. Continue with the prepared bootstrap handoff, then wait for its first heartbeat.</p><dl class="assistant-created-advanced"><div><dt>Provider resource</dt><dd data-created-resource>pending</dd></div><div><dt>SSH destination</dt><dd data-created-ssh>pending</dd></div><div><dt>Credential target</dt><dd data-created-secret>runtime file</dd></div><div><dt>Setup helper</dt><dd data-created-command>prepared handoff</dd></div></dl></section><details data-created-recovery><summary>Recovery options {chevron}</summary><section class="assistant-created-danger" data-created-danger><div class="assistant-created-danger-head">{warning}<div><strong>Delete this server</strong><p>Removes the paid Hetzner server. This cannot be undone.</p></div></div><label class="assistant-delete-confirm"><input type="checkbox" data-created-delete-confirm><span>I understand this permanently deletes the server.</span></label><div class="assistant-delete-actions"><button class="assistant-delete" type="button" data-created-delete disabled>{trash} Delete server</button><span data-created-delete-status role="status" aria-live="polite"></span></div></section></details></section><div class="assistant-error" data-assistant-error role="alert" hidden></div>
-
-</div></div></section>"#,
-        plus = icons::PLUS,
-        server = icons::SERVER,
-        close = icons::X,
-        arrow_left = icons::ARROW_LEFT,
-        arrow_right = icons::ARROW_RIGHT,
-        chevron = icons::CHEVRON_DOWN,
-        setup = icons::SLIDERS,
-        after = icons::SHIELD_CHECK,
-        link = icons::LINK,
-        map_pin = icons::MAP_PIN,
-        warning = icons::TRIANGLE_ALERT,
-        trash = icons::TRASH_2,
-    )
-}
-
-fn empty_state(can_onboard: bool) -> String {
-    let action = if can_onboard {
-        onboard_primary("Add first server")
-    } else {
-        String::new()
-    };
-    format!(
-        r#"<section class="empty-state" aria-label="first run"><div class="empty-copy"><span class="empty-kicker">first light</span><h2>Waiting for the first host</h2><p>Register a host and Pharos will hold it in the grey awaiting state until the first real heartbeat arrives.</p>{action}</div><div class="empty-visual" aria-hidden="true"><span class="empty-sun"></span><span class="empty-line"></span><span class="empty-lighthouse">{lighthouse}</span><span class="empty-await">awaiting first heartbeat</span></div></section>"#,
-        action = action,
-        lighthouse = icons::LIGHTHOUSE
-    )
-}
-
-fn lone_host_state(can_onboard: bool) -> String {
-    let action = if can_onboard {
-        onboard_primary("Add server")
-    } else {
-        String::new()
-    };
-    format!(
-        r#"<aside class="lone-state" aria-label="lone host state"><span class="lone-mark">{lighthouse}</span><div class="lone-copy"><span class="lone-kicker">one light</span><strong>First host is on the map</strong><p>The fleet view is ready for the next onboarded machine.</p></div>{action}</aside>"#,
-        lighthouse = icons::LIGHTHOUSE,
-        action = action
-    )
-}
-
-fn provisioning_job_host_name(job: &ProvisioningJob) -> Option<&str> {
-    job.host_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-}
-
-fn provisioning_job_rolled_back(job: &ProvisioningJob) -> bool {
-    job.state == ProvisioningJobState::Complete
-        && job.terminal_outcome == Some(ProvisioningTerminalOutcome::RolledBack)
-}
-
-fn provisioning_job_role(job: &ProvisioningJob) -> &str {
-    job.role
-        .as_deref()
-        .map(str::trim)
-        .filter(|role| !role.is_empty())
-        .unwrap_or("server")
-}
-
-fn provisioning_job_visible_in_fleet(job: &ProvisioningJob) -> bool {
-    matches!(
-        job.state,
-        ProvisioningJobState::Planning
-            | ProvisioningJobState::Provisioning
-            | ProvisioningJobState::Bootstrapping
-            | ProvisioningJobState::WaitingForHeartbeat
-            | ProvisioningJobState::BackupPending
-            | ProvisioningJobState::CleanupNeeded
-    )
-}
-
-fn first_heartbeat_timeout_secs(job: &ProvisioningJob) -> i64 {
-    let interval = i64::try_from(job.heartbeat_interval_secs.unwrap_or(60))
-        .unwrap_or(60)
-        .max(1);
-    (interval * 5).clamp(300, 1800)
-}
-
-fn provisioning_job_first_heartbeat_overdue(job: &ProvisioningJob, now: i64) -> bool {
-    job.state == ProvisioningJobState::WaitingForHeartbeat
-        && now.saturating_sub(job.updated_at) > first_heartbeat_timeout_secs(job)
-}
-
-fn provisioning_job_fleet_status(
-    job: &ProvisioningJob,
-    now: i64,
-) -> (&'static str, &'static str, &'static str, u8, String) {
-    if provisioning_job_rolled_back(job) {
-        return ("unknown", "clear", "ok", 4, "setup rolled back".to_string());
-    }
-    if provisioning_job_first_heartbeat_overdue(job, now) {
-        return (
-            "stale",
-            "warning",
-            "warn",
-            1,
-            "first heartbeat overdue".to_string(),
-        );
-    }
-
-    match job.state {
-        ProvisioningJobState::Planning
-        | ProvisioningJobState::Provisioning
-        | ProvisioningJobState::Bootstrapping => (
-            "awaiting_first_heartbeat",
-            "watch",
-            "wait",
-            2,
-            format!("setup {}", job.state.label()),
-        ),
-        ProvisioningJobState::WaitingForHeartbeat => (
-            "awaiting_first_heartbeat",
-            "watch",
-            "wait",
-            2,
-            "waiting for first heartbeat".to_string(),
-        ),
-        ProvisioningJobState::BackupPending => (
-            "awaiting_first_heartbeat",
-            "watch",
-            "wait",
-            2,
-            "backup pending".to_string(),
-        ),
-        ProvisioningJobState::Complete => ("live", "clear", "ok", 4, "setup complete".to_string()),
-        ProvisioningJobState::Failed | ProvisioningJobState::CleanupNeeded => {
-            ("down", "critical", "down", 0, job.state.label().to_string())
-        }
-    }
-}
-
-fn provisioning_job_setup_intent(job: &ProvisioningJob) -> ProvisioningSetupIntent {
-    job.setup_intent.clone().unwrap_or(ProvisioningSetupIntent {
-        backup: BackupSetupIntent::Deferred,
-        location: LocationSetupIntent::Auto,
-        access: AccessSetupIntent::OperatorOnly,
-    })
-}
-
-fn provisioning_job_latest_message(job: &ProvisioningJob) -> String {
-    job.progress
-        .last()
-        .map(|entry| entry.message.clone())
-        .unwrap_or_else(|| "Setup job is waiting for progress.".to_string())
-}
-
-fn setup_intent_markup(intent: &ProvisioningSetupIntent) -> String {
-    format!(
-        r#"<div class="setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span><span class="setup-chip access">{access}</span></div>"#,
-        backup = html_escape(intent.backup_label()),
-        location = html_escape(intent.location_label()),
-        access = html_escape(intent.access_label())
-    )
-}
-
-fn setup_intent_search_text(intent: &ProvisioningSetupIntent) -> String {
-    format!(
-        "{} {} {} {} {} {}",
-        intent.backup_label(),
-        intent.backup_next_action(),
-        intent.location_label(),
-        intent.location_next_action(),
-        intent.access_label(),
-        intent.access_next_action()
-    )
-}
-
-fn pending_setup_jobs<'a>(hosts: &[Host], jobs: &'a [ProvisioningJob]) -> Vec<&'a ProvisioningJob> {
-    let runtime_names: BTreeSet<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
-    let mut latest_by_host: BTreeMap<&str, &ProvisioningJob> = BTreeMap::new();
-    for job in jobs {
-        let Some(host_name) = provisioning_job_host_name(job) else {
-            continue;
-        };
-        if runtime_names.contains(host_name) || !provisioning_job_visible_in_fleet(job) {
-            continue;
-        }
-        let replace = latest_by_host
-            .get(host_name)
-            .is_none_or(|existing| job.updated_at >= existing.updated_at);
-        if replace {
-            latest_by_host.insert(host_name, job);
-        }
-    }
-    let mut jobs: Vec<&ProvisioningJob> = latest_by_host.into_values().collect();
-    jobs.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| provisioning_job_host_name(left).cmp(&provisioning_job_host_name(right)))
-    });
-    jobs
-}
-
-fn reconcile_provisioning_jobs_with_runtime(
-    provisioning_jobs: &ProvisioningJobStore,
-    hosts: &[Host],
-    now: i64,
-) {
-    let runtime_by_name: BTreeMap<&str, &Host> = hosts
-        .iter()
-        .map(|host| (host.name.as_str(), host))
-        .collect();
-    for job in provisioning_jobs.list() {
-        let Some(host_name) = provisioning_job_host_name(&job) else {
-            continue;
-        };
-        let Some(host) = runtime_by_name.get(host_name) else {
-            continue;
-        };
-        match job.state {
-            ProvisioningJobState::WaitingForHeartbeat
-                if host
-                    .last_seen
-                    .is_some_and(|last_seen| last_seen >= job.updated_at) =>
-            {
-                let setup = provisioning_job_setup_intent(&job);
-                let next_state = if matches!(
-                    setup.backup,
-                    BackupSetupIntent::External | BackupSetupIntent::Absent
-                ) {
-                    ProvisioningJobState::Complete
-                } else {
-                    ProvisioningJobState::BackupPending
-                };
-                let message = if next_state == ProvisioningJobState::Complete {
-                    "First heartbeat observed; onboarding is complete for the selected backup policy."
-                } else {
-                    "First heartbeat observed; backup decision or enrollment remains pending."
-                };
-                let _ = provisioning_jobs.append_progress(&job.id, next_state, message, now);
-            }
-            ProvisioningJobState::CleanupNeeded
-                if job.provider == "existing-host"
-                    && host
-                        .last_seen
-                        .is_some_and(|last_seen| last_seen >= job.updated_at) =>
-            {
-                let setup = provisioning_job_setup_intent(&job);
-                let next_state = if matches!(
-                    setup.backup,
-                    BackupSetupIntent::External | BackupSetupIntent::Absent
-                ) {
-                    ProvisioningJobState::Complete
-                } else {
-                    ProvisioningJobState::BackupPending
-                };
-                let message = if next_state == ProvisioningJobState::Complete {
-                    "Authenticated heartbeat received after an uncertain install result; onboarding is complete for the selected backup policy."
-                } else {
-                    "Authenticated heartbeat received after an uncertain install result; backup decision or enrollment remains pending."
-                };
-                let _ = provisioning_jobs.append_progress(&job.id, next_state, message, now);
-            }
-            ProvisioningJobState::BackupPending if !host.backup_observations.is_empty() => {
-                let _ = provisioning_jobs.append_progress(
-                    &job.id,
-                    ProvisioningJobState::Complete,
-                    "Backup observation received; setup job complete.",
-                    now,
-                );
-            }
-            _ => {}
-        }
-    }
-}
-
-fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
-    let Some(raw_name) = provisioning_job_host_name(job) else {
-        return String::new();
-    };
-    let name = html_escape(raw_name);
-    let role = html_escape(provisioning_job_role(job));
-    let is_nix = job.is_nix.unwrap_or(false);
-    let host_icon = if is_nix {
-        icons::SNOWFLAKE
-    } else {
-        icons::SERVER
-    };
-    let (live_key, level, reason_level, sev, reason) = provisioning_job_fleet_status(job, now);
-    let intent = provisioning_job_setup_intent(job);
-    let intent_markup = setup_intent_markup(&intent);
-    let search = html_escape(&format!(
-        "{} {} setup provisioning {} {} {}",
-        raw_name.to_lowercase(),
-        provisioning_job_role(job).to_lowercase(),
-        reason.to_lowercase(),
-        job.state.label(),
-        setup_intent_search_text(&intent).to_lowercase()
-    ));
-    let detail = if provisioning_job_first_heartbeat_overdue(job, now) {
-        format!(
-            "No first heartbeat after {}. Check beacon install, network, and host power.",
-            duration_label(now.saturating_sub(job.updated_at))
-        )
-    } else {
-        provisioning_job_latest_message(job)
-    };
-    let started = format!("setup started {} ago", duration_label(now - job.created_at));
-    format!(
-        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="header-chip settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div></article>"#,
-        sort_name = html_escape(&raw_name.to_lowercase()),
-        updated_at = job.updated_at,
-        job_id = html_escape(&job.id),
-        settings = icons::SLIDERS,
-        reason = html_escape(&reason),
-        detail = html_escape(&detail),
-        started = html_escape(&started),
-        as_of = clock_label(now)
-    )
-}
-
-fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
-    let Some(raw_name) = provisioning_job_host_name(job) else {
-        return String::new();
-    };
-    let name = html_escape(raw_name);
-    let role = html_escape(provisioning_job_role(job));
-    let is_nix = job.is_nix.unwrap_or(false);
-    let host_icon = if is_nix {
-        icons::SNOWFLAKE
-    } else {
-        icons::SERVER
-    };
-    let (live_key, level, reason_level, sev, reason) = provisioning_job_fleet_status(job, now);
-    let intent = provisioning_job_setup_intent(job);
-    let search = html_escape(&format!(
-        "{} {} setup provisioning {} {} {}",
-        raw_name.to_lowercase(),
-        provisioning_job_role(job).to_lowercase(),
-        reason.to_lowercase(),
-        job.state.label(),
-        setup_intent_search_text(&intent).to_lowercase()
-    ));
-    let started = format!("setup started {} ago", duration_label(now - job.created_at));
-    format!(
-        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a></div></td></tr>"#,
-        sort_name = html_escape(&raw_name.to_lowercase()),
-        updated_at = job.updated_at,
-        job_id = html_escape(&job.id),
-        reason = html_escape(&reason),
-        backup = html_escape(intent.backup_label()),
-        location = html_escape(intent.location_label()),
-        started = html_escape(&started),
-        job_state = html_escape(job.state.label())
-    )
-}
-
-fn heartbeat_samples(log: &[i64], last_seen: Option<i64>) -> Vec<i64> {
-    let mut samples = log.to_vec();
-    if samples.is_empty() {
-        if let Some(last) = last_seen {
-            samples.push(last);
-        }
-    }
-    samples.sort_unstable();
-    samples.dedup();
-    samples
-}
-
-struct HeartbeatSignal {
-    text: String,
-    level: &'static str,
-    window: &'static str,
-    title: String,
-}
-
-fn heartbeat_signal(
-    log: &[i64],
-    last_seen: Option<i64>,
-    interval: i64,
-    now: i64,
-    window_label: &'static str,
-    window_secs: i64,
-) -> HeartbeatSignal {
-    let samples = heartbeat_samples(log, last_seen);
-    if samples.is_empty() {
-        return HeartbeatSignal {
-            text: "new".to_string(),
-            level: "wait",
-            window: window_label,
-            title: format!("Signal over {window_label}: waiting for first heartbeat"),
-        };
-    };
-
-    let interval = interval.max(1);
-    let window_secs = window_secs.max(interval);
-    let requested_start = now - window_secs;
-    let retained_start = samples
-        .first()
-        .copied()
-        .map(|oldest| oldest.max(requested_start))
-        .unwrap_or(requested_start);
-    let span = (now - retained_start).max(interval).min(window_secs);
-    let expected = ((span + interval - 1) / interval).max(1) as usize;
-    let received = samples
-        .iter()
-        .filter(|stamp| **stamp >= retained_start && **stamp <= now)
-        .count();
-    let mut previous = retained_start;
-    let mut longest_gap = samples
-        .last()
-        .copied()
-        .map(|latest| (now - latest).max(0).min(span))
-        .unwrap_or(span);
-    for stamp in samples
-        .iter()
-        .copied()
-        .filter(|stamp| *stamp >= retained_start && *stamp <= now)
-    {
-        longest_gap = longest_gap.max(stamp - previous);
-        previous = stamp;
-    }
-    longest_gap = longest_gap.max(now - previous);
-
-    let percent = (((received * 100) + (expected / 2)) / expected).min(100);
-    let level = if percent >= 95 {
-        "good"
-    } else if percent >= 75 {
-        "warn"
-    } else {
-        "down"
-    };
-    HeartbeatSignal {
-        text: format!("{percent}%"),
-        level,
-        window: window_label,
-        title: format!(
-            "Signal over {window_label}: {received} of {expected} expected heartbeats received · longest gap {}{}",
-            duration_label(longest_gap),
-            if retained_start > requested_start {
-                format!(" · retained {}", duration_label(span))
-            } else {
-                String::new()
-            }
-        ),
-    }
-}
-
-fn signal_markup(signal: &HeartbeatSignal) -> String {
-    let title = html_escape(&signal.title);
-    format!(
-        r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window" type="button" data-signal-window title="{title}">{window}</button></span>"#,
-        level = html_escape(signal.level),
-        text = html_escape(&signal.text),
-        window = html_escape(signal.window),
-    )
-}
-
-fn head_with_extra(extra: &str) -> String {
-    HEAD.replacen("</style></head>", &format!("</style>{extra}</head>"), 1)
-}
-
-const LOCATION_STALE_AFTER_SECS: i64 = 24 * 3600;
-
-#[derive(Debug, Clone, PartialEq)]
-struct SiteLocation {
-    id: String,
-    label: String,
-    region: String,
-    lat: f64,
-    lon: f64,
-    source: HostLocationSource,
-    mode: &'static str,
-    state: &'static str,
-    stale: bool,
-    manual_override: bool,
-    observed_at: Option<i64>,
-    accuracy_meters: Option<f64>,
-    precision_meters: Option<f64>,
-}
-
-impl SiteLocation {
-    fn from_site(site: &str, source: HostLocationSource) -> Self {
-        let (id, label, region, lat, lon) = match site {
-            "cloud" | "cloud-de" => ("cloud-de", "Cloud", "Germany", 50.1109, 8.6821),
-            "home" | "home-at" => ("home-at", "Home", "Austria", 48.2082, 16.3738),
-            "ww87" | "parents-home" => ("ww87", "Parents' home", "Austria", 48.32, 15.92),
-            "parents-in-law" => ("parents-in-law", "Parents-in-law", "Austria", 48.13, 15.18),
-            "dsc" | "dsc0" | "dsc-us" | "hillsboro-or" => {
-                ("dsc-us", "DSC", "Hillsboro, OR, US", 45.5229, -122.9898)
-            }
-            _ => ("unknown", "Unknown site", "Not declared", 46.8, 8.2),
-        };
-        Self {
-            id: id.to_string(),
-            label: label.to_string(),
-            region: region.to_string(),
-            lat,
-            lon,
-            source,
-            mode: "auto",
-            state: if id == "unknown" { "unknown" } else { "known" },
-            stale: false,
-            manual_override: false,
-            observed_at: None,
-            accuracy_meters: None,
-            precision_meters: None,
-        }
-    }
-
-    fn from_host_location(
-        location: &HostLocation,
-        fallback_label: impl Into<String>,
-        fallback_region: impl Into<String>,
-        mode: &'static str,
-        state: &'static str,
-        now: i64,
-    ) -> Self {
-        let stale = location_stale(location, now);
-        let label = location
-            .label
-            .clone()
-            .unwrap_or_else(|| fallback_label.into());
-        let region = fallback_region.into();
-        let id = format!(
-            "{}:{:.4},{:.4}",
-            location_source_key(location.source),
-            location.latitude,
-            location.longitude
-        );
-        Self {
-            id,
-            label,
-            region,
-            lat: location.latitude,
-            lon: location.longitude,
-            source: location.source,
-            mode,
-            state: if stale { "stale" } else { state },
-            stale,
-            manual_override: location.manual_override,
-            observed_at: location.observed_at,
-            accuracy_meters: location.accuracy_meters,
-            precision_meters: location.precision_meters,
-        }
-    }
-
-    fn hidden() -> Self {
-        Self {
-            id: "hidden".to_string(),
-            label: "Location hidden".to_string(),
-            region: "Not shown".to_string(),
-            lat: 46.8,
-            lon: 8.2,
-            source: HostLocationSource::Unknown,
-            mode: "hidden",
-            state: "hidden",
-            stale: false,
-            manual_override: false,
-            observed_at: None,
-            accuracy_meters: None,
-            precision_meters: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MapProbeTarget {
-    endpoint: Option<(String, u16)>,
-    kind: &'static str,
-    policy: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MapSignal {
-    label: String,
-    level: &'static str,
-    title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    policy: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MapHost {
-    name: String,
-    role: String,
-    live: &'static str,
-    status: &'static str,
-    attention: String,
-    search: String,
-    site_id: String,
-    site_label: String,
-    region: String,
-    lat: f64,
-    lon: f64,
-    location_source: &'static str,
-    location_state: &'static str,
-    location_stale: bool,
-    location_manual_override: bool,
-    location: serde_json::Value,
-    is_pharos: bool,
-    inbound_label: String,
-    inbound_level: &'static str,
-    inbound_title: String,
-    outbound_label: String,
-    outbound_level: &'static str,
-    outbound_title: String,
-    outbound_policy: &'static str,
-    settings_href: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MapDataPayload {
-    schema: &'static str,
-    as_of: i64,
-    hosts: Vec<MapHost>,
-}
-
-fn site_location(site: &str) -> SiteLocation {
-    SiteLocation::from_site(site, HostLocationSource::Provider)
-}
-
-fn fallback_site_location(host: &str) -> SiteLocation {
-    SiteLocation::from_site(fallback_site_for_host(host), HostLocationSource::Fallback)
-}
-
-fn location_source_key(source: HostLocationSource) -> &'static str {
-    match source {
-        HostLocationSource::Wifi => "wifi",
-        HostLocationSource::Ip => "ip",
-        HostLocationSource::Provider => "provider",
-        HostLocationSource::Declared => "declared",
-        HostLocationSource::Fallback => "fallback",
-        HostLocationSource::Unknown => "unknown",
-    }
-}
-
-fn location_source_label(source: HostLocationSource) -> &'static str {
-    match source {
-        HostLocationSource::Wifi | HostLocationSource::Ip => "auto",
-        HostLocationSource::Provider => "provider",
-        HostLocationSource::Declared => "declared",
-        HostLocationSource::Fallback => "fallback",
-        HostLocationSource::Unknown => "unknown",
-    }
-}
-
-fn location_stale(location: &HostLocation, now: i64) -> bool {
-    if location.stale {
-        return true;
-    }
-    location
-        .observed_at
-        .is_some_and(|observed| now.saturating_sub(observed) > LOCATION_STALE_AFTER_SECS)
-}
-
-fn location_payload(location: &SiteLocation) -> serde_json::Value {
-    json!({
-        "latitude": location.lat,
-        "longitude": location.lon,
-        "source": location_source_key(location.source),
-        "mode": location.mode,
-        "state": location.state,
-        "stale": location.stale,
-        "manual_override": location.manual_override,
-        "observed_at": location.observed_at,
-        "accuracy_meters": location.accuracy_meters,
-        "precision_meters": location.precision_meters,
-        "label": location.label,
-        "region": location.region,
-        "site_id": location.id,
-    })
-}
-
-fn resolve_host_location(
-    host: Option<&Host>,
-    manifest: Option<&HostManifest>,
-    host_name: &str,
-    now: i64,
-) -> SiteLocation {
-    let mode = manifest
-        .map(|manifest| manifest.host.location_mode)
-        .unwrap_or_default();
-    if mode == ManifestLocationMode::Hidden {
-        return SiteLocation::hidden();
-    }
-
-    let provider = manifest
-        .and_then(|manifest| {
-            manifest
-                .host
-                .site
-                .as_deref()
-                .filter(|site| !site.trim().is_empty())
-        })
-        .map(site_location);
-
-    let declared_location = manifest.and_then(|manifest| manifest.host.location.as_ref());
-
-    if let Some(location) = declared_location.filter(|location| {
-        mode == ManifestLocationMode::DeclaredOverride
-            || (mode == ManifestLocationMode::Auto && location.manual_override)
-    }) {
-        let fallback = provider
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| fallback_site_location(host_name));
-        return SiteLocation::from_host_location(
-            location,
-            fallback.label,
-            fallback.region,
-            "declared-override",
-            "declared",
-            now,
-        );
-    }
-
-    if let Some(location) = host.and_then(|host| host.location.as_ref()) {
-        let fallback = provider
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| fallback_site_location(host_name));
-        return SiteLocation::from_host_location(
-            location,
-            fallback.label,
-            fallback.region,
-            "observed",
-            "observed",
-            now,
-        );
-    }
-
-    if let Some(location) = declared_location.filter(|_| {
-        matches!(
-            mode,
-            ManifestLocationMode::DeclaredFallback | ManifestLocationMode::Auto
-        )
-    }) {
-        let fallback = provider
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| fallback_site_location(host_name));
-        return SiteLocation::from_host_location(
-            location,
-            fallback.label,
-            fallback.region,
-            "declared-fallback",
-            "declared",
-            now,
-        );
-    }
-
-    provider.unwrap_or_else(|| fallback_site_location(host_name))
-}
-
-fn fallback_site_for_host(host: &str) -> &'static str {
-    match host {
-        "csb0" | "csb1" => "cloud-de",
-        "hsb0" | "hsb1" | "gpc0" => "home-at",
-        "hsb8" => "ww87",
-        "hsb9" => "parents-in-law",
-        "dsc0" => "dsc-us",
-        _ => "unknown",
-    }
-}
-
-fn manifest_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &HostManifest> {
-    let mut by_host = BTreeMap::new();
-    for manifest in manifests {
-        by_host.insert(manifest.host.name.as_str(), manifest);
-        by_host.insert(manifest.slug.as_str(), manifest);
-    }
-    by_host
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostPreferencesState {
-    Applied,
-    RequestPending,
-    DeclaredNotApplied,
-}
-
-impl HostPreferencesState {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Applied => "applied",
-            Self::RequestPending => "request_pending",
-            Self::DeclaredNotApplied => "declared_not_applied",
-        }
-    }
-
-    fn card_label(self) -> &'static str {
-        match self {
-            Self::Applied => "",
-            Self::RequestPending => "change requested",
-            Self::DeclaredNotApplied => "change waiting",
-        }
-    }
-}
-
-fn host_preferences_state(
-    applied: &HostPreferences,
-    declared: Option<&HostPreferences>,
-    requested: Option<&HostPreferences>,
-) -> HostPreferencesState {
-    if let Some(requested) = requested {
-        if declared.is_some_and(|declared| declared == requested && declared != applied) {
-            return HostPreferencesState::DeclaredNotApplied;
-        }
-        if requested != applied {
-            return HostPreferencesState::RequestPending;
-        }
-    }
-    if declared.is_some_and(|declared| declared != applied) {
-        HostPreferencesState::DeclaredNotApplied
-    } else {
-        HostPreferencesState::Applied
-    }
-}
-
-fn pending_preference_color<'a>(
-    state: HostPreferencesState,
-    declared: Option<&'a HostPreferences>,
-    requested: Option<&'a HostPreferences>,
-) -> Option<&'a str> {
-    match state {
-        HostPreferencesState::Applied => None,
-        HostPreferencesState::RequestPending => requested.and_then(|value| value.accent.as_deref()),
-        HostPreferencesState::DeclaredNotApplied => declared
-            .and_then(|value| value.accent.as_deref())
-            .or_else(|| requested.and_then(|value| value.accent.as_deref())),
-    }
-}
-
-fn valid_preference_accent(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 7 && bytes.first() == Some(&b'#') && bytes[1..].iter().all(u8::is_ascii_hexdigit)
-}
-
-fn split_probe_host_port(raw: &str, default_port: u16) -> Option<(String, u16)> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(url) = Url::parse(trimmed) {
-        let host = url.host_str()?.trim().to_string();
-        if host.is_empty() {
-            return None;
-        }
-        return Some((host, url.port_or_known_default().unwrap_or(default_port)));
-    }
-    let target = trimmed
-        .trim_start_matches("//")
-        .split('/')
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
-    if target.is_empty() {
-        return None;
-    }
-    let target = target.rsplit('@').next().unwrap_or(target).trim();
-    if target.is_empty() {
-        return None;
-    }
-    if let Some((host, port)) = target.rsplit_once(':') {
-        if !host.contains(':') {
-            if let Ok(port) = port.parse::<u16>() {
-                return Some((host.to_string(), port));
-            }
-        }
-    }
-    Some((target.to_string(), default_port))
-}
-
-fn normalize_outbound_policy(policy: &str) -> Option<&'static str> {
-    match policy.trim().to_ascii_lowercase().as_str() {
-        "expected" | "reachable" | "allow" | "allowed" | "required" => Some("expected"),
-        "blocked" | "deny" | "denied" | "intentional-block" | "intentional_block" => {
-            Some("blocked")
-        }
-        "unknown" | "probe" | "best-effort" | "best_effort" => Some("unknown"),
-        _ => None,
-    }
-}
-
-fn manifest_outbound_policy(host: &str, manifests: &[HostManifest]) -> Option<&'static str> {
-    let manifests = manifest_by_host(manifests);
-    let manifest = manifests.get(host)?;
-    [
-        "pharosOutbound",
-        "pharosOutboundPolicy",
-        "pharosConnectivity",
-    ]
-    .into_iter()
-    .find_map(|key| manifest.host.access.get(key))
-    .and_then(|value| normalize_outbound_policy(value))
-}
-
-fn outbound_policy_for_host(host: &Host, manifests: &[HostManifest]) -> &'static str {
-    manifest_outbound_policy(&host.name, manifests).unwrap_or("unknown")
-}
-
-fn map_probe_target(host: &Host, manifests: &[HostManifest]) -> MapProbeTarget {
-    let policy = outbound_policy_for_host(host, manifests);
-    if policy == "blocked" {
-        return MapProbeTarget {
-            endpoint: None,
-            kind: "tailnet ssh",
-            policy,
-        };
-    }
-    let manifests = manifest_by_host(manifests);
-    if let Some(manifest) = manifests.get(host.name.as_str()) {
-        if let Some(tailnet) = manifest.host.tailnet_hostname() {
-            if let Some((host, port)) = split_probe_host_port(tailnet, 2222) {
-                return MapProbeTarget {
-                    endpoint: Some((host, port)),
-                    kind: "tailnet ssh",
-                    policy,
-                };
-            }
-        }
-        if let Some(lan) = manifest.host.lan_hostname() {
-            if let Some((host, port)) = split_probe_host_port(lan, 2222) {
-                return MapProbeTarget {
-                    endpoint: Some((host, port)),
-                    kind: "lan ssh",
-                    policy,
-                };
-            }
-        }
-        if let Some(ip) = manifest.host.lan_ip() {
-            if let Some((host, port)) = split_probe_host_port(ip, 2222) {
-                return MapProbeTarget {
-                    endpoint: Some((host, port)),
-                    kind: "lan ssh",
-                    policy,
-                };
-            }
-        }
-    }
-    MapProbeTarget {
-        endpoint: Some((format!("{}.ts.barta.cm", host.name), 2222)),
-        kind: "tailnet ssh",
-        policy,
-    }
-}
-
-fn default_map_signal() -> MapSignal {
-    MapSignal {
-        label: "checking".to_string(),
-        level: "wait",
-        title: "Pharos reachability check is pending".to_string(),
-        policy: None,
-    }
-}
-
-async fn map_connectivity_probe(target: MapProbeTarget) -> MapSignal {
-    let Some((host, port)) = target.endpoint else {
-        return MapSignal {
-            label: if target.policy == "blocked" {
-                "blocked".to_string()
-            } else {
-                "unknown".to_string()
-            },
-            level: "wait",
-            title: if target.policy == "blocked" {
-                "Outbound access from Pharos is blocked by policy".to_string()
-            } else {
-                "No outbound probe endpoint declared".to_string()
-            },
-            policy: Some(target.policy),
-        };
-    };
-    let started = Instant::now();
-    match timeout(
-        SERVER_PROBE_TIMEOUT,
-        TcpStream::connect((host.as_str(), port)),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
-            let elapsed_ms = started.elapsed().as_millis().max(1);
-            MapSignal {
-                label: format!("{elapsed_ms} ms"),
-                level: "good",
-                title: format!(
-                    "Pharos {kind} check to {host}:{port} reachable in {elapsed_ms} ms",
-                    kind = target.kind,
-                    host = host,
-                    port = port
-                ),
-                policy: Some(target.policy),
-            }
-        }
-        Ok(Err(_)) => MapSignal {
-            label: "no route".to_string(),
-            level: if target.policy == "expected" {
-                "down"
-            } else {
-                "warn"
-            },
-            title: format!(
-                "Pharos {kind} check to {host}:{port} failed",
-                kind = target.kind,
-                host = host,
-                port = port
-            ),
-            policy: Some(target.policy),
-        },
-        Err(_) => MapSignal {
-            label: "timeout".to_string(),
-            level: "warn",
-            title: format!(
-                "Pharos {kind} check to {host}:{port} timed out after {} ms",
-                SERVER_PROBE_TIMEOUT.as_millis(),
-                kind = target.kind,
-                host = host,
-                port = port
-            ),
-            policy: Some(target.policy),
-        },
-    }
-}
-
-async fn map_connectivity_probes(
-    hosts: &[Host],
-    manifests: &[HostManifest],
-) -> BTreeMap<String, MapSignal> {
-    let mut jobs = JoinSet::new();
-    for host in hosts {
-        let name = host.name.clone();
-        let target = map_probe_target(host, manifests);
-        jobs.spawn(async move { (name, map_connectivity_probe(target).await) });
-    }
-    let mut probes = BTreeMap::new();
-    while let Some(result) = jobs.join_next().await {
-        if let Ok((name, probe)) = result {
-            probes.insert(name, probe);
-        }
-    }
-    probes
-}
-
-fn map_inbound_signal(host: &Host, is_pharos: bool, now: i64) -> MapSignal {
-    if is_pharos {
-        return MapSignal {
-            label: "local".to_string(),
-            level: "good",
-            title: "Pharos is the local control host".to_string(),
-            policy: None,
-        };
-    }
-    if let Some(rtt) = host.inbound_rtt {
-        let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-        let level = match live {
-            Liveness::Live => {
-                if rtt.millis <= 500 {
-                    "good"
-                } else {
-                    "warn"
-                }
-            }
-            Liveness::Stale => "warn",
-            Liveness::Down => "down",
-            Liveness::AwaitingFirstHeartbeat => "wait",
-        };
-        let observed_age = (now - rtt.observed_at).max(0);
-        return MapSignal {
-            label: format!("{} ms", rtt.millis),
-            level,
-            title: format!(
-                "Host-to-Pharos report submit RTT from {} was {} ms, observed {} ago",
-                host.name,
-                rtt.millis,
-                duration_label(observed_age)
-            ),
-            policy: None,
-        };
-    }
-    let Some(last_seen) = host.last_seen else {
-        return MapSignal {
-            label: "waiting".to_string(),
-            level: "wait",
-            title: "No heartbeat from this host has reached Pharos yet".to_string(),
-            policy: None,
-        };
-    };
-    let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-    let level = match live {
-        Liveness::Live => "good",
-        Liveness::Stale => "warn",
-        Liveness::Down => "down",
-        Liveness::AwaitingFirstHeartbeat => "wait",
-    };
-    let age = (now - last_seen).max(0);
-    MapSignal {
-        label: format!("beat {}", duration_label(age)),
-        level,
-        title: format!(
-            "No measured inbound RTT yet; last heartbeat from {} reached Pharos {} ago",
-            host.name,
-            duration_label(age)
-        ),
-        policy: None,
-    }
-}
-
-fn map_hosts(
-    hosts: &[Host],
-    self_name: &str,
-    now: i64,
-    manifests: &[HostManifest],
-    probes: &BTreeMap<String, MapSignal>,
-) -> Vec<MapHost> {
-    let manifests = manifest_by_host(manifests);
-    let mut mapped = hosts
-        .iter()
-        .map(|host| {
-            let is_pharos = host.name == self_name;
-            let mut live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-            if is_pharos {
-                live = Liveness::Live;
-            }
-            let (_color, status) = live.badge();
-            let attention = if host.name == self_name {
-                self_attention_reason()
-            } else {
-                attention_reason(
-                    live,
-                    &host.freshness,
-                    host.kernel.as_ref(),
-                    &host.service_observations,
-                    &host.preferences,
-                )
-            };
-            let site = resolve_host_location(
-                Some(host),
-                manifests.get(host.name.as_str()).copied(),
-                &host.name,
-                now,
-            );
-            let inbound = map_inbound_signal(host, is_pharos, now);
-            let outbound = probes
-                .get(&host.name)
-                .cloned()
-                .unwrap_or_else(default_map_signal);
-            let search = format!(
-                "{} {} {} {} {} {} {} {} {} {}",
-                host.name,
-                host.role,
-                status,
-                attention.label,
-                site.label,
-                site.region,
-                location_source_key(site.source),
-                location_source_label(site.source),
-                inbound.label,
-                outbound.label
-            )
-            .to_lowercase();
-            let location = location_payload(&site);
-            MapHost {
-                name: host.name.clone(),
-                role: host.role.clone(),
-                live: live_key(live),
-                status,
-                attention: attention.label,
-                search,
-                site_id: site.id,
-                site_label: site.label,
-                region: site.region,
-                lat: site.lat,
-                lon: site.lon,
-                location_source: location_source_key(site.source),
-                location_state: site.state,
-                location_stale: site.stale,
-                location_manual_override: site.manual_override,
-                location,
-                is_pharos,
-                inbound_label: inbound.label,
-                inbound_level: inbound.level,
-                inbound_title: inbound.title,
-                outbound_label: outbound.label,
-                outbound_level: outbound.level,
-                outbound_title: outbound.title,
-                outbound_policy: outbound.policy.unwrap_or("unknown"),
-                settings_href: format!("/agora?host={}", url_query_escape(&host.name)),
-            }
-        })
-        .collect::<Vec<_>>();
-    mapped.sort_by(|a, b| {
-        a.site_label
-            .cmp(&b.site_label)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    mapped
-}
-
-fn map_data_payload(
-    hosts: &[Host],
-    self_name: &str,
-    now: i64,
-    manifests: &[HostManifest],
-    probes: &BTreeMap<String, MapSignal>,
-) -> MapDataPayload {
-    MapDataPayload {
-        schema: "inspr.pharos.map-data.v1",
-        as_of: now,
-        hosts: map_hosts(hosts, self_name, now, manifests, probes),
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AlertItem {
-    level: &'static str,
-    host: String,
-    role: String,
-    issue: String,
-    detail: String,
-    source: &'static str,
-    seen: String,
-    next_action: String,
-    sort_time: i64,
-}
-
-#[derive(Debug, Clone)]
-struct AlertGroup {
-    level: &'static str,
-    hosts: Vec<(String, String)>,
-    issue: String,
-    detail: String,
-    source: &'static str,
-    seen: String,
-    next_action: String,
-    sort_time: i64,
-    count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ActivityEvent {
-    timestamp: i64,
-    host: String,
-    level: &'static str,
-    kind: &'static str,
-    title: String,
-    detail: String,
-    source: &'static str,
-    workflow_id: Option<String>,
-}
-
-impl ActivityEvent {
-    fn new(
-        timestamp: i64,
-        host: impl Into<String>,
-        level: &'static str,
-        kind: &'static str,
-        title: impl Into<String>,
-        detail: impl Into<String>,
-        source: &'static str,
-    ) -> Self {
-        Self {
-            timestamp,
-            host: host.into(),
-            level,
-            kind,
-            title: title.into(),
-            detail: detail.into(),
-            source,
-            workflow_id: None,
-        }
-    }
-
-    fn with_workflow(mut self, workflow_id: impl Into<String>) -> Self {
-        self.workflow_id = Some(workflow_id.into());
-        self
-    }
-}
-
-fn level_rank(level: &str) -> usize {
-    match level {
-        "critical" => 0,
-        "warning" => 1,
-        "watch" => 2,
-        "recovery" => 3,
-        "info" => 4,
-        "clear" => 5,
-        _ => 6,
-    }
-}
-
-fn level_label(level: &str) -> &'static str {
-    match level {
-        "critical" => "critical",
-        "warning" => "warning",
-        "watch" => "watch",
-        "recovery" => "recovery",
-        "info" => "info",
-        "clear" => "clear",
-        _ => "info",
-    }
-}
-
-fn seen_label(last_seen: Option<i64>, now: i64) -> String {
-    match last_seen {
-        Some(seen) => format!("{} ago", duration_label(now - seen)),
-        None => "never".to_string(),
-    }
-}
-
-fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str, String, String)> {
-    if !freshness.applicable {
-        return None;
-    }
-
-    let age = freshness.flake_lock_age_days;
-    let commits = freshness.commits_behind;
-    if age.is_none() || commits.is_none() {
-        return Some((
-            "watch",
-            "Freshness is only partially observed".to_string(),
-            "Confirm the beacon can read nixcfg freshness.".to_string(),
-        ));
-    }
-
-    let days = age.unwrap_or(0);
-    let behind = commits.unwrap_or(0);
-    if behind > 0 || days >= 30 {
-        return Some((
-            "warning",
-            freshness.tldr(),
-            "Review nixcfg, then update or deploy when safe.".to_string(),
-        ));
-    }
-    if days > 0 {
-        return Some((
-            "watch",
-            freshness.tldr(),
-            "Consider a normal flake update during the next maintenance window.".to_string(),
-        ));
-    }
-    None
-}
-
-fn kernel_alert(host: &Host, now: i64) -> Option<AlertItem> {
-    let kernel = kernel_reboot_required(host.kernel.as_ref())?;
-    let running = kernel.running_version.as_deref()?;
-    let expected = kernel.expected_version.as_deref()?;
-    Some(AlertItem {
-        level: "warning",
-        host: host.name.clone(),
-        role: host.role.clone(),
-        issue: "Restart needed".to_string(),
-        detail: format!(
-            "Running kernel {running}; kernel {expected} is ready after the next planned restart."
-        ),
-        source: "kernel",
-        seen: format!(
-            "{} ago",
-            duration_label(now.saturating_sub(kernel.observed_at))
-        ),
-        next_action: "Plan a controlled restart when the host's workload allows it.".to_string(),
-        sort_time: kernel.observed_at,
-    })
-}
-
-fn service_alert(host: &Host, observation: &ServiceObservation, now: i64) -> Option<AlertItem> {
-    if is_nix_freshness_observation(observation) {
-        return None;
-    }
-
-    let (level, action) = match observation.state {
-        ServiceObservationState::Healthy => return None,
-        ServiceObservationState::Warning => ("warning", "Inspect the service on the host."),
-        ServiceObservationState::Stale => ("warning", "Verify the service is still reporting."),
-        ServiceObservationState::Unknown => {
-            ("watch", "Confirm whether this service should report state.")
-        }
-    };
-    Some(AlertItem {
-        level,
-        host: host.name.clone(),
-        role: host.role.clone(),
-        issue: format!("{}: {}", observation.label, observation.state.label()),
-        detail: observation.summary.clone(),
-        source: "service",
-        seen: seen_label(host.last_seen, now),
-        next_action: action.to_string(),
-        sort_time: host.last_seen.unwrap_or(now),
-    })
-}
-
-fn backup_sort_time(host: &Host, observation: &BackupObservation, now: i64) -> i64 {
-    observation
-        .last_attempt_at
-        .or(observation.last_success_at)
-        .or(observation.last_check_at)
-        .or(host.last_seen)
-        .unwrap_or(now)
-}
-
-fn backup_alert(host: &Host, observation: &BackupObservation, now: i64) -> Option<AlertItem> {
-    let (level, action) = match observation.state {
-        BackupPostureState::Healthy => return None,
-        BackupPostureState::Failed => (
-            "critical",
-            "Inspect the backup job, fix the failure, then confirm the next successful run.",
-        ),
-        BackupPostureState::Missing => (
-            "critical",
-            "Restore or declare the expected backup job for this host.",
-        ),
-        BackupPostureState::Stale => (
-            "warning",
-            "Confirm the backup schedule, runner, and latest successful snapshot.",
-        ),
-        BackupPostureState::Warning => (
-            "warning",
-            "Review backup evidence and schedule before the next maintenance window.",
-        ),
-        BackupPostureState::Unknown => (
-            "watch",
-            "Confirm the backup collector can observe this job.",
-        ),
-        BackupPostureState::NotConfigured => (
-            "watch",
-            "Decide whether this host should be protected or intentionally unprotected.",
-        ),
-    };
-    Some(AlertItem {
-        level,
-        host: host.name.clone(),
-        role: host.role.clone(),
-        issue: format!(
-            "{}: {}",
-            observation.label,
-            backup_state_label(observation.state)
-        ),
-        detail: observation.summary.clone(),
-        source: "backup",
-        seen: format!(
-            "{} ago",
-            duration_label((now - backup_sort_time(host, observation, now)).max(0))
-        ),
-        next_action: action.to_string(),
-        sort_time: backup_sort_time(host, observation, now),
-    })
-}
-
-fn backup_validation_alert(
-    host: &Host,
-    observation: &BackupObservation,
-    now: i64,
-) -> Option<AlertItem> {
-    let restore = observation.restore_validation.as_ref();
-    let (state, checked_at, label, detail) = if let Some(restore) = restore {
-        (
-            restore.state,
-            restore.checked_at,
-            restore
-                .evidence_label
-                .as_deref()
-                .unwrap_or_else(|| backup_validation_level_label(restore.level))
-                .to_string(),
-            restore
-                .summary
-                .clone()
-                .unwrap_or_else(|| backup_validation_label(observation, now)),
-        )
-    } else {
-        let state = observation.last_check_state?;
-        (
-            state,
-            observation.last_check_at,
-            "backup check".to_string(),
-            backup_validation_label(observation, now),
-        )
-    };
-
-    let (level, issue, action) = match state {
-        pharos_core::BackupValidationState::Failed => (
-            "critical",
-            "Restore validation failed",
-            "Inspect validation evidence and run a clean restore or repository check.",
-        ),
-        pharos_core::BackupValidationState::Stale => (
-            "warning",
-            "Restore validation overdue",
-            "Run a restore validation or repository check and let Pharos observe it.",
-        ),
-        pharos_core::BackupValidationState::Passed
-        | pharos_core::BackupValidationState::Unknown => return None,
-    };
-
-    let sort_time = checked_at.unwrap_or_else(|| backup_sort_time(host, observation, now));
-    Some(AlertItem {
-        level,
-        host: host.name.clone(),
-        role: host.role.clone(),
-        issue: format!("{}: {}", observation.label, issue),
-        detail: label + " - " + &detail,
-        source: "backup",
-        seen: format!("{} ago", duration_label((now - sort_time).max(0))),
-        next_action: action.to_string(),
-        sort_time,
-    })
-}
-
-fn is_nix_freshness_observation(observation: &ServiceObservation) -> bool {
-    observation.id == "nix-freshness" || observation.label.eq_ignore_ascii_case("Nix freshness")
-}
-
-fn probe_alert(host: &str, role: &str, probe: &ServerProbeObservation) -> Option<AlertItem> {
-    let (level, action) = match probe.state {
-        ServiceObservationState::Healthy => return None,
-        ServiceObservationState::Warning => (
-            "warning",
-            "Check the service route, firewall, or probe target.",
-        ),
-        ServiceObservationState::Stale => ("warning", "Re-check the service probe path."),
-        ServiceObservationState::Unknown => ("watch", "Complete the service probe declaration."),
-    };
-    Some(AlertItem {
-        level,
-        host: host.to_string(),
-        role: role.to_string(),
-        issue: format!("{} probe {}", probe.service, probe.state.label()),
-        detail: probe.summary.clone(),
-        source: "probe",
-        seen: format!("as of {}", clock_label(probe.checked_at)),
-        next_action: action.to_string(),
-        sort_time: probe.checked_at,
-    })
-}
-
-fn provisioning_job_alert(
-    job: &ProvisioningJob,
-    runtime_names: &BTreeSet<&str>,
-    now: i64,
-) -> Option<AlertItem> {
-    let host = provisioning_job_host_name(job)?;
-    if runtime_names.contains(host) && !matches!(job.state, ProvisioningJobState::BackupPending) {
-        return None;
-    }
-
-    let latest = provisioning_job_latest_message(job);
-    let (level, issue, detail, action) = match job.state {
-        ProvisioningJobState::Planning
-        | ProvisioningJobState::Provisioning
-        | ProvisioningJobState::Bootstrapping => (
-            "watch",
-            "Setup in progress",
-            latest,
-            "Continue setup and wait for the first valid beacon heartbeat.",
-        ),
-        ProvisioningJobState::WaitingForHeartbeat => {
-            if provisioning_job_first_heartbeat_overdue(job, now) {
-                (
-                    "warning",
-                    "First heartbeat overdue",
-                    format!(
-                        "No first heartbeat after {}.",
-                        duration_label(now.saturating_sub(job.updated_at))
-                    ),
-                    "Check beacon install, network, and host power.",
-                )
-            } else {
-                (
-                    "watch",
-                    "Waiting for first heartbeat",
-                    latest,
-                    "Finish the beacon handoff and keep onboarding open.",
-                )
-            }
-        }
-        ProvisioningJobState::BackupPending => (
-            "watch",
-            "Backup enrollment pending",
-            latest,
-            "Record backup posture or wait for the first backup observation.",
-        ),
-        ProvisioningJobState::Failed => (
-            "critical",
-            "Setup failed",
-            latest,
-            "Open the setup assistant, correct the blocker, and retry.",
-        ),
-        ProvisioningJobState::CleanupNeeded => (
-            "critical",
-            "Setup cleanup needed",
-            latest,
-            "Review provider state before retrying or removing the job.",
-        ),
-        ProvisioningJobState::Complete => return None,
-    };
-
-    Some(AlertItem {
-        level,
-        host: host.to_string(),
-        role: provisioning_job_role(job).to_string(),
-        issue: issue.to_string(),
-        detail,
-        source: "setup",
-        seen: format!("as of {}", clock_label(job.updated_at)),
-        next_action: action.to_string(),
-        sort_time: job.updated_at,
-    })
-}
-
-fn alert_items(
-    hosts: &[Host],
-    jobs: &[ProvisioningJob],
-    _self_name: &str,
-    now: i64,
-    manifests: &[HostManifest],
-    load_errors: &[ManifestLoadIssue],
-    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
-) -> Vec<AlertItem> {
-    let mut alerts = Vec::new();
-    let runtime_by_name: BTreeMap<&str, &Host> = hosts
-        .iter()
-        .map(|host| (host.name.as_str(), host))
-        .collect();
-    let runtime_names: BTreeSet<&str> = runtime_by_name.keys().copied().collect();
-    let manifest_roles: BTreeMap<&str, &str> = manifests
-        .iter()
-        .map(|manifest| {
-            (
-                manifest.host.name.as_str(),
-                manifest.host.role.as_deref().unwrap_or("declared host"),
-            )
-        })
-        .collect();
-
-    for issue in load_errors {
-        alerts.push(AlertItem {
-            level: "critical",
-            host: "Pharos".to_string(),
-            role: "manifest loader".to_string(),
-            issue: "Declared host manifest failed to load".to_string(),
-            detail: format!("{} - {}", issue.path, issue.error),
-            source: "config",
-            seen: format!("as of {}", clock_label(now)),
-            next_action: "Fix the manifest and restart or reload Pharos.".to_string(),
-            sort_time: now,
-        });
-    }
-
-    for manifest in manifests {
-        let runtime = runtime_by_name
-            .get(manifest.host.name.as_str())
-            .copied()
-            .or_else(|| runtime_by_name.get(manifest.slug.as_str()).copied());
-        if runtime.is_none() {
-            alerts.push(AlertItem {
-                level: "watch",
-                host: manifest.host.name.clone(),
-                role: manifest
-                    .host
-                    .role
-                    .clone()
-                    .unwrap_or_else(|| "declared host".to_string()),
-                issue: "Declared host has not reported yet".to_string(),
-                detail:
-                    "The host exists in declared metadata, but no runtime heartbeat is present."
-                        .to_string(),
-                source: "config",
-                seen: "never".to_string(),
-                next_action: "Install or start pharos-beacon, or remove stale metadata."
-                    .to_string(),
-                sort_time: now,
-            });
-        }
-    }
-
-    for host in hosts {
-        let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-        match live {
-            Liveness::Down if !host.preferences.suppresses_down_alerts() => {
-                alerts.push(AlertItem {
-                    level: "critical",
-                    host: host.name.clone(),
-                    role: host.role.clone(),
-                    issue: "No heartbeat received".to_string(),
-                    detail: "Pharos has not received a report within the allowed heartbeat window."
-                        .to_string(),
-                    source: "heartbeat",
-                    seen: seen_label(host.last_seen, now),
-                    next_action: "Check host power, network, and pharos-beacon.".to_string(),
-                    sort_time: host.last_seen.unwrap_or(now),
-                })
-            }
-            Liveness::Down => {}
-            Liveness::Stale => alerts.push(AlertItem {
-                level: "warning",
-                host: host.name.clone(),
-                role: host.role.clone(),
-                issue: "Heartbeat is late".to_string(),
-                detail: "The host checked in later than its normal cadence.".to_string(),
-                source: "heartbeat",
-                seen: seen_label(host.last_seen, now),
-                next_action: "Verify pharos-beacon and recent host load.".to_string(),
-                sort_time: host.last_seen.unwrap_or(now),
-            }),
-            Liveness::AwaitingFirstHeartbeat => alerts.push(AlertItem {
-                level: "watch",
-                host: host.name.clone(),
-                role: host.role.clone(),
-                issue: "Waiting for first heartbeat".to_string(),
-                detail: "The host is registered but has not sent a first report.".to_string(),
-                source: "heartbeat",
-                seen: "never".to_string(),
-                next_action: "Finish onboarding or confirm the host should exist.".to_string(),
-                sort_time: now,
-            }),
-            Liveness::Live => {}
-        }
-
-        if !host.preferences.alerts.suppress_nix_freshness {
-            if let Some((level, issue, action)) = freshness_alert(&host.freshness) {
-                alerts.push(AlertItem {
-                    level,
-                    host: host.name.clone(),
-                    role: host.role.clone(),
-                    issue,
-                    detail: "Nix freshness differs from the preferred declared state.".to_string(),
-                    source: "freshness",
-                    seen: seen_label(host.last_seen, now),
-                    next_action: action,
-                    sort_time: host.last_seen.unwrap_or(now),
-                });
-            }
-        }
-
-        if let Some(alert) = kernel_alert(host, now) {
-            alerts.push(alert);
-        }
-
-        for observation in &host.service_observations {
-            if let Some(alert) = service_alert(host, observation, now) {
-                alerts.push(alert);
-            }
-        }
-
-        if !host.preferences.alerts.suppress_backup {
-            for observation in &host.backup_observations {
-                if let Some(alert) = backup_alert(host, observation, now) {
-                    alerts.push(alert);
-                }
-                if let Some(alert) = backup_validation_alert(host, observation, now) {
-                    alerts.push(alert);
-                }
-            }
-
-            if let Some(alert) = protection_onboarding_alert(host, jobs, now) {
-                alerts.push(alert);
-            }
-        }
-    }
-
-    for job in jobs {
-        if let Some(alert) = provisioning_job_alert(job, &runtime_names, now) {
-            alerts.push(alert);
-        }
-    }
-
-    for (host, probes) in server_probes {
-        let role = runtime_by_name
-            .get(host.as_str())
-            .map(|host| host.role.as_str())
-            .or_else(|| manifest_roles.get(host.as_str()).copied())
-            .unwrap_or("declared service");
-        for probe in probes {
-            if let Some(alert) = probe_alert(host, role, probe) {
-                alerts.push(alert);
-            }
-        }
-    }
-
-    alerts.sort_by(|left, right| {
-        level_rank(left.level)
-            .cmp(&level_rank(right.level))
-            .then_with(|| right.sort_time.cmp(&left.sort_time))
-            .then_with(|| left.host.cmp(&right.host))
-            .then_with(|| left.source.cmp(right.source))
-    });
-    alerts
-}
-
-fn alert_counts(alerts: &[AlertItem], hosts: &[Host]) -> (usize, usize, usize, usize) {
-    let critical = alerts
-        .iter()
-        .filter(|alert| alert.level == "critical")
-        .count();
-    let warning = alerts
-        .iter()
-        .filter(|alert| alert.level == "warning")
-        .count();
-    let watch = alerts.iter().filter(|alert| alert.level == "watch").count();
-    let affected: std::collections::BTreeSet<&str> = alerts
-        .iter()
-        .filter(|alert| alert.host != "Pharos")
-        .map(|alert| alert.host.as_str())
-        .collect();
-    let clear = hosts.len().saturating_sub(affected.len());
-    (critical, warning, watch, clear)
-}
-
-fn alert_groups(alerts: &[AlertItem]) -> Vec<AlertGroup> {
-    let mut groups: Vec<AlertGroup> = Vec::new();
-
-    for alert in alerts {
-        if let Some(group) = groups.iter_mut().find(|group| {
-            group.level == alert.level
-                && group.source == alert.source
-                && group.issue == alert.issue
-                && group.detail == alert.detail
-                && group.next_action == alert.next_action
-        }) {
-            group.count += 1;
-            if !group.hosts.iter().any(|(host, _)| host == &alert.host) {
-                group.hosts.push((alert.host.clone(), alert.role.clone()));
-            }
-            if alert.sort_time >= group.sort_time {
-                group.sort_time = alert.sort_time;
-                group.seen = alert.seen.clone();
-            }
-        } else {
-            groups.push(AlertGroup {
-                level: alert.level,
-                hosts: vec![(alert.host.clone(), alert.role.clone())],
-                issue: alert.issue.clone(),
-                detail: alert.detail.clone(),
-                source: alert.source,
-                seen: alert.seen.clone(),
-                next_action: alert.next_action.clone(),
-                sort_time: alert.sort_time,
-                count: 1,
-            });
-        }
-    }
-
-    for group in &mut groups {
-        group.hosts.sort_by(|left, right| left.0.cmp(&right.0));
-    }
-    groups.sort_by(|left, right| {
-        level_rank(left.level)
-            .cmp(&level_rank(right.level))
-            .then_with(|| right.sort_time.cmp(&left.sort_time))
-            .then_with(|| left.issue.cmp(&right.issue))
-            .then_with(|| left.source.cmp(right.source))
-    });
-    groups
-}
-
-fn ops_summary_metrics(alerts: &[AlertItem], hosts: &[Host]) -> String {
-    let (critical, warning, watch, clear) = alert_counts(alerts, hosts);
-    format!(
-        r#"<section class="ops-summary" aria-label="alert summary"><button class="ops-metric critical" type="button" data-ops-filter="critical" aria-pressed="false"><b>{critical}</b><span>critical</span></button><button class="ops-metric warning" type="button" data-ops-filter="warning" aria-pressed="false"><b>{warning}</b><span>warning</span></button><button class="ops-metric watch" type="button" data-ops-filter="watch" aria-pressed="false"><b>{watch}</b><span>watch</span></button><button class="ops-metric clear" type="button" data-ops-filter="clear" aria-pressed="false"><b>{clear}</b><span>clear</span></button></section>"#
-    )
-}
-
-fn alert_group_host_label(group: &AlertGroup) -> (String, String) {
-    if group.hosts.len() == 1 {
-        return group.hosts[0].clone();
-    }
-
-    let mut names = group
-        .hosts
-        .iter()
-        .take(3)
-        .map(|(host, _)| host.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if group.hosts.len() > 3 {
-        names.push_str(&format!(" +{} more", group.hosts.len() - 3));
-    }
-    (format!("{} hosts", group.hosts.len()), names)
-}
-
-fn alert_group_host_search(group: &AlertGroup) -> String {
-    let mut parts = Vec::new();
-    for (host, role) in &group.hosts {
-        parts.push(host.as_str());
-        parts.push(role.as_str());
-    }
-    parts.push(group.issue.as_str());
-    parts.push(group.detail.as_str());
-    parts.push(group.source);
-    parts.join(" ").to_lowercase()
-}
-
-fn render_alert_row(group: &AlertGroup) -> String {
-    let (host_label, host_detail) = alert_group_host_label(group);
-    let repeat = if group.count > 1 {
-        format!(
-            r#"<span class="alert-repeat">{count} alerts</span>"#,
-            count = group.count
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        r#"<article class="alert-row {level}" data-ops-row data-ops-level="{level}" data-ops-kind="{source}" data-host-search="{host_search}"><div class="alert-host"><span class="alert-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{role}</span></div></div><div class="alert-status"><span class="severity">{level_label}</span>{repeat}</div><div class="alert-issue"><strong>{issue}</strong><p>{detail}</p></div><span class="ops-source">{source}</span><span class="ops-time">{seen}</span><span class="next-action">{next_action}</span></article>"#,
-        level = html_escape(group.level),
-        level_label = level_label(group.level),
-        repeat = repeat,
-        host = html_escape(&host_label),
-        role = html_escape(&host_detail),
-        issue = html_escape(&group.issue),
-        detail = html_escape(&group.detail),
-        source = html_escape(group.source),
-        seen = html_escape(&group.seen),
-        next_action = html_escape(&group.next_action),
-        host_search = html_escape(&alert_group_host_search(group))
-    )
-}
-
-fn render_alert_rows(groups: &[AlertGroup]) -> String {
-    if groups.is_empty() {
-        return r#"<section class="ops-empty"><h2>All clear</h2><p>No host, backup, freshness, kernel, service, probe, or manifest alert needs attention right now.</p></section>"#.to_string();
-    }
-    groups.iter().map(render_alert_row).collect()
-}
-
-fn posture_panel(alerts: &[AlertItem], hosts: &[Host]) -> String {
-    let (critical, warning, watch, clear) = alert_counts(alerts, hosts);
-    let total_alerts = alerts.len().max(1);
-    let (posture_label, posture_color, posture_count, posture_filter) = if critical > 0 {
-        ("critical", "var(--down)", critical, "critical")
-    } else if warning > 0 {
-        ("warning", "var(--stale)", warning, "warning")
-    } else if watch > 0 {
-        ("watch", "var(--sun)", watch, "watch")
-    } else {
-        ("clear", "var(--live)", clear, "clear")
-    };
-    let posture_fill = if alerts.is_empty() {
-        100
-    } else {
-        ((posture_count * 100) / total_alerts).clamp(8, 100)
-    };
-    format!(
-        r#"<aside class="ops-side-panel" aria-label="operations posture"><div><h2>Operations posture</h2><p>Most important work first.</p></div><button class="posture-ring" type="button" data-ops-filter="{posture_filter}" aria-pressed="false" style="--posture-fill:{posture_fill}%;--posture-color:{posture_color}"><div><strong>{posture_count}</strong><span>{posture_label}</span></div></button><div class="posture-list"><button class="posture-chip critical" type="button" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="posture-chip warning" type="button" data-ops-filter="warning" aria-pressed="false">warning {warning}</button><button class="posture-chip watch" type="button" data-ops-filter="watch" aria-pressed="false">watch {watch}</button><button class="posture-chip clear" type="button" data-ops-filter="clear" aria-pressed="false">clear {clear}</button><button class="posture-chip info" type="button" data-ops-filter="all" aria-pressed="true">show all</button></div><div class="ops-note">Repeated alerts are grouped. Use the host search and severity controls to focus the queue.</div><a class="ops-action" href="/map">View on map</a></aside>"#
-    )
-}
-
-fn render_alerts(
-    runtime: RuntimeSnapshot<'_>,
-    self_name: &str,
-    now: i64,
-    manifests: &[HostManifest],
-    load_errors: &[ManifestLoadIssue],
-    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
-    shell: ShellContext<'_>,
-) -> String {
-    let alerts = alert_items(
-        runtime.hosts,
-        runtime.jobs,
-        self_name,
-        now,
-        manifests,
-        load_errors,
-        server_probes,
-    );
-    let groups = alert_groups(&alerts);
-    let rows = render_alert_rows(&groups);
-    format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, backup, freshness, kernel, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "alerts"),
-        header = page_header("Alerts", "Needs attention", now),
-        summary = ops_summary_metrics(&alerts, runtime.hosts),
-        toolbar = ops_toolbar(),
-        count = alerts.len(),
-        posture = posture_panel(&alerts, runtime.hosts),
-        script = ops_script()
-    )
-}
-
-fn ops_toolbar() -> String {
-    format!(
-        r#"<section class="toolbar ops-toolbar" aria-label="operations filters"><div class="toolbar-left"><button class="activity-filter info" type="button" data-ops-filter="all" aria-pressed="true">Show all</button></div><div class="toolbar-right">{search}</div></section>"#,
-        search = search_box("Search hosts...")
-    )
-}
-
-fn backup_summary_metrics(hosts: &[Host], now: i64) -> String {
-    let mut protected = 0;
-    let mut review = 0;
-    let mut failed = 0;
-    let mut unknown = 0;
-
-    for host in hosts {
-        match backup_ui_summary(&host.backup_observations, now).level {
-            "clear" => protected += 1,
-            "warning" => review += 1,
-            "critical" => failed += 1,
-            _ => unknown += 1,
-        }
-    }
-
-    format!(
-        r#"<section class="ops-summary backup-summary" aria-label="backup summary"><button class="ops-metric clear" type="button" data-ops-filter="clear" aria-pressed="false"><b>{protected}</b><span>Protected</span></button><button class="ops-metric warning" type="button" data-ops-filter="warning" aria-pressed="false"><b>{review}</b><span>Review</span></button><button class="ops-metric critical" type="button" data-ops-filter="critical" aria-pressed="false"><b>{failed}</b><span>Failed or missing</span></button><button class="ops-metric watch" type="button" data-ops-filter="watch" aria-pressed="false"><b>{unknown}</b><span>Unknown</span></button></section>"#
-    )
-}
-
-fn render_backup_rows(hosts: &[Host], now: i64) -> String {
-    if hosts.is_empty() {
-        return r#"<section class="ops-empty"><h2>No hosts yet</h2><p>Once hosts report, Pharos will show backup posture here.</p></section>"#.to_string();
-    }
-
-    let mut rows: Vec<(&Host, BackupUiSummary)> = hosts
-        .iter()
-        .map(|host| (host, backup_ui_summary(&host.backup_observations, now)))
-        .collect();
-    rows.sort_by(|(left_host, left), (right_host, right)| {
-        left.rank
-            .cmp(&right.rank)
-            .then_with(|| left_host.name.cmp(&right_host.name))
-    });
-
-    rows.into_iter()
-        .map(|(host, backup)| {
-            let count = if backup.total > 1 {
-                format!(
-                    r#"<span class="backup-count">{count} jobs</span>"#,
-                    count = backup.total
-                )
-            } else {
-                String::new()
-            };
-            let search = html_escape(
-                &format!(
-                    "{} {} {} {} {} {} {} {}",
-                    host.name,
-                    host.role,
-                    backup.label,
-                    backup.detail,
-                    backup.last_success,
-                    backup.schedule,
-                    backup.target,
-                    backup.validation
-                )
-                .to_lowercase(),
-            );
-            format!(
-                r#"<article class="backup-row {level}" data-ops-row data-ops-level="{level}" data-host="{host}" data-host-search="{search}"><div class="backup-host"><div><strong>{host}</strong><span>{role}</span></div></div><div class="backup-state"><span class="severity">{label}</span>{count}</div><div class="backup-issue"><strong>{detail}</strong><p>{state}</p></div><div class="backup-field"><span>Last success</span><strong>{last_success}</strong></div><div class="backup-field"><span>Schedule</span><strong>{schedule}</strong></div><div class="backup-field"><span>Target</span><strong>{target}</strong></div><div class="backup-field"><span>Validation</span><strong>{validation}</strong></div></article>"#,
-                level = html_escape(backup.level),
-                search = search,
-                host = html_escape(&host.name),
-                role = html_escape(&host.role),
-                label = html_escape(&backup.label),
-                count = count,
-                detail = html_escape(&backup.detail),
-                state = html_escape(backup.state),
-                last_success = html_escape(&backup.last_success),
-                schedule = html_escape(&backup.schedule),
-                target = html_escape(&backup.target),
-                validation = html_escape(&backup.validation)
-            )
-        })
-        .collect()
-}
-
-fn render_backups(hosts: &[Host], now: i64, shell: ShellContext<'_>) -> String {
-    let rows = render_backup_rows(hosts, now);
-    format!(
-        r#"{HEAD}{sidebar}<main class="ops-main backup-page" data-ops-page="backups">{header}{summary}{toolbar}<section class="ops-panel" aria-label="backup posture"><header class="ops-panel-head"><div><h2>Backup posture</h2><p>Sanitized runtime evidence from backup jobs. No logs, paths, repositories, or credentials are shown.</p></div><span class="ops-count">{count}</span></header><div class="backup-list-full">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching backup rows.</section></section><div class="ops-note" style="margin-top:14px">A protected state means the latest reported backup source is healthy. Restore validation is tracked separately from last backup success when evidence exists.</div></main>{script}</div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "backups"),
-        header = page_header("Backups", "Protection at a glance", now),
-        summary = backup_summary_metrics(hosts, now),
-        toolbar = ops_toolbar(),
-        count = hosts.len(),
-        rows = rows,
-        script = ops_script()
-    )
-}
-
-fn ops_script() -> &'static str {
-    r#"<script>
-document.querySelectorAll('[data-ops-page]').forEach(root=>{
-  const search=root.querySelector('[data-search]');
-  const rows=[...root.querySelectorAll('[data-ops-row]')];
-  const empty=root.querySelector('[data-ops-empty]');
-  const requestedHost=new URLSearchParams(window.location.search).get('host')?.trim()||'';
-  let active='all';
-  function setFilter(filter){
-    active=filter||'all';
-    root.querySelectorAll('[data-ops-filter]').forEach(button=>{
-      button.setAttribute('aria-pressed',String((button.dataset.opsFilter||'all')===active));
-    });
-    apply();
-  }
-  function apply(){
-    const query=(search?.value||'').trim().toLowerCase();
-    let visible=0;
-    rows.forEach(row=>{
-      const filterOk=active==='all'||row.dataset.opsLevel===active||row.dataset.opsKind===active;
-      const haystack=(row.dataset.hostSearch||row.textContent||'').toLowerCase();
-      const searchOk=!query||haystack.includes(query);
-      const show=filterOk&&searchOk;
-      row.hidden=!show;
-      if(show)visible++;
-    });
-    if(empty)empty.dataset.visible=String(visible===0&&rows.length>0);
-  }
-  root.querySelectorAll('[data-ops-filter]').forEach(button=>{
-    button.addEventListener('click',()=>setFilter(button.dataset.opsFilter||'all'));
-  });
-  search?.addEventListener('input',apply);
-  if(requestedHost&&search)search.value=requestedHost;
-  setFilter('all');
-  if(requestedHost){
-    const normalized=requestedHost.toLowerCase();
-    const target=rows.find(row=>(row.dataset.host||'').toLowerCase()===normalized);
-    if(target){
-      target.dataset.deepLinked='true';
-      requestAnimationFrame(()=>target.scrollIntoView({block:'center',behavior:'smooth'}));
-    }
-  }
-});
-</script>"#
-}
-
-fn backup_engine_label(engine: pharos_core::BackupEngine) -> &'static str {
-    match engine {
-        pharos_core::BackupEngine::Restic => "Restic",
-        pharos_core::BackupEngine::Borg => "Borg",
-        pharos_core::BackupEngine::Kopia => "Kopia",
-        pharos_core::BackupEngine::ProviderSnapshot => "provider snapshot",
-        pharos_core::BackupEngine::Other => "backup",
-        pharos_core::BackupEngine::Unknown => "backup",
-    }
-}
-
-fn backup_activity_level(state: BackupPostureState) -> &'static str {
-    match backup_level(state) {
-        "clear" => "info",
-        level => level,
-    }
-}
-
-fn backup_activity_detail(observation: &BackupObservation) -> String {
-    let mut parts = vec![backup_engine_label(observation.engine).to_string()];
-    if let Some(schedule) = &observation.schedule {
-        parts.push(format!("schedule {}", schedule));
-    }
-    if let Some(target) = &observation.target_label {
-        parts.push(format!("target {}", target));
-    }
-    parts.join(" · ")
-}
-
-fn push_backup_activity_events(
-    events: &mut Vec<ActivityEvent>,
-    host: &Host,
-    observation: &BackupObservation,
-    now: i64,
-) {
-    let observed_at = backup_sort_time(host, observation, now);
-    events.push(ActivityEvent::new(
-        host.last_seen.unwrap_or(observed_at),
-        host.name.clone(),
-        "info",
-        "backup",
-        "Backup source observed",
-        backup_activity_detail(observation),
-        "backup",
-    ));
-
-    if let Some(timestamp) = observation.last_success_at {
-        events.push(ActivityEvent::new(
-            timestamp,
-            host.name.clone(),
-            "info",
-            "backup",
-            format!("{} succeeded", observation.label),
-            backup_activity_detail(observation),
-            "backup",
-        ));
-    }
-
-    if let (Some(timestamp), Some(state)) =
-        (observation.last_attempt_at, observation.last_attempt_state)
-    {
-        match state {
-            pharos_core::BackupRunState::Succeeded => {}
-            pharos_core::BackupRunState::Failed => events.push(ActivityEvent::new(
-                timestamp,
-                host.name.clone(),
-                "critical",
-                "backup",
-                format!("{} failed", observation.label),
-                observation.summary.clone(),
-                "backup",
-            )),
-            pharos_core::BackupRunState::Running => events.push(ActivityEvent::new(
-                timestamp,
-                host.name.clone(),
-                "watch",
-                "backup",
-                format!("{} running", observation.label),
-                observation.summary.clone(),
-                "backup",
-            )),
-            pharos_core::BackupRunState::Unknown => events.push(ActivityEvent::new(
-                timestamp,
-                host.name.clone(),
-                "watch",
-                "backup",
-                format!("{} state unknown", observation.label),
-                observation.summary.clone(),
-                "backup",
-            )),
-        }
-    }
-
-    if observation.state != BackupPostureState::Healthy {
-        events.push(ActivityEvent::new(
-            observed_at,
-            host.name.clone(),
-            backup_activity_level(observation.state),
-            "backup",
-            format!(
-                "{}: {}",
-                observation.label,
-                backup_state_label(observation.state)
-            ),
-            observation.summary.clone(),
-            "backup",
-        ));
-    }
-
-    if let Some(restore) = &observation.restore_validation {
-        let level = match restore.state {
-            pharos_core::BackupValidationState::Passed => "info",
-            pharos_core::BackupValidationState::Failed => "critical",
-            pharos_core::BackupValidationState::Stale => "warning",
-            pharos_core::BackupValidationState::Unknown => "watch",
-        };
-        let checked_at = restore.checked_at.unwrap_or(observed_at);
-        let label = restore
-            .evidence_label
-            .as_deref()
-            .unwrap_or_else(|| backup_validation_level_label(restore.level));
-        events.push(ActivityEvent::new(
-            checked_at,
-            host.name.clone(),
-            level,
-            "backup",
-            format!(
-                "{} validation {}",
-                observation.label,
-                backup_validation_state_label(restore.state)
-            ),
-            format!(
-                "{} - {}",
-                label,
-                restore
-                    .summary
-                    .clone()
-                    .unwrap_or_else(|| backup_validation_label(observation, now))
-            ),
-            "backup",
-        ));
-    } else if let (Some(timestamp), Some(state)) =
-        (observation.last_check_at, observation.last_check_state)
-    {
-        let level = match state {
-            pharos_core::BackupValidationState::Passed => "info",
-            pharos_core::BackupValidationState::Failed => "critical",
-            pharos_core::BackupValidationState::Stale => "warning",
-            pharos_core::BackupValidationState::Unknown => "watch",
-        };
-        events.push(ActivityEvent::new(
-            timestamp,
-            host.name.clone(),
-            level,
-            "backup",
-            format!(
-                "{} validation {}",
-                observation.label,
-                backup_validation_state_label(state)
-            ),
-            backup_validation_label(observation, now),
-            "backup",
-        ));
-    }
-}
-
-fn activity_events(
-    runtime: RuntimeSnapshot<'_>,
-    _self_name: &str,
-    now: i64,
-    sources: ActivitySources<'_>,
-) -> Vec<ActivityEvent> {
-    let hosts = runtime.hosts;
-    let jobs = runtime.jobs;
-    let ActivitySources {
-        manifests,
-        load_errors,
-        server_probes,
-        action_jobs,
-    } = sources;
-    let mut events = Vec::new();
-    let runtime_names: BTreeSet<&str> = hosts.iter().map(|host| host.name.as_str()).collect();
-
-    for issue in load_errors {
-        events.push(ActivityEvent::new(
-            now,
-            "Pharos",
-            "critical",
-            "config",
-            "Manifest load failed",
-            format!("{} - {}", issue.path, issue.error),
-            "config",
-        ));
-    }
-
-    for job in action_jobs {
-        let (level, title) = match (job.workflow_kind(), job.state) {
-            (HostWorkflowKind::SettingsChange, HostActionState::ProposalRequested) => {
-                ("watch", "Host settings change waiting")
-            }
-            (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => {
-                ("recovery", "Host settings applied")
-            }
-            (HostWorkflowKind::SettingsChange, HostActionState::Failed) => {
-                ("warning", "Host settings request stopped")
-            }
-            (HostWorkflowKind::SystemUpdateProposal, HostActionState::ProposalRequested) => {
-                ("info", "System update review requested")
-            }
-            (HostWorkflowKind::SystemUpdateProposal, HostActionState::Succeeded) => {
-                ("recovery", "System update review completed")
-            }
-            (HostWorkflowKind::SystemUpdateProposal, HostActionState::Failed) => {
-                ("warning", "System update review stopped")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::QueuedReview) => {
-                ("watch", "Guarded update review queued")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Reviewing) => {
-                ("watch", "Guarded update review running")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::AwaitingConfirmation) => {
-                ("watch", "Update review ready for confirmation")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::QueuedApply) => {
-                ("warning", "Update and restart confirmed")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Applying)
-                if job.recovery_started_at.is_some() =>
-            {
-                ("warning", "Recovery verification running")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Applying) => {
-                ("warning", "Target-local update running")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Rebooting)
-                if job.recovery_started_at.is_some() =>
-            {
-                ("warning", "Recovery verification queued")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Rebooting) => {
-                ("warning", "Host restart in progress")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Succeeded)
-                if job.recovery_started_at.is_some() =>
-            {
-                ("recovery", "Guarded update recovered and verified")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Succeeded) => {
-                ("recovery", "Guarded host update completed")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Cancelled) => {
-                ("info", "Guarded update review cancelled safely")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Failed)
-                if job.recovery_started_at.is_some() =>
-            {
-                ("warning", "Recovery verification needs attention")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Failed)
-                if job.confirmed_at.is_none() =>
-            {
-                ("warning", "Guarded update review stopped")
-            }
-            (HostWorkflowKind::UpdateRestart, HostActionState::Failed) => {
-                ("warning", "Guarded update needs verification")
-            }
-            (HostWorkflowKind::RemoveHost, HostActionState::ProposalRequested) => {
-                ("watch", "Host removal preparing")
-            }
-            (HostWorkflowKind::RemoveHost, HostActionState::RemovalPending) => {
-                ("warning", "Host removal pending")
-            }
-            (HostWorkflowKind::RemoveHost, HostActionState::Succeeded) => {
-                ("recovery", "Host removed from Pharos")
-            }
-            (HostWorkflowKind::RemoveHost, HostActionState::Failed) => {
-                ("warning", "Host removal stopped")
-            }
-            _ => ("info", "Host action recorded"),
-        };
-        let removal_detail = job.removal_plan.as_ref().map(|plan| {
-            let disposition = plan.disposition.key();
-            let successor = plan
-                .successor
-                .as_deref()
-                .map(|successor| format!(" · successor {successor}"))
-                .unwrap_or_default();
-            let cleanup = if plan.declaration_pending {
-                " · nixcfg cleanup pending"
-            } else {
-                " · runtime registration only"
-            };
-            let credentials = if plan.credential_retirement_required {
-                " · Janus credential retirement required"
-            } else {
-                ""
-            };
-            format!(" Disposition: {disposition}{successor}{cleanup}{credentials}.")
-        });
-        events.push(
-            ActivityEvent::new(
-                job.updated_at,
-                job.host.clone(),
-                level,
-                "action",
-                title,
-                format!(
-                    "{} · requested by {}. {}{}",
-                    job.ticket,
-                    job.requested_by,
-                    action_message(job),
-                    removal_detail.as_deref().unwrap_or_default()
-                ),
-                "guarded action",
-            )
-            .with_workflow(job.id.clone()),
-        );
-    }
-
-    for manifest in manifests {
-        events.push(ActivityEvent::new(
-            now,
-            manifest.host.name.clone(),
-            "info",
-            "config",
-            "Declared host manifest loaded",
-            format!("{} declared services", manifest.services.len()),
-            "config",
-        ));
-    }
-
-    for job in jobs {
-        let Some(host) = provisioning_job_host_name(job) else {
-            continue;
-        };
-        if provisioning_job_first_heartbeat_overdue(job, now) && !runtime_names.contains(host) {
-            events.push(ActivityEvent::new(
-                now,
-                host.to_string(),
-                "warning",
-                "setup",
-                "First heartbeat overdue",
-                format!(
-                    "No first heartbeat after {}.",
-                    duration_label(now.saturating_sub(job.updated_at))
-                ),
-                "setup",
-            ));
-        }
-        for entry in &job.progress {
-            let level = match entry.state {
-                ProvisioningJobState::Failed | ProvisioningJobState::CleanupNeeded => "critical",
-                ProvisioningJobState::WaitingForHeartbeat
-                | ProvisioningJobState::BackupPending
-                | ProvisioningJobState::Planning
-                | ProvisioningJobState::Provisioning
-                | ProvisioningJobState::Bootstrapping => "watch",
-                ProvisioningJobState::Complete => "recovery",
-            };
-            events.push(ActivityEvent::new(
-                entry.observed_at,
-                host.to_string(),
-                level,
-                "setup",
-                if provisioning_job_rolled_back(job)
-                    && entry.state == ProvisioningJobState::Complete
-                {
-                    "Setup rolled back".to_string()
-                } else {
-                    format!("Setup {}", entry.state.label())
-                },
-                entry.message.clone(),
-                "setup",
-            ));
-        }
-    }
-
-    for host in hosts {
-        let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-        match live {
-            Liveness::Down if !host.preferences.suppresses_down_alerts() => {
-                events.push(ActivityEvent::new(
-                    now,
-                    host.name.clone(),
-                    "critical",
-                    "heartbeat",
-                    "No heartbeat received",
-                    format!("Last report was {}", seen_label(host.last_seen, now)),
-                    "heartbeat",
-                ))
-            }
-            Liveness::Down => {}
-            Liveness::Stale => events.push(ActivityEvent::new(
-                now,
-                host.name.clone(),
-                "warning",
-                "heartbeat",
-                "Heartbeat lateness detected",
-                format!("Last report was {}", seen_label(host.last_seen, now)),
-                "heartbeat",
-            )),
-            Liveness::AwaitingFirstHeartbeat => events.push(ActivityEvent::new(
-                now,
-                host.name.clone(),
-                "watch",
-                "heartbeat",
-                "Awaiting first heartbeat",
-                "Host exists but has not reported yet.",
-                "heartbeat",
-            )),
-            Liveness::Live => {}
-        }
-
-        let samples = heartbeat_samples(&host.heartbeat_log, host.last_seen);
-        for stamp in samples.iter().rev().take(4) {
-            events.push(ActivityEvent::new(
-                *stamp,
-                host.name.clone(),
-                "info",
-                "heartbeat",
-                "Heartbeat received",
-                format!("{} checked in at {}", host.name, clock_label(*stamp)),
-                "heartbeat",
-            ));
-        }
-
-        if !host.preferences.alerts.suppress_nix_freshness {
-            if let Some((level, issue, _action)) = freshness_alert(&host.freshness) {
-                events.push(ActivityEvent::new(
-                    host.last_seen.unwrap_or(now),
-                    host.name.clone(),
-                    level,
-                    "freshness",
-                    "Freshness drift detected",
-                    issue,
-                    "freshness",
-                ));
-            }
-        }
-
-        if let Some(kernel) = kernel_reboot_required(host.kernel.as_ref()) {
-            if let (Some(running), Some(expected)) = (
-                kernel.running_version.as_deref(),
-                kernel.expected_version.as_deref(),
-            ) {
-                events.push(ActivityEvent::new(
-                    kernel.observed_at,
-                    host.name.clone(),
-                    "warning",
-                    "kernel",
-                    "Restart needed",
-                    format!(
-                        "Running kernel {running}; kernel {expected} is ready after restart. Pharos will not restart this host."
-                    ),
-                    "kernel",
-                ));
-            }
-        }
-
-        for observation in &host.service_observations {
-            if is_nix_freshness_observation(observation) {
-                continue;
-            }
-
-            if observation.state == ServiceObservationState::Healthy {
-                events.push(ActivityEvent::new(
-                    host.last_seen.unwrap_or(now),
-                    host.name.clone(),
-                    "info",
-                    "service",
-                    format!("{} is healthy", observation.label),
-                    observation.summary.clone(),
-                    "service",
-                ));
-            } else {
-                let level = match observation.state {
-                    ServiceObservationState::Warning | ServiceObservationState::Stale => "warning",
-                    ServiceObservationState::Unknown => "watch",
-                    ServiceObservationState::Healthy => "info",
-                };
-                events.push(ActivityEvent::new(
-                    host.last_seen.unwrap_or(now),
-                    host.name.clone(),
-                    level,
-                    "service",
-                    format!("{} {}", observation.label, observation.state.label()),
-                    observation.summary.clone(),
-                    "service",
-                ));
-            }
-        }
-
-        if !host.preferences.alerts.suppress_backup {
-            for observation in &host.backup_observations {
-                push_backup_activity_events(&mut events, host, observation, now);
-            }
-
-            push_protection_onboarding_activity(&mut events, host, jobs, now);
-        }
-    }
-
-    for (host, probes) in server_probes {
-        for probe in probes {
-            let level = match probe.state {
-                ServiceObservationState::Healthy => "info",
-                ServiceObservationState::Warning | ServiceObservationState::Stale => "warning",
-                ServiceObservationState::Unknown => "watch",
-            };
-            events.push(ActivityEvent::new(
-                probe.checked_at,
-                host.clone(),
-                level,
-                "service",
-                format!("{} probe {}", probe.service, probe.state.label()),
-                probe.summary.clone(),
-                "probe",
-            ));
-        }
-    }
-
-    events.sort_by(|left, right| {
-        right
-            .timestamp
-            .cmp(&left.timestamp)
-            .then_with(|| level_rank(left.level).cmp(&level_rank(right.level)))
-            .then_with(|| left.host.cmp(&right.host))
-    });
-    events
-}
-
-fn activity_source_count(events: &[ActivityEvent], kind: &str) -> usize {
-    events.iter().filter(|event| event.kind == kind).count()
-}
-
-fn activity_summary_metrics(events: &[ActivityEvent]) -> String {
-    let heartbeat = activity_source_count(events, "heartbeat");
-    let freshness = activity_source_count(events, "freshness");
-    let service = activity_source_count(events, "service");
-    let backup = activity_source_count(events, "backup");
-    let setup = activity_source_count(events, "setup");
-    let kernel = activity_source_count(events, "kernel");
-    let actions = activity_source_count(events, "action");
-    format!(
-        r#"<section class="ops-summary" aria-label="activity summary"><button class="ops-metric info" type="button" data-ops-filter="all" aria-pressed="true"><b>{total}</b><span>all events</span></button><button class="ops-metric clear" type="button" data-ops-filter="heartbeat" aria-pressed="false"><b>{heartbeat}</b><span>heartbeat</span></button><button class="ops-metric watch" type="button" data-ops-filter="setup" aria-pressed="false"><b>{setup}</b><span>setup</span></button><button class="ops-metric warning" type="button" data-ops-filter="action" aria-pressed="false"><b>{actions}</b><span>actions</span></button><button class="ops-metric watch" type="button" data-ops-filter="freshness" aria-pressed="false"><b>{freshness}</b><span>freshness</span></button><button class="ops-metric warning" type="button" data-ops-filter="kernel" aria-pressed="false"><b>{kernel}</b><span>kernel</span></button><button class="ops-metric warning" type="button" data-ops-filter="service" aria-pressed="false"><b>{service}</b><span>service</span></button><button class="ops-metric recovery" type="button" data-ops-filter="backup" aria-pressed="false"><b>{backup}</b><span>backup</span></button></section>"#,
-        total = events.len()
-    )
-}
-
-fn activity_filter_bar(events: &[ActivityEvent]) -> String {
-    let config = activity_source_count(events, "config");
-    let setup = activity_source_count(events, "setup");
-    let actions = activity_source_count(events, "action");
-    let critical = events
-        .iter()
-        .filter(|event| event.level == "critical")
-        .count();
-    let warning = events
-        .iter()
-        .filter(|event| event.level == "warning")
-        .count();
-    format!(
-        r#"<div class="activity-filters" role="group" aria-label="activity filters"><button class="activity-filter info" type="button" data-activity-filter="all" data-ops-filter="all" aria-pressed="true">All events {total}</button><button class="activity-filter clear" type="button" data-activity-filter="heartbeat" data-ops-filter="heartbeat" aria-pressed="false">Heartbeat {heartbeat}</button><button class="activity-filter watch" type="button" data-activity-filter="setup" data-ops-filter="setup" aria-pressed="false">Setup {setup}</button><button class="activity-filter warning" type="button" data-activity-filter="action" data-ops-filter="action" aria-pressed="false">Actions {actions}</button><button class="activity-filter watch" type="button" data-activity-filter="freshness" data-ops-filter="freshness" aria-pressed="false">Freshness {freshness}</button><button class="activity-filter warning" type="button" data-activity-filter="kernel" data-ops-filter="kernel" aria-pressed="false">Kernel {kernel}</button><button class="activity-filter warning" type="button" data-activity-filter="service" data-ops-filter="service" aria-pressed="false">Service {service}</button><button class="activity-filter recovery" type="button" data-activity-filter="backup" data-ops-filter="backup" aria-pressed="false">Backup {backup}</button><button class="activity-filter info" type="button" data-activity-filter="config" data-ops-filter="config" aria-pressed="false">Config {config}</button><button class="activity-filter critical" type="button" data-activity-filter="critical" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="activity-filter warning" type="button" data-activity-filter="warning" data-ops-filter="warning" aria-pressed="false">warning {warning}</button></div>"#,
-        total = events.len(),
-        heartbeat = activity_source_count(events, "heartbeat"),
-        freshness = activity_source_count(events, "freshness"),
-        service = activity_source_count(events, "service"),
-        backup = activity_source_count(events, "backup"),
-        kernel = activity_source_count(events, "kernel"),
-    )
-}
-
-fn render_activity_row(event: &ActivityEvent) -> String {
-    let (tag, href) = event.workflow_id.as_deref().map_or_else(
-        || ("article", String::new()),
-        |workflow_id| {
-            (
-                "a",
-                format!(
-                    r#" href="/?host={host}&amp;workflow={workflow}" aria-label="Open saved workflow for {host_label}" title="Open saved workflow""#,
-                    host = html_escape(&url_query_escape(&event.host)),
-                    workflow = html_escape(&url_query_escape(workflow_id)),
-                    host_label = html_escape(&event.host),
-                ),
-            )
-        },
-    );
-    format!(
-        r#"<{tag} class="activity-row {level}" data-ops-row data-activity-kind="{kind}" data-activity-level="{level}" data-ops-kind="{kind}" data-ops-level="{level}" data-host-search="{host_search}"{href}><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></{tag}>"#,
-        tag = tag,
-        href = href,
-        level = html_escape(event.level),
-        kind = html_escape(event.kind),
-        time = html_escape(&clock_label(event.timestamp)),
-        host = html_escape(&event.host),
-        level_label = level_label(event.level),
-        title = html_escape(&event.title),
-        detail = html_escape(&event.detail),
-        source = html_escape(event.source),
-        host_search = html_escape(
-            &format!(
-                "{} {} {} {} {}",
-                event.host, event.kind, event.title, event.detail, event.source
-            )
-            .to_lowercase(),
-        )
-    )
-}
-
-fn activity_rows(events: &[ActivityEvent]) -> String {
-    if events.is_empty() {
-        return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, backup changes, freshness changes, kernel posture, service observations, and config events here.</p></section>"#.to_string();
-    }
-    events.iter().take(80).map(render_activity_row).collect()
-}
-
-fn activity_script() -> &'static str {
-    ops_script()
-}
-
-#[cfg(test)]
-fn render_activity(
-    runtime: RuntimeSnapshot<'_>,
-    self_name: &str,
-    now: i64,
-    manifests: &[HostManifest],
-    load_errors: &[ManifestLoadIssue],
-    server_probes: &BTreeMap<String, Vec<ServerProbeObservation>>,
-    shell: ShellContext<'_>,
-) -> String {
-    render_activity_with_actions(
-        runtime,
-        self_name,
-        now,
-        ActivitySources {
-            manifests,
-            load_errors,
-            server_probes,
-            action_jobs: &[],
-        },
-        shell,
-    )
-}
-
-fn render_activity_with_actions(
-    runtime: RuntimeSnapshot<'_>,
-    self_name: &str,
-    now: i64,
-    sources: ActivitySources<'_>,
-    shell: ShellContext<'_>,
-) -> String {
-    let events = activity_events(runtime, self_name, now, sources);
-    let rows = activity_rows(&events);
-    format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
-        header = page_header("Activity", "Operational timeline", now),
-        summary = activity_summary_metrics(&events),
-        toolbar = ops_toolbar(),
-        count = events.len(),
-        filters = activity_filter_bar(&events),
-        script = activity_script()
-    )
-}
-
-fn render_map(
-    hosts: &[Host],
-    self_name: &str,
-    now: i64,
-    user_label: &str,
-    logout_enabled: bool,
-) -> String {
-    let summary = summary_cards(hosts, self_name, now);
-    let toolbar = map_toolbar();
-    let map_script = r#"<script>
-const MAP_DATA_URL='/map/data.json';
-const MAP_LEAFLET_CSS='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-const MAP_LEAFLET_JS='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-const MAP_D3_JS='https://unpkg.com/d3@7.9.0/dist/d3.min.js';
-let MAP_HOSTS=[];
-let applyMapFilterNow=null;
-let pendingMapFilter={q:'',live:'all'};
-function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
-function stateVar(live){return live==='awaiting_first_heartbeat'?'wait':live}
-function locationSourceLabel(source){
-  switch(source){
-    case 'wifi':
-    case 'ip':
-      return 'auto';
-    case 'declared':
-      return 'declared';
-    case 'provider':
-      return 'provider';
-    case 'fallback':
-      return 'fallback';
-    default:
-      return 'unknown';
-  }
-}
-function locationSourceTitle(host){
-  const label=locationSourceLabel(host.location_source);
-  const stale=host.location_stale?'stale ':'';
-  const state=host.location_state&&host.location_state!=='observed'?' · '+host.location_state:'';
-  return stale+label+' location'+state;
-}
-function loadStylesheet(href){
-  if(document.querySelector('link[href="'+href+'"]'))return Promise.resolve();
-  return new Promise((resolve,reject)=>{
-    const tag=document.createElement('link');
-    tag.rel='stylesheet';
-    tag.href=href;
-    tag.onload=resolve;
-    tag.onerror=()=>reject(new Error('stylesheet failed'));
-    document.head.appendChild(tag);
-  });
-}
-function loadScript(src,ready){
-  if(ready&&ready())return Promise.resolve();
-  if(document.querySelector('script[src="'+src+'"]')){
-    return new Promise(resolve=>{
-      const check=()=>ready&&ready()?resolve():setTimeout(check,30);
-      check();
-    });
-  }
-  return new Promise((resolve,reject)=>{
-    const tag=document.createElement('script');
-    tag.src=src;
-    tag.async=true;
-    tag.onload=resolve;
-    tag.onerror=()=>reject(new Error('script failed'));
-    document.head.appendChild(tag);
-  });
-}
-async function loadMapAssets(){
-  await loadStylesheet(MAP_LEAFLET_CSS);
-  await loadScript(MAP_LEAFLET_JS,()=>Boolean(window.L));
-  await loadScript(MAP_D3_JS,()=>Boolean(window.d3));
-}
-async function loadMapData(){
-  const res=await fetch(MAP_DATA_URL+'?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin'});
-  if(!res.ok)throw new Error('map data failed');
-  const data=await res.json();
-  if(!data||!Array.isArray(data.hosts))throw new Error('map data malformed');
-  return data;
-}
-function setMapLoading(state,message){
-  const panel=document.getElementById('map-panel');
-  const sitePanel=document.querySelector('[data-site-panel]');
-  const note=document.querySelector('[data-map-note]');
-  const text=document.querySelector('[data-map-status-message]');
-  if(panel)panel.dataset.loading=state==='loading'?'true':'false';
-  if(panel)panel.dataset.mapState=state;
-  if(sitePanel)sitePanel.dataset.loading=state==='loading'?'true':'false';
-  if(note&&message)note.textContent=message;
-  if(text&&message)text.textContent=message;
-}
-function siteSkeleton(){
-  return '<div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div>';
-}
-function siteError(message){
-  return '<div class="site-error"><strong>Locations unavailable</strong><span>'+escapeHtml(message||'Map data could not be loaded. Try refreshing this view.')+'</span></div>';
-}
-function siteHostHtml(host){
-  const style='--host-state:var(--'+escapeHtml(stateVar(host.live))+')';
-  const sourceLabel=locationSourceLabel(host.location_source);
-  const sourceTitle=locationSourceTitle(host);
-  return '<a class="site-host" href="'+escapeHtml(host.settings_href)+'" data-host="'+escapeHtml(host.name)+'" data-live="'+escapeHtml(host.live)+'" data-search="'+escapeHtml(host.search||'')+'" style="'+style+'" title="'+escapeHtml(host.name+': '+host.attention+'; '+sourceTitle+'; '+host.inbound_title+'; '+host.outbound_title)+'"><span class="site-host-name">'+escapeHtml(host.name)+'</span><span class="site-host-signals"><span class="site-host-ping" data-probe-level="'+escapeHtml(host.inbound_level)+'">in '+escapeHtml(host.inbound_label)+'</span><span class="site-host-ping" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">out '+escapeHtml(host.outbound_label)+'</span><span class="site-host-source" data-location-source="'+escapeHtml(host.location_source)+'" data-location-state="'+escapeHtml(host.location_state)+'" title="'+escapeHtml(sourceTitle)+'">'+escapeHtml(sourceLabel)+'</span></span></a>';
-}
-function renderSiteList(hosts){
-  const target=document.querySelector('[data-site-list]');
-  if(!target)return;
-  if(!hosts.length){
-    target.innerHTML='<div class="site-error"><strong>No mapped hosts</strong><span>Pharos has no host locations to show yet.</span></div>';
-    return;
-  }
-  const bySite=new Map();
-  hosts.forEach(host=>{
-    const key=host.site_id||'unknown';
-    if(!bySite.has(key))bySite.set(key,[]);
-    bySite.get(key).push(host);
-  });
-  const sections=Array.from(bySite.values()).sort((a,b)=>String(a[0].site_label).localeCompare(String(b[0].site_label))).map(siteHosts=>{
-    siteHosts.sort((a,b)=>String(a.name).localeCompare(String(b.name)));
-    const first=siteHosts[0];
-    return '<section class="site-item"><div class="site-head"><div><strong>'+escapeHtml(first.site_label)+'</strong><p>'+escapeHtml(first.region)+'</p></div><span class="site-count">'+siteHosts.length+'</span></div><div class="site-hosts">'+siteHosts.map(siteHostHtml).join('')+'</div></section>';
-  });
-  target.innerHTML=sections.join('');
-}
-function nodeHtml(host){const sourceLabel=locationSourceLabel(host.location_source);const sourceTitle=locationSourceTitle(host);return '<span class="map-status-dot" aria-hidden="true"></span><span class="map-name">'+escapeHtml(host.name)+'</span><span class="map-signals"><span class="map-ping" data-dir="in" data-probe-level="'+escapeHtml(host.inbound_level)+'">'+escapeHtml(host.inbound_label)+'</span><span class="map-ping" data-dir="out" data-probe-level="'+escapeHtml(host.outbound_level)+'" data-policy="'+escapeHtml(host.outbound_policy)+'">'+escapeHtml(host.outbound_label)+'</span></span><span class="map-source" data-location-source="'+escapeHtml(host.location_source)+'" data-location-state="'+escapeHtml(host.location_state)+'" title="'+escapeHtml(sourceTitle)+'">'+escapeHtml(sourceLabel)+'</span>'}
-function groupOffsets(hosts){
-  const groups=new Map();
-  hosts.forEach(host=>{
-    const key=Number(host.lat).toFixed(4)+','+Number(host.lon).toFixed(4);
-    if(!groups.has(key))groups.set(key,[]);
-    groups.get(key).push(host.name);
-  });
-  return groups;
-}
-function seedOffset(index,count){
-  if(count<=1)return {x:34,y:-28};
-  const angle=(-Math.PI/2)+(index/count)*Math.PI*2;
-  const radius=42+Math.min(count,6)*6;
-  return {x:Math.cos(angle)*radius,y:Math.sin(angle)*radius};
-}
-function clamp(value,min,max){return Math.max(min,Math.min(max,value))}
-function forceBounds(nodes,width,height){
-  return function(){
-    for(const d of nodes){
-      d.x=clamp(d.x,d.w/2+8,width-d.w/2-8);
-      d.y=clamp(d.y,d.h/2+8,height-d.h/2-8);
-    }
-  }
-}
-function svgEl(name){return document.createElementNS('http://www.w3.org/2000/svg',name)}
-function curvePath(a,b){
-  const dx=b.ax-a.ax;
-  const dy=b.ay-a.ay;
-  const mx=(a.ax+b.ax)/2;
-  const my=(a.ay+b.ay)/2;
-  const len=Math.max(1,Math.hypot(dx,dy));
-  const bend=Math.min(70,Math.max(18,len*.12));
-  const cx=mx+(-dy/len)*bend;
-  const cy=my+(dx/len)*bend;
-  return 'M '+a.ax.toFixed(1)+' '+a.ay.toFixed(1)+' Q '+cx.toFixed(1)+' '+cy.toFixed(1)+' '+b.ax.toFixed(1)+' '+b.ay.toFixed(1);
-}
-function addPacket(path,id,dir,level,policy,reverse){
-  const circle=svgEl('circle');
-  circle.setAttribute('r','3');
-  circle.classList.add('map-packet',dir);
-  circle.dataset.level=level;
-  circle.dataset.policy=policy||'unknown';
-  const motion=svgEl('animateMotion');
-  motion.setAttribute('dur',dir==='inbound'?'3.6s':'2.8s');
-  motion.setAttribute('repeatCount','indefinite');
-  motion.setAttribute('calcMode','linear');
-  if(reverse){
-    motion.setAttribute('keyPoints','1;0');
-    motion.setAttribute('keyTimes','0;1');
-  }
-  const mpath=svgEl('mpath');
-  mpath.setAttribute('href','#'+id);
-  motion.appendChild(mpath);
-  circle.appendChild(motion);
-  path.parentNode.appendChild(circle);
-  return circle;
-}
-function mapHostMatches(host,q,live){return (q===''||String(host.search||'').includes(q))&&(live==='all'||host.live===live)}
-function buildLabels(map,el){
-  const layer=document.createElement('div');
-  layer.className='map-label-layer';
-  const links=svgEl('svg');
-  links.classList.add('map-links');
-  const leaders=svgEl('svg');
-  leaders.classList.add('map-leaders');
-  layer.appendChild(links);
-  layer.appendChild(leaders);
-  el.appendChild(layer);
-  const groups=groupOffsets(MAP_HOSTS);
-  const seen=new Map();
-  const nodes=MAP_HOSTS.map((host,idx)=>{
-    const key=Number(host.lat).toFixed(4)+','+Number(host.lon).toFixed(4);
-    const groupIndex=seen.get(key)||0;
-    seen.set(key,groupIndex+1);
-    const anchor=document.createElement('span');
-    anchor.className='map-anchor '+escapeHtml(host.live);
-    const link=document.createElement('a');
-    link.className='map-node '+escapeHtml(host.live);
-    link.href=host.settings_href;
-    link.dataset.host=host.name;
-    link.dataset.live=host.live;
-    link.dataset.search=host.search||'';
-    link.dataset.mapLayer='managed';
-    link.innerHTML=nodeHtml(host);
-    link.title=host.name+': '+host.status+'; '+locationSourceTitle(host)+'; '+host.inbound_title+'; '+host.outbound_title;
-    link.setAttribute('aria-label',host.name+', '+host.status+', '+locationSourceTitle(host)+', inbound '+host.inbound_label+', outbound '+host.outbound_label);
-    const line=svgEl('line');
-    leaders.appendChild(line);
-    layer.appendChild(anchor);
-    layer.appendChild(link);
-    return {host,idx,anchor,link,line,groupIndex,groupCount:(groups.get(key)||[]).length,visible:true,w:100,h:38,r:58,x:0,y:0,ax:0,ay:0};
-  });
-  const pharosNode=nodes.find(node=>node.host.is_pharos)||nodes[0];
-  const linksByHost=nodes.filter(node=>node!==pharosNode).map((node,idx)=>{
-    const path=svgEl('path');
-    const id='map-link-'+idx;
-    path.id=id;
-    path.classList.add('map-link');
-    path.dataset.inboundLevel=node.host.inbound_level;
-    path.dataset.outboundLevel=node.host.outbound_level;
-    path.dataset.outboundPolicy=node.host.outbound_policy;
-    links.appendChild(path);
-    const packets=[];
-    if(node.host.inbound_level!=='wait')packets.push(addPacket(path,id,'inbound',node.host.inbound_level,node.host.outbound_policy,true));
-    if(node.host.outbound_level==='good')packets.push(addPacket(path,id,'outbound',node.host.outbound_level,node.host.outbound_policy,false));
-    return {node,path,packets};
-  });
-  let scheduled=false;
-  function layout(){
-    scheduled=false;
-    const width=el.clientWidth||800;
-    const height=el.clientHeight||520;
-    links.setAttribute('viewBox','0 0 '+width+' '+height);
-    leaders.setAttribute('viewBox','0 0 '+width+' '+height);
-    const visibleNodes=nodes.filter(node=>node.visible!==false);
-    nodes.filter(node=>node.visible===false).forEach(node=>{
-      node.anchor.hidden=true;
-      node.link.hidden=true;
-      node.line.style.opacity='0';
-    });
-    visibleNodes.forEach(node=>{
-      const point=map.latLngToContainerPoint([node.host.lat,node.host.lon]);
-      const offset=seedOffset(node.groupIndex,node.groupCount);
-      node.ax=point.x;
-      node.ay=point.y;
-      node.anchor.hidden=false;
-      node.link.hidden=false;
-      node.anchor.style.left=point.x+'px';
-      node.anchor.style.top=point.y+'px';
-      node.link.style.transform='translate(-1000px,-1000px)';
-      const rect=node.link.getBoundingClientRect();
-      node.w=rect.width||110;
-      node.h=rect.height||54;
-      node.r=Math.sqrt(node.w*node.w+node.h*node.h)/2+10;
-      node.x=clamp(point.x+offset.x,node.w/2+8,width-node.w/2-8);
-      node.y=clamp(point.y+offset.y,node.h/2+8,height-node.h/2-8);
-    });
-    if(window.d3&&d3.forceSimulation){
-      const simulation=d3.forceSimulation(visibleNodes)
-        .force('x',d3.forceX(d=>d.ax+seedOffset(d.groupIndex,d.groupCount).x).strength(.18))
-        .force('y',d3.forceY(d=>d.ay+seedOffset(d.groupIndex,d.groupCount).y).strength(.18))
-        .force('collide',d3.forceCollide(d=>d.r).strength(1))
-        .force('bounds',forceBounds(visibleNodes,width,height))
-        .stop();
-      for(let i=0;i<90;i++)simulation.tick();
-    }
-    visibleNodes.forEach(node=>{
-      node.x=clamp(node.x,node.w/2+8,width-node.w/2-8);
-      node.y=clamp(node.y,node.h/2+8,height-node.h/2-8);
-      const left=node.x-node.w/2;
-      const top=node.y-node.h/2;
-      node.link.style.transform='translate('+left.toFixed(1)+'px,'+top.toFixed(1)+'px)';
-      const distance=Math.hypot(node.x-node.ax,node.y-node.ay);
-      node.line.setAttribute('x1',node.ax);
-      node.line.setAttribute('y1',node.ay);
-      node.line.setAttribute('x2',node.x);
-      node.line.setAttribute('y2',node.y);
-      node.line.style.opacity=distance>22?'.55':'0';
-    });
-    if(pharosNode){
-      linksByHost.forEach(link=>{
-        const visible=pharosNode.visible!==false&&link.node.visible!==false;
-        link.path.style.display=visible?'':'none';
-        link.packets.forEach(packet=>{packet.style.display=visible?'':'none'});
-        if(!visible)return;
-        link.path.setAttribute('d',curvePath(pharosNode,link.node));
-      });
-    }
-  }
-  function scheduleLayout(){
-    if(scheduled)return;
-    scheduled=true;
-    requestAnimationFrame(layout);
-  }
-  map.on('move zoom moveend zoomend resize viewreset',scheduleLayout);
-  window.addEventListener('resize',scheduleLayout);
-  applyMapFilterNow=(q='',live='all')=>{
-    nodes.forEach(node=>{
-      node.visible=mapHostMatches(node.host,q,live);
-    });
-    scheduleLayout();
-  };
-  window.pharosMapApplyFilter=(q='',live='all')=>{
-    pendingMapFilter={q,live};
-    applyMapFilterNow(q,live);
-  };
-  applyMapFilterNow(pendingMapFilter.q,pendingMapFilter.live);
-  scheduleLayout();
-  return scheduleLayout;
-}
-function fullscreenElement(){return document.fullscreenElement||document.webkitFullscreenElement||null}
-function requestFullscreen(el){
-  if(el.requestFullscreen)return el.requestFullscreen();
-  if(el.webkitRequestFullscreen)return el.webkitRequestFullscreen();
-  return Promise.reject(new Error('Fullscreen is not supported'));
-}
-function exitFullscreen(){
-  if(document.exitFullscreen)return document.exitFullscreen();
-  if(document.webkitExitFullscreen)return document.webkitExitFullscreen();
-  return Promise.resolve();
-}
-const MAP_VIEWPORT_STORAGE='pharos.map.viewport.v1';
-const MAP_MODE_STORAGE='pharos.map.mode.v1';
-const MAP_LABEL_DENSITY_STORAGE='pharos.map.labelDensity.v1';
-function storageGet(key){try{return window.localStorage.getItem(key)}catch(_){return null}}
-function storageSet(key,value){try{window.localStorage.setItem(key,value)}catch(_){}}
-function storedMapMode(){
-  const value=storageGet(MAP_MODE_STORAGE);
-  return value==='maximized'?'maximized':'standard';
-}
-function storeMapMode(mode){
-  storageSet(MAP_MODE_STORAGE,mode==='standard'?'standard':'maximized');
-}
-function storedMapLabelDensity(){
-  return storageGet(MAP_LABEL_DENSITY_STORAGE)==='compact'?'compact':'normal';
-}
-function storeMapLabelDensity(density){
-  storageSet(MAP_LABEL_DENSITY_STORAGE,density==='compact'?'compact':'normal');
-}
-function storedViewport(){
-  try{
-    const raw=storageGet(MAP_VIEWPORT_STORAGE);
-    if(!raw)return null;
-    const parsed=JSON.parse(raw);
-    const lat=Number(parsed.lat);
-    const lon=Number(parsed.lon);
-    const zoom=Number(parsed.zoom);
-    if(!Number.isFinite(lat)||!Number.isFinite(lon)||!Number.isFinite(zoom))return null;
-    if(lat<-90||lat>90||lon<-180||lon>180||zoom<0||zoom>20)return null;
-    return {lat,lon,zoom};
-  }catch(_){
-    return null;
-  }
-}
-function storeViewport(map){
-  const center=map.getCenter();
-  storageSet(MAP_VIEWPORT_STORAGE,JSON.stringify({
-    lat:Number(center.lat.toFixed(5)),
-    lon:Number(center.lng.toFixed(5)),
-    zoom:map.getZoom()
-  }));
-}
-function setupMapModes(map,el,relayout){
-  const panel=document.getElementById('map-panel');
-  const layout=document.querySelector('[data-map-layout]');
-  const main=document.querySelector('[data-map-view]');
-  const buttons=Array.from(document.querySelectorAll('[data-map-mode-button]'));
-  const densityButton=document.querySelector('[data-map-density-button]');
-  if(!panel||!layout||!main||!buttons.length)return;
-  let mode='standard';
-  let beforeFullscreen='standard';
-  function resizeSoon(){
-    const run=()=>{map.invalidateSize();relayout&&relayout()};
-    requestAnimationFrame(run);
-    window.setTimeout(run,90);
-    window.setTimeout(run,260);
-  }
-  function setPressed(next){
-    buttons.forEach(button=>{
-      const active=button.dataset.mapModeButton===next;
-      button.setAttribute('aria-pressed',active?'true':'false');
-    });
-  }
-  function commit(next){
-    mode=next;
-    panel.dataset.mode=next;
-    layout.dataset.mode=next==='fullscreen'?'maximized':next;
-    main.dataset.mapView=next==='standard'?'standard':'maximized';
-    setPressed(next);
-    storeMapMode(next);
-    resizeSoon();
-  }
-  function setMode(next){
-    if(next==='fullscreen'){
-      beforeFullscreen=mode==='fullscreen'?'standard':mode;
-      commit('fullscreen');
-      requestFullscreen(panel).catch(()=>commit('maximized'));
-      return;
-    }
-    if(fullscreenElement()===panel){
-      exitFullscreen().catch(()=>{});
-    }
-    commit(next);
-  }
-  buttons.forEach(button=>{
-    button.addEventListener('click',()=>setMode(button.dataset.mapModeButton||'standard'));
-  });
-  function setDensity(next){
-    const density=next==='compact'?'compact':'normal';
-    panel.dataset.labelDensity=density;
-    if(densityButton)densityButton.setAttribute('aria-pressed',density==='compact'?'true':'false');
-    storeMapLabelDensity(density);
-    resizeSoon();
-  }
-  densityButton?.addEventListener('click',()=>{
-    setDensity(panel.dataset.labelDensity==='compact'?'normal':'compact');
-  });
-  function onFullscreenChange(){
-    if(fullscreenElement()===panel){
-      commit('fullscreen');
-    }else if(mode==='fullscreen'){
-      commit(beforeFullscreen||'standard');
-    }else{
-      resizeSoon();
-    }
-  }
-  document.addEventListener('fullscreenchange',onFullscreenChange);
-  document.addEventListener('webkitfullscreenchange',onFullscreenChange);
-  commit(storedMapMode());
-  setDensity(storedMapLabelDensity());
-}
-function initMap(){
-  const el=document.getElementById('fleet-map');
-  if(!el||!window.L){document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}
-  const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:true,zoomControl:false});
-  L.control.zoom({position:'topleft'}).addTo(map);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:20,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'}).addTo(map);
-  const bounds=MAP_HOSTS.map(host=>[host.lat,host.lon]);
-  const saved=storedViewport();
-  if(saved){map.setView([saved.lat,saved.lon],saved.zoom)}
-  else if(bounds.length===1){map.setView(bounds[0],5)}
-  else if(bounds.length){map.fitBounds(bounds,{padding:[64,64],maxZoom:5})}
-  else{map.setView([20,0],2)}
-  const relayout=buildLabels(map,el);
-  setupMapModes(map,el,relayout);
-  map.on('moveend zoomend',()=>storeViewport(map));
-  storeViewport(map);
-}
-window.pharosMapApplyFilter=(q='',live='all')=>{
-  pendingMapFilter={q,live};
-  if(applyMapFilterNow)applyMapFilterNow(q,live);
-};
-async function bootMap(){
-  setMapLoading('loading','Loading server locations and reachability checks.');
-  const target=document.querySelector('[data-site-list]');
-  if(target)target.innerHTML=siteSkeleton();
-  try{
-    const [data]=await Promise.all([loadMapData(),loadMapAssets()]);
-    MAP_HOSTS=data.hosts;
-    renderSiteList(MAP_HOSTS);
-    initMap();
-    setMapLoading('ready','All servers stay visible; labels are separated by D3 force layout with leader lines.');
-    if(typeof applySurfaceFilters==='function')applySurfaceFilters(false);
-    else window.pharosMapApplyFilter(pendingMapFilter.q,pendingMapFilter.live);
-  }catch(error){
-    setMapLoading('error','Map data is temporarily unavailable. The rest of Pharos remains usable.');
-    const fallback=document.querySelector('[data-map-fallback]');
-    if(fallback)fallback.style.display='grid';
-    const target=document.querySelector('[data-site-list]');
-    if(target)target.innerHTML=siteError(error&&error.message);
-  }
-}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bootMap,{once:true});
-else bootMap();
-</script>"#;
-    format!(
-        r#"{HEAD}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof" data-as-of>as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal" data-loading="true" data-map-state="loading"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-loading" data-map-loading><div class="map-load-card"><strong>Preparing map</strong><p data-map-status-message>Loading server locations and reachability checks.</p><span class="map-load-rail" aria-hidden="true"></span></div></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available when data can be loaded.</p></div></div></div><aside class="site-panel" aria-label="server locations" data-site-panel data-loading="true"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list" data-site-list><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div></div><div class="map-note" data-map-note>Loading server locations and reachability checks.</div></aside></section></main>{map_script}{FOOT}"#,
-        sidebar = sidebar(user_label, logout_enabled, "map"),
-        as_of = clock_label(now),
-        summary = summary,
-        toolbar = toolbar,
-        standard_icon = icons::PANEL_RIGHT,
-        maximize_icon = icons::MAXIMIZE_2,
-        fullscreen_icon = icons::FULLSCREEN,
-        compact_icon = icons::LIST,
-    )
-}
-
-struct HeartbeatHistoryView {
-    start: i64,
-    span: i64,
-    visible: Vec<usize>,
-}
-
-fn heartbeat_history_view(log: &[i64], window_secs: i64) -> HeartbeatHistoryView {
-    if log.len() < 2 {
-        return HeartbeatHistoryView {
-            start: 0,
-            span: 1,
-            visible: Vec::new(),
-        };
-    }
-
-    let latest = log[log.len() - 1];
-    let start = log[0].max(latest - window_secs.max(1));
-    let span = (latest - start).max(1);
-    let candidates = log
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, stamp)| {
-            if idx > 0 && *stamp >= start && *stamp <= latest {
-                Some(idx)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    if candidates.len() <= HEARTBEAT_HISTORY_DOTS {
-        return HeartbeatHistoryView {
-            start,
-            span,
-            visible: candidates,
-        };
-    }
-
-    let mut buckets = vec![None; HEARTBEAT_HISTORY_DOTS];
-    for idx in candidates {
-        let raw_bucket = (((log[idx] - start) as f64 / span as f64) * HEARTBEAT_HISTORY_DOTS as f64)
-            .floor() as usize;
-        let bucket = raw_bucket.min(HEARTBEAT_HISTORY_DOTS - 1);
-        buckets[bucket] = Some(idx);
-    }
-
-    HeartbeatHistoryView {
-        start,
-        span,
-        visible: buckets.into_iter().flatten().collect(),
-    }
-}
-
-fn heartbeat_visible_log(log: &[i64], window_secs: i64) -> Vec<i64> {
-    let view = heartbeat_history_view(log, window_secs);
-    view.visible.into_iter().map(|idx| log[idx]).collect()
-}
-
-fn heartbeat_history(log: &[i64], idx: usize, interval: i64) -> (&'static str, String, String) {
-    let stamp = log[idx];
-    let Some(previous) = idx.checked_sub(1).and_then(|previous| log.get(previous)) else {
-        return (
-            "first",
-            "first heartbeat".to_string(),
-            format!("at {}", clock_label(stamp)),
-        );
-    };
-    let gap = (stamp - previous).max(0);
-    let interval = interval.max(1);
-    let (level, label) = if gap <= interval {
-        ("ok", "on cadence")
-    } else if gap <= interval * 2 {
-        ("late", "late heartbeat")
-    } else if gap <= interval * 5 {
-        ("stale", "stale gap recovered")
-    } else {
-        ("down", "offline gap recovered")
-    };
-    (
-        level,
-        label.to_string(),
-        format!(
-            "{} after previous · {}",
-            duration_label(gap),
-            clock_label(stamp)
-        ),
-    )
-}
-
-fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (String, f64) {
-    if log.len() < 2 {
-        return (String::new(), 0.0);
-    }
-
-    let interval = interval.max(1);
-    let step = HEARTBEAT_EXPECT_X / HEARTBEAT_HISTORY_DOTS.max(1) as f64;
-    let newest_x = HEARTBEAT_EXPECT_X - step;
-    let view = heartbeat_history_view(log, window_secs);
-    let view_start = view.start;
-    let view_span = view.span;
-    let mark_x = |idx: usize| {
-        (((log[idx] - view_start).max(0) as f64 / view_span as f64) * newest_x).clamp(0.0, newest_x)
-    };
-    let history_start_x = view.visible.first().map(|idx| mark_x(*idx)).unwrap_or(0.0);
-    let mut marks = String::new();
-    for idx in view.visible {
-        let x = mark_x(idx);
-        let (level, label, detail) = heartbeat_history(log, idx, interval);
-        let title = format!("{label} · {detail}");
-        marks.push_str(&format!(
-            r#"<span class="beat-mark" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
-            level = html_escape(level),
-            label = html_escape(&label),
-            detail = html_escape(&detail),
-            title = html_escape(&title)
-        ));
-    }
-    (marks, history_start_x)
-}
-
-fn heartbeat_x(age: i64, interval: i64) -> f64 {
-    let age = age.max(0) as f64;
-    let interval = interval.max(1) as f64;
-    if age <= interval {
-        return (age / interval) * HEARTBEAT_EXPECT_X;
-    }
-    if age <= interval * 2.0 {
-        return HEARTBEAT_EXPECT_X + ((age - interval) / interval) * 18.0;
-    }
-    if age <= interval * 5.0 {
-        return HEARTBEAT_STALE_X + ((age - interval * 2.0) / (interval * 3.0)) * 18.0;
-    }
-    100.0
-}
-
-fn heartbeat_card(
-    last_seen: Option<i64>,
-    heartbeat_log: &[i64],
-    interval_secs: Option<u64>,
-    now: i64,
-    is_self: bool,
-) -> String {
-    let interval = i64::try_from(interval_secs.unwrap_or(60))
-        .unwrap_or(60)
-        .max(1);
-    let all_beats = heartbeat_samples(heartbeat_log, last_seen);
-    let visible_beats = heartbeat_visible_log(&all_beats, SIGNAL_DEFAULT_WINDOW_SECS);
-    let beats_attr = visible_beats
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let signal_beats_attr = all_beats
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let (marks, history_start_x) =
-        heartbeat_marks(&all_beats, interval, SIGNAL_DEFAULT_WINDOW_SECS);
-    let (last_attr, next_at_attr, beat_state, now_x, fill_color, expect_fill, target_ring) =
-        match last_seen {
-            Some(last) => {
-                let age = (now - last).max(0);
-                let progress = (age as f64 / interval as f64).clamp(0.0, 1.0);
-                if age <= interval {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        if is_self { "lit" } else { "tracking" },
-                        heartbeat_x(age, interval),
-                        if is_self { "var(--sun)" } else { "var(--sea)" },
-                        progress * 360.0,
-                        3.0 + progress * 5.0,
-                    )
-                } else if age <= interval * 2 {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "late",
-                        heartbeat_x(age, interval),
-                        "var(--sun)",
-                        360.0,
-                        8.0,
-                    )
-                } else if age <= interval * 5 {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "stale",
-                        heartbeat_x(age, interval),
-                        "var(--stale)",
-                        360.0,
-                        8.0,
-                    )
-                } else {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "down",
-                        100.0,
-                        "var(--down)",
-                        360.0,
-                        8.0,
-                    )
-                }
-            }
-            None => (
-                "".to_string(),
-                "".to_string(),
-                "waiting",
-                0.0,
-                "var(--wait)",
-                0.0,
-                3.0,
-            ),
-        };
-    let self_attr = if is_self { r#" data-self="true""# } else { "" };
-    format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window}" style="--now-x:{now_x:.2}%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span data-history-window-label>{history_window}</span><span>expected</span><span>late</span></span></div></div>"#,
-        count = visible_beats.len(),
-        history_window = html_escape(SIGNAL_DEFAULT_WINDOW_LABEL)
-    )
-}
-
-#[cfg(test)]
-fn render_home(
-    runtime: RuntimeSnapshot<'_>,
-    self_name: &str,
-    now: i64,
-    manifests: &[HostManifest],
-    shell: ShellContext<'_>,
-    can_onboard: bool,
-) -> String {
-    render_home_with_capabilities(
-        runtime,
-        self_name,
-        now,
-        manifests,
-        shell,
-        FleetCapabilities {
-            can_onboard,
-            can_manage_fleet: can_onboard,
-            system_update_available: true,
-            host_removal_available: true,
-        },
-    )
-}
-
-fn render_home_with_capabilities(
-    runtime: RuntimeSnapshot<'_>,
-    self_name: &str,
-    now: i64,
-    manifests: &[HostManifest],
-    shell: ShellContext<'_>,
-    capabilities: FleetCapabilities,
-) -> String {
-    let can_onboard = capabilities.can_onboard;
-    let hosts = runtime.hosts;
-    let setup_jobs = pending_setup_jobs(runtime.hosts, runtime.jobs);
-    if runtime.hosts.is_empty() && setup_jobs.is_empty() {
-        let assistant = if can_onboard {
-            setup_assistant()
-        } else {
-            String::new()
-        };
-        return format!(
-            "{HEAD}{sidebar}<main>{header}{empty}</main>{assistant}{FOOT}",
-            sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
-            header = header(now),
-            empty = empty_state(can_onboard),
-            assistant = assistant
-        );
-    }
-
-    let manifests_by_host = manifest_by_host(manifests);
-    let mut sorted: Vec<&Host> = hosts.iter().collect();
-    sorted.sort_by_key(|h| {
-        let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        let rank = attention_reason(
-            live,
-            &h.freshness,
-            h.kernel.as_ref(),
-            &h.service_observations,
-            &h.preferences,
-        )
-        .rank;
-        (rank, h.name.clone())
-    });
-
-    let mut cards = String::new();
-    let mut rows = String::new();
-    for h in sorted {
-        let is_self = h.name == self_name;
-        let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
-        let nix_icon = if h.is_nix {
-            icons::SNOWFLAKE
-        } else {
-            icons::SERVER
-        };
-        let name = html_escape(&h.name);
-        let role = html_escape(&h.role);
-        let fresh_tldr = h.freshness.tldr();
-        let fresh = freshness_markup(&h.freshness);
-        let attention = attention_reason(
-            live,
-            &h.freshness,
-            h.kernel.as_ref(),
-            &h.service_observations,
-            &h.preferences,
-        );
-        let reason = reason_markup(
-            &attention,
-            kernel_reboot_required(h.kernel.as_ref()).is_some(),
-        );
-        let kernel = kernel_posture_markup(h.kernel.as_ref(), &h.name, live);
-        let muted = muted_preferences_markup(&h.preferences);
-        let backup = backup_ui_summary(&h.backup_observations, now);
-        let backup_chip = backup_chip_markup(&backup, &h.name);
-        let protection = protection_onboarding_status(h, runtime.jobs, now);
-        let protection_card = protection
-            .as_ref()
-            .map(|status| protection_onboarding_markup(status, ""))
-            .unwrap_or_default();
-        let protection_list = protection
-            .as_ref()
-            .map(|status| protection_onboarding_markup(status, "protection-list"))
-            .unwrap_or_default();
-        let mut search_parts = vec![format!(
-            "{} {} {} {}",
-            h.name.to_lowercase(),
-            h.role.to_lowercase(),
-            fresh_tldr.to_lowercase(),
-            attention.label.to_lowercase()
-        )];
-        if let Some(backup_text) = backup_search_text(&backup) {
-            search_parts.push(backup_text.to_lowercase());
-        }
-        if let Some(status) = &protection {
-            search_parts.push(status.search_text().to_lowercase());
-        }
-        if kernel_reboot_required(h.kernel.as_ref()).is_some() {
-            search_parts.push("restart needed kernel reboot required".to_string());
-        }
-        if h.preferences.suppresses_down_alerts()
-            || h.preferences.alerts.suppress_backup
-            || h.preferences.alerts.suppress_nix_freshness
-        {
-            search_parts.push(if h.preferences.kind == HostKind::Workstation {
-                "workstation expected offline down alerts suppressed muted alert preferences"
-                    .to_string()
-            } else {
-                "muted alert preferences".to_string()
-            });
-        }
-        let sort_name = html_escape(&h.name.to_lowercase());
-        let last_sort = h.last_seen.unwrap_or(0);
-        let sev = attention.rank;
-        let seen = match h.last_seen {
-            Some(t) => format!("last seen {} ago", duration_label(now - t)),
-            None => "never seen".to_string(),
-        };
-        let seen_compact = match h.last_seen {
-            Some(t) => format!("{} ago", duration_label(now - t)),
-            None => "never".to_string(),
-        };
-        let light_cls = if is_self { " light" } else { "" };
-        let self_attr = if is_self { r#" data-self="true""# } else { "" };
-        let beam = if is_self {
-            format!(
-                r#"<span class="pharos-mark" aria-hidden="true">{}</span>"#,
-                icons::LIGHTHOUSE
-            )
-        } else {
-            String::new()
-        };
-        let manifest = manifests_by_host.get(h.name.as_str()).copied();
-        let declared_preferences = runtime
-            .declared_preferences
-            .and_then(|preferences| preferences.get(&h.name))
-            .or_else(|| manifest.map(|manifest| &manifest.host.preferences));
-        let settings_state = host_preferences_state(
-            &h.preferences,
-            declared_preferences,
-            h.requested_preferences.as_ref(),
-        );
-        let settings_state_key = settings_state.key();
-        let settings_state_label = settings_state.card_label();
-        if !settings_state_label.is_empty() {
-            search_parts.push(settings_state_label.to_string());
-        }
-        let search = html_escape(&search_parts.join(" "));
-        let settings_href_raw = format!("/agora?host={}", url_query_escape(&h.name));
-        let settings_href = html_escape(&settings_href_raw);
-        let settings_color = h
-            .preferences
-            .accent
-            .as_deref()
-            .filter(|color| valid_preference_accent(color))
-            .map(html_escape);
-        let pending_color = pending_preference_color(
-            settings_state,
-            declared_preferences,
-            h.requested_preferences.as_ref(),
-        )
-        .filter(|color| valid_preference_accent(color))
-        .map(html_escape);
-        let settings_cls = if settings_color.is_some() {
-            " has-settings"
-        } else {
-            ""
-        };
-        let mut host_color_vars = Vec::new();
-        if let Some(color) = settings_color.as_ref() {
-            host_color_vars.push(format!("--host-color:{color}"));
-        }
-        if let Some(color) = pending_color.as_ref() {
-            host_color_vars.push(format!("--pending-color:{color}"));
-        }
-        let host_color_style = if host_color_vars.is_empty() {
-            String::new()
-        } else {
-            format!(r#" style="{}""#, host_color_vars.join(";"))
-        };
-        let settings_title = if settings_state_label.is_empty() {
-            format!("Open host settings for {name}")
-        } else {
-            format!("{settings_state_label} for {name}")
-        };
-        let settings_action = format!(
-            r#"<a class="header-chip settings-card" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"><span class="settings-icon">{settings_icon}</span><span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
-            settings_icon = icons::SLIDERS,
-            settings_title = html_escape(&settings_title),
-        );
-        let declared = manifest.is_some() || declared_preferences.is_some();
-        let card_host_actions = if can_onboard {
-            host_actions_markup(
-                h,
-                HostActionRenderContext {
-                    manifest,
-                    declared,
-                    settings_state,
-                    settings_href: &settings_href_raw,
-                    backup: &backup,
-                    surface: "card",
-                    capabilities,
-                },
-            )
-        } else {
-            String::new()
-        };
-        let row_host_actions = if can_onboard {
-            host_actions_markup(
-                h,
-                HostActionRenderContext {
-                    manifest,
-                    declared,
-                    settings_state,
-                    settings_href: &settings_href_raw,
-                    backup: &backup,
-                    surface: "row",
-                    capabilities,
-                },
-            )
-        } else {
-            String::new()
-        };
-        let settings_note = format!(
-            r#"<a class="settings-wait-note" data-settings-note data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"{settings_note_hidden}>{wait_icon}<span data-settings-note-copy>{settings_state_label}</span></a>"#,
-            wait_icon = icons::CLOCK_3,
-            settings_title = html_escape(&settings_title),
-            settings_state_label = html_escape(settings_state_label),
-            settings_note_hidden = if settings_state == HostPreferencesState::Applied {
-                " hidden"
-            } else {
-                ""
-            },
-        );
-        let action_note = format!(
-            r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note hidden>{icon}<span data-host-action-note-copy></span></button>"#,
-            icon = icons::HISTORY,
-        );
-        let drag_action = format!(
-            r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
-            icon = icons::GRIP
-        );
-        let heartbeat = heartbeat_card(
-            h.last_seen,
-            &h.heartbeat_log,
-            h.heartbeat_interval_secs,
-            now,
-            is_self,
-        );
-        let interval = i64::try_from(h.heartbeat_interval_secs.unwrap_or(60))
-            .unwrap_or(60)
-            .max(1);
-        let signal = signal_markup(&heartbeat_signal(
-            &h.heartbeat_log,
-            h.last_seen,
-            interval,
-            now,
-            SIGNAL_DEFAULT_WINDOW_LABEL,
-            SIGNAL_DEFAULT_WINDOW_SECS,
-        ));
-        let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
-        cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{settings_action}{card_host_actions}</div></header>{settings_note}{action_note}{reason}{kernel}{muted}<div class="fresh" data-fresh>{fresh}</div>{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
-            live_key = live_key(live),
-            as_of = clock_label(now)
-        ));
-        rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{settings_note}{action_note}{reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
-            live_key = live_key(live),
-            as_of = clock_label(now),
-        ));
-    }
-    for job in setup_jobs {
-        cards.push_str(&render_setup_card(job, now));
-        rows.push_str(&render_setup_row(job, now));
-    }
-
-    let lone = if hosts.len() == 1 {
-        lone_host_state(can_onboard)
-    } else {
-        String::new()
-    };
-    if can_onboard {
-        cards.push_str(&onboard_tile());
-        rows.push_str(&onboard_row());
-    }
-    let assistant = if can_onboard {
-        setup_assistant()
-    } else {
-        String::new()
-    };
-    let action_dialog = if can_onboard {
-        host_action_dialog()
-    } else {
-        String::new()
-    };
-
-    format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{action_dialog}{FOOT}",
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
-        header = header(now),
-        summary = summary_cards(hosts, self_name, now),
-        toolbar = toolbar(),
-        assistant = assistant,
-        action_dialog = action_dialog,
-        now = now,
-    )
-}
-
 #[tokio::main]
 async fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
+        std::process::exit(if container_healthcheck().await { 0 } else { 1 });
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
+    let startup = StartupConfig::from_env()
+        .unwrap_or_else(|err| panic!("invalid Pharos startup configuration: {err}"));
     let host_store_path = std::env::var("PHAROS_DB").ok().map(PathBuf::from);
     let provisioning_job_store_path = provisioning_jobs_path(host_store_path.as_deref());
     let host_action_store_path = HostActionStore::path_for(host_store_path.as_deref());
     let retired_host_store_path = RetiredHostStore::path_for(host_store_path.as_deref());
     let provider_connection_store_path =
         ProviderConnectionStore::path_for(host_store_path.as_deref());
-    let store = Arc::new(Store::new(host_store_path));
+    let alert_store_path = AlertStore::path_for(host_store_path.as_deref());
+    let store = Arc::new(
+        Store::new(host_store_path)
+            .unwrap_or_else(|error| panic!("host store startup failed: {error}")),
+    );
     let provisioning_jobs = Arc::new(ProvisioningJobStore::new(provisioning_job_store_path));
     let host_actions = Arc::new(HostActionStore::new(host_action_store_path));
     let retired_hosts = Arc::new(RetiredHostStore::new(retired_host_store_path));
-    let provider_connections =
-        Arc::new(ProviderConnectionStore::new(provider_connection_store_path));
+    let provider_connections = Arc::new(
+        ProviderConnectionStore::new(provider_connection_store_path)
+            .unwrap_or_else(|error| panic!("provider connection store startup failed: {error}")),
+    );
+    let alert_store = Arc::new(
+        AlertStore::new(alert_store_path)
+            .unwrap_or_else(|error| panic!("alert store startup failed: {error}")),
+    );
     let manifests = Arc::new(ManifestRegistry::from_env());
-    let auth = Auth::from_env().await;
-    let beacon_auth = BeaconAuth::from_env();
+    let auth = Auth::from_config(startup.auth)
+        .await
+        .unwrap_or_else(|err| panic!("Pharos authentication startup failed: {err}"));
+    let beacon_auth = startup.beacon_auth;
     let provider_runtime = ProviderRuntimeConfig::from_env();
     let nixcfg_dispatch = NixcfgDispatch::from_env();
     let retirement_owner = RetirementOwnerAuth::from_env();
-    let alert_notifier = AlertNotifier::from_env();
+    let alert_notifier = AlertNotifier::from_env(alert_store)
+        .unwrap_or_else(|error| panic!("alert notifier startup failed: {error}"));
+    let alert_health = alert_notifier.health.clone();
     let state = AppState {
         store,
         provisioning_jobs,
@@ -19020,141 +2617,20 @@ async fn main() {
         retirement_owner,
         host_actions,
         retired_hosts,
+        alert_health,
     };
     reconcile_completed_removals(&state, now_unix());
     spawn_alert_loop(state.clone(), alert_notifier);
 
-    let app = Router::new()
-        // Human routes — gated by OIDC when configured (open otherwise).
-        .route("/", get(home))
-        .route("/map", get(map_page))
-        .route("/map/data.json", get(map_data_json))
-        .route("/alerts", get(alerts_page))
-        .route("/backups", get(backups_page))
-        .route("/activity", get(activity_page))
-        .route("/settings/providers", get(provider_settings_page))
-        .route("/settings/providers.json", get(provider_connections_json))
-        .route(
-            "/settings/providers/{provider}",
-            get(provider_settings_detail_page),
-        )
-        .route(
-            "/settings/providers/hetzner-cloud/test",
-            post(test_hetzner_provider_connection),
-        )
-        .route(
-            "/settings/providers/hetzner-cloud/preferences",
-            post(update_hetzner_provider_preferences),
-        )
-        .route(
-            "/settings/providers/hetzner-cloud/disconnect",
-            post(disconnect_hetzner_provider),
-        )
-        .route("/agora", get(agora::page))
-        .route(
-            "/agora/proposals/host-palette.json",
-            get(agora::palette_proposal),
-        )
-        .route(
-            "/agora/requests/host-preferences.json",
-            post(agora::request_host_preferences),
-        )
-        .route(
-            "/agora/proposals/host-location.json",
-            get(agora::location_proposal),
-        )
-        .route("/hosts.json", get(hosts_json))
-        .route("/setup/provider-plan.json", get(setup_provider_plan_json))
-        .route("/setup/provisioning-jobs", post(create_provisioning_job))
-        .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
-        .route(
-            "/setup/provisioning-jobs/{id}/confirm",
-            post(confirm_paid_provisioning_job),
-        )
-        .route(
-            "/setup/provisioning-jobs/{id}/create",
-            post(create_paid_provisioning_job),
-        )
-        .route(
-            "/setup/provisioning-jobs/{id}/cleanup",
-            post(cleanup_provisioning_job),
-        )
-        .route(
-            "/setup/existing-host/preflight",
-            post(existing_host_preflight_json),
-        )
-        .route("/declared-hosts.json", get(declared_hosts_json))
-        .route("/host-actions/system-update", post(request_system_update))
-        .route(
-            "/host-actions/{host}/update-restart/review",
-            post(request_update_restart_review),
-        )
-        .route("/host-actions/jobs/{id}", get(host_action_job_json))
-        .route(
-            "/host-actions/jobs/{id}/retry",
-            post(retry_update_restart_review),
-        )
-        .route(
-            "/host-actions/jobs/{id}/cancel",
-            post(cancel_update_restart_review),
-        )
-        .route(
-            "/host-actions/jobs/{id}/confirm",
-            post(confirm_update_restart),
-        )
-        .route(
-            "/host-actions/jobs/{id}/recover",
-            post(recover_update_restart),
-        )
-        .route("/host-actions/{host}/remove", post(request_host_removal))
-        .route(
-            "/host-actions/jobs/{id}/retry-retirement",
-            post(retry_host_retirement),
-        )
-        .route(
-            "/host-actions/{host}/allow-reonboarding",
-            post(allow_host_reonboarding),
-        )
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
-        // Machine/public routes: beacon ingestion, local registration, health,
-        // version, static assets, and the auth flow.
-        .route("/healthz", get(healthz))
-        .route("/version", get(version))
-        .route("/favicon.svg", get(favicon_svg))
-        .route("/assets/fleet-horizon.png", get(fleet_horizon_asset))
-        .route(
-            "/assets/sidebar-lighthouse.png",
-            get(sidebar_lighthouse_asset),
-        )
-        .route(
-            "/assets/sidebar-lighthouse-motion-v1.mp4",
-            get(sidebar_lighthouse_motion_asset),
-        )
-        .route("/register", post(register))
-        .route("/report", post(report))
-        .route("/agent/actions/claim", post(claim_host_action))
-        .route(
-            "/agent/actions/{id}/result",
-            post(record_host_action_result),
-        )
-        .route("/agent/retirements/claim", post(claim_retirement_action))
-        .route(
-            "/agent/retirements/{id}/result",
-            post(record_retirement_action_result),
-        )
-        .route("/auth/login", get(auth::login))
-        .route("/auth/callback", get(auth::callback))
-        .route("/auth/logout", get(auth::logout))
-        .route("/auth/logged-out", get(auth::logged_out))
-        .with_state(state);
+    let app = build_router(state);
 
-    let addr = std::env::var("PHAROS_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let listener = tokio::net::TcpListener::bind(startup.addr)
         .await
         .expect("bind PHAROS_ADDR");
     tracing::info!(
-        "pharosd v{} listening on http://{addr}",
-        env!("CARGO_PKG_VERSION")
+        "pharosd v{} listening on http://{}",
+        env!("CARGO_PKG_VERSION"),
+        startup.addr
     );
     axum::serve(listener, app).await.expect("serve");
 }
@@ -19164,6 +2640,16 @@ mod tests {
     use super::*;
 
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    async fn json_response(response: Response) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body is bounded");
+        let payload = serde_json::from_slice(&bytes).expect("response body is JSON");
+        (status, headers, payload)
+    }
 
     #[derive(Clone, Debug)]
     struct RecordedSshCall {
@@ -19230,6 +2716,17 @@ mod tests {
         std::fs::write(&known_hosts_file, b"test-host-key\n").expect("known hosts");
         std::fs::write(&beacon_binary_path, b"test-beacon-binary").expect("beacon binary");
         std::fs::write(&installer_path, b"#!/bin/sh\nexit 0\n").expect("installer");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&known_hosts_file, std::fs::Permissions::from_mode(0o600))
+                .expect("known-hosts permissions");
+            std::fs::set_permissions(&beacon_binary_path, std::fs::Permissions::from_mode(0o700))
+                .expect("beacon permissions");
+            std::fs::set_permissions(&installer_path, std::fs::Permissions::from_mode(0o700))
+                .expect("installer permissions");
+        }
         (
             ExistingHostRuntimeConfig {
                 execute_enabled: true,
@@ -19278,6 +2775,18 @@ mod tests {
         assert_eq!(payload["version"], APP_VERSION);
         assert_eq!(payload["display_version"], release_label());
         assert_eq!(payload["git_commit"], GIT_COMMIT);
+    }
+
+    #[test]
+    fn container_healthcheck_targets_the_bound_port_over_loopback() {
+        assert_eq!(
+            container_healthcheck_url("0.0.0.0:8080".parse().unwrap()),
+            "http://127.0.0.1:8080/readyz"
+        );
+        assert_eq!(
+            container_healthcheck_url("[::]:9090".parse().unwrap()),
+            "http://[::1]:9090/readyz"
+        );
     }
 
     #[test]
@@ -19557,7 +3066,7 @@ mod tests {
         );
         assert!(html.contains("No access yet"));
         assert!(html.contains("Your login works"));
-        assert!(html.contains(r#"href="/auth/logout""#));
+        assert!(html.contains(r#"action="/auth/logout" method="post""#));
     }
 
     #[tokio::test]
@@ -19594,6 +3103,73 @@ mod tests {
             .expect("sidebar motion body");
         assert!(!body.is_empty());
         assert!(body.len() < 500_000);
+    }
+
+    #[tokio::test]
+    async fn vendored_map_assets_are_versioned_and_same_origin() {
+        let leaflet = leaflet_js_asset().await.into_response();
+        assert_eq!(leaflet.status(), StatusCode::OK);
+        assert_eq!(
+            leaflet.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            leaflet.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        let leaflet = axum::body::to_bytes(leaflet.into_body(), usize::MAX)
+            .await
+            .expect("vendored Leaflet body");
+        assert!(leaflet.starts_with(b"/* @preserve"));
+
+        let d3 = d3_js_asset().await.into_response();
+        let d3 = axum::body::to_bytes(d3.into_body(), usize::MAX)
+            .await
+            .expect("vendored D3 body");
+        assert!(d3.starts_with(b"// https://d3js.org"));
+
+        assert_eq!(
+            leaflet_image_asset(AxumPath("not-vendored.png".to_string()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_html_receives_nonce_csp_and_browser_security_headers() {
+        let response = secure_response(
+            Html("<html><head><style>body{color:black}</style></head><body><script>window.ok=true</script></body></html>")
+                .into_response(),
+        )
+        .await;
+        let headers = response.headers().clone();
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .expect("CSP header");
+        let nonce = csp
+            .split("'nonce-")
+            .nth(1)
+            .and_then(|tail| tail.split('\'').next())
+            .expect("CSP nonce");
+
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+        assert!(headers.contains_key("permissions-policy"));
+        assert!(headers.contains_key("strict-transport-security"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("script-src-attr 'none'"));
+        assert!(csp.contains("img-src 'self' data: https://*.basemaps.cartocdn.com"));
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("secured HTML body");
+        let body = std::str::from_utf8(&body).expect("secured HTML is UTF-8");
+        assert!(body.contains(&format!(r#"<style nonce="{nonce}">"#)));
+        assert!(body.contains(&format!(r#"<script nonce="{nonce}">"#)));
     }
 
     #[tokio::test]
@@ -19865,7 +3441,7 @@ mod tests {
         assert!(html.contains(r#"href="/" aria-current="page""#));
         assert!(html.contains(r#"href="/map""#));
         assert!(html.contains(r#"href="/backups""#));
-        assert!(html.contains(r#"href="/auth/logout""#));
+        assert!(html.contains(r#"action="/auth/logout" method="post""#));
         assert!(html.contains(r#"aria-label="Log out of Pharos""#));
         assert!(!html.contains(">mba<"));
         assert!(html.contains("cache:'no-store'"));
@@ -21250,7 +4826,11 @@ mod tests {
         );
         assert_eq!(map[0].live, "down");
         assert_eq!(map[0].attention, "offline as expected");
-        assert!(silent_beacon_alerts(std::slice::from_ref(&workstation), 1000).is_empty());
+        let alert_store = AlertStore::new(None).expect("in-memory alert store starts");
+        alert_store
+            .reconcile_hosts(std::slice::from_ref(&workstation), 1000)
+            .expect("workstation alert state reconciles");
+        assert_eq!(alert_store.pending_count(), 0);
 
         workstation.service_observations = vec![ServiceObservation {
             id: "nginx".to_string(),
@@ -21501,7 +5081,9 @@ mod tests {
         let payload = map_data_payload(&hosts, "csb1", 1000, &manifests, &probes);
         let data_json = serde_json::to_string(&payload).expect("map payload serializes");
 
-        let leaflet_css = html.find("leaflet@1.9.4/dist/leaflet.css").unwrap();
+        let leaflet_css = html
+            .find("/assets/vendor/leaflet-1.9.4/leaflet.css")
+            .unwrap();
         let body = html.find("</head><body>").unwrap();
         assert!(leaflet_css > body);
         assert!(html.contains(r#"href="/map" aria-current="page""#));
@@ -21516,7 +5098,9 @@ mod tests {
         assert!(html.contains("Loading server locations and reachability checks."));
         assert!(html.contains("let MAP_HOSTS=[]"));
         assert!(!html.contains("const MAP_HOSTS=["));
-        assert!(html.contains("d3@7.9.0"));
+        assert!(html.contains("/assets/vendor/d3-7.9.0/d3.min.js"));
+        assert!(html.contains("/assets/vendor/leaflet-1.9.4/leaflet.js"));
+        assert!(!html.contains(&["unpkg", ".com"].concat()));
         assert!(html.contains("d3.forceSimulation"));
         assert!(html.contains("d3.forceCollide"));
         assert!(html.contains("renderSiteList(MAP_HOSTS)"));
@@ -21791,7 +5375,7 @@ mod tests {
     }
 
     #[test]
-    fn silent_beacon_alerts_only_previous_hosts_that_are_down() {
+    fn alert_incidents_only_open_for_previous_unsuppressed_down_hosts() {
         fn host(name: &str, last_seen: Option<i64>) -> Host {
             Host {
                 name: name.to_string(),
@@ -21817,24 +5401,22 @@ mod tests {
         manually_muted.preferences.alerts.suppress_down = true;
         let mut workstation = host("workstation", Some(600));
         workstation.preferences.kind = HostKind::Workstation;
-        let alerts = silent_beacon_alerts(
-            &[
-                host("live", Some(950)),
-                host("stale", Some(800)),
-                host("down", Some(600)),
-                host("awaiting", None),
-                manually_muted,
-                workstation,
-            ],
-            1000,
-        );
+        let outbox = AlertStore::new(None).expect("in-memory alert store starts");
+        outbox
+            .reconcile_hosts(
+                &[
+                    host("live", Some(950)),
+                    host("stale", Some(800)),
+                    host("down", Some(600)),
+                    host("awaiting", None),
+                    manually_muted,
+                    workstation,
+                ],
+                1000,
+            )
+            .expect("incidents reconcile");
 
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].host, "down");
-        assert_eq!(alerts[0].kind, "silent_heartbeat");
-        assert_eq!(alerts[0].age_seconds, 400);
-        assert_eq!(alerts[0].heartbeat_interval_secs, 60);
-        assert!(alerts[0].summary.contains("has not reported"));
+        assert_eq!(outbox.pending_count(), 1);
     }
 
     #[test]
@@ -21886,6 +5468,117 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(selected.as_deref(), Some("https://watchtower.example/hook"));
     }
 
+    #[tokio::test]
+    async fn alert_webhook_refuses_redirects_and_sends_idempotency_key() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let sink_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sink_address = sink_listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::sync_channel(1);
+        let redirect_server = std::thread::spawn(move || {
+            let (mut stream, _) = redirect_listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2_048];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_sender.send(request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://{sink_address}/sink\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let outbox = Arc::new(AlertStore::new(None).unwrap());
+        let notifier = AlertNotifier {
+            webhook_url: Some(format!("http://{redirect_address}/hook")),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(250))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            outbox,
+            health: AlertWorkerHealth::new(true, now_unix(), 60),
+            check_interval: Duration::from_secs(60),
+        };
+        let event = AlertEvent {
+            schema: "inspr.pharos.alert-event.v1".to_string(),
+            event_id: "alert-event-fixture".to_string(),
+            incident_id: "alert-incident-fixture".to_string(),
+            kind: crate::alerts::AlertEventKind::Down,
+            sequence: 0,
+            level: "critical".to_string(),
+            host: "gpc0".to_string(),
+            role: "server".to_string(),
+            last_seen: 100,
+            age_seconds: 360,
+            heartbeat_interval_secs: 60,
+            occurred_at: 460,
+            summary: "gpc0 has not reported for 6m 00s.".to_string(),
+            next_action: "Check host power, network, and pharos-beacon.".to_string(),
+        };
+
+        assert!(!notifier.send(&event).await);
+        redirect_server.join().unwrap();
+        let request = String::from_utf8(request_receiver.recv().unwrap()).unwrap();
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("idempotency-key: alert-event-fixture"));
+        sink_listener.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            sink_listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn alert_worker_supervisor_restarts_a_failed_child() {
+        let health = AlertWorkerHealth::new(true, now_unix(), 60);
+        let spawn_count = Arc::new(AtomicU64::new(0));
+        let factory_count = spawn_count.clone();
+        let supervisor_health = health.clone();
+        let supervisor = tokio::spawn(supervise_alert_worker(
+            supervisor_health,
+            Duration::from_millis(1),
+            move || {
+                let attempt = factory_count.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(async move {
+                    if attempt == 0 {
+                        panic!("injected alert worker failure");
+                    }
+                })
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if health.snapshot(now_unix()).restarts_total >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervisor restarts failed alert workers");
+
+        assert!(spawn_count.load(Ordering::Acquire) >= 2);
+        supervisor.abort();
+        let _ = supervisor.await;
+    }
+
     #[test]
     fn telegram_alert_target_parses_shoutrrr_url() {
         let url =
@@ -21898,18 +5591,21 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn telegram_alert_text_is_plain_and_actionable() {
-        let alert = SilentBeaconAlert {
-            schema: "inspr.pharos.alert.v1",
-            level: "critical",
-            kind: "silent_heartbeat",
+        let alert = AlertEvent {
+            schema: "inspr.pharos.alert-event.v1".to_string(),
+            event_id: "alert-event-fixture".to_string(),
+            incident_id: "alert-incident-fixture".to_string(),
+            level: "critical".to_string(),
+            kind: crate::alerts::AlertEventKind::Down,
+            sequence: 0,
             host: "gpc0".to_string(),
             role: "server".to_string(),
             last_seen: 100,
             age_seconds: 360,
             heartbeat_interval_secs: 60,
-            as_of: 460,
+            occurred_at: 460,
             summary: "gpc0 has not reported for 6m 00s.".to_string(),
-            next_action: "Check host power, network, and pharos-beacon.",
+            next_action: "Check host power, network, and pharos-beacon.".to_string(),
         };
 
         let text = telegram_alert_text(&alert);
@@ -21917,6 +5613,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(text.contains("Pharos critical alert"));
         assert!(text.contains("Host: gpc0"));
         assert!(text.contains("Check host power"));
+        assert!(text.contains("alert-event-fixture"));
     }
 
     #[test]
@@ -24648,6 +8345,146 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn existing_host_runtime_files_reject_symlinks_and_unsafe_modes() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-existing-file-check-{}-{}",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let trusted = dir.join("trusted");
+        let linked = dir.join("linked");
+        std::fs::write(&trusted, b"bounded-runtime-input").expect("trusted fixture");
+        std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o600))
+            .expect("trusted permissions");
+        symlink(&trusted, &linked).expect("symlink fixture");
+
+        assert!(open_trusted_runtime_file(&trusted, 1024, 0o077, false).is_some());
+        assert!(open_trusted_runtime_file(&linked, 1024, 0o077, false).is_none());
+
+        std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o620))
+            .expect("broad permissions");
+        assert!(open_trusted_runtime_file(&trusted, 1024, 0o077, false).is_none());
+
+        std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o600))
+            .expect("non-executable permissions");
+        assert!(open_trusted_runtime_file(&trusted, 1024, 0o022, true).is_none());
+        std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+        assert!(open_trusted_runtime_file(&trusted, 1024, 0o022, true).is_some());
+
+        std::fs::remove_file(linked).expect("remove symlink fixture");
+        std::fs::remove_file(trusted).expect("remove file fixture");
+        std::fs::remove_dir(dir).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_host_runtime_files_reject_unexpected_owners_and_special_modes() {
+        let effective_uid = unsafe { libc::geteuid() };
+        let unexpected_uid = if effective_uid == 1000 { 1001 } else { 1000 };
+
+        assert!(trusted_runtime_owner_and_mode(
+            0,
+            0o600,
+            effective_uid,
+            0o077,
+            false
+        ));
+        assert!(trusted_runtime_owner_and_mode(
+            effective_uid,
+            0o700,
+            effective_uid,
+            0o022,
+            true
+        ));
+        assert!(!trusted_runtime_owner_and_mode(
+            unexpected_uid,
+            0o600,
+            effective_uid,
+            0o077,
+            false
+        ));
+        assert!(!trusted_runtime_owner_and_mode(
+            effective_uid,
+            0o4600,
+            effective_uid,
+            0o077,
+            false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_host_child_runner_enforces_total_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+
+        let error = run_child_with_deadline(&mut command, None, Duration::from_millis(100), 4096)
+            .expect_err("the fixed deadline stops a hung child");
+
+        assert_eq!(error, ExistingHostExecutionError::RemoteCommandTimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_host_child_runner_deadline_covers_descendant_held_pipes() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "(sleep 5) & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let error = run_child_with_deadline(&mut command, None, Duration::from_millis(100), 4096)
+            .expect_err("a descendant cannot hold the output pipe past the deadline");
+
+        assert_eq!(error, ExistingHostExecutionError::RemoteCommandTimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_host_child_runner_bounds_output_and_drains_stdin() {
+        let mut echo_command = Command::new("/bin/sh");
+        echo_command
+            .args(["-c", "cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let payload = b"bounded-input";
+        assert_eq!(
+            run_child_with_deadline(
+                &mut echo_command,
+                Some(payload),
+                Duration::from_secs(1),
+                4096
+            )
+            .expect("bounded input is drained concurrently"),
+            payload
+        );
+
+        let mut noisy_command = Command::new("/bin/sh");
+        noisy_command
+            .args(["-c", "printf 123456789"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        assert_eq!(
+            run_child_with_deadline(&mut noisy_command, None, Duration::from_secs(1), 4),
+            Err(ExistingHostExecutionError::RemoteCommandFailed)
+        );
+    }
+
     #[test]
     fn native_systemd_target_fields_cannot_become_ssh_options() {
         assert!(!valid_ssh_endpoint("-oProxyCommand=unsafe"));
@@ -25183,7 +9020,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     fn ready_provider_connection_store(now: i64) -> ProviderConnectionStore {
-        let store = ProviderConnectionStore::new(None);
+        let store = ProviderConnectionStore::new(None).expect("in-memory provider store starts");
         let catalog = HetznerCatalog {
             refreshed_at: now,
             currency: "EUR".to_string(),
@@ -25212,20 +9049,22 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ssh_keys: vec!["pharos-bootstrap-key".to_string()],
             firewalls: vec!["pharos-bootstrap-firewall".to_string()],
         };
-        store.record_test(HetznerConnectionTestResult {
-            attempt: HetznerConnectionAttempt {
-                tested_at: now,
-                code: HetznerConnectionCode::Ready,
-                api_access: true,
-                credential_boundary_ready: true,
-                execution_enabled: true,
-                ssh_key_ready: true,
-                firewall_ready: true,
-                default_location_ready: true,
-                catalog_ready: true,
-            },
-            catalog: Some(catalog),
-        });
+        store
+            .record_test(HetznerConnectionTestResult {
+                attempt: HetznerConnectionAttempt {
+                    tested_at: now,
+                    code: HetznerConnectionCode::Ready,
+                    api_access: true,
+                    credential_boundary_ready: true,
+                    execution_enabled: true,
+                    ssh_key_ready: true,
+                    firewall_ready: true,
+                    default_location_ready: true,
+                    catalog_ready: true,
+                },
+                catalog: Some(catalog),
+            })
+            .expect("provider evidence persists");
         store
             .update_preferences(
                 HetznerConnectionPreferences {
@@ -25238,6 +9077,29 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             )
             .expect("test provider preferences are valid");
         store
+    }
+
+    #[tokio::test]
+    async fn provider_test_api_returns_unavailable_when_evidence_cannot_persist() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-provider-api-persistence-failure-{}-{}",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut state = report_test_state(true);
+        state.provider_connections = Arc::new(
+            ProviderConnectionStore::new(Some(path.clone()))
+                .expect("durable provider store starts"),
+        );
+        std::fs::create_dir(&path).expect("rename-blocking destination created");
+
+        let response = test_hetzner_provider_connection(State(state.clone()), action_headers())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.provider_connections.last_attempt().is_none());
+        std::fs::remove_dir_all(path).expect("test destination removed");
     }
 
     #[test]
@@ -25276,7 +9138,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     #[test]
     fn hetzner_runtime_readiness_exposes_only_safe_capabilities() {
         let now = 1_700_000_000;
-        let empty_store = ProviderConnectionStore::new(None);
+        let empty_store =
+            ProviderConnectionStore::new(None).expect("in-memory provider store starts");
         let blocked =
             hetzner_runtime_readiness(&HetznerCloudRuntimeConfig::default(), &empty_store, now);
         assert!(!blocked.connection_ready);
@@ -25411,7 +9274,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn provider_catalog_is_small_honest_and_secret_free() {
-        let store = ProviderConnectionStore::new(None);
+        let store = ProviderConnectionStore::new(None).expect("in-memory provider store starts");
         let catalog =
             provider_connections(&ProviderRuntimeConfig::default(), &store, 1_700_000_000);
         assert_eq!(catalog.schema, PROVIDER_CONNECTIONS_SCHEMA);
@@ -25486,7 +9349,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn provider_connections_page_keeps_the_first_screen_reduced() {
-        let store = ProviderConnectionStore::new(None);
+        let store = ProviderConnectionStore::new(None).expect("in-memory provider store starts");
         let catalog =
             provider_connections(&ProviderRuntimeConfig::default(), &store, 1_700_000_000);
         let managed = render_provider_connections_page(
@@ -25894,83 +9757,114 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: None,
             require_report_token,
             report_token_mode: BeaconTokenMode::Local,
-            janus_token_hash_sources: vec![],
+            janus_tokens: None,
             local_register_enabled: true,
         })
     }
 
     fn report_test_state_with_auth(beacon_auth: BeaconAuth) -> AppState {
         AppState {
-            store: Arc::new(Store::new(None)),
+            store: Arc::new(Store::new(None).expect("in-memory host store starts")),
             provisioning_jobs: Arc::new(ProvisioningJobStore::new(None)),
             manifests: Arc::new(ManifestRegistry::default()),
             auth: None,
             beacon_auth,
             provider_runtime: ProviderRuntimeConfig::default(),
-            provider_connections: Arc::new(ProviderConnectionStore::new(None)),
+            provider_connections: Arc::new(
+                ProviderConnectionStore::new(None).expect("in-memory provider store starts"),
+            ),
             paid_create_lock: Arc::new(tokio::sync::Mutex::new(())),
             nixcfg_dispatch: NixcfgDispatch::disabled(),
             retirement_owner: RetirementOwnerAuth::default(),
             host_actions: Arc::new(HostActionStore::new(None)),
             retired_hosts: Arc::new(RetiredHostStore::new(None)),
+            alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
         }
     }
 
     static JANUS_HASH_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn janus_hash_file(host: &str, token: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time moves forward")
-            .as_nanos();
-        let counter = JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "pharos-janus-token-hashes-{}-{}-{}.json",
-            std::process::id(),
-            nanos,
-            counter
-        ));
-        let payload = json!({
-            "schema": JANUS_BEACON_TOKEN_HASH_SCHEMA,
-            "hosts": [
-                {
-                    "name": host,
-                    "token_sha256": token_hash(token)
-                }
-            ]
-        });
-        std::fs::write(&path, serde_json::to_string(&payload).unwrap()).expect("write hash file");
-        path
-    }
-
-    fn janus_hash_dir(entries: &[(&str, &str)]) -> PathBuf {
+    fn janus_generation_dir(entries: &[(&str, &str)]) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time moves forward")
             .as_nanos();
         let counter = JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "pharos-janus-token-hash-dir-{}-{}-{}",
+            "pharos-janus-token-generation-{}-{}-{}",
             std::process::id(),
             nanos,
             counter
         ));
-        std::fs::create_dir(&dir).expect("create hash dir");
-        for (host, token) in entries {
-            let path = dir.join(format!("{host}.json"));
-            let payload = json!({
-                "schema": JANUS_BEACON_TOKEN_HASH_SCHEMA,
-                "hosts": [
-                    {
-                        "name": host,
-                        "token_sha256": token_hash(token)
-                    }
-                ]
-            });
-            std::fs::write(&path, serde_json::to_string(&payload).unwrap())
-                .expect("write hash file");
-        }
+        crate::janus_auth::write_test_generation(
+            &dir,
+            entries
+                .iter()
+                .map(|(host, token)| ((*host).to_string(), token_hash(token))),
+        );
         dir
+    }
+
+    fn janus_test_store(entries: &[(&str, &str)]) -> (PathBuf, JanusTokenStore) {
+        let root = janus_generation_dir(entries);
+        let store = JanusTokenStore::load(root.clone()).expect("load Janus generation fixture");
+        (root, store)
+    }
+
+    #[test]
+    fn beacon_token_mode_rejects_unknown_values() {
+        assert!(parse_beacon_token_mode("janus").is_ok());
+        assert!(parse_beacon_token_mode("typo").is_err());
+    }
+
+    #[test]
+    fn janus_mode_enforces_startup_invariants() {
+        let (root, store) = janus_test_store(&[("ares", "test-token")]);
+
+        assert!(BeaconAuth::validated(
+            None,
+            false,
+            BeaconTokenMode::Janus,
+            Some(store.clone()),
+            false,
+        )
+        .is_err());
+        assert!(BeaconAuth::validated(
+            None,
+            true,
+            BeaconTokenMode::Janus,
+            Some(store.clone()),
+            true,
+        )
+        .is_err());
+        assert!(BeaconAuth::validated(
+            Some("unused-registration-value".to_string()),
+            true,
+            BeaconTokenMode::Janus,
+            Some(store.clone()),
+            false,
+        )
+        .is_err());
+        assert!(BeaconAuth::validated(None, true, BeaconTokenMode::Janus, None, false,).is_err());
+        assert!(
+            BeaconAuth::validated(None, true, BeaconTokenMode::Janus, Some(store), false,).is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn janus_mode_rejects_unavailable_or_empty_sources_at_startup() {
+        let missing = std::env::temp_dir().join(format!(
+            "pharos-missing-janus-source-{}-{}",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(JanusTokenStore::load(missing).is_err());
+
+        let empty = janus_generation_dir(&[]);
+        assert!(JanusTokenStore::load(empty.clone()).is_err());
+        let _ = std::fs::remove_dir_all(empty);
     }
 
     fn test_report(host: &str) -> HostReport {
@@ -25995,15 +9889,20 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     fn register_test_token(state: &AppState, host: &str, token: &str) {
-        state.store.register(
-            HostRegistration {
-                name: host.to_string(),
-                role: "server".to_string(),
-                is_nix: true,
-                heartbeat_interval_secs: 60,
-            },
-            token_hash(token),
-        );
+        state
+            .store
+            .register(
+                HostRegistration {
+                    schema: pharos_core::HOST_REGISTRATION_SCHEMA.to_string(),
+                    version: pharos_core::HOST_REGISTRATION_VERSION,
+                    name: host.to_string(),
+                    role: "server".to_string(),
+                    is_nix: true,
+                    heartbeat_interval_secs: 60,
+                },
+                token_hash(token),
+            )
+            .expect("test registration persists");
     }
 
     fn bearer_headers(token: &str) -> HeaderMap {
@@ -26040,7 +9939,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let mut report = test_report(host);
         report.kernel = Some(reboot_required_kernel(now_unix()));
         report.freshness.commits_behind = Some(1);
-        state.store.record(report, now_unix());
+        state
+            .store
+            .record(report, now_unix())
+            .expect("test report persists");
         (state, path)
     }
 
@@ -26256,7 +10158,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let mut runtime_report = test_report("ares");
         runtime_report.is_nix = false;
         runtime_report.freshness.applicable = false;
-        state.store.record(runtime_report, now_unix());
+        state
+            .store
+            .record(runtime_report, now_unix())
+            .expect("test report persists");
 
         let (status, _) = request_host_removal(
             State(state.clone()),
@@ -26328,7 +10233,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             let mut runtime_report = test_report(host);
             runtime_report.is_nix = false;
             runtime_report.freshness.applicable = false;
-            state.store.record(runtime_report, now_unix());
+            state
+                .store
+                .record(runtime_report, now_unix())
+                .expect("test report persists");
         }
 
         for successor in [None, Some("gpc0"), Some("not-onboarded")] {
@@ -26376,7 +10284,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     async fn runtime_only_nix_host_removal_does_not_assume_declarative_ownership() {
         let state = report_test_state(true);
         register_test_token(&state, "gpc0", "remove-token");
-        state.store.record(test_report("gpc0"), now_unix());
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
 
         let (status, Json(payload)) = request_host_removal(
             State(state.clone()),
@@ -26428,7 +10339,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[tokio::test]
     async fn janus_managed_removal_requires_a_distinct_configured_owner() {
-        let hash_path = janus_hash_file("hsb8", "retirement-token");
+        let (generation_root, janus_tokens) = janus_test_store(&[("hsb8", "retirement-token")]);
         let manifest_path = std::env::temp_dir().join(format!(
             "pharos-retirement-owner-manifest-{}-{}.json",
             std::process::id(),
@@ -26443,11 +10354,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_sources: vec![JanusTokenHashSource::File(hash_path.clone())],
+            janus_tokens: Some(janus_tokens),
             local_register_enabled: false,
         });
         state.manifests = Arc::new(ManifestRegistry::from_paths(vec![manifest_path.clone()]));
-        state.store.record(test_report("hsb8"), now_unix());
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("test report persists");
 
         let (status, _) = request_host_removal(
             State(state.clone()),
@@ -26480,7 +10394,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(!state.retired_hosts.is_retired("hsb8"));
 
-        let _ = std::fs::remove_file(hash_path);
+        let _ = std::fs::remove_dir_all(generation_root);
         let _ = std::fs::remove_file(manifest_path);
     }
 
@@ -26576,7 +10490,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     async fn system_update_dispatch_failure_keeps_a_persisted_checklist() {
         let state = report_test_state(true);
         register_test_token(&state, "gpc0", "update-token");
-        state.store.record(test_report("gpc0"), now_unix());
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
 
         let (status, Json(payload)) = request_system_update(
             State(state.clone()),
@@ -26660,6 +10577,105 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn report_returns_unavailable_and_rolls_back_when_host_store_persistence_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-report-persistence-failure-{}-{}",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut state = report_test_state(false);
+        state.store = Arc::new(Store::new(Some(path.clone())).expect("durable store starts"));
+        std::fs::create_dir(&path).expect("rename-blocking destination created");
+
+        let response = report(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(test_report("persistence-test")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.store.get("persistence-test").is_none());
+        std::fs::remove_dir_all(path).expect("test destination removed");
+    }
+
+    #[tokio::test]
+    async fn registration_never_returns_a_credential_when_persistence_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-registration-persistence-failure-{}-{}",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut state = report_test_state_with_auth(BeaconAuth {
+            registration_token: Some("bootstrap-fixture".to_string()),
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Local,
+            janus_tokens: None,
+            local_register_enabled: true,
+        });
+        state.store = Arc::new(Store::new(Some(path.clone())).expect("durable store starts"));
+        std::fs::create_dir(&path).expect("rename-blocking destination created");
+
+        let response = register(
+            State(state.clone()),
+            bearer_headers("bootstrap-fixture"),
+            Json(HostRegistration {
+                schema: pharos_core::HOST_REGISTRATION_SCHEMA.to_string(),
+                version: pharos_core::HOST_REGISTRATION_VERSION,
+                name: "registration-test".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: 60,
+            }),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(payload.get("token").is_none());
+        assert!(state.store.get("registration-test").is_none());
+        std::fs::remove_dir_all(path).expect("test destination removed");
+    }
+
+    #[tokio::test]
+    async fn credential_bearing_registration_response_is_never_cacheable() {
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: Some("bootstrap-fixture".to_string()),
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Local,
+            janus_tokens: None,
+            local_register_enabled: true,
+        });
+        let response = register(
+            State(state),
+            bearer_headers("bootstrap-fixture"),
+            Json(HostRegistration {
+                schema: pharos_core::HOST_REGISTRATION_SCHEMA.to_string(),
+                version: pharos_core::HOST_REGISTRATION_VERSION,
+                name: "registration-cache-test".to_string(),
+                role: "server".to_string(),
+                is_nix: true,
+                heartbeat_interval_secs: 60,
+            }),
+        )
+        .await;
+        let (status, headers, payload) = json_response(response).await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(payload.get("token").is_some());
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store, no-cache, max-age=0, must-revalidate")
+        );
+        assert_eq!(
+            headers.get(header::PRAGMA).and_then(|v| v.to_str().ok()),
+            Some("no-cache")
+        );
+    }
+
+    #[tokio::test]
     async fn report_accepts_valid_token_when_strict_enabled() {
         let state = report_test_state(true);
         register_test_token(&state, "ares", "valid-token");
@@ -26680,7 +10696,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let mut initial = test_report("gpc0");
         initial.is_nix = false;
         initial.freshness = NixFreshness::default();
-        state.store.record(initial.clone(), now_unix());
+        state
+            .store
+            .record(initial.clone(), now_unix())
+            .expect("test report persists");
         let requested = HostPreferences {
             accent: Some("#48b8a8".to_string()),
             kind: HostKind::Workstation,
@@ -26718,7 +10737,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     async fn report_never_returns_local_write_preferences_to_nix_hosts() {
         let state = report_test_state(false);
         let initial = test_report("ares");
-        state.store.record(initial.clone(), now_unix());
+        state
+            .store
+            .record(initial.clone(), now_unix())
+            .expect("test report persists");
         state
             .store
             .request_preferences(
@@ -26746,7 +10768,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let mut initial = test_report("gpc0");
         initial.is_nix = false;
         initial.freshness = NixFreshness::default();
-        state.store.record(initial.clone(), now_unix());
+        state
+            .store
+            .record(initial.clone(), now_unix())
+            .expect("test report persists");
         let requested = HostPreferences {
             accent: Some("#48b8a8".to_string()),
             ..Default::default()
@@ -26766,13 +10791,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
-    async fn report_accepts_janus_hash_file_token_without_local_registration() {
-        let path = janus_hash_file("ares", "janus-token");
+    async fn report_accepts_janus_generation_token_without_local_registration() {
+        let (root, janus_tokens) = janus_test_store(&[("ares", "janus-token")]);
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_sources: vec![JanusTokenHashSource::File(path.clone())],
+            janus_tokens: Some(janus_tokens),
             local_register_enabled: false,
         });
 
@@ -26785,17 +10810,17 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         assert_eq!(status.status(), StatusCode::NO_CONTENT);
         assert!(!state.store.has_token("ares"));
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn report_rejects_local_token_when_janus_mode_is_enabled() {
-        let path = janus_hash_file("ares", "janus-token");
+        let (root, janus_tokens) = janus_test_store(&[("ares", "janus-token")]);
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_sources: vec![JanusTokenHashSource::File(path.clone())],
+            janus_tokens: Some(janus_tokens),
             local_register_enabled: false,
         });
         register_test_token(&state, "ares", "local-token");
@@ -26808,17 +10833,17 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
 
         assert_eq!(status.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn report_accepts_local_or_janus_token_in_dual_mode() {
-        let path = janus_hash_file("ares", "janus-token");
+        let (root, janus_tokens) = janus_test_store(&[("ares", "janus-token")]);
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Dual,
-            janus_token_hash_sources: vec![JanusTokenHashSource::File(path.clone())],
+            janus_tokens: Some(janus_tokens),
             local_register_enabled: true,
         });
         register_test_token(&state, "athena", "local-token");
@@ -26838,17 +10863,18 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         assert_eq!(janus_status.status(), StatusCode::NO_CONTENT);
         assert_eq!(local_status.status(), StatusCode::NO_CONTENT);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn report_accepts_janus_hash_sidecar_directory() {
-        let dir = janus_hash_dir(&[("ares", "ares-token"), ("athena", "athena-token")]);
+    async fn report_accepts_complete_janus_generation() {
+        let (root, janus_tokens) =
+            janus_test_store(&[("ares", "ares-token"), ("athena", "athena-token")]);
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_sources: vec![JanusTokenHashSource::Dir(dir.clone())],
+            janus_tokens: Some(janus_tokens),
             local_register_enabled: false,
         });
 
@@ -26867,19 +10893,20 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         assert_eq!(ares_status.status(), StatusCode::NO_CONTENT);
         assert_eq!(athena_status.status(), StatusCode::NO_CONTENT);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn report_ignores_janus_hash_sidecar_directory_temp_files() {
-        let dir = janus_hash_dir(&[("ares", "ares-token")]);
-        std::fs::write(dir.join(".ares.json.123.tmp"), "not-json").expect("write temp sidecar");
-        std::fs::write(dir.join("README.txt"), "not-json").expect("write ignored text file");
+    async fn report_ignores_files_outside_the_active_janus_generation() {
+        let (root, janus_tokens) = janus_test_store(&[("ares", "ares-token")]);
+        std::fs::write(root.join(".ares.json.123.tmp"), "not-json")
+            .expect("write unrelated temporary file");
+        std::fs::write(root.join("unrelated.json"), "not-json").expect("write unrelated JSON file");
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_sources: vec![JanusTokenHashSource::Dir(dir.clone())],
+            janus_tokens: Some(janus_tokens),
             local_register_enabled: false,
         });
 
@@ -26891,18 +10918,22 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
 
         assert_eq!(status.status(), StatusCode::NO_CONTENT);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn report_fails_closed_when_janus_hash_file_is_unavailable() {
+    async fn report_fails_closed_when_janus_generation_becomes_unavailable() {
+        let (root, janus_tokens) = janus_test_store(&[("ares", "janus-token")]);
+        std::fs::write(
+            root.join(crate::janus_auth::JANUS_CURRENT_FILE),
+            format!("{}\n", "f".repeat(64)),
+        )
+        .expect("point fixture at unavailable generation");
         let state = report_test_state_with_auth(BeaconAuth {
             registration_token: None,
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_sources: vec![JanusTokenHashSource::File(PathBuf::from(
-                "/no/such/pharos-token-hashes.json",
-            ))],
+            janus_tokens: Some(janus_tokens),
             local_register_enabled: false,
         });
 
@@ -26914,6 +10945,73 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
 
         assert_eq!(status.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn readiness_and_metrics_track_the_active_janus_generation() {
+        let (root, janus_tokens) = janus_test_store(&[("ares", "janus-token")]);
+        let generation = janus_tokens
+            .readiness()
+            .generation
+            .expect("fixture generation id");
+        let state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_tokens: Some(janus_tokens),
+            local_register_enabled: false,
+        });
+
+        let response = readyz(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let metric_response = metrics(State(state.clone())).await.into_response();
+        let body = axum::body::to_bytes(metric_response.into_body(), 64 * 1024)
+            .await
+            .expect("metrics body reads");
+        let body = String::from_utf8(body.to_vec()).expect("metrics are utf8");
+        assert!(body.contains("pharos_janus_sidecar_ready 1"));
+        assert!(body.contains(&format!("generation=\"{generation}\"")));
+
+        std::fs::write(
+            root.join(crate::janus_auth::JANUS_CURRENT_FILE),
+            format!("{}\n", "e".repeat(64)),
+        )
+        .expect("point fixture at unavailable generation");
+        let response = readyz(State(state)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dead_or_stale_alert_worker_fails_readiness_and_is_measurable() {
+        let mut state = report_test_state(false);
+        let health = AlertWorkerHealth::new(true, now_unix(), 5);
+        state.alert_health = health.clone();
+        assert_eq!(
+            readyz(State(state.clone())).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        health.mark_running(true);
+        health.record_cycle(now_unix(), true, 3);
+        assert_eq!(readyz(State(state.clone())).await.status(), StatusCode::OK);
+        let response = metrics(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("pharos_alert_worker_ready 1"));
+        assert!(body.contains("pharos_alert_outbox_pending 3"));
+
+        health.mark_running(false);
+        let mut state = report_test_state(false);
+        state.alert_health = health;
+        assert_eq!(
+            readyz(State(state)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
@@ -26922,16 +11020,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             registration_token: Some("bootstrap".to_string()),
             require_report_token: true,
             report_token_mode: BeaconTokenMode::Janus,
-            janus_token_hash_sources: vec![JanusTokenHashSource::File(PathBuf::from(
-                "/run/janus/pharos-token-hashes.json",
-            ))],
+            janus_tokens: None,
             local_register_enabled: false,
         });
 
-        let (status, Json(payload)) = register(
+        let response = register(
             State(state),
             bearer_headers("bootstrap"),
             Json(HostRegistration {
+                schema: pharos_core::HOST_REGISTRATION_SCHEMA.to_string(),
+                version: pharos_core::HOST_REGISTRATION_VERSION,
                 name: "ares".to_string(),
                 role: "server".to_string(),
                 is_nix: true,
@@ -26939,6 +11037,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             }),
         )
         .await;
+        let (status, _, payload) = json_response(response).await;
 
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(
@@ -26949,15 +11048,15 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[test]
     fn janus_token_hash_contract_rejects_secret_shaped_or_invalid_hashes() {
-        let err = parse_janus_token_hashes(
-            r#"{
-                "schema": "inspr.pharos.beacon-token-hashes.v1",
-                "tokens": { "ares": "pharos_not_a_hash" }
-            }"#,
-        )
-        .expect_err("invalid hash is rejected");
+        let root = janus_generation_dir(&[]);
+        crate::janus_auth::write_test_generation(
+            &root,
+            [("ares".to_string(), "pharos_not_a_hash".to_string())],
+        );
+        let err = JanusTokenStore::load(root.clone()).expect_err("invalid hash is rejected");
 
         assert_eq!(err, JanusTokenHashError::InvalidHash);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

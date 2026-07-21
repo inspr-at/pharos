@@ -1,0 +1,2955 @@
+</div><script>
+const words={live:'live',stale:'stale',down:'down',awaiting_first_heartbeat:'awaiting'};
+const HISTORY_DOTS=12;
+const EXPECT_X=64;
+const STALE_X=82;
+const HISTORY_STEP=EXPECT_X/HISTORY_DOTS;
+const SIGNAL_WINDOWS=[{key:'10m',label:'10m',secs:10*60},{key:'1h',label:'1h',secs:60*60},{key:'24h',label:'24h',secs:24*60*60}];
+let signalWindow=SIGNAL_WINDOWS[0];
+let activeSearch='';
+let activeLiveFilter='all';
+function dur(s){s=Math.max(0,s);if(s<10)return s.toFixed(1)+'s';s=Math.ceil(s);return s<60?s+'s':Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s'}
+function clock(t){return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+const ESC={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
+function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(name+'='))?.split('=').slice(1).join('=')||''}
+function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
+function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host-surface="runtime"]')).filter(el=>el.dataset.host===name)}
+let openHostActionsRoot=null;
+let hostActionContext=null;
+let hostActionReturnFocus=null;
+const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:''};
+function setHostActionPollSuspended(suspended){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  if(overlay)overlay.dataset.suspended=suspended?'true':'false';
+}
+function pauseHostActionPoll(){
+  if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+  hostActionPoll.timer=null;
+  hostActionPoll.controller?.abort();
+  hostActionPoll.controller=null;
+  setHostActionPollSuspended(true);
+}
+function stopHostActionPoll(){
+  pauseHostActionPoll();
+  hostActionPoll.id=null;
+  hostActionPoll.failures=0;
+  hostActionPoll.lastRevision='';
+}
+function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
+function closeHostActions(root=openHostActionsRoot,restore=false){
+  if(!root)return;
+  const trigger=root.querySelector('[data-host-actions-trigger]');
+  const menu=root.querySelector('[data-host-actions-menu]');
+  if(menu){menu.hidden=true;menu.style.removeProperty('left');menu.style.removeProperty('top')}
+  if(trigger)trigger.setAttribute('aria-expanded','false');
+  if(openHostActionsRoot===root)openHostActionsRoot=null;
+  if(restore)trigger?.focus();
+}
+function positionHostActions(root){
+  const trigger=root.querySelector('[data-host-actions-trigger]');
+  const menu=root.querySelector('[data-host-actions-menu]');
+  if(!trigger||!menu||menu.hidden)return;
+  const anchor=trigger.getBoundingClientRect();
+  const box=menu.getBoundingClientRect();
+  const margin=12;
+  const left=Math.max(margin,Math.min(window.innerWidth-box.width-margin,anchor.right-box.width));
+  const below=anchor.bottom+7;
+  const above=anchor.top-box.height-7;
+  const top=below+box.height<=window.innerHeight-margin?below:Math.max(margin,above);
+  menu.style.left=left+'px';
+  menu.style.top=top+'px';
+}
+function openHostActions(root){
+  if(openHostActionsRoot&&openHostActionsRoot!==root)closeHostActions(openHostActionsRoot);
+  const trigger=root.querySelector('[data-host-actions-trigger]');
+  const menu=root.querySelector('[data-host-actions-menu]');
+  if(!trigger||!menu)return;
+  const opening=menu.hidden;
+  if(!opening){closeHostActions(root,true);return}
+  menu.hidden=false;
+  trigger.setAttribute('aria-expanded','true');
+  openHostActionsRoot=root;
+  positionHostActions(root);
+  visibleHostActionItems(menu)[0]?.focus();
+}
+function setHostActionFact(name,value,visible=true){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const row=overlay?.querySelector('[data-host-action-fact-row="'+name+'"]');
+  const target=overlay?.querySelector('[data-host-action-fact="'+name+'"]');
+  if(row)row.hidden=!visible;
+  if(target)target.textContent=value||'not reported';
+}
+function hostActionTechnicalText(root){
+  const surface=root.closest('[data-host-surface="runtime"]');
+  const live=surface?.dataset.live||'unknown';
+  const kernel=root.dataset.kernelState==='reboot_required'
+    ? root.dataset.kernelRunning+' running; '+root.dataset.kernelExpected+' expected'
+    : root.dataset.kernelState.replaceAll('_',' ');
+  return [
+    'Host: '+root.dataset.host,
+    'Role: '+root.dataset.role,
+    'System: '+(root.dataset.isNix==='true'?'Nix':'non-Nix'),
+    'Live state: '+live.replaceAll('_',' '),
+    'Declared: '+(root.dataset.declared==='true'?'yes':'no'),
+    'Privileged actions: '+(root.dataset.janusReady==='true'?'Janus guarded':'not prepared'),
+    'Settings: '+root.dataset.settingsState.replaceAll('_',' '),
+    'Backup: '+root.dataset.backupLabel,
+    'Kernel: '+kernel
+  ].join('\n');
+}
+function closeHostActionDialog(restore=true){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  if(!overlay)return;
+  stopHostActionPoll();
+  if(overlay.hidden)return;
+  overlay.hidden=true;
+  document.body.removeAttribute('data-host-action-dialog-open');
+  resumeBeatClock();
+  resumeRefresh('dialog-close');
+  const input=overlay.querySelector('[data-host-remove-input]');
+  if(input)input.value='';
+  const disposition=overlay.querySelector('[data-host-remove-disposition]');
+  if(disposition)disposition.value='';
+  const successor=overlay.querySelector('[data-host-remove-successor-input]');
+  if(successor)successor.value='';
+  const attended=overlay.querySelector('[data-host-attended-input]');
+  if(attended)attended.checked=false;
+  hostActionContext=null;
+  if(restore)hostActionReturnFocus?.focus();
+  hostActionReturnFocus=null;
+}
+function openHostActionDialog(action,root,returnFocus){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const dialog=overlay?.querySelector('[data-host-action-dialog]');
+  if(!overlay||!dialog)return;
+  stopHostActionPoll();
+  closeHostActions(root);
+  hostActionContext={action,root,host:root.dataset.host};
+  hostActionReturnFocus=returnFocus||root.querySelector('[data-host-actions-trigger]');
+  dialog.dataset.action=action;
+  dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{icon.hidden=icon.dataset.actionIcon!==action});
+  const title=dialog.querySelector('[data-host-action-title]');
+  const copy=dialog.querySelector('[data-host-action-copy]');
+  const infoTitle=dialog.querySelector('[data-host-action-info-title]');
+  const infoCopy=dialog.querySelector('[data-host-action-info-copy]');
+  const primary=dialog.querySelector('[data-host-action-primary]');
+  const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
+  const cancelRequest=dialog.querySelector('[data-host-action-cancel]');
+  const confirm=dialog.querySelector('[data-host-remove-confirm]');
+  const removeName=dialog.querySelector('[data-host-remove-name]');
+  const input=dialog.querySelector('[data-host-remove-input]');
+  const dispositionField=dialog.querySelector('[data-host-remove-disposition-field]');
+  const disposition=dialog.querySelector('[data-host-remove-disposition]');
+  const successorField=dialog.querySelector('[data-host-remove-successor]');
+  const successorInput=dialog.querySelector('[data-host-remove-successor-input]');
+  const attendedConfirm=dialog.querySelector('[data-host-attended-confirm]');
+  const attendedInput=dialog.querySelector('[data-host-attended-input]');
+  const technical=dialog.querySelector('[data-host-action-technical]');
+  const facts=dialog.querySelector('[data-host-action-facts]');
+  const workflow=dialog.querySelector('[data-host-workflow]');
+  const status=dialog.querySelector('[data-host-action-status]');
+  dialog.dataset.workflow='false';
+  if(status)status.textContent='';
+  if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
+  if(cancel)cancel.textContent='Cancel';
+  if(cancelRequest){cancelRequest.hidden=true;cancelRequest.disabled=false}
+  if(confirm)confirm.hidden=true;
+  if(dispositionField)dispositionField.hidden=true;
+  if(successorField)successorField.hidden=true;
+  if(attendedConfirm)attendedConfirm.hidden=true;
+  if(input)input.value='';
+  if(disposition)disposition.value='';
+  if(successorInput)successorInput.value='';
+  if(attendedInput)attendedInput.checked=false;
+  if(technical)technical.hidden=true;
+  if(workflow){workflow.hidden=true;workflow.replaceChildren()}
+  if(facts)facts.hidden=false;
+  setHostActionFact('host',root.dataset.host,true);
+  setHostActionFact('state',(root.closest('[data-host-surface="runtime"]')?.dataset.live||'unknown').replaceAll('_',' '),true);
+  setHostActionFact('backup',root.dataset.backupLabel,true);
+  setHostActionFact('kernel',root.dataset.kernelState==='reboot_required'?root.dataset.kernelRunning+' → '+root.dataset.kernelExpected:root.dataset.kernelState.replaceAll('_',' '),true);
+  if(action==='system-update'){
+    title.textContent='Check for system updates';
+    copy.textContent='Prepare an isolated nixcfg proposal and validate every configured host. Nothing is merged or deployed.';
+    infoTitle.textContent='Fleet-wide review';
+    infoCopy.textContent='A shared flake update can affect every Nix host, even when launched from '+root.dataset.host+'.';
+    setHostActionFact('scope','all configured Nix hosts',true);
+    primary.textContent='Create update review';
+  }else if(action==='update-restart'){
+    title.textContent='Apply update and restart '+root.dataset.host;
+    copy.textContent='First prepare a target-local review. The final switch remains blocked until backup, validation, Janus authorization, and attended confirmation pass.';
+    infoTitle.textContent='No immediate restart';
+    infoCopy.textContent='This step only prepares the guarded plan. You confirm again immediately before any live change.';
+    setHostActionFact('scope',root.dataset.host+' only',true);
+    primary.textContent='Prepare guarded review';
+  }else if(action==='technical'){
+    title.textContent=root.dataset.host+' technical details';
+    copy.textContent='Sanitized runtime and declaration facts used by Pharos. Credentials, store paths, and opaque identifiers are excluded.';
+    infoTitle.textContent='Safe details only';
+    infoCopy.textContent='These values are observational and do not grant access to the host.';
+    setHostActionFact('scope','',false);
+    if(facts)facts.hidden=true;
+    if(technical){technical.hidden=false;technical.textContent=hostActionTechnicalText(root)}
+    if(primary)primary.hidden=true;
+    if(cancel)cancel.textContent='Close';
+  }else if(action==='workflow'){
+    title.textContent=root.dataset.host+' workflow';
+    copy.textContent='Loading the saved execution checklist...';
+    if(infoTitle)infoTitle.textContent='Saved workflow';
+    if(infoCopy)infoCopy.textContent='The current state comes from the persisted server record.';
+    if(primary)primary.hidden=true;
+    if(cancel)cancel.textContent='Close';
+  }else if(action==='remove'){
+    if(root.dataset.retired==='true'){
+      title.textContent='Removal pending for '+root.dataset.host;
+      copy.textContent='Pharos has revoked this host’s reporting access. The server and its data remain untouched while declarative cleanup is reviewed and applied.';
+      infoTitle.textContent='Beacon access revoked';
+      infoCopy.textContent='The host remains visible so this unfinished removal cannot be mistaken for completion.';
+      const dispositionLabel={destroyed:'Host no longer exists',unmanaged:'Host remains unmanaged',rebuilt:'Replaced by '+root.dataset.retirementSuccessor}[root.dataset.retirementDisposition]||'Lifecycle recorded';
+      setHostActionFact('scope',dispositionLabel+' · waiting for nixcfg removal',true);
+      if(primary)primary.hidden=true;
+      if(cancel)cancel.textContent='Close';
+      if(status)status.textContent='Removal is still pending.';
+    }else{
+    title.textContent='Remove '+root.dataset.host+' from Pharos?';
+    copy.textContent='Pharos will stop managing and accepting reports from this host. The server, disks, services, and application data stay untouched.';
+    const needsCleanup=root.dataset.declared==='true';
+    infoTitle.textContent=needsCleanup?'Nix cleanup review required':'Runtime-only removal';
+    infoCopy.textContent=needsCleanup
+      ?'A nixcfg proposal must remove the declaration. Until it is applied, Pharos keeps the removal visibly pending.'
+      :'The runtime registration and beacon access will be revoked after confirmation.';
+    setHostActionFact('scope',needsCleanup?'Pharos registration + nixcfg review':'Pharos registration only',true);
+    if(dispositionField)dispositionField.hidden=false;
+    if(confirm)confirm.hidden=false;
+    if(removeName)removeName.textContent=root.dataset.host;
+    if(primary){primary.textContent='Remove host';primary.classList.add('danger');primary.disabled=true}
+    }
+  }
+  overlay.hidden=false;
+  document.body.dataset.hostActionDialogOpen='true';
+  stopBeatClock();
+  scheduleRefresh(DIALOG_REFRESH_MS);
+  requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
+  const storedKind=root.dataset.actionKind;
+  const storedMatches=action==='workflow'
+    ||(action==='update-restart'&&storedKind==='update_restart');
+  if(action!=='technical'&&root.dataset.actionJobId&&storedMatches)pollHostActionJob(root.dataset.actionJobId,true);
+}
+async function requestHostAction(path,body){
+  const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},body:JSON.stringify(body||{})});
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok&&!payload.job)throw new Error(payload.error||payload.message||'The guarded action could not be requested.');
+  return payload;
+}
+function hostActionStateLabel(state){
+  return ({proposal_requested:'review requested',queued_review:'review queued',reviewing:'reviewing on host',awaiting_confirmation:'ready for confirmation',queued_apply:'confirmed',applying:'applying on host',rebooting:'restarting and verifying',removal_pending:'removal pending',succeeded:'completed',failed:'failed',cancelled:'cancelled safely'})[state]||String(state||'recorded').replaceAll('_',' ');
+}
+function updateHostRemovalForm(){
+  if(hostActionContext?.action!=='remove')return;
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const disposition=overlay?.querySelector('[data-host-remove-disposition]')?.value||'';
+  const successorField=overlay?.querySelector('[data-host-remove-successor]');
+  const successor=overlay?.querySelector('[data-host-remove-successor-input]');
+  const infoTitle=overlay?.querySelector('[data-host-action-info-title]');
+  const infoCopy=overlay?.querySelector('[data-host-action-info-copy]');
+  const primary=overlay?.querySelector('[data-host-action-primary]');
+  const rebuilt=disposition==='rebuilt';
+  if(successorField)successorField.hidden=!rebuilt;
+  if(!rebuilt&&successor)successor.value='';
+  const copy={
+    destroyed:['Host no longer exists','Pharos stops monitoring it and keeps a retirement record. The server provider and any disks are never touched.'],
+    unmanaged:['Host still exists','Pharos stops monitoring and managing it. The machine, services, disks, and application data remain unchanged.'],
+    rebuilt:['Host was replaced','The old record is retired and linked to an already onboarded successor. Nothing is deleted from either machine.']
+  }[disposition];
+  if(copy&&infoTitle)infoTitle.textContent=copy[0];
+  if(copy&&infoCopy)infoCopy.textContent=copy[1];
+  if(primary)primary.disabled=!hostActionConfirmationReady();
+}
+function hostActionConfirmationReady(){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const input=overlay?.querySelector('[data-host-remove-input]');
+  if(hostActionContext?.action==='remove'){
+    const disposition=overlay?.querySelector('[data-host-remove-disposition]')?.value||'';
+    const successor=(overlay?.querySelector('[data-host-remove-successor-input]')?.value||'').trim();
+    return input?.value===hostActionContext.host
+      &&['destroyed','unmanaged','rebuilt'].includes(disposition)
+      &&(disposition!=='rebuilt'||(successor.length>0&&successor!==hostActionContext.host));
+  }
+  const attended=overlay?.querySelector('[data-host-attended-input]');
+  return input?.value===hostActionContext?.host&&attended?.checked===true;
+}
+function scheduleHostActionPoll(id,delay=2000){
+  if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+  hostActionPoll.timer=null;
+  hostActionPoll.id=id;
+  const suspended=document.hidden||!navigator.onLine||!hostActionContext;
+  setHostActionPollSuspended(suspended);
+  if(suspended)return;
+  hostActionPoll.timer=setTimeout(()=>{
+    hostActionPoll.timer=null;
+    pollHostActionJob(id,false);
+  },delay);
+}
+function hostActionPollDelay(job){
+  const kind=job?.workflow?.kind;
+  if(kind==='settings_change'||kind==='remove_host')return 10000;
+  return job?.state==='rebooting'?5000:2000;
+}
+function renderHostActionJob(job,message,workflowHtml){
+  if(!hostActionContext||!job)return;
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const dialog=overlay?.querySelector('[data-host-action-dialog]');
+  const primary=overlay?.querySelector('[data-host-action-primary]');
+  const cancel=overlay?.querySelector('.host-action-dialog-buttons [data-host-action-close]');
+  const cancelRequest=overlay?.querySelector('[data-host-action-cancel]');
+  const status=overlay?.querySelector('[data-host-action-status]');
+  const copy=overlay?.querySelector('[data-host-action-copy]');
+  const title=overlay?.querySelector('[data-host-action-title]');
+  const info=overlay?.querySelector('[data-host-action-info]');
+  const facts=overlay?.querySelector('[data-host-action-facts]');
+  const workflowRoot=overlay?.querySelector('[data-host-workflow]');
+  const safeNote=overlay?.querySelector('[data-host-action-safe-note]');
+  const confirm=overlay?.querySelector('[data-host-remove-confirm]');
+  const removeName=overlay?.querySelector('[data-host-remove-name]');
+  const attended=overlay?.querySelector('[data-host-attended-confirm]');
+  const workflow=job.workflow||{};
+  const workflowKind=String(workflow.kind||job.kind||'');
+  const primaryAction=workflow.primary_action||null;
+  hostActionContext.jobId=job.id;
+  hostActionContext.action=workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':workflowKind==='system_update_proposal'?'system-update':'workflow';
+  hostActionContext.root.dataset.actionJobId=job.id;
+  hostActionContext.root.dataset.actionKind=workflowKind;
+  hostActionContext.root.dataset.actionState=job.state;
+  hostActionPoll.lastRevision=[job.id,job.state,job.updated_at].join(':');
+  if(dialog){dialog.dataset.workflow='true';dialog.dataset.action=workflowKind.replaceAll('_','-')}
+  dialog?.querySelectorAll('[data-action-icon]').forEach(icon=>{
+    const iconKind=workflowKind==='settings_change'?'settings-change':workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':'system-update';
+    icon.hidden=icon.dataset.actionIcon!==iconKind;
+  });
+  if(title)title.textContent=workflow.title||hostActionContext.host+' workflow';
+  if(copy)copy.textContent=workflow.guidance||message||hostActionStateLabel(job.state)+'.';
+  if(info)info.hidden=true;
+  if(facts)facts.hidden=true;
+  if(workflowRoot){workflowRoot.hidden=false;workflowRoot.innerHTML=workflowHtml||''}
+  if(safeNote)safeNote.textContent='Persisted and reviewable';
+  if(status)status.textContent=message||'';
+  if(cancel)cancel.textContent='Close';
+  if(cancelRequest){cancelRequest.hidden=workflow.can_cancel!==true;cancelRequest.disabled=false}
+  if(confirm)confirm.hidden=primaryAction?.kind!=='confirm';
+  if(attended)attended.hidden=primaryAction?.kind!=='confirm';
+  if(removeName)removeName.textContent=hostActionContext.host;
+  hostActionContext.stage=primaryAction?.kind||'observe';
+  if(primaryAction&&primary){
+    primary.hidden=false;
+    primary.classList.remove('danger');
+    primary.textContent=primaryAction.label||'Continue';
+    primary.disabled=primaryAction.kind==='confirm'?!hostActionConfirmationReady():false;
+  }else if(primary){
+    primary.hidden=true;
+  }
+  const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
+    ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
+    ||(workflowKind==='remove_host'&&job.state==='removal_pending');
+  if(active)scheduleHostActionPoll(job.id,hostActionPollDelay(job));
+}
+async function pollHostActionJob(id,immediate=false){
+  if(!hostActionContext||hostActionContext.jobId&&hostActionContext.jobId!==id)return;
+  hostActionPoll.timer=null;
+  if(document.hidden||!navigator.onLine){hostActionPoll.id=id;setHostActionPollSuspended(true);return}
+  setHostActionPollSuspended(false);
+  hostActionPoll.controller?.abort();
+  const controller=new AbortController();
+  hostActionPoll.controller=controller;
+  try{
+    const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{credentials:'same-origin',cache:'no-store',signal:controller.signal});
+    const payload=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(payload.error||'Could not refresh guarded action state.');
+    hostActionPoll.failures=0;
+    const revision=[payload.job?.id,payload.job?.state,payload.job?.updated_at].join(':');
+    if(immediate||revision!==hostActionPoll.lastRevision)renderHostActionJob(payload.job,payload.message,payload.workflow_html);
+    else scheduleHostActionPoll(id,hostActionPollDelay(payload.job));
+  }catch(error){
+    if(error?.name==='AbortError')return;
+    const status=document.querySelector('[data-host-action-status]');
+    if(status)status.textContent=error instanceof Error?error.message:'Could not refresh guarded action state.';
+    hostActionPoll.failures=Math.min(hostActionPoll.failures+1,4);
+    scheduleHostActionPoll(id,Math.min(30000,3000*(2**hostActionPoll.failures)));
+  }finally{
+    if(hostActionPoll.controller===controller)hostActionPoll.controller=null;
+  }
+}
+async function submitHostAction(){
+  if(!hostActionContext)return;
+  const {action,root,host}=hostActionContext;
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const primary=overlay?.querySelector('[data-host-action-primary]');
+  const status=overlay?.querySelector('[data-host-action-status]');
+  if(!primary||!status)return;
+  primary.disabled=true;
+  status.textContent=action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
+    :action==='remove'?'Recording retirement and revoking reports…'
+    :hostActionContext.stage==='recover'?'Queueing target-local recovery checks…'
+    :hostActionContext.stage==='confirm'?'Recording attended confirmation…'
+    :'Requesting a guarded review…';
+  try{
+    let result;
+    if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
+    else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
+    else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
+    else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
+    else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
+    else if(action==='remove'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry-retirement',{});
+    else if(action==='remove'){
+      const disposition=overlay.querySelector('[data-host-remove-disposition]')?.value||'';
+      const successor=(overlay.querySelector('[data-host-remove-successor-input]')?.value||'').trim();
+      result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/remove',{confirmation:host,disposition,successor:successor||null});
+    }
+    else return;
+    status.textContent=result.message||'Request recorded.';
+    if(result?.job)renderHostActionJob(result.job,result.message,result.workflow_html);
+    else primary.hidden=true;
+  }catch(error){
+    status.textContent=error instanceof Error?error.message:'The guarded action could not be requested.';
+    primary.disabled=false;
+  }
+}
+async function submitHostActionCancellation(){
+  if(!hostActionContext?.jobId)return;
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const button=overlay?.querySelector('[data-host-action-cancel]');
+  const status=overlay?.querySelector('[data-host-action-status]');
+  if(!button||!status)return;
+  button.disabled=true;
+  status.textContent='Cancelling before any live change…';
+  try{
+    const result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/cancel',{});
+    renderHostActionJob(result.job,result.message,result.workflow_html);
+  }catch(error){
+    status.textContent=error instanceof Error?error.message:'The safe cancellation could not be recorded.';
+    button.disabled=false;
+  }
+}
+function updateHostActionState(surface,host,backup){
+  const root=surface.querySelector('[data-host-actions]');
+  if(!root)return;
+  const state=String(host.preferences_state||'applied');
+  const kernel=host.kernel||{};
+  const kernelState=String(kernel.state||'unknown');
+  const commitsBehind=Number(host.freshness?.commits_behind||0);
+  const canManage=root.dataset.canManage==='true';
+  const systemUpdateAvailable=root.dataset.systemUpdateAvailable==='true';
+  const hostRemovalAvailable=root.dataset.hostRemovalAvailable==='true';
+  const job=host.host_action||null;
+  const workflow=job?.workflow||null;
+  const retirement=host.retirement||null;
+  root.dataset.settingsState=state;
+  root.dataset.kernelState=kernelState;
+  root.dataset.kernelRunning=String(kernel.running_version||'not reported');
+  root.dataset.kernelExpected=String(kernel.expected_version||'not reported');
+  root.dataset.retired=retirement?.pending===true?'true':'false';
+  root.dataset.retirementDisposition=String(retirement?.disposition||'');
+  root.dataset.retirementSuccessor=String(retirement?.successor||'');
+  if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(workflow?.kind||job.kind||'');root.dataset.actionState=String(job.state||'')}
+  else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
+  if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
+  const review=root.querySelector('[data-host-action="review-pending"]');
+  const update=root.querySelector('[data-host-action="system-update"]');
+  const restart=root.querySelector('[data-host-action="update-restart"]');
+  const remove=root.querySelector('[data-host-action="remove"]');
+  const primarySeparator=root.querySelector('[data-primary-separator]');
+  const removeSeparator=root.querySelector('[data-remove-separator]');
+  if(review)review.hidden=state==='applied';
+  const updateJobActive=workflow?.kind==='update_restart'&&!['succeeded','cancelled'].includes(job.state);
+  const updatePending=kernelState==='reboot_required'||commitsBehind>0;
+  root.dataset.updatePending=updatePending?'true':'false';
+  const retired=retirement?.pending===true;
+  const removalReady=root.dataset.declared!=='true'||hostRemovalAvailable;
+  if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
+  if(restart){
+    restart.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&(updatePending||updateJobActive));
+    const strong=restart.querySelector('strong');
+    if(strong)strong.textContent=updateJobActive?'Continue update workflow':'Apply update and restart';
+  }
+  if(remove)remove.hidden=!removalReady||!canManage||retired;
+  if(primarySeparator)primarySeparator.hidden=[review,update,restart].every(item=>!item||item.hidden);
+  if(removeSeparator)removeSeparator.hidden=!removalReady||!canManage||retired;
+  const note=surface.querySelector('[data-host-action-note]');
+  const noteCopy=note?.querySelector('[data-host-action-note-copy]');
+  if(note){
+    const show=retired||(job&&!['succeeded','cancelled'].includes(job.state));
+    note.hidden=!show;
+    note.dataset.actionLevel=retired?'warning':String(workflow?.status_level||'warning');
+    if(noteCopy)noteCopy.textContent=retired?'removal pending':String(workflow?.status_label||hostActionStateLabel(job?.state));
+  }
+  const dot=root.querySelector('[data-host-action-dot]');
+  if(dot)dot.hidden=state==='applied'&&kernelState!=='reboot_required'&&!retired&&!(job&&!['succeeded','cancelled'].includes(job.state));
+  if(openHostActionsRoot===root)positionHostActions(root);
+}
+function initHostActions(){
+  document.addEventListener('click',event=>{
+    const trigger=event.target.closest('[data-host-actions-trigger]');
+    if(trigger){event.preventDefault();openHostActions(trigger.closest('[data-host-actions]'));return}
+    const actionNote=event.target.closest('[data-host-action-note]');
+    if(actionNote){
+      event.preventDefault();
+      const surface=actionNote.closest('[data-host-surface="runtime"]');
+      const root=surface?.querySelector('[data-host-actions]');
+      if(root){
+        const kind=root.dataset.actionKind;
+        const action=kind==='update_restart'?'update-restart':'workflow';
+        openHostActionDialog(action,root,actionNote);
+      }
+      return;
+    }
+    const actionItem=event.target.closest('[data-host-action]');
+    if(actionItem&&actionItem.closest('[data-host-actions-menu]')&&!actionItem.matches('a')){
+      event.preventDefault();
+      const root=actionItem.closest('[data-host-actions]');
+      openHostActionDialog(actionItem.dataset.hostAction,root,actionItem);
+      return;
+    }
+    if(event.target.closest('[data-host-action-close]')){event.preventDefault();closeHostActionDialog();return}
+    if(openHostActionsRoot&&!event.target.closest('[data-host-actions]'))closeHostActions(openHostActionsRoot);
+  });
+  document.addEventListener('keydown',event=>{
+    const overlay=document.querySelector('[data-host-action-overlay]');
+    if(overlay&&!overlay.hidden){
+      if(event.key==='Escape'){event.preventDefault();closeHostActionDialog();return}
+      if(event.key==='Tab'){
+        const focusable=Array.from(overlay.querySelectorAll('button:not([hidden]):not(:disabled),input:not([hidden]):not(:disabled),select:not([hidden]):not(:disabled)')).filter(el=>el.offsetParent!==null);
+        if(focusable.length){const first=focusable[0],last=focusable[focusable.length-1];if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}}
+      }
+      return;
+    }
+    if(!openHostActionsRoot)return;
+    const menu=openHostActionsRoot.querySelector('[data-host-actions-menu]');
+    const items=visibleHostActionItems(menu);
+    const index=items.indexOf(document.activeElement);
+    if(event.key==='Escape'){event.preventDefault();closeHostActions(openHostActionsRoot,true)}
+    else if(event.key==='ArrowDown'){event.preventDefault();items[(index+1+items.length)%items.length]?.focus()}
+    else if(event.key==='ArrowUp'){event.preventDefault();items[(index-1+items.length)%items.length]?.focus()}
+    else if(event.key==='Home'){event.preventDefault();items[0]?.focus()}
+    else if(event.key==='End'){event.preventDefault();items[items.length-1]?.focus()}
+    else if(event.key==='Tab')closeHostActions(openHostActionsRoot);
+  });
+  document.querySelector('[data-host-remove-input]')?.addEventListener('input',event=>{
+    const primary=document.querySelector('[data-host-action-primary]');
+    if(!primary||!hostActionContext)return;
+    if(hostActionContext.action==='remove')primary.disabled=!hostActionConfirmationReady();
+    else if(hostActionContext.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
+  });
+  document.querySelector('[data-host-remove-disposition]')?.addEventListener('change',updateHostRemovalForm);
+  document.querySelector('[data-host-remove-successor-input]')?.addEventListener('input',updateHostRemovalForm);
+  document.querySelector('[data-host-attended-input]')?.addEventListener('change',()=>{
+    const primary=document.querySelector('[data-host-action-primary]');
+    if(primary&&hostActionContext?.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
+  });
+  document.querySelector('[data-host-action-cancel]')?.addEventListener('click',submitHostActionCancellation);
+  document.querySelector('[data-host-action-primary]')?.addEventListener('click',submitHostAction);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden){pauseHostActionPoll();return}
+    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
+  });
+  window.addEventListener('focus',()=>{
+    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
+  });
+  window.addEventListener('online',()=>{
+    if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);
+  });
+  window.addEventListener('offline',()=>{
+    pauseHostActionPoll();
+    const status=document.querySelector('[data-host-action-status]');
+    if(status&&hostActionContext)status.textContent='Offline. The saved workflow will refresh when connectivity returns.';
+  });
+  window.addEventListener('pagehide',stopHostActionPoll);
+  window.addEventListener('resize',()=>closeHostActions(openHostActionsRoot));
+  window.addEventListener('scroll',()=>closeHostActions(openHostActionsRoot),true);
+}
+function openRequestedWorkflow(){
+  const params=new URLSearchParams(location.search);
+  const host=(params.get('host')||'').trim();
+  const workflowId=(params.get('workflow')||'').trim();
+  if(!/^[a-z0-9-]{1,63}$/.test(host)||!/^[A-Za-z0-9_-]{8,128}$/.test(workflowId))return;
+  const surfaces=hostSurfaces(host);
+  const surface=surfaces.find(item=>item.offsetParent!==null)||surfaces[0];
+  const root=surface?.querySelector('[data-host-actions]');
+  if(!root)return;
+  root.dataset.actionJobId=workflowId;
+  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));
+}
+function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
+function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
+function historyWindowMeta(samples,windowDef){
+  if(samples.length<2)return {start:0,latest:0,span:1,candidates:[]};
+  const latest=samples[samples.length-1];
+  const start=Math.max(latest-windowDef.secs,samples[0]);
+  const span=Math.max(1,latest-start);
+  const candidates=samples.map((stamp,index)=>({stamp,index})).filter(item=>item.index>0&&item.stamp>=start&&item.stamp<=latest);
+  return {start,latest,span,candidates};
+}
+function visibleHistory(samples,windowDef){
+  const meta=historyWindowMeta(samples,windowDef);
+  if(meta.candidates.length<=HISTORY_DOTS)return {...meta,visible:meta.candidates};
+  const buckets=Array(HISTORY_DOTS).fill(null);
+  for(const item of meta.candidates){
+    const bucket=Math.min(HISTORY_DOTS-1,Math.max(0,Math.floor(((item.stamp-meta.start)/meta.span)*HISTORY_DOTS)));
+    buckets[bucket]=item;
+  }
+  return {...meta,visible:buckets.filter(Boolean)};
+}
+function historyInfo(beats,index,interval){
+  const stamp=beats[index];
+  const previous=index>0?beats[index-1]:null;
+  if(previous==null)return {level:'first',label:'first heartbeat',detail:'at '+clock(stamp)};
+  const gap=Math.max(0,stamp-previous);
+  if(gap<=interval)return {level:'ok',label:'on cadence',detail:dur(gap)+' after previous · '+clock(stamp)};
+  if(gap<=interval*2)return {level:'late',label:'late heartbeat',detail:dur(gap)+' after previous · '+clock(stamp)};
+  if(gap<=interval*5)return {level:'stale',label:'stale gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
+  return {level:'down',label:'offline gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
+}
+function freshRow(label,value,klass){return '<div class="fresh-row"><span>'+esc(label)+'</span><strong class="'+klass+'">'+esc(value)+'</strong></div>'}
+function freshValue(v,zero){
+  const n=Number(v);
+  if(v==null||!Number.isFinite(n))return {value:'unknown',klass:'na'};
+  if(n===0)return {value:zero,klass:'ok'};
+  return {value:String(n),klass:'warn'};
+}
+function freshHtml(f){
+  if(!f||f.applicable===false)return freshRow('Flake.lock age','n/a','na')+freshRow('Commits behind','n/a','na');
+  const age=freshValue(f.flake_lock_age_days,'fresh');
+  const commits=freshValue(f.commits_behind,'0');
+  if(age.klass==='warn')age.value=age.value+'d';
+  return freshRow('Flake.lock age',age.value,age.klass)+freshRow('Commits behind',commits.value,commits.klass);
+}
+function kernelNeedsRestart(kernel){
+  return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
+}
+function kernelSearch(kernel){
+  return kernelNeedsRestart(kernel)?'restart needed kernel reboot required '+kernel.running_version+' '+kernel.expected_version:'';
+}
+function updateKernel(surface,host){
+  const slot=surface.querySelector('[data-kernel-slot]');
+  if(!slot)return;
+  const required=kernelNeedsRestart(host.kernel);
+  slot.hidden=!required;
+  const reason=surface.querySelector('[data-reason]');
+  if(reason)reason.hidden=required;
+  const details=slot.querySelector('[data-kernel-posture]');
+  if(!required){
+    if(details)details.open=false;
+    return;
+  }
+  const healthy=host.liveness==='live';
+  const explanation=healthy
+    ? String(host.name||'This host')+' is healthy. A newer system kernel is ready for its next planned restart.'
+    : String(host.name||'This host')+' has a newer system kernel ready for its next planned restart.';
+  const explanationNode=slot.querySelector('[data-kernel-explanation]');
+  const running=slot.querySelector('[data-kernel-running]');
+  const expected=slot.querySelector('[data-kernel-expected]');
+  if(explanationNode)explanationNode.textContent=explanation;
+  if(running)running.textContent=host.kernel.running_version;
+  if(expected)expected.textContent=host.kernel.expected_version;
+}
+function freshnessAttention(f){
+  if(!f||f.applicable===false)return null;
+  const age=Number(f.flake_lock_age_days);
+  const commits=Number(f.commits_behind);
+  const hasAge=f.flake_lock_age_days!=null&&Number.isFinite(age);
+  const hasCommits=f.commits_behind!=null&&Number.isFinite(commits);
+  const ageWarn=hasAge&&age>0;
+  const commitsWarn=hasCommits&&commits>0;
+  if(ageWarn&&commitsWarn)return {label:'nix drift: '+age+'d · '+commits+' commits',level:'warn',rank:3};
+  if(ageWarn)return {label:'flake.lock '+age+'d',level:'warn',rank:3};
+  if(commitsWarn)return {label:commits+' commits behind',level:'warn',rank:3};
+  if(!hasAge||!hasCommits)return {label:'freshness unknown',level:'wait',rank:3};
+  return null;
+}
+function downAlertsSuppressed(preferences){
+  return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
+}
+function attentionFor(live,f,preferences){
+  if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
+  if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
+  if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
+  const freshness=freshnessAttention(f);
+  if(freshness)return freshness;
+  if(live==='down')return {label:preferences?.kind==='workstation'?'offline as expected':'down alerts muted',level:'ok',rank:4};
+  return {label:'all clear',level:'ok',rank:4};
+}
+const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
+const BACKUP_LEVEL={failed:'critical',missing:'critical',stale:'warning',warning:'warning',unknown:'watch','not-configured':'watch',healthy:'clear'};
+const BACKUP_LABEL={failed:'Backup failed',missing:'Backup missing',stale:'Backup stale',warning:'Review backup',unknown:'Backup pending','not-configured':'No backup',healthy:'Protected'};
+function backupRunLabel(state){
+  return ({succeeded:'succeeded',failed:'failed',running:'running',unknown:'unknown'})[state]||String(state||'unknown');
+}
+function backupDetail(obs,now){
+  if(!obs)return 'No backup signal yet';
+  if(obs.state==='healthy'&&Number.isFinite(Number(obs.last_success_at)))return 'last success '+dur(now-Number(obs.last_success_at))+' ago';
+  if(Number.isFinite(Number(obs.last_attempt_at))&&obs.last_attempt_state)return backupRunLabel(obs.last_attempt_state)+' · '+dur(now-Number(obs.last_attempt_at))+' ago';
+  return String(obs.summary||'backup status reported');
+}
+function backupInfo(host,now){
+  const observations=Array.isArray(host.backup_observations)?host.backup_observations:[];
+  if(!observations.length)return {state:'unknown',level:'watch',label:'Not observed',detail:'No backup signal yet',search:'',total:0};
+  const primary=[...observations].sort((a,b)=>(BACKUP_RANK[a.state]??4)-(BACKUP_RANK[b.state]??4))[0];
+  const state=primary.state||'unknown';
+  const label=BACKUP_LABEL[state]||'Backup pending';
+  const detail=backupDetail(primary,now);
+  const last=Number.isFinite(Number(primary.last_success_at))?dur(now-Number(primary.last_success_at))+' ago':'not yet';
+  const schedule=String(primary.schedule||'not declared');
+  const target=String(primary.target_label||'not declared');
+  return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' ')};
+}
+function updateBackup(surface,info){
+  const el=surface.querySelector('[data-backup-state]');
+  if(!el)return;
+  if(el.classList.contains('backup-chip')){
+    const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
+    const host=surface.dataset.host||'';
+    el.classList.remove('clear','watch','warning','critical');
+    el.classList.add(info.level);
+    el.dataset.backupState=info.state;
+    el.dataset.backupLevel=info.level;
+    el.dataset.backupGlyph=glyph;
+    el.href='/backups?host='+encodeURIComponent(host);
+    el.title='Backup: '+info.label+' - '+info.detail;
+    el.setAttribute('aria-label','Backup for '+host+': '+info.label+', '+info.detail);
+  }
+}
+function setReason(surface,reason){
+  const el=surface.querySelector('[data-reason]');
+  if(!el)return;
+  el.className='reason '+reason.level;
+  const text=el.querySelector('span');
+  if(text)text.textContent=reason.label;
+}
+function mutedInfo(preferences){
+  const alerts=preferences?.alerts||{};
+  const labels=[];
+  const workstation=preferences?.kind==='workstation';
+  if(!workstation&&alerts.suppress_down)labels.push('down');
+  if(alerts.suppress_backup)labels.push('backup');
+  if(alerts.suppress_nix_freshness)labels.push('Nix freshness');
+  const label=workstation
+    ? ['down alerts off for workstation',labels.length?labels.join(', ')+' muted':''].filter(Boolean).join(' · ')
+    : (labels.length?labels.join(', ')+' muted':'');
+  const search=label?(workstation?'workstation expected offline down alerts suppressed ':'muted alert preferences ')+label:'';
+  return {label,search};
+}
+function updateMuted(surface,info){
+  const el=surface.querySelector('[data-mute-note]');
+  if(!el)return;
+  el.hidden=!info.label;
+  el.title=info.label;
+  const text=el.querySelector('span');
+  if(text)text.textContent=info.label;
+}
+function updatePreferenceState(surface,host){
+  const applied=host.preferences||{};
+  const declared=host.declared_preferences||null;
+  const requested=host.requested_preferences||null;
+  const state=String(host.preferences_state||'applied');
+  const appliedColor=String(applied.accent||'');
+  const pendingSource=state==='request_pending'?requested:(declared||requested);
+  const pendingColor=String(pendingSource?.accent||'');
+  const validColor=value=>/^#[0-9a-fA-F]{6}$/.test(value);
+  surface.classList.toggle('has-settings',validColor(appliedColor));
+  if(validColor(appliedColor))surface.style.setProperty('--host-color',appliedColor);
+  else surface.style.removeProperty('--host-color');
+  if(validColor(pendingColor))surface.style.setProperty('--pending-color',pendingColor);
+  else surface.style.removeProperty('--pending-color');
+  const link=surface.querySelector('[data-settings-state]');
+  const label=state==='declared_not_applied'?'change waiting':state==='request_pending'?'change requested':'';
+  const name=surface.dataset.host||'host';
+  const title=label?label+' for '+name:'Open host settings for '+name;
+  if(link){
+    link.dataset.settingsState=state;
+    link.title=title;
+    link.setAttribute('aria-label',title);
+  }
+  const note=surface.querySelector('[data-settings-note]');
+  if(note){
+    note.hidden=!label;
+    note.dataset.settingsState=state;
+    const copy=note.querySelector('[data-settings-note-copy]');
+    if(copy)copy.textContent=label;
+  }
+}
+function markHtml(beats,interval,windowDef=signalWindow){
+  const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
+  if(kept.length<2)return '';
+  const cadence=Math.max(1,Number(interval)||60);
+  const newestX=EXPECT_X-HISTORY_STEP;
+  const view=visibleHistory(kept,windowDef);
+  return view.visible.map(item=>{
+    const x=((item.stamp-view.start)/view.span)*newestX;
+    const info=historyInfo(kept,item.index,cadence);
+    const title=info.label+' · '+info.detail;
+    return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
+  }).join('');
+}
+function syncHistoryStart(beat){
+  const first=beat.querySelector('.beat-mark');
+  const start=first?.style.getPropertyValue('--mark-x').trim()||'0%';
+  beat.style.setProperty('--history-start-x',start);
+}
+function signalInfo(beats,last,interval,now,windowDef=signalWindow){
+  const cadence=Math.max(1,Number(interval)||60);
+  const samples=Array.from(new Set(beats.concat(Number.isFinite(last)&&last>0?[last]:[]))).filter(Number.isFinite).filter(n=>n>0).sort((a,b)=>a-b);
+  if(!samples.length)return {text:'new',level:'wait',window:windowDef.label,title:'Signal over '+windowDef.label+': waiting for first heartbeat'};
+  const requestedStart=now-windowDef.secs;
+  const retainedStart=Math.max(requestedStart,samples[0]);
+  const span=Math.max(cadence,Math.min(windowDef.secs,now-retainedStart));
+  const expected=Math.max(1,Math.ceil(span/cadence));
+  const received=samples.filter(stamp=>stamp>=retainedStart&&stamp<=now).length;
+  let longestGap=Math.max(0,Math.min(now-samples[samples.length-1],span));
+  let previous=retainedStart;
+  for(const stamp of samples){
+    if(stamp<retainedStart||stamp>now)continue;
+    longestGap=Math.max(longestGap,stamp-previous);
+    previous=stamp;
+  }
+  longestGap=Math.max(longestGap,now-previous);
+  const percent=Math.max(0,Math.min(100,Math.round((received/expected)*100)));
+  const level=percent>=95?'good':percent>=75?'warn':'down';
+  const coverage=retainedStart>requestedStart?' · retained '+dur(span):'';
+  return {text:percent+'%',level,window:windowDef.label,title:'Signal over '+windowDef.label+': '+received+' of '+expected+' expected heartbeats received · longest gap '+dur(longestGap)+coverage};
+}
+function updateSignal(surface,info){
+  const signal=surface?.querySelector('[data-signal]');
+  if(!signal)return;
+  signal.dataset.signalLevel=info.level;
+  signal.dataset.signalWindowKey=info.window;
+  signal.title=info.title;
+  signal.setAttribute('aria-label',info.title);
+  const text=signal.querySelector('[data-signal-percent]');
+  if(text)text.textContent=info.text;
+  const windowLabel=signal.querySelector('[data-signal-window]');
+  if(windowLabel){
+    const next=SIGNAL_WINDOWS[(SIGNAL_WINDOWS.findIndex(w=>w.label===info.window)+1)%SIGNAL_WINDOWS.length]||SIGNAL_WINDOWS[0];
+    windowLabel.textContent=info.window;
+    windowLabel.title=info.title+'; click for '+next.label;
+    windowLabel.setAttribute('aria-label',info.title+'; click for '+next.label);
+  }
+}
+function setHistoryHint(mark,show){
+  const surface=mark.closest('[data-host]');
+  if(!surface)return;
+  const seen=surface.querySelector('[data-seen]');
+  const asof=surface.querySelector('[data-card-asof]');
+  if(!seen)return;
+  if(show){
+    surface.dataset.historyHint='true';
+    seen.textContent=mark.dataset.historyLabel||'historic heartbeat';
+    if(asof)asof.textContent=mark.dataset.historyDetail||'';
+  }else{
+    delete surface.dataset.historyHint;
+    seen.textContent=seen.dataset.defaultText||seen.textContent;
+    if(asof)asof.textContent=asof.dataset.defaultText||asof.textContent;
+  }
+}
+function bindHistoryHints(root=document){
+  root.querySelectorAll('.beat-mark').forEach(mark=>{
+    if(mark.dataset.hintBound==='true')return;
+    mark.dataset.hintBound='true';
+    mark.addEventListener('mouseenter',()=>setHistoryHint(mark,true));
+    mark.addEventListener('mouseleave',()=>setHistoryHint(mark,false));
+    mark.addEventListener('focus',()=>setHistoryHint(mark,true));
+    mark.addEventListener('blur',()=>setHistoryHint(mark,false));
+  });
+}
+function setBeatHistory(beat,beats,interval){
+  const all=Array.from(new Set(beats)).sort((a,b)=>a-b);
+  const view=visibleHistory(all,signalWindow);
+  const kept=view.visible.map(item=>item.stamp);
+  const cadence=Math.max(1,Number(interval)||Number(beat.dataset.interval)||60);
+  beat.dataset.signalBeats=all.join(',');
+  beat.dataset.beats=kept.join(',');
+  beat.dataset.count=String(kept.length);
+  beat.dataset.historyWindow=signalWindow.label;
+  const windowLabel=beat.querySelector('[data-history-window-label]');
+  if(windowLabel)windowLabel.textContent=signalWindow.label;
+  const marks=beat.querySelector('.beat-marks');
+  if(marks){
+    marks.innerHTML=markHtml(all,cadence,signalWindow);
+    syncHistoryStart(beat);
+    bindHistoryHints(marks);
+  }
+}
+function flashBeat(beat){
+  beat.dataset.flash='true';
+  window.setTimeout(()=>{delete beat.dataset.flash},950);
+}
+function heartbeatX(age,interval){
+  if(age<=interval)return (age/interval)*EXPECT_X;
+  if(age<=interval*2)return EXPECT_X+((age-interval)/interval)*(STALE_X-EXPECT_X);
+  if(age<=interval*5)return STALE_X+((age-interval*2)/(interval*3))*(100-STALE_X);
+  return 100;
+}
+function updateBeatClock(beat,now){
+  const last=Number(beat.dataset.last);
+  const interval=Math.max(1,Number(beat.dataset.interval)||60);
+  const surface=beat.closest('[data-host]');
+  if(!Number.isFinite(last)||last<=0){
+    beat.style.setProperty('--expect-alpha','.22');
+    beat.style.setProperty('--now-x','0%');
+    beat.style.setProperty('--fill-color','var(--wait)');
+    beat.style.setProperty('--expect-fill','0deg');
+    beat.style.setProperty('--target-ring','3px');
+    beat.style.setProperty('--late-alpha','.3');
+    beat.dataset.beat='waiting';
+    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats),last,interval,now));
+    return;
+  }
+  const age=Math.max(0,now-last);
+  const expect=Math.max(0,Math.min(1,age/interval));
+  const x=heartbeatX(age,interval);
+  beat.style.setProperty('--now-x',x.toFixed(2)+'%');
+  beat.style.setProperty('--expect-alpha',(.34+expect*.45).toFixed(3));
+  beat.style.setProperty('--expect-fill',(expect*360).toFixed(1)+'deg');
+  beat.style.setProperty('--target-ring',(3+expect*5).toFixed(1)+'px');
+  if(age<=interval){
+    beat.style.setProperty('--fill-color',beat.dataset.self==='true'?'var(--sun)':'var(--sea)');
+    beat.dataset.beat=beat.dataset.self==='true'?'lit':'tracking';
+  }else if(age<=interval*2){
+    beat.style.setProperty('--fill-color','var(--sun)');
+    beat.style.setProperty('--expect-alpha','.79');
+    beat.style.setProperty('--expect-fill','360deg');
+    beat.style.setProperty('--target-ring','8px');
+    beat.dataset.beat='late';
+  }else if(age<=interval*5){
+    beat.style.setProperty('--fill-color','var(--stale)');
+    beat.style.setProperty('--expect-alpha','.86');
+    beat.style.setProperty('--expect-fill','360deg');
+    beat.style.setProperty('--target-ring','8px');
+    beat.dataset.beat='stale';
+  }else{
+    beat.style.setProperty('--fill-color','var(--down)');
+    beat.style.setProperty('--expect-alpha','.86');
+    beat.style.setProperty('--expect-fill','360deg');
+    beat.style.setProperty('--target-ring','8px');
+    beat.dataset.beat='down';
+  }
+  updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,now));
+}
+let beatClockTimer=null;
+function stopBeatClock(){
+  if(beatClockTimer!=null)clearTimeout(beatClockTimer);
+  beatClockTimer=null;
+}
+function frame(){
+  stopBeatClock();
+  if(document.hidden||document.body.dataset.hostActionDialogOpen==='true')return;
+  if(!fleetSnapshotFresh()){
+    setFleetSyncState('stale');
+    if(typeof document.hasFocus!=='function'||document.hasFocus())recoverFleet('watchdog');
+    return;
+  }
+  const now=Date.now()/1000;
+  document.querySelectorAll('.beat').forEach(beat=>{
+    updateBeatClock(beat,now);
+  });
+  beatClockTimer=setTimeout(frame,1000);
+}
+function resumeBeatClock(){
+  stopBeatClock();
+  const main=fleetMain();
+  if(main?.dataset.fleetSyncState!=='current')return;
+  if(!document.hidden&&(typeof document.hasFocus!=='function'||document.hasFocus())&&document.body.dataset.hostActionDialogOpen!=='true')frame();
+}
+function setSeen(card,last,now){
+  const seen=card.querySelector('[data-seen]');
+  if(!seen)return;
+  const compact=seen.hasAttribute('data-seen-compact');
+  const text=last==null?(compact?'never':'never seen'):(compact?dur(now-last)+' ago':'last seen '+dur(now-last)+' ago');
+  seen.dataset.defaultText=text;
+  if(card.dataset.historyHint!=='true')seen.textContent=text;
+}
+function setCardAsOf(card,now){
+  const asof=card.querySelector('[data-card-asof]');
+  if(!asof)return;
+  const text='as of '+clock(now);
+  asof.dataset.defaultText=text;
+  if(card.dataset.historyHint!=='true')asof.textContent=text;
+}
+function sevFor(live){return live==='down'?0:live==='stale'?1:live==='awaiting_first_heartbeat'?2:3}
+function cmp(a,b,mode){
+  if(mode==='name')return a.dataset.sortName.localeCompare(b.dataset.sortName);
+  if(mode==='last')return Number(b.dataset.last||0)-Number(a.dataset.last||0)||a.dataset.sortName.localeCompare(b.dataset.sortName);
+  return Number(a.dataset.sev)-Number(b.dataset.sev)||a.dataset.sortName.localeCompare(b.dataset.sortName);
+}
+const FREEFORM_ORDER_KEY='pharos_freeform_order_v1';
+function readFreeformOrder(){
+  try{
+    const parsed=JSON.parse(window.localStorage.getItem(FREEFORM_ORDER_KEY)||'[]');
+    return Array.isArray(parsed)?parsed.filter(v=>typeof v==='string'&&v):[];
+  }catch(_){return []}
+}
+function writeFreeformOrder(){
+  const grid=document.querySelector('[data-grid]');
+  if(!grid)return;
+  try{
+    const order=Array.from(grid.querySelectorAll('.card')).map(el=>el.dataset.host).filter(Boolean);
+    window.localStorage.setItem(FREEFORM_ORDER_KEY,JSON.stringify(order));
+  }catch(_){}
+}
+function clearFreeformOrder(){
+  try{window.localStorage.removeItem(FREEFORM_ORDER_KEY)}catch(_){}
+}
+function sortByFreeformOrder(items,order){
+  const index=new Map(order.map((name,idx)=>[name,idx]));
+  return items.sort((a,b)=>{
+    const ai=index.has(a.dataset.host)?index.get(a.dataset.host):Number.MAX_SAFE_INTEGER;
+    const bi=index.has(b.dataset.host)?index.get(b.dataset.host):Number.MAX_SAFE_INTEGER;
+    return ai-bi||a.dataset.sortName.localeCompare(b.dataset.sortName);
+  });
+}
+function keepOnboardAffordanceLast(){
+  const grid=document.querySelector('[data-grid]');
+  const tile=document.querySelector('[data-onboard-tile]');
+  if(grid&&tile)grid.appendChild(tile);
+}
+function applyFreeformOrder(){
+  const grid=document.querySelector('[data-grid]');
+  const body=document.querySelector('[data-list-body]');
+  const order=readFreeformOrder();
+  if(!order.length){
+    writeFreeformOrder();
+    keepOnboardAffordanceLast();
+    return;
+  }
+  if(grid)sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order).forEach(el=>grid.appendChild(el));
+  if(body)sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order).forEach(el=>body.appendChild(el));
+  keepOnboardAffordanceLast();
+}
+function setArrangeMode(mode){
+  const main=document.querySelector('main');
+  if(main)main.dataset.arrange=mode;
+}
+function applySort(mode,write=true){
+  mode=['attention','name','last','freeform'].includes(mode)?mode:'attention';
+  const grid=document.querySelector('[data-grid]');
+  const body=document.querySelector('[data-list-body]');
+  setArrangeMode(mode);
+  if(mode==='freeform'){
+    applyFreeformOrder();
+  }else{
+    if(write)clearFreeformOrder();
+    if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
+    if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
+  }
+  keepOnboardAffordanceLast();
+  const select=document.querySelector('[data-sort]');
+  if(select)select.value=mode;
+  if(write)setCookie('pharos_sort',mode);
+}
+function applyView(view,write=true){
+  view=view==='list'?'list':'grid';
+  const main=document.querySelector('main');
+  if(main)main.dataset.view=view;
+  document.querySelectorAll('[data-view-button]').forEach(btn=>btn.setAttribute('aria-pressed',String(btn.dataset.viewButton===view)));
+  if(write)setCookie('pharos_view',view);
+}
+function hostMatchesSurface(el,q,live){
+  const text=q===''||String(el.dataset.search||'').includes(q);
+  const state=live==='all'||el.dataset.live===live;
+  return text&&state;
+}
+function updateGroupVisibility(){
+  document.querySelectorAll('.site-item').forEach(site=>{
+    const visible=Array.from(site.querySelectorAll('.site-host')).some(host=>!host.hidden);
+    site.hidden=!visible;
+  });
+}
+function updateSummaryFilterButtons(){
+  document.querySelectorAll('[data-live-filter]').forEach(btn=>{
+    const active=btn.dataset.liveFilter===activeLiveFilter;
+    btn.setAttribute('aria-pressed',active?'true':'false');
+  });
+}
+function applySurfaceFilters(write=true){
+  const q=activeSearch.trim().toLowerCase();
+  document.querySelectorAll('[data-host]').forEach(el=>{
+    if(el.dataset.mapLayer==='managed')return;
+    el.hidden=!hostMatchesSurface(el,q,activeLiveFilter);
+  });
+  updateGroupVisibility();
+  if(typeof window.pharosMapApplyFilter==='function')window.pharosMapApplyFilter(q,activeLiveFilter);
+  updateSummaryFilterButtons();
+  if(write){
+    setCookie('pharos_search',activeSearch);
+    setCookie('pharos_live_filter',activeLiveFilter);
+  }
+}
+function applyFilter(query,write=true){
+  activeSearch=query;
+  const input=document.querySelector('[data-search]');
+  if(input&&input.value!==query)input.value=query;
+  applySurfaceFilters(write);
+}
+function applyLiveFilter(filter,write=true){
+  activeLiveFilter=['all','live','stale','down','awaiting_first_heartbeat'].includes(filter)?filter:'all';
+  applySurfaceFilters(write);
+}
+function applySignalWindow(key,write=true){
+  signalWindow=signalWindowByKey(key);
+  document.querySelectorAll('.beat').forEach(beat=>{
+    const surface=beat.closest('[data-host]');
+    const last=Number(beat.dataset.last);
+    const interval=Math.max(1,Number(beat.dataset.interval)||60);
+    setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),interval);
+    updateSignal(surface,signalInfo(parseBeats(beat.dataset.signalBeats||beat.dataset.beats),last,interval,Date.now()/1000,signalWindow));
+  });
+  if(write)setCookie('pharos_signal_window',signalWindow.key);
+}
+function cycleSignalWindow(){
+  const idx=SIGNAL_WINDOWS.findIndex(w=>w.key===signalWindow.key);
+  applySignalWindow(SIGNAL_WINDOWS[(idx+1)%SIGNAL_WINDOWS.length].key);
+  updateUrlState();
+}
+function freeformTarget(grid,x,y){
+  let best=null;
+  let bestDistance=Infinity;
+  let bestAfter=false;
+  grid.querySelectorAll('.card:not([data-dragging]):not([hidden])').forEach(card=>{
+    const box=card.getBoundingClientRect();
+    const cx=box.left+box.width/2;
+    const cy=box.top+box.height/2;
+    const distance=Math.hypot(x-cx,(y-cy)*1.35);
+    if(distance<bestDistance){
+      best=card;
+      bestDistance=distance;
+      bestAfter=y>cy||Math.abs(y-cy)<box.height*.42&&x>cx;
+    }
+  });
+  return {card:best,after:bestAfter};
+}
+function bindFreeformDrag(){
+  const grid=document.querySelector('[data-grid]');
+  if(!grid||grid.dataset.freeformBound==='true')return;
+  grid.dataset.freeformBound='true';
+  let drag=null;
+  function finish(){
+    if(!drag)return;
+    delete drag.card.dataset.dragging;
+    drag.card.style.zIndex='';
+    delete grid.dataset.freeformDragging;
+    writeFreeformOrder();
+    applyFreeformOrder();
+    drag=null;
+  }
+  grid.addEventListener('pointerdown',event=>{
+    const handle=event.target.closest('[data-drag-handle]');
+    if(!handle||!grid.contains(handle))return;
+    if(document.querySelector('main')?.dataset.arrange!=='freeform')return;
+    if(event.button!==0)return;
+    const card=handle.closest('.card');
+    if(!card)return;
+    event.preventDefault();
+    handle.setPointerCapture?.(event.pointerId);
+    drag={card,pointerId:event.pointerId};
+    card.dataset.dragging='true';
+    card.style.zIndex='20';
+    grid.dataset.freeformDragging='true';
+  });
+  grid.addEventListener('pointermove',event=>{
+    if(!drag||event.pointerId!==drag.pointerId)return;
+    event.preventDefault();
+    const target=freeformTarget(grid,event.clientX,event.clientY);
+    if(!target.card){
+      grid.appendChild(drag.card);
+      return;
+    }
+    const before=target.after?target.card.nextSibling:target.card;
+    if(before!==drag.card)grid.insertBefore(drag.card,before);
+  });
+  grid.addEventListener('pointerup',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
+  grid.addEventListener('pointercancel',event=>{if(drag&&event.pointerId===drag.pointerId)finish()});
+  window.addEventListener('blur',finish);
+}
+const ASSISTANT_SETUP_PARAM='setup';
+const ASSISTANT_PATH_PARAM='setup_path';
+const ASSISTANT_PROVIDER_PARAM='setup_provider';
+const ASSISTANT_TEMPLATE_PARAM='setup_template';
+const ASSISTANT_STAGE_PARAM='setup_stage';
+const ASSISTANT_JOB_PARAM='setup_job';
+const ASSISTANT_TEMPLATE_PROVIDERS={
+	  'hetzner-small-nixos':'hetzner-cloud',
+	  'hetzner-lab':'hetzner-cloud',
+	  'bring-own-plan':'hetzner-cloud',
+	  'manual-import':'manual-import',
+	  'netcup-manual-import':'manual-import',
+	  'oracle-always-free-lab':'manual-import',
+	  'gcp-free-tier-lab':'manual-import',
+	  'nixos-anywhere':'existing-host',
+  'native-systemd':'existing-host',
+  'manual-deferred':'existing-host'
+};
+function assistantPath(path){
+  return ['new','existing'].includes(path)?path:'';
+}
+function assistantProvider(provider){
+  return ['hetzner-cloud','manual-import','existing-host'].includes(provider)?provider:'';
+}
+function assistantTemplate(template){
+  return Object.prototype.hasOwnProperty.call(ASSISTANT_TEMPLATE_PROVIDERS,template)?template:'';
+}
+function assistantStage(stage){
+  return ['choose','template','existing','bootstrap','plan','job'].includes(stage)?stage:'choose';
+}
+function assistantState(overlay){
+  return {
+    path: assistantPath(overlay?.dataset.assistantSelectedPath||''),
+    provider: assistantProvider(overlay?.dataset.assistantSelectedProvider||''),
+    template: assistantTemplate(overlay?.dataset.assistantSelectedTemplate||''),
+    stage: assistantStage(overlay?.dataset.assistantStage||'choose')
+  };
+}
+function writeAssistantUrl(open,path='',provider='',template='',stage='choose'){
+  const params=new URLSearchParams(location.search);
+  if(open){
+    params.set(ASSISTANT_SETUP_PARAM,'add-server');
+    const safePath=assistantPath(path);
+    if(safePath)params.set(ASSISTANT_PATH_PARAM,safePath);
+    else params.delete(ASSISTANT_PATH_PARAM);
+    const safeProvider=safePath==='new'?assistantProvider(provider):'';
+    const safeTemplate=safePath==='new'?assistantTemplate(template):'';
+    if(safeProvider)params.set(ASSISTANT_PROVIDER_PARAM,safeProvider);
+    else params.delete(ASSISTANT_PROVIDER_PARAM);
+    if(safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===safeProvider)params.set(ASSISTANT_TEMPLATE_PARAM,safeTemplate);
+    else params.delete(ASSISTANT_TEMPLATE_PARAM);
+    let safeStage='choose';
+    if(safePath==='new')safeStage=safeTemplate&&assistantStage(stage)==='plan'?'plan':'template';
+    if(safePath==='existing')safeStage=['bootstrap','plan'].includes(assistantStage(stage))?assistantStage(stage):'existing';
+    const jobId=(document.querySelector('[data-setup-assistant]')?.dataset.assistantJobId||'').trim();
+    if(jobId&&jobId.length<=128){
+      const paidStage=document.querySelector('[data-setup-assistant]')?.dataset.assistantPaidStage||'';
+      safeStage=['reviewed','authorized','claimed','reconcile'].includes(paidStage)?'plan':'job';
+      params.set(ASSISTANT_JOB_PARAM,jobId);
+    }else{
+      params.delete(ASSISTANT_JOB_PARAM);
+    }
+    if(safeStage!=='choose')params.set(ASSISTANT_STAGE_PARAM,safeStage);
+    else params.delete(ASSISTANT_STAGE_PARAM);
+  }else{
+    params.delete(ASSISTANT_SETUP_PARAM);
+    params.delete(ASSISTANT_PATH_PARAM);
+    params.delete(ASSISTANT_PROVIDER_PARAM);
+    params.delete(ASSISTANT_TEMPLATE_PARAM);
+    params.delete(ASSISTANT_STAGE_PARAM);
+    params.delete(ASSISTANT_JOB_PARAM);
+  }
+  const query=params.toString();
+  history.replaceState(null,'',location.pathname+(query?'?'+query:''));
+}
+function syncAssistantNext(overlay){
+  const {path,provider,stage}=assistantState(overlay);
+  overlay.dataset.assistantStage=stage;
+  const title=overlay.querySelector('#setup-assistant-title');
+  const copy=title?.parentElement?.querySelector('p');
+  const back=overlay.querySelector('[data-assistant-step-back]');
+  if(back)back.hidden=stage==='choose'||stage==='job'||overlay.dataset.providerCreated==='true'||Boolean(overlay.dataset.assistantJobId);
+  if(stage==='template'){
+    if(title)title.textContent=provider==='manual-import'?'Connect a server':'New server';
+    if(copy)copy.textContent=provider==='manual-import'?'Choose the provider handoff.':'Choose a starting point.';
+  }else if(stage==='existing'){
+    if(title)title.textContent='Existing server';
+    if(copy)copy.textContent='Enter the server you already control.';
+  }else if(stage==='bootstrap'){
+    if(title)title.textContent='Choose setup';
+    if(copy)copy.textContent='Pick the available installation method.';
+  }else if(stage==='plan'&&path==='new'){
+    const paidStage=overlay.dataset.assistantPaidStage||'';
+    if(title)title.textContent=paidStage==='reconcile'?'Check provider result':paidStage==='claimed'?'Continue authorized create':paidStage==='authorized'?'Create authorized server':paidStage==='reviewed'?'Authorize paid plan':'Review server';
+    if(copy)copy.textContent=paidStage==='reconcile'?'Pharos will inspect exact ownership labels without replaying the paid request.':paidStage==='claimed'?'The create is durably claimed, but the provider request has not started.':paidStage?'The exact provider plan is persisted. Nothing has been created yet.':'Nothing has been created yet.';
+  }else if(stage==='plan'&&path==='existing'){
+    if(title)title.textContent='Review setup';
+    if(copy)copy.textContent='No host changes have been started yet.';
+  }else if(stage!=='job'){
+    if(title)title.textContent='Add a server';
+    if(copy)copy.textContent='What would you like to add?';
+  }
+  updateAssistantReview(overlay);
+  syncAssistantStart(overlay);
+}
+function showAssistantError(overlay,message=''){
+  const error=overlay?.querySelector('[data-assistant-error]');
+  if(!error)return;
+  error.textContent=message;
+  error.hidden=!message;
+}
+function provisioningJobTerminal(state){
+  return ['complete','failed','cleanup-needed'].includes(state||'');
+}
+function provisioningJobLabel(state){
+  return String(state||'pending').replace(/-/g,' ');
+}
+function latestProvisioningMessage(job){
+  const progress=Array.isArray(job?.progress)?job.progress:[];
+  const latest=progress[progress.length-1];
+  return latest?.message||'Tracked setup job is waiting for progress.';
+}
+const BACKUP_INTENT_COPY={
+  'required':['backup required','observe existing jobs or queue Pharos enrollment'],
+  'optional':['backup optional','offer enrollment, but do not block onboarding'],
+  'external':['managed elsewhere','observe external backup evidence when available'],
+  'enroll-later':['enroll later','queue backup enrollment after first heartbeat'],
+  'absent':['no backups','record that backups are intentionally absent'],
+  'deferred':['backup decision pending','ask again before marking onboarding complete']
+};
+const LOCATION_INTENT_COPY={
+  'auto':['auto location','use runtime auto-detection when the beacon reports'],
+  'manual':['manual location','collect declared coordinates outside runtime facts'],
+  'site-fallback':['site fallback','use provider or site fallback when runtime is missing'],
+  'hidden':['hidden location','keep host coordinates hidden']
+};
+const ACCESS_INTENT_COPY={
+  'operator-only':['operator only','keep visibility scoped to the onboarding operator until review'],
+  'all-operators':['all operators','grant the normal operator group after the host reports'],
+  'limited-users':['limited users','create an explicit host access grant before broadening visibility'],
+  'deferred':['access decision pending','ask again before making the host broadly visible']
+};
+function setupIntentChoice(overlay,name,fallback){
+  return overlay.querySelector(`input[name="${name}"]:checked`)?.value||fallback;
+}
+const SETUP_TEMPLATE_REVIEW={
+  'hetzner-small-nixos':'Small NixOS',
+  'hetzner-lab':'Lab NixOS',
+  'bring-own-plan':'Custom NixOS'
+};
+function assistantReviewValue(overlay,selector,fallback=''){
+  return (overlay.querySelector(selector)?.value||fallback).trim();
+}
+function assistantStartLabel(start){
+  return start?.querySelector('[data-assistant-start-label]')?.textContent||start?.textContent||'';
+}
+function setAssistantStartLabel(start,label){
+  const node=start?.querySelector('[data-assistant-start-label]');
+  if(node)node.textContent=label;
+  else if(start)start.textContent=label;
+}
+function updateAssistantReview(overlay){
+  if(!overlay||overlay.dataset.providerCreated==='true')return;
+  const state=assistantState(overlay);
+  const reviewing=state.stage==='plan';
+  const details=overlay.querySelector('[data-assistant-review-details]');
+  const advancedLabel=overlay.querySelector('[data-assistant-advanced-label]');
+  const confirmCopy=overlay.querySelector('[data-assistant-confirm-copy]');
+  const start=overlay.querySelector('[data-assistant-start]');
+  if(reviewing&&state.path==='new'&&!['reviewed','authorized'].includes(overlay.dataset.assistantPaidStage||'')){
+    if(advancedLabel)advancedLabel.textContent='Advanced server options';
+    if(assistantStartLabel(start)!=='Saving review')setAssistantStartLabel(start,'Review paid plan');
+    const location=assistantReviewValue(overlay,'[data-new-location]');
+    const serverType=assistantReviewValue(overlay,'[data-new-server-type]');
+    const template=SETUP_TEMPLATE_REVIEW[state.template]||'NixOS server';
+    const provider=overlay.querySelector('[data-review-provider]');
+    const server=overlay.querySelector('[data-review-server]');
+    const setup=overlay.querySelector('[data-review-setup]');
+    const after=overlay.querySelector('[data-review-after]');
+    if(provider)provider.textContent=`Hetzner Cloud · ${providerLocationLabel(location)}`;
+    if(server)server.textContent=`${template} · ${serverType.toUpperCase()}`;
+    if(setup)setup.textContent='NixOS + Pharos';
+    if(after){
+      const backup=BACKUP_INTENT_COPY[setupIntentChoice(overlay,'backup_intent','deferred')]?.[0]||'backup decision pending';
+      const locationIntent=LOCATION_INTENT_COPY[setupIntentChoice(overlay,'location_intent','auto')]?.[0]||'auto location';
+      const access=ACCESS_INTENT_COPY[setupIntentChoice(overlay,'access_intent','operator-only')]?.[0]||'operator only';
+      after.textContent=[backup,locationIntent,access]
+        .map(value=>value.charAt(0).toUpperCase()+value.slice(1))
+        .join(' · ');
+    }
+  }else if(reviewing&&state.path==='existing'){
+    if(advancedLabel)advancedLabel.textContent='Advanced setup';
+    if(confirmCopy)confirmCopy.textContent='I reviewed this setup path.';
+    if(assistantStartLabel(start)!=='Starting setup')setAssistantStartLabel(start,'Record setup path');
+    const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'Existing server').trim()||'Existing server';
+    const request=existingPreflightRequest(overlay);
+    const connection=request.ssh.route==='none'?'Manual handoff':`${request.ssh.route}${request.ssh.host?` · ${request.ssh.host}`:''}`;
+    const selected=overlay.querySelector('[data-bootstrap-option][data-selected="true"] strong');
+    const values={
+      '[data-existing-review-host]':hostName,
+      '[data-existing-review-connection]':connection,
+      '[data-existing-review-method]':selected?.textContent||'Selected setup method'
+    };
+    Object.entries(values).forEach(([selector,value])=>{
+      const node=overlay.querySelector(selector);
+      if(node)node.textContent=value;
+    });
+  }
+  if(details&&state.stage!=='plan')details.open=false;
+}
+function providerPlanResourceTitle(resource){
+  return String(resource?.key||'provider resource').replace(/_/g,' ').replace(/\b\w/g,letter=>letter.toUpperCase());
+}
+let currentProviderCatalog=null;
+let assistantReturnFocus=null;
+function providerPlanAvailability(serverType,location){
+  return (Array.isArray(serverType?.locations)?serverType.locations:[]).find(item=>item?.name===location&&item?.available&&item?.monthly_gross);
+}
+function providerMoneyLabel(value,currency){
+  const amount=Number(value);
+  const code=String(currency||'').trim().toUpperCase();
+  if(!Number.isFinite(amount)||amount<0)return [String(value||''),code].filter(Boolean).join(' ');
+  try{
+    return new Intl.NumberFormat(undefined,{style:'currency',currency:code,minimumFractionDigits:2,maximumFractionDigits:2}).format(amount);
+  }catch(_error){
+    return `${new Intl.NumberFormat(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}).format(amount)}${code?` ${code}`:''}`;
+  }
+}
+function providerPlanLabel(serverType,location,currency){
+  const availability=providerPlanAvailability(serverType,location);
+  const price=availability?.monthly_gross?` · ${providerMoneyLabel(availability.monthly_gross,currency)}/month`:'';
+  return `${serverType?.name||'Plan'} · ${serverType?.cores||0} vCPU · ${serverType?.memory_gb||0} GB${price}`;
+}
+function recommendedProviderPlan(catalog,location){
+  return (Array.isArray(catalog?.server_types)?catalog.server_types:[])
+    .filter(serverType=>serverType?.architecture==='x86'&&Number(serverType?.cores)>=2&&Number(serverType?.memory_gb)>=4&&providerPlanAvailability(serverType,location))
+    .sort((left,right)=>Number(providerPlanAvailability(left,location)?.monthly_gross)-Number(providerPlanAvailability(right,location)?.monthly_gross)||String(left?.name).localeCompare(String(right?.name)))[0]||null;
+}
+function populateProviderPlanChoices(overlay,catalog,defaults){
+  currentProviderCatalog=catalog||null;
+  overlay.pharosProviderCatalog=catalog||null;
+  overlay.pharosProviderDefaults=defaults||null;
+  const locationSelect=overlay.querySelector('[data-new-location]');
+  const planSelect=overlay.querySelector('[data-new-server-type]');
+  const sshSelect=overlay.querySelector('[data-new-ssh-key]');
+  const locations=(Array.isArray(catalog?.locations)?catalog.locations:[]).filter(location=>(catalog?.server_types||[]).some(serverType=>providerPlanAvailability(serverType,location.name)));
+  if(locationSelect){
+    const previous=locationSelect.value;
+    locationSelect.replaceChildren(...locations.map(location=>new Option(`${location.city} (${location.name})`,location.name)));
+    const preferred=[previous,defaults?.location].find(value=>value&&locations.some(location=>location.name===value));
+    if(preferred)locationSelect.value=preferred;
+  }
+  const populatePlans=()=>{
+    if(!planSelect)return;
+    const location=locationSelect?.value||'';
+    const plans=(Array.isArray(catalog?.server_types)?catalog.server_types:[]).filter(serverType=>providerPlanAvailability(serverType,location));
+    const previous=planSelect.value;
+    planSelect.replaceChildren(...plans.map(serverType=>new Option(providerPlanLabel(serverType,location,catalog?.currency||''),serverType.name)));
+    const recommended=recommendedProviderPlan(catalog,location)?.name;
+    const preferred=[previous,defaults?.server_type,recommended].find(value=>value&&plans.some(serverType=>serverType.name===value));
+    if(preferred)planSelect.value=preferred;
+    updateAssistantReview(overlay);
+    syncAssistantStart(overlay);
+  };
+  populatePlans();
+  if(locationSelect&&locationSelect.dataset.catalogBound!=='true'){
+    locationSelect.dataset.catalogBound='true';
+    locationSelect.addEventListener('change',populatePlans);
+  }
+  if(sshSelect){
+    const defaultLabel=defaults?.ssh_key_ref?`Use connection default (${defaults.ssh_key_ref})`:'Use connection default';
+    const options=[new Option(defaultLabel,'')].concat((catalog?.ssh_keys||[]).map(value=>new Option(value,value)));
+    sshSelect.replaceChildren(...options);
+  }
+}
+function renderProviderPlanReview(overlay,payload){
+  const plan=payload?.plan||null;
+  const runtime=payload?.runtime||null;
+  overlay.pharosProviderPlan=plan;
+  overlay.pharosProviderRuntime=runtime;
+  populateProviderPlanChoices(overlay,payload?.catalog||null,payload?.defaults||null);
+  const list=overlay.querySelector('[data-provider-plan-resources]');
+  if(list&&plan){
+    list.replaceChildren();
+    (Array.isArray(plan.resources)?plan.resources:[]).filter(resource=>resource?.required).forEach(resource=>{
+      const row=document.createElement('div');
+      row.className='assistant-plan-row';
+      const copy=document.createElement('span');
+      const title=document.createElement('strong');
+      title.textContent=providerPlanResourceTitle(resource);
+      const detail=document.createElement('span');
+      detail.textContent=resource.detail||'Required before server creation.';
+      copy.append(title,detail);
+      const status=document.createElement('em');
+      status.className='assistant-plan-chip';
+      status.textContent='required';
+      row.append(copy,status);
+      list.append(row);
+    });
+  }
+  updateProviderReadiness(overlay);
+}
+function updateProviderReadiness(overlay){
+  const runtime=overlay?.pharosProviderRuntime||null;
+  const readiness=overlay?.querySelector('[data-provider-readiness]');
+  const sshKey=assistantReviewValue(overlay,'[data-new-ssh-key]');
+  const keyReady=Boolean(runtime?.default_ssh_key_configured||sshKey);
+  const planReady=Boolean(assistantReviewValue(overlay,'[data-new-location]')&&assistantReviewValue(overlay,'[data-new-server-type]'));
+  const durableReady=runtime?.durable_job_store_ready===true;
+  const projectAvailable=runtime?.paid_project_available===true;
+  const ready=Boolean(runtime?.provider_ready&&durableReady&&projectAvailable&&keyReady&&planReady);
+  const activationRequired=runtime?.connection_ready===true&&runtime?.execution_enabled===false;
+  if(readiness){
+    readiness.dataset.state=ready?'ready':activationRequired?'attention':'blocked';
+    const message=readiness.querySelector('span');
+    if(message){
+      message.textContent=ready
+        ? 'Provider connection, SSH public key, and firewall are ready.'
+        : activationRequired
+          ? 'Provider setup is complete. This Pharos installation must enable managed creation before paid review can begin.'
+        : !durableReady
+          ? 'Configure durable Pharos persistence before reviewing a paid server.'
+          : !projectAvailable
+            ? 'Resolve the existing paid attempt or tracked server before starting another.'
+            : runtime?.message||'Provider readiness could not be verified.';
+    }
+    const setup=readiness.querySelector('[data-provider-setup]');
+    if(setup){
+      setup.hidden=ready;
+      setup.textContent=activationRequired?'Review activation step':'Set up provider';
+      const params=new URLSearchParams();
+      params.set('return',location.pathname+location.search);
+      setup.href='/settings/providers/hetzner-cloud?'+params.toString();
+    }
+  }
+  syncAssistantStart(overlay);
+}
+function syncAssistantStart(overlay){
+  const state=assistantState(overlay);
+  const start=overlay.querySelector('[data-assistant-start]');
+  const confirmed=Boolean(overlay.querySelector('[data-assistant-confirm]')?.checked);
+  if(!start)return;
+  if(state.path==='new'){
+    const paidStage=overlay.dataset.assistantPaidStage||'';
+    if(['reviewed','authorized','claimed','reconcile'].includes(paidStage)){
+      start.disabled=overlay.dataset.assistantPaidActionPending==='true'||!overlay.pharosProvisioningJob?.reviewed_plan;
+      return;
+    }
+    const runtime=overlay.pharosProviderRuntime||null;
+    const keyReady=Boolean(runtime?.default_ssh_key_configured||assistantReviewValue(overlay,'[data-new-ssh-key]'));
+    const inputsReady=[
+      '[data-new-host-name]',
+      '[data-new-role]',
+      '[data-new-location]',
+      '[data-new-server-type]',
+      '[data-new-image]'
+    ].every(selector=>Boolean(assistantReviewValue(overlay,selector)));
+    start.disabled=!(runtime?.provider_ready&&runtime?.durable_job_store_ready===true&&runtime?.paid_project_available===true&&runtime?.project_label_configured&&keyReady&&inputsReady);
+  }else{
+    start.disabled=!confirmed;
+  }
+}
+async function loadProviderPlanReview(overlay){
+  const state=assistantState(overlay);
+  if(state.path!=='new'||state.provider!=='hetzner-cloud'||!state.template)return;
+  overlay.pharosProviderRuntime=null;
+  updateProviderReadiness(overlay);
+  const params=new URLSearchParams({provider:state.provider,template:state.template});
+  const response=await fetch(`/setup/provider-plan.json?${params.toString()}`,{
+    credentials:'same-origin',
+    headers:{'accept':'application/json'},
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'provider plan could not be loaded');
+  renderProviderPlanReview(overlay,payload);
+}
+function primaryProviderResource(job){
+  const resources=Array.isArray(job?.provider_resources)?job.provider_resources:[];
+  return resources.find(resource=>resource?.provider==='hetzner-cloud'&&resource?.kind==='server')||null;
+}
+function providerLocationLabel(location){
+  const value=String(location||'').trim();
+  const match=(currentProviderCatalog?.locations||[]).find(item=>item?.name===value);
+  return match?.city||value.toUpperCase()||'Provider location';
+}
+function providerSshLabel(resource){
+  const ssh=resource?.ssh||{};
+  if(!ssh.host)return 'Not available';
+  const user=ssh.user?`${ssh.user}@`:'';
+  const port=ssh.port&&Number(ssh.port)!==22?`:${ssh.port}`:'';
+  return `${user}${ssh.host}${port}`;
+}
+function paidPlanExpired(job){
+  const expiresAt=Number(job?.reviewed_plan?.expires_at||0);
+  return !Number.isFinite(expiresAt)||expiresAt<=Math.floor(Date.now()/1000);
+}
+function paidPlanTimeLabel(seconds){
+  const instant=new Date(Number(seconds)*1000);
+  if(!Number.isFinite(instant.getTime()))return 'Invalid expiry';
+  return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(instant);
+}
+function setPaidPlanTime(overlay,selector,seconds,fallback='not recorded'){
+  const node=overlay.querySelector(selector);
+  if(!node)return;
+  const instant=new Date(Number(seconds)*1000);
+  if(!Number.isFinite(instant.getTime())||Number(seconds)<=0){
+    node.textContent=fallback;
+    node.removeAttribute('datetime');
+    return;
+  }
+  node.textContent=paidPlanTimeLabel(seconds);
+  node.dateTime=instant.toISOString();
+}
+function setPaidPlanText(overlay,selector,value){
+  const node=overlay.querySelector(selector);
+  if(node)node.textContent=String(value||'not recorded');
+}
+function renderPaidPlanReview(overlay,job,authoritative=false){
+  const plan=job?.reviewed_plan;
+  if(!overlay||!job?.id||!plan)return false;
+  if(authoritative)delete overlay.dataset.assistantPaidActionPending;
+  delete overlay.dataset.providerCreated;
+  overlay.dataset.assistantSelectedPath='new';
+  overlay.dataset.assistantSelectedProvider='hetzner-cloud';
+  overlay.dataset.assistantSelectedTemplate=assistantTemplate(job.template||'')||'hetzner-small-nixos';
+  overlay.dataset.assistantStage='plan';
+  overlay.dataset.assistantJobId=job.id;
+  const executionState=String(job.paid_execution?.state||'');
+  const claimed=executionState==='claimed';
+  const reconciling=['request-started','uncertain'].includes(executionState);
+  overlay.dataset.assistantPaidStage=reconciling?'reconcile':claimed?'claimed':job.paid_authorization?'authorized':'reviewed';
+  overlay.pharosProvisioningJob=job;
+  const jobBox=overlay.querySelector('[data-assistant-job]');
+  const created=overlay.querySelector('[data-assistant-created]');
+  if(jobBox)jobBox.hidden=true;
+  if(created)created.hidden=true;
+  const hostName=overlay.querySelector('[data-new-host-name]');
+  if(hostName&&job.host_name)hostName.value=job.host_name;
+  const currency=plan.price_currency||'';
+  setPaidPlanText(overlay,'[data-paid-server-name]',plan.server_name);
+  setPaidPlanText(overlay,'[data-paid-provider-project]',plan.provider_project);
+  setPaidPlanText(overlay,'[data-paid-region]',[plan.location_label,plan.location].filter(Boolean).join(' · '));
+  setPaidPlanText(overlay,'[data-paid-server-type]',[plan.server_type_label,plan.server_type].filter(Boolean).join(' · '));
+  setPaidPlanText(overlay,'[data-paid-image]',plan.image);
+  setPaidPlanText(overlay,'[data-paid-price-hourly]',`${plan.price_hourly_gross} ${currency} / hour`);
+  setPaidPlanText(overlay,'[data-paid-price-monthly]',`${plan.price_monthly_gross} ${currency} / month`);
+  setPaidPlanText(overlay,'[data-paid-cap-hourly]',`${plan.max_hourly_gross} ${currency} / hour`);
+  setPaidPlanText(overlay,'[data-paid-cap-monthly]',`${plan.max_monthly_gross} ${currency} / month`);
+  setPaidPlanText(overlay,'[data-paid-max-active]',`${plan.max_active_servers} maximum · ${plan.observed_active_servers} currently observed`);
+  setPaidPlanText(overlay,'[data-paid-ssh-key]',plan.ssh_key_ref);
+  setPaidPlanText(overlay,'[data-paid-firewall]',plan.firewall_ref);
+  setPaidPlanText(overlay,'[data-paid-operations]',(Array.isArray(plan.allowed_operations)?plan.allowed_operations:[]).join(', '));
+  setPaidPlanText(overlay,'[data-paid-cleanup]',plan.cleanup_policy);
+  setPaidPlanText(overlay,'[data-paid-plan-hash]',plan.plan_sha256);
+  setPaidPlanTime(overlay,'[data-paid-catalog-refreshed]',plan.catalog_refreshed_at);
+  setPaidPlanTime(overlay,'[data-paid-expiry]',plan.expires_at);
+  setPaidPlanTime(overlay,'[data-paid-confirmed-at]',job.paid_authorization?.confirmed_at,'not authorized');
+  const executionFacts=[];
+  if(executionState)executionFacts.push(executionState);
+  if(job.paid_execution?.claimed_at)executionFacts.push(`claimed ${paidPlanTimeLabel(job.paid_execution.claimed_at)}`);
+  if(job.paid_execution?.provider_request_started_at)executionFacts.push(`provider request started ${paidPlanTimeLabel(job.paid_execution.provider_request_started_at)}`);
+  setPaidPlanText(overlay,'[data-paid-execution-state]',executionFacts.join(' · ')||'not started');
+  const labels=overlay.querySelector('[data-paid-labels]');
+  if(labels){
+    labels.replaceChildren();
+    Object.entries(plan.required_labels||{}).sort(([left],[right])=>left.localeCompare(right)).forEach(([key,value])=>{
+      const item=document.createElement('li');
+      item.textContent=`${key}=${value}`;
+      labels.append(item);
+    });
+  }
+  const authorized=Boolean(job.paid_authorization);
+  const expired=paidPlanExpired(job)&&!claimed;
+  const stage=overlay.querySelector('[data-paid-stage-status]');
+  const boundary=overlay.querySelector('[data-paid-billing-boundary]');
+  const next=overlay.querySelector('[data-paid-next-step]');
+  const authorization=overlay.querySelector('[data-paid-authorization]');
+  const operator=overlay.querySelector('[data-paid-operator]');
+  if(stage)stage.textContent=reconciling?'Create result check required':expired?'Review expired':claimed?'Authorized create claimed':authorized?'Authorized':'Persisted review';
+  if(boundary){
+    boundary.textContent=reconciling
+      ? 'The paid attempt is already claimed. Pharos will check exact ownership labels and reviewed server facts and will not send a duplicate create request.'
+      : expired
+        ? 'This review expired without creating a server or starting billing.'
+      : claimed
+        ? 'The paid create is durably claimed, but no provider request has started. Continuing may send the one authorized create request after fresh live checks.'
+      : authorized
+        ? 'Authorization is stored, but no server exists yet. Billing can begin only after Create sends the one allowed provider request and Hetzner accepts it.'
+        : 'Token enrollment, read-only testing, review, and authorization create nothing. Billing begins only when Hetzner accepts server creation.';
+  }
+  if(next){
+    next.textContent=reconciling
+      ? 'Check the provider result. One exact ownership-and-server-fact match is adopted; zero or multiple matches stop for manual review.'
+      : expired
+        ? 'Return to the editable choices and persist a fresh current review.'
+      : claimed
+        ? 'Continue the authorized create. The server enforces the authorization expiry, then rechecks the exact plan before it may send the one allowed provider request.'
+      : authorized
+        ? 'Create this exact server before the authorization expires. Pharos rechecks price and inventory first.'
+        : 'Authorize this exact persisted plan before it expires. Authorization still does not create the server.';
+  }
+  if(authorization){
+    authorization.hidden=!authorized;
+    if(operator)operator.textContent=job.paid_authorization?.operator_label||'the authenticated operator';
+  }
+  syncAssistantNext(overlay);
+  const start=overlay.querySelector('[data-assistant-start]');
+  setAssistantStartLabel(start,reconciling?'Check provider result':expired?'Review again':claimed?'Continue authorized create':authorized?'Create server':'Allow one paid server');
+  syncAssistantStart(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
+  const paidReview=overlay.querySelector('[data-paid-review]');
+  paidReview?.scrollIntoView({block:'nearest'});
+  if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
+    paidReview?.focus({preventScroll:true});
+  }
+  window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
+  if(!expired&&!claimed&&!reconciling){
+    const delay=Math.max(0,Math.min(2147483000,Number(plan.expires_at)*1000-Date.now()+25));
+    window.pharosAssistantPaidExpiryTimer=window.setTimeout(()=>{
+      if(!overlay.hidden&&overlay.pharosProvisioningJob?.id===job.id)renderPaidPlanReview(overlay,overlay.pharosProvisioningJob);
+    },delay);
+  }
+  return true;
+}
+function renderAssistantProvisioningJob(overlay,job){
+  const executionState=String(job?.paid_execution?.state||'');
+  if(job?.provider==='hetzner-cloud'&&job?.reviewed_plan&&(!executionState||['claimed','request-started','uncertain'].includes(executionState))){
+    return renderPaidPlanReview(overlay,job,true);
+  }
+  renderProvisioningJob(overlay,job);
+  return false;
+}
+function resetPaidPlanReview(overlay){
+  window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
+  delete overlay.dataset.assistantPaidActionPending;
+  delete overlay.dataset.assistantJobId;
+  delete overlay.dataset.assistantPaidStage;
+  overlay.pharosProvisioningJob=null;
+  overlay.dataset.assistantStage='plan';
+  showAssistantError(overlay);
+  syncAssistantNext(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
+}
+function renderProviderCreatedResult(overlay,job){
+  const result=overlay?.querySelector('[data-assistant-created]');
+  if(!overlay||!result)return false;
+  const resource=primaryProviderResource(job);
+  const handoff=job?.handoff;
+  const deleted=Boolean(
+    resource?.state==='deleted'&&
+    handoff?.status==='provider-resource-deleted'&&
+    job?.state==='complete'&&
+    job?.terminal_outcome==='rolled-back'
+  );
+  const activeResource=Boolean(
+    resource&&['created','created-address-pending'].includes(resource.state)
+  );
+  const visible=deleted||Boolean(
+    activeResource&&['bootstrapping','waiting-for-heartbeat','cleanup-needed'].includes(job?.state)
+  );
+  if(!visible){
+    delete overlay.dataset.providerCreated;
+    overlay.pharosProvisioningJob=null;
+    result.hidden=true;
+    return false;
+  }
+  overlay.dataset.providerCreated='true';
+  overlay.pharosProvisioningJob=job;
+  result.hidden=false;
+  result.dataset.state=deleted?'deleted':'active';
+  const cleanupNeeded=!deleted&&job?.state==='cleanup-needed';
+  const viewTitle=deleted?'Server deleted':cleanupNeeded?'Server needs attention':'Server created';
+  const headTitle=overlay.querySelector('#setup-assistant-title');
+  const headCopy=headTitle?.parentElement?.querySelector('p');
+  if(headTitle)headTitle.textContent=viewTitle;
+  if(headCopy)headCopy.textContent=deleted?'The provider resource is no longer active.':cleanupNeeded?'Review recovery before making another provider change.':'Install Pharos to finish setup.';
+  const back=overlay.querySelector('[data-assistant-step-back]');
+  if(back)back.hidden=true;
+  const setupReady=!cleanupNeeded&&handoff?.status==='provider-created-bootstrap-required';
+  const title=result.querySelector('[data-created-title]');
+  const ready=result.querySelector('[data-created-ready-text]');
+  if(title)title.textContent=viewTitle;
+  if(ready)ready.textContent=deleted?'Removed':cleanupNeeded?'Recovery required':'Ready for setup';
+  const progress=result.querySelector('[data-created-progress]');
+  const actions=result.querySelector('[data-created-actions]');
+  const setup=result.querySelector('[data-created-setup]');
+  const recovery=result.querySelector('[data-created-recovery]');
+  if(progress)progress.hidden=deleted||cleanupNeeded;
+  if(actions)actions.hidden=deleted||!setupReady;
+  if(recovery)recovery.hidden=deleted;
+  const viewKey=`${job?.id||''}:${deleted?'deleted':job?.state||'active'}`;
+  const viewChanged=result.dataset.jobViewKey!==viewKey;
+  result.dataset.jobViewKey=viewKey;
+  if(viewChanged){
+    if(setup)setup.hidden=true;
+    if(recovery)recovery.open=cleanupNeeded;
+    const confirm=result.querySelector('[data-created-delete-confirm]');
+    const remove=result.querySelector('[data-created-delete]');
+    const status=result.querySelector('[data-created-delete-status]');
+    if(confirm)confirm.checked=false;
+    if(remove)remove.disabled=true;
+    if(status)status.textContent='';
+  }
+  const values={
+    '[data-created-host]':resource.name||job.host_name||'new server',
+    '[data-created-location]':providerLocationLabel(resource.location),
+    '[data-created-resource]':`Hetzner server ${resource.provider_id||'created'}${deleted?' · deleted':''}`,
+    '[data-created-ssh]':deleted?'No active destination':providerSshLabel(resource),
+    '[data-created-secret]':deleted?'Not applicable':handoff?.secret_target||'private runtime file',
+    '[data-created-command]':deleted?'Not applicable':handoff?.command_ref||'prepared bootstrap handoff',
+    '[data-created-guidance]':handoff?.summary||'Review recovery before making another provider change.'
+  };
+  Object.entries(values).forEach(([selector,value])=>{
+    const node=result.querySelector(selector);
+    if(node)node.textContent=value;
+  });
+  const nextSteps=result.querySelector('[data-created-next-steps]');
+  if(nextSteps){
+    nextSteps.replaceChildren();
+    const steps=Array.isArray(handoff?.next_steps)?handoff.next_steps:[];
+    steps.forEach(step=>{
+      const item=document.createElement('li');
+      item.textContent=step;
+      nextSteps.append(item);
+    });
+    nextSteps.hidden=steps.length===0;
+  }
+  result.scrollIntoView({block:'nearest'});
+  return true;
+}
+function renderProvisioningJob(overlay,job){
+  if(!overlay||!job)return;
+  delete overlay.dataset.assistantPaidActionPending;
+  delete overlay.dataset.assistantPaidStage;
+  overlay.dataset.assistantJobId=job.id||'';
+  overlay.dataset.assistantStage='job';
+  const title=overlay.querySelector('#setup-assistant-title');
+  const copy=title?.parentElement?.querySelector('p');
+  const jobBox=overlay.querySelector('[data-assistant-job]');
+  const jobTitle=overlay.querySelector('[data-assistant-job-title]');
+  const jobMessage=overlay.querySelector('[data-assistant-job-message]');
+  const spinner=overlay.querySelector('.assistant-job-spinner');
+  const label=provisioningJobLabel(job.state);
+  const message=latestProvisioningMessage(job);
+  const providerCreated=renderProviderCreatedResult(overlay,job);
+  const rolledBack=job.state==='complete'&&job.terminal_outcome==='rolled-back';
+  if(!providerCreated){
+    if(title)title.textContent=rolledBack?'Setup rolled back':job.state==='failed'?'Setup did not start':job.state==='complete'?'Setup complete':'Setting up server';
+    if(copy)copy.textContent=provisioningJobTerminal(job.state)?`Setup ${label}.`:'This may take a few minutes.';
+  }
+  if(jobBox){
+    jobBox.hidden=false;
+    jobBox.dataset.state=job.state||'pending';
+    if(!providerCreated)jobBox.scrollIntoView({block:'nearest'});
+  }
+  if(spinner)spinner.hidden=provisioningJobTerminal(job.state);
+  const jobHeading={
+    planning:'Preparing setup',
+    provisioning:'Creating server',
+    bootstrapping:'Installing Pharos',
+    'waiting-for-heartbeat':'Waiting for the first heartbeat',
+    'backup-pending':'Finishing backup setup',
+    complete:'Setup complete',
+    failed:'Setup failed',
+    'cleanup-needed':'Setup needs attention'
+  }[job.state]||`Setup ${label}`;
+  if(jobTitle)jobTitle.textContent=jobHeading;
+  if(jobMessage)jobMessage.textContent=message;
+  const state=assistantState(overlay);
+  writeAssistantUrl(true,state.path,state.provider,state.template,'job');
+  if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
+    const focusTarget=providerCreated?overlay.querySelector('[data-assistant-created]'):jobBox;
+    focusTarget?.setAttribute('tabindex','-1');
+    focusTarget?.focus({preventScroll:true});
+  }
+}
+function preflightBoolValue(overlay,name){
+  const value=overlay.querySelector(`[data-preflight-fact="${name}"]`)?.value||'';
+  if(value==='true')return true;
+  if(value==='false')return false;
+  return undefined;
+}
+function existingHostRole(overlay){
+  return (overlay.querySelector('[data-preflight-role]')?.value||'server').trim()||'server';
+}
+function existingHostType(overlay){
+  return overlay.querySelector('[data-preflight-host-type]')?.value||'';
+}
+function existingHostIsNix(overlay){
+  const type=existingHostType(overlay);
+  if(type==='nixos')return true;
+  if(type==='linux-beacon')return false;
+  return undefined;
+}
+function existingHeartbeatInterval(overlay){
+  const raw=(overlay.querySelector('[data-preflight-heartbeat]')?.value||'60').trim();
+  const parsed=Number(raw);
+  if(Number.isFinite(parsed)&&parsed>0)return Math.max(10,Math.min(3600,Math.floor(parsed)));
+  return 60;
+}
+function existingPreflightRequest(overlay){
+  const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
+  const hostType=existingHostType(overlay);
+  const route=overlay.querySelector('[data-preflight-route]')?.value||'tailnet';
+  const sshUser=(overlay.querySelector('[data-preflight-ssh-user]')?.value||'').trim();
+  const sshHost=(overlay.querySelector('[data-preflight-ssh-host]')?.value||'').trim();
+  const admin=overlay.querySelector('[data-preflight-admin]')?.value||'';
+  const os=overlay.querySelector('[data-preflight-os]')?.value||'';
+  const diskRaw=(overlay.querySelector('[data-preflight-disk]')?.value||'').trim();
+  const facts={};
+  const sshAuthenticated=preflightBoolValue(overlay,'ssh_authenticated');
+  const nixAvailable=preflightBoolValue(overlay,'nix_available');
+  const pharosReachable=preflightBoolValue(overlay,'pharos_reachable');
+  if(hostType==='nixos'){facts.os_family='nixos';facts.nixos=true;facts.nix_available=true}
+  else if(hostType==='linux-beacon'){facts.os_family='linux';facts.nixos=false}
+  if(sshAuthenticated!==undefined)facts.ssh_authenticated=sshAuthenticated;
+  if(nixAvailable!==undefined)facts.nix_available=nixAvailable;
+  if(pharosReachable!==undefined)facts.pharos_reachable=pharosReachable;
+  if(admin==='root'){facts.root=true;facts.sudo=false}
+  else if(admin==='sudo'){facts.root=false;facts.sudo=true}
+  else if(admin==='none'){facts.root=false;facts.sudo=false}
+  if(os==='nixos'){facts.os_family='nixos';facts.nixos=true;facts.nix_available=true}
+  else if(os==='linux'){facts.os_family='linux';facts.nixos=false}
+  else if(os==='other'){facts.os_family='other';facts.nixos=false}
+  if(diskRaw){
+    const disk=Number(diskRaw);
+    if(Number.isFinite(disk)&&disk>=0)facts.free_disk_gib=Math.floor(disk);
+  }
+  return {
+    host_name:hostName,
+    ssh:{
+      route,
+      user:sshUser||undefined,
+      host:route==='none'?undefined:sshHost||undefined
+    },
+    facts,
+    pharos_url:location.origin
+  };
+}
+function preflightStateTitle(state){
+  return String(state||'unknown').replace(/-/g,' ');
+}
+function selectExistingBootstrap(overlay,option,button){
+  overlay.dataset.existingBootstrapMethod=option.method||'';
+  overlay.querySelectorAll('[data-bootstrap-option]').forEach(item=>{
+    item.dataset.selected=String(item===button);
+  });
+  overlay.dataset.assistantStage='plan';
+  const confirm=overlay.querySelector('[data-assistant-confirm]');
+  if(confirm)confirm.checked=false;
+  const details=overlay.querySelector('[data-assistant-review-details]');
+  if(details)details.open=false;
+  showAssistantError(overlay);
+  syncAssistantNext(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
+}
+function existingBootstrapTemplate(method){
+  if(method==='nixos-anywhere')return 'nixos-anywhere';
+  if(method==='native-systemd')return 'native-systemd';
+  if(method==='manual')return 'manual-deferred';
+  if(method==='deferred')return 'manual-deferred';
+  return '';
+}
+function renderExistingPreflight(overlay,preflight){
+  const box=overlay.querySelector('[data-preflight-result]');
+  const summary=overlay.querySelector('[data-preflight-summary]');
+  const message=overlay.querySelector('[data-preflight-message]');
+  const checks=overlay.querySelector('[data-preflight-checks]');
+  const bootstrap=overlay.querySelector('[data-preflight-bootstrap]');
+  if(!box||!preflight)return;
+  box.hidden=false;
+  overlay.pharosExistingPreflight=preflight;
+  overlay.dataset.existingBootstrapMethod='';
+  if(summary)summary.textContent=preflight.summary?.label||'Preflight';
+  if(message)message.textContent=preflight.summary?.message||preflight.next_action||'Review checks before continuing.';
+  if(checks){
+    checks.replaceChildren();
+    (Array.isArray(preflight.checks)?preflight.checks:[]).forEach(check=>{
+      const row=document.createElement('div');
+      row.className='assistant-check-row';
+      row.dataset.state=check.state||'unknown';
+      const copy=document.createElement('div');
+      const title=document.createElement('strong');
+      title.textContent=check.label||preflightStateTitle(check.key);
+      const text=document.createElement('span');
+      text.textContent=check.message||preflightStateTitle(check.state);
+      copy.append(title,text);
+      row.append(copy);
+      checks.append(row);
+    });
+  }
+  if(bootstrap){
+    bootstrap.replaceChildren();
+    const options=Array.isArray(preflight.bootstrap_options)?preflight.bootstrap_options:[];
+    options.forEach(option=>{
+      const row=document.createElement('button');
+      row.type='button';
+      row.className='assistant-bootstrap-option';
+      row.dataset.bootstrapOption=option.method||'';
+      row.dataset.available=String(Boolean(option.available));
+      row.disabled=!option.available;
+      const title=document.createElement('strong');
+      title.textContent=option.label||preflightStateTitle(option.method);
+      const text=document.createElement('span');
+      text.textContent=option.message||'Review this path before applying changes.';
+      const detail=document.createElement('span');
+      const changes=Array.isArray(option.changes)?option.changes:[];
+      const detailParts=[
+        changes.join(' '),
+        option.token_handoff||'',
+        option.existing_token_policy||'',
+        option.next_state?`Next: ${option.next_state}.`:''
+      ].filter(Boolean);
+      detail.textContent=detailParts.join(' ');
+      row.append(title,text);
+      if(detail.textContent)row.append(detail);
+      row.addEventListener('click',()=>selectExistingBootstrap(overlay,option,row));
+      bootstrap.append(row);
+    });
+    bootstrap.hidden=options.length===0;
+  }
+  overlay.dataset.assistantStage='bootstrap';
+  showAssistantError(overlay);
+  const state=assistantState(overlay);
+  writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'bootstrap');
+  syncAssistantNext(overlay);
+}
+async function runExistingPreflight(overlay,button){
+  const request=existingPreflightRequest(overlay);
+  if(!request.host_name)throw new Error('Enter a server name first.');
+  if(request.ssh.route!=='none'&&!request.ssh.host)throw new Error('Enter an SSH address or choose Manual.');
+  if(button){
+    button.disabled=true;
+    button.textContent='Checking';
+  }
+  const result=overlay.querySelector('[data-preflight-result]');
+  const summary=overlay.querySelector('[data-preflight-summary]');
+  const message=overlay.querySelector('[data-preflight-message]');
+  if(result)result.hidden=false;
+  if(summary)summary.textContent='Checking server';
+  if(message)message.textContent='Running read-only checks from Pharos.';
+  const response=await fetch('/setup/existing-host/preflight',{
+    method:'POST',
+    headers:{'content-type':'application/json','accept':'application/json'},
+    body:JSON.stringify(request),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'preflight could not be completed');
+  renderExistingPreflight(overlay,payload.preflight);
+}
+async function fetchProvisioningJob(id){
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(id)}`,{
+    credentials:'same-origin',
+    headers:{'accept':'application/json'},
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'setup job could not be loaded');
+  return payload.job;
+}
+async function recoverPaidJobAfterActionError(overlay){
+  const job=overlay?.pharosProvisioningJob;
+  if(!job?.id||!job?.reviewed_plan)return false;
+  try{
+    const latest=await fetchProvisioningJob(job.id);
+    renderAssistantProvisioningJob(overlay,latest);
+  }catch(_error){
+    window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
+    overlay.dataset.assistantPaidActionPending='true';
+    const title=overlay.querySelector('#setup-assistant-title');
+    const copy=title?.parentElement?.querySelector('p');
+    const start=overlay.querySelector('[data-assistant-start]');
+    if(title)title.textContent='Create result unknown';
+    if(copy)copy.textContent='Pharos could not reload the durable attempt. Do not retry the paid action until status can be checked.';
+    if(start){start.disabled=true;setAssistantStartLabel(start,'Reload status to continue')}
+    syncAssistantStart(overlay);
+  }
+  return true;
+}
+async function confirmPaidProvisioningJob(overlay,start){
+  const job=overlay?.pharosProvisioningJob;
+  const plan=job?.reviewed_plan;
+  if(!job?.id||!plan?.plan_sha256)throw new Error('Persist the exact paid plan before authorizing it.');
+  if(paidPlanExpired(job)&&overlay.dataset.assistantPaidStage!=='reconcile'){
+    resetPaidPlanReview(overlay);
+    await loadProviderPlanReview(overlay);
+    return;
+  }
+  overlay.dataset.assistantPaidActionPending='true';
+  setAssistantStartLabel(start,'Authorizing');
+  start.disabled=true;
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/confirm`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({plan_sha256:plan.plan_sha256,attended:true}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok){
+    if(response.status===409){resetPaidPlanReview(overlay);await loadProviderPlanReview(overlay)}
+    throw new Error(payload.error||'The exact paid plan could not be authorized.');
+  }
+  if(!renderPaidPlanReview(overlay,payload.job,true))throw new Error('The authorized plan response was incomplete.');
+}
+async function createPaidProvisioningJob(overlay,start){
+  const job=overlay?.pharosProvisioningJob;
+  const plan=job?.reviewed_plan;
+  const executionState=String(job?.paid_execution?.state||'');
+  if(!job?.id||!plan?.plan_sha256||!job?.paid_authorization){
+    throw new Error('Authorize the exact persisted plan before creating the server.');
+  }
+  if(paidPlanExpired(job)&&overlay.dataset.assistantPaidStage!=='reconcile'&&executionState!=='claimed'){
+    resetPaidPlanReview(overlay);
+    await loadProviderPlanReview(overlay);
+    return;
+  }
+  overlay.dataset.assistantPaidActionPending='true';
+  setAssistantStartLabel(start,'Creating server');
+  start.disabled=true;
+  const title=overlay.querySelector('#setup-assistant-title');
+  const copy=title?.parentElement?.querySelector('p');
+  if(title)title.textContent='Creating authorized server';
+  if(copy)copy.textContent='Pharos is rechecking the exact plan before sending one provider request.';
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/create`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({plan_sha256:plan.plan_sha256}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok){
+    if(payload.job?.paid_execution?.state==='failed-closed'){
+      resetPaidPlanReview(overlay);
+      await loadProviderPlanReview(overlay);
+      return;
+    }
+    if(payload.job?.reviewed_plan)renderAssistantProvisioningJob(overlay,payload.job);
+    else if(response.status===409){resetPaidPlanReview(overlay);await loadProviderPlanReview(overlay)}
+    throw new Error(payload.error||'The authorized server could not be created.');
+  }
+  if(!payload.job)throw new Error('The provider create response was incomplete.');
+  renderProvisioningJob(overlay,payload.job);
+  if(payload.job.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
+}
+async function deleteTrackedProviderServer(overlay,button){
+  const job=overlay?.pharosProvisioningJob;
+  if(!job?.id)throw new Error('The tracked setup job is not available.');
+  const confirm=overlay.querySelector('[data-created-delete-confirm]');
+  const status=overlay.querySelector('[data-created-delete-status]');
+  if(!confirm?.checked)throw new Error('Confirm permanent deletion first.');
+  button.disabled=true;
+  button.setAttribute('aria-busy','true');
+  if(status)status.textContent='Deleting the tracked server…';
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/cleanup`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({confirm:true}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(payload.job)renderProvisioningJob(overlay,payload.job);
+  if(!response.ok)throw new Error(payload.error||'Provider deletion could not be confirmed.');
+  return payload.cleanup||{};
+}
+function scheduleProvisioningPoll(overlay,id){
+  if(!id)return;
+  window.clearTimeout(window.pharosAssistantJobTimer);
+  window.pharosAssistantJobTimer=window.setTimeout(async()=>{
+    try{
+      const job=await fetchProvisioningJob(id);
+      renderProvisioningJob(overlay,job);
+      if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,id);
+    }catch(error){
+      showAssistantError(overlay,error.message||'Setup status could not be refreshed.');
+    }
+  },1500);
+}
+async function startProvisioningJob(overlay,start){
+  const state=assistantState(overlay);
+  const paidJob=overlay.pharosProvisioningJob;
+  if(state.path==='new'&&state.provider==='hetzner-cloud'&&paidJob?.reviewed_plan){
+    if(paidJob.paid_authorization)await createPaidProvisioningJob(overlay,start);
+    else await confirmPaidProvisioningJob(overlay,start);
+    return;
+  }
+  const body={provider:state.provider,template:state.template};
+  body.backup_intent=setupIntentChoice(overlay,'backup_intent','deferred');
+  body.location_intent=setupIntentChoice(overlay,'location_intent','auto');
+  body.access_intent=setupIntentChoice(overlay,'access_intent','operator-only');
+  if(state.path==='new'){
+    const hostName=(overlay.querySelector('[data-new-host-name]')?.value||'').trim();
+    const role=(overlay.querySelector('[data-new-role]')?.value||'server').trim()||'server';
+    const location=(overlay.querySelector('[data-new-location]')?.value||'').trim();
+    const serverType=(overlay.querySelector('[data-new-server-type]')?.value||'').trim();
+    const image=(overlay.querySelector('[data-new-image]')?.value||'').trim();
+    const sshKey=(overlay.querySelector('[data-new-ssh-key]')?.value||'').trim();
+    if(!hostName)throw new Error('Enter a server name first.');
+    if(state.provider==='hetzner-cloud'){
+      if(!location)throw new Error('Enter a Hetzner location first.');
+      if(!serverType)throw new Error('Enter a Hetzner server type first.');
+      if(!image)throw new Error('Enter a Hetzner image first.');
+      if(!sshKey&&!overlay.pharosProviderRuntime?.default_ssh_key_configured){
+        throw new Error('Enter an existing Hetzner SSH public-key name first.');
+      }
+    }
+    body.host_name=hostName;
+    body.role=role;
+    body.is_nix=state.provider==='hetzner-cloud';
+    body.heartbeat_interval_secs=60;
+    if(location)body.location=location;
+    if(serverType)body.server_type=serverType;
+    if(image)body.image=image;
+    if(sshKey)body.ssh_key_ref=sshKey;
+    body.apply=false;
+  }else if(state.path==='existing'){
+    const hostName=(overlay.querySelector('[data-preflight-host-name]')?.value||'').trim();
+    const template=existingBootstrapTemplate(overlay.dataset.existingBootstrapMethod||'');
+    const preflight=overlay.pharosExistingPreflight||{};
+    if(!hostName)throw new Error('Enter a server name first.');
+    if(!template)throw new Error('Choose a bootstrap path first.');
+    body.provider='existing-host';
+    body.template=template;
+    body.host_name=hostName;
+    body.role=existingHostRole(overlay);
+    const isNix=existingHostIsNix(overlay);
+    if(isNix!==undefined)body.is_nix=isNix;
+    body.heartbeat_interval_secs=existingHeartbeatInterval(overlay);
+    body.ssh=existingPreflightRequest(overlay).ssh;
+    if(preflight.summary)body.preflight_summary=preflight.summary;
+    if(Array.isArray(preflight.checks)){
+      body.preflight_checks=preflight.checks.slice(0,12).map(check=>({
+        key:String(check.key||'check'),
+        label:String(check.label||check.key||'Check'),
+        state:String(check.state||'unknown'),
+        message:String(check.message||'No detail recorded.')
+      }));
+    }
+    body.apply=true;
+  }
+  setAssistantStartLabel(start,state.path==='new'?'Saving review':'Starting setup');
+  start.disabled=true;
+  const headers={'content-type':'application/json','accept':'application/json'};
+  if(state.path==='new'&&state.provider==='hetzner-cloud')headers['X-Pharos-Action']='1';
+  const response=await fetch('/setup/provisioning-jobs',{
+    method:'POST',
+    credentials:'same-origin',
+    headers,
+    body:JSON.stringify(body),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'setup job could not be started');
+  if(state.path==='new'&&state.provider==='hetzner-cloud'){
+    if(!renderPaidPlanReview(overlay,payload.job,true))throw new Error('The persisted paid-plan response was incomplete.');
+  }else{
+    renderProvisioningJob(overlay,payload.job);
+    setAssistantStartLabel(start,'Setup job recorded');
+    if(payload.job?.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
+  }
+}
+function setAssistantTemplate(template,write=true){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const provider=assistantProvider(overlay.dataset.assistantSelectedProvider||'');
+  const safeTemplate=assistantTemplate(template);
+  const nextTemplate=safeTemplate&&ASSISTANT_TEMPLATE_PROVIDERS[safeTemplate]===provider?safeTemplate:'';
+  overlay.dataset.assistantSelectedTemplate=nextTemplate;
+  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
+    const visible=!btn.hidden&&btn.dataset.assistantTemplateProvider===provider;
+    btn.setAttribute('aria-pressed',String(visible&&btn.dataset.assistantTemplate===nextTemplate));
+  });
+  syncAssistantNext(overlay);
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
+  }
+}
+function setAssistantProvider(provider,write=true){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const safeProvider=assistantProvider(provider);
+  overlay.dataset.assistantSelectedProvider=safeProvider;
+  overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>{
+    btn.setAttribute('aria-pressed',String(btn.dataset.assistantProvider===safeProvider));
+  });
+  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>{
+    btn.hidden=!(safeProvider&&btn.dataset.assistantTemplateProvider===safeProvider);
+  });
+  if(ASSISTANT_TEMPLATE_PROVIDERS[assistantTemplate(overlay.dataset.assistantSelectedTemplate||'')]!==safeProvider){
+    setAssistantTemplate('',false);
+  }else{
+    setAssistantTemplate(overlay.dataset.assistantSelectedTemplate,false);
+  }
+  syncAssistantNext(overlay);
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
+  }
+}
+function setAssistantPath(path,write=true){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const safePath=assistantPath(path);
+  const previousPath=assistantPath(overlay.dataset.assistantSelectedPath||'');
+  overlay.dataset.assistantSelectedPath=safePath;
+  if(safePath!==previousPath){
+    delete overlay.dataset.assistantJobId;
+    delete overlay.dataset.assistantPaidStage;
+    overlay.dataset.existingBootstrapMethod='';
+    overlay.pharosProvisioningJob=null;
+    overlay.pharosExistingPreflight=null;
+    overlay.pharosProviderPlan=null;
+    overlay.pharosProviderRuntime=null;
+    showAssistantError(overlay);
+    const reviewDetails=overlay.querySelector('[data-assistant-review-details]');
+    if(reviewDetails)reviewDetails.open=false;
+  }
+  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>{
+    btn.setAttribute('aria-pressed',String(btn.dataset.assistantPath===safePath));
+  });
+  if(safePath!==previousPath){
+    const backupValue=safePath==='new'?'enroll-later':'deferred';
+    const backup=overlay.querySelector(`input[name="backup_intent"][value="${backupValue}"]`);
+    if(backup)backup.checked=true;
+    const confirm=overlay.querySelector('[data-assistant-confirm]');
+    if(confirm)confirm.checked=false;
+  }
+  if(safePath==='new'){
+    overlay.dataset.assistantStage='template';
+    setAssistantProvider('hetzner-cloud',false);
+    setAssistantTemplate('',false);
+  }else if(safePath==='existing'){
+    overlay.dataset.assistantStage='existing';
+    setAssistantProvider('',false);
+    setAssistantTemplate('',false);
+  }else{
+    overlay.dataset.assistantStage='choose';
+    setAssistantProvider('',false);
+    setAssistantTemplate('',false);
+  }
+  syncAssistantNext(overlay);
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
+  }
+}
+function setAssistantOpen(open,write=true){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const wasHidden=overlay.hidden;
+  if(open&&wasHidden&&document.activeElement instanceof HTMLElement)assistantReturnFocus=document.activeElement;
+  overlay.hidden=!open;
+  document.body.dataset.assistantOpen=open?'true':'false';
+  if(!open){
+    window.clearTimeout(window.pharosAssistantJobTimer);
+    window.clearTimeout(window.pharosAssistantPaidExpiryTimer);
+    delete overlay.dataset.providerCreated;
+    delete overlay.dataset.assistantJobId;
+    delete overlay.dataset.assistantPaidStage;
+    overlay.pharosProvisioningJob=null;
+    const created=overlay.querySelector('[data-assistant-created]');
+    if(created)created.hidden=true;
+    const job=overlay.querySelector('[data-assistant-job]');
+    if(job)job.hidden=true;
+    showAssistantError(overlay);
+    setAssistantPath('',false);
+  }else if(!overlay.dataset.assistantStage){
+    overlay.dataset.assistantStage='choose';
+    syncAssistantNext(overlay);
+  }
+  if(write){
+    const state=assistantState(overlay);
+    writeAssistantUrl(open,state.path,state.provider,state.template,state.stage);
+  }
+  if(open)overlay.querySelector('[data-assistant-path]')?.focus();
+  else if(!wasHidden&&assistantReturnFocus?.isConnected){
+    assistantReturnFocus.focus();
+    assistantReturnFocus=null;
+  }
+}
+function restoreAssistantFromUrl(){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  const params=new URLSearchParams(location.search);
+  const open=params.get(ASSISTANT_SETUP_PARAM)==='add-server';
+  setAssistantOpen(open,false);
+  if(!open){
+    setAssistantPath('',false);
+    return;
+  }
+  const path=assistantPath(params.get(ASSISTANT_PATH_PARAM));
+  setAssistantPath(path,false);
+  if(path==='new'){
+    setAssistantProvider(assistantProvider(params.get(ASSISTANT_PROVIDER_PARAM))||'hetzner-cloud',false);
+    setAssistantTemplate(params.get(ASSISTANT_TEMPLATE_PARAM),false);
+  }
+  const jobId=(params.get(ASSISTANT_JOB_PARAM)||'').trim();
+  if(jobId&&jobId.length<=128){
+    fetchProvisioningJob(jobId).then(job=>{
+      const paidReview=renderAssistantProvisioningJob(overlay,job);
+      if(!paidReview&&!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,job.id);
+    }).catch(error=>{
+      showAssistantError(overlay,error.message||'The setup job could not be loaded.');
+      if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
+        overlay.querySelector('[data-assistant-close]')?.focus();
+      }
+    });
+    return;
+  }
+  if(path==='new'){
+    const requestedStage=assistantStage(params.get(ASSISTANT_STAGE_PARAM));
+    overlay.dataset.assistantStage=assistantState(overlay).template&&requestedStage==='plan'?'plan':'template';
+    syncAssistantNext(overlay);
+    if(overlay.dataset.assistantStage==='plan'){
+      loadProviderPlanReview(overlay).catch(()=>updateProviderReadiness(overlay));
+    }
+  }else if(path==='existing'){
+    overlay.dataset.assistantStage='existing';
+    syncAssistantNext(overlay);
+  }
+}
+function initSetupAssistant(){
+  const overlay=document.querySelector('[data-setup-assistant]');
+  if(!overlay)return;
+  document.querySelectorAll('[data-onboard-open]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(true)));
+  overlay.querySelectorAll('[data-assistant-close]').forEach(btn=>btn.addEventListener('click',()=>setAssistantOpen(false)));
+  overlay.addEventListener('click',event=>{if(event.target===overlay)setAssistantOpen(false)});
+  document.addEventListener('keydown',event=>{
+    if(overlay.hidden)return;
+    if(event.key==='Escape'){
+      setAssistantOpen(false);
+      return;
+    }
+    if(event.key!=='Tab')return;
+    const focusable=[...overlay.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])')]
+      .filter(node=>node.getClientRects().length>0&&!node.closest('[hidden]'));
+    if(!focusable.length){
+      event.preventDefault();
+      overlay.querySelector('[data-assistant-close]')?.focus();
+      return;
+    }
+    const first=focusable[0];
+    const last=focusable[focusable.length-1];
+    if(!focusable.includes(document.activeElement)){
+      event.preventDefault();
+      (event.shiftKey?last:first).focus();
+      return;
+    }
+    if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}
+    else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}
+  });
+  overlay.querySelectorAll('[data-assistant-path]').forEach(btn=>btn.addEventListener('click',()=>setAssistantPath(btn.dataset.assistantPath)));
+  overlay.querySelectorAll('[data-assistant-provider]').forEach(btn=>btn.addEventListener('click',()=>setAssistantProvider(btn.dataset.assistantProvider)));
+  overlay.querySelectorAll('[data-assistant-template]').forEach(btn=>btn.addEventListener('click',()=>{
+    setAssistantTemplate(btn.dataset.assistantTemplate,false);
+    const selected=assistantState(overlay);
+    if(selected.provider==='manual-import'){
+      setAssistantPath('existing');
+      overlay.querySelector('[data-preflight-host-name]')?.focus();
+      return;
+    }
+    overlay.dataset.assistantStage='plan';
+    const confirm=overlay.querySelector('[data-assistant-confirm]');
+    if(confirm)confirm.checked=false;
+    const details=overlay.querySelector('[data-assistant-review-details]');
+    if(details)details.open=false;
+    showAssistantError(overlay);
+    syncAssistantNext(overlay);
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,'plan');
+    loadProviderPlanReview(overlay).catch(error=>{
+      updateProviderReadiness(overlay);
+      showAssistantError(overlay,error.message||'Provider readiness could not be checked.');
+    });
+  }));
+  overlay.querySelector('[data-preflight-form]')?.addEventListener('submit',async event=>{
+    event.preventDefault();
+    const button=overlay.querySelector('[data-preflight-check]');
+    const summary=overlay.querySelector('[data-preflight-summary]');
+    const message=overlay.querySelector('[data-preflight-message]');
+    try{
+      await runExistingPreflight(overlay,button);
+    }catch(error){
+      if(summary)summary.textContent='Preflight could not run';
+      if(message)message.textContent=error.message||'Check the server details and try again.';
+      showAssistantError(overlay,error.message||'Check the server details and try again.');
+      syncAssistantNext(overlay);
+    }finally{
+      if(button){
+        button.disabled=false;
+        button.textContent='Check server';
+      }
+    }
+  });
+  overlay.querySelector('[data-assistant-confirm]')?.addEventListener('change',event=>{
+    syncAssistantStart(overlay);
+  });
+  overlay.querySelectorAll('input[name="backup_intent"],input[name="location_intent"],input[name="access_intent"]').forEach(input=>{
+    input.addEventListener('change',()=>{
+      syncAssistantNext(overlay);
+      updateAssistantReview(overlay);
+    });
+  });
+  overlay.querySelectorAll('[data-new-host-name],[data-new-role],[data-new-location],[data-new-server-type],[data-new-image],[data-new-ssh-key]').forEach(input=>{
+    input.addEventListener('input',()=>{
+      updateAssistantReview(overlay);
+      updateProviderReadiness(overlay);
+    });
+  });
+  overlay.querySelector('[data-assistant-step-back]')?.addEventListener('click',()=>{
+    const before=assistantState(overlay);
+    const confirm=overlay.querySelector('[data-assistant-confirm]');
+    if(confirm)confirm.checked=false;
+    const details=overlay.querySelector('[data-assistant-review-details]');
+    if(details)details.open=false;
+    if(before.stage==='template'||before.stage==='existing'){
+      setAssistantPath('',false);
+    }else if(before.stage==='bootstrap'){
+      overlay.dataset.assistantStage='existing';
+    }else if(before.stage==='plan'){
+      overlay.dataset.assistantStage=before.path==='new'?'template':'bootstrap';
+    }
+    showAssistantError(overlay);
+    syncAssistantNext(overlay);
+    const state=assistantState(overlay);
+    writeAssistantUrl(!overlay.hidden,state.path,state.provider,state.template,state.stage);
+    if(state.stage==='template'){
+      overlay.querySelector(`[data-assistant-template="${state.template}"]`)?.focus();
+    }else if(state.stage==='existing'){
+      overlay.querySelector('[data-preflight-host-name]')?.focus();
+    }else if(state.stage==='bootstrap'){
+      overlay.querySelector('[data-bootstrap-option][data-available="true"]')?.focus();
+    }else{
+      overlay.querySelector('[data-assistant-path]')?.focus();
+    }
+  });
+  overlay.querySelector('[data-assistant-finish]')?.addEventListener('click',()=>{
+    const setup=overlay.querySelector('[data-created-setup]');
+    if(setup){
+      setup.hidden=false;
+      setup.scrollIntoView({block:'nearest'});
+    }
+  });
+  overlay.querySelector('[data-created-delete-confirm]')?.addEventListener('change',event=>{
+    const remove=overlay.querySelector('[data-created-delete]');
+    if(remove)remove.disabled=!event.currentTarget.checked;
+  });
+  overlay.querySelector('[data-created-delete]')?.addEventListener('click',async event=>{
+    const button=event.currentTarget;
+    const status=overlay.querySelector('[data-created-delete-status]');
+    try{
+      await deleteTrackedProviderServer(overlay,button);
+    }catch(error){
+      if(status)status.textContent=error.message||'Provider deletion could not be confirmed.';
+    }finally{
+      button.removeAttribute('aria-busy');
+      const deleted=overlay.pharosProvisioningJob?.terminal_outcome==='rolled-back';
+      const confirm=overlay.querySelector('[data-created-delete-confirm]');
+      button.disabled=deleted||!confirm?.checked;
+    }
+  });
+  overlay.querySelector('[data-assistant-later]')?.addEventListener('click',()=>setAssistantOpen(false));
+  overlay.querySelector('[data-assistant-start]')?.addEventListener('click',async event=>{
+    if(event.currentTarget.disabled)return;
+    const start=event.currentTarget;
+    showAssistantError(overlay);
+    try{
+      await startProvisioningJob(overlay,start);
+    }catch(error){
+      const paidRecovered=await recoverPaidJobAfterActionError(overlay);
+      if(!paidRecovered){
+        updateAssistantReview(overlay);
+        syncAssistantStart(overlay);
+      }
+      showAssistantError(overlay,error.message||'The setup job could not be created.');
+    }
+  });
+  window.addEventListener('popstate',restoreAssistantFromUrl);
+  restoreAssistantFromUrl();
+}
+function setProviderActionStatus(message,error=false){
+  document.querySelectorAll('[data-provider-action-status]').forEach(status=>{
+    status.textContent=message||'';
+    status.dataset.error=error?'true':'false';
+  });
+}
+async function runProviderAction(button,url,body){
+  const original=button?.innerHTML||'';
+  if(button){
+    button.disabled=true;
+    button.setAttribute('aria-busy','true');
+  }
+  setProviderActionStatus('Working…');
+  try{
+    const options={method:'POST',credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json','X-Pharos-Action':'1'}};
+    if(body!==undefined){
+      options.headers['Content-Type']='application/json';
+      options.body=JSON.stringify(body);
+    }
+    const response=await fetch(url,options);
+    const payload=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(payload.error||'The provider action did not complete.');
+    location.reload();
+  }catch(error){
+    setProviderActionStatus(error.message||'The provider action did not complete.',true);
+    if(button){
+      button.disabled=false;
+      button.removeAttribute('aria-busy');
+      button.innerHTML=original;
+    }
+  }
+}
+function showProviderGuidePanel(guide,name){
+  const panel=guide.querySelector(`[data-guide-panel="${name}"]`);
+  if(!panel)return;
+  guide.querySelectorAll('[data-guide-panel]').forEach(item=>{item.hidden=item!==panel});
+  guide.querySelectorAll('[data-guide-nav]').forEach(button=>{
+    if(button.dataset.guideNav===name)button.setAttribute('aria-current','step');
+    else button.removeAttribute('aria-current');
+  });
+  panel.focus({preventScroll:true});
+  panel.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function setProviderGuideLanguage(guide,language){
+  const selected=language==='de'?'de':'en';
+  guide.dataset.guideLanguage=selected;
+  guide.querySelectorAll('[data-guide-language]').forEach(button=>{
+    button.setAttribute('aria-pressed',button.dataset.guideLanguage===selected?'true':'false');
+  });
+  guide.querySelectorAll('[data-guide-text-en][data-guide-text-de]').forEach(node=>{
+    node.textContent=selected==='de'?node.dataset.guideTextDe:node.dataset.guideTextEn;
+    node.lang=selected;
+  });
+  guide.querySelectorAll('[data-guide-href-en][data-guide-href-de]').forEach(link=>{
+    link.href=selected==='de'?link.dataset.guideHrefDe:link.dataset.guideHrefEn;
+  });
+  try{localStorage.setItem('pharos-provider-guide-language',selected)}catch(_error){}
+}
+function showProviderGuideNetwork(guide,network){
+  const selected=['fixed','dynamic','tailscale'].includes(network)?network:'';
+  guide.querySelectorAll('[data-guide-network]').forEach(button=>{
+    button.setAttribute('aria-pressed',button.dataset.guideNetwork===selected?'true':'false');
+  });
+  guide.querySelectorAll('[data-guide-network-panel]').forEach(panel=>{
+    panel.hidden=panel.dataset.guideNetworkPanel!==selected;
+  });
+  const workflow=guide.querySelector('[data-guide-network-workflow]');
+  if(workflow)workflow.hidden=selected!=='fixed'&&selected!=='dynamic';
+  const finish=guide.querySelector('[data-guide-firewall-finish]');
+  if(finish)finish.disabled=selected!=='fixed'&&selected!=='dynamic';
+  guide.querySelector(`[data-guide-network-panel="${selected}"]`)?.focus({preventScroll:true});
+}
+function initProviderSetupGuide(){
+  const guide=document.querySelector('[data-provider-setup-guide]');
+  if(!guide)return;
+  let storedLanguage='';
+  try{storedLanguage=localStorage.getItem('pharos-provider-guide-language')||''}catch(_error){}
+  const initialLanguage=storedLanguage==='de'||storedLanguage==='en'
+    ?storedLanguage
+    :(navigator.language||'').toLowerCase().startsWith('de')?'de':'en';
+  setProviderGuideLanguage(guide,initialLanguage);
+  guide.querySelectorAll('[data-guide-language]').forEach(button=>button.addEventListener('click',()=>{
+    setProviderGuideLanguage(guide,button.dataset.guideLanguage);
+  }));
+  showProviderGuidePanel(guide,guide.dataset.initialStep||'api');
+  guide.querySelectorAll('[data-guide-nav]').forEach(button=>button.addEventListener('click',()=>{
+    showProviderGuidePanel(guide,button.dataset.guideNav);
+  }));
+  guide.querySelectorAll('[data-guide-next]').forEach(button=>button.addEventListener('click',()=>{
+    showProviderGuidePanel(guide,button.dataset.guideNext);
+  }));
+  guide.querySelectorAll('[data-guide-platform]').forEach(button=>button.addEventListener('click',()=>{
+    const platform=button.dataset.guidePlatform;
+    guide.querySelectorAll('[data-guide-platform]').forEach(choice=>choice.setAttribute('aria-pressed',choice===button?'true':'false'));
+    guide.querySelectorAll('[data-guide-platform-panel]').forEach(panel=>{panel.hidden=panel.dataset.guidePlatformPanel!==platform});
+    guide.querySelector(`[data-guide-platform-panel="${platform}"]`)?.focus({preventScroll:true});
+  }));
+  guide.querySelectorAll('[data-guide-network]').forEach(button=>button.addEventListener('click',()=>{
+    showProviderGuideNetwork(guide,button.dataset.guideNetwork||'');
+  }));
+  guide.querySelectorAll('[data-copy-command]').forEach(button=>button.addEventListener('click',async()=>{
+    const command=document.getElementById(button.dataset.copyCommand||'');
+    const status=button.closest('[data-guide-panel]')?.querySelector('[data-guide-copy-status]');
+    if(!command||!navigator.clipboard?.writeText){
+      if(status)status.textContent='Copy is unavailable here. Select the command text manually.';
+      return;
+    }
+    try{
+      await navigator.clipboard.writeText(command.textContent||'');
+      if(status)status.textContent='Safe command copied. No key or credential was copied.';
+    }catch(_error){
+      if(status)status.textContent='Copy was blocked by the browser. Select the command text manually.';
+    }
+  }));
+  guide.querySelectorAll('[data-guide-provider-test]').forEach(button=>button.addEventListener('click',()=>{
+    runProviderAction(button,'/settings/providers/hetzner-cloud/test');
+  }));
+  guide.querySelectorAll('[data-guide-open-details]').forEach(button=>button.addEventListener('click',()=>{
+    const details=document.querySelector('[data-provider-details]');
+    if(!details){
+      setProviderActionStatus('Refresh the provider choices first.',true);
+      return;
+    }
+    details.open=true;
+    details.scrollIntoView({behavior:'smooth',block:'nearest'});
+    setTimeout(()=>details.querySelector('select')?.focus(),180);
+  }));
+}
+function initProviderConnection(){
+  const details=document.querySelector('[data-provider-details]');
+  document.querySelectorAll('[data-provider-open-details]').forEach(button=>button.addEventListener('click',()=>{
+    if(!details){
+      setProviderActionStatus('Test the connection first to load current choices.',true);
+      return;
+    }
+    details.open=true;
+    details.scrollIntoView({behavior:'smooth',block:'nearest'});
+    setTimeout(()=>details.querySelector('select')?.focus(),180);
+  }));
+  document.querySelectorAll('[data-provider-test]').forEach(button=>button.addEventListener('click',()=>{
+    runProviderAction(button,'/settings/providers/hetzner-cloud/test');
+  }));
+  document.querySelector('[data-provider-preferences]')?.addEventListener('submit',event=>{
+    event.preventDefault();
+    const form=event.currentTarget;
+    if(!form.reportValidity())return;
+    const values=new FormData(form);
+    runProviderAction(form.querySelector('button[type="submit"]'),'/settings/providers/hetzner-cloud/preferences',{
+      default_location:String(values.get('default_location')||''),
+      ssh_key_ref:String(values.get('ssh_key_ref')||''),
+      firewall_ref:String(values.get('firewall_ref')||'')
+    });
+  });
+  document.querySelector('[data-provider-disconnect]')?.addEventListener('click',event=>{
+    if(!window.confirm('Disconnect Hetzner Cloud from Pharos? The encrypted credential remains in Janus.'))return;
+    runProviderAction(event.currentTarget,'/settings/providers/hetzner-cloud/disconnect',{confirm:true});
+  });
+}
+function updateUrlState(){
+  const main=document.querySelector('main');
+  const sort=document.querySelector('[data-sort]')?.value||'attention';
+  const params=new URLSearchParams(location.search);
+  params.set('view',main?.dataset.view||'grid');
+  params.set('sort',sort);
+  params.set('filter',activeLiveFilter);
+  params.set('signal',signalWindow.key);
+  const url=location.pathname+'?'+params.toString();
+  history.replaceState(null,'',url);
+}
+function initControls(){
+  const params=new URLSearchParams(location.search);
+  const view=params.get('view')||decodeURIComponent(cookie('pharos_view'))||'grid';
+  const sort=params.get('sort')||decodeURIComponent(cookie('pharos_sort'))||'attention';
+  const search=decodeURIComponent(cookie('pharos_search'));
+  const liveFilter=params.get('filter')||decodeURIComponent(cookie('pharos_live_filter'))||'all';
+  const selectedSignalWindow=params.get('signal')||decodeURIComponent(cookie('pharos_signal_window'))||SIGNAL_WINDOWS[0].key;
+  applyView(view,false);
+  applySort(sort,false);
+  applyFilter(search,false);
+  applyLiveFilter(liveFilter,false);
+  applySignalWindow(selectedSignalWindow,false);
+  document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
+  document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
+  document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
+  document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
+  document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
+  bindFreeformDrag();
+  initHostActions();
+  openRequestedWorkflow();
+  initSetupAssistant();
+}
+const REFRESH_MS=10000;
+const DIALOG_REFRESH_MS=60000;
+const FETCH_TIMEOUT_MS=9000;
+const MAX_SNAPSHOT_AGE_MS=REFRESH_MS*2+FETCH_TIMEOUT_MS;
+let refreshTimer=null;
+let refreshPromise=null;
+let refreshAbort=null;
+let refreshGeneration=0;
+let recoveryPromise=null;
+let lastSuccessfulRefreshAt=Date.now();
+function fleetMain(){return document.querySelector('main[data-fleet-sync-state]')}
+function fleetSnapshotFresh(at=Date.now()){
+  return !fleetMain()||at-lastSuccessfulRefreshAt<=MAX_SNAPSHOT_AGE_MS;
+}
+function fleetSnapshotLabel(asof){
+  const label=asof?.dataset.snapshotLabel||asof?.textContent||'last update unavailable';
+  return label.startsWith('as of ')?'last update '+label.slice(6):label;
+}
+function setFleetSyncState(state){
+  const main=fleetMain();
+  if(!main)return;
+  main.dataset.fleetSyncState=state;
+  const asof=main.querySelector('[data-as-of]');
+  if(!asof)return;
+  if(!asof.dataset.snapshotLabel)asof.dataset.snapshotLabel=asof.textContent||'';
+  asof.dataset.refreshState=state;
+  if(state==='syncing')asof.textContent='Syncing\u2026 \u00b7 '+fleetSnapshotLabel(asof);
+  else if(state==='stale')asof.textContent='Data out of date \u00b7 '+fleetSnapshotLabel(asof);
+  else asof.textContent=asof.dataset.snapshotLabel;
+}
+function setFleetSnapshotLabel(now){
+  const asof=fleetMain()?.querySelector('[data-as-of]');
+  if(!asof)return;
+  asof.dataset.snapshotLabel='as of '+clock(now);
+}
+function updateFleetSummary(hosts){
+  const counts={all:hosts.length,live:0,stale:0,down:0};
+  hosts.forEach(host=>{if(['live','stale','down'].includes(host.liveness))counts[host.liveness]++});
+  Object.entries(counts).forEach(([key,value])=>{
+    const target=document.querySelector('[data-summary-count="'+key+'"]');
+    if(target)target.textContent=String(value);
+  });
+}
+function validFleetSnapshot(data){
+  if(!data||!Number.isFinite(Number(data.as_of))||!Array.isArray(data.hosts))return false;
+  const names=data.hosts.map(host=>host?.name);
+  return new Set(names).size===names.length&&data.hosts.every(host=>host&&typeof host.name==='string'&&host.name&&['live','stale','down','awaiting_first_heartbeat'].includes(host.liveness));
+}
+function fleetMembershipMatches(hosts){
+  const grid=document.querySelector('[data-grid]');
+  if(!grid)return true;
+  const rendered=new Set(Array.from(grid.querySelectorAll('.card[data-host][data-host-surface="runtime"]')).map(card=>card.dataset.host));
+  const incoming=new Set(hosts.map(host=>host.name));
+  return rendered.size===incoming.size&&Array.from(rendered).every(name=>incoming.has(name));
+}
+function applyFleetSnapshot(data){
+  if(!validFleetSnapshot(data))return false;
+  const hosts=data.hosts;
+  if(!fleetMembershipMatches(hosts)){
+    window.location.reload();
+    return false;
+  }
+  const now=Number(data.as_of);
+  for(const h of hosts){
+    const surfaces=hostSurfaces(h.name);
+    for(const card of surfaces){
+      const live=h.liveness;
+      card.dataset.live=live;
+      const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences);
+      const backup=backupInfo(h,now);
+      const muted=mutedInfo(h.preferences);
+      card.dataset.sev=String(attention.rank ?? sevFor(live));
+      card.dataset.last=h.last_seen ?? 0;
+      card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+kernelSearch(h.kernel)+' '+muted.search).toLowerCase().trim();
+      const word=card.querySelector('[data-status-word]');
+      if(word)word.textContent=words[h.liveness]||h.liveness;
+      setReason(card,attention);
+      updateKernel(card,h);
+      updateMuted(card,muted);
+      updatePreferenceState(card,h);
+      updateHostActionState(card,h,backup);
+      const fresh=card.querySelector('[data-fresh]');
+      if(fresh)fresh.innerHTML=freshHtml(h.freshness);
+      updateBackup(card,backup);
+      setSeen(card,h.last_seen,now);
+      setCardAsOf(card,now);
+      const beat=card.querySelector('.beat');
+      if(beat){
+        const previous=Number(beat.dataset.last);
+        const last=h.last_seen == null ? NaN : Number(h.last_seen);
+        const interval=h.heartbeat_interval_secs || 60;
+        const incoming=Array.isArray(h.heartbeat_log)?h.heartbeat_log.map(Number).filter(Number.isFinite):[];
+        const beats=incoming.length?incoming:(Number.isFinite(last)?[last]:[]);
+        beat.dataset.interval=interval;
+        setBeatHistory(beat,beats,interval);
+        updateSignal(card,signalInfo(beats,last,interval,now));
+        if(beat.dataset.ready==='true'&&Number.isFinite(previous)&&Number.isFinite(last)&&last>previous){
+          beat.style.setProperty('--hit-x',heartbeatX(Math.max(0,last-previous),Math.max(1,Number(interval)||60)).toFixed(2)+'%');
+          flashBeat(beat);
+        }
+        beat.dataset.ready='true';
+        beat.dataset.last=Number.isFinite(last)?String(last):'';
+        beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
+      }
+    }
+  }
+  updateFleetSummary(hosts);
+  applySort(document.querySelector('[data-sort]')?.value||'attention',false);
+  applySurfaceFilters(false);
+  setFleetSnapshotLabel(now);
+  return true;
+}
+function clearRefreshTimer(){
+  if(refreshTimer!=null){
+    clearTimeout(refreshTimer);
+    refreshTimer=null;
+  }
+}
+function nextRefreshDelay(){
+  return document.body.dataset.hostActionDialogOpen==='true'?DIALOG_REFRESH_MS:REFRESH_MS;
+}
+function scheduleRefresh(delay=nextRefreshDelay()){
+  clearRefreshTimer();
+  if(!fleetMain()||document.hidden||(typeof document.hasFocus==='function'&&!document.hasFocus()))return;
+  refreshTimer=setTimeout(()=>refresh('timer'),delay);
+}
+function abandonRefresh(){
+  clearRefreshTimer();
+  if(refreshAbort)refreshAbort.abort();
+  refreshGeneration++;
+  refreshAbort=null;
+  refreshPromise=null;
+}
+async function refresh(reason='manual',options={}){
+  if(!fleetMain())return false;
+  clearRefreshTimer();
+  if(options.force===true&&refreshPromise)abandonRefresh();
+  if(refreshPromise)return refreshPromise;
+  const controller=new AbortController();
+  const generation=++refreshGeneration;
+  refreshAbort=controller;
+  const timeout=setTimeout(()=>controller.abort(),FETCH_TIMEOUT_MS);
+  refreshPromise=(async()=>{
+  try{
+    const res=await fetch('/hosts.json?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin',signal:controller.signal});
+    const contentType=String(res.headers.get('content-type')||'').toLowerCase();
+    if(!res.ok||res.redirected||!contentType.includes('application/json'))throw new Error('fleet snapshot unavailable');
+    const data=await res.json();
+    if(generation!==refreshGeneration)return false;
+    if(!validFleetSnapshot(data))throw new Error('fleet snapshot invalid');
+    if(!applyFleetSnapshot(data))return false;
+    lastSuccessfulRefreshAt=Date.now();
+    setFleetSyncState('current');
+    resumeBeatClock();
+    return true;
+  }catch(error){
+    if(generation===refreshGeneration&&(options.recovery===true||!fleetSnapshotFresh()))setFleetSyncState('stale');
+    return false;
+  }
+  finally{
+    clearTimeout(timeout);
+    if(generation===refreshGeneration){
+      if(refreshAbort===controller)refreshAbort=null;
+      refreshPromise=null;
+      scheduleRefresh();
+    }
+  }
+  })();
+  return refreshPromise;
+}
+function suspendFleet(){
+  stopBeatClock();
+  abandonRefresh();
+  recoveryPromise=null;
+}
+function recoverFleet(reason='foreground'){
+  if(!fleetMain()||document.hidden)return Promise.resolve(false);
+  if(recoveryPromise)return recoveryPromise;
+  stopBeatClock();
+  setFleetSyncState('syncing');
+  let recoveryRun;
+  recoveryRun=refresh(reason,{force:true,recovery:true}).finally(()=>{if(recoveryPromise===recoveryRun)recoveryPromise=null});
+  recoveryPromise=recoveryRun;
+  return recoveryPromise;
+}
+function resumeRefresh(reason){
+  if(document.hidden){
+    suspendFleet();
+    return Promise.resolve(false);
+  }
+  return recoverFleet(reason);
+}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)suspendFleet();else recoverFleet('visible')});
+window.addEventListener('blur',suspendFleet);
+window.addEventListener('focus',()=>recoverFleet('focus'));
+window.addEventListener('pageshow',event=>{if(event.persisted||!fleetSnapshotFresh())recoverFleet('pageshow')});
+window.addEventListener('online',()=>recoverFleet('online'));
+document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
+document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
+initControls();
+initProviderConnection();
+initProviderSetupGuide();
+setFleetSyncState('current');
+resumeBeatClock();
+scheduleRefresh(3000);
+</script></body></html>
