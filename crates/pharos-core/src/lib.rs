@@ -2074,6 +2074,12 @@ pub fn liveness(
 
 pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v2";
 pub const HOST_REPORT_VERSION: u16 = 2;
+pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v1";
+pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 1;
+pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 2] = [
+    (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
+    (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
+];
 
 fn default_host_report_version() -> u16 {
     HOST_REPORT_VERSION
@@ -2112,14 +2118,11 @@ pub struct HostReport {
 
 impl HostReport {
     pub fn validate_contract(&self) -> Result<(), String> {
-        if self.schema != HOST_REPORT_SCHEMA {
-            return Err("unsupported report schema".to_string());
-        }
-        if self.version != HOST_REPORT_VERSION {
-            return Err(format!(
-                "unsupported report version {}; expected {}",
-                self.version, HOST_REPORT_VERSION
-            ));
+        if !SUPPORTED_HOST_REPORT_CONTRACTS
+            .iter()
+            .any(|(schema, version)| self.schema == *schema && self.version == *version)
+        {
+            return Err("unsupported report schema/version pair".to_string());
         }
         validate_report_identity(&self.name, &self.role)?;
         validate_heartbeat_interval(self.heartbeat_interval_secs)?;
@@ -3102,8 +3105,8 @@ mod tests {
         current.validate_contract().expect("current report valid");
 
         let legacy: HostReport = serde_json::from_value(serde_json::json!({
-            "schema": "inspr.pharos.host-report.v1",
-            "version": 1,
+            "schema": PREVIOUS_HOST_REPORT_SCHEMA,
+            "version": PREVIOUS_HOST_REPORT_VERSION,
             "name": "hsb8",
             "role": "server",
             "is_nix": true,
@@ -3111,7 +3114,15 @@ mod tests {
             "freshness": {"applicable": true}
         }))
         .expect("legacy report remains structurally parseable");
-        assert!(legacy.validate_contract().is_err());
+        legacy
+            .validate_contract()
+            .expect("the immediately preceding report remains valid during rollout");
+
+        let mismatched = HostReport {
+            version: HOST_REPORT_VERSION,
+            ..legacy.clone()
+        };
+        assert!(mismatched.validate_contract().is_err());
 
         let runtime = HostReport {
             inbound_rtt_ms: Some(42),

@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/markus-barta/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/markus-barta/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.56-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.57-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -99,6 +99,13 @@ different report schemas. The current report contract is
 fields and reject extensions. Reports are limited to 64 KiB, heartbeat cadence
 is 10–3600 seconds, and all identities, freshness values, and observation text
 are bounded before persistence or alerting.
+
+For an ordered fleet rollout, the control plane accepts the current report
+contract and exactly its immediate predecessor. Deploy the new control plane
+first, verify readiness and old-beacon reports, then roll the beacons. Unknown,
+older, or mismatched schema/version pairs still fail closed; this bounded
+compatibility window prevents a release from aging otherwise healthy hosts to
+Down while avoiding an open-ended legacy protocol surface.
 
 ### Persistence
 
@@ -519,7 +526,7 @@ health, restarts, the pending backlog, and delivery outcomes.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.56**. It is already used as a real
+Pharos is an active early release at **v0.1.57**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
