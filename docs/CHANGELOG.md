@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.57 - 2026-07-22
+
+- Keep the immediately preceding host-report contract valid during a control-plane-first rolling upgrade, reject mismatched or older schema/version pairs, and enforce that bounded compatibility window in the release contract tests.
+
 ## 0.1.56 - 2026-07-21
 
 - Pin the release signer to cosign v2.5.2, the version checksum-bootstrapped by the reviewed installer action, instead of requesting an incompatible v3 release whose assets use a different verification format.

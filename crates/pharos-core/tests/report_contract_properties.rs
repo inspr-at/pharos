@@ -1,6 +1,7 @@
 use pharos_core::{
     HostPreferences, HostRegistration, HostReport, NixFreshness, HOST_REGISTRATION_SCHEMA,
     HOST_REGISTRATION_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_HOST_REPORT_BYTES,
+    PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION, SUPPORTED_HOST_REPORT_CONTRACTS,
 };
 use proptest::prelude::*;
 
@@ -20,6 +21,42 @@ fn report(name: String, role: String, heartbeat_interval_secs: u64) -> HostRepor
         location: None,
         preferences: HostPreferences::default(),
     }
+}
+
+#[test]
+fn control_plane_accepts_current_and_previous_reports_for_ordered_rollouts() {
+    assert_eq!(
+        SUPPORTED_HOST_REPORT_CONTRACTS,
+        [
+            (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
+            (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
+        ]
+    );
+    assert_eq!(PREVIOUS_HOST_REPORT_VERSION + 1, HOST_REPORT_VERSION);
+
+    let current = report("current.example".to_string(), "server".to_string(), 60);
+    current.validate_contract().unwrap();
+
+    let previous = HostReport {
+        schema: PREVIOUS_HOST_REPORT_SCHEMA.to_string(),
+        version: PREVIOUS_HOST_REPORT_VERSION,
+        name: "previous.example".to_string(),
+        ..current
+    };
+    previous.validate_contract().unwrap();
+
+    let mismatched = HostReport {
+        version: HOST_REPORT_VERSION,
+        ..previous
+    };
+    assert!(mismatched.validate_contract().is_err());
+
+    let older = HostReport {
+        schema: "inspr.pharos.host-report.v0".to_string(),
+        version: 0,
+        ..mismatched
+    };
+    assert!(older.validate_contract().is_err());
 }
 
 proptest! {
