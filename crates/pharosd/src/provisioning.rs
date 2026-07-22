@@ -197,6 +197,26 @@ pub(super) struct ProvisioningJobStore {
     counter: AtomicU64,
 }
 
+pub(super) fn new_managed_identity(
+    credential_ref: &str,
+    executor_owner: &str,
+) -> ProvisioningManagedIdentity {
+    ProvisioningManagedIdentity {
+        credential_ref: credential_ref.to_string(),
+        executor_owner: executor_owner.to_string(),
+        state: ProvisioningManagedIdentityState::AwaitingHostKey,
+        host_key_fingerprint: None,
+        host_key_operator_ref: None,
+        host_key_attested_at: None,
+        lease_until: None,
+        credential_ready_at: None,
+        bootstrap_completed_at: None,
+        first_heartbeat_at: None,
+        credential_retired_at: None,
+        last_failure: None,
+    }
+}
+
 impl ProvisioningJobStore {
     pub(super) fn new(path: Option<PathBuf>) -> Self {
         let (jobs, store_id, durable_ready) = match path.as_ref() {
@@ -366,6 +386,7 @@ impl ProvisioningJobStore {
             reviewed_plan: None,
             paid_authorization: None,
             paid_execution: None,
+            managed_identity: None,
             provider_resources: vec![],
             progress,
         };
@@ -728,6 +749,16 @@ impl ProvisioningJobStore {
         updated.updated_at = now;
         updated.provider_resources.clear();
         updated.provider_resources.push(resource);
+        if updated.managed_identity.is_none() {
+            if let Some((owner, credential_ref)) = updated.reviewed_plan.as_ref().and_then(|plan| {
+                Some((
+                    plan.managed_executor_owner.as_deref()?,
+                    plan.managed_credential_ref.as_deref()?,
+                ))
+            }) {
+                updated.managed_identity = Some(new_managed_identity(credential_ref, owner));
+            }
+        }
         if handoff.is_some() {
             updated.handoff = handoff;
         }
@@ -809,7 +840,10 @@ impl ProvisioningJobStore {
         }
         if !matches!(
             current.state,
-            ProvisioningJobState::WaitingForHeartbeat | ProvisioningJobState::CleanupNeeded
+            ProvisioningJobState::WaitingForHeartbeat
+                | ProvisioningJobState::BackupPending
+                | ProvisioningJobState::Complete
+                | ProvisioningJobState::CleanupNeeded
         ) {
             return Err(ProvisioningPaidStoreError::InvalidState);
         }
@@ -874,21 +908,55 @@ impl ProvisioningJobStore {
             return Err(ProvisioningPaidStoreError::InvalidState);
         }
         let mut updated = current.clone();
-        updated.state = ProvisioningJobState::Complete;
-        updated.terminal_outcome = Some(ProvisioningTerminalOutcome::RolledBack);
+        let retirement_required = updated
+            .managed_identity
+            .as_ref()
+            .is_some_and(|identity| identity.credential_ready_at.is_some());
+        updated.state = if retirement_required {
+            ProvisioningJobState::CleanupNeeded
+        } else {
+            ProvisioningJobState::Complete
+        };
+        updated.terminal_outcome =
+            (!retirement_required).then_some(ProvisioningTerminalOutcome::RolledBack);
         updated.updated_at = now;
         updated.progress.push(ProvisioningProgressEntry {
-            state: ProvisioningJobState::Complete,
-            message:
-                "Tracked Hetzner server deleted; setup ended without an active provider resource."
-                    .to_string(),
+            state: updated.state,
+            message: if retirement_required {
+                "Tracked Hetzner server deleted; the exact job-owned Janus credential is queued for retirement before cleanup can complete."
+            } else {
+                "Tracked Hetzner server deleted; setup ended without an active provider resource or issued host credential."
+            }
+            .to_string(),
             observed_at: now,
         });
         updated
             .provider_resources
             .retain(|existing| existing.provider_id != resource.provider_id);
         updated.provider_resources.push(resource);
+        let mut handoff = handoff;
+        if retirement_required {
+            handoff.status = "provider-resource-deleted-identity-cleanup-pending".to_string();
+            handoff.summary = "The provider server is deleted. The reviewed Janus owner is retiring the exact job-owned credential before Pharos removes any owned runtime host state.".to_string();
+            handoff.token_policy = "The raw credential remains inside the Janus boundary while retirement is reconciled.".to_string();
+            handoff.next_steps = vec![
+                "Wait for the Janus retirement owner to report value-free completion evidence."
+                    .to_string(),
+                "If retirement remains pending, review the recorded safe reason; do not create a replacement credential blindly."
+                    .to_string(),
+            ];
+        }
         updated.handoff = Some(handoff);
+        if let Some(identity) = updated.managed_identity.as_mut() {
+            identity.lease_until = None;
+            identity.last_failure = None;
+            if retirement_required {
+                identity.state = ProvisioningManagedIdentityState::RetirementPending;
+            } else {
+                identity.state = ProvisioningManagedIdentityState::CredentialRetired;
+                identity.credential_retired_at = Some(now);
+            }
+        }
         updated
             .validate_contract()
             .map_err(|_| ProvisioningPaidStoreError::ContractFailed)?;
@@ -954,6 +1022,513 @@ impl ProvisioningJobStore {
     }
 }
 
+const MANAGED_PROVISIONING_LEASE_SECS: i64 = 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProvisioningAgentStoreError {
+    NotFound,
+    WrongOwner,
+    InvalidTransition,
+    InvalidContract,
+    Persistence,
+}
+
+impl ProvisioningJobStore {
+    pub(super) fn attest_managed_host_key(
+        &self,
+        id: &str,
+        fingerprint: &str,
+        operator_ref: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningAgentStoreError> {
+        if !valid_ssh_host_fingerprint(fingerprint) || !is_sha256_hex(operator_ref) || now <= 0 {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        self.require_durable()
+            .map_err(|_| ProvisioningAgentStoreError::Persistence)?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::NotFound)?;
+        let mut updated = previous.clone();
+        let identity = updated
+            .managed_identity
+            .as_mut()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        if updated.state != ProvisioningJobState::WaitingForHeartbeat
+            || !matches!(
+                identity.state,
+                ProvisioningManagedIdentityState::AwaitingHostKey
+                    | ProvisioningManagedIdentityState::RetryRequired
+            )
+            || (identity.state == ProvisioningManagedIdentityState::RetryRequired
+                && identity.last_failure != Some(ProvisioningManagedFailure::HostKeyMismatch))
+        {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        identity.host_key_fingerprint = Some(fingerprint.to_string());
+        identity.host_key_operator_ref = Some(operator_ref.to_string());
+        identity.host_key_attested_at = Some(now);
+        identity.state = ProvisioningManagedIdentityState::Ready;
+        identity.last_failure = None;
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::WaitingForHeartbeat,
+            message: "The out-of-band SSH host-key fingerprint was attested; the reviewed Linux executor may now claim bootstrap work.".to_string(),
+            observed_at: now,
+        });
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(updated)
+    }
+
+    pub(super) fn retry_managed_bootstrap(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningAgentStoreError> {
+        self.require_durable()
+            .map_err(|_| ProvisioningAgentStoreError::Persistence)?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::NotFound)?;
+        let mut updated = previous.clone();
+        let identity = updated
+            .managed_identity
+            .as_mut()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        if updated.state != ProvisioningJobState::CleanupNeeded
+            || identity.state != ProvisioningManagedIdentityState::RetryRequired
+            || identity.host_key_fingerprint.is_none()
+        {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        identity.state = ProvisioningManagedIdentityState::Ready;
+        identity.last_failure = None;
+        updated.state = ProvisioningJobState::WaitingForHeartbeat;
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::WaitingForHeartbeat,
+            message: "The same job-owned credential and attested host key were queued for one bounded bootstrap retry.".to_string(),
+            observed_at: now,
+        });
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(updated)
+    }
+
+    pub(super) fn claim_managed_provisioning(
+        &self,
+        owner: &str,
+        now: i64,
+    ) -> Result<Option<ProvisioningAgentLease>, ProvisioningAgentStoreError> {
+        if !valid_action_host_name(owner) || now <= 0 {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        self.require_durable()
+            .map_err(|_| ProvisioningAgentStoreError::Persistence)?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+
+        if let Some(expired_id) = jobs.values().find_map(|job| {
+            job.managed_identity.as_ref().and_then(|identity| {
+                (identity.executor_owner == owner
+                    && identity.state == ProvisioningManagedIdentityState::BootstrapClaimed
+                    && identity.lease_until.is_some_and(|until| until <= now))
+                .then(|| job.id.clone())
+            })
+        }) {
+            let previous = jobs.get(&expired_id).cloned().expect("expired job exists");
+            let mut updated = previous.clone();
+            let identity = updated.managed_identity.as_mut().expect("managed identity");
+            identity.state = ProvisioningManagedIdentityState::Uncertain;
+            identity.lease_until = None;
+            identity.last_failure = Some(ProvisioningManagedFailure::UncertainExecution);
+            updated.state = ProvisioningJobState::CleanupNeeded;
+            updated.updated_at = now;
+            updated.progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::CleanupNeeded,
+                message: "The bootstrap lease expired without a result; Pharos will not replay a potentially destructive install.".to_string(),
+                observed_at: now,
+            });
+            jobs.insert(expired_id.clone(), updated);
+            if self.persist_jobs(&jobs).is_err() {
+                jobs.insert(expired_id, previous);
+                return Err(ProvisioningAgentStoreError::Persistence);
+            }
+            return Ok(None);
+        }
+
+        let candidate = jobs
+            .values()
+            .filter_map(|job| {
+                let identity = job.managed_identity.as_ref()?;
+                if identity.executor_owner != owner {
+                    return None;
+                }
+                let action = if job.state == ProvisioningJobState::WaitingForHeartbeat
+                    && identity.state == ProvisioningManagedIdentityState::Ready
+                {
+                    ProvisioningAgentAction::Bootstrap
+                } else if job.state == ProvisioningJobState::CleanupNeeded
+                    && (identity.state == ProvisioningManagedIdentityState::RetirementPending
+                        || (identity.state == ProvisioningManagedIdentityState::RetirementClaimed
+                            && identity.lease_until.is_some_and(|until| until <= now)))
+                {
+                    ProvisioningAgentAction::Retire
+                } else {
+                    return None;
+                };
+                Some((job.created_at, job.id.clone(), action))
+            })
+            .min_by_key(|(created_at, id, _)| (*created_at, id.clone()));
+        let Some((_, id, action)) = candidate else {
+            return Ok(None);
+        };
+        let previous = jobs.get(&id).cloned().expect("candidate exists");
+        let mut updated = previous.clone();
+        let resource = updated
+            .provider_resources
+            .iter()
+            .find(|resource| resource.provider == "hetzner-cloud" && resource.kind == "server")
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        let plan = updated
+            .reviewed_plan
+            .clone()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        let host = updated
+            .host_name
+            .clone()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        let role = updated.role.clone().unwrap_or_else(|| "server".to_string());
+        let identity = updated
+            .managed_identity
+            .as_mut()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        let (ssh_host, ssh_port, host_key_fingerprint) = match action {
+            ProvisioningAgentAction::Bootstrap => {
+                let ssh = resource
+                    .ssh
+                    .as_ref()
+                    .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+                (
+                    ssh.host.clone(),
+                    ssh.port,
+                    identity.host_key_fingerprint.clone(),
+                )
+            }
+            ProvisioningAgentAction::Retire => (None, None, None),
+        };
+        if action == ProvisioningAgentAction::Bootstrap
+            && (resource.state != "created"
+                || ssh_host.is_none()
+                || ssh_port.is_none()
+                || host_key_fingerprint.is_none())
+        {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        if action == ProvisioningAgentAction::Retire && resource.state != "deleted" {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        identity.state = match action {
+            ProvisioningAgentAction::Bootstrap => {
+                updated.state = ProvisioningJobState::Bootstrapping;
+                ProvisioningManagedIdentityState::BootstrapClaimed
+            }
+            ProvisioningAgentAction::Retire => ProvisioningManagedIdentityState::RetirementClaimed,
+        };
+        identity.lease_until = Some(now.saturating_add(MANAGED_PROVISIONING_LEASE_SECS));
+        identity.last_failure = None;
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: updated.state,
+            message: match action {
+                ProvisioningAgentAction::Bootstrap => {
+                    "The reviewed Linux executor claimed the exact server bootstrap lease."
+                }
+                ProvisioningAgentAction::Retire => {
+                    "The reviewed Janus owner claimed retirement of the exact job-owned credential."
+                }
+            }
+            .to_string(),
+            observed_at: now,
+        });
+        let lease = ProvisioningAgentLease {
+            schema: "inspr.pharos.provisioning-agent-lease.v1",
+            version: 1,
+            id: updated.id.clone(),
+            host,
+            ticket: "PHAROS-175",
+            action,
+            credential_ref: identity.credential_ref.clone(),
+            provider_id: resource.provider_id,
+            lease_until: identity
+                .lease_until
+                .expect("managed provisioning claim sets a lease deadline"),
+            ssh_host,
+            ssh_port,
+            host_key_fingerprint,
+            ssh_key_ref: plan.ssh_key_ref,
+            role,
+            heartbeat_interval_secs: updated.heartbeat_interval_secs.unwrap_or(60),
+        };
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.clone(), updated);
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id, previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(Some(lease))
+    }
+
+    pub(super) fn record_managed_provisioning_result(
+        &self,
+        id: &str,
+        request: &ProvisioningAgentResultRequest,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningAgentStoreError> {
+        if !request.valid() || now <= 0 {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        self.require_durable()
+            .map_err(|_| ProvisioningAgentStoreError::Persistence)?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::NotFound)?;
+        let mut updated = previous.clone();
+        if updated.host_name.as_deref() != Some(request.host.as_str()) {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        let identity = updated
+            .managed_identity
+            .as_mut()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        if identity.executor_owner != request.owner {
+            return Err(ProvisioningAgentStoreError::WrongOwner);
+        }
+        let expected_state = match request.action {
+            ProvisioningAgentAction::Bootstrap => {
+                ProvisioningManagedIdentityState::BootstrapClaimed
+            }
+            ProvisioningAgentAction::Retire => ProvisioningManagedIdentityState::RetirementClaimed,
+        };
+        if identity.state != expected_state || identity.lease_until.is_none() {
+            if request.action == ProvisioningAgentAction::Retire
+                && request.outcome == ProvisioningAgentOutcome::Succeeded
+                && identity.state == ProvisioningManagedIdentityState::CredentialRetired
+            {
+                return Ok(previous);
+            }
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        identity.lease_until = None;
+        identity.last_failure = request.reason;
+        let message = match (request.action, request.outcome) {
+            (ProvisioningAgentAction::Bootstrap, ProvisioningAgentOutcome::Succeeded) => {
+                identity.state = ProvisioningManagedIdentityState::AwaitingHeartbeat;
+                identity.credential_ready_at.get_or_insert(now);
+                identity.bootstrap_completed_at = Some(now);
+                updated.state = ProvisioningJobState::WaitingForHeartbeat;
+                "Janus credential handoff and NixOS bootstrap completed; waiting for the first authenticated heartbeat."
+            }
+            (ProvisioningAgentAction::Bootstrap, ProvisioningAgentOutcome::Failed) => {
+                if request.credential_created {
+                    identity.credential_ready_at.get_or_insert(now);
+                }
+                identity.state = ProvisioningManagedIdentityState::RetryRequired;
+                updated.state = ProvisioningJobState::CleanupNeeded;
+                "Managed bootstrap stopped at a known boundary; review the recorded reason before retry or cleanup."
+            }
+            (ProvisioningAgentAction::Bootstrap, ProvisioningAgentOutcome::Uncertain) => {
+                if request.credential_created {
+                    identity.credential_ready_at.get_or_insert(now);
+                }
+                identity.state = ProvisioningManagedIdentityState::Uncertain;
+                updated.state = ProvisioningJobState::CleanupNeeded;
+                "Managed bootstrap ended without trustworthy completion evidence; Pharos will not replay it blindly."
+            }
+            (ProvisioningAgentAction::Retire, ProvisioningAgentOutcome::Succeeded) => {
+                identity.state = ProvisioningManagedIdentityState::CredentialRetired;
+                identity.credential_retired_at = Some(now);
+                updated.state = ProvisioningJobState::CleanupNeeded;
+                "Janus retired the exact job-owned credential; durable fleet cleanup is being finalized."
+            }
+            (ProvisioningAgentAction::Retire, ProvisioningAgentOutcome::Failed) => {
+                identity.state = ProvisioningManagedIdentityState::RetirementPending;
+                updated.state = ProvisioningJobState::CleanupNeeded;
+                "Janus credential retirement stopped at a known boundary and remains queued for idempotent recovery."
+            }
+            (ProvisioningAgentAction::Retire, ProvisioningAgentOutcome::Uncertain) => {
+                identity.state = ProvisioningManagedIdentityState::RetirementPending;
+                updated.state = ProvisioningJobState::CleanupNeeded;
+                "Janus credential retirement is uncertain; only the same ownership-bound reconciliation may retry."
+            }
+        };
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: updated.state,
+            message: message.to_string(),
+            observed_at: now,
+        });
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(updated)
+    }
+
+    pub(super) fn record_managed_first_heartbeat(
+        &self,
+        id: &str,
+        next_state: ProvisioningJobState,
+        message: &str,
+        observed_at: i64,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningAgentStoreError> {
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::NotFound)?;
+        let mut updated = previous.clone();
+        let identity = updated
+            .managed_identity
+            .as_mut()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        if updated.state != ProvisioningJobState::WaitingForHeartbeat
+            || identity.state != ProvisioningManagedIdentityState::AwaitingHeartbeat
+            || identity
+                .bootstrap_completed_at
+                .is_none_or(|completed_at| observed_at < completed_at)
+            || !matches!(
+                next_state,
+                ProvisioningJobState::BackupPending | ProvisioningJobState::Complete
+            )
+        {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        identity.state = ProvisioningManagedIdentityState::HeartbeatObserved;
+        identity.first_heartbeat_at = Some(observed_at);
+        updated.state = next_state;
+        updated.terminal_outcome = (next_state == ProvisioningJobState::Complete)
+            .then_some(ProvisioningTerminalOutcome::Provisioned);
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: next_state,
+            message: message.to_string(),
+            observed_at: now,
+        });
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(updated)
+    }
+
+    pub(super) fn complete_managed_backup(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningAgentStoreError> {
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::NotFound)?;
+        if previous.state != ProvisioningJobState::BackupPending
+            || previous.managed_identity.as_ref().is_none_or(|identity| {
+                identity.state != ProvisioningManagedIdentityState::HeartbeatObserved
+            })
+        {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        let mut updated = previous.clone();
+        updated.state = ProvisioningJobState::Complete;
+        updated.terminal_outcome = Some(ProvisioningTerminalOutcome::Provisioned);
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Complete,
+            message: "Backup observation received; setup job complete.".to_string(),
+            observed_at: now,
+        });
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(updated)
+    }
+
+    pub(super) fn complete_managed_retirement(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningAgentStoreError> {
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::NotFound)?;
+        if previous.state != ProvisioningJobState::CleanupNeeded
+            || previous.provider_resources.len() != 1
+            || previous.provider_resources[0].state != "deleted"
+            || previous.managed_identity.as_ref().is_none_or(|identity| {
+                identity.state != ProvisioningManagedIdentityState::CredentialRetired
+            })
+        {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        let mut updated = previous.clone();
+        updated.state = ProvisioningJobState::Complete;
+        updated.terminal_outcome = Some(ProvisioningTerminalOutcome::RolledBack);
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::Complete,
+            message: "Provider resource, job-owned Janus credential, and owned runtime host state are retired.".to_string(),
+            observed_at: now,
+        });
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(updated)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ProvisioningJobStartRequest {
     pub(super) provider: String,
@@ -998,6 +1573,104 @@ pub(super) struct ProvisioningCleanupRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ProvisioningHostKeyAttestationRequest {
+    pub(super) fingerprint: String,
+    pub(super) attended: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProvisioningBootstrapRetryRequest {
+    pub(super) confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProvisioningAgentClaimRequest {
+    pub(super) owner: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProvisioningAgentAction {
+    Bootstrap,
+    Retire,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(super) struct ProvisioningAgentLease {
+    pub(super) schema: &'static str,
+    pub(super) version: u16,
+    pub(super) id: String,
+    pub(super) host: String,
+    pub(super) ticket: &'static str,
+    pub(super) action: ProvisioningAgentAction,
+    pub(super) credential_ref: String,
+    pub(super) provider_id: String,
+    pub(super) lease_until: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) host_key_fingerprint: Option<String>,
+    pub(super) ssh_key_ref: String,
+    pub(super) role: String,
+    pub(super) heartbeat_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProvisioningAgentOutcome {
+    Succeeded,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProvisioningAgentResultRequest {
+    pub(super) owner: String,
+    pub(super) host: String,
+    pub(super) action: ProvisioningAgentAction,
+    pub(super) outcome: ProvisioningAgentOutcome,
+    #[serde(default)]
+    pub(super) credential_created: bool,
+    #[serde(default)]
+    pub(super) reason: Option<ProvisioningManagedFailure>,
+}
+
+impl ProvisioningAgentResultRequest {
+    fn valid(&self) -> bool {
+        valid_action_host_name(&self.owner)
+            && valid_action_host_name(&self.host)
+            && match (self.action, self.outcome, self.reason) {
+                (ProvisioningAgentAction::Bootstrap, ProvisioningAgentOutcome::Succeeded, None) => {
+                    self.credential_created
+                }
+                (ProvisioningAgentAction::Retire, ProvisioningAgentOutcome::Succeeded, None) => {
+                    !self.credential_created
+                }
+                (
+                    _,
+                    ProvisioningAgentOutcome::Failed | ProvisioningAgentOutcome::Uncertain,
+                    Some(_),
+                ) => true,
+                _ => false,
+            }
+    }
+}
+
+pub(super) fn valid_ssh_host_fingerprint(value: &str) -> bool {
+    value.len() == 50
+        && value.starts_with("SHA256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProvisioningPaidConfirmRequest {
     plan_sha256: String,
     attended: bool,
@@ -1035,6 +1708,10 @@ pub(super) fn paid_job_integrity_valid(job: &ProvisioningJob) -> bool {
     if reviewed_paid_plan_digest(plan) != plan.plan_sha256
         || job.host_name.as_deref() != Some(plan.server_name.as_str())
         || plan.required_labels != paid_required_labels(&job.id, &plan.provider_project)
+        || job.managed_identity.as_ref().is_some_and(|identity| {
+            plan.managed_credential_ref.as_deref() != Some(identity.credential_ref.as_str())
+                || plan.managed_executor_owner.as_deref() != Some(identity.executor_owner.as_str())
+        })
     {
         return false;
     }
@@ -1053,6 +1730,7 @@ pub(super) fn paid_job_integrity_valid(job: &ProvisioningJob) -> bool {
                 && resources.len() == 1
                 && resources[0].provider_id == provider_id
                 && resources[0].name == plan.server_name
+                && (plan.managed_executor_owner.is_some() == job.managed_identity.is_some())
         }
         Some(_) => resources.is_empty(),
     }
@@ -1086,6 +1764,7 @@ pub(super) fn paid_project_blocked_in(
 pub(super) struct ProviderRuntimeConfig {
     pub(super) hetzner_cloud: HetznerCloudRuntimeConfig,
     pub(super) existing_host: ExistingHostRuntimeConfig,
+    pub(super) managed_provisioning: ManagedProvisioningRuntimeConfig,
     pub(super) janus_public_url: Option<Url>,
 }
 
@@ -1094,9 +1773,128 @@ impl ProviderRuntimeConfig {
         Self {
             hetzner_cloud: HetznerCloudRuntimeConfig::from_env(),
             existing_host: ExistingHostRuntimeConfig::from_env(),
+            managed_provisioning: ManagedProvisioningRuntimeConfig::from_env(),
             janus_public_url: env_nonempty("PHAROS_JANUS_PUBLIC_URL")
                 .and_then(|value| provider_setup_base_url(&value)),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ManagedProvisioningRuntimeConfig {
+    pub(super) enabled: bool,
+    pub(super) owner_host: Option<String>,
+    scope: Option<ManagedProvisioningJanusScope>,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedProvisioningJanusScope {
+    organization: String,
+    project: String,
+    repository: String,
+    environment: String,
+}
+
+fn valid_janus_scope_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn hash_length_framed_field(digest: &mut Sha256, value: &str) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+fn janus_managed_credential_ref(scope: &ManagedProvisioningJanusScope, host: &str) -> String {
+    let mut scope_digest = Sha256::new();
+    for value in [
+        "janus-scope-v1",
+        scope.organization.as_str(),
+        scope.project.as_str(),
+        scope.repository.as_str(),
+        scope.environment.as_str(),
+    ] {
+        hash_length_framed_field(&mut scope_digest, value);
+    }
+    scope_digest.update([0, 0]);
+    let scope_ref = format!("scp_{}", &hex(&scope_digest.finalize())[..40]);
+    let secret_name = format!(
+        "PHAROS_BEACON_{}_TOKEN",
+        host.replace('-', "_").to_ascii_uppercase()
+    );
+    let mut secret_digest = Sha256::new();
+    secret_digest.update(b"janus-secret-ref-v2\0");
+    secret_digest.update(scope_ref.as_bytes());
+    secret_digest.update(b"\0");
+    secret_digest.update(secret_name.as_bytes());
+    format!("sec_{}", &hex(&secret_digest.finalize())[..20])
+}
+
+impl ManagedProvisioningRuntimeConfig {
+    fn from_env() -> Self {
+        let enabled = env_nonempty("PHAROS_PROVISIONING_EXECUTOR_READY")
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(false);
+        let owner_host = env_nonempty("PHAROS_PROVISIONING_OWNER_HOST");
+        let scope_parts = [
+            env_nonempty("PHAROS_PROVISIONING_SCOPE_ORGANIZATION"),
+            env_nonempty("PHAROS_PROVISIONING_SCOPE_PROJECT"),
+            env_nonempty("PHAROS_PROVISIONING_SCOPE_REPOSITORY"),
+            env_nonempty("PHAROS_PROVISIONING_SCOPE_ENVIRONMENT"),
+        ];
+        let any_scope = scope_parts.iter().any(Option::is_some);
+        let scope = match scope_parts {
+            [Some(organization), Some(project), Some(repository), Some(environment)] => {
+                for value in [&organization, &project, &repository, &environment] {
+                    assert!(
+                        valid_janus_scope_component(value),
+                        "PHAROS_PROVISIONING_SCOPE_* values must be valid Janus scope components"
+                    );
+                }
+                Some(ManagedProvisioningJanusScope {
+                    organization,
+                    project,
+                    repository,
+                    environment,
+                })
+            }
+            _ => {
+                assert!(
+                    !any_scope,
+                    "all PHAROS_PROVISIONING_SCOPE_* values must be configured together"
+                );
+                None
+            }
+        };
+        if let Some(owner) = owner_host.as_deref() {
+            assert!(
+                valid_action_host_name(owner),
+                "PHAROS_PROVISIONING_OWNER_HOST must be a valid host name"
+            );
+            tracing::info!(owner = %owner, ready = enabled, "Pharos managed provisioning owner configured");
+        }
+        Self {
+            enabled,
+            owner_host,
+            scope,
+        }
+    }
+
+    pub(super) fn is_owner(&self, host: &str) -> bool {
+        self.enabled && self.owner_host.as_deref() == Some(host)
+    }
+
+    pub(super) fn ready(&self) -> bool {
+        self.enabled && self.owner_host.is_some() && self.scope.is_some()
+    }
+
+    fn credential_ref_for(&self, host: &str) -> Option<String> {
+        self.ready()
+            .then(|| janus_managed_credential_ref(self.scope.as_ref().expect("ready scope"), host))
     }
 }
 
@@ -2487,10 +3285,18 @@ pub(super) fn hetzner_cleanup_target(
         .ok()
         .filter(|value| *value > 0)
         .ok_or(ProvisioningCleanupError::ResourceInvalid)?;
-    if resource.state == "deleted"
-        && job.state == ProvisioningJobState::Complete
-        && job.terminal_outcome == Some(ProvisioningTerminalOutcome::RolledBack)
-    {
+    let completed_rollback = job.state == ProvisioningJobState::Complete
+        && job.terminal_outcome == Some(ProvisioningTerminalOutcome::RolledBack);
+    let managed_retirement_in_progress = job.state == ProvisioningJobState::CleanupNeeded
+        && job.managed_identity.as_ref().is_some_and(|identity| {
+            matches!(
+                identity.state,
+                ProvisioningManagedIdentityState::RetirementPending
+                    | ProvisioningManagedIdentityState::RetirementClaimed
+                    | ProvisioningManagedIdentityState::CredentialRetired
+            )
+        });
+    if resource.state == "deleted" && (completed_rollback || managed_retirement_in_progress) {
         return Ok(HetznerCleanupTarget {
             provider_id,
             resource,
@@ -2499,7 +3305,10 @@ pub(super) fn hetzner_cleanup_target(
     }
     if !matches!(
         job.state,
-        ProvisioningJobState::WaitingForHeartbeat | ProvisioningJobState::CleanupNeeded
+        ProvisioningJobState::WaitingForHeartbeat
+            | ProvisioningJobState::BackupPending
+            | ProvisioningJobState::Complete
+            | ProvisioningJobState::CleanupNeeded
     ) {
         return Err(ProvisioningCleanupError::CleanupNotAllowed);
     }
@@ -4277,6 +5086,13 @@ pub(super) fn paid_setup_runtime_readiness(state: &AppState, now: i64) -> serde_
             "paid_project_available".to_string(),
             json!(!state.provisioning_jobs.paid_project_blocked(None)),
         );
+        object.insert(
+            "managed_executor_ready".to_string(),
+            json!(
+                state.provider_runtime.managed_provisioning.ready()
+                    && state.beacon_auth.report_token_mode == BeaconTokenMode::Janus
+            ),
+        );
     }
     value
 }
@@ -4368,6 +5184,71 @@ pub(super) async fn create_provisioning_job(
                 })),
             );
         }
+        if !state.provider_runtime.managed_provisioning.ready()
+            || state.beacon_auth.report_token_mode != BeaconTokenMode::Janus
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                no_store_headers(),
+                Json(json!({
+                    "error": "Managed server creation is not ready on this Pharos installation. No paid action was started."
+                })),
+            );
+        }
+        let Some(host_name) = request
+            .host_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| valid_action_host_name(host))
+        else {
+            return (
+                StatusCode::BAD_REQUEST,
+                no_store_headers(),
+                Json(json!({ "error": "Choose a valid server name." })),
+            );
+        };
+        if state.store.get(host_name).is_some()
+            || host_is_declared(&state, host_name)
+            || state.retired_hosts.is_retired(host_name)
+            || state.provisioning_jobs.list().iter().any(|job| {
+                job.host_name.as_deref() == Some(host_name)
+                    && job.terminal_outcome != Some(ProvisioningTerminalOutcome::RolledBack)
+            })
+        {
+            return (
+                StatusCode::CONFLICT,
+                no_store_headers(),
+                Json(json!({
+                    "error": "That server name is already owned by runtime, declared, retired, or provisioning state. No paid action was started."
+                })),
+            );
+        }
+        match state.beacon_auth.janus_manages_host(host_name) {
+            Ok(false) => {}
+            Ok(true) => {
+                return (
+                    StatusCode::CONFLICT,
+                    no_store_headers(),
+                    Json(json!({
+                        "error": "That server name already has a Janus-managed identity. No paid action was started."
+                    })),
+                );
+            }
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    no_store_headers(),
+                    Json(json!({
+                        "error": "Janus identity ownership could not be verified. No paid action was started."
+                    })),
+                );
+            }
+        }
+        let managed_credential_ref = state
+            .provider_runtime
+            .managed_provisioning
+            .credential_ref_for(host_name)
+            .expect("managed provisioning readiness requires a Janus scope");
         if state.provisioning_jobs.paid_project_blocked(None) {
             return (
                 StatusCode::CONFLICT,
@@ -4473,6 +5354,13 @@ pub(super) async fn create_provisioning_job(
             &request,
             &review_operation,
             &state.provider_connections,
+            state
+                .provider_runtime
+                .managed_provisioning
+                .owner_host
+                .as_deref()
+                .expect("managed provisioning readiness requires an owner"),
+            &managed_credential_ref,
             now,
         ) {
             Ok(plan) => plan,
@@ -4568,6 +5456,8 @@ pub(super) fn build_reviewed_paid_plan(
     request: &ProvisioningJobStartRequest,
     operation: &HetznerOperationContext,
     connections: &ProviderConnectionStore,
+    managed_executor_owner: &str,
+    managed_credential_ref: &str,
     now: i64,
 ) -> Result<ProvisioningReviewedPaidPlan, (StatusCode, &'static str)> {
     let runtime = &operation.runtime;
@@ -4634,6 +5524,8 @@ pub(super) fn build_reviewed_paid_plan(
         expires_at: now.saturating_add(runtime.approval_ttl_secs),
         ssh_key_ref: ssh_key_ref.to_string(),
         firewall_ref: firewall_ref.to_string(),
+        managed_executor_owner: Some(managed_executor_owner.to_string()),
+        managed_credential_ref: Some(managed_credential_ref.to_string()),
         required_labels,
         allowed_operations: vec!["create-server".to_string(), "delete-server".to_string()],
         cleanup_policy: "No silent retry or automatic deletion. If setup fails, Pharos keeps the tracked server visible and requires separately confirmed cleanup.".to_string(),
@@ -4741,6 +5633,17 @@ pub(super) async fn revalidate_reviewed_paid_plan(
         return Err((
             StatusCode::CONFLICT,
             "The persisted paid plan no longer validates. Review current details again.",
+        ));
+    }
+    if reviewed
+        .managed_executor_owner
+        .as_deref()
+        .is_none_or(|owner| !state.provider_runtime.managed_provisioning.is_owner(owner))
+        || state.beacon_auth.report_token_mode != BeaconTokenMode::Janus
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The reviewed managed provisioning executor is not ready. No provider resource was created.",
         ));
     }
     if now >= reviewed.expires_at {
@@ -5696,19 +6599,19 @@ pub(super) fn hetzner_bootstrap_handoff(
     resource: &ProvisioningProviderResource,
 ) -> Option<ProvisioningHandoff> {
     let ssh = resource.ssh.as_ref()?;
-    let address = ssh.host.as_deref()?;
+    ssh.host.as_deref()?;
     Some(ProvisioningHandoff {
         method: BootstrapMethod::NixosAnywhere,
-        status: "provider-created-bootstrap-required".to_string(),
+        status: "provider-created-host-key-required".to_string(),
         title: "Server created".to_string(),
-        summary: "The provider server is ready; finish setup to install NixOS, start pharos-beacon, and wait for the first heartbeat.".to_string(),
-        token_policy: "Use a private runtime token file with the guarded nixos-anywhere helper; raw credentials never enter job output, command arguments, or the Nix store.".to_string(),
-        secret_target: Some("/etc/pharos/pharos-beacon.token".to_string()),
-        command_ref: Some("scripts/bootstrap-pharos-nixos-anywhere.sh".to_string()),
+        summary: "Confirm the server's SSH host-key fingerprint out of band. The reviewed Linux executor will then create the job-owned Janus credential, install NixOS, and wait for the first heartbeat.".to_string(),
+        token_policy: "Janus generates and owns one job-bound beacon credential. Its raw value is never returned to Pharos, the browser, command arguments, logs, or the Nix store.".to_string(),
+        secret_target: Some("Janus-managed runtime file".to_string()),
+        command_ref: Some("managed Linux provisioning executor".to_string()),
         next_steps: vec![
-            format!("Prepare the reviewed NixOS flake for {}.", resource.name),
-            format!("Run the bootstrap helper against root@{address} from an approved Linux executor."),
-            "Keep setup open until the first authenticated heartbeat confirms the new host.".to_string(),
+            format!("Open the provider web console for {} and run: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256", resource.name),
+            "Copy only the displayed SHA256 fingerprint into this assistant. A fingerprint is public verification data; never copy the private host key.".to_string(),
+            "Keep setup open. The reviewed Linux executor proceeds automatically after the fingerprint is attested, and Pharos finishes only after an authenticated heartbeat.".to_string(),
         ],
     })
 }
@@ -5927,6 +6830,117 @@ pub(super) async fn provisioning_job_json(
             no_store_headers(),
             Json(json!({ "error": "provisioning job not found" })),
         ),
+    }
+}
+
+fn provisioning_agent_error_response(
+    error: ProvisioningAgentStoreError,
+) -> (StatusCode, &'static str) {
+    match error {
+        ProvisioningAgentStoreError::NotFound => {
+            (StatusCode::NOT_FOUND, "Provisioning job not found.")
+        }
+        ProvisioningAgentStoreError::WrongOwner => (
+            StatusCode::FORBIDDEN,
+            "This executor does not own the provisioning job.",
+        ),
+        ProvisioningAgentStoreError::InvalidTransition => (
+            StatusCode::CONFLICT,
+            "The provisioning job is not ready for that action.",
+        ),
+        ProvisioningAgentStoreError::InvalidContract => (
+            StatusCode::BAD_REQUEST,
+            "The provisioning action did not satisfy the required contract.",
+        ),
+        ProvisioningAgentStoreError::Persistence => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The provisioning action could not be durably recorded.",
+        ),
+    }
+}
+
+pub(super) async fn attest_provisioning_host_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProvisioningHostKeyAttestationRequest>,
+) -> impl IntoResponse {
+    let (operator_ref, _) = match paid_operator(&state, &headers) {
+        Ok(operator) => operator,
+        Err((status, message)) => {
+            return (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            );
+        }
+    };
+    if !request.attended {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": "Attended host-key attestation is required." })),
+        );
+    }
+    match state.provisioning_jobs.attest_managed_host_key(
+        &id,
+        request.fingerprint.trim(),
+        &operator_ref,
+        now_unix(),
+    ) {
+        Ok(job) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "job": job })),
+        ),
+        Err(error) => {
+            let (status, message) = provisioning_agent_error_response(error);
+            (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            )
+        }
+    }
+}
+
+pub(super) async fn retry_provisioning_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProvisioningBootstrapRetryRequest>,
+) -> impl IntoResponse {
+    if let Err((status, message)) = paid_operator(&state, &headers) {
+        return (
+            status,
+            no_store_headers(),
+            Json(json!({ "error": message })),
+        );
+    }
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": "Explicit bootstrap retry confirmation is required." })),
+        );
+    }
+    match state
+        .provisioning_jobs
+        .retry_managed_bootstrap(&id, now_unix())
+    {
+        Ok(job) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "job": job })),
+        ),
+        Err(error) => {
+            let (status, message) = provisioning_agent_error_response(error);
+            (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            )
+        }
     }
 }
 

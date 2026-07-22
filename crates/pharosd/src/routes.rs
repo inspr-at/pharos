@@ -58,6 +58,14 @@ fn human_routes() -> Router<AppState> {
             post(cleanup_provisioning_job),
         )
         .route(
+            "/setup/provisioning-jobs/{id}/host-key",
+            post(attest_provisioning_host_key),
+        )
+        .route(
+            "/setup/provisioning-jobs/{id}/retry-bootstrap",
+            post(retry_provisioning_bootstrap),
+        )
+        .route(
             "/setup/existing-host/preflight",
             post(existing_host_preflight_json),
         )
@@ -141,6 +149,14 @@ fn machine_and_public_routes() -> Router<AppState> {
         .route(
             "/agent/retirements/{id}/result",
             post(record_retirement_action_result),
+        )
+        .route(
+            "/agent/provisioning/claim",
+            post(claim_managed_provisioning_action),
+        )
+        .route(
+            "/agent/provisioning/{id}/result",
+            post(record_managed_provisioning_result),
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))

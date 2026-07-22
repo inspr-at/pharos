@@ -2746,9 +2746,43 @@ pub(super) fn reconcile_provisioning_jobs_with_runtime(
         };
         match job.state {
             ProvisioningJobState::WaitingForHeartbeat
-                if host
-                    .last_seen
-                    .is_some_and(|last_seen| last_seen >= job.updated_at) =>
+                if job.managed_identity.as_ref().is_some_and(|identity| {
+                    identity.state == ProvisioningManagedIdentityState::AwaitingHeartbeat
+                        && identity.bootstrap_completed_at.is_some_and(|completed_at| {
+                            host.last_seen
+                                .is_some_and(|last_seen| last_seen >= completed_at)
+                        })
+                }) =>
+            {
+                let setup = provisioning_job_setup_intent(&job);
+                let next_state = if matches!(
+                    setup.backup,
+                    BackupSetupIntent::External | BackupSetupIntent::Absent
+                ) {
+                    ProvisioningJobState::Complete
+                } else {
+                    ProvisioningJobState::BackupPending
+                };
+                let message = if next_state == ProvisioningJobState::Complete {
+                    "First authenticated heartbeat observed after bootstrap; onboarding is complete for the selected backup policy."
+                } else {
+                    "First authenticated heartbeat observed after bootstrap; backup decision or enrollment remains pending."
+                };
+                if let Some(observed_at) = host.last_seen {
+                    let _ = provisioning_jobs.record_managed_first_heartbeat(
+                        &job.id,
+                        next_state,
+                        message,
+                        observed_at,
+                        now,
+                    );
+                }
+            }
+            ProvisioningJobState::WaitingForHeartbeat
+                if job.managed_identity.is_none()
+                    && host
+                        .last_seen
+                        .is_some_and(|last_seen| last_seen >= job.updated_at) =>
             {
                 let setup = provisioning_job_setup_intent(&job);
                 let next_state = if matches!(
@@ -2789,12 +2823,16 @@ pub(super) fn reconcile_provisioning_jobs_with_runtime(
                 let _ = provisioning_jobs.append_progress(&job.id, next_state, message, now);
             }
             ProvisioningJobState::BackupPending if !host.backup_observations.is_empty() => {
-                let _ = provisioning_jobs.append_progress(
-                    &job.id,
-                    ProvisioningJobState::Complete,
-                    "Backup observation received; setup job complete.",
-                    now,
-                );
+                if job.managed_identity.is_some() {
+                    let _ = provisioning_jobs.complete_managed_backup(&job.id, now);
+                } else {
+                    let _ = provisioning_jobs.append_progress(
+                        &job.id,
+                        ProvisioningJobState::Complete,
+                        "Backup observation received; setup job complete.",
+                        now,
+                    );
+                }
             }
             _ => {}
         }
