@@ -1484,6 +1484,10 @@ pub struct ProvisioningReviewedPaidPlan {
     pub expires_at: UnixSeconds,
     pub ssh_key_ref: String,
     pub firewall_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_executor_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_credential_ref: Option<String>,
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -1502,6 +1506,31 @@ impl ProvisioningReviewedPaidPlan {
             if !safe_paid_text(value, 200) {
                 return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
             }
+        }
+        if self.managed_executor_owner.as_deref().is_some_and(|owner| {
+            let bytes = owner.as_bytes();
+            !(1..=63).contains(&bytes.len())
+                || !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+                || bytes.iter().any(|byte| {
+                    !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && *byte != b'-'
+                })
+        }) {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
+        }
+        let managed_ref_valid = self
+            .managed_credential_ref
+            .as_deref()
+            .is_none_or(|reference| {
+                reference.len() == 24
+                    && reference.starts_with("sec_")
+                    && reference[4..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if !managed_ref_valid
+            || self.managed_executor_owner.is_some() != self.managed_credential_ref.is_some()
+        {
+            return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
         }
         if !safe_paid_text(&self.cleanup_policy, 600) {
             return Err(ServerLifecycleContractError::InvalidReviewedPaidPlan);
@@ -1667,6 +1696,143 @@ impl ProvisioningPaidExecution {
     }
 }
 
+/// Value-free ownership and progress for the Janus-backed identity used by a
+/// managed provider server. The raw credential and SSH key never belong in
+/// this contract.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvisioningManagedIdentityState {
+    AwaitingHostKey,
+    Ready,
+    BootstrapClaimed,
+    RetryRequired,
+    Uncertain,
+    AwaitingHeartbeat,
+    HeartbeatObserved,
+    RetirementPending,
+    RetirementClaimed,
+    CredentialRetired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvisioningManagedFailure {
+    CheckoutNotReady,
+    JanusUnavailable,
+    JanusRejected,
+    SshIdentityUnavailable,
+    SshUnreachable,
+    HostKeyMismatch,
+    BootstrapFailed,
+    ResultContractInvalid,
+    UncertainExecution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningManagedIdentity {
+    pub credential_ref: String,
+    pub executor_owner: String,
+    pub state: ProvisioningManagedIdentityState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_operator_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key_attested_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ready_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_completed_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_heartbeat_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_retired_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<ProvisioningManagedFailure>,
+}
+
+impl ProvisioningManagedIdentity {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        let credential_ref_valid = self.credential_ref.len() == 24
+            && self.credential_ref.starts_with("sec_")
+            && self.credential_ref[4..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let executor_valid = self.executor_owner.len() <= 63
+            && self.executor_owner.chars().next().is_some_and(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit()
+            })
+            && self.executor_owner.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            });
+        let fingerprint_valid = self
+            .host_key_fingerprint
+            .as_deref()
+            .is_none_or(|fingerprint| {
+                fingerprint.len() == 50
+                    && fingerprint.starts_with("SHA256:")
+                    && fingerprint[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+            });
+        let attestation_complete = self.host_key_fingerprint.is_some()
+            == self.host_key_operator_ref.is_some()
+            && self.host_key_fingerprint.is_some() == self.host_key_attested_at.is_some();
+        let timestamps_valid = [
+            self.host_key_attested_at,
+            self.lease_until,
+            self.credential_ready_at,
+            self.bootstrap_completed_at,
+            self.first_heartbeat_at,
+            self.credential_retired_at,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|value| value > 0);
+        let state_valid = match self.state {
+            ProvisioningManagedIdentityState::AwaitingHostKey => {
+                self.host_key_fingerprint.is_none() && self.lease_until.is_none()
+            }
+            ProvisioningManagedIdentityState::Ready
+            | ProvisioningManagedIdentityState::RetryRequired
+            | ProvisioningManagedIdentityState::Uncertain => {
+                self.host_key_fingerprint.is_some() && self.lease_until.is_none()
+            }
+            ProvisioningManagedIdentityState::BootstrapClaimed
+            | ProvisioningManagedIdentityState::RetirementClaimed => self.lease_until.is_some(),
+            ProvisioningManagedIdentityState::AwaitingHeartbeat => {
+                self.lease_until.is_none()
+                    && self.credential_ready_at.is_some()
+                    && self.bootstrap_completed_at.is_some()
+            }
+            ProvisioningManagedIdentityState::HeartbeatObserved => {
+                self.lease_until.is_none() && self.first_heartbeat_at.is_some()
+            }
+            ProvisioningManagedIdentityState::RetirementPending => self.lease_until.is_none(),
+            ProvisioningManagedIdentityState::CredentialRetired => {
+                self.lease_until.is_none() && self.credential_retired_at.is_some()
+            }
+        };
+        if !credential_ref_valid
+            || !executor_valid
+            || !fingerprint_valid
+            || !attestation_complete
+            || self
+                .host_key_operator_ref
+                .as_deref()
+                .is_some_and(|value| !lower_hex_sha256(value))
+            || !timestamps_valid
+            || !state_valid
+        {
+            return Err(ServerLifecycleContractError::InvalidManagedIdentity);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningJob {
     #[serde(default = "default_provisioning_job_schema")]
@@ -1703,6 +1869,8 @@ pub struct ProvisioningJob {
     pub paid_authorization: Option<ProvisioningPaidAuthorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paid_execution: Option<ProvisioningPaidExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_identity: Option<ProvisioningManagedIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_resources: Vec<ProvisioningProviderResource>,
     #[serde(default)]
@@ -1794,6 +1962,35 @@ impl ProvisioningJob {
                     .is_some_and(|started_at| started_at > self.updated_at)
             {
                 return Err(ServerLifecycleContractError::InvalidPaidExecution);
+            }
+        }
+        if let Some(identity) = &self.managed_identity {
+            identity.validate_contract()?;
+            if self.provider != "hetzner-cloud"
+                || self.reviewed_plan.is_none()
+                || self.paid_execution.as_ref().is_none_or(|execution| {
+                    !matches!(execution.state.as_str(), "created" | "reconciled")
+                })
+            {
+                return Err(ServerLifecycleContractError::InvalidManagedIdentity);
+            }
+            if identity
+                .host_key_attested_at
+                .is_some_and(|at| at < self.created_at || at > self.updated_at)
+                || identity
+                    .credential_ready_at
+                    .is_some_and(|at| at < self.created_at || at > self.updated_at)
+                || identity
+                    .bootstrap_completed_at
+                    .is_some_and(|at| at < self.created_at || at > self.updated_at)
+                || identity
+                    .first_heartbeat_at
+                    .is_some_and(|at| at < self.created_at || at > self.updated_at)
+                || identity
+                    .credential_retired_at
+                    .is_some_and(|at| at < self.created_at || at > self.updated_at)
+            {
+                return Err(ServerLifecycleContractError::InvalidManagedIdentity);
             }
         }
         for resource in &self.provider_resources {
@@ -1918,6 +2115,7 @@ pub enum ServerLifecycleContractError {
     InvalidReviewedPaidPlan,
     InvalidPaidAuthorization,
     InvalidPaidExecution,
+    InvalidManagedIdentity,
     PaidAuthorizationWithoutReviewedPlan,
     PaidExecutionWithoutAuthorization,
     PaidPlanHashMismatch,
@@ -1983,6 +2181,9 @@ impl std::fmt::Display for ServerLifecycleContractError {
                     f,
                     "paid execution is invalid or outside its authorization window"
                 )
+            }
+            Self::InvalidManagedIdentity => {
+                write!(f, "managed provisioning identity is invalid")
             }
             Self::PaidAuthorizationWithoutReviewedPlan => {
                 write!(f, "paid authorization requires an exact reviewed plan")
@@ -3837,6 +4038,7 @@ mod tests {
             reviewed_plan: None,
             paid_authorization: None,
             paid_execution: None,
+            managed_identity: None,
             provider_resources: vec![ProvisioningProviderResource {
                 provider: "hetzner-cloud".to_string(),
                 kind: "server".to_string(),
@@ -3979,6 +4181,8 @@ mod tests {
             expires_at: 1_700_000_900,
             ssh_key_ref: "pharos-bootstrap-key".to_string(),
             firewall_ref: "pharos-bootstrap-firewall".to_string(),
+            managed_executor_owner: Some("csb1".to_string()),
+            managed_credential_ref: Some(format!("sec_{}", "c".repeat(20))),
             required_labels: BTreeMap::from([
                 ("managed-by".to_string(), "pharos".to_string()),
                 ("pharos-setup".to_string(), "tracked-job".to_string()),
@@ -4025,6 +4229,7 @@ mod tests {
                 provider_request_started_at: None,
                 provider_id: None,
             }),
+            managed_identity: None,
             provider_resources: vec![],
             progress: vec![ProvisioningProgressEntry {
                 state: ProvisioningJobState::Planning,

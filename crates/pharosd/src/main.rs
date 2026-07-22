@@ -57,7 +57,8 @@ use pharos_core::{
     LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
     ManifestStatusSource, NixFreshness, PreflightCheckState, PrivilegedActionMode,
     ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
-    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningPaidAuthorization,
+    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningManagedFailure,
+    ProvisioningManagedIdentity, ProvisioningManagedIdentityState, ProvisioningPaidAuthorization,
     ProvisioningPaidExecution, ProvisioningProgressEntry, ProvisioningProviderResource,
     ProvisioningReviewedPaidPlan, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
     SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
@@ -1488,6 +1489,118 @@ fn retirement_owner_authorized(
     }
 }
 
+fn provisioning_owner_authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+) -> Result<(), StatusCode> {
+    if !state.provider_runtime.managed_provisioning.is_owner(owner) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if state.retired_hosts.is_retired(owner) {
+        return Err(StatusCode::GONE);
+    }
+    let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    match state
+        .beacon_auth
+        .report_token_status(&state.store, owner, token)
+    {
+        ReportTokenAuth::Allowed => Ok(()),
+        ReportTokenAuth::Denied => Err(StatusCode::UNAUTHORIZED),
+        ReportTokenAuth::Unavailable(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn claim_managed_provisioning_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProvisioningAgentClaimRequest>,
+) -> axum::response::Response {
+    let owner = request.owner.trim().to_string();
+    if !valid_action_host_name(&owner) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(status) = provisioning_owner_authorized(&state, &headers, &owner) {
+        return status.into_response();
+    }
+    match state
+        .provisioning_jobs
+        .claim_managed_provisioning(&owner, now_unix())
+    {
+        Ok(Some(lease)) => (StatusCode::OK, Json(lease)).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(ProvisioningAgentStoreError::Persistence) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(_) => StatusCode::CONFLICT.into_response(),
+    }
+}
+
+async fn record_managed_provisioning_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProvisioningAgentResultRequest>,
+) -> axum::response::Response {
+    let owner = request.owner.trim().to_string();
+    if !valid_action_host_name(&owner) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(status) = provisioning_owner_authorized(&state, &headers, &owner) {
+        return status.into_response();
+    }
+    let action = request.action;
+    let outcome = request.outcome;
+    let job =
+        match state
+            .provisioning_jobs
+            .record_managed_provisioning_result(&id, &request, now_unix())
+        {
+            Ok(job) => job,
+            Err(ProvisioningAgentStoreError::NotFound) => {
+                return StatusCode::NOT_FOUND.into_response()
+            }
+            Err(ProvisioningAgentStoreError::WrongOwner) => {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            Err(ProvisioningAgentStoreError::Persistence) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(_) => return StatusCode::CONFLICT.into_response(),
+        };
+    if action == ProvisioningAgentAction::Retire && outcome == ProvisioningAgentOutcome::Succeeded {
+        let Some(host) = job.host_name.as_deref() else {
+            return StatusCode::CONFLICT.into_response();
+        };
+        let owned_runtime = job
+            .managed_identity
+            .as_ref()
+            .is_some_and(|identity| identity.first_heartbeat_at.is_some());
+        if owned_runtime {
+            if host_is_declared(&state, host) {
+                tracing::error!(host = %host, ticket = "PHAROS-176", "job-owned cleanup refused to remove declared host state");
+                return StatusCode::CONFLICT.into_response();
+            }
+            if let Err(error) = state.store.remove(host) {
+                tracing::error!(host = %host, error = %error, ticket = "PHAROS-176", "job-owned runtime host cleanup could not be persisted");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+        if let Err(error) = state
+            .provisioning_jobs
+            .complete_managed_retirement(&id, now_unix())
+        {
+            return match error {
+                ProvisioningAgentStoreError::Persistence => {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+                _ => StatusCode::CONFLICT.into_response(),
+            };
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn claim_retirement_action(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1841,6 +1954,9 @@ async fn report(
     if let Err(error) = state.store.record(rep, now) {
         tracing::error!(host = %host_name, error = %error, "report could not be durably recorded");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if let Some(host) = state.store.get(&host_name) {
+        reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &[host], now);
     }
     if settings_applied {
         match state.host_actions.complete_settings_change(&host_name, now) {
@@ -2895,6 +3011,7 @@ mod tests {
             reviewed_plan: None,
             paid_authorization: None,
             paid_execution: None,
+            managed_identity: None,
             provider_resources: vec![],
             progress: vec![ProvisioningProgressEntry {
                 state,
@@ -6841,6 +6958,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             expires_at: job.created_at + 15 * 60,
             ssh_key_ref: "pharos-bootstrap-key".to_string(),
             firewall_ref: "pharos-bootstrap-firewall".to_string(),
+            managed_executor_owner: None,
+            managed_credential_ref: None,
             required_labels: paid_required_labels(&job.id, "test-project"),
             allowed_operations: vec!["create-server".to_string(), "delete-server".to_string()],
             cleanup_policy: "No silent retry or automatic deletion; separately confirm cleanup."
@@ -6882,6 +7001,51 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 port: Some(22),
             }),
         }
+    }
+
+    fn managed_hcloud_created_job(
+        store: &ProvisioningJobStore,
+        host_name: &str,
+        provider_id: &str,
+        created_at: i64,
+    ) -> ProvisioningJob {
+        let job = start_hcloud_review_job(store, host_name, created_at);
+        let mut reviewed = test_reviewed_paid_plan(&job);
+        reviewed.managed_executor_owner = Some("csb1".to_string());
+        reviewed.managed_credential_ref = Some(format!("sec_{}", "d".repeat(20)));
+        reviewed.plan_sha256 = reviewed_paid_plan_digest(&reviewed);
+        let digest = reviewed.plan_sha256.clone();
+        let operator_ref = "b".repeat(64);
+        store
+            .attach_paid_review(&job.id, reviewed, created_at + 1)
+            .expect("managed review attaches");
+        store
+            .confirm_paid_review(
+                &job.id,
+                &digest,
+                &operator_ref,
+                "operator@example.test",
+                created_at + 2,
+            )
+            .expect("managed review confirms");
+        store
+            .claim_paid_execution(&job.id, &digest, &operator_ref, created_at + 3)
+            .expect("managed provider execution claims");
+        store
+            .mark_paid_request_started(&job.id, &digest, created_at + 4)
+            .expect("managed provider request starts");
+        let resource = test_paid_resource(host_name, provider_id);
+        let handoff = hetzner_bootstrap_handoff(&resource).expect("managed handoff");
+        store
+            .complete_paid_create(
+                &job.id,
+                &digest,
+                resource,
+                Some(handoff),
+                false,
+                created_at + 5,
+            )
+            .expect("managed provider result persists")
     }
 
     fn provisioning_store_test_path(label: &str) -> PathBuf {
@@ -7578,6 +7742,229 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert_eq!(store.get(&job.id), Some(complete));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_bootstrap_requires_attested_host_key_and_one_bounded_claim() {
+        let path = provisioning_store_test_path("managed-bootstrap-claim");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_010_000;
+        let job = managed_hcloud_created_job(&store, "managed-bootstrap-test", "5101", created_at);
+        let identity = job.managed_identity.as_ref().expect("managed identity");
+        assert_eq!(
+            identity.state,
+            ProvisioningManagedIdentityState::AwaitingHostKey
+        );
+        assert_eq!(identity.credential_ready_at, None);
+        assert_eq!(
+            store.claim_managed_provisioning("csb1", created_at + 6),
+            Ok(None)
+        );
+        assert_eq!(
+            store.attest_managed_host_key(
+                &job.id,
+                "not-a-fingerprint",
+                &"a".repeat(64),
+                created_at + 7,
+            ),
+            Err(ProvisioningAgentStoreError::InvalidContract)
+        );
+        let fingerprint = format!("SHA256:{}", "A".repeat(43));
+        let attested = store
+            .attest_managed_host_key(&job.id, &fingerprint, &"a".repeat(64), created_at + 8)
+            .expect("public fingerprint attests");
+        assert_eq!(
+            attested.managed_identity.as_ref().map(|value| value.state),
+            Some(ProvisioningManagedIdentityState::Ready)
+        );
+        let lease = store
+            .claim_managed_provisioning("csb1", created_at + 9)
+            .expect("claim persists")
+            .expect("bootstrap lease");
+        assert_eq!(lease.action, ProvisioningAgentAction::Bootstrap);
+        assert_eq!(
+            lease.host_key_fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(
+            store.claim_managed_provisioning("csb1", created_at + 10),
+            Ok(None)
+        );
+        let json = serde_json::to_string(&lease).expect("lease serializes");
+        assert!(!json.to_ascii_lowercase().contains("private"));
+        assert!(!json.to_ascii_lowercase().contains("bearer"));
+        remove_provisioning_store_test_files(&path);
+    }
+
+    #[test]
+    fn managed_bootstrap_known_failure_retries_but_expired_claim_never_replays() {
+        let path = provisioning_store_test_path("managed-bootstrap-retry");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_020_000;
+        let job = managed_hcloud_created_job(&store, "managed-retry-test", "5102", created_at);
+        let fingerprint = format!("SHA256:{}", "B".repeat(43));
+        store
+            .attest_managed_host_key(&job.id, &fingerprint, &"a".repeat(64), created_at + 6)
+            .expect("fingerprint attests");
+        store
+            .claim_managed_provisioning("csb1", created_at + 7)
+            .expect("claim persists")
+            .expect("bootstrap lease");
+        let failed = store
+            .record_managed_provisioning_result(
+                &job.id,
+                &ProvisioningAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "managed-retry-test".to_string(),
+                    action: ProvisioningAgentAction::Bootstrap,
+                    outcome: ProvisioningAgentOutcome::Failed,
+                    credential_created: false,
+                    reason: Some(ProvisioningManagedFailure::SshUnreachable),
+                },
+                created_at + 8,
+            )
+            .expect("known failure persists");
+        assert_eq!(failed.state, ProvisioningJobState::CleanupNeeded);
+        assert_eq!(
+            failed.managed_identity.as_ref().map(|value| value.state),
+            Some(ProvisioningManagedIdentityState::RetryRequired)
+        );
+        store
+            .retry_managed_bootstrap(&job.id, created_at + 9)
+            .expect("attended bounded retry queues");
+        store
+            .claim_managed_provisioning("csb1", created_at + 10)
+            .expect("retry claim persists")
+            .expect("retry bootstrap lease");
+        assert_eq!(
+            store.claim_managed_provisioning("csb1", created_at + 10 + 60 * 60,),
+            Ok(None)
+        );
+        let uncertain = store.get(&job.id).expect("uncertain job remains");
+        assert_eq!(uncertain.state, ProvisioningJobState::CleanupNeeded);
+        assert_eq!(
+            uncertain.managed_identity.as_ref().map(|value| value.state),
+            Some(ProvisioningManagedIdentityState::Uncertain)
+        );
+        assert_eq!(
+            store.retry_managed_bootstrap(&job.id, created_at + 20_000),
+            Err(ProvisioningAgentStoreError::InvalidTransition)
+        );
+        remove_provisioning_store_test_files(&path);
+    }
+
+    #[tokio::test]
+    async fn managed_cleanup_retires_exact_identity_before_terminal_rollback() {
+        let inventory = json!({
+            "servers": [{
+                "id": 5103,
+                "name": "managed-cleanup-test",
+                "labels": paid_required_labels("setup-1700030000-1", "test-project")
+            }],
+            "meta": {"pagination": {
+                "page": 1,
+                "next_page": null,
+                "last_page": 1,
+                "total_entries": 1
+            }}
+        })
+        .to_string();
+        let (api, requests) = hcloud_cleanup_mock_server(inventory, "204 No Content", "").await;
+        let (state, _files) = test_hcloud_state(api);
+        let created_at = 1_700_030_000;
+        let job = managed_hcloud_created_job(
+            &state.provisioning_jobs,
+            "managed-cleanup-test",
+            "5103",
+            created_at,
+        );
+        let fingerprint = format!("SHA256:{}", "C".repeat(43));
+        state
+            .provisioning_jobs
+            .attest_managed_host_key(&job.id, &fingerprint, &"a".repeat(64), created_at + 6)
+            .expect("fingerprint attests");
+        state
+            .provisioning_jobs
+            .claim_managed_provisioning("csb1", created_at + 7)
+            .expect("bootstrap claim persists")
+            .expect("bootstrap lease");
+        state
+            .provisioning_jobs
+            .record_managed_provisioning_result(
+                &job.id,
+                &ProvisioningAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "managed-cleanup-test".to_string(),
+                    action: ProvisioningAgentAction::Bootstrap,
+                    outcome: ProvisioningAgentOutcome::Succeeded,
+                    credential_created: true,
+                    reason: None,
+                },
+                created_at + 8,
+            )
+            .expect("bootstrap completion persists");
+        state
+            .provisioning_jobs
+            .record_managed_first_heartbeat(
+                &job.id,
+                ProvisioningJobState::Complete,
+                "Authenticated ownership proof recorded.",
+                created_at + 9,
+                created_at + 9,
+            )
+            .expect("first authenticated heartbeat binds ownership");
+
+        let current = state
+            .provisioning_jobs
+            .get(&job.id)
+            .expect("managed job remains");
+        let (deleted, already_absent) = execute_hetzner_cleanup_job(&state, current)
+            .await
+            .expect("provider deletion is proven");
+        assert!(!already_absent);
+        assert_eq!(deleted.state, ProvisioningJobState::CleanupNeeded);
+        assert_eq!(deleted.provider_resources[0].state, "deleted");
+        assert_eq!(
+            deleted.managed_identity.as_ref().map(|value| value.state),
+            Some(ProvisioningManagedIdentityState::RetirementPending)
+        );
+        let (idempotent, already_absent) = execute_hetzner_cleanup_job(&state, deleted.clone())
+            .await
+            .expect("deleted cleanup is idempotent");
+        assert!(already_absent);
+        assert_eq!(idempotent, deleted);
+
+        let retirement = state
+            .provisioning_jobs
+            .claim_managed_provisioning("csb1", created_at + 10)
+            .expect("retirement claim persists")
+            .expect("retirement lease");
+        assert_eq!(retirement.action, ProvisioningAgentAction::Retire);
+        state
+            .provisioning_jobs
+            .record_managed_provisioning_result(
+                &job.id,
+                &ProvisioningAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "managed-cleanup-test".to_string(),
+                    action: ProvisioningAgentAction::Retire,
+                    outcome: ProvisioningAgentOutcome::Succeeded,
+                    credential_created: false,
+                    reason: None,
+                },
+                created_at + 11,
+            )
+            .expect("exact credential retirement persists");
+        let complete = state
+            .provisioning_jobs
+            .complete_managed_retirement(&job.id, created_at + 12)
+            .expect("managed cleanup finishes");
+        assert_eq!(complete.state, ProvisioningJobState::Complete);
+        assert_eq!(
+            complete.terminal_outcome,
+            Some(ProvisioningTerminalOutcome::RolledBack)
+        );
+        assert_eq!(requests.lock().expect("provider requests").len(), 2);
     }
 
     #[test]

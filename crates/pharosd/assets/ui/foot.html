@@ -1279,8 +1279,12 @@ function showAssistantError(overlay,message=''){
   error.textContent=message;
   error.hidden=!message;
 }
-function provisioningJobTerminal(state){
-  return ['complete','failed','cleanup-needed'].includes(state||'');
+function provisioningJobTerminal(jobOrState){
+  const job=typeof jobOrState==='object'?jobOrState:null;
+  const state=job?.state||jobOrState||'';
+  const identityState=job?.managed_identity?.state||'';
+  if(state==='cleanup-needed'&&['retirement_pending','retirement_claimed','credential_retired'].includes(identityState))return false;
+  return ['complete','failed','cleanup-needed'].includes(state);
 }
 function provisioningJobLabel(state){
   return String(state||'pending').replace(/-/g,' ');
@@ -1478,8 +1482,9 @@ function updateProviderReadiness(overlay){
   const planReady=Boolean(assistantReviewValue(overlay,'[data-new-location]')&&assistantReviewValue(overlay,'[data-new-server-type]'));
   const durableReady=runtime?.durable_job_store_ready===true;
   const projectAvailable=runtime?.paid_project_available===true;
-  const ready=Boolean(runtime?.provider_ready&&durableReady&&projectAvailable&&keyReady&&planReady);
-  const activationRequired=runtime?.connection_ready===true&&runtime?.execution_enabled===false;
+  const managedExecutorReady=runtime?.managed_executor_ready===true;
+  const ready=Boolean(runtime?.provider_ready&&durableReady&&projectAvailable&&managedExecutorReady&&keyReady&&planReady);
+  const activationRequired=runtime?.connection_ready===true&&(runtime?.execution_enabled===false||!managedExecutorReady);
   if(readiness){
     readiness.dataset.state=ready?'ready':activationRequired?'attention':'blocked';
     const message=readiness.querySelector('span');
@@ -1525,7 +1530,7 @@ function syncAssistantStart(overlay){
       '[data-new-server-type]',
       '[data-new-image]'
     ].every(selector=>Boolean(assistantReviewValue(overlay,selector)));
-    start.disabled=!(runtime?.provider_ready&&runtime?.durable_job_store_ready===true&&runtime?.paid_project_available===true&&runtime?.project_label_configured&&keyReady&&inputsReady);
+    start.disabled=!(runtime?.provider_ready&&runtime?.durable_job_store_ready===true&&runtime?.paid_project_available===true&&runtime?.managed_executor_ready===true&&runtime?.project_label_configured&&keyReady&&inputsReady);
   }else{
     start.disabled=!confirmed;
   }
@@ -1620,6 +1625,7 @@ function renderPaidPlanReview(overlay,job,authoritative=false){
   setPaidPlanText(overlay,'[data-paid-max-active]',`${plan.max_active_servers} maximum · ${plan.observed_active_servers} currently observed`);
   setPaidPlanText(overlay,'[data-paid-ssh-key]',plan.ssh_key_ref);
   setPaidPlanText(overlay,'[data-paid-firewall]',plan.firewall_ref);
+  setPaidPlanText(overlay,'[data-paid-managed-executor]',plan.managed_executor_owner);
   setPaidPlanText(overlay,'[data-paid-operations]',(Array.isArray(plan.allowed_operations)?plan.allowed_operations:[]).join(', '));
   setPaidPlanText(overlay,'[data-paid-cleanup]',plan.cleanup_policy);
   setPaidPlanText(overlay,'[data-paid-plan-hash]',plan.plan_sha256);
@@ -1719,16 +1725,23 @@ function renderProviderCreatedResult(overlay,job){
   if(!overlay||!result)return false;
   const resource=primaryProviderResource(job);
   const handoff=job?.handoff;
+  const identity=job?.managed_identity||null;
+  const identityState=String(identity?.state||'');
   const deleted=Boolean(
     resource?.state==='deleted'&&
     handoff?.status==='provider-resource-deleted'&&
     job?.state==='complete'&&
     job?.terminal_outcome==='rolled-back'
   );
+  const cleanupFinishing=Boolean(
+    resource?.state==='deleted'&&
+    handoff?.status==='provider-resource-deleted-identity-cleanup-pending'&&
+    job?.state==='cleanup-needed'
+  );
   const activeResource=Boolean(
     resource&&['created','created-address-pending'].includes(resource.state)
   );
-  const visible=deleted||Boolean(
+  const visible=deleted||cleanupFinishing||Boolean(
     activeResource&&['bootstrapping','waiting-for-heartbeat','cleanup-needed'].includes(job?.state)
   );
   if(!visible){
@@ -1740,32 +1753,65 @@ function renderProviderCreatedResult(overlay,job){
   overlay.dataset.providerCreated='true';
   overlay.pharosProvisioningJob=job;
   result.hidden=false;
-  result.dataset.state=deleted?'deleted':'active';
-  const cleanupNeeded=!deleted&&job?.state==='cleanup-needed';
-  const viewTitle=deleted?'Server deleted':cleanupNeeded?'Server needs attention':'Server created';
+  result.dataset.state=deleted?'deleted':cleanupFinishing?'cleanup':'active';
+  const cleanupNeeded=!deleted&&!cleanupFinishing&&job?.state==='cleanup-needed';
+  const viewTitle=deleted?'Server deleted':cleanupFinishing?'Finishing cleanup':cleanupNeeded?'Server needs attention':'Server created';
   const headTitle=overlay.querySelector('#setup-assistant-title');
   const headCopy=headTitle?.parentElement?.querySelector('p');
   if(headTitle)headTitle.textContent=viewTitle;
-  if(headCopy)headCopy.textContent=deleted?'The provider resource is no longer active.':cleanupNeeded?'Review recovery before making another provider change.':'Install Pharos to finish setup.';
+  if(headCopy)headCopy.textContent=deleted?'The provider resource is no longer active.':cleanupFinishing?'The server is gone; Pharos is retiring only its job-owned identity.':cleanupNeeded?'Review the safe failure state before retrying or deleting.':'Pharos guides the remaining trust check and automatic installation.';
   const back=overlay.querySelector('[data-assistant-step-back]');
   if(back)back.hidden=true;
-  const setupReady=!cleanupNeeded&&handoff?.status==='provider-created-bootstrap-required';
   const title=result.querySelector('[data-created-title]');
   const ready=result.querySelector('[data-created-ready-text]');
   if(title)title.textContent=viewTitle;
-  if(ready)ready.textContent=deleted?'Removed':cleanupNeeded?'Recovery required':'Ready for setup';
+  const readyLabel={
+    awaiting_host_key:'Verify SSH host key',
+    ready:'Queued for installation',
+    bootstrap_claimed:'Installing NixOS',
+    awaiting_heartbeat:'Waiting for heartbeat',
+    heartbeat_observed:'Heartbeat verified',
+    retry_required:'Known-safe retry available',
+    uncertain:'Manual recovery required',
+    retirement_pending:'Retiring identity',
+    retirement_claimed:'Retiring identity',
+    credential_retired:'Finalizing cleanup'
+  }[identityState];
+  if(ready)ready.textContent=deleted?'Removed':cleanupFinishing?(readyLabel||'Finishing cleanup'):cleanupNeeded?(readyLabel||'Recovery required'):(readyLabel||'Ready for setup');
   const progress=result.querySelector('[data-created-progress]');
   const actions=result.querySelector('[data-created-actions]');
+  const hostKey=result.querySelector('[data-created-host-key]');
   const setup=result.querySelector('[data-created-setup]');
   const recovery=result.querySelector('[data-created-recovery]');
-  if(progress)progress.hidden=deleted||cleanupNeeded;
-  if(actions)actions.hidden=deleted||!setupReady;
-  if(recovery)recovery.hidden=deleted;
-  const viewKey=`${job?.id||''}:${deleted?'deleted':job?.state||'active'}`;
+  const needsHostKey=identityState==='awaiting_host_key'||(identityState==='retry_required'&&identity?.last_failure==='host_key_mismatch');
+  const showAutomatic=Boolean(identity&&!needsHostKey&&!deleted&&!cleanupFinishing);
+  if(progress){
+    progress.hidden=deleted||cleanupFinishing||identityState==='uncertain';
+    const trustDone=!needsHostKey;
+    const installDone=['awaiting_heartbeat','heartbeat_observed'].includes(identityState);
+    const heartbeatDone=identityState==='heartbeat_observed';
+    const states={
+      created:'done',
+      trust:needsHostKey?'current':trustDone?'done':'',
+      install:installDone?'done':['ready','bootstrap_claimed','retry_required'].includes(identityState)?'current':'',
+      heartbeat:heartbeatDone?'done':identityState==='awaiting_heartbeat'?'current':''
+    };
+    Object.entries(states).forEach(([step,state])=>{
+      const node=progress.querySelector(`[data-created-progress-step="${step}"]`);
+      if(!node)return;
+      if(state)node.dataset.state=state;else delete node.dataset.state;
+    });
+  }
+  if(actions)actions.hidden=true;
+  if(hostKey)hostKey.hidden=!needsHostKey;
+  if(setup)setup.hidden=!showAutomatic;
+  if(recovery)recovery.hidden=deleted||cleanupFinishing;
+  const retry=result.querySelector('[data-created-bootstrap-retry]');
+  if(retry)retry.hidden=identityState!=='retry_required'||identity?.last_failure==='host_key_mismatch';
+  const viewKey=`${job?.id||''}:${deleted?'deleted':cleanupFinishing?'cleanup':job?.state||'active'}:${identityState}`;
   const viewChanged=result.dataset.jobViewKey!==viewKey;
   result.dataset.jobViewKey=viewKey;
   if(viewChanged){
-    if(setup)setup.hidden=true;
     if(recovery)recovery.open=cleanupNeeded;
     const confirm=result.querySelector('[data-created-delete-confirm]');
     const remove=result.querySelector('[data-created-delete]');
@@ -1777,10 +1823,10 @@ function renderProviderCreatedResult(overlay,job){
   const values={
     '[data-created-host]':resource.name||job.host_name||'new server',
     '[data-created-location]':providerLocationLabel(resource.location),
-    '[data-created-resource]':`Hetzner server ${resource.provider_id||'created'}${deleted?' · deleted':''}`,
-    '[data-created-ssh]':deleted?'No active destination':providerSshLabel(resource),
-    '[data-created-secret]':deleted?'Not applicable':handoff?.secret_target||'private runtime file',
-    '[data-created-command]':deleted?'Not applicable':handoff?.command_ref||'prepared bootstrap handoff',
+    '[data-created-resource]':`Hetzner server ${resource.provider_id||'created'}${deleted||cleanupFinishing?' · deleted':''}`,
+    '[data-created-ssh]':deleted||cleanupFinishing?'No active destination':providerSshLabel(resource),
+    '[data-created-secret]':deleted?'Not applicable':handoff?.secret_target||'Janus-managed runtime file',
+    '[data-created-command]':deleted?'Not applicable':handoff?.command_ref||'managed Linux executor',
     '[data-created-guidance]':handoff?.summary||'Review recovery before making another provider change.'
   };
   Object.entries(values).forEach(([selector,value])=>{
@@ -1819,14 +1865,14 @@ function renderProvisioningJob(overlay,job){
   const rolledBack=job.state==='complete'&&job.terminal_outcome==='rolled-back';
   if(!providerCreated){
     if(title)title.textContent=rolledBack?'Setup rolled back':job.state==='failed'?'Setup did not start':job.state==='complete'?'Setup complete':'Setting up server';
-    if(copy)copy.textContent=provisioningJobTerminal(job.state)?`Setup ${label}.`:'This may take a few minutes.';
+    if(copy)copy.textContent=provisioningJobTerminal(job)?`Setup ${label}.`:'This may take a few minutes.';
   }
   if(jobBox){
     jobBox.hidden=false;
     jobBox.dataset.state=job.state||'pending';
     if(!providerCreated)jobBox.scrollIntoView({block:'nearest'});
   }
-  if(spinner)spinner.hidden=provisioningJobTerminal(job.state);
+  if(spinner)spinner.hidden=provisioningJobTerminal(job);
   const jobHeading={
     planning:'Preparing setup',
     provisioning:'Creating server',
@@ -2117,7 +2163,7 @@ async function createPaidProvisioningJob(overlay,start){
   }
   if(!payload.job)throw new Error('The provider create response was incomplete.');
   renderProvisioningJob(overlay,payload.job);
-  if(payload.job.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
+  if(payload.job.id&&!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
 }
 async function deleteTrackedProviderServer(overlay,button){
   const job=overlay?.pharosProvisioningJob;
@@ -2140,6 +2186,51 @@ async function deleteTrackedProviderServer(overlay,button){
   if(!response.ok)throw new Error(payload.error||'Provider deletion could not be confirmed.');
   return payload.cleanup||{};
 }
+async function attestProvisioningHostKey(overlay,button){
+  const job=overlay?.pharosProvisioningJob;
+  const input=overlay?.querySelector('[data-created-host-key-fingerprint]');
+  const confirm=overlay?.querySelector('[data-created-host-key-confirm]');
+  const status=overlay?.querySelector('[data-created-host-key-status]');
+  const fingerprint=String(input?.value||'').trim();
+  if(!job?.id)throw new Error('The tracked setup job is not available.');
+  if(!/^SHA256:[A-Za-z0-9+/]{43}$/.test(fingerprint))throw new Error('Paste the complete SHA256 fingerprint shown by the Hetzner web console.');
+  if(!confirm?.checked)throw new Error('Confirm the out-of-band Hetzner web-console check first.');
+  button.disabled=true;
+  button.setAttribute('aria-busy','true');
+  if(status)status.textContent='Recording the public fingerprint…';
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/host-key`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({fingerprint,attended:true}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'The host-key fingerprint could not be recorded.');
+  if(!payload.job)throw new Error('The host-key response was incomplete.');
+  if(input)input.value='';
+  if(confirm)confirm.checked=false;
+  renderProvisioningJob(overlay,payload.job);
+  if(!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
+}
+async function retryManagedProvisioningBootstrap(overlay,button){
+  const job=overlay?.pharosProvisioningJob;
+  if(!job?.id)throw new Error('The tracked setup job is not available.');
+  button.disabled=true;
+  button.setAttribute('aria-busy','true');
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/retry-bootstrap`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({confirm:true}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'The bounded bootstrap retry could not be queued.');
+  if(!payload.job)throw new Error('The bootstrap retry response was incomplete.');
+  renderProvisioningJob(overlay,payload.job);
+  if(!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
+}
 function scheduleProvisioningPoll(overlay,id){
   if(!id)return;
   window.clearTimeout(window.pharosAssistantJobTimer);
@@ -2147,7 +2238,7 @@ function scheduleProvisioningPoll(overlay,id){
     try{
       const job=await fetchProvisioningJob(id);
       renderProvisioningJob(overlay,job);
-      if(!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,id);
+      if(!provisioningJobTerminal(job))scheduleProvisioningPoll(overlay,id);
     }catch(error){
       showAssistantError(overlay,error.message||'Setup status could not be refreshed.');
     }
@@ -2233,7 +2324,7 @@ async function startProvisioningJob(overlay,start){
   }else{
     renderProvisioningJob(overlay,payload.job);
     setAssistantStartLabel(start,'Setup job recorded');
-    if(payload.job?.id&&!provisioningJobTerminal(payload.job.state))scheduleProvisioningPoll(overlay,payload.job.id);
+    if(payload.job?.id&&!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
   }
 }
 function setAssistantTemplate(template,write=true){
@@ -2376,7 +2467,7 @@ function restoreAssistantFromUrl(){
   if(jobId&&jobId.length<=128){
     fetchProvisioningJob(jobId).then(job=>{
       const paidReview=renderAssistantProvisioningJob(overlay,job);
-      if(!paidReview&&!provisioningJobTerminal(job?.state))scheduleProvisioningPoll(overlay,job.id);
+      if(!paidReview&&!provisioningJobTerminal(job))scheduleProvisioningPoll(overlay,job.id);
     }).catch(error=>{
       showAssistantError(overlay,error.message||'The setup job could not be loaded.');
       if(document.activeElement&&overlay.contains(document.activeElement)&&document.activeElement.getClientRects().length===0){
@@ -2517,6 +2608,37 @@ function initSetupAssistant(){
     if(setup){
       setup.hidden=false;
       setup.scrollIntoView({block:'nearest'});
+    }
+  });
+  const syncHostKeySubmit=()=>{
+    const input=overlay.querySelector('[data-created-host-key-fingerprint]');
+    const confirm=overlay.querySelector('[data-created-host-key-confirm]');
+    const submit=overlay.querySelector('[data-created-host-key-submit]');
+    if(submit)submit.disabled=!confirm?.checked||!/^SHA256:[A-Za-z0-9+/]{43}$/.test(String(input?.value||'').trim());
+  };
+  overlay.querySelector('[data-created-host-key-fingerprint]')?.addEventListener('input',syncHostKeySubmit);
+  overlay.querySelector('[data-created-host-key-confirm]')?.addEventListener('change',syncHostKeySubmit);
+  overlay.querySelector('[data-created-host-key-submit]')?.addEventListener('click',async event=>{
+    const button=event.currentTarget;
+    const status=overlay.querySelector('[data-created-host-key-status]');
+    try{
+      await attestProvisioningHostKey(overlay,button);
+    }catch(error){
+      if(status)status.textContent=error.message||'The host-key fingerprint could not be recorded.';
+    }finally{
+      button.removeAttribute('aria-busy');
+      syncHostKeySubmit();
+    }
+  });
+  overlay.querySelector('[data-created-bootstrap-retry]')?.addEventListener('click',async event=>{
+    const button=event.currentTarget;
+    try{
+      await retryManagedProvisioningBootstrap(overlay,button);
+    }catch(error){
+      showAssistantError(overlay,error.message||'The bounded bootstrap retry could not be queued.');
+    }finally{
+      button.removeAttribute('aria-busy');
+      button.disabled=false;
     }
   });
   overlay.querySelector('[data-created-delete-confirm]')?.addEventListener('change',event=>{
