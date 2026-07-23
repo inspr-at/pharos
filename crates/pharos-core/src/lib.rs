@@ -1707,6 +1707,8 @@ pub enum ProvisioningManagedIdentityState {
     BootstrapClaimed,
     RetryRequired,
     Uncertain,
+    ReconciliationPending,
+    ReconciliationClaimed,
     AwaitingHeartbeat,
     HeartbeatObserved,
     RetirementPending,
@@ -1798,10 +1800,12 @@ impl ProvisioningManagedIdentity {
             }
             ProvisioningManagedIdentityState::Ready
             | ProvisioningManagedIdentityState::RetryRequired
-            | ProvisioningManagedIdentityState::Uncertain => {
+            | ProvisioningManagedIdentityState::Uncertain
+            | ProvisioningManagedIdentityState::ReconciliationPending => {
                 self.host_key_fingerprint.is_some() && self.lease_until.is_none()
             }
             ProvisioningManagedIdentityState::BootstrapClaimed
+            | ProvisioningManagedIdentityState::ReconciliationClaimed
             | ProvisioningManagedIdentityState::RetirementClaimed => self.lease_until.is_some(),
             ProvisioningManagedIdentityState::AwaitingHeartbeat => {
                 self.lease_until.is_none()
@@ -3161,6 +3165,14 @@ mod tests {
                 "retry-required",
             ),
             (ProvisioningManagedIdentityState::Uncertain, "uncertain"),
+            (
+                ProvisioningManagedIdentityState::ReconciliationPending,
+                "reconciliation-pending",
+            ),
+            (
+                ProvisioningManagedIdentityState::ReconciliationClaimed,
+                "reconciliation-claimed",
+            ),
             (
                 ProvisioningManagedIdentityState::AwaitingHeartbeat,
                 "awaiting-heartbeat",

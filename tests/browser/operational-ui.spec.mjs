@@ -56,6 +56,7 @@ test("managed server progress follows the backend's kebab-case identity states",
   const automatic = overlay.locator("[data-created-setup]");
   const ready = overlay.locator("[data-created-ready-text]");
   const retry = overlay.locator("[data-created-bootstrap-retry]");
+  const reconcile = overlay.locator("[data-created-bootstrap-reconcile]");
   const guidance = overlay.locator("[data-created-guidance]");
   const nextSteps = overlay.locator("[data-created-next-steps]");
   const progress = overlay.locator("[data-created-progress]");
@@ -128,6 +129,23 @@ test("managed server progress follows the backend's kebab-case identity states",
   await expect(automatic).toBeHidden();
   await expect(retry).toBeHidden();
 
+  await renderState("uncertain", "result_contract_invalid");
+  await expect(ready).toHaveText("Manual recovery required");
+  await expect(progress).toBeHidden();
+  await expect(reconcile).toBeVisible();
+  await expect(retry).toBeHidden();
+
+  await renderState("reconciliation-pending", "result_contract_invalid");
+  await expect(ready).toHaveText("Recovery check queued");
+  await expect(progress).toBeHidden();
+  await expect(reconcile).toBeHidden();
+  await expect(nextSteps).toContainText("checking that the server and credential state are unchanged");
+
+  await renderState("reconciliation-claimed", "result_contract_invalid");
+  await expect(ready).toHaveText("Checking safe recovery");
+  await expect(progress).toBeHidden();
+  await expect(nextSteps).toContainText("read-only recovery check runs");
+
   await renderState("awaiting-heartbeat");
   await expect(ready).toHaveText("Waiting for heartbeat");
   await expect(installStep).toHaveAttribute("data-state", "done");
@@ -144,8 +162,14 @@ test("managed server progress follows the backend's kebab-case identity states",
   await expect(automatic).toBeHidden();
   await expect(recovery).toHaveJSProperty("open", true);
 
-  const retirementStillPolls = await page.evaluate(() =>
-    ["retirement-pending", "retirement-claimed", "credential-retired"].every(
+  const serverSideRecoveryStillPolls = await page.evaluate(() =>
+    [
+      "reconciliation-pending",
+      "reconciliation-claimed",
+      "retirement-pending",
+      "retirement-claimed",
+      "credential-retired",
+    ].every(
       (state) =>
         !provisioningJobTerminal({
           state: "cleanup-needed",
@@ -153,7 +177,7 @@ test("managed server progress follows the backend's kebab-case identity states",
         }),
     ),
   );
-  expect(retirementStillPolls).toBe(true);
+  expect(serverSideRecoveryStillPolls).toBe(true);
 });
 
 test("responsive layouts do not overflow and numbered guide circles stay centred", async ({
