@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.58 - 2026-07-22
+
+- Carry a reviewed Hetzner paid plan through durable creation, SSH host-key attestation, a leased NixOS bootstrap, and the first authenticated heartbeat without automatically replaying uncertain work.
+- Bind every job to one managed executor and Janus credential reference, and require exact ownership plus credential retirement for destructive recovery.
+- Continue the in-app server assistant through verification and installation while keeping provider execution and executor readiness behind independent activation gates.
+
 ## 0.1.57 - 2026-07-22
 
 - Keep the immediately preceding host-report contract valid during a control-plane-first rolling upgrade, reject mismatched or older schema/version pairs, and enforce that bounded compatibility window in the release contract tests.
