@@ -357,6 +357,23 @@ mod tests {
     }
 
     #[test]
+    fn canonical_fingerprint_matches_nix_and_go_for_html_like_safe_labels() {
+        let mut manifest: ManagedServiceManifestV1 = serde_json::from_str(fixture()).unwrap();
+        manifest.host_ref = "host_7f94a1c8e912".to_string();
+        manifest.services[0].service_ref = "svc_24b7c8f0aa19".to_string();
+        manifest.services[0].safe_label = "<Canary & service>".to_string();
+        manifest.services[0].slots[0].slot_ref = "slot_d5019e2a7b11".to_string();
+        manifest.services[0].slots[0].safe_label = "Admin <password> & token".to_string();
+        manifest.services[0].slots[0].delivery.profile_ref = "delivery_2ed71ad75c98".to_string();
+        manifest.services[0].slots[0].reload.profile_ref = "reload_5e776ec5d9a1".to_string();
+        manifest.services[0].slots[0].health.profile_ref = "health_84c12f390b2a".to_string();
+        assert_eq!(
+            manifest.computed_declaration_fingerprint().unwrap(),
+            "decl_eed42d4f2d389904ad63beb09256db37f38c3435c15b46840faae1ac181b70e4"
+        );
+    }
+
+    #[test]
     fn rejects_unknown_variants_fields_duplicates_and_unsafe_labels() {
         let mut value: serde_json::Value = serde_json::from_str(fixture()).unwrap();
         value["extra"] = serde_json::json!(true);

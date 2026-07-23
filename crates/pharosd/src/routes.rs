@@ -74,6 +74,14 @@ fn human_routes() -> Router<AppState> {
             "/managed-service-declarations.json",
             get(managed_service_declarations_json),
         )
+        .route(
+            "/managed-service-setup-intents",
+            post(create_managed_setup_intent).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/managed-service-setup-intents/{intent_ref}/cancel",
+            post(cancel_managed_setup_intent),
+        )
         .route("/host-actions/system-update", post(request_system_update))
         .route(
             "/host-actions/{host}/update-restart/review",
@@ -161,6 +169,10 @@ fn machine_and_public_routes() -> Router<AppState> {
         .route(
             "/agent/provisioning/{id}/result",
             post(record_managed_provisioning_result),
+        )
+        .route(
+            "/internal/managed-service-setup-intents/{intent_ref}",
+            get(retrieve_managed_setup_intent),
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))

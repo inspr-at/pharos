@@ -16,6 +16,7 @@ mod durable_file;
 mod host_actions;
 mod icons;
 mod janus_auth;
+mod managed_setup_intents;
 mod manifests;
 mod nixcfg_dispatch;
 mod provider_connections;
@@ -87,6 +88,7 @@ use crate::host_actions::{
     RetiredHostStore, RetirementAgentResultRequest,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
+use crate::managed_setup_intents::*;
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::nixcfg_dispatch::NixcfgDispatch;
 use crate::provider_connections::{
@@ -113,6 +115,7 @@ struct AppState {
     store: Arc<Store>,
     provisioning_jobs: Arc<ProvisioningJobStore>,
     manifests: Arc<ManifestRegistry>,
+    managed_setup_intents: Option<Arc<ManagedSetupIntentStore>>,
     auth: AuthState,
     beacon_auth: BeaconAuth,
     provider_runtime: ProviderRuntimeConfig,
@@ -2223,6 +2226,195 @@ async fn managed_service_declarations_json(
     )
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateManagedSetupIntentRequest {
+    operation_kind: ManagedOperationKind,
+    source: ManagedSecretSource,
+    host_ref: String,
+    service_ref: String,
+    slot_ref: String,
+}
+
+async fn create_managed_setup_intent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateManagedSetupIntentRequest>,
+) -> Response {
+    if !action_request_header(&headers) {
+        return managed_intent_denial(IntentReason::InvalidRequest);
+    }
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.can_agora() {
+        return managed_intent_denial(IntentReason::Forbidden);
+    }
+    let Some(user) = state
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.current_user(&headers))
+    else {
+        return managed_intent_denial(IntentReason::AuthenticationRequired);
+    };
+    let Some(store) = state.managed_setup_intents.as_ref() else {
+        return managed_intent_denial(IntentReason::Disabled);
+    };
+    let declaration_fingerprint = match current_managed_slot(&state.manifests, &request) {
+        Ok(fingerprint) => fingerprint,
+        Err(reason) => return managed_intent_denial(reason),
+    };
+    match store.issue(IssueIntent {
+        operation_kind: request.operation_kind,
+        source: request.source,
+        host_ref: request.host_ref,
+        service_ref: request.service_ref,
+        slot_ref: request.slot_ref,
+        human_session_ref: user.managed_human_session_ref,
+        declaration_fingerprint,
+        now_unix_secs: now_unix(),
+    }) {
+        Ok(issued) => (
+            StatusCode::CREATED,
+            no_store_headers(),
+            Json(json!({
+                "schema": DELIVERY_SCHEMA,
+                "schema_version": CONTRACT_VERSION,
+                "intent_ref": issued.intent_ref,
+                "continue_url": issued.continue_url,
+                "expires_at_unix_secs": issued.expires_at_unix_secs,
+                "value_returned": false,
+            })),
+        )
+            .into_response(),
+        Err(reason) => managed_intent_denial(reason),
+    }
+}
+
+async fn cancel_managed_setup_intent(
+    State(state): State<AppState>,
+    AxumPath(intent_ref): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !action_request_header(&headers) {
+        return managed_intent_denial(IntentReason::InvalidRequest);
+    }
+    let Some(user) = state
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.current_user(&headers))
+    else {
+        return managed_intent_denial(IntentReason::AuthenticationRequired);
+    };
+    let Some(store) = state.managed_setup_intents.as_ref() else {
+        return managed_intent_denial(IntentReason::Disabled);
+    };
+    match store.cancel(&intent_ref, &user.managed_human_session_ref, now_unix()) {
+        Ok(()) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({
+                "schema": DELIVERY_SCHEMA,
+                "schema_version": CONTRACT_VERSION,
+                "intent_ref": intent_ref,
+                "outcome": "cancelled",
+                "reason_code": "managed_intent_cancelled",
+                "value_returned": false,
+            })),
+        )
+            .into_response(),
+        Err(reason) => managed_intent_denial(reason),
+    }
+}
+
+async fn retrieve_managed_setup_intent(
+    State(state): State<AppState>,
+    AxumPath(intent_ref): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(store) = state.managed_setup_intents.as_ref() else {
+        return managed_intent_denial(IntentReason::Disabled);
+    };
+    let token = bearer_token(&headers).unwrap_or_default();
+    match store.retrieve(&intent_ref, token, now_unix()) {
+        Ok(envelope) => (StatusCode::OK, no_store_headers(), Json(envelope)).into_response(),
+        Err(reason) => managed_intent_denial(reason),
+    }
+}
+
+fn current_managed_slot(
+    manifests: &ManifestRegistry,
+    request: &CreateManagedSetupIntentRequest,
+) -> Result<String, IntentReason> {
+    if !manifests.managed_service_load_errors().is_empty() {
+        return Err(IntentReason::DeclarationUnavailable);
+    }
+    let manifest = manifests
+        .managed_service_manifests()
+        .iter()
+        .find(|manifest| manifest.host_ref == request.host_ref)
+        .ok_or(IntentReason::DeclarationDrift)?;
+    let service = manifest
+        .services
+        .iter()
+        .find(|service| service.service_ref == request.service_ref)
+        .ok_or(IntentReason::DeclarationDrift)?;
+    let slot = service
+        .slots
+        .iter()
+        .find(|slot| slot.slot_ref == request.slot_ref)
+        .ok_or(IntentReason::DeclarationDrift)?;
+    let source_allowed = slot.allowed_sources.iter().any(|source| {
+        matches!(
+            (source, request.source),
+            (
+                pharos_core::managed_services::ManagedSecretSource::Generated,
+                ManagedSecretSource::Generated
+            ) | (
+                pharos_core::managed_services::ManagedSecretSource::Import,
+                ManagedSecretSource::Import
+            )
+        )
+    });
+    if !source_allowed {
+        return Err(IntentReason::DeclarationDrift);
+    }
+    // The v1 declaration deliberately admits both setup operations. Janus
+    // custody owns the current-state check that distinguishes create from
+    // replace; Pharos only signs the exact requested kind and source policy.
+    Ok(manifest.declaration_fingerprint.clone())
+}
+
+fn managed_intent_denial(reason: IntentReason) -> Response {
+    let status = match reason {
+        IntentReason::AuthenticationRequired | IntentReason::UnauthorizedSystem => {
+            StatusCode::UNAUTHORIZED
+        }
+        IntentReason::Forbidden => StatusCode::FORBIDDEN,
+        IntentReason::InvalidRequest => StatusCode::BAD_REQUEST,
+        IntentReason::Unknown => StatusCode::NOT_FOUND,
+        IntentReason::Expired | IntentReason::Cancelled | IntentReason::WrongUser => {
+            StatusCode::GONE
+        }
+        IntentReason::DeclarationDrift | IntentReason::AlreadyDelivered => StatusCode::CONFLICT,
+        IntentReason::Disabled
+        | IntentReason::DeclarationUnavailable
+        | IntentReason::Capacity
+        | IntentReason::PersistenceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    tracing::warn!(reason_code = reason.code(), "managed setup intent denied");
+    (
+        status,
+        no_store_headers(),
+        Json(json!({
+            "schema": DELIVERY_SCHEMA,
+            "schema_version": CONTRACT_VERSION,
+            "outcome": "denied",
+            "reason_code": reason.code(),
+            "value_returned": false,
+        })),
+    )
+        .into_response()
+}
+
 fn managed_service_declarations_payload(
     manifests: &[ManagedServiceManifestV1],
     load_errors: &[ManifestLoadIssue],
@@ -2752,6 +2944,8 @@ async fn main() {
     let startup = StartupConfig::from_env()
         .unwrap_or_else(|err| panic!("invalid Pharos startup configuration: {err}"));
     let host_store_path = std::env::var("PHAROS_DB").ok().map(PathBuf::from);
+    let managed_setup_intent_store_path =
+        ManagedSetupIntentStore::path_for(host_store_path.as_deref());
     let provisioning_job_store_path = provisioning_jobs_path(host_store_path.as_deref());
     let host_action_store_path = HostActionStore::path_for(host_store_path.as_deref());
     let retired_host_store_path = RetiredHostStore::path_for(host_store_path.as_deref());
@@ -2774,6 +2968,21 @@ async fn main() {
             .unwrap_or_else(|error| panic!("alert store startup failed: {error}")),
     );
     let manifests = Arc::new(ManifestRegistry::from_env());
+    let managed_setup_intents = match ManagedSetupIntentConfig::from_env()
+        .unwrap_or_else(|error| panic!("managed setup intent startup failed: {error}"))
+    {
+        None => None,
+        Some(config) => {
+            let path = managed_setup_intent_store_path.unwrap_or_else(|| {
+                panic!("managed setup intents require PHAROS_DB for durable single-use state")
+            });
+            Some(Arc::new(
+                ManagedSetupIntentStore::new(path, config).unwrap_or_else(|error| {
+                    panic!("managed setup intent store startup failed: {error}")
+                }),
+            ))
+        }
+    };
     let auth = Auth::from_config(startup.auth)
         .await
         .unwrap_or_else(|err| panic!("Pharos authentication startup failed: {err}"));
@@ -2788,6 +2997,7 @@ async fn main() {
         store,
         provisioning_jobs,
         manifests,
+        managed_setup_intents,
         auth,
         beacon_auth,
         provider_runtime,
@@ -6495,6 +6705,170 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(blocked["mutation_ready"], false);
         assert_eq!(blocked["mutation_block"], "registry_invalid");
         assert_eq!(blocked["load_errors"].as_array().unwrap().len(), 1);
+    }
+
+    fn managed_setup_request() -> CreateManagedSetupIntentRequest {
+        CreateManagedSetupIntentRequest {
+            operation_kind: ManagedOperationKind::Create,
+            source: ManagedSecretSource::Generated,
+            host_ref: "host_58f36c72a91e".to_string(),
+            service_ref: "svc_0bca8d31f7e2".to_string(),
+            slot_ref: "slot_49c0e8a17d63".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_setup_human_handlers_require_action_header_and_oidc_session() {
+        let state = report_test_state(false);
+        let response = create_managed_setup_intent(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(managed_setup_request()),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(payload["reason_code"], IntentReason::InvalidRequest.code());
+
+        let mut action_headers = HeaderMap::new();
+        action_headers.insert("X-Pharos-Action", "1".parse().unwrap());
+        let response = create_managed_setup_intent(
+            State(state.clone()),
+            action_headers.clone(),
+            Json(managed_setup_request()),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            payload["reason_code"],
+            IntentReason::AuthenticationRequired.code()
+        );
+
+        let response = cancel_managed_setup_intent(
+            State(state),
+            AxumPath("intent_0f92b78c3d16".to_string()),
+            action_headers,
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            payload["reason_code"],
+            IntentReason::AuthenticationRequired.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_setup_machine_handler_requires_bearer_and_returns_exact_envelope() {
+        let sequence = TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "pharos-managed-handler-{}-{sequence}.json",
+            std::process::id()
+        ));
+        let token = "m".repeat(32);
+        let store = Arc::new(
+            ManagedSetupIntentStore::new(
+                path.clone(),
+                ManagedSetupIntentConfig::for_test([14; 32], "key_handler0001", &token),
+            )
+            .unwrap(),
+        );
+        let issued = store
+            .issue(IssueIntent {
+                operation_kind: ManagedOperationKind::Create,
+                source: ManagedSecretSource::Generated,
+                host_ref: "host_58f36c72a91e".to_string(),
+                service_ref: "svc_0bca8d31f7e2".to_string(),
+                slot_ref: "slot_49c0e8a17d63".to_string(),
+                human_session_ref: "hsn_489e126a70bf".to_string(),
+                declaration_fingerprint:
+                    "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e"
+                        .to_string(),
+                now_unix_secs: now_unix(),
+            })
+            .unwrap();
+        let mut state = report_test_state(false);
+        state.managed_setup_intents = Some(store);
+
+        let response = retrieve_managed_setup_intent(
+            State(state.clone()),
+            AxumPath(issued.intent_ref.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            payload["reason_code"],
+            IntentReason::UnauthorizedSystem.code()
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let response =
+            retrieve_managed_setup_intent(State(state), AxumPath(issued.intent_ref), headers).await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["schema"], SIGNED_INTENT_SCHEMA);
+        assert_eq!(payload["key_id"], "key_handler0001");
+        assert!(payload.get("reason_code").is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_setup_declaration_resolution_is_source_bound_and_fail_closed() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/managed-service-declarations-v1.json");
+        let registry = ManifestRegistry::from_all_sources(Vec::new(), None, vec![fixture]);
+        let request = managed_setup_request();
+        assert_eq!(
+            current_managed_slot(&registry, &request).unwrap(),
+            "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e"
+        );
+
+        let missing_registry = ManifestRegistry::from_all_sources(
+            Vec::new(),
+            None,
+            vec![PathBuf::from("/definitely/missing/managed-service.json")],
+        );
+        assert_eq!(
+            current_managed_slot(&missing_registry, &request),
+            Err(IntentReason::DeclarationUnavailable)
+        );
+        let mut drifted = request;
+        drifted.slot_ref = "slot_unknown0000".to_string();
+        assert_eq!(
+            current_managed_slot(&registry, &drifted),
+            Err(IntentReason::DeclarationDrift)
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_setup_denial_statuses_are_stable_and_value_free() {
+        for (reason, expected) in [
+            (IntentReason::Forbidden, StatusCode::FORBIDDEN),
+            (IntentReason::DeclarationDrift, StatusCode::CONFLICT),
+            (IntentReason::AlreadyDelivered, StatusCode::CONFLICT),
+            (IntentReason::Unknown, StatusCode::NOT_FOUND),
+            (IntentReason::Expired, StatusCode::GONE),
+            (
+                IntentReason::PersistenceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (status, _, payload) = json_response(managed_intent_denial(reason)).await;
+            assert_eq!(status, expected);
+            assert_eq!(payload["reason_code"], reason.code());
+            assert_eq!(payload["value_returned"], false);
+            let encoded = payload.to_string();
+            assert!(!encoded.contains("host_"));
+            assert!(!encoded.contains("slot_"));
+            assert!(!encoded.contains("password"));
+        }
     }
 
     #[test]
@@ -10316,6 +10690,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             store: Arc::new(Store::new(None).expect("in-memory host store starts")),
             provisioning_jobs: Arc::new(ProvisioningJobStore::new(None)),
             manifests: Arc::new(ManifestRegistry::default()),
+            managed_setup_intents: None,
             auth: None,
             beacon_auth,
             provider_runtime: ProviderRuntimeConfig::default(),
