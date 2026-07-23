@@ -204,3 +204,50 @@ test("provider help visual stays within its reviewed baseline", async ({ page })
     maxDiffPixelRatio: 0.005,
   });
 });
+
+test("managed service secrets stay value-free, accessible, and narrow-screen safe", async ({
+  page,
+}) => {
+  const servicesResponse = await page.goto("/services");
+  expect(servicesResponse?.status()).toBe(200);
+  const service = page.locator(".managed-service-card").first();
+  await expect(service).toBeVisible();
+  await expect(service).toContainText("Needs setup");
+  await service.click();
+
+  await expect(page.getByRole("heading", { name: "Managed service canary" })).toBeVisible();
+  await expect(page.getByText("Service secret", { exact: true })).toBeVisible();
+  await expect(page.getByText("Reveal", { exact: true })).toBeVisible();
+  await expect(page.getByText("Never", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Setup unavailable" })).toBeDisabled();
+
+  const html = await page.content();
+  for (const forbidden of [
+    'name="secret_value"',
+    'name="source"',
+    'name="host_ref"',
+    'name="service_ref"',
+    'name="slot_ref"',
+    "callback_url",
+    "return_url",
+  ]) {
+    expect(html).not.toContain(forbidden);
+  }
+
+  const details = page.getByText("Technical details", { exact: true });
+  await details.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("Host reference", { exact: true })).toBeVisible();
+
+  const results = await new AxeBuilder({ page }).analyze();
+  expect(
+    results.violations.filter(({ impact }) =>
+      ["serious", "critical"].includes(impact),
+    ),
+  ).toEqual([]);
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+});

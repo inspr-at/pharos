@@ -16,6 +16,7 @@ mod durable_file;
 mod host_actions;
 mod icons;
 mod janus_auth;
+mod managed_service_ui;
 mod managed_setup_intents;
 mod manifests;
 mod nixcfg_dispatch;
@@ -2230,7 +2231,6 @@ async fn managed_service_declarations_json(
 #[serde(deny_unknown_fields)]
 struct CreateManagedSetupIntentRequest {
     operation_kind: ManagedOperationKind,
-    source: ManagedSecretSource,
     host_ref: String,
     service_ref: String,
     slot_ref: String,
@@ -2258,18 +2258,18 @@ async fn create_managed_setup_intent(
     let Some(store) = state.managed_setup_intents.as_ref() else {
         return managed_intent_denial(IntentReason::Disabled);
     };
-    let declaration_fingerprint = match current_managed_slot(&state.manifests, &request) {
-        Ok(fingerprint) => fingerprint,
+    let slot_policy = match current_managed_slot(&state.manifests, &request) {
+        Ok(policy) => policy,
         Err(reason) => return managed_intent_denial(reason),
     };
     match store.issue(IssueIntent {
         operation_kind: request.operation_kind,
-        source: request.source,
+        allowed_sources: slot_policy.allowed_sources,
         host_ref: request.host_ref,
         service_ref: request.service_ref,
         slot_ref: request.slot_ref,
         human_session_ref: user.managed_human_session_ref,
-        declaration_fingerprint,
+        declaration_fingerprint: slot_policy.declaration_fingerprint,
         now_unix_secs: now_unix(),
     }) {
         Ok(issued) => (
@@ -2343,7 +2343,7 @@ async fn retrieve_managed_setup_intent(
 fn current_managed_slot(
     manifests: &ManifestRegistry,
     request: &CreateManagedSetupIntentRequest,
-) -> Result<String, IntentReason> {
+) -> Result<ManagedSlotIntentPolicy, IntentReason> {
     if !manifests.managed_service_load_errors().is_empty() {
         return Err(IntentReason::DeclarationUnavailable);
     }
@@ -2362,25 +2362,32 @@ fn current_managed_slot(
         .iter()
         .find(|slot| slot.slot_ref == request.slot_ref)
         .ok_or(IntentReason::DeclarationDrift)?;
-    let source_allowed = slot.allowed_sources.iter().any(|source| {
-        matches!(
-            (source, request.source),
-            (
-                pharos_core::managed_services::ManagedSecretSource::Generated,
+    let allowed_sources = slot
+        .allowed_sources
+        .iter()
+        .map(|source| match source {
+            pharos_core::managed_services::ManagedSecretSource::Generated => {
                 ManagedSecretSource::Generated
-            ) | (
-                pharos_core::managed_services::ManagedSecretSource::Import,
+            }
+            pharos_core::managed_services::ManagedSecretSource::Import => {
                 ManagedSecretSource::Import
-            )
-        )
-    });
-    if !source_allowed {
-        return Err(IntentReason::DeclarationDrift);
-    }
+            }
+        })
+        .collect();
     // The v1 declaration deliberately admits both setup operations. Janus
     // custody owns the current-state check that distinguishes create from
-    // replace; Pharos only signs the exact requested kind and source policy.
-    Ok(manifest.declaration_fingerprint.clone())
+    // replace; Pharos signs the exact action and the slot's complete reviewed
+    // source policy. Janus binds one human choice to the fresh step-up proof.
+    Ok(ManagedSlotIntentPolicy {
+        declaration_fingerprint: manifest.declaration_fingerprint.clone(),
+        allowed_sources,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ManagedSlotIntentPolicy {
+    declaration_fingerprint: String,
+    allowed_sources: Vec<ManagedSecretSource>,
 }
 
 fn managed_intent_denial(reason: IntentReason) -> Response {
@@ -6363,7 +6370,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(empty.contains(r#"data-created-ssh"#));
         assert!(!empty.contains(r#"data-assistant-continue"#));
         assert!(!empty.contains(r#"data-assistant-next-title"#));
-        assert!(!empty.contains(r#"data-progress-state"#));
+        assert!(!empty.contains(r#"<li data-progress-state=""#));
         assert!(!empty.contains("Choose what you want to add. Nothing changes until you confirm."));
         assert!(!empty.contains("Manual / existing provider"));
         assert!(empty.contains(r#"aria-pressed="false""#));
@@ -6710,7 +6717,6 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     fn managed_setup_request() -> CreateManagedSetupIntentRequest {
         CreateManagedSetupIntentRequest {
             operation_kind: ManagedOperationKind::Create,
-            source: ManagedSecretSource::Generated,
             host_ref: "host_58f36c72a91e".to_string(),
             service_ref: "svc_0bca8d31f7e2".to_string(),
             slot_ref: "slot_49c0e8a17d63".to_string(),
@@ -6777,7 +6783,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let issued = store
             .issue(IssueIntent {
                 operation_kind: ManagedOperationKind::Create,
-                source: ManagedSecretSource::Generated,
+                allowed_sources: vec![ManagedSecretSource::Generated, ManagedSecretSource::Import],
                 host_ref: "host_58f36c72a91e".to_string(),
                 service_ref: "svc_0bca8d31f7e2".to_string(),
                 slot_ref: "slot_49c0e8a17d63".to_string(),
@@ -6820,14 +6826,19 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
-    fn managed_setup_declaration_resolution_is_source_bound_and_fail_closed() {
+    fn managed_setup_declaration_resolution_binds_source_policy_and_fails_closed() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../contracts/managed-service-declarations-v1.json");
         let registry = ManifestRegistry::from_all_sources(Vec::new(), None, vec![fixture]);
         let request = managed_setup_request();
+        let policy = current_managed_slot(&registry, &request).unwrap();
         assert_eq!(
-            current_managed_slot(&registry, &request).unwrap(),
+            policy.declaration_fingerprint,
             "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e"
+        );
+        assert_eq!(
+            policy.allowed_sources,
+            vec![ManagedSecretSource::Generated, ManagedSecretSource::Import]
         );
 
         let missing_registry = ManifestRegistry::from_all_sources(
@@ -10493,8 +10504,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(managed.contains(r#"class="provider-details""#));
         assert!(managed.contains(r#"class="provider-help""#));
         assert!(managed.contains("Prepare the Hetzner project"));
-        assert!(!managed.contains(">Services<"));
-        assert!(!managed.contains(">Access<"));
+        let managed_page = managed
+            .split_once("</aside>")
+            .map(|(_, page)| page)
+            .expect("provider page contains the application sidebar");
+        assert!(!managed_page.contains(">Services<"));
+        assert!(!managed_page.contains(">Access<"));
         assert!(!managed.contains("provider-page-fixture"));
 
         let viewer = render_hetzner_connection_page(&runtime, &store, shell, false, None);

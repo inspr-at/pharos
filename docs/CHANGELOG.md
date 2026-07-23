@@ -5,6 +5,7 @@
 - Honor the kebab-case managed provisioning state contract in the setup assistant, expose SSH host-key attestation and accurate installation guidance, keep identity-retirement polling active, and fail closed on unknown states.
 - Load deterministic value-free managed-service secret-slot declarations from nixcfg, reject malformed, ambiguous, cross-host, or stale declarations for mutation, and expose declaration/load status separately from Janus-owned delivery and observed health.
 - Issue short-lived Ed25519-signed managed-service setup intents, keep browser handoffs opaque, authenticate Janus retrieval, bind cancellation to the initiating OIDC principal, and durably close delivery/cancellation races.
+- Add a focused Services view for declared managed-service secret slots, with locked targets, one value-free setup action, plain lifecycle/progress language, safe offline and declaration-error recovery, and a Janus handoff that never asks Pharos for a source or value.
 
 ## 0.1.59 - 2026-07-23
 

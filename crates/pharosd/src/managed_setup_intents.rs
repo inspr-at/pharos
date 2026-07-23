@@ -38,7 +38,7 @@ pub(crate) enum ManagedOperationKind {
     Replace,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ManagedSecretSource {
     Generated,
@@ -52,7 +52,7 @@ pub(crate) struct ManagedSetupIntentV1 {
     pub schema_version: u16,
     pub intent_ref: String,
     pub operation_kind: ManagedOperationKind,
-    pub source: ManagedSecretSource,
+    pub allowed_sources: Vec<ManagedSecretSource>,
     pub host_ref: String,
     pub service_ref: String,
     pub slot_ref: String,
@@ -240,7 +240,7 @@ pub(crate) struct ManagedSetupIntentStore {
 #[derive(Clone, Debug)]
 pub(crate) struct IssueIntent {
     pub operation_kind: ManagedOperationKind,
-    pub source: ManagedSecretSource,
+    pub allowed_sources: Vec<ManagedSecretSource>,
     pub host_ref: String,
     pub service_ref: String,
     pub slot_ref: String,
@@ -312,13 +312,14 @@ impl ManagedSetupIntentStore {
         database_path.map(|path| path.with_file_name("managed-setup-intents.json"))
     }
 
-    pub(crate) fn issue(&self, request: IssueIntent) -> Result<IssuedIntent, IntentReason> {
+    pub(crate) fn issue(&self, mut request: IssueIntent) -> Result<IssuedIntent, IntentReason> {
         if request.now_unix_secs <= 0
             || !valid_ref("host_", &request.host_ref)
             || !valid_ref("svc_", &request.service_ref)
             || !valid_ref("slot_", &request.slot_ref)
             || !valid_ref("hsn_", &request.human_session_ref)
             || !valid_ref("decl_", &request.declaration_fingerprint)
+            || !canonicalize_allowed_sources(&mut request.allowed_sources)
         {
             return Err(IntentReason::InvalidRequest);
         }
@@ -330,7 +331,7 @@ impl ManagedSetupIntentStore {
             schema_version: CONTRACT_VERSION,
             intent_ref: intent_ref.clone(),
             operation_kind: request.operation_kind,
-            source: request.source,
+            allowed_sources: request.allowed_sources,
             host_ref: request.host_ref,
             service_ref: request.service_ref,
             slot_ref: request.slot_ref,
@@ -539,6 +540,14 @@ pub(crate) fn valid_ref(prefix: &str, value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+fn canonicalize_allowed_sources(sources: &mut [ManagedSecretSource]) -> bool {
+    if sources.is_empty() || sources.len() > 2 {
+        return false;
+    }
+    sources.sort_unstable();
+    sources.windows(2).all(|pair| pair[0] != pair[1])
+}
+
 fn parse_origin(value: &str, label: &str) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|_| format!("{label} origin is invalid"))?;
     let loopback_http =
@@ -637,7 +646,7 @@ mod tests {
     fn request(now: i64) -> IssueIntent {
         IssueIntent {
             operation_kind: ManagedOperationKind::Create,
-            source: ManagedSecretSource::Generated,
+            allowed_sources: vec![ManagedSecretSource::Generated, ManagedSecretSource::Import],
             host_ref: "host_7f94a1c8e912".to_string(),
             service_ref: "svc_24b7c8f0aa19".to_string(),
             slot_ref: "slot_d5019e2a7b11".to_string(),
@@ -758,7 +767,7 @@ mod tests {
                 schema_version: 1,
                 intent_ref: "intent_0f92b78c3d16".to_string(),
                 operation_kind: ManagedOperationKind::Create,
-                source: ManagedSecretSource::Generated,
+                allowed_sources: vec![ManagedSecretSource::Generated, ManagedSecretSource::Import],
                 host_ref: "host_7f94a1c8e912".to_string(),
                 service_ref: "svc_24b7c8f0aa19".to_string(),
                 slot_ref: "slot_d5019e2a7b11".to_string(),
@@ -794,11 +803,11 @@ mod tests {
         );
         assert_eq!(
             URL_SAFE_NO_PAD.encode(&payload),
-            "eyJzY2hlbWEiOiJpbnNwci5qYW51cy5tYW5hZ2VkLXNlcnZpY2Utc2V0dXAtaW50ZW50LnYxIiwic2NoZW1hX3ZlcnNpb24iOjEsImludGVudF9yZWYiOiJpbnRlbnRfMGY5MmI3OGMzZDE2Iiwib3BlcmF0aW9uX2tpbmQiOiJjcmVhdGUiLCJzb3VyY2UiOiJnZW5lcmF0ZWQiLCJob3N0X3JlZiI6Imhvc3RfN2Y5NGExYzhlOTEyIiwic2VydmljZV9yZWYiOiJzdmNfMjRiN2M4ZjBhYTE5Iiwic2xvdF9yZWYiOiJzbG90X2Q1MDE5ZTJhN2IxMSIsImh1bWFuX3Nlc3Npb25fcmVmIjoiaHNuXzQ4OWUxMjZhNzBiZiIsImlzc3Vlcl9yZWYiOiJzeXNfcGhhcm9zX2NvbnRyb2xfcGxhbmVfdjEiLCJhdWRpZW5jZV9yZWYiOiJzeXNfamFudXNfc2VjcmV0X2N1c3RvZHlfdjEiLCJub25jZV9yZWYiOiJub25jZV9hMjgwZmQ2MWI5Y2UiLCJkZWNsYXJhdGlvbl9maW5nZXJwcmludCI6ImRlY2xfNDEyNjhlMmI3NzJhIiwiaXNzdWVkX2F0X3VuaXhfc2VjcyI6MTc4NDgzMzIwMCwiZXhwaXJlc19hdF91bml4X3NlY3MiOjE3ODQ4MzM1MDAsInJldHVybl90YXJnZXQiOiJwaGFyb3Nfc2VydmljZSJ9"
+            "eyJzY2hlbWEiOiJpbnNwci5qYW51cy5tYW5hZ2VkLXNlcnZpY2Utc2V0dXAtaW50ZW50LnYxIiwic2NoZW1hX3ZlcnNpb24iOjEsImludGVudF9yZWYiOiJpbnRlbnRfMGY5MmI3OGMzZDE2Iiwib3BlcmF0aW9uX2tpbmQiOiJjcmVhdGUiLCJhbGxvd2VkX3NvdXJjZXMiOlsiZ2VuZXJhdGVkIiwiaW1wb3J0Il0sImhvc3RfcmVmIjoiaG9zdF83Zjk0YTFjOGU5MTIiLCJzZXJ2aWNlX3JlZiI6InN2Y18yNGI3YzhmMGFhMTkiLCJzbG90X3JlZiI6InNsb3RfZDUwMTllMmE3YjExIiwiaHVtYW5fc2Vzc2lvbl9yZWYiOiJoc25fNDg5ZTEyNmE3MGJmIiwiaXNzdWVyX3JlZiI6InN5c19waGFyb3NfY29udHJvbF9wbGFuZV92MSIsImF1ZGllbmNlX3JlZiI6InN5c19qYW51c19zZWNyZXRfY3VzdG9keV92MSIsIm5vbmNlX3JlZiI6Im5vbmNlX2EyODBmZDYxYjljZSIsImRlY2xhcmF0aW9uX2ZpbmdlcnByaW50IjoiZGVjbF80MTI2OGUyYjc3MmEiLCJpc3N1ZWRfYXRfdW5peF9zZWNzIjoxNzg0ODMzMjAwLCJleHBpcmVzX2F0X3VuaXhfc2VjcyI6MTc4NDgzMzUwMCwicmV0dXJuX3RhcmdldCI6InBoYXJvc19zZXJ2aWNlIn0"
         );
         assert_eq!(
             URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-            "HzAdIgR9Tu2uRIjXeSXVuUKI2Qz_iRaNc8jLspprckTvx-XGRFFwaYT8D1ntisizZ1dIIDBsXQ5XD0-s3GBkAg"
+            "3ThLNIbJ9GUo-deWwOxn8na6tuFhNwPaMo7QY4M1g4CE81TFYBzv8lBbHjCSkqKq2pRJhcUkaogKMye59SxcBg"
         );
     }
 
