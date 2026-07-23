@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.59 - 2026-07-23
+
+- Reconcile current Hetzner server responses through their top-level location while retaining the legacy nested datacenter fallback, sharing one exact fact matcher across creation and uncertain-result recovery, and rejecting missing or conflicting location evidence without replaying paid work.
+
 ## 0.1.58 - 2026-07-22
 
 - Carry a reviewed Hetzner paid plan through durable creation, SSH host-key attestation, a leased NixOS bootstrap, and the first authenticated heartbeat without automatically replaying uncertain work.
