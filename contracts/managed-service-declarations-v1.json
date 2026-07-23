@@ -1,0 +1,37 @@
+{
+  "schema": "inspr.pharos.managed-service-declarations.v1",
+  "schema_version": 1,
+  "generated_by": "nixcfg",
+  "host_ref": "host_58f36c72a91e",
+  "declaration_fingerprint": "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e",
+  "services": [
+    {
+      "service_ref": "svc_0bca8d31f7e2",
+      "safe_label": "Managed service canary",
+      "runtime_kind": "compose",
+      "slots": [
+        {
+          "slot_ref": "slot_49c0e8a17d63",
+          "safe_label": "Canary API token",
+          "consumer_kind": "managed_service",
+          "delivery": {
+            "kind": "private_env_file",
+            "profile_ref": "delivery_2d7a0f63c951"
+          },
+          "reload": {
+            "method": "compose_recreate",
+            "profile_ref": "reload_65bc19f3a087"
+          },
+          "health": {
+            "probe": "compose_healthcheck",
+            "profile_ref": "health_918d0ce7b4a2"
+          },
+          "allowed_sources": [
+            "generated",
+            "import"
+          ]
+        }
+      ]
+    }
+  ]
+}

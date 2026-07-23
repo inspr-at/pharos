@@ -48,23 +48,26 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
-    liveness, AccessSetupIntent, BackupObservation, BackupPostureState, BackupSetupIntent,
-    BootstrapMethod, ExistingHostBootstrapOption, ExistingHostPreflightCheck,
-    ExistingHostPreflightFacts, ExistingHostPreflightReport, ExistingHostPreflightRequest,
-    ExistingHostPreflightSummary, ExistingHostSetupContext, Host, HostKind, HostLocation,
-    HostLocationSource, HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse,
-    HostReport, HostReportResponse, KernelPosture, KernelPostureState, Liveness,
-    LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
-    ManifestStatusSource, NixFreshness, PreflightCheckState, PrivilegedActionMode,
-    ProvisioningBackupProposal, ProvisioningBackupProposalKind, ProvisioningBackupSecretFile,
-    ProvisioningHandoff, ProvisioningJob, ProvisioningJobState, ProvisioningManagedFailure,
-    ProvisioningManagedIdentity, ProvisioningManagedIdentityState, ProvisioningPaidAuthorization,
-    ProvisioningPaidExecution, ProvisioningProgressEntry, ProvisioningProviderResource,
-    ProvisioningReviewedPaidPlan, ProvisioningSetupIntent, ProvisioningTerminalOutcome,
-    SecretOwner, ServiceObservation, ServiceObservationState, SshAccessIntent, SshRoute,
-    EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA,
-    HOST_MANIFEST_VERSION, MAX_HOST_REGISTRATION_BYTES, MAX_HOST_REPORT_BYTES,
-    PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    liveness,
+    managed_services::{
+        ManagedServiceManifestV1, MANAGED_SERVICE_MANIFEST_SCHEMA, MANAGED_SERVICE_MANIFEST_VERSION,
+    },
+    AccessSetupIntent, BackupObservation, BackupPostureState, BackupSetupIntent, BootstrapMethod,
+    ExistingHostBootstrapOption, ExistingHostPreflightCheck, ExistingHostPreflightFacts,
+    ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary,
+    ExistingHostSetupContext, Host, HostKind, HostLocation, HostLocationSource, HostManifest,
+    HostPreferences, HostRegistration, HostRegistrationResponse, HostReport, HostReportResponse,
+    KernelPosture, KernelPostureState, Liveness, LocationSetupIntent, ManifestLocationMode,
+    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
+    PrivilegedActionMode, ProvisioningBackupProposal, ProvisioningBackupProposalKind,
+    ProvisioningBackupSecretFile, ProvisioningHandoff, ProvisioningJob, ProvisioningJobState,
+    ProvisioningManagedFailure, ProvisioningManagedIdentity, ProvisioningManagedIdentityState,
+    ProvisioningPaidAuthorization, ProvisioningPaidExecution, ProvisioningProgressEntry,
+    ProvisioningProviderResource, ProvisioningReviewedPaidPlan, ProvisioningSetupIntent,
+    ProvisioningTerminalOutcome, SecretOwner, ServiceObservation, ServiceObservationState,
+    SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION,
+    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, MAX_HOST_REGISTRATION_BYTES,
+    MAX_HOST_REPORT_BYTES, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2192,6 +2195,67 @@ async fn declared_hosts_json(
         &server_probes,
         now,
     ))
+}
+
+async fn managed_service_declarations_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> (
+    StatusCode,
+    [(header::HeaderName, &'static str); 3],
+    Json<serde_json::Value>,
+) {
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.can_agora() {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(json!({ "error": "Managed-service declaration access is not granted" })),
+        );
+    }
+    (
+        StatusCode::OK,
+        no_store_headers(),
+        Json(managed_service_declarations_payload(
+            state.manifests.managed_service_manifests(),
+            state.manifests.managed_service_load_errors(),
+        )),
+    )
+}
+
+fn managed_service_declarations_payload(
+    manifests: &[ManagedServiceManifestV1],
+    load_errors: &[ManifestLoadIssue],
+) -> serde_json::Value {
+    let mutation_block = if !load_errors.is_empty() {
+        Some("registry_invalid")
+    } else if manifests.is_empty() {
+        Some("no_declarations")
+    } else {
+        None
+    };
+    let declarations: Vec<_> = manifests
+        .iter()
+        .map(|manifest| {
+            json!({
+                "declared": manifest,
+                "runtime": {
+                    "delivery_owner": "janus",
+                    "delivery": null,
+                    "observed_health": null,
+                },
+            })
+        })
+        .collect();
+    json!({
+        "schema": "inspr.pharos.managed-service-declaration-status.v1",
+        "declaration_schema": MANAGED_SERVICE_MANIFEST_SCHEMA,
+        "declaration_version": MANAGED_SERVICE_MANIFEST_VERSION,
+        "mutation_ready": mutation_block.is_none(),
+        "mutation_block": mutation_block,
+        "declarations": declarations,
+        "load_errors": load_errors,
+    })
 }
 
 fn declared_hosts_payload(
@@ -6397,6 +6461,40 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert!(!html.contains(r#"<section class="assistant-overlay""#));
         assert!(!html.contains(r#"<tr class="onboard-row""#));
+    }
+
+    #[test]
+    fn managed_service_status_keeps_declaration_delivery_and_health_separate() {
+        let manifest: ManagedServiceManifestV1 = serde_json::from_str(include_str!(
+            "../../../contracts/managed-service-declarations-v1.json"
+        ))
+        .unwrap();
+        let payload = managed_service_declarations_payload(std::slice::from_ref(&manifest), &[]);
+
+        assert_eq!(
+            payload["schema"],
+            "inspr.pharos.managed-service-declaration-status.v1"
+        );
+        assert_eq!(payload["mutation_ready"], true);
+        assert!(payload["mutation_block"].is_null());
+        assert_eq!(payload["declarations"][0]["declared"], json!(manifest));
+        assert_eq!(
+            payload["declarations"][0]["runtime"],
+            json!({
+                "delivery_owner": "janus",
+                "delivery": null,
+                "observed_health": null,
+            })
+        );
+
+        let issue = ManifestLoadIssue {
+            path: "/managed-services/bad.json".to_string(),
+            error: "managed-service manifest JSON is invalid".to_string(),
+        };
+        let blocked = managed_service_declarations_payload(&[], &[issue]);
+        assert_eq!(blocked["mutation_ready"], false);
+        assert_eq!(blocked["mutation_block"], "registry_invalid");
+        assert_eq!(blocked["load_errors"].as_array().unwrap().len(), 1);
     }
 
     #[test]

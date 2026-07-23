@@ -70,6 +70,10 @@ fn human_routes() -> Router<AppState> {
             post(existing_host_preflight_json),
         )
         .route("/declared-hosts.json", get(declared_hosts_json))
+        .route(
+            "/managed-service-declarations.json",
+            get(managed_service_declarations_json),
+        )
         .route("/host-actions/system-update", post(request_system_update))
         .route(
             "/host-actions/{host}/update-restart/review",
