@@ -452,7 +452,11 @@ path is rejected: paid creation must follow persisted review → authorize →
 unresolved create attempt reserves the provider project across restarts so a
 new review cannot race an uncertain result. The SSH key and firewall must
 already exist in the provider project. Each provider operation pins one token
-snapshot and disables HTTP redirects. After a legitimate token rotation,
+snapshot and disables HTTP redirects. Current Hetzner server responses expose
+the location directly; Pharos also accepts the legacy nested datacenter
+location when the two facts do not conflict, so uncertain creation can be
+reconciled without weakening the exact reviewed-location check. After a
+legitimate token rotation,
 reconciliation and cleanup can recover only from an exact visible ownership
 match; an empty inventory under a different credential is never accepted as
 proof that the original server is absent.
