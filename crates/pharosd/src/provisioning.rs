@@ -2814,6 +2814,8 @@ pub(super) struct HetznerListedServer {
     #[serde(default)]
     image: Option<HetznerNamedServerFact>,
     #[serde(default)]
+    location: Option<HetznerNamedServerFact>,
+    #[serde(default)]
     datacenter: Option<HetznerDatacenterFact>,
     #[serde(default)]
     public_net: Option<HetznerPublicNet>,
@@ -2821,22 +2823,19 @@ pub(super) struct HetznerListedServer {
 
 impl HetznerListedServer {
     fn matches_labels(&self, required: &BTreeMap<String, String>) -> bool {
-        required
-            .iter()
-            .all(|(key, value)| self.labels.get(key) == Some(value))
+        hetzner_labels_match(&self.labels, required)
     }
 
     pub(super) fn matches_reviewed_plan(&self, reviewed: &ProvisioningReviewedPaidPlan) -> bool {
-        self.name == reviewed.server_name
-            && self.matches_labels(&reviewed.required_labels)
-            && self.server_type.as_ref().map(|fact| fact.name.as_str())
-                == Some(reviewed.server_type.as_str())
-            && self.image.as_ref().map(|fact| fact.name.as_str()) == Some(reviewed.image.as_str())
-            && self
-                .datacenter
-                .as_ref()
-                .map(|fact| fact.location.name.as_str())
-                == Some(reviewed.location.as_str())
+        hetzner_server_matches_reviewed_plan(
+            &self.name,
+            &self.labels,
+            self.server_type.as_ref(),
+            self.image.as_ref(),
+            self.location.as_ref(),
+            self.datacenter.as_ref(),
+            reviewed,
+        )
     }
 
     fn into_created(self) -> HetznerCreatedServer {
@@ -2846,6 +2845,7 @@ impl HetznerListedServer {
             labels: self.labels,
             server_type: self.server_type,
             image: self.image,
+            location: self.location,
             datacenter: self.datacenter,
             public_net: self.public_net,
         }
@@ -2863,6 +2863,8 @@ pub(super) struct HetznerCreatedServer {
     #[serde(default)]
     pub(super) image: Option<HetznerNamedServerFact>,
     #[serde(default)]
+    pub(super) location: Option<HetznerNamedServerFact>,
+    #[serde(default)]
     pub(super) datacenter: Option<HetznerDatacenterFact>,
     #[serde(default)]
     pub(super) public_net: Option<HetznerPublicNet>,
@@ -2878,7 +2880,57 @@ pub(super) struct HetznerDatacenterFact {
     location: HetznerNamedServerFact,
 }
 
+fn hetzner_labels_match(
+    labels: &BTreeMap<String, String>,
+    required: &BTreeMap<String, String>,
+) -> bool {
+    required
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
+}
+
+fn hetzner_server_location_name<'a>(
+    location: Option<&'a HetznerNamedServerFact>,
+    datacenter: Option<&'a HetznerDatacenterFact>,
+) -> Option<&'a str> {
+    let current = location.map(|fact| fact.name.as_str());
+    let legacy = datacenter.map(|fact| fact.location.name.as_str());
+    match (current, legacy) {
+        (Some(current), Some(legacy)) if current != legacy => None,
+        (Some(current), _) => Some(current),
+        (None, legacy) => legacy,
+    }
+}
+
+fn hetzner_server_matches_reviewed_plan(
+    name: &str,
+    labels: &BTreeMap<String, String>,
+    server_type: Option<&HetznerNamedServerFact>,
+    image: Option<&HetznerNamedServerFact>,
+    location: Option<&HetznerNamedServerFact>,
+    datacenter: Option<&HetznerDatacenterFact>,
+    reviewed: &ProvisioningReviewedPaidPlan,
+) -> bool {
+    name == reviewed.server_name
+        && hetzner_labels_match(labels, &reviewed.required_labels)
+        && server_type.map(|fact| fact.name.as_str()) == Some(reviewed.server_type.as_str())
+        && image.map(|fact| fact.name.as_str()) == Some(reviewed.image.as_str())
+        && hetzner_server_location_name(location, datacenter) == Some(reviewed.location.as_str())
+}
+
 impl HetznerCreatedServer {
+    pub(super) fn matches_reviewed_plan(&self, reviewed: &ProvisioningReviewedPaidPlan) -> bool {
+        hetzner_server_matches_reviewed_plan(
+            &self.name,
+            &self.labels,
+            self.server_type.as_ref(),
+            self.image.as_ref(),
+            self.location.as_ref(),
+            self.datacenter.as_ref(),
+            reviewed,
+        )
+    }
+
     fn ssh_address(&self) -> Option<String> {
         self.public_net
             .as_ref()
@@ -3119,21 +3171,7 @@ pub(super) async fn send_hetzner_create(
         .await
         .map(|payload| payload.server)
         .map_err(|_| HetznerExecutionError::InvalidResponse)?;
-    if server.id == 0
-        || server.name.trim() != plan.server_name
-        || server.server_type.as_ref().map(|value| value.name.as_str())
-            != Some(plan.server_type.as_str())
-        || server.image.as_ref().map(|value| value.name.as_str()) != Some(plan.image.as_str())
-        || server
-            .datacenter
-            .as_ref()
-            .map(|value| value.location.name.as_str())
-            != Some(plan.location.as_str())
-        || !plan
-            .required_labels
-            .iter()
-            .all(|(key, value)| server.labels.get(key) == Some(value))
-    {
+    if server.id == 0 || !server.matches_reviewed_plan(plan) {
         return Err(HetznerExecutionError::InvalidResponse);
     }
     Ok(server)

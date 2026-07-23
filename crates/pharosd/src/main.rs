@@ -7125,7 +7125,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[tokio::test]
     async fn paid_create_payload_uses_only_the_persisted_plan_and_ownership_labels() {
-        let response_body = r#"{"server":{"id":4242,"name":"hcloud-paid-test","labels":{"managed-by":"pharos","pharos-setup":"tracked-job","pharos-owner":"75c84d20a0aa90c5","pharos-job":"setup-1700000000-1","pharos-attempt":"setup-1700000000-1-1"},"server_type":{"name":"cx22"},"image":{"name":"debian-12"},"datacenter":{"location":{"name":"fsn1"}},"public_net":{"ipv4":{"ip":"192.0.2.42"}}}}"#;
+        let response_body = r#"{"server":{"id":4242,"name":"hcloud-paid-test","labels":{"managed-by":"pharos","pharos-setup":"tracked-job","pharos-owner":"75c84d20a0aa90c5","pharos-job":"setup-1700000000-1","pharos-attempt":"setup-1700000000-1-1"},"server_type":{"name":"cx22"},"image":{"name":"debian-12"},"location":{"id":1,"name":"fsn1","city":"Falkenstein","country":"DE","network_zone":"eu-central"},"public_net":{"ipv4":{"ip":"192.0.2.42"}}}}"#;
         let (api, requests) = hcloud_mock_server("201 Created", response_body, true).await;
         let (state, token_path) = test_hcloud_state(api);
         let job =
@@ -7192,6 +7192,47 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn paid_create_response_accepts_compatible_locations_and_rejects_unsafe_facts() {
+        let path = provisioning_store_test_path("paid-create-location-compat");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let job = start_hcloud_review_job(&store, "hcloud-location-compat", 1_700_000_025);
+        let reviewed = test_reviewed_paid_plan(&job);
+        let legacy = json!({
+            "id": 4242,
+            "name": reviewed.server_name,
+            "labels": reviewed.required_labels,
+            "server_type": {"name": reviewed.server_type},
+            "image": {"name": reviewed.image},
+            "datacenter": {"location": {"name": reviewed.location}}
+        });
+        let server: HetznerCreatedServer =
+            serde_json::from_value(legacy.clone()).expect("legacy create response parses");
+        assert!(server.matches_reviewed_plan(&reviewed));
+
+        let mut current_and_legacy = legacy.clone();
+        current_and_legacy["location"] = json!({"name": reviewed.location});
+        let server: HetznerCreatedServer = serde_json::from_value(current_and_legacy)
+            .expect("compatible current and legacy create response parses");
+        assert!(server.matches_reviewed_plan(&reviewed));
+
+        let mut conflicting = legacy.clone();
+        conflicting["location"] = json!({"name": "nbg1"});
+        let server: HetznerCreatedServer =
+            serde_json::from_value(conflicting).expect("conflicting create response parses");
+        assert!(!server.matches_reviewed_plan(&reviewed));
+
+        let mut incomplete = legacy;
+        incomplete
+            .as_object_mut()
+            .expect("server object")
+            .remove("datacenter");
+        let server: HetznerCreatedServer =
+            serde_json::from_value(incomplete).expect("incomplete create response parses");
+        assert!(!server.matches_reviewed_plan(&reviewed));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn paid_reconciliation_requires_all_reviewed_server_facts() {
         let path = provisioning_store_test_path("paid-reconciliation-facts");
         let store = ProvisioningJobStore::new(Some(path.clone()));
@@ -7203,7 +7244,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             "labels": reviewed.required_labels,
             "server_type": {"name": reviewed.server_type},
             "image": {"name": reviewed.image},
-            "datacenter": {"location": {"name": reviewed.location}}
+            "location": {
+                "id": 1,
+                "name": reviewed.location,
+                "city": "Falkenstein",
+                "country": "DE",
+                "network_zone": "eu-central"
+            }
         });
         let server: HetznerListedServer =
             serde_json::from_value(exact.clone()).expect("exact inventory server parses");
@@ -7212,7 +7259,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         for (pointer, replacement) in [
             ("/server_type/name", json!("cx32")),
             ("/image/name", json!("unexpected-image")),
-            ("/datacenter/location/name", json!("nbg1")),
+            ("/location/name", json!("nbg1")),
         ] {
             let mut changed = exact.clone();
             *changed
@@ -7222,11 +7269,28 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 serde_json::from_value(changed).expect("changed inventory server parses");
             assert!(!server.matches_reviewed_plan(&reviewed));
         }
+
+        let mut legacy = exact.clone();
+        legacy
+            .as_object_mut()
+            .expect("server object")
+            .remove("location");
+        legacy["datacenter"] = json!({"location": {"name": reviewed.location}});
+        let server: HetznerListedServer =
+            serde_json::from_value(legacy).expect("legacy inventory server parses");
+        assert!(server.matches_reviewed_plan(&reviewed));
+
+        let mut conflicting = exact.clone();
+        conflicting["datacenter"] = json!({"location": {"name": "nbg1"}});
+        let server: HetznerListedServer =
+            serde_json::from_value(conflicting).expect("conflicting inventory server parses");
+        assert!(!server.matches_reviewed_plan(&reviewed));
+
         let mut incomplete = exact;
         incomplete
             .as_object_mut()
             .expect("server object")
-            .remove("datacenter");
+            .remove("location");
         let server: HetznerListedServer =
             serde_json::from_value(incomplete).expect("incomplete inventory server parses");
         assert!(!server.matches_reviewed_plan(&reviewed));
