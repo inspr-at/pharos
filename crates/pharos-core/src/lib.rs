@@ -3145,6 +3145,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_identity_states_serialize_as_the_ui_contract() {
+        let cases = [
+            (
+                ProvisioningManagedIdentityState::AwaitingHostKey,
+                "awaiting-host-key",
+            ),
+            (ProvisioningManagedIdentityState::Ready, "ready"),
+            (
+                ProvisioningManagedIdentityState::BootstrapClaimed,
+                "bootstrap-claimed",
+            ),
+            (
+                ProvisioningManagedIdentityState::RetryRequired,
+                "retry-required",
+            ),
+            (ProvisioningManagedIdentityState::Uncertain, "uncertain"),
+            (
+                ProvisioningManagedIdentityState::AwaitingHeartbeat,
+                "awaiting-heartbeat",
+            ),
+            (
+                ProvisioningManagedIdentityState::HeartbeatObserved,
+                "heartbeat-observed",
+            ),
+            (
+                ProvisioningManagedIdentityState::RetirementPending,
+                "retirement-pending",
+            ),
+            (
+                ProvisioningManagedIdentityState::RetirementClaimed,
+                "retirement-claimed",
+            ),
+            (
+                ProvisioningManagedIdentityState::CredentialRetired,
+                "credential-retired",
+            ),
+        ];
+
+        for (state, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(state).expect("managed identity state serializes"),
+                serde_json::Value::String(expected.to_string())
+            );
+        }
+    }
+
+    #[test]
     fn tldr_variants() {
         let na = NixFreshness {
             applicable: false,

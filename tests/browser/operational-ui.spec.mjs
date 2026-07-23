@@ -47,6 +47,115 @@ test("setup assistant traps focus, closes with Escape, and restores its trigger"
   await expect(trigger).toBeFocused();
 });
 
+test("managed server progress follows the backend's kebab-case identity states", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const overlay = page.locator("[data-setup-assistant]");
+  const hostKey = overlay.locator("[data-created-host-key]");
+  const automatic = overlay.locator("[data-created-setup]");
+  const ready = overlay.locator("[data-created-ready-text]");
+  const retry = overlay.locator("[data-created-bootstrap-retry]");
+  const guidance = overlay.locator("[data-created-guidance]");
+  const nextSteps = overlay.locator("[data-created-next-steps]");
+  const progress = overlay.locator("[data-created-progress]");
+  const recovery = overlay.locator("[data-created-recovery]");
+  const trustStep = overlay.locator('[data-created-progress-step="trust"]');
+  const installStep = overlay.locator('[data-created-progress-step="install"]');
+  const heartbeatStep = overlay.locator('[data-created-progress-step="heartbeat"]');
+
+  const renderState = async (state, lastFailure = null) => {
+    await page.evaluate(
+      ({ state, lastFailure }) => {
+        const assistant = document.querySelector("[data-setup-assistant]");
+        assistant.hidden = false;
+        renderProvisioningJob(assistant, {
+          id: "setup-browser-contract",
+          provider: "hetzner-cloud",
+          state: "waiting-for-heartbeat",
+          host_name: "lab-01",
+          provider_resources: [
+            {
+              provider: "hetzner-cloud",
+              kind: "server",
+              provider_id: "1",
+              name: "lab-01",
+              location: "fsn1",
+              state: "created",
+            },
+          ],
+          handoff: {
+            status: "provider-resource-created",
+            summary: "Managed installation is coordinated by Pharos.",
+            next_steps: ["Keep this setup open."],
+          },
+          managed_identity: {
+            credential_ref: "sec_00000000000000000000",
+            executor_owner: "csb1",
+            state,
+            ...(lastFailure ? { last_failure: lastFailure } : {}),
+          },
+          progress: [],
+        });
+      },
+      { state, lastFailure },
+    );
+  };
+
+  await renderState("awaiting-host-key");
+  await expect(ready).toHaveText("Verify SSH host key");
+  await expect(hostKey).toBeVisible();
+  await expect(automatic).toBeHidden();
+  await expect(trustStep).toHaveAttribute("data-state", "current");
+  expect(await installStep.getAttribute("data-state")).toBeNull();
+
+  await renderState("ready");
+  await expect(ready).toHaveText("Queued for installation");
+  await expect(hostKey).toBeHidden();
+  await expect(automatic).toBeVisible();
+  await expect(trustStep).toHaveAttribute("data-state", "done");
+  await expect(installStep).toHaveAttribute("data-state", "current");
+  await expect(guidance).toContainText("SSH host key is verified");
+  await expect(nextSteps).toContainText("starts the reviewed NixOS installation");
+  await expect(nextSteps).not.toContainText("Keep this setup open");
+
+  await renderState("retry-required", "bootstrap_failed");
+  await expect(ready).toHaveText("Known-safe retry available");
+  await expect(retry).toBeVisible();
+
+  await renderState("retry-required", "host_key_mismatch");
+  await expect(hostKey).toBeVisible();
+  await expect(automatic).toBeHidden();
+  await expect(retry).toBeHidden();
+
+  await renderState("awaiting-heartbeat");
+  await expect(ready).toHaveText("Waiting for heartbeat");
+  await expect(installStep).toHaveAttribute("data-state", "done");
+  await expect(heartbeatStep).toHaveAttribute("data-state", "current");
+
+  await renderState("heartbeat-observed");
+  await expect(ready).toHaveText("Heartbeat verified");
+  await expect(heartbeatStep).toHaveAttribute("data-state", "done");
+
+  await renderState("future-state");
+  await expect(ready).toHaveText("Manual recovery required");
+  await expect(progress).toBeHidden();
+  await expect(hostKey).toBeHidden();
+  await expect(automatic).toBeHidden();
+  await expect(recovery).toHaveJSProperty("open", true);
+
+  const retirementStillPolls = await page.evaluate(() =>
+    ["retirement-pending", "retirement-claimed", "credential-retired"].every(
+      (state) =>
+        !provisioningJobTerminal({
+          state: "cleanup-needed",
+          managed_identity: { state },
+        }),
+    ),
+  );
+  expect(retirementStillPolls).toBe(true);
+});
+
 test("responsive layouts do not overflow and numbered guide circles stay centred", async ({
   page,
 }, testInfo) => {

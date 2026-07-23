@@ -1279,11 +1279,66 @@ function showAssistantError(overlay,message=''){
   error.textContent=message;
   error.hidden=!message;
 }
+const MANAGED_IDENTITY_STATE=Object.freeze({
+  awaitingHostKey:'awaiting-host-key',
+  ready:'ready',
+  bootstrapClaimed:'bootstrap-claimed',
+  retryRequired:'retry-required',
+  uncertain:'uncertain',
+  awaitingHeartbeat:'awaiting-heartbeat',
+  heartbeatObserved:'heartbeat-observed',
+  retirementPending:'retirement-pending',
+  retirementClaimed:'retirement-claimed',
+  credentialRetired:'credential-retired'
+});
+const MANAGED_IDENTITY_STATE_VALUES=new Set(Object.values(MANAGED_IDENTITY_STATE));
+const MANAGED_IDENTITY_GUIDANCE=Object.freeze({
+  [MANAGED_IDENTITY_STATE.ready]:{
+    summary:'The SSH host key is verified. The reviewed executor is queued and continues server-side.',
+    steps:['Wait here or return later. Pharos starts the reviewed NixOS installation automatically.']
+  },
+  [MANAGED_IDENTITY_STATE.bootstrapClaimed]:{
+    summary:'The reviewed executor is installing NixOS on this server.',
+    steps:['Do not restart or delete the server while installation is running.']
+  },
+  [MANAGED_IDENTITY_STATE.awaitingHeartbeat]:{
+    summary:'NixOS installation finished. Pharos is waiting for the first authenticated heartbeat.',
+    steps:['No manual action is required. This page updates when the new server reports successfully.']
+  },
+  [MANAGED_IDENTITY_STATE.heartbeatObserved]:{
+    summary:'The first authenticated heartbeat was received. Pharos is finalizing setup.',
+    steps:['No manual action is required.']
+  },
+  [MANAGED_IDENTITY_STATE.retryRequired]:{
+    summary:'Automatic installation stopped at a known safe boundary and will not replay by itself.',
+    steps:['Use the reviewed retry below to continue with this same server.']
+  },
+  [MANAGED_IDENTITY_STATE.uncertain]:{
+    summary:'The installation outcome is uncertain. Pharos will not retry a potentially destructive step automatically.',
+    steps:['Review recovery before changing or deleting the server.']
+  },
+  [MANAGED_IDENTITY_STATE.retirementPending]:{
+    summary:'Pharos is waiting to retire this job-owned identity safely.',
+    steps:['No manual action is required while retirement is queued.']
+  },
+  [MANAGED_IDENTITY_STATE.retirementClaimed]:{
+    summary:'The reviewed executor is retiring this job-owned identity.',
+    steps:['No manual action is required.']
+  },
+  [MANAGED_IDENTITY_STATE.credentialRetired]:{
+    summary:'The job-owned identity is retired. Pharos is finalizing cleanup.',
+    steps:['No manual action is required.']
+  }
+});
 function provisioningJobTerminal(jobOrState){
   const job=typeof jobOrState==='object'?jobOrState:null;
   const state=job?.state||jobOrState||'';
   const identityState=job?.managed_identity?.state||'';
-  if(state==='cleanup-needed'&&['retirement_pending','retirement_claimed','credential_retired'].includes(identityState))return false;
+  if(state==='cleanup-needed'&&[
+    MANAGED_IDENTITY_STATE.retirementPending,
+    MANAGED_IDENTITY_STATE.retirementClaimed,
+    MANAGED_IDENTITY_STATE.credentialRetired
+  ].includes(identityState))return false;
   return ['complete','failed','cleanup-needed'].includes(state);
 }
 function provisioningJobLabel(state){
@@ -1727,6 +1782,8 @@ function renderProviderCreatedResult(overlay,job){
   const handoff=job?.handoff;
   const identity=job?.managed_identity||null;
   const identityState=String(identity?.state||'');
+  const identityStateKnown=MANAGED_IDENTITY_STATE_VALUES.has(identityState);
+  const identityInvalid=!identity||!identityStateKnown;
   const deleted=Boolean(
     resource?.state==='deleted'&&
     handoff?.status==='provider-resource-deleted'&&
@@ -1766,35 +1823,46 @@ function renderProviderCreatedResult(overlay,job){
   const ready=result.querySelector('[data-created-ready-text]');
   if(title)title.textContent=viewTitle;
   const readyLabel={
-    awaiting_host_key:'Verify SSH host key',
-    ready:'Queued for installation',
-    bootstrap_claimed:'Installing NixOS',
-    awaiting_heartbeat:'Waiting for heartbeat',
-    heartbeat_observed:'Heartbeat verified',
-    retry_required:'Known-safe retry available',
-    uncertain:'Manual recovery required',
-    retirement_pending:'Retiring identity',
-    retirement_claimed:'Retiring identity',
-    credential_retired:'Finalizing cleanup'
+    [MANAGED_IDENTITY_STATE.awaitingHostKey]:'Verify SSH host key',
+    [MANAGED_IDENTITY_STATE.ready]:'Queued for installation',
+    [MANAGED_IDENTITY_STATE.bootstrapClaimed]:'Installing NixOS',
+    [MANAGED_IDENTITY_STATE.awaitingHeartbeat]:'Waiting for heartbeat',
+    [MANAGED_IDENTITY_STATE.heartbeatObserved]:'Heartbeat verified',
+    [MANAGED_IDENTITY_STATE.retryRequired]:'Known-safe retry available',
+    [MANAGED_IDENTITY_STATE.uncertain]:'Manual recovery required',
+    [MANAGED_IDENTITY_STATE.retirementPending]:'Retiring identity',
+    [MANAGED_IDENTITY_STATE.retirementClaimed]:'Retiring identity',
+    [MANAGED_IDENTITY_STATE.credentialRetired]:'Finalizing cleanup'
   }[identityState];
-  if(ready)ready.textContent=deleted?'Removed':cleanupFinishing?(readyLabel||'Finishing cleanup'):cleanupNeeded?(readyLabel||'Recovery required'):(readyLabel||'Ready for setup');
+  if(ready)ready.textContent=deleted?'Removed':cleanupFinishing?(readyLabel||'Finishing cleanup'):identityInvalid?'Manual recovery required':cleanupNeeded?(readyLabel||'Recovery required'):(readyLabel||'Ready for setup');
   const progress=result.querySelector('[data-created-progress]');
   const actions=result.querySelector('[data-created-actions]');
   const hostKey=result.querySelector('[data-created-host-key]');
   const setup=result.querySelector('[data-created-setup]');
   const recovery=result.querySelector('[data-created-recovery]');
-  const needsHostKey=identityState==='awaiting_host_key'||(identityState==='retry_required'&&identity?.last_failure==='host_key_mismatch');
-  const showAutomatic=Boolean(identity&&!needsHostKey&&!deleted&&!cleanupFinishing);
+  const needsHostKey=identityState===MANAGED_IDENTITY_STATE.awaitingHostKey||
+    (identityState===MANAGED_IDENTITY_STATE.retryRequired&&identity?.last_failure==='host_key_mismatch');
+  const showAutomatic=Boolean(
+    identityStateKnown&&!needsHostKey&&!deleted&&!cleanupFinishing
+  );
   if(progress){
-    progress.hidden=deleted||cleanupFinishing||identityState==='uncertain';
+    progress.hidden=deleted||cleanupFinishing||identityInvalid||
+      identityState===MANAGED_IDENTITY_STATE.uncertain;
     const trustDone=!needsHostKey;
-    const installDone=['awaiting_heartbeat','heartbeat_observed'].includes(identityState);
-    const heartbeatDone=identityState==='heartbeat_observed';
+    const installDone=[
+      MANAGED_IDENTITY_STATE.awaitingHeartbeat,
+      MANAGED_IDENTITY_STATE.heartbeatObserved
+    ].includes(identityState);
+    const heartbeatDone=identityState===MANAGED_IDENTITY_STATE.heartbeatObserved;
     const states={
       created:'done',
       trust:needsHostKey?'current':trustDone?'done':'',
-      install:installDone?'done':['ready','bootstrap_claimed','retry_required'].includes(identityState)?'current':'',
-      heartbeat:heartbeatDone?'done':identityState==='awaiting_heartbeat'?'current':''
+      install:installDone?'done':[
+        MANAGED_IDENTITY_STATE.ready,
+        MANAGED_IDENTITY_STATE.bootstrapClaimed,
+        MANAGED_IDENTITY_STATE.retryRequired
+      ].includes(identityState)?'current':'',
+      heartbeat:heartbeatDone?'done':identityState===MANAGED_IDENTITY_STATE.awaitingHeartbeat?'current':''
     };
     Object.entries(states).forEach(([step,state])=>{
       const node=progress.querySelector(`[data-created-progress-step="${step}"]`);
@@ -1807,12 +1875,13 @@ function renderProviderCreatedResult(overlay,job){
   if(setup)setup.hidden=!showAutomatic;
   if(recovery)recovery.hidden=deleted||cleanupFinishing;
   const retry=result.querySelector('[data-created-bootstrap-retry]');
-  if(retry)retry.hidden=identityState!=='retry_required'||identity?.last_failure==='host_key_mismatch';
+  if(retry)retry.hidden=identityState!==MANAGED_IDENTITY_STATE.retryRequired||
+    identity?.last_failure==='host_key_mismatch';
   const viewKey=`${job?.id||''}:${deleted?'deleted':cleanupFinishing?'cleanup':job?.state||'active'}:${identityState}`;
   const viewChanged=result.dataset.jobViewKey!==viewKey;
   result.dataset.jobViewKey=viewKey;
   if(viewChanged){
-    if(recovery)recovery.open=cleanupNeeded;
+    if(recovery)recovery.open=cleanupNeeded||identityInvalid;
     const confirm=result.querySelector('[data-created-delete-confirm]');
     const remove=result.querySelector('[data-created-delete]');
     const status=result.querySelector('[data-created-delete-status]');
@@ -1827,7 +1896,11 @@ function renderProviderCreatedResult(overlay,job){
     '[data-created-ssh]':deleted||cleanupFinishing?'No active destination':providerSshLabel(resource),
     '[data-created-secret]':deleted?'Not applicable':handoff?.secret_target||'Janus-managed runtime file',
     '[data-created-command]':deleted?'Not applicable':handoff?.command_ref||'managed Linux executor',
-    '[data-created-guidance]':handoff?.summary||'Review recovery before making another provider change.'
+    '[data-created-guidance]':identityInvalid?
+      'Managed installation state is unavailable. Pharos will not continue automatically.':
+      MANAGED_IDENTITY_GUIDANCE[identityState]?.summary||
+      handoff?.summary||
+      'Review recovery before making another provider change.'
   };
   Object.entries(values).forEach(([selector,value])=>{
     const node=result.querySelector(selector);
@@ -1836,7 +1909,10 @@ function renderProviderCreatedResult(overlay,job){
   const nextSteps=result.querySelector('[data-created-next-steps]');
   if(nextSteps){
     nextSteps.replaceChildren();
-    const steps=Array.isArray(handoff?.next_steps)?handoff.next_steps:[];
+    const managedSteps=MANAGED_IDENTITY_GUIDANCE[identityState]?.steps;
+    const steps=Array.isArray(managedSteps)?
+      managedSteps:
+      Array.isArray(handoff?.next_steps)?handoff.next_steps:[];
     steps.forEach(step=>{
       const item=document.createElement('li');
       item.textContent=step;
