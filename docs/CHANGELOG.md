@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.60 - 2026-07-23
+
+- Honor the kebab-case managed provisioning state contract in the setup assistant, expose SSH host-key attestation and accurate installation guidance, keep identity-retirement polling active, and fail closed on unknown states.
+
 ## 0.1.59 - 2026-07-23
 
 - Reconcile current Hetzner server responses through their top-level location while retaining the legacy nested datacenter fallback, sharing one exact fact matcher across creation and uncertain-result recovery, and rejecting missing or conflicting location evidence without replaying paid work.

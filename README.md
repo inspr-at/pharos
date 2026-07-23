@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/markus-barta/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/markus-barta/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.59-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.60-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -530,7 +530,7 @@ health, restarts, the pending backlog, and delivery outcomes.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.59**. It is already used as a real
+Pharos is an active early release at **v0.1.60**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
