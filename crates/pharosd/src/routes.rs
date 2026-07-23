@@ -66,6 +66,10 @@ fn human_routes() -> Router<AppState> {
             post(retry_provisioning_bootstrap),
         )
         .route(
+            "/setup/provisioning-jobs/{id}/reconcile-bootstrap",
+            post(reconcile_provisioning_bootstrap),
+        )
+        .route(
             "/setup/existing-host/preflight",
             post(existing_host_preflight_json),
         )

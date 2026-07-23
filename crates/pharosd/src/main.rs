@@ -7914,6 +7914,139 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             store.retry_managed_bootstrap(&job.id, created_at + 20_000),
             Err(ProvisioningAgentStoreError::InvalidTransition)
         );
+        let reconciliation = store
+            .queue_managed_bootstrap_reconciliation(&job.id, created_at + 20_001)
+            .expect("attended read-only reconciliation queues");
+        assert_eq!(
+            reconciliation
+                .managed_identity
+                .as_ref()
+                .map(|value| value.state),
+            Some(ProvisioningManagedIdentityState::ReconciliationPending)
+        );
+        let reconciliation_lease = store
+            .claim_managed_provisioning("csb1", created_at + 20_002)
+            .expect("reconciliation claim persists")
+            .expect("reconciliation lease");
+        assert_eq!(
+            reconciliation_lease.action,
+            ProvisioningAgentAction::ReconcileBootstrap
+        );
+        assert_eq!(
+            store
+                .get(&job.id)
+                .and_then(|value| value.managed_identity)
+                .and_then(|value| value.last_failure),
+            Some(ProvisioningManagedFailure::UncertainExecution)
+        );
+        assert_eq!(
+            store.record_managed_provisioning_result(
+                &job.id,
+                &ProvisioningAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "managed-retry-test".to_string(),
+                    action: ProvisioningAgentAction::ReconcileBootstrap,
+                    outcome: ProvisioningAgentOutcome::Succeeded,
+                    credential_created: true,
+                    reason: None,
+                },
+                created_at + 20_003,
+            ),
+            Err(ProvisioningAgentStoreError::InvalidContract)
+        );
+        let reconciled = store
+            .record_managed_provisioning_result(
+                &job.id,
+                &ProvisioningAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "managed-retry-test".to_string(),
+                    action: ProvisioningAgentAction::ReconcileBootstrap,
+                    outcome: ProvisioningAgentOutcome::Succeeded,
+                    credential_created: false,
+                    reason: None,
+                },
+                created_at + 20_003,
+            )
+            .expect("read-only reconciliation result persists");
+        assert_eq!(reconciled.state, ProvisioningJobState::CleanupNeeded);
+        assert_eq!(
+            reconciled
+                .managed_identity
+                .as_ref()
+                .map(|value| value.state),
+            Some(ProvisioningManagedIdentityState::RetryRequired)
+        );
+        assert_eq!(
+            reconciled
+                .managed_identity
+                .as_ref()
+                .and_then(|value| value.last_failure),
+            Some(ProvisioningManagedFailure::UncertainExecution)
+        );
+        store
+            .retry_managed_bootstrap(&job.id, created_at + 20_004)
+            .expect("reconciled bootstrap queues one bounded retry");
+        remove_provisioning_store_test_files(&path);
+    }
+
+    #[test]
+    fn managed_bootstrap_reconciliation_expiry_stays_fail_closed() {
+        let path = provisioning_store_test_path("managed-bootstrap-reconciliation-expiry");
+        let store = ProvisioningJobStore::new(Some(path.clone()));
+        let created_at = 1_700_025_000;
+        let job =
+            managed_hcloud_created_job(&store, "managed-reconcile-expiry", "5104", created_at);
+        let fingerprint = format!("SHA256:{}", "C".repeat(43));
+        store
+            .attest_managed_host_key(&job.id, &fingerprint, &"a".repeat(64), created_at + 6)
+            .expect("fingerprint attests");
+        store
+            .claim_managed_provisioning("csb1", created_at + 7)
+            .expect("bootstrap claim persists")
+            .expect("bootstrap lease");
+        store
+            .record_managed_provisioning_result(
+                &job.id,
+                &ProvisioningAgentResultRequest {
+                    owner: "csb1".to_string(),
+                    host: "managed-reconcile-expiry".to_string(),
+                    action: ProvisioningAgentAction::Bootstrap,
+                    outcome: ProvisioningAgentOutcome::Uncertain,
+                    credential_created: false,
+                    reason: Some(ProvisioningManagedFailure::UncertainExecution),
+                },
+                created_at + 8,
+            )
+            .expect("uncertain result persists");
+        store
+            .queue_managed_bootstrap_reconciliation(&job.id, created_at + 9)
+            .expect("reconciliation queues");
+        store
+            .claim_managed_provisioning("csb1", created_at + 10)
+            .expect("reconciliation claim persists")
+            .expect("reconciliation lease");
+        assert_eq!(
+            store.claim_managed_provisioning("csb1", created_at + 10 + 60 * 60,),
+            Ok(None)
+        );
+        let expired = store.get(&job.id).expect("expired reconciliation remains");
+        assert_eq!(expired.state, ProvisioningJobState::CleanupNeeded);
+        assert_eq!(
+            expired.managed_identity.as_ref().map(|value| (
+                value.state,
+                value.lease_until,
+                value.last_failure
+            )),
+            Some((
+                ProvisioningManagedIdentityState::Uncertain,
+                None,
+                Some(ProvisioningManagedFailure::UncertainExecution),
+            ))
+        );
+        assert_eq!(
+            store.retry_managed_bootstrap(&job.id, created_at + 4_000),
+            Err(ProvisioningAgentStoreError::InvalidTransition)
+        );
         remove_provisioning_store_test_files(&path);
     }
 

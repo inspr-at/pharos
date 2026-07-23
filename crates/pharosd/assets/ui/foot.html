@@ -1285,6 +1285,8 @@ const MANAGED_IDENTITY_STATE=Object.freeze({
   bootstrapClaimed:'bootstrap-claimed',
   retryRequired:'retry-required',
   uncertain:'uncertain',
+  reconciliationPending:'reconciliation-pending',
+  reconciliationClaimed:'reconciliation-claimed',
   awaitingHeartbeat:'awaiting-heartbeat',
   heartbeatObserved:'heartbeat-observed',
   retirementPending:'retirement-pending',
@@ -1315,7 +1317,15 @@ const MANAGED_IDENTITY_GUIDANCE=Object.freeze({
   },
   [MANAGED_IDENTITY_STATE.uncertain]:{
     summary:'The installation outcome is uncertain. Pharos will not retry a potentially destructive step automatically.',
-    steps:['Review recovery before changing or deleting the server.']
+    steps:['Run the read-only recovery check below before retrying or changing the server.']
+  },
+  [MANAGED_IDENTITY_STATE.reconciliationPending]:{
+    summary:'A read-only recovery check is queued. Installation remains unauthorized.',
+    steps:['Wait here or return later. Pharos is checking that the server and credential state are unchanged.']
+  },
+  [MANAGED_IDENTITY_STATE.reconciliationClaimed]:{
+    summary:'The reviewed executor is proving that no installation or credential mutation started.',
+    steps:['No manual action is required while the read-only recovery check runs.']
   },
   [MANAGED_IDENTITY_STATE.retirementPending]:{
     summary:'Pharos is waiting to retire this job-owned identity safely.',
@@ -1335,6 +1345,8 @@ function provisioningJobTerminal(jobOrState){
   const state=job?.state||jobOrState||'';
   const identityState=job?.managed_identity?.state||'';
   if(state==='cleanup-needed'&&[
+    MANAGED_IDENTITY_STATE.reconciliationPending,
+    MANAGED_IDENTITY_STATE.reconciliationClaimed,
     MANAGED_IDENTITY_STATE.retirementPending,
     MANAGED_IDENTITY_STATE.retirementClaimed,
     MANAGED_IDENTITY_STATE.credentialRetired
@@ -1830,6 +1842,8 @@ function renderProviderCreatedResult(overlay,job){
     [MANAGED_IDENTITY_STATE.heartbeatObserved]:'Heartbeat verified',
     [MANAGED_IDENTITY_STATE.retryRequired]:'Known-safe retry available',
     [MANAGED_IDENTITY_STATE.uncertain]:'Manual recovery required',
+    [MANAGED_IDENTITY_STATE.reconciliationPending]:'Recovery check queued',
+    [MANAGED_IDENTITY_STATE.reconciliationClaimed]:'Checking safe recovery',
     [MANAGED_IDENTITY_STATE.retirementPending]:'Retiring identity',
     [MANAGED_IDENTITY_STATE.retirementClaimed]:'Retiring identity',
     [MANAGED_IDENTITY_STATE.credentialRetired]:'Finalizing cleanup'
@@ -1840,6 +1854,10 @@ function renderProviderCreatedResult(overlay,job){
   const hostKey=result.querySelector('[data-created-host-key]');
   const setup=result.querySelector('[data-created-setup]');
   const recovery=result.querySelector('[data-created-recovery]');
+  const reconciliationInProgress=[
+    MANAGED_IDENTITY_STATE.reconciliationPending,
+    MANAGED_IDENTITY_STATE.reconciliationClaimed
+  ].includes(identityState);
   const needsHostKey=identityState===MANAGED_IDENTITY_STATE.awaitingHostKey||
     (identityState===MANAGED_IDENTITY_STATE.retryRequired&&identity?.last_failure==='host_key_mismatch');
   const showAutomatic=Boolean(
@@ -1847,7 +1865,11 @@ function renderProviderCreatedResult(overlay,job){
   );
   if(progress){
     progress.hidden=deleted||cleanupFinishing||identityInvalid||
-      identityState===MANAGED_IDENTITY_STATE.uncertain;
+      [
+        MANAGED_IDENTITY_STATE.uncertain,
+        MANAGED_IDENTITY_STATE.reconciliationPending,
+        MANAGED_IDENTITY_STATE.reconciliationClaimed
+      ].includes(identityState);
     const trustDone=!needsHostKey;
     const installDone=[
       MANAGED_IDENTITY_STATE.awaitingHeartbeat,
@@ -1873,10 +1895,13 @@ function renderProviderCreatedResult(overlay,job){
   if(actions)actions.hidden=true;
   if(hostKey)hostKey.hidden=!needsHostKey;
   if(setup)setup.hidden=!showAutomatic;
-  if(recovery)recovery.hidden=deleted||cleanupFinishing;
+  if(recovery)recovery.hidden=deleted||cleanupFinishing||reconciliationInProgress;
   const retry=result.querySelector('[data-created-bootstrap-retry]');
   if(retry)retry.hidden=identityState!==MANAGED_IDENTITY_STATE.retryRequired||
     identity?.last_failure==='host_key_mismatch';
+  const reconcile=result.querySelector('[data-created-bootstrap-reconcile]');
+  if(reconcile)reconcile.hidden=identityState!==MANAGED_IDENTITY_STATE.uncertain||
+    Boolean(identity?.credential_ready_at);
   const viewKey=`${job?.id||''}:${deleted?'deleted':cleanupFinishing?'cleanup':job?.state||'active'}:${identityState}`;
   const viewChanged=result.dataset.jobViewKey!==viewKey;
   result.dataset.jobViewKey=viewKey;
@@ -2307,6 +2332,24 @@ async function retryManagedProvisioningBootstrap(overlay,button){
   renderProvisioningJob(overlay,payload.job);
   if(!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
 }
+async function reconcileManagedProvisioningBootstrap(overlay,button){
+  const job=overlay?.pharosProvisioningJob;
+  if(!job?.id)throw new Error('The tracked setup job is not available.');
+  button.disabled=true;
+  button.setAttribute('aria-busy','true');
+  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/reconcile-bootstrap`,{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+    body:JSON.stringify({confirm:true}),
+    cache:'no-store'
+  });
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(payload.error||'The read-only recovery check could not be queued.');
+  if(!payload.job)throw new Error('The recovery response was incomplete.');
+  renderProvisioningJob(overlay,payload.job);
+  if(!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
+}
 function scheduleProvisioningPoll(overlay,id){
   if(!id)return;
   window.clearTimeout(window.pharosAssistantJobTimer);
@@ -2712,6 +2755,17 @@ function initSetupAssistant(){
       await retryManagedProvisioningBootstrap(overlay,button);
     }catch(error){
       showAssistantError(overlay,error.message||'The bounded bootstrap retry could not be queued.');
+    }finally{
+      button.removeAttribute('aria-busy');
+      button.disabled=false;
+    }
+  });
+  overlay.querySelector('[data-created-bootstrap-reconcile]')?.addEventListener('click',async event=>{
+    const button=event.currentTarget;
+    try{
+      await reconcileManagedProvisioningBootstrap(overlay,button);
+    }catch(error){
+      showAssistantError(overlay,error.message||'The read-only recovery check could not be queued.');
     }finally{
       button.removeAttribute('aria-busy');
       button.disabled=false;
