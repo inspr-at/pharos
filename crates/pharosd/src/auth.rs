@@ -50,6 +50,7 @@ const ACCESS_POLICY_FILE_ENV: &str = "PHAROS_ACCESS_POLICY_FILE";
 const ALLOW_OPEN_ENV: &str = "PHAROS_ALLOW_OPEN";
 const OPERATOR_REF_DOMAIN: &str = "pharos:oidc-principal:operator-ref:v2:";
 const VERIFIED_EMAIL_REF_DOMAIN: &str = "pharos:oidc-principal:verified-email-ref:v1:";
+const MANAGED_HUMAN_SESSION_REF_DOMAIN: &str = "inspr.managed-service-human-session.v1";
 
 type OidcClient = CoreClient<
     EndpointSet,
@@ -103,6 +104,7 @@ impl RateWindow {
 #[derive(Clone)]
 pub struct AuthUser {
     pub operator_ref: String,
+    pub managed_human_session_ref: String,
     pub display_name: String,
 }
 
@@ -537,9 +539,20 @@ impl AuthUser {
     fn from_session(session: &Session, issuer: &str) -> Self {
         Self {
             operator_ref: operator_ref_from_principal(issuer, &session.subject),
+            managed_human_session_ref: managed_human_session_ref(issuer, &session.subject),
             display_name: session.display_name.clone(),
         }
     }
+}
+
+fn managed_human_session_ref(issuer: &str, subject: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(MANAGED_HUMAN_SESSION_REF_DOMAIN.as_bytes());
+    hasher.update([0]);
+    hasher.update(issuer.trim_end_matches('/').as_bytes());
+    hasher.update([0]);
+    hasher.update(subject.as_bytes());
+    format!("hsn_{:x}", hasher.finalize())
 }
 
 fn operator_ref_from_principal(issuer: &str, subject: &str) -> String {
@@ -1689,6 +1702,23 @@ mod tests {
         assert!(OperatorPolicy::from_raw(Some("operator-ref:not-a-hash")).is_err());
         assert!(OperatorPolicy::from_raw(Some("verified-email-ref:not-a-hash")).is_err());
         assert!(OperatorPolicy::from_raw(Some("email:not-an-email")).is_err());
+    }
+
+    #[test]
+    fn managed_human_session_binding_matches_janus_and_normalizes_issuer_slash() {
+        let expected = "hsn_9faf4f59563351db0902dcb553e34717e3d37497b11422efcbd54d9b367c415a";
+        assert_eq!(
+            managed_human_session_ref("https://issuer.example.test", "subject-1"),
+            expected
+        );
+        assert_eq!(
+            managed_human_session_ref("https://issuer.example.test/", "subject-1"),
+            expected
+        );
+        assert_ne!(
+            managed_human_session_ref("https://issuer.example.test", "subject-2"),
+            expected
+        );
     }
 
     #[test]

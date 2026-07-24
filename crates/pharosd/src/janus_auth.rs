@@ -313,7 +313,7 @@ fn load_generation(
 
     let mut hosts = BTreeMap::new();
     for entry in payload.hosts {
-        if !valid_host_name(&entry.name) {
+        if !valid_token_subject(&entry.name) {
             return Err(JanusTokenHashError::InvalidHost);
         }
         if !is_sha256_hex(&entry.token_sha256) {
@@ -459,6 +459,16 @@ pub(crate) fn valid_host_name(value: &str) -> bool {
                 .last()
                 .is_some_and(u8::is_ascii_alphanumeric)
     })
+}
+
+fn valid_token_subject(value: &str) -> bool {
+    valid_host_name(value)
+        || (value.len() >= "host_".len() + 8
+            && value.len() <= 96
+            && value.starts_with("host_")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -657,6 +667,20 @@ mod tests {
         assert!(!valid_host_name("-bad"));
         assert!(!valid_host_name("bad-"));
         assert!(valid_host_name("host-1.example"));
+    }
+
+    #[test]
+    fn host_ref_is_a_valid_agent_token_subject_but_not_a_hostname() {
+        let root = fixture_root("host-ref-subject");
+        let host_ref = "host_58f36c72a91e";
+        let hash = "8".repeat(64);
+        write_test_generation(&root, [(host_ref.to_string(), hash.clone())]);
+        let store = JanusTokenStore::load(root).expect("load host-ref generation");
+
+        assert!(store.token_matches(host_ref, &hash).unwrap());
+        assert!(!valid_host_name(host_ref));
+        assert!(valid_token_subject(host_ref));
+        assert!(!valid_token_subject("host_short"));
     }
 
     #[test]

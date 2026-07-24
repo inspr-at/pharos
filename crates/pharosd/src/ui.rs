@@ -1841,6 +1841,11 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
     } else {
         ""
     };
+    let services_current = if active == "services" {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
     let host_settings_current = if active == "settings" {
         r#" aria-current="page""#
     } else {
@@ -1852,12 +1857,13 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="/assets/sidebar-lighthouse-motion-v1.mp4" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{host_settings_current}>{host_settings}<span>Host settings</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{logout_csrf}{sidebar_motion}"##,
+        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="/assets/sidebar-lighthouse-motion-v1.mp4" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/services"{services_current}>{services}<span>Services</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{host_settings_current}>{host_settings}<span>Host settings</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{logout_csrf}{sidebar_motion}"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
         alerts = icons::status_svg(Liveness::Stale),
         backups = icons::SHIELD_CHECK,
+        services = icons::KEY_ROUND,
         activity = icons::LIST,
         host_settings = icons::SLIDERS,
         platform_settings = icons::SETTINGS,
@@ -1871,6 +1877,7 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
         map_current = map_current,
         alerts_current = alerts_current,
         backups_current = backups_current,
+        services_current = services_current,
         activity_current = activity_current,
         host_settings_current = host_settings_current,
         platform_settings_current = platform_settings_current,

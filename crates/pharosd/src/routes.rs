@@ -10,6 +10,11 @@ fn human_routes() -> Router<AppState> {
         .route("/alerts", get(alerts_page))
         .route("/backups", get(backups_page))
         .route("/activity", get(activity_page))
+        .route("/services", get(managed_service_ui::services_page))
+        .route(
+            "/services/{host_ref}/{service_ref}",
+            get(managed_service_ui::service_detail_page),
+        )
         .route("/settings/providers", get(provider_settings_page))
         .route("/settings/providers.json", get(provider_connections_json))
         .route(
@@ -74,6 +79,18 @@ fn human_routes() -> Router<AppState> {
             post(existing_host_preflight_json),
         )
         .route("/declared-hosts.json", get(declared_hosts_json))
+        .route(
+            "/managed-service-declarations.json",
+            get(managed_service_declarations_json),
+        )
+        .route(
+            "/managed-service-setup-intents",
+            post(create_managed_setup_intent).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/managed-service-setup-intents/{intent_ref}/cancel",
+            post(cancel_managed_setup_intent),
+        )
         .route("/host-actions/system-update", post(request_system_update))
         .route(
             "/host-actions/{host}/update-restart/review",
@@ -161,6 +178,33 @@ fn machine_and_public_routes() -> Router<AppState> {
         .route(
             "/agent/provisioning/{id}/result",
             post(record_managed_provisioning_result),
+        )
+        .route(
+            "/agent/managed-services/claim",
+            post(claim_managed_service_operation)
+                .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
+        )
+        .route(
+            "/agent/managed-services/{operation_ref}/result",
+            post(record_managed_service_operation_result)
+                .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
+        )
+        .route(
+            "/agent/managed-services/{operation_ref}",
+            get(retrieve_managed_service_operation_for_host),
+        )
+        .route(
+            "/internal/managed-service-setup-intents/{intent_ref}",
+            get(retrieve_managed_setup_intent),
+        )
+        .route(
+            "/internal/managed-service-operations",
+            post(register_managed_service_operation)
+                .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
+        )
+        .route(
+            "/internal/managed-service-operations/{operation_ref}",
+            get(retrieve_managed_service_operation),
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))

@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.62 - 2026-07-24
+
+- Add the managed-service secret CRUD control plane: declaration-locked service and slot selection, signed single-use Janus handoffs, value-free operation leases, exact host execution, health-confirmed activation, replacement rollback, and recoverable removal quarantine.
+- Ship a focused, accessible Services UX that offers generated or one-time imported values without reveal, copy, or secret-shaped evidence; keep future consumer types subtle and managed services first.
+- Add closed release assurance for the cross-repository Pharos, Janus, and host-agent contract, including real desktop/mobile Chromium coverage and fail-closed adversarial paths.
+
 ## 0.1.61 - 2026-07-23
 
 - Reconcile an uncertain managed bootstrap through an explicit read-only lease that proves the exact job credential and installation artifacts are absent before allowing the existing server to retry.
@@ -8,6 +14,9 @@
 ## 0.1.60 - 2026-07-23
 
 - Honor the kebab-case managed provisioning state contract in the setup assistant, expose SSH host-key attestation and accurate installation guidance, keep identity-retirement polling active, and fail closed on unknown states.
+- Load deterministic value-free managed-service secret-slot declarations from nixcfg, reject malformed, ambiguous, cross-host, or stale declarations for mutation, and expose declaration/load status separately from Janus-owned delivery and observed health.
+- Issue short-lived Ed25519-signed managed-service setup intents, keep browser handoffs opaque, authenticate Janus retrieval, bind cancellation to the initiating OIDC principal, and durably close delivery/cancellation races.
+- Add a focused Services view for declared managed-service secret slots, with locked targets, one value-free setup action, plain lifecycle/progress language, safe offline and declaration-error recovery, and a Janus handoff that never asks Pharos for a source or value.
 
 ## 0.1.59 - 2026-07-23
 

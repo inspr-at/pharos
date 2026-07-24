@@ -37,7 +37,9 @@ export default defineConfig({
     : {
         command:
           `env PHAROS_ALLOW_OPEN=true PHAROS_ADDR=127.0.0.1:${port} ` +
-          "PHAROS_PUBLIC_ADDR=127.0.0.1:18081 RUST_LOG=warn target/debug/pharosd",
+          "PHAROS_PUBLIC_ADDR=127.0.0.1:18081 " +
+          "PHAROS_MANAGED_SERVICE_MANIFEST_PATHS=contracts/managed-service-declarations-v1.json " +
+          "RUST_LOG=warn target/debug/pharosd",
         url: `http://127.0.0.1:${port}/healthz`,
         reuseExistingServer: false,
         timeout: 30_000,
