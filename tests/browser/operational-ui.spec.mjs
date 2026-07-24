@@ -220,6 +220,8 @@ test("managed service secrets stay value-free, accessible, and narrow-screen saf
   await expect(page.getByText("Reveal", { exact: true })).toBeVisible();
   await expect(page.getByText("Never", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Setup unavailable" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: /reveal|show|copy/i })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: /reveal|show|copy/i })).toHaveCount(0);
 
   const html = await page.content();
   for (const forbidden of [
