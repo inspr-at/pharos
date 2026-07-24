@@ -9,7 +9,7 @@ name: pharos-selfhost
 
 services:
   pharosd:
-    image: ghcr.io/markus-barta/pharos/pharosd:${PHAROS_IMAGE_TAG:-0.1.56}
+    image: ghcr.io/inspr-at/pharos/pharosd:${PHAROS_IMAGE_TAG:-0.1.56}
     restart: unless-stopped
     init: true
     read_only: true
