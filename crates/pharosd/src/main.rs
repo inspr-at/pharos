@@ -2422,6 +2422,37 @@ async fn register_managed_service_operation(
     }
 }
 
+async fn retrieve_managed_service_operation(
+    State(state): State<AppState>,
+    AxumPath(operation_ref): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(intent_store) = state.managed_setup_intents.as_ref() else {
+        return managed_operation_denial(ManagedOperationStoreError::PersistenceUnavailable);
+    };
+    let token = bearer_token(&headers).unwrap_or_default();
+    if !intent_store.system_authorized(token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state
+        .managed_service_operations
+        .get(&operation_ref, now_unix())
+    {
+        Ok(operation) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({
+                "schema": "inspr.pharos.managed-service-operation-status.v1",
+                "schema_version": 1,
+                "operation": operation,
+                "value_returned": false,
+            })),
+        )
+            .into_response(),
+        Err(error) => managed_operation_denial(error),
+    }
+}
+
 async fn claim_managed_service_operation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2443,6 +2474,45 @@ async fn claim_managed_service_operation(
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(_) => StatusCode::CONFLICT.into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedOperationHostStatusQuery {
+    host_ref: String,
+}
+
+async fn retrieve_managed_service_operation_for_host(
+    State(state): State<AppState>,
+    AxumPath(operation_ref): AxumPath<String>,
+    Query(query): Query<ManagedOperationHostStatusQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = managed_agent_authorized(&state, &headers, &query.host_ref) {
+        return status.into_response();
+    }
+    match state
+        .managed_service_operations
+        .get(&operation_ref, now_unix())
+    {
+        Ok(operation) if operation.host_ref == query.host_ref => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({
+                "schema": "inspr.pharos.managed-service-operation-status.v1",
+                "schema_version": 1,
+                "operation": operation,
+                "value_returned": false,
+            })),
+        )
+            .into_response(),
+        Ok(_) => StatusCode::FORBIDDEN.into_response(),
+        Err(ManagedOperationStoreError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ManagedOperationStoreError::PersistenceUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
@@ -7142,6 +7212,58 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             Some("no-store, no-cache, max-age=0, must-revalidate")
         );
         assert_eq!(payload["operation"]["phase"], "install_pending");
+        assert_eq!(payload["value_returned"], false);
+
+        let response = retrieve_managed_service_operation(
+            State(state.clone()),
+            AxumPath("op_10000001".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = retrieve_managed_service_operation(
+            State(state.clone()),
+            AxumPath("op_10000001".to_string()),
+            bearer_headers(&internal_token),
+        )
+        .await;
+        let (status, headers, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, no-cache, max-age=0, must-revalidate")
+        );
+        assert_eq!(payload["operation"]["operation_ref"], "op_10000001");
+        assert_eq!(payload["operation"]["phase"], "install_pending");
+        assert_eq!(payload["value_returned"], false);
+
+        let response = retrieve_managed_service_operation_for_host(
+            State(state.clone()),
+            AxumPath("op_10000001".to_string()),
+            Query(ManagedOperationHostStatusQuery {
+                host_ref: host_ref.to_string(),
+            }),
+            bearer_headers(ordinary_host_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = retrieve_managed_service_operation_for_host(
+            State(state.clone()),
+            AxumPath("op_10000001".to_string()),
+            Query(ManagedOperationHostStatusQuery {
+                host_ref: host_ref.to_string(),
+            }),
+            bearer_headers(agent_token),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["operation"]["operation_ref"], "op_10000001");
+        assert_eq!(payload["operation"]["host_ref"], host_ref);
         assert_eq!(payload["value_returned"], false);
 
         let claim = ManagedOperationClaimV1 {

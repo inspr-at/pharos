@@ -343,6 +343,27 @@ impl ManagedServiceOperationStore {
         ))
     }
 
+    pub(crate) fn get(
+        &self,
+        operation_ref: &str,
+        now: i64,
+    ) -> Result<ManagedOperationSummary, ManagedOperationStoreError> {
+        if !valid_ref("op_", operation_ref) || now <= 0 {
+            return Err(ManagedOperationStoreError::InvalidRequest);
+        }
+        let mut document = self.document.lock().expect("managed operation lock");
+        let previous = document.clone();
+        reconcile(&mut document, now);
+        let summary = document
+            .operations
+            .get(operation_ref)
+            .map(ManagedOperationSummary::from);
+        if *document != previous {
+            self.persist_or_restore(&mut document, previous)?;
+        }
+        summary.ok_or(ManagedOperationStoreError::NotFound)
+    }
+
     pub(crate) fn claim(
         &self,
         host_ref: &str,

@@ -186,6 +186,10 @@ fn machine_and_public_routes() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
         )
         .route(
+            "/agent/managed-services/{operation_ref}",
+            get(retrieve_managed_service_operation_for_host),
+        )
+        .route(
             "/internal/managed-service-setup-intents/{intent_ref}",
             get(retrieve_managed_setup_intent),
         )
@@ -193,6 +197,10 @@ fn machine_and_public_routes() -> Router<AppState> {
             "/internal/managed-service-operations",
             post(register_managed_service_operation)
                 .layer(DefaultBodyLimit::max(MAX_MANAGED_OPERATION_REQUEST_BYTES)),
+        )
+        .route(
+            "/internal/managed-service-operations/{operation_ref}",
+            get(retrieve_managed_service_operation),
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
