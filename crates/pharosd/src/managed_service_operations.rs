@@ -11,7 +11,8 @@ use std::sync::Mutex;
 use pharos_core::managed_operations::{
     valid_ref, ManagedHealthEvidenceV1, ManagedOperationAgentOutcome, ManagedOperationAgentPhase,
     ManagedOperationKind, ManagedOperationLeaseV1, ManagedOperationReadyV1, ManagedOperationReason,
-    ManagedOperationResultV1, MANAGED_OPERATION_CONTRACT_VERSION, MANAGED_OPERATION_LEASE_SCHEMA,
+    ManagedOperationResultV1, ManagedRollbackEvidenceV1, MANAGED_OPERATION_CONTRACT_VERSION,
+    MANAGED_OPERATION_LEASE_SCHEMA,
 };
 use pharos_core::managed_services::ManagedSecretSlotDeclarationV1;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ pub(crate) enum ManagedOperationPhase {
     VerifyPending,
     Verifying,
     Active,
+    RolledBack,
     Failed,
     Superseded,
 }
@@ -52,6 +54,7 @@ impl ManagedOperationPhase {
             Self::VerifyPending => "verify_pending",
             Self::Verifying => "verifying",
             Self::Active => "active",
+            Self::RolledBack => "rolled_back",
             Self::Failed => "failed",
             Self::Superseded => "superseded",
         }
@@ -91,8 +94,11 @@ impl ManagedOperationPhase {
         }
     }
 
-    fn terminal(self) -> bool {
-        matches!(self, Self::Active | Self::Failed | Self::Superseded)
+    pub(crate) fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Active | Self::RolledBack | Self::Failed | Self::Superseded
+        )
     }
 }
 
@@ -107,6 +113,16 @@ pub(crate) enum ManagedHealthOutcome {
 struct AcceptedHealthEvidence {
     generation: u64,
     outcome: ManagedHealthOutcome,
+    heartbeat_observed_at_unix_secs: i64,
+    process_observed_at_unix_secs: i64,
+    probe_observed_at_unix_secs: i64,
+    accepted_at_unix_secs: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AcceptedRollbackEvidence {
+    restored_generation: u64,
     heartbeat_observed_at_unix_secs: i64,
     process_observed_at_unix_secs: i64,
     probe_observed_at_unix_secs: i64,
@@ -145,6 +161,8 @@ struct ManagedOperationRecord {
     delivery_completed_at_unix_secs: Option<i64>,
     reload_completed_at_unix_secs: Option<i64>,
     health: Option<AcceptedHealthEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollback: Option<AcceptedRollbackEvidence>,
     active_lease: Option<ActiveLease>,
     uncertain_attempts: u8,
     last_result_sha256: Option<String>,
@@ -182,12 +200,24 @@ pub(crate) struct ManagedOperationSummary {
     pub created_at_unix_secs: i64,
     pub updated_at_unix_secs: i64,
     pub health: Option<ManagedHealthSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<ManagedRollbackSummary>,
     pub value_returned: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct ManagedHealthSummary {
     pub generation: u64,
+    pub outcome: ManagedHealthOutcome,
+    pub heartbeat_observed_at_unix_secs: i64,
+    pub process_observed_at_unix_secs: i64,
+    pub probe_observed_at_unix_secs: i64,
+    pub accepted_at_unix_secs: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct ManagedRollbackSummary {
+    pub restored_generation: u64,
     pub outcome: ManagedHealthOutcome,
     pub heartbeat_observed_at_unix_secs: i64,
     pub process_observed_at_unix_secs: i64,
@@ -217,6 +247,17 @@ impl From<&ManagedOperationRecord> for ManagedOperationSummary {
                 probe_observed_at_unix_secs: health.probe_observed_at_unix_secs,
                 accepted_at_unix_secs: health.accepted_at_unix_secs,
             }),
+            rollback: record
+                .rollback
+                .as_ref()
+                .map(|rollback| ManagedRollbackSummary {
+                    restored_generation: rollback.restored_generation,
+                    outcome: ManagedHealthOutcome::Healthy,
+                    heartbeat_observed_at_unix_secs: rollback.heartbeat_observed_at_unix_secs,
+                    process_observed_at_unix_secs: rollback.process_observed_at_unix_secs,
+                    probe_observed_at_unix_secs: rollback.probe_observed_at_unix_secs,
+                    accepted_at_unix_secs: rollback.accepted_at_unix_secs,
+                }),
             value_returned: false,
         }
     }
@@ -279,6 +320,13 @@ impl ManagedServiceOperationStore {
             }
             return Err(ManagedOperationStoreError::Conflict);
         }
+        if document
+            .operations
+            .values()
+            .any(|operation| same_slot(operation, request) && !operation.phase.terminal())
+        {
+            return Err(ManagedOperationStoreError::Conflict);
+        }
         let max_generation = document
             .operations
             .values()
@@ -295,16 +343,6 @@ impl ManagedServiceOperationStore {
         if document.operations.len() >= MAX_OPERATIONS {
             *document = previous;
             return Err(ManagedOperationStoreError::Capacity);
-        }
-        for operation in document
-            .operations
-            .values_mut()
-            .filter(|operation| same_slot(operation, request) && !operation.phase.terminal())
-        {
-            operation.phase = ManagedOperationPhase::Superseded;
-            operation.reason_code = Some(ManagedOperationReason::OperationSuperseded);
-            operation.active_lease = None;
-            operation.updated_at_unix_secs = now;
         }
         let record = ManagedOperationRecord {
             schema: RECORD_SCHEMA.to_string(),
@@ -327,6 +365,7 @@ impl ManagedServiceOperationStore {
             delivery_completed_at_unix_secs: None,
             reload_completed_at_unix_secs: None,
             health: None,
+            rollback: None,
             active_lease: None,
             uncertain_attempts: 0,
             last_result_sha256: None,
@@ -408,6 +447,7 @@ impl ManagedServiceOperationStore {
             schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
             lease_ref,
             operation_ref: operation.operation_ref.clone(),
+            operation_kind: operation.operation_kind,
             host_ref: operation.host_ref.clone(),
             service_ref: operation.service_ref.clone(),
             slot_ref: operation.slot_ref.clone(),
@@ -491,8 +531,29 @@ impl ManagedServiceOperationStore {
                 }
             }
             ManagedOperationAgentOutcome::Failed => {
-                operation.phase = ManagedOperationPhase::Failed;
-                operation.reason_code = Some(request.reason_code);
+                if operation.operation_kind == ManagedOperationKind::Replace {
+                    if let Some(evidence) = request.rollback_evidence.as_ref() {
+                        validate_rollback_evidence(operation, evidence, now)?;
+                        operation.rollback = Some(AcceptedRollbackEvidence {
+                            restored_generation: evidence.restored_generation,
+                            heartbeat_observed_at_unix_secs: evidence
+                                .heartbeat_observed_at_unix_secs,
+                            process_observed_at_unix_secs: evidence.process_observed_at_unix_secs,
+                            probe_observed_at_unix_secs: evidence.probe_observed_at_unix_secs,
+                            accepted_at_unix_secs: now,
+                        });
+                        operation.phase = ManagedOperationPhase::RolledBack;
+                        operation.reason_code = Some(request.reason_code);
+                    } else {
+                        operation.phase = ManagedOperationPhase::Failed;
+                        operation.reason_code = Some(request.reason_code);
+                    }
+                } else if request.rollback_evidence.is_some() {
+                    return Err(ManagedOperationStoreError::InvalidEvidence);
+                } else {
+                    operation.phase = ManagedOperationPhase::Failed;
+                    operation.reason_code = Some(request.reason_code);
+                }
             }
         }
         operation.active_lease = None;
@@ -575,6 +636,7 @@ fn apply_success(
     request: &ManagedOperationResultV1,
     now: i64,
 ) -> Result<(), ManagedOperationStoreError> {
+    operation.rollback = None;
     match request.phase {
         ManagedOperationAgentPhase::Install => {
             operation.delivery_completed_at_unix_secs = Some(now);
@@ -630,6 +692,31 @@ fn validate_health_evidence(
         || timestamps.iter().any(|observed| {
             *observed < delivery_at
                 || *observed < reload_at
+                || *observed > now.saturating_add(CLOCK_SKEW_SECONDS)
+                || now.saturating_sub(*observed) > HEALTH_EVIDENCE_MAX_AGE_SECONDS
+        })
+    {
+        return Err(ManagedOperationStoreError::InvalidEvidence);
+    }
+    Ok(())
+}
+
+fn validate_rollback_evidence(
+    operation: &ManagedOperationRecord,
+    evidence: &ManagedRollbackEvidenceV1,
+    now: i64,
+) -> Result<(), ManagedOperationStoreError> {
+    let timestamps = [
+        evidence.heartbeat_observed_at_unix_secs,
+        evidence.process_observed_at_unix_secs,
+        evidence.probe_observed_at_unix_secs,
+    ];
+    if operation.operation_kind != ManagedOperationKind::Replace
+        || evidence.restored_generation == 0
+        || evidence.restored_generation >= operation.generation
+        || !evidence.materialized
+        || timestamps.iter().any(|observed| {
+            *observed < operation.created_at_unix_secs
                 || *observed > now.saturating_add(CLOCK_SKEW_SECONDS)
                 || now.saturating_sub(*observed) > HEALTH_EVIDENCE_MAX_AGE_SECONDS
         })
@@ -779,7 +866,10 @@ fn validate_document(document: &ManagedOperationDocument) -> Result<(), String> 
             || operation.phase.leased_agent_phase().is_some() != operation.active_lease.is_some()
             || operation.phase == ManagedOperationPhase::Active && operation.health.is_none()
             || operation.phase != ManagedOperationPhase::Active && operation.health.is_some()
+            || operation.phase == ManagedOperationPhase::RolledBack && operation.rollback.is_none()
+            || operation.phase != ManagedOperationPhase::RolledBack && operation.rollback.is_some()
             || !persisted_health_is_consistent(operation)
+            || !persisted_rollback_is_consistent(operation)
             || operation
                 .last_result_sha256
                 .as_ref()
@@ -798,6 +888,24 @@ fn validate_document(document: &ManagedOperationDocument) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+fn persisted_rollback_is_consistent(operation: &ManagedOperationRecord) -> bool {
+    let Some(rollback) = operation.rollback.as_ref() else {
+        return operation.phase != ManagedOperationPhase::RolledBack;
+    };
+    operation.phase == ManagedOperationPhase::RolledBack
+        && operation.operation_kind == ManagedOperationKind::Replace
+        && rollback.restored_generation > 0
+        && rollback.restored_generation < operation.generation
+        && rollback.accepted_at_unix_secs >= operation.created_at_unix_secs
+        && [
+            rollback.heartbeat_observed_at_unix_secs,
+            rollback.process_observed_at_unix_secs,
+            rollback.probe_observed_at_unix_secs,
+        ]
+        .iter()
+        .all(|observed| *observed >= operation.created_at_unix_secs)
 }
 
 fn persisted_health_is_consistent(operation: &ManagedOperationRecord) -> bool {
@@ -893,6 +1001,7 @@ mod tests {
             reason_code: reason,
             generation: lease.generation,
             health_evidence: None,
+            rollback_evidence: None,
             value_returned: false,
         }
     }
@@ -1013,6 +1122,70 @@ mod tests {
     }
 
     #[test]
+    fn failed_replace_accepts_only_fresh_proven_previous_generation_recovery() {
+        let store = ManagedServiceOperationStore::new(None).unwrap();
+        let manifest = fixture();
+        let slot = &manifest.services[0].slots[0];
+        let mut replacement = ready("op_replace0001", 2);
+        replacement.operation_kind = ManagedOperationKind::Replace;
+        store.register(&replacement, slot, NOW).unwrap();
+
+        let install = store.claim(&manifest.host_ref, NOW + 1).unwrap().unwrap();
+        assert_eq!(install.operation_kind, ManagedOperationKind::Replace);
+        store
+            .record_result(
+                &result(
+                    &install,
+                    ManagedOperationAgentOutcome::Succeeded,
+                    ManagedOperationReason::PhaseSucceeded,
+                ),
+                NOW + 2,
+            )
+            .unwrap();
+        let reload = store.claim(&manifest.host_ref, NOW + 3).unwrap().unwrap();
+        store
+            .record_result(
+                &result(
+                    &reload,
+                    ManagedOperationAgentOutcome::Succeeded,
+                    ManagedOperationReason::PhaseSucceeded,
+                ),
+                NOW + 4,
+            )
+            .unwrap();
+        let verify = store.claim(&manifest.host_ref, NOW + 5).unwrap().unwrap();
+        let mut failed = result(
+            &verify,
+            ManagedOperationAgentOutcome::Failed,
+            ManagedOperationReason::VerificationFailed,
+        );
+        failed.rollback_evidence = Some(ManagedRollbackEvidenceV1 {
+            restored_generation: 1,
+            materialized: true,
+            process_state: pharos_core::managed_operations::ManagedProcessState::Running,
+            probe_state: pharos_core::managed_operations::ManagedProbeState::Healthy,
+            heartbeat_observed_at_unix_secs: NOW + 6,
+            process_observed_at_unix_secs: NOW + 6,
+            probe_observed_at_unix_secs: NOW + 6,
+        });
+        let rolled_back = store.record_result(&failed, NOW + 6).unwrap();
+        assert_eq!(rolled_back.phase, ManagedOperationPhase::RolledBack);
+        assert_eq!(
+            rolled_back
+                .rollback
+                .as_ref()
+                .map(|proof| proof.restored_generation),
+            Some(1)
+        );
+        assert!(rolled_back.health.is_none());
+        assert_eq!(store.record_result(&failed, NOW + 7).unwrap(), rolled_back);
+
+        let encoded = serde_json::to_string(&rolled_back).unwrap();
+        assert!(encoded.contains("\"phase\":\"rolled_back\""));
+        assert!(!encoded.contains("secret_value"));
+    }
+
+    #[test]
     fn stale_heartbeat_http_only_and_old_generation_cannot_fabricate_active() {
         let store = ManagedServiceOperationStore::new(None).unwrap();
         let manifest = fixture();
@@ -1069,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_expiry_uncertain_retry_duplicate_and_supersede_are_recoverable() {
+    fn lease_expiry_uncertain_retry_duplicate_and_concurrent_replace_fail_closed() {
         let store = ManagedServiceOperationStore::new(None).unwrap();
         let manifest = fixture();
         let slot = &manifest.services[0].slots[0];
@@ -1117,23 +1290,14 @@ mod tests {
             .unwrap();
         assert_eq!(first, duplicate);
 
-        store
-            .register(
+        assert_eq!(
+            store.register(
                 &ready("op_00000004", 2),
                 slot,
                 final_lease.leased_at_unix_secs + 3,
-            )
-            .unwrap();
-        let old = store
-            .latest_for_slot(
-                &manifest.host_ref,
-                &manifest.services[0].service_ref,
-                &slot.slot_ref,
-                final_lease.leased_at_unix_secs + 4,
-            )
-            .unwrap();
-        assert_eq!(old.operation_ref, "op_00000004");
-        assert_eq!(old.generation, 2);
+            ),
+            Err(ManagedOperationStoreError::Conflict)
+        );
     }
 
     #[test]

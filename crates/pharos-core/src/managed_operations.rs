@@ -20,6 +20,10 @@ pub enum ManagedOperationKind {
     Replace,
 }
 
+fn default_managed_operation_kind() -> ManagedOperationKind {
+    ManagedOperationKind::Create
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedOperationAgentPhase {
@@ -135,6 +139,8 @@ pub struct ManagedOperationLeaseV1 {
     pub schema_version: u16,
     pub lease_ref: String,
     pub operation_ref: String,
+    #[serde(default = "default_managed_operation_kind")]
+    pub operation_kind: ManagedOperationKind,
     pub host_ref: String,
     pub service_ref: String,
     pub slot_ref: String,
@@ -181,6 +187,19 @@ pub struct ManagedHealthEvidenceV1 {
     pub probe_observed_at_unix_secs: i64,
 }
 
+/// Fresh proof that a failed replacement restored the prior generation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRollbackEvidenceV1 {
+    pub restored_generation: u64,
+    pub materialized: bool,
+    pub process_state: ManagedProcessState,
+    pub probe_state: ManagedProbeState,
+    pub heartbeat_observed_at_unix_secs: i64,
+    pub process_observed_at_unix_secs: i64,
+    pub probe_observed_at_unix_secs: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedOperationResultV1 {
@@ -194,6 +213,8 @@ pub struct ManagedOperationResultV1 {
     pub reason_code: ManagedOperationReason,
     pub generation: u64,
     pub health_evidence: Option<ManagedHealthEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_evidence: Option<ManagedRollbackEvidenceV1>,
     pub value_returned: bool,
 }
 
@@ -215,6 +236,17 @@ impl ManagedOperationResultV1 {
             || (self.phase != ManagedOperationAgentPhase::Verify && self.health_evidence.is_some())
             || (self.outcome != ManagedOperationAgentOutcome::Succeeded
                 && self.health_evidence.is_some())
+            || self.rollback_evidence.as_ref().is_some_and(|evidence| {
+                self.outcome != ManagedOperationAgentOutcome::Failed
+                    || evidence.restored_generation == 0
+                    || evidence.restored_generation >= self.generation
+                    || !evidence.materialized
+                    || evidence.heartbeat_observed_at_unix_secs <= 0
+                    || evidence.process_observed_at_unix_secs <= 0
+                    || evidence.probe_observed_at_unix_secs <= 0
+            })
+            || self.outcome != ManagedOperationAgentOutcome::Failed
+                && self.rollback_evidence.is_some()
         {
             return Err("managed_operation_result_invalid");
         }
@@ -273,6 +305,7 @@ mod tests {
             reason_code: ManagedOperationReason::PhaseSucceeded,
             generation: 1,
             health_evidence: None,
+            rollback_evidence: None,
             value_returned: false,
         }
     }
@@ -284,6 +317,7 @@ mod tests {
             schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
             lease_ref: "lease_49c0e8a17d63".to_string(),
             operation_ref: "op_58f36c72a91e".to_string(),
+            operation_kind: ManagedOperationKind::Create,
             host_ref: "host_58f36c72a91e".to_string(),
             service_ref: "svc_0bca8d31f7e2".to_string(),
             slot_ref: "slot_49c0e8a17d63".to_string(),
@@ -309,11 +343,36 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden), "found {forbidden}");
         }
+
+        let mut previous_lease = serde_json::to_value(&lease).unwrap();
+        previous_lease
+            .as_object_mut()
+            .unwrap()
+            .remove("operation_kind");
+        assert_eq!(
+            serde_json::from_value::<ManagedOperationLeaseV1>(previous_lease)
+                .unwrap()
+                .operation_kind,
+            ManagedOperationKind::Create
+        );
     }
 
     #[test]
     fn result_rejects_output_shapes_and_health_on_non_verify_phases() {
         result().validate_contract().unwrap();
+        let previous_result = serde_json::to_value(result()).unwrap();
+        assert!(
+            previous_result
+                .as_object()
+                .unwrap()
+                .get("rollback_evidence")
+                .is_none(),
+            "empty replacement-only evidence must not break an older create peer"
+        );
+        serde_json::from_value::<ManagedOperationResultV1>(previous_result)
+            .unwrap()
+            .validate_contract()
+            .unwrap();
         let mut with_health = result();
         with_health.health_evidence = Some(ManagedHealthEvidenceV1 {
             generation: 1,

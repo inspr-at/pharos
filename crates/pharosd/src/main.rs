@@ -94,7 +94,9 @@ use crate::host_actions::{
     RetiredHostStore, RetirementAgentResultRequest,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
-use crate::managed_service_operations::{ManagedOperationStoreError, ManagedServiceOperationStore};
+use crate::managed_service_operations::{
+    ManagedOperationPhase, ManagedOperationStoreError, ManagedServiceOperationStore,
+};
 use crate::managed_setup_intents::*;
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
 use crate::nixcfg_dispatch::NixcfgDispatch;
@@ -2295,7 +2297,12 @@ async fn create_managed_setup_intent(
     let Some(store) = state.managed_setup_intents.as_ref() else {
         return managed_intent_denial(IntentReason::Disabled);
     };
-    let slot_policy = match current_managed_slot(&state.manifests, &request) {
+    let slot_policy = match current_managed_slot(
+        &state.manifests,
+        &state.managed_service_operations,
+        &request,
+        now_unix(),
+    ) {
         Ok(policy) => policy,
         Err(reason) => return managed_intent_denial(reason),
     };
@@ -2609,7 +2616,9 @@ fn managed_operation_denial(error: ManagedOperationStoreError) -> Response {
 
 fn current_managed_slot(
     manifests: &ManifestRegistry,
+    operations: &ManagedServiceOperationStore,
     request: &CreateManagedSetupIntentRequest,
+    now: i64,
 ) -> Result<ManagedSlotIntentPolicy, IntentReason> {
     if !manifests.managed_service_load_errors().is_empty() {
         return Err(IntentReason::DeclarationUnavailable);
@@ -2629,6 +2638,35 @@ fn current_managed_slot(
         .iter()
         .find(|slot| slot.slot_ref == request.slot_ref)
         .ok_or(IntentReason::DeclarationDrift)?;
+    let latest = operations.latest_for_slot(
+        &request.host_ref,
+        &request.service_ref,
+        &request.slot_ref,
+        now,
+    );
+    match request.operation_kind {
+        ManagedOperationKind::Create => {
+            if latest.as_ref().is_some_and(|operation| {
+                !matches!(
+                    operation.phase,
+                    ManagedOperationPhase::Failed | ManagedOperationPhase::Superseded
+                )
+            }) {
+                return Err(IntentReason::OperationConflict);
+            }
+        }
+        ManagedOperationKind::Replace => match latest.as_ref() {
+            Some(operation)
+                if operation.declaration_fingerprint == manifest.declaration_fingerprint
+                    && (operation.phase == ManagedOperationPhase::Active
+                        || operation.phase == ManagedOperationPhase::RolledBack
+                            && operation.rollback.is_some()) => {}
+            Some(operation) if !operation.phase.terminal() => {
+                return Err(IntentReason::OperationConflict);
+            }
+            _ => return Err(IntentReason::ActiveGenerationRequired),
+        },
+    }
     let allowed_sources = slot
         .allowed_sources
         .iter()
@@ -2641,10 +2679,9 @@ fn current_managed_slot(
             }
         })
         .collect();
-    // The v1 declaration deliberately admits both setup operations. Janus
-    // custody owns the current-state check that distinguishes create from
-    // replace; Pharos signs the exact action and the slot's complete reviewed
-    // source policy. Janus binds one human choice to the fresh step-up proof.
+    // The declaration admits both operations, but Pharos signs Replace only
+    // for a current, healthy generation (or a proven healthy rollback). Janus
+    // independently rechecks value custody and the exact declaration binding.
     Ok(ManagedSlotIntentPolicy {
         declaration_fingerprint: manifest.declaration_fingerprint.clone(),
         allowed_sources,
@@ -2664,6 +2701,9 @@ fn managed_intent_denial(reason: IntentReason) -> Response {
         }
         IntentReason::Forbidden => StatusCode::FORBIDDEN,
         IntentReason::InvalidRequest => StatusCode::BAD_REQUEST,
+        IntentReason::OperationConflict | IntentReason::ActiveGenerationRequired => {
+            StatusCode::CONFLICT
+        }
         IntentReason::Unknown => StatusCode::NOT_FOUND,
         IntentReason::Expired | IntentReason::Cancelled | IntentReason::WrongUser => {
             StatusCode::GONE
@@ -7309,6 +7349,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             reason_code: ManagedOperationReason::PhaseSucceeded,
             generation: lease.generation,
             health_evidence: None,
+            rollback_evidence: None,
             value_returned: false,
         };
         let response = record_managed_service_operation_result(
@@ -7345,7 +7386,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .join("../../contracts/managed-service-declarations-v1.json");
         let registry = ManifestRegistry::from_all_sources(Vec::new(), None, vec![fixture]);
         let request = managed_setup_request();
-        let policy = current_managed_slot(&registry, &request).unwrap();
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        let policy = current_managed_slot(&registry, &operations, &request, 1_800_000_000).unwrap();
         assert_eq!(
             policy.declaration_fingerprint,
             "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e"
@@ -7361,14 +7403,120 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             vec![PathBuf::from("/definitely/missing/managed-service.json")],
         );
         assert_eq!(
-            current_managed_slot(&missing_registry, &request),
+            current_managed_slot(&missing_registry, &operations, &request, 1_800_000_000),
             Err(IntentReason::DeclarationUnavailable)
         );
         let mut drifted = request;
         drifted.slot_ref = "slot_unknown0000".to_string();
         assert_eq!(
-            current_managed_slot(&registry, &drifted),
+            current_managed_slot(&registry, &operations, &drifted, 1_800_000_000),
             Err(IntentReason::DeclarationDrift)
+        );
+    }
+
+    #[test]
+    fn replacement_intent_requires_one_healthy_generation_and_rejects_overlap() {
+        use pharos_core::managed_operations::{
+            ManagedHealthEvidenceV1, ManagedOperationAgentOutcome,
+            ManagedOperationKind as AgentOperationKind, ManagedOperationReason, ManagedProbeState,
+            ManagedProcessState, MANAGED_OPERATION_CONTRACT_VERSION,
+            MANAGED_OPERATION_READY_SCHEMA, MANAGED_OPERATION_RESULT_SCHEMA,
+        };
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/managed-service-declarations-v1.json");
+        let registry = ManifestRegistry::from_all_sources(Vec::new(), None, vec![fixture]);
+        let manifest = &registry.managed_service_manifests()[0];
+        let service = &manifest.services[0];
+        let slot = &service.slots[0];
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        let now = 1_800_000_000;
+        let ready = ManagedOperationReadyV1 {
+            schema: MANAGED_OPERATION_READY_SCHEMA.to_string(),
+            schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+            operation_ref: "op_policycreate01".to_string(),
+            operation_kind: AgentOperationKind::Create,
+            host_ref: manifest.host_ref.clone(),
+            service_ref: service.service_ref.clone(),
+            slot_ref: slot.slot_ref.clone(),
+            declaration_fingerprint: manifest.declaration_fingerprint.clone(),
+            generation: 1,
+            value_returned: false,
+        };
+        operations.register(&ready, slot, now).unwrap();
+        for completed_at in [now + 2, now + 4] {
+            let lease = operations
+                .claim(&manifest.host_ref, completed_at - 1)
+                .unwrap()
+                .unwrap();
+            operations
+                .record_result(
+                    &ManagedOperationResultV1 {
+                        schema: MANAGED_OPERATION_RESULT_SCHEMA.to_string(),
+                        schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+                        lease_ref: lease.lease_ref,
+                        operation_ref: lease.operation_ref,
+                        host_ref: lease.host_ref,
+                        phase: lease.phase,
+                        outcome: ManagedOperationAgentOutcome::Succeeded,
+                        reason_code: ManagedOperationReason::PhaseSucceeded,
+                        generation: lease.generation,
+                        health_evidence: None,
+                        rollback_evidence: None,
+                        value_returned: false,
+                    },
+                    completed_at,
+                )
+                .unwrap();
+        }
+        let verify = operations
+            .claim(&manifest.host_ref, now + 5)
+            .unwrap()
+            .unwrap();
+        operations
+            .record_result(
+                &ManagedOperationResultV1 {
+                    schema: MANAGED_OPERATION_RESULT_SCHEMA.to_string(),
+                    schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+                    lease_ref: verify.lease_ref,
+                    operation_ref: verify.operation_ref,
+                    host_ref: verify.host_ref,
+                    phase: verify.phase,
+                    outcome: ManagedOperationAgentOutcome::Succeeded,
+                    reason_code: ManagedOperationReason::PhaseSucceeded,
+                    generation: verify.generation,
+                    health_evidence: Some(ManagedHealthEvidenceV1 {
+                        generation: 1,
+                        materialized: true,
+                        process_state: ManagedProcessState::Running,
+                        probe_state: ManagedProbeState::Healthy,
+                        heartbeat_observed_at_unix_secs: now + 5,
+                        process_observed_at_unix_secs: now + 5,
+                        probe_observed_at_unix_secs: now + 5,
+                    }),
+                    rollback_evidence: None,
+                    value_returned: false,
+                },
+                now + 6,
+            )
+            .unwrap();
+
+        let mut replacement = managed_setup_request();
+        replacement.operation_kind = ManagedOperationKind::Replace;
+        assert!(current_managed_slot(&registry, &operations, &replacement, now + 7).is_ok());
+        assert_eq!(
+            current_managed_slot(&registry, &operations, &managed_setup_request(), now + 7),
+            Err(IntentReason::OperationConflict)
+        );
+
+        let mut replacing = ready;
+        replacing.operation_ref = "op_policyreplace1".to_string();
+        replacing.operation_kind = AgentOperationKind::Replace;
+        replacing.generation = 2;
+        operations.register(&replacing, slot, now + 8).unwrap();
+        assert_eq!(
+            current_managed_slot(&registry, &operations, &replacement, now + 9),
+            Err(IntentReason::OperationConflict)
         );
     }
 

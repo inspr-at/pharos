@@ -8,19 +8,22 @@ use super::*;
 use crate::managed_service_operations::ManagedOperationPhase;
 
 const MANAGED_SETUP_RUNTIME: &str = r#"
-document.querySelectorAll('[data-managed-secret-add]').forEach(button=>button.addEventListener('click',async()=>{
+document.querySelectorAll('[data-managed-secret-action]').forEach(button=>button.addEventListener('click',async()=>{
   if(button.disabled)return;
   const status=button.closest('.managed-slot-card')?.querySelector('[data-managed-action-status]');
   const original=button.textContent;
   button.disabled=true;button.textContent='Opening Janus…';
-  if(status)status.textContent='Creating a short-lived, value-free setup request…';
+  const replacing=button.dataset.operationKind==='replace';
+  if(status)status.textContent=replacing
+    ?'Creating a short-lived, value-free replacement request…'
+    :'Creating a short-lived, value-free setup request…';
   try{
     const response=await fetch('/managed-service-setup-intents',{
       method:'POST',
       credentials:'same-origin',
       headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},
       body:JSON.stringify({
-        operation_kind:'create',
+        operation_kind:button.dataset.operationKind,
         host_ref:button.dataset.hostRef,
         service_ref:button.dataset.serviceRef,
         slot_ref:button.dataset.slotRef
@@ -39,7 +42,9 @@ document.querySelectorAll('[data-managed-secret-add]').forEach(button=>button.ad
       ?'You are offline. Reconnect, then try again.'
       :error.message==='managed_intent_declaration_drift'
         ?'This declaration changed. Refresh the page before trying again.'
-        :'Janus setup is unavailable right now. Nothing changed; try again.';
+        :replacing
+          ?'Janus replacement is unavailable right now. The current secret is unchanged; try again.'
+          :'Janus setup is unavailable right now. Nothing changed; try again.';
   }
 }));"#;
 
@@ -49,6 +54,7 @@ pub(crate) enum ManagedSecretSlotState {
     Installing,
     Active,
     ActionNeeded,
+    RollbackRestored,
     Replacing,
     Removing,
 }
@@ -56,6 +62,7 @@ pub(crate) enum ManagedSecretSlotState {
 impl ManagedSecretSlotState {
     fn from_operation(operation_kind: Option<&str>, phase: Option<&str>) -> Self {
         match (operation_kind, phase) {
+            (Some("replace"), Some("rolled_back")) => Self::RollbackRestored,
             (_, Some("active" | "healthy")) => Self::Active,
             (_, Some("failed" | "rolled_back")) => Self::ActionNeeded,
             (Some("remove"), Some(_)) => Self::Removing,
@@ -71,6 +78,7 @@ impl ManagedSecretSlotState {
             Self::Installing => "Installing",
             Self::Active => "Active",
             Self::ActionNeeded => "Action needed",
+            Self::RollbackRestored => "Active · replacement undone",
             Self::Replacing => "Replacing",
             Self::Removing => "Removing",
         }
@@ -81,6 +89,7 @@ impl ManagedSecretSlotState {
             Self::Missing => "missing",
             Self::Installing | Self::Replacing | Self::Removing => "working",
             Self::Active => "active",
+            Self::RollbackRestored => "active",
             Self::ActionNeeded => "attention",
         }
     }
@@ -96,6 +105,9 @@ impl ManagedSecretSlotState {
             }
             Self::ActionNeeded => {
                 "The last safe attempt stopped. Open the details before trying again."
+            }
+            Self::RollbackRestored => {
+                "The replacement did not pass every check, so the previous healthy secret was restored."
             }
             Self::Replacing => "A replacement is being delivered and checked.",
             Self::Removing => "Removal is in progress and the service is being checked.",
@@ -357,7 +369,7 @@ fn render_slot(
 ) -> String {
     let action = if state == ManagedSecretSlotState::Missing && setup_enabled {
         format!(
-            r#"<button class="managed-primary" type="button" data-managed-secret-add data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Add missing secret</button>"#,
+            r#"<button class="managed-primary" type="button" data-managed-secret-action data-operation-kind="create" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Add missing secret</button>"#,
             host_ref = html_escape(&manifest.host_ref),
             service_ref = html_escape(&service.service_ref),
             slot_ref = html_escape(&slot.slot_ref),
@@ -365,6 +377,17 @@ fn render_slot(
     } else if state == ManagedSecretSlotState::Missing {
         r#"<button class="managed-primary" type="button" disabled>Setup unavailable</button>"#
             .to_string()
+    } else if matches!(
+        state,
+        ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
+    ) && setup_enabled
+    {
+        format!(
+            r#"<button class="managed-secondary" type="button" data-managed-secret-action data-operation-kind="replace" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Replace / rotate secret</button>"#,
+            host_ref = html_escape(&manifest.host_ref),
+            service_ref = html_escape(&service.service_ref),
+            slot_ref = html_escape(&slot.slot_ref),
+        )
     } else {
         r#"<button class="managed-secondary" type="button" disabled>View operation details</button>"#
             .to_string()
@@ -383,7 +406,13 @@ fn render_slot(
         separation = separation,
         progress = progress,
         action = action,
-        availability = if setup_enabled {
+        availability = if setup_enabled
+            && matches!(
+                state,
+                ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
+            ) {
+            "Janus will stage a new generation and keep the previous working generation recoverable until every check passes."
+        } else if setup_enabled {
             "Janus will confirm the exact target and ask how to create the value."
         } else {
             "Managed setup is not configured on this Pharos instance."
@@ -416,6 +445,11 @@ fn render_operation_separation(
             "Declared reload completed",
             "Fresh generation healthy",
         ),
+        Some(ManagedOperationPhase::RolledBack) => (
+            "Replacement withdrawn",
+            "Previous generation restored",
+            "Previous generation healthy",
+        ),
         Some(ManagedOperationPhase::Failed) => {
             ("Delivery recorded", "Action stopped safely", "Not accepted")
         }
@@ -429,6 +463,9 @@ fn render_operation_separation(
 }
 
 fn render_operation_progress(phase: &str) -> String {
+    if phase == "rolled_back" {
+        return r#"<section class="managed-operation-progress" aria-label="Replacement recovery"><h3>Replacement safely undone</h3><p>The previous generation was restored and passed the declared service health check. The replacement value is not active.</p></section>"#.to_string();
+    }
     let achieved = match phase {
         "install_pending" | "installing" | "encrypted" => Some(0),
         "reload_pending" | "reloading" | "materialized" => Some(1),
@@ -601,6 +638,42 @@ mod tests {
         assert_eq!(html.matches(r#"data-progress-state="complete""#).count(), 3);
         assert!(!html.contains("operation_ref"));
         assert!(!html.contains("evidence_ref"));
+    }
+
+    #[test]
+    fn active_slot_offers_only_replace_and_rollback_copy_preserves_confidence() {
+        let manifest = fixture();
+        let service = &manifest.services[0];
+        let slot = &service.slots[0];
+        let active = render_slot(
+            &manifest,
+            service,
+            slot,
+            ManagedSecretSlotState::Active,
+            None,
+            true,
+        );
+        for expected in [
+            "Replace / rotate secret",
+            r#"data-operation-kind="replace""#,
+            "keep the previous working generation recoverable",
+            "Reveal</dt><dd>Never",
+        ] {
+            assert!(active.contains(expected), "missing {expected}");
+        }
+        for forbidden in ["Edit secret", "Reveal secret", "secret_value"] {
+            assert!(!active.contains(forbidden), "found {forbidden}");
+        }
+
+        let rolled_back = render_operation_progress("rolled_back");
+        for expected in [
+            "Replacement safely undone",
+            "previous generation was restored",
+            "replacement value is not active",
+        ] {
+            assert!(rolled_back.contains(expected), "missing {expected}");
+        }
+        assert!(!rolled_back.contains("rollback_id"));
     }
 
     #[test]
