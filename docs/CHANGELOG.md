@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.62 - 2026-07-24
+
+- Add the managed-service secret CRUD control plane: declaration-locked service and slot selection, signed single-use Janus handoffs, value-free operation leases, exact host execution, health-confirmed activation, replacement rollback, and recoverable removal quarantine.
+- Ship a focused, accessible Services UX that offers generated or one-time imported values without reveal, copy, or secret-shaped evidence; keep future consumer types subtle and managed services first.
+- Add closed release assurance for the cross-repository Pharos, Janus, and host-agent contract, including real desktop/mobile Chromium coverage and fail-closed adversarial paths.
+
 ## 0.1.61 - 2026-07-23
 
 - Reconcile an uncertain managed bootstrap through an explicit read-only lease that proves the exact job credential and installation artifacts are absent before allowing the existing server to retry.
