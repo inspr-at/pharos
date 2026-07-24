@@ -1132,6 +1132,61 @@ impl ProvisioningJobStore {
         Ok(updated)
     }
 
+    pub(super) fn queue_managed_bootstrap_reconciliation(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<ProvisioningJob, ProvisioningAgentStoreError> {
+        if now <= 0 {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        self.require_durable()
+            .map_err(|_| ProvisioningAgentStoreError::Persistence)?;
+        let mut jobs = self.jobs.write().expect("provisioning job store lock");
+        let previous = jobs
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningAgentStoreError::NotFound)?;
+        let mut updated = previous.clone();
+        let identity = updated
+            .managed_identity
+            .as_mut()
+            .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
+        let created_server_present = updated.provider_resources.iter().any(|resource| {
+            resource.provider == "hetzner-cloud"
+                && resource.kind == "server"
+                && resource.state == "created"
+        });
+        if updated.state != ProvisioningJobState::CleanupNeeded
+            || identity.state != ProvisioningManagedIdentityState::Uncertain
+            || identity.host_key_fingerprint.is_none()
+            || identity.credential_ready_at.is_some()
+            || identity.bootstrap_completed_at.is_some()
+            || identity.first_heartbeat_at.is_some()
+            || identity.last_failure.is_none()
+            || !created_server_present
+        {
+            return Err(ProvisioningAgentStoreError::InvalidTransition);
+        }
+        identity.state = ProvisioningManagedIdentityState::ReconciliationPending;
+        identity.lease_until = None;
+        updated.updated_at = now;
+        updated.progress.push(ProvisioningProgressEntry {
+            state: ProvisioningJobState::CleanupNeeded,
+            message: "An operator requested a read-only recovery proof; no install or credential action is authorized.".to_string(),
+            observed_at: now,
+        });
+        if updated.validate_contract().is_err() || !paid_job_integrity_valid(&updated) {
+            return Err(ProvisioningAgentStoreError::InvalidContract);
+        }
+        jobs.insert(id.to_string(), updated.clone());
+        if self.persist_jobs(&jobs).is_err() {
+            jobs.insert(id.to_string(), previous);
+            return Err(ProvisioningAgentStoreError::Persistence);
+        }
+        Ok(updated)
+    }
+
     pub(super) fn claim_managed_provisioning(
         &self,
         owner: &str,
@@ -1173,6 +1228,35 @@ impl ProvisioningJobStore {
             return Ok(None);
         }
 
+        if let Some(expired_id) = jobs.values().find_map(|job| {
+            job.managed_identity.as_ref().and_then(|identity| {
+                (identity.executor_owner == owner
+                    && identity.state == ProvisioningManagedIdentityState::ReconciliationClaimed
+                    && identity.lease_until.is_some_and(|until| until <= now))
+                .then(|| job.id.clone())
+            })
+        }) {
+            let previous = jobs.get(&expired_id).cloned().expect("expired job exists");
+            let mut updated = previous.clone();
+            let identity = updated.managed_identity.as_mut().expect("managed identity");
+            identity.state = ProvisioningManagedIdentityState::Uncertain;
+            identity.lease_until = None;
+            identity.last_failure = Some(ProvisioningManagedFailure::UncertainExecution);
+            updated.state = ProvisioningJobState::CleanupNeeded;
+            updated.updated_at = now;
+            updated.progress.push(ProvisioningProgressEntry {
+                state: ProvisioningJobState::CleanupNeeded,
+                message: "The read-only recovery proof expired without a result; Pharos kept the server fail-closed.".to_string(),
+                observed_at: now,
+            });
+            jobs.insert(expired_id.clone(), updated);
+            if self.persist_jobs(&jobs).is_err() {
+                jobs.insert(expired_id, previous);
+                return Err(ProvisioningAgentStoreError::Persistence);
+            }
+            return Ok(None);
+        }
+
         let candidate = jobs
             .values()
             .filter_map(|job| {
@@ -1180,7 +1264,11 @@ impl ProvisioningJobStore {
                 if identity.executor_owner != owner {
                     return None;
                 }
-                let action = if job.state == ProvisioningJobState::WaitingForHeartbeat
+                let action = if job.state == ProvisioningJobState::CleanupNeeded
+                    && identity.state == ProvisioningManagedIdentityState::ReconciliationPending
+                {
+                    ProvisioningAgentAction::ReconcileBootstrap
+                } else if job.state == ProvisioningJobState::WaitingForHeartbeat
                     && identity.state == ProvisioningManagedIdentityState::Ready
                 {
                     ProvisioningAgentAction::Bootstrap
@@ -1221,7 +1309,7 @@ impl ProvisioningJobStore {
             .as_mut()
             .ok_or(ProvisioningAgentStoreError::InvalidTransition)?;
         let (ssh_host, ssh_port, host_key_fingerprint) = match action {
-            ProvisioningAgentAction::Bootstrap => {
+            ProvisioningAgentAction::Bootstrap | ProvisioningAgentAction::ReconcileBootstrap => {
                 let ssh = resource
                     .ssh
                     .as_ref()
@@ -1234,11 +1322,13 @@ impl ProvisioningJobStore {
             }
             ProvisioningAgentAction::Retire => (None, None, None),
         };
-        if action == ProvisioningAgentAction::Bootstrap
-            && (resource.state != "created"
-                || ssh_host.is_none()
-                || ssh_port.is_none()
-                || host_key_fingerprint.is_none())
+        if matches!(
+            action,
+            ProvisioningAgentAction::Bootstrap | ProvisioningAgentAction::ReconcileBootstrap
+        ) && (resource.state != "created"
+            || ssh_host.is_none()
+            || ssh_port.is_none()
+            || host_key_fingerprint.is_none())
         {
             return Err(ProvisioningAgentStoreError::InvalidTransition);
         }
@@ -1250,16 +1340,24 @@ impl ProvisioningJobStore {
                 updated.state = ProvisioningJobState::Bootstrapping;
                 ProvisioningManagedIdentityState::BootstrapClaimed
             }
+            ProvisioningAgentAction::ReconcileBootstrap => {
+                ProvisioningManagedIdentityState::ReconciliationClaimed
+            }
             ProvisioningAgentAction::Retire => ProvisioningManagedIdentityState::RetirementClaimed,
         };
         identity.lease_until = Some(now.saturating_add(MANAGED_PROVISIONING_LEASE_SECS));
-        identity.last_failure = None;
+        if action != ProvisioningAgentAction::ReconcileBootstrap {
+            identity.last_failure = None;
+        }
         updated.updated_at = now;
         updated.progress.push(ProvisioningProgressEntry {
             state: updated.state,
             message: match action {
                 ProvisioningAgentAction::Bootstrap => {
                     "The reviewed Linux executor claimed the exact server bootstrap lease."
+                }
+                ProvisioningAgentAction::ReconcileBootstrap => {
+                    "The reviewed Linux executor claimed a read-only recovery proof; installation remains unauthorized."
                 }
                 ProvisioningAgentAction::Retire => {
                     "The reviewed Janus owner claimed retirement of the exact job-owned credential."
@@ -1329,6 +1427,9 @@ impl ProvisioningJobStore {
             ProvisioningAgentAction::Bootstrap => {
                 ProvisioningManagedIdentityState::BootstrapClaimed
             }
+            ProvisioningAgentAction::ReconcileBootstrap => {
+                ProvisioningManagedIdentityState::ReconciliationClaimed
+            }
             ProvisioningAgentAction::Retire => ProvisioningManagedIdentityState::RetirementClaimed,
         };
         if identity.state != expected_state || identity.lease_until.is_none() {
@@ -1340,6 +1441,7 @@ impl ProvisioningJobStore {
             }
             return Err(ProvisioningAgentStoreError::InvalidTransition);
         }
+        let previous_failure = identity.last_failure;
         identity.lease_until = None;
         identity.last_failure = request.reason;
         let message = match (request.action, request.outcome) {
@@ -1365,6 +1467,20 @@ impl ProvisioningJobStore {
                 identity.state = ProvisioningManagedIdentityState::Uncertain;
                 updated.state = ProvisioningJobState::CleanupNeeded;
                 "Managed bootstrap ended without trustworthy completion evidence; Pharos will not replay it blindly."
+            }
+            (ProvisioningAgentAction::ReconcileBootstrap, ProvisioningAgentOutcome::Succeeded) => {
+                identity.state = ProvisioningManagedIdentityState::RetryRequired;
+                identity.last_failure = previous_failure;
+                updated.state = ProvisioningJobState::CleanupNeeded;
+                "Read-only recovery proved that neither NixOS installation nor the job-owned credential started; a bounded retry is available."
+            }
+            (
+                ProvisioningAgentAction::ReconcileBootstrap,
+                ProvisioningAgentOutcome::Failed | ProvisioningAgentOutcome::Uncertain,
+            ) => {
+                identity.state = ProvisioningManagedIdentityState::Uncertain;
+                updated.state = ProvisioningJobState::CleanupNeeded;
+                "Read-only recovery could not prove an unchanged server and absent credential; Pharos kept the server fail-closed."
             }
             (ProvisioningAgentAction::Retire, ProvisioningAgentOutcome::Succeeded) => {
                 identity.state = ProvisioningManagedIdentityState::CredentialRetired;
@@ -1586,6 +1702,12 @@ pub(super) struct ProvisioningBootstrapRetryRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ProvisioningBootstrapReconciliationRequest {
+    pub(super) confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProvisioningAgentClaimRequest {
     pub(super) owner: String,
 }
@@ -1594,6 +1716,7 @@ pub(super) struct ProvisioningAgentClaimRequest {
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProvisioningAgentAction {
     Bootstrap,
+    ReconcileBootstrap,
     Retire,
 }
 
@@ -1652,7 +1775,17 @@ impl ProvisioningAgentResultRequest {
                     !self.credential_created
                 }
                 (
-                    _,
+                    ProvisioningAgentAction::ReconcileBootstrap,
+                    ProvisioningAgentOutcome::Succeeded,
+                    None,
+                ) => !self.credential_created,
+                (
+                    ProvisioningAgentAction::ReconcileBootstrap,
+                    ProvisioningAgentOutcome::Failed | ProvisioningAgentOutcome::Uncertain,
+                    Some(_),
+                ) => !self.credential_created,
+                (
+                    ProvisioningAgentAction::Bootstrap | ProvisioningAgentAction::Retire,
                     ProvisioningAgentOutcome::Failed | ProvisioningAgentOutcome::Uncertain,
                     Some(_),
                 ) => true,
@@ -3334,6 +3467,14 @@ pub(super) fn hetzner_cleanup_target(
                     | ProvisioningManagedIdentityState::CredentialRetired
             )
         });
+    let managed_reconciliation_in_progress = job.state == ProvisioningJobState::CleanupNeeded
+        && job.managed_identity.as_ref().is_some_and(|identity| {
+            matches!(
+                identity.state,
+                ProvisioningManagedIdentityState::ReconciliationPending
+                    | ProvisioningManagedIdentityState::ReconciliationClaimed
+            )
+        });
     if resource.state == "deleted" && (completed_rollback || managed_retirement_in_progress) {
         return Ok(HetznerCleanupTarget {
             provider_id,
@@ -3348,6 +3489,9 @@ pub(super) fn hetzner_cleanup_target(
             | ProvisioningJobState::Complete
             | ProvisioningJobState::CleanupNeeded
     ) {
+        return Err(ProvisioningCleanupError::CleanupNotAllowed);
+    }
+    if managed_reconciliation_in_progress {
         return Err(ProvisioningCleanupError::CleanupNotAllowed);
     }
     if !matches!(
@@ -6965,6 +7109,46 @@ pub(super) async fn retry_provisioning_bootstrap(
     match state
         .provisioning_jobs
         .retry_managed_bootstrap(&id, now_unix())
+    {
+        Ok(job) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({ "job": job })),
+        ),
+        Err(error) => {
+            let (status, message) = provisioning_agent_error_response(error);
+            (
+                status,
+                no_store_headers(),
+                Json(json!({ "error": message })),
+            )
+        }
+    }
+}
+
+pub(super) async fn reconcile_provisioning_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ProvisioningBootstrapReconciliationRequest>,
+) -> impl IntoResponse {
+    if let Err((status, message)) = paid_operator(&state, &headers) {
+        return (
+            status,
+            no_store_headers(),
+            Json(json!({ "error": message })),
+        );
+    }
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": "Explicit read-only recovery confirmation is required." })),
+        );
+    }
+    match state
+        .provisioning_jobs
+        .queue_managed_bootstrap_reconciliation(&id, now_unix())
     {
         Ok(job) => (
             StatusCode::OK,

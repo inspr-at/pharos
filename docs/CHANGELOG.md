@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.61 - 2026-07-23
+
+- Reconcile an uncertain managed bootstrap through an explicit read-only lease that proves the exact job credential and installation artifacts are absent before allowing the existing server to retry.
+- Keep uncertain, failed, expired, and ambiguous evidence fail-closed; prevent cleanup while reconciliation is active; and guide operators through the safe recovery state without replaying installation work.
+
 ## 0.1.60 - 2026-07-23
 
 - Honor the kebab-case managed provisioning state contract in the setup assistant, expose SSH host-key attestation and accurate installation guidance, keep identity-retirement polling active, and fail closed on unknown states.
