@@ -38,7 +38,7 @@ jobs:
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
-          images: ghcr.io/markus-barta/pharos/pharosd
+          images: ghcr.io/inspr-at/pharos/pharosd
           tags: |
             type=ref,event=branch
             type=sha
@@ -47,7 +47,7 @@ jobs:
       - name: refuse semantic tag overwrite
         if: github.ref_type == 'tag'
         env:
-          IMAGE: ghcr.io/markus-barta/pharos/pharosd
+          IMAGE: ghcr.io/inspr-at/pharos/pharosd
           VERSION: ${{ steps.version.outputs.value }}
         run: |
           if output=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" 2>&1); then
@@ -75,7 +75,7 @@ jobs:
       - name: scan published image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/markus-barta/pharos/pharosd@${{ steps.build.outputs.digest }}
+          image-ref: ghcr.io/inspr-at/pharos/pharosd@${{ steps.build.outputs.digest }}
           version: v0.72.0
           format: table
           exit-code: "1"
@@ -86,7 +86,7 @@ jobs:
       - name: generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ghcr.io/markus-barta/pharos/pharosd@${{ steps.build.outputs.digest }}
+          image: ghcr.io/inspr-at/pharos/pharosd@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: pharos.spdx.json
           artifact-name: pharos-${{ steps.version.outputs.value }}.spdx.json
@@ -95,7 +95,7 @@ jobs:
           upload-release-assets: false
       - name: verify embedded OCI provenance and SBOM
         env:
-          IMAGE: ghcr.io/markus-barta/pharos/pharosd
+          IMAGE: ghcr.io/inspr-at/pharos/pharosd
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           provenance=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{ json .Provenance.SLSA }}')
@@ -116,12 +116,12 @@ jobs:
           cosign-release: v2.5.2
       - name: sign image digest with GitHub OIDC
         env:
-          IMAGE: ghcr.io/markus-barta/pharos/pharosd
+          IMAGE: ghcr.io/inspr-at/pharos/pharosd
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
       - name: verify image signature
         env:
-          IMAGE: ghcr.io/markus-barta/pharos/pharosd
+          IMAGE: ghcr.io/inspr-at/pharos/pharosd
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           cosign verify "${IMAGE}@${DIGEST}" \
