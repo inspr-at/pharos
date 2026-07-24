@@ -17,6 +17,13 @@ permissions:
 
 jobs:
   image:
+    # OPS-88: deliberately NOT on Blacksmith, unlike ci.yml.
+    # This job performs cosign keyless signing with the GitHub OIDC
+    # token, so the runner holds the credential that signs releases as
+    # this repo. Keep that on GitHub-hosted infrastructure rather than a
+    # third-party runner. The cost argument is weak here anyway: release
+    # runs ~6 min against ~40-50 min for a full ci.yml run, so this is
+    # roughly a tenth of the minute consumption.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
