@@ -36,6 +36,7 @@ const MAX_TOKEN_FILE_BYTES: u64 = 8 * 1024;
 pub(crate) enum ManagedOperationKind {
     Create,
     Replace,
+    Remove,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -266,6 +267,8 @@ pub(crate) enum IntentReason {
     DeclarationDrift,
     OperationConflict,
     ActiveGenerationRequired,
+    BindingDetachRequired,
+    BindingDetached,
     AlreadyDelivered,
     Unknown,
     Expired,
@@ -287,6 +290,8 @@ impl IntentReason {
             Self::DeclarationDrift => "managed_intent_declaration_drift",
             Self::OperationConflict => "managed_intent_operation_conflict",
             Self::ActiveGenerationRequired => "managed_intent_active_generation_required",
+            Self::BindingDetachRequired => "managed_intent_binding_detach_required",
+            Self::BindingDetached => "managed_intent_binding_detached",
             Self::AlreadyDelivered => "managed_intent_already_delivered",
             Self::Unknown => "managed_intent_unknown",
             Self::Expired => "managed_intent_expired",
@@ -327,7 +332,12 @@ impl ManagedSetupIntentStore {
             || !valid_ref("slot_", &request.slot_ref)
             || !valid_ref("hsn_", &request.human_session_ref)
             || !valid_ref("decl_", &request.declaration_fingerprint)
-            || !canonicalize_allowed_sources(&mut request.allowed_sources)
+            || match request.operation_kind {
+                ManagedOperationKind::Create | ManagedOperationKind::Replace => {
+                    !canonicalize_allowed_sources(&mut request.allowed_sources)
+                }
+                ManagedOperationKind::Remove => !request.allowed_sources.is_empty(),
+            }
         {
             return Err(IntentReason::InvalidRequest);
         }

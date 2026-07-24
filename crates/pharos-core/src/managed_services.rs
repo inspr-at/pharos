@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MANAGED_SERVICE_MANIFEST_SCHEMA: &str = "inspr.pharos.managed-service-declarations.v1";
-pub const MANAGED_SERVICE_MANIFEST_VERSION: u16 = 1;
+pub const MANAGED_SERVICE_MANIFEST_VERSION: u16 = 2;
+pub const MANAGED_SERVICE_MANIFEST_PREDECESSOR_VERSION: u16 = 1;
 pub const MAX_MANAGED_SERVICE_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MAX_MANAGED_SERVICES_PER_HOST: usize = 64;
 pub const MAX_MANAGED_SECRET_SLOTS_PER_SERVICE: usize = 32;
@@ -52,6 +53,20 @@ pub enum ManagedSecretSource {
     Import,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedBindingState {
+    #[default]
+    Required,
+    Detached,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedDetachMethod {
+    ComposeStopAndVerify,
+}
+
 impl ManagedSecretSource {
     fn contract_name(self) -> &'static str {
         match self {
@@ -90,6 +105,10 @@ pub struct ManagedSecretSlotDeclarationV1 {
     pub delivery: ManagedDeliveryDeclarationV1,
     pub reload: ManagedReloadDeclarationV1,
     pub health: ManagedHealthDeclarationV1,
+    #[serde(default)]
+    pub binding_state: ManagedBindingState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detach: Option<ManagedDetachDeclarationV1>,
     pub allowed_sources: Vec<ManagedSecretSource>,
 }
 
@@ -111,6 +130,13 @@ pub struct ManagedReloadDeclarationV1 {
 #[serde(deny_unknown_fields)]
 pub struct ManagedHealthDeclarationV1 {
     pub probe: ManagedHealthProbe,
+    pub profile_ref: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDetachDeclarationV1 {
+    pub method: ManagedDetachMethod,
     pub profile_ref: String,
 }
 
@@ -142,12 +168,42 @@ struct CanonicalSlot<'a> {
     slot_ref: &'a str,
 }
 
+#[derive(Serialize)]
+struct CanonicalFingerprintBodyV2<'a> {
+    host_ref: &'a str,
+    services: Vec<CanonicalServiceV2<'a>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalServiceV2<'a> {
+    runtime_kind: ManagedRuntimeKind,
+    safe_label: &'a str,
+    service_ref: &'a str,
+    slots: Vec<CanonicalSlotV2<'a>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalSlotV2<'a> {
+    allowed_sources: &'a [ManagedSecretSource],
+    binding_state: ManagedBindingState,
+    consumer_kind: ManagedConsumerKind,
+    delivery: &'a ManagedDeliveryDeclarationV1,
+    detach: &'a ManagedDetachDeclarationV1,
+    health: &'a ManagedHealthDeclarationV1,
+    reload: &'a ManagedReloadDeclarationV1,
+    safe_label: &'a str,
+    slot_ref: &'a str,
+}
+
 impl ManagedServiceManifestV1 {
     pub fn validate_contract(&self) -> Result<(), ManagedServiceManifestError> {
         if self.schema != MANAGED_SERVICE_MANIFEST_SCHEMA {
             return Err(ManagedServiceManifestError::UnsupportedSchema);
         }
-        if self.schema_version != MANAGED_SERVICE_MANIFEST_VERSION {
+        if !matches!(
+            self.schema_version,
+            MANAGED_SERVICE_MANIFEST_PREDECESSOR_VERSION | MANAGED_SERVICE_MANIFEST_VERSION
+        ) {
             return Err(ManagedServiceManifestError::UnsupportedVersion);
         }
         if self.generated_by != "nixcfg" {
@@ -186,6 +242,23 @@ impl ManagedServiceManifestV1 {
                 validate_ref("delivery_", &slot.delivery.profile_ref)?;
                 validate_ref("reload_", &slot.reload.profile_ref)?;
                 validate_ref("health_", &slot.health.profile_ref)?;
+                match self.schema_version {
+                    MANAGED_SERVICE_MANIFEST_PREDECESSOR_VERSION => {
+                        if slot.binding_state != ManagedBindingState::Required
+                            || slot.detach.is_some()
+                        {
+                            return Err(ManagedServiceManifestError::InvalidDetachPolicy);
+                        }
+                    }
+                    MANAGED_SERVICE_MANIFEST_VERSION => {
+                        let detach = slot
+                            .detach
+                            .as_ref()
+                            .ok_or(ManagedServiceManifestError::InvalidDetachPolicy)?;
+                        validate_ref("detach_", &detach.profile_ref)?;
+                    }
+                    _ => unreachable!("version checked above"),
+                }
                 if !slot_refs.insert(slot.slot_ref.as_str()) {
                     return Err(ManagedServiceManifestError::DuplicateSlotRef);
                 }
@@ -193,7 +266,16 @@ impl ManagedServiceManifestV1 {
                     return Err(ManagedServiceManifestError::NonCanonicalOrder);
                 }
                 previous_slot_ref = Some(&slot.slot_ref);
-                if slot.allowed_sources.is_empty() || slot.allowed_sources.len() > 2 {
+                match slot.binding_state {
+                    ManagedBindingState::Required if slot.allowed_sources.is_empty() => {
+                        return Err(ManagedServiceManifestError::InvalidSourcePolicy);
+                    }
+                    ManagedBindingState::Detached if !slot.allowed_sources.is_empty() => {
+                        return Err(ManagedServiceManifestError::InvalidSourcePolicy);
+                    }
+                    _ => {}
+                }
+                if slot.allowed_sources.len() > 2 {
                     return Err(ManagedServiceManifestError::InvalidSourcePolicy);
                 }
                 let mut previous_source = None;
@@ -213,33 +295,62 @@ impl ManagedServiceManifestV1 {
     }
 
     pub fn computed_declaration_fingerprint(&self) -> Result<String, ManagedServiceManifestError> {
-        let body = CanonicalFingerprintBody {
-            host_ref: &self.host_ref,
-            services: self
-                .services
-                .iter()
-                .map(|service| CanonicalService {
-                    runtime_kind: service.runtime_kind,
-                    safe_label: &service.safe_label,
-                    service_ref: &service.service_ref,
-                    slots: service
-                        .slots
-                        .iter()
-                        .map(|slot| CanonicalSlot {
-                            allowed_sources: &slot.allowed_sources,
-                            consumer_kind: slot.consumer_kind,
-                            delivery: &slot.delivery,
-                            health: &slot.health,
-                            reload: &slot.reload,
-                            safe_label: &slot.safe_label,
-                            slot_ref: &slot.slot_ref,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        };
-        let canonical = serde_json::to_vec(&body)
-            .map_err(|_| ManagedServiceManifestError::InvalidDeclarationFingerprint)?;
+        let canonical = if self.schema_version == MANAGED_SERVICE_MANIFEST_PREDECESSOR_VERSION {
+            serde_json::to_vec(&CanonicalFingerprintBody {
+                host_ref: &self.host_ref,
+                services: self
+                    .services
+                    .iter()
+                    .map(|service| CanonicalService {
+                        runtime_kind: service.runtime_kind,
+                        safe_label: &service.safe_label,
+                        service_ref: &service.service_ref,
+                        slots: service
+                            .slots
+                            .iter()
+                            .map(|slot| CanonicalSlot {
+                                allowed_sources: &slot.allowed_sources,
+                                consumer_kind: slot.consumer_kind,
+                                delivery: &slot.delivery,
+                                health: &slot.health,
+                                reload: &slot.reload,
+                                safe_label: &slot.safe_label,
+                                slot_ref: &slot.slot_ref,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        } else {
+            serde_json::to_vec(&CanonicalFingerprintBodyV2 {
+                host_ref: &self.host_ref,
+                services: self
+                    .services
+                    .iter()
+                    .map(|service| CanonicalServiceV2 {
+                        runtime_kind: service.runtime_kind,
+                        safe_label: &service.safe_label,
+                        service_ref: &service.service_ref,
+                        slots: service
+                            .slots
+                            .iter()
+                            .map(|slot| CanonicalSlotV2 {
+                                allowed_sources: &slot.allowed_sources,
+                                binding_state: slot.binding_state,
+                                consumer_kind: slot.consumer_kind,
+                                delivery: &slot.delivery,
+                                detach: slot.detach.as_ref().expect("v2 detach policy validated"),
+                                health: &slot.health,
+                                reload: &slot.reload,
+                                safe_label: &slot.safe_label,
+                                slot_ref: &slot.slot_ref,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        }
+        .map_err(|_| ManagedServiceManifestError::InvalidDeclarationFingerprint)?;
         Ok(format!("decl_{:x}", Sha256::digest(canonical)))
     }
 }
@@ -294,6 +405,7 @@ pub enum ManagedServiceManifestError {
     DuplicateSlotRef,
     NonCanonicalOrder,
     InvalidSourcePolicy,
+    InvalidDetachPolicy,
 }
 
 impl std::fmt::Display for ManagedServiceManifestError {
@@ -311,6 +423,7 @@ impl std::fmt::Display for ManagedServiceManifestError {
             Self::DuplicateSlotRef => "duplicate slot reference",
             Self::NonCanonicalOrder => "non-canonical declaration order",
             Self::InvalidSourcePolicy => "invalid source policy",
+            Self::InvalidDetachPolicy => "invalid detach policy",
         };
         formatter.write_str(reason)
     }
@@ -369,7 +482,49 @@ mod tests {
         manifest.services[0].slots[0].health.profile_ref = "health_84c12f390b2a".to_string();
         assert_eq!(
             manifest.computed_declaration_fingerprint().unwrap(),
-            "decl_eed42d4f2d389904ad63beb09256db37f38c3435c15b46840faae1ac181b70e4"
+            "decl_98b1cdeac5cfb3cb9a97c4ffafe7c37b125b9e1bcec8033b88658b1dcbd3f0a4"
+        );
+    }
+
+    #[test]
+    fn predecessor_manifest_defaults_to_required_and_cannot_authorize_detach() {
+        let mut value: serde_json::Value = serde_json::from_str(fixture()).unwrap();
+        value["schema_version"] = serde_json::json!(MANAGED_SERVICE_MANIFEST_PREDECESSOR_VERSION);
+        value["declaration_fingerprint"] = serde_json::json!(
+            "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e"
+        );
+        value["services"][0]["slots"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("binding_state");
+        value["services"][0]["slots"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("detach");
+        let manifest: ManagedServiceManifestV1 = serde_json::from_value(value).unwrap();
+        manifest.validate_contract().unwrap();
+        assert_eq!(
+            manifest.services[0].slots[0].binding_state,
+            ManagedBindingState::Required
+        );
+        assert!(manifest.services[0].slots[0].detach.is_none());
+    }
+
+    #[test]
+    fn detached_v2_manifest_requires_an_empty_creation_policy() {
+        let mut manifest: ManagedServiceManifestV1 = serde_json::from_str(fixture()).unwrap();
+        manifest.services[0].slots[0].binding_state = ManagedBindingState::Detached;
+        manifest.services[0].slots[0].allowed_sources.clear();
+        manifest.declaration_fingerprint = manifest.computed_declaration_fingerprint().unwrap();
+        manifest.validate_contract().unwrap();
+
+        manifest.services[0].slots[0]
+            .allowed_sources
+            .push(ManagedSecretSource::Generated);
+        manifest.declaration_fingerprint = manifest.computed_declaration_fingerprint().unwrap();
+        assert_eq!(
+            manifest.validate_contract(),
+            Err(ManagedServiceManifestError::InvalidSourcePolicy)
         );
     }
 

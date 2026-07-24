@@ -57,7 +57,8 @@ use pharos_core::{
         MAX_MANAGED_OPERATION_REQUEST_BYTES,
     },
     managed_services::{
-        ManagedServiceManifestV1, MANAGED_SERVICE_MANIFEST_SCHEMA, MANAGED_SERVICE_MANIFEST_VERSION,
+        ManagedBindingState, ManagedServiceManifestV1, MANAGED_SERVICE_MANIFEST_SCHEMA,
+        MANAGED_SERVICE_MANIFEST_VERSION,
     },
     AccessSetupIntent, BackupObservation, BackupPostureState, BackupSetupIntent, BootstrapMethod,
     ExistingHostBootstrapOption, ExistingHostPreflightCheck, ExistingHostPreflightFacts,
@@ -2646,6 +2647,9 @@ fn current_managed_slot(
     );
     match request.operation_kind {
         ManagedOperationKind::Create => {
+            if slot.binding_state != ManagedBindingState::Required {
+                return Err(IntentReason::BindingDetached);
+            }
             if latest.as_ref().is_some_and(|operation| {
                 !matches!(
                     operation.phase,
@@ -2655,30 +2659,53 @@ fn current_managed_slot(
                 return Err(IntentReason::OperationConflict);
             }
         }
-        ManagedOperationKind::Replace => match latest.as_ref() {
-            Some(operation)
-                if operation.declaration_fingerprint == manifest.declaration_fingerprint
-                    && (operation.phase == ManagedOperationPhase::Active
+        ManagedOperationKind::Replace => {
+            if slot.binding_state != ManagedBindingState::Required {
+                return Err(IntentReason::BindingDetached);
+            }
+            match latest.as_ref() {
+                Some(operation)
+                    if operation.declaration_fingerprint == manifest.declaration_fingerprint
+                        && (operation.phase == ManagedOperationPhase::Active
+                            || operation.phase == ManagedOperationPhase::RolledBack
+                                && operation.rollback.is_some()) => {}
+                Some(operation) if !operation.phase.terminal() => {
+                    return Err(IntentReason::OperationConflict);
+                }
+                _ => return Err(IntentReason::ActiveGenerationRequired),
+            }
+        }
+        ManagedOperationKind::Remove => {
+            if slot.binding_state != ManagedBindingState::Detached || slot.detach.is_none() {
+                return Err(IntentReason::BindingDetachRequired);
+            }
+            match latest.as_ref() {
+                Some(operation)
+                    if operation.phase == ManagedOperationPhase::Active
                         || operation.phase == ManagedOperationPhase::RolledBack
-                            && operation.rollback.is_some()) => {}
-            Some(operation) if !operation.phase.terminal() => {
-                return Err(IntentReason::OperationConflict);
+                            && operation.rollback.is_some() => {}
+                Some(operation) if !operation.phase.terminal() => {
+                    return Err(IntentReason::OperationConflict);
+                }
+                _ => return Err(IntentReason::ActiveGenerationRequired),
             }
-            _ => return Err(IntentReason::ActiveGenerationRequired),
-        },
+        }
     }
-    let allowed_sources = slot
-        .allowed_sources
-        .iter()
-        .map(|source| match source {
-            pharos_core::managed_services::ManagedSecretSource::Generated => {
-                ManagedSecretSource::Generated
-            }
-            pharos_core::managed_services::ManagedSecretSource::Import => {
-                ManagedSecretSource::Import
-            }
-        })
-        .collect();
+    let allowed_sources = if request.operation_kind == ManagedOperationKind::Remove {
+        Vec::new()
+    } else {
+        slot.allowed_sources
+            .iter()
+            .map(|source| match source {
+                pharos_core::managed_services::ManagedSecretSource::Generated => {
+                    ManagedSecretSource::Generated
+                }
+                pharos_core::managed_services::ManagedSecretSource::Import => {
+                    ManagedSecretSource::Import
+                }
+            })
+            .collect()
+    };
     // The declaration admits both operations, but Pharos signs Replace only
     // for a current, healthy generation (or a proven healthy rollback). Janus
     // independently rechecks value custody and the exact declaration binding.
@@ -2701,9 +2728,10 @@ fn managed_intent_denial(reason: IntentReason) -> Response {
         }
         IntentReason::Forbidden => StatusCode::FORBIDDEN,
         IntentReason::InvalidRequest => StatusCode::BAD_REQUEST,
-        IntentReason::OperationConflict | IntentReason::ActiveGenerationRequired => {
-            StatusCode::CONFLICT
-        }
+        IntentReason::OperationConflict
+        | IntentReason::ActiveGenerationRequired
+        | IntentReason::BindingDetachRequired
+        | IntentReason::BindingDetached => StatusCode::CONFLICT,
         IntentReason::Unknown => StatusCode::NOT_FOUND,
         IntentReason::Expired | IntentReason::Cancelled | IntentReason::WrongUser => {
             StatusCode::GONE
@@ -7123,7 +7151,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 slot_ref: "slot_49c0e8a17d63".to_string(),
                 human_session_ref: "hsn_489e126a70bf".to_string(),
                 declaration_fingerprint:
-                    "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e"
+                    "decl_d962b7d42f75d59e53bf94ee39ee3ec467bf507e99178c17f05b3c8205c82a2a"
                         .to_string(),
                 now_unix_secs: now_unix(),
             })
@@ -7209,8 +7237,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             service_ref: "svc_0bca8d31f7e2".to_string(),
             slot_ref: "slot_49c0e8a17d63".to_string(),
             declaration_fingerprint:
-                "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e".to_string(),
+                "decl_d962b7d42f75d59e53bf94ee39ee3ec467bf507e99178c17f05b3c8205c82a2a".to_string(),
             generation: 1,
+            purge_not_before_unix_secs: None,
             value_returned: false,
         };
 
@@ -7350,6 +7379,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             generation: lease.generation,
             health_evidence: None,
             rollback_evidence: None,
+            removal_evidence: None,
             value_returned: false,
         };
         let response = record_managed_service_operation_result(
@@ -7390,7 +7420,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let policy = current_managed_slot(&registry, &operations, &request, 1_800_000_000).unwrap();
         assert_eq!(
             policy.declaration_fingerprint,
-            "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e"
+            "decl_d962b7d42f75d59e53bf94ee39ee3ec467bf507e99178c17f05b3c8205c82a2a"
         );
         assert_eq!(
             policy.allowed_sources,
@@ -7441,6 +7471,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             slot_ref: slot.slot_ref.clone(),
             declaration_fingerprint: manifest.declaration_fingerprint.clone(),
             generation: 1,
+            purge_not_before_unix_secs: None,
             value_returned: false,
         };
         operations.register(&ready, slot, now).unwrap();
@@ -7463,6 +7494,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                         generation: lease.generation,
                         health_evidence: None,
                         rollback_evidence: None,
+                        removal_evidence: None,
                         value_returned: false,
                     },
                     completed_at,
@@ -7495,11 +7527,46 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                         probe_observed_at_unix_secs: now + 5,
                     }),
                     rollback_evidence: None,
+                    removal_evidence: None,
                     value_returned: false,
                 },
                 now + 6,
             )
             .unwrap();
+
+        let mut remove = managed_setup_request();
+        remove.operation_kind = ManagedOperationKind::Remove;
+        assert_eq!(
+            current_managed_slot(&registry, &operations, &remove, now + 7),
+            Err(IntentReason::BindingDetachRequired)
+        );
+        let detached_path = std::env::temp_dir().join(format!(
+            "pharos-managed-service-detached-{}-{now}.json",
+            std::process::id()
+        ));
+        let mut detached_manifest = manifest.clone();
+        detached_manifest.services[0].slots[0].binding_state = ManagedBindingState::Detached;
+        detached_manifest.services[0].slots[0]
+            .allowed_sources
+            .clear();
+        detached_manifest.declaration_fingerprint = detached_manifest
+            .computed_declaration_fingerprint()
+            .unwrap();
+        fs::write(
+            &detached_path,
+            serde_json::to_vec_pretty(&detached_manifest).unwrap(),
+        )
+        .unwrap();
+        let detached_registry =
+            ManifestRegistry::from_all_sources(Vec::new(), None, vec![detached_path.clone()]);
+        let removal_policy =
+            current_managed_slot(&detached_registry, &operations, &remove, now + 7).unwrap();
+        assert!(removal_policy.allowed_sources.is_empty());
+        assert_eq!(
+            removal_policy.declaration_fingerprint,
+            detached_manifest.declaration_fingerprint
+        );
+        fs::remove_file(detached_path).unwrap();
 
         let mut replacement = managed_setup_request();
         replacement.operation_kind = ManagedOperationKind::Replace;

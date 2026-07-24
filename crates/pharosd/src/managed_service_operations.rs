@@ -11,10 +11,10 @@ use std::sync::Mutex;
 use pharos_core::managed_operations::{
     valid_ref, ManagedHealthEvidenceV1, ManagedOperationAgentOutcome, ManagedOperationAgentPhase,
     ManagedOperationKind, ManagedOperationLeaseV1, ManagedOperationReadyV1, ManagedOperationReason,
-    ManagedOperationResultV1, ManagedRollbackEvidenceV1, MANAGED_OPERATION_CONTRACT_VERSION,
-    MANAGED_OPERATION_LEASE_SCHEMA,
+    ManagedOperationResultV1, ManagedRemovalEvidenceV1, ManagedRollbackEvidenceV1,
+    MANAGED_OPERATION_CONTRACT_VERSION, MANAGED_OPERATION_LEASE_SCHEMA,
 };
-use pharos_core::managed_services::ManagedSecretSlotDeclarationV1;
+use pharos_core::managed_services::{ManagedBindingState, ManagedSecretSlotDeclarationV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +28,8 @@ const OPERATION_TIMEOUT_SECONDS: i64 = 30 * 60;
 const MAX_UNCERTAIN_ATTEMPTS: u8 = 3;
 const HEALTH_EVIDENCE_MAX_AGE_SECONDS: i64 = 120;
 const CLOCK_SKEW_SECONDS: i64 = 30;
+const MIN_REMOVAL_RECOVERY_SECONDS: i64 = 5 * 60;
+const MAX_REMOVAL_RECOVERY_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,7 +40,10 @@ pub(crate) enum ManagedOperationPhase {
     Reloading,
     VerifyPending,
     Verifying,
+    RemovalPending,
+    Removing,
     Active,
+    Removed,
     RolledBack,
     Failed,
     Superseded,
@@ -53,7 +58,10 @@ impl ManagedOperationPhase {
             Self::Reloading => "reloading",
             Self::VerifyPending => "verify_pending",
             Self::Verifying => "verifying",
+            Self::RemovalPending => "removal_pending",
+            Self::Removing => "removing",
             Self::Active => "active",
+            Self::Removed => "removed",
             Self::RolledBack => "rolled_back",
             Self::Failed => "failed",
             Self::Superseded => "superseded",
@@ -65,6 +73,7 @@ impl ManagedOperationPhase {
             Self::InstallPending => Some(ManagedOperationAgentPhase::Install),
             Self::ReloadPending => Some(ManagedOperationAgentPhase::Reload),
             Self::VerifyPending => Some(ManagedOperationAgentPhase::Verify),
+            Self::RemovalPending => Some(ManagedOperationAgentPhase::Remove),
             _ => None,
         }
     }
@@ -74,6 +83,7 @@ impl ManagedOperationPhase {
             Self::Installing => Some(ManagedOperationAgentPhase::Install),
             Self::Reloading => Some(ManagedOperationAgentPhase::Reload),
             Self::Verifying => Some(ManagedOperationAgentPhase::Verify),
+            Self::Removing => Some(ManagedOperationAgentPhase::Remove),
             _ => None,
         }
     }
@@ -83,6 +93,7 @@ impl ManagedOperationPhase {
             ManagedOperationAgentPhase::Install => Self::Installing,
             ManagedOperationAgentPhase::Reload => Self::Reloading,
             ManagedOperationAgentPhase::Verify => Self::Verifying,
+            ManagedOperationAgentPhase::Remove => Self::Removing,
         }
     }
 
@@ -91,13 +102,14 @@ impl ManagedOperationPhase {
             ManagedOperationAgentPhase::Install => Self::InstallPending,
             ManagedOperationAgentPhase::Reload => Self::ReloadPending,
             ManagedOperationAgentPhase::Verify => Self::VerifyPending,
+            ManagedOperationAgentPhase::Remove => Self::RemovalPending,
         }
     }
 
     pub(crate) fn terminal(self) -> bool {
         matches!(
             self,
-            Self::Active | Self::RolledBack | Self::Failed | Self::Superseded
+            Self::Active | Self::Removed | Self::RolledBack | Self::Failed | Self::Superseded
         )
     }
 }
@@ -131,6 +143,16 @@ struct AcceptedRollbackEvidence {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct AcceptedRemovalEvidence {
+    generation: u64,
+    heartbeat_observed_at_unix_secs: i64,
+    process_observed_at_unix_secs: i64,
+    cache_observed_at_unix_secs: i64,
+    accepted_at_unix_secs: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct ActiveLease {
     lease_ref: String,
     phase: ManagedOperationAgentPhase,
@@ -153,6 +175,10 @@ struct ManagedOperationRecord {
     delivery_profile_ref: String,
     reload_profile_ref: String,
     health_profile_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detach_profile_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purge_not_before_unix_secs: Option<i64>,
     phase: ManagedOperationPhase,
     reason_code: Option<ManagedOperationReason>,
     created_at_unix_secs: i64,
@@ -163,6 +189,8 @@ struct ManagedOperationRecord {
     health: Option<AcceptedHealthEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rollback: Option<AcceptedRollbackEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removal: Option<AcceptedRemovalEvidence>,
     active_lease: Option<ActiveLease>,
     uncertain_attempts: u8,
     last_result_sha256: Option<String>,
@@ -195,6 +223,8 @@ pub(crate) struct ManagedOperationSummary {
     pub slot_ref: String,
     pub declaration_fingerprint: String,
     pub generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purge_not_before_unix_secs: Option<i64>,
     pub phase: ManagedOperationPhase,
     pub reason_code: Option<ManagedOperationReason>,
     pub created_at_unix_secs: i64,
@@ -202,6 +232,8 @@ pub(crate) struct ManagedOperationSummary {
     pub health: Option<ManagedHealthSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback: Option<ManagedRollbackSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal: Option<ManagedRemovalSummary>,
     pub value_returned: bool,
 }
 
@@ -225,6 +257,16 @@ pub(crate) struct ManagedRollbackSummary {
     pub accepted_at_unix_secs: i64,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct ManagedRemovalSummary {
+    pub generation: u64,
+    pub outcome: ManagedHealthOutcome,
+    pub heartbeat_observed_at_unix_secs: i64,
+    pub process_observed_at_unix_secs: i64,
+    pub cache_observed_at_unix_secs: i64,
+    pub accepted_at_unix_secs: i64,
+}
+
 impl From<&ManagedOperationRecord> for ManagedOperationSummary {
     fn from(record: &ManagedOperationRecord) -> Self {
         Self {
@@ -235,6 +277,7 @@ impl From<&ManagedOperationRecord> for ManagedOperationSummary {
             slot_ref: record.slot_ref.clone(),
             declaration_fingerprint: record.declaration_fingerprint.clone(),
             generation: record.generation,
+            purge_not_before_unix_secs: record.purge_not_before_unix_secs,
             phase: record.phase,
             reason_code: record.reason_code,
             created_at_unix_secs: record.created_at_unix_secs,
@@ -257,6 +300,17 @@ impl From<&ManagedOperationRecord> for ManagedOperationSummary {
                     process_observed_at_unix_secs: rollback.process_observed_at_unix_secs,
                     probe_observed_at_unix_secs: rollback.probe_observed_at_unix_secs,
                     accepted_at_unix_secs: rollback.accepted_at_unix_secs,
+                }),
+            removal: record
+                .removal
+                .as_ref()
+                .map(|removal| ManagedRemovalSummary {
+                    generation: removal.generation,
+                    outcome: ManagedHealthOutcome::Healthy,
+                    heartbeat_observed_at_unix_secs: removal.heartbeat_observed_at_unix_secs,
+                    process_observed_at_unix_secs: removal.process_observed_at_unix_secs,
+                    cache_observed_at_unix_secs: removal.cache_observed_at_unix_secs,
+                    accepted_at_unix_secs: removal.accepted_at_unix_secs,
                 }),
             value_returned: false,
         }
@@ -314,9 +368,15 @@ impl ManagedServiceOperationStore {
             return Err(ManagedOperationStoreError::InvalidRequest);
         }
         let mut document = self.document.lock().expect("managed operation lock");
+        let previous = document.clone();
+        reconcile(&mut document, now);
         if let Some(existing) = document.operations.get(&request.operation_ref) {
             if record_matches_ready(existing, request, slot) {
-                return Ok(ManagedOperationSummary::from(existing));
+                let summary = ManagedOperationSummary::from(existing);
+                if *document != previous {
+                    self.persist_or_restore(&mut document, previous)?;
+                }
+                return Ok(summary);
             }
             return Err(ManagedOperationStoreError::Conflict);
         }
@@ -327,15 +387,54 @@ impl ManagedServiceOperationStore {
         {
             return Err(ManagedOperationStoreError::Conflict);
         }
-        let max_generation = document
+        let latest = document
+            .operations
+            .values()
+            .filter(|operation| same_slot(operation, request))
+            .max_by_key(|operation| {
+                (
+                    operation.created_at_unix_secs,
+                    operation.generation,
+                    operation.operation_ref.as_str(),
+                )
+            });
+        let maximum_generation = document
             .operations
             .values()
             .filter(|operation| same_slot(operation, request))
             .map(|operation| operation.generation)
-            .max()
-            .unwrap_or(0);
-        if request.generation <= max_generation {
-            return Err(ManagedOperationStoreError::GenerationDowngrade);
+            .max();
+        match request.operation_kind {
+            ManagedOperationKind::Create | ManagedOperationKind::Replace => {
+                if slot.binding_state != ManagedBindingState::Required
+                    || request.purge_not_before_unix_secs.is_some()
+                    || maximum_generation.is_some_and(|generation| request.generation <= generation)
+                {
+                    return Err(ManagedOperationStoreError::GenerationDowngrade);
+                }
+            }
+            ManagedOperationKind::Remove => {
+                let purge_not_before = request
+                    .purge_not_before_unix_secs
+                    .ok_or(ManagedOperationStoreError::InvalidRequest)?;
+                let latest = latest.ok_or(ManagedOperationStoreError::Conflict)?;
+                let active_generation = match latest.phase {
+                    ManagedOperationPhase::Active => Some(latest.generation),
+                    ManagedOperationPhase::RolledBack => latest
+                        .rollback
+                        .as_ref()
+                        .map(|rollback| rollback.restored_generation),
+                    _ => None,
+                };
+                if slot.binding_state != ManagedBindingState::Detached
+                    || slot.detach.is_none()
+                    || active_generation != Some(request.generation)
+                    || purge_not_before < now.saturating_add(MIN_REMOVAL_RECOVERY_SECONDS)
+                    || purge_not_before > now.saturating_add(MAX_REMOVAL_RECOVERY_SECONDS)
+                {
+                    return Err(ManagedOperationStoreError::Conflict);
+                }
+            }
         }
 
         let previous = document.clone();
@@ -357,7 +456,16 @@ impl ManagedServiceOperationStore {
             delivery_profile_ref: slot.delivery.profile_ref.clone(),
             reload_profile_ref: slot.reload.profile_ref.clone(),
             health_profile_ref: slot.health.profile_ref.clone(),
-            phase: ManagedOperationPhase::InstallPending,
+            detach_profile_ref: slot
+                .detach
+                .as_ref()
+                .map(|detach| detach.profile_ref.clone()),
+            purge_not_before_unix_secs: request.purge_not_before_unix_secs,
+            phase: if request.operation_kind == ManagedOperationKind::Remove {
+                ManagedOperationPhase::RemovalPending
+            } else {
+                ManagedOperationPhase::InstallPending
+            },
             reason_code: None,
             created_at_unix_secs: now,
             updated_at_unix_secs: now,
@@ -366,6 +474,7 @@ impl ManagedServiceOperationStore {
             reload_completed_at_unix_secs: None,
             health: None,
             rollback: None,
+            removal: None,
             active_lease: None,
             uncertain_attempts: 0,
             last_result_sha256: None,
@@ -453,11 +562,16 @@ impl ManagedServiceOperationStore {
             slot_ref: operation.slot_ref.clone(),
             declaration_fingerprint: operation.declaration_fingerprint.clone(),
             generation: operation.generation,
+            purge_not_before_unix_secs: operation.purge_not_before_unix_secs,
             phase,
             profile_ref: match phase {
                 ManagedOperationAgentPhase::Install => operation.delivery_profile_ref.clone(),
                 ManagedOperationAgentPhase::Reload => operation.reload_profile_ref.clone(),
                 ManagedOperationAgentPhase::Verify => operation.health_profile_ref.clone(),
+                ManagedOperationAgentPhase::Remove => operation
+                    .detach_profile_ref
+                    .clone()
+                    .ok_or(ManagedOperationStoreError::InvalidRequest)?,
             },
             leased_at_unix_secs: lease.leased_at_unix_secs,
             expires_at_unix_secs: lease.expires_at_unix_secs,
@@ -593,7 +707,13 @@ impl ManagedServiceOperationStore {
                     && operation.service_ref == service_ref
                     && operation.slot_ref == slot_ref
             })
-            .max_by_key(|operation| (operation.generation, operation.created_at_unix_secs))
+            .max_by_key(|operation| {
+                (
+                    operation.created_at_unix_secs,
+                    operation.generation,
+                    operation.operation_ref.as_str(),
+                )
+            })
             .map(ManagedOperationSummary::from)
     }
 
@@ -637,6 +757,7 @@ fn apply_success(
     now: i64,
 ) -> Result<(), ManagedOperationStoreError> {
     operation.rollback = None;
+    operation.removal = None;
     match request.phase {
         ManagedOperationAgentPhase::Install => {
             operation.delivery_completed_at_unix_secs = Some(now);
@@ -665,9 +786,52 @@ fn apply_success(
             });
             operation.phase = ManagedOperationPhase::Active;
         }
+        ManagedOperationAgentPhase::Remove => {
+            let evidence = request
+                .removal_evidence
+                .as_ref()
+                .ok_or(ManagedOperationStoreError::InvalidEvidence)?;
+            validate_removal_evidence(operation, evidence, now)?;
+            operation.health = None;
+            operation.removal = Some(AcceptedRemovalEvidence {
+                generation: evidence.generation,
+                heartbeat_observed_at_unix_secs: evidence.heartbeat_observed_at_unix_secs,
+                process_observed_at_unix_secs: evidence.process_observed_at_unix_secs,
+                cache_observed_at_unix_secs: evidence.cache_observed_at_unix_secs,
+                accepted_at_unix_secs: now,
+            });
+            operation.phase = ManagedOperationPhase::Removed;
+        }
     }
     operation.uncertain_attempts = 0;
     operation.reason_code = Some(ManagedOperationReason::PhaseSucceeded);
+    Ok(())
+}
+
+fn validate_removal_evidence(
+    operation: &ManagedOperationRecord,
+    evidence: &ManagedRemovalEvidenceV1,
+    now: i64,
+) -> Result<(), ManagedOperationStoreError> {
+    let timestamps = [
+        evidence.heartbeat_observed_at_unix_secs,
+        evidence.process_observed_at_unix_secs,
+        evidence.cache_observed_at_unix_secs,
+    ];
+    if operation.operation_kind != ManagedOperationKind::Remove
+        || operation
+            .purge_not_before_unix_secs
+            .is_none_or(|deadline| deadline <= now)
+        || evidence.generation != operation.generation
+        || !evidence.runtime_absent
+        || timestamps.iter().any(|observed| {
+            *observed < operation.created_at_unix_secs
+                || *observed > now.saturating_add(CLOCK_SKEW_SECONDS)
+                || now.saturating_sub(*observed) > HEALTH_EVIDENCE_MAX_AGE_SECONDS
+        })
+    {
+        return Err(ManagedOperationStoreError::InvalidEvidence);
+    }
     Ok(())
 }
 
@@ -777,7 +941,7 @@ fn same_slot(operation: &ManagedOperationRecord, request: &ManagedOperationReady
 }
 
 fn prune_terminal_history(document: &mut ManagedOperationDocument) {
-    let mut latest_by_slot: BTreeMap<(&str, &str, &str), (u64, i64, &str)> = BTreeMap::new();
+    let mut latest_by_slot: BTreeMap<(&str, &str, &str), (i64, u64, &str)> = BTreeMap::new();
     for operation in document.operations.values() {
         let slot = (
             operation.host_ref.as_str(),
@@ -785,8 +949,8 @@ fn prune_terminal_history(document: &mut ManagedOperationDocument) {
             operation.slot_ref.as_str(),
         );
         let candidate = (
-            operation.generation,
             operation.created_at_unix_secs,
+            operation.generation,
             operation.operation_ref.as_str(),
         );
         if latest_by_slot
@@ -819,6 +983,12 @@ fn record_matches_ready(
         && operation.delivery_profile_ref == slot.delivery.profile_ref
         && operation.reload_profile_ref == slot.reload.profile_ref
         && operation.health_profile_ref == slot.health.profile_ref
+        && operation.detach_profile_ref
+            == slot
+                .detach
+                .as_ref()
+                .map(|detach| detach.profile_ref.clone())
+        && operation.purge_not_before_unix_secs == request.purge_not_before_unix_secs
 }
 
 fn result_hash(request: &ManagedOperationResultV1) -> Result<String, ManagedOperationStoreError> {
@@ -858,6 +1028,10 @@ fn validate_document(document: &ManagedOperationDocument) -> Result<(), String> 
             || !valid_ref("delivery_", &operation.delivery_profile_ref)
             || !valid_ref("reload_", &operation.reload_profile_ref)
             || !valid_ref("health_", &operation.health_profile_ref)
+            || operation
+                .detach_profile_ref
+                .as_ref()
+                .is_some_and(|profile| !valid_ref("detach_", profile))
             || operation.generation == 0
             || operation.created_at_unix_secs <= 0
             || operation.updated_at_unix_secs < operation.created_at_unix_secs
@@ -868,8 +1042,12 @@ fn validate_document(document: &ManagedOperationDocument) -> Result<(), String> 
             || operation.phase != ManagedOperationPhase::Active && operation.health.is_some()
             || operation.phase == ManagedOperationPhase::RolledBack && operation.rollback.is_none()
             || operation.phase != ManagedOperationPhase::RolledBack && operation.rollback.is_some()
+            || operation.phase == ManagedOperationPhase::Removed && operation.removal.is_none()
+            || operation.phase != ManagedOperationPhase::Removed && operation.removal.is_some()
+            || !persisted_operation_kind_is_consistent(operation)
             || !persisted_health_is_consistent(operation)
             || !persisted_rollback_is_consistent(operation)
+            || !persisted_removal_is_consistent(operation)
             || operation
                 .last_result_sha256
                 .as_ref()
@@ -888,6 +1066,63 @@ fn validate_document(document: &ManagedOperationDocument) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+fn persisted_operation_kind_is_consistent(operation: &ManagedOperationRecord) -> bool {
+    let removal_phase = matches!(
+        operation.phase,
+        ManagedOperationPhase::RemovalPending
+            | ManagedOperationPhase::Removing
+            | ManagedOperationPhase::Removed
+    );
+    if operation.operation_kind == ManagedOperationKind::Remove {
+        operation
+            .purge_not_before_unix_secs
+            .is_some_and(|deadline| {
+                deadline
+                    >= operation
+                        .created_at_unix_secs
+                        .saturating_add(MIN_REMOVAL_RECOVERY_SECONDS)
+                    && deadline
+                        <= operation
+                            .created_at_unix_secs
+                            .saturating_add(MAX_REMOVAL_RECOVERY_SECONDS)
+            })
+            && operation.detach_profile_ref.is_some()
+            && operation.delivery_completed_at_unix_secs.is_none()
+            && operation.reload_completed_at_unix_secs.is_none()
+            && operation.health.is_none()
+            && operation.rollback.is_none()
+            && (removal_phase
+                || matches!(
+                    operation.phase,
+                    ManagedOperationPhase::Failed | ManagedOperationPhase::Superseded
+                ))
+    } else {
+        operation.purge_not_before_unix_secs.is_none()
+            && !removal_phase
+            && operation.removal.is_none()
+    }
+}
+
+fn persisted_removal_is_consistent(operation: &ManagedOperationRecord) -> bool {
+    let Some(removal) = operation.removal.as_ref() else {
+        return operation.phase != ManagedOperationPhase::Removed;
+    };
+    operation.phase == ManagedOperationPhase::Removed
+        && operation.operation_kind == ManagedOperationKind::Remove
+        && operation
+            .purge_not_before_unix_secs
+            .is_some_and(|deadline| deadline > operation.created_at_unix_secs)
+        && removal.generation == operation.generation
+        && removal.accepted_at_unix_secs >= operation.created_at_unix_secs
+        && [
+            removal.heartbeat_observed_at_unix_secs,
+            removal.process_observed_at_unix_secs,
+            removal.cache_observed_at_unix_secs,
+        ]
+        .iter()
+        .all(|observed| *observed >= operation.created_at_unix_secs)
 }
 
 fn persisted_rollback_is_consistent(operation: &ManagedOperationRecord) -> bool {
@@ -945,11 +1180,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use pharos_core::managed_operations::{
-        ManagedOperationAgentOutcome, ManagedOperationClaimV1, ManagedOperationResultV1,
-        ManagedProbeState, ManagedProcessState, MANAGED_OPERATION_CLAIM_SCHEMA,
-        MANAGED_OPERATION_READY_SCHEMA, MANAGED_OPERATION_RESULT_SCHEMA,
+        ManagedCacheState, ManagedOperationAgentOutcome, ManagedOperationClaimV1,
+        ManagedOperationResultV1, ManagedProbeState, ManagedProcessState, ManagedRemovalEvidenceV1,
+        MANAGED_OPERATION_CLAIM_SCHEMA, MANAGED_OPERATION_READY_SCHEMA,
+        MANAGED_OPERATION_RESULT_SCHEMA,
     };
-    use pharos_core::managed_services::ManagedServiceManifestV1;
+    use pharos_core::managed_services::{ManagedBindingState, ManagedServiceManifestV1};
 
     const NOW: i64 = 1_800_000_000;
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -979,8 +1215,9 @@ mod tests {
             service_ref: "svc_0bca8d31f7e2".to_string(),
             slot_ref: "slot_49c0e8a17d63".to_string(),
             declaration_fingerprint:
-                "decl_1e0775870c7d987ec744b94ec096d7f8985aae059248856ebcf1d9a52bacbc2e".to_string(),
+                "decl_d962b7d42f75d59e53bf94ee39ee3ec467bf507e99178c17f05b3c8205c82a2a".to_string(),
             generation,
+            purge_not_before_unix_secs: None,
             value_returned: false,
         }
     }
@@ -1002,8 +1239,216 @@ mod tests {
             generation: lease.generation,
             health_evidence: None,
             rollback_evidence: None,
+            removal_evidence: None,
             value_returned: false,
         }
+    }
+
+    fn activate(
+        store: &ManagedServiceOperationStore,
+        manifest: &ManagedServiceManifestV1,
+        operation_ref: &str,
+        generation: u64,
+        now: i64,
+    ) {
+        let slot = &manifest.services[0].slots[0];
+        store
+            .register(&ready(operation_ref, generation), slot, now)
+            .unwrap();
+        for completed_at in [now + 2, now + 4] {
+            let lease = store
+                .claim(&manifest.host_ref, completed_at - 1)
+                .unwrap()
+                .unwrap();
+            store
+                .record_result(
+                    &result(
+                        &lease,
+                        ManagedOperationAgentOutcome::Succeeded,
+                        ManagedOperationReason::PhaseSucceeded,
+                    ),
+                    completed_at,
+                )
+                .unwrap();
+        }
+        let lease = store.claim(&manifest.host_ref, now + 5).unwrap().unwrap();
+        let mut verified = result(
+            &lease,
+            ManagedOperationAgentOutcome::Succeeded,
+            ManagedOperationReason::PhaseSucceeded,
+        );
+        verified.health_evidence = Some(ManagedHealthEvidenceV1 {
+            generation,
+            materialized: true,
+            process_state: ManagedProcessState::Running,
+            probe_state: ManagedProbeState::Healthy,
+            heartbeat_observed_at_unix_secs: now + 5,
+            process_observed_at_unix_secs: now + 5,
+            probe_observed_at_unix_secs: now + 5,
+        });
+        assert_eq!(
+            store.record_result(&verified, now + 6).unwrap().phase,
+            ManagedOperationPhase::Active
+        );
+    }
+
+    #[test]
+    fn removal_requires_reviewed_detach_and_fresh_exact_absence_evidence() {
+        let store = ManagedServiceOperationStore::new(None).unwrap();
+        let manifest = fixture();
+        activate(&store, &manifest, "op_create_remove1", 1, NOW);
+
+        let mut removal = ready("op_remove000001", 1);
+        removal.operation_kind = ManagedOperationKind::Remove;
+        removal.purge_not_before_unix_secs = Some(NOW + 86_400);
+        assert_eq!(
+            store.register(&removal, &manifest.services[0].slots[0], NOW + 10),
+            Err(ManagedOperationStoreError::Conflict)
+        );
+
+        let mut detached = manifest.services[0].slots[0].clone();
+        detached.binding_state = ManagedBindingState::Detached;
+        let mut too_soon = removal.clone();
+        too_soon.operation_ref = "op_remove_too_soon".to_string();
+        too_soon.purge_not_before_unix_secs = Some(NOW + 10 + MIN_REMOVAL_RECOVERY_SECONDS - 1);
+        assert_eq!(
+            store.register(&too_soon, &detached, NOW + 10),
+            Err(ManagedOperationStoreError::Conflict)
+        );
+        let mut too_late = removal.clone();
+        too_late.operation_ref = "op_remove_too_late".to_string();
+        too_late.purge_not_before_unix_secs = Some(NOW + 10 + MAX_REMOVAL_RECOVERY_SECONDS + 1);
+        assert_eq!(
+            store.register(&too_late, &detached, NOW + 10),
+            Err(ManagedOperationStoreError::Conflict)
+        );
+        let pending = store.register(&removal, &detached, NOW + 10).unwrap();
+        assert_eq!(pending.phase, ManagedOperationPhase::RemovalPending);
+        let lease = store.claim(&manifest.host_ref, NOW + 11).unwrap().unwrap();
+        assert_eq!(lease.operation_kind, ManagedOperationKind::Remove);
+        assert_eq!(lease.phase, ManagedOperationAgentPhase::Remove);
+        assert_eq!(
+            lease.profile_ref,
+            detached.detach.as_ref().unwrap().profile_ref
+        );
+        assert_eq!(lease.purge_not_before_unix_secs, Some(NOW + 86_400));
+
+        let mut removed = result(
+            &lease,
+            ManagedOperationAgentOutcome::Succeeded,
+            ManagedOperationReason::PhaseSucceeded,
+        );
+        removed.removal_evidence = Some(ManagedRemovalEvidenceV1 {
+            generation: 1,
+            runtime_absent: true,
+            process_state: ManagedProcessState::Stopped,
+            cache_state: ManagedCacheState::Quarantined,
+            heartbeat_observed_at_unix_secs: NOW + 12,
+            process_observed_at_unix_secs: NOW + 12,
+            cache_observed_at_unix_secs: NOW + 12,
+        });
+        let mut runtime_present = removed.clone();
+        runtime_present
+            .removal_evidence
+            .as_mut()
+            .unwrap()
+            .runtime_absent = false;
+        assert_eq!(
+            store.record_result(&runtime_present, NOW + 13),
+            Err(ManagedOperationStoreError::InvalidRequest)
+        );
+        let mut stale = removed.clone();
+        stale
+            .removal_evidence
+            .as_mut()
+            .unwrap()
+            .cache_observed_at_unix_secs = NOW - HEALTH_EVIDENCE_MAX_AGE_SECONDS - 1;
+        assert_eq!(
+            store.record_result(&stale, NOW + 13),
+            Err(ManagedOperationStoreError::InvalidEvidence)
+        );
+        let summary = store.record_result(&removed, NOW + 13).unwrap();
+        assert_eq!(summary.phase, ManagedOperationPhase::Removed);
+        assert_eq!(summary.removal.as_ref().unwrap().generation, 1);
+        assert!(summary.health.is_none());
+        assert_eq!(store.record_result(&removed, NOW + 14).unwrap(), summary);
+    }
+
+    #[test]
+    fn removal_after_failed_replacement_targets_the_restored_active_generation() {
+        let store = ManagedServiceOperationStore::new(None).unwrap();
+        let manifest = fixture();
+        let slot = &manifest.services[0].slots[0];
+        activate(&store, &manifest, "op_create_restore1", 1, NOW);
+
+        let mut replacement = ready("op_replace_restore2", 2);
+        replacement.operation_kind = ManagedOperationKind::Replace;
+        store.register(&replacement, slot, NOW + 10).unwrap();
+        let install = store.claim(&manifest.host_ref, NOW + 11).unwrap().unwrap();
+        store
+            .record_result(
+                &result(
+                    &install,
+                    ManagedOperationAgentOutcome::Succeeded,
+                    ManagedOperationReason::PhaseSucceeded,
+                ),
+                NOW + 12,
+            )
+            .unwrap();
+        let reload = store.claim(&manifest.host_ref, NOW + 13).unwrap().unwrap();
+        store
+            .record_result(
+                &result(
+                    &reload,
+                    ManagedOperationAgentOutcome::Succeeded,
+                    ManagedOperationReason::PhaseSucceeded,
+                ),
+                NOW + 14,
+            )
+            .unwrap();
+        let verify = store.claim(&manifest.host_ref, NOW + 15).unwrap().unwrap();
+        let mut failed = result(
+            &verify,
+            ManagedOperationAgentOutcome::Failed,
+            ManagedOperationReason::VerificationFailed,
+        );
+        failed.rollback_evidence = Some(ManagedRollbackEvidenceV1 {
+            restored_generation: 1,
+            materialized: true,
+            process_state: ManagedProcessState::Running,
+            probe_state: ManagedProbeState::Healthy,
+            heartbeat_observed_at_unix_secs: NOW + 16,
+            process_observed_at_unix_secs: NOW + 16,
+            probe_observed_at_unix_secs: NOW + 16,
+        });
+        assert_eq!(
+            store.record_result(&failed, NOW + 16).unwrap().phase,
+            ManagedOperationPhase::RolledBack
+        );
+
+        let mut detached = slot.clone();
+        detached.binding_state = ManagedBindingState::Detached;
+        let mut removal = ready("op_remove_restore1", 1);
+        removal.operation_kind = ManagedOperationKind::Remove;
+        removal.purge_not_before_unix_secs = Some(NOW + 86_400);
+        let pending = store.register(&removal, &detached, NOW + 20).unwrap();
+        assert_eq!(pending.generation, 1);
+        assert_eq!(pending.phase, ManagedOperationPhase::RemovalPending);
+        assert_eq!(
+            store
+                .latest_for_slot(
+                    &manifest.host_ref,
+                    &manifest.services[0].service_ref,
+                    &slot.slot_ref,
+                    NOW + 20,
+                )
+                .unwrap()
+                .operation_ref,
+            removal.operation_ref
+        );
+        let lease = store.claim(&manifest.host_ref, NOW + 21).unwrap().unwrap();
+        assert_eq!(lease.phase, ManagedOperationAgentPhase::Remove);
+        assert_eq!(lease.generation, 1);
     }
 
     #[test]

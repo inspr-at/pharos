@@ -18,6 +18,7 @@ pub const MAX_MANAGED_OPERATION_REQUEST_BYTES: usize = 8 * 1024;
 pub enum ManagedOperationKind {
     Create,
     Replace,
+    Remove,
 }
 
 fn default_managed_operation_kind() -> ManagedOperationKind {
@@ -30,6 +31,7 @@ pub enum ManagedOperationAgentPhase {
     Install,
     Reload,
     Verify,
+    Remove,
 }
 
 impl ManagedOperationAgentPhase {
@@ -38,6 +40,7 @@ impl ManagedOperationAgentPhase {
             Self::Install => "delivery_",
             Self::Reload => "reload_",
             Self::Verify => "health_",
+            Self::Remove => "detach_",
         }
     }
 }
@@ -65,18 +68,27 @@ pub enum ManagedOperationReason {
     LeaseExpired,
     OperationTimeout,
     OperationSuperseded,
+    RemovalFailed,
+    RemovalUncertain,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedProcessState {
     Running,
+    Stopped,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedProbeState {
     Healthy,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedCacheState {
+    Quarantined,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -91,6 +103,8 @@ pub struct ManagedOperationReadyV1 {
     pub slot_ref: String,
     pub declaration_fingerprint: String,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_not_before_unix_secs: Option<i64>,
     pub value_returned: bool,
 }
 
@@ -104,6 +118,14 @@ impl ManagedOperationReadyV1 {
             || !valid_ref("slot_", &self.slot_ref)
             || !valid_ref("decl_", &self.declaration_fingerprint)
             || self.generation == 0
+            || match self.operation_kind {
+                ManagedOperationKind::Remove => self
+                    .purge_not_before_unix_secs
+                    .is_none_or(|deadline| deadline <= 0),
+                ManagedOperationKind::Create | ManagedOperationKind::Replace => {
+                    self.purge_not_before_unix_secs.is_some()
+                }
+            }
             || self.value_returned
         {
             return Err("managed_operation_ready_invalid");
@@ -146,6 +168,8 @@ pub struct ManagedOperationLeaseV1 {
     pub slot_ref: String,
     pub declaration_fingerprint: String,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_not_before_unix_secs: Option<i64>,
     pub phase: ManagedOperationAgentPhase,
     pub profile_ref: String,
     pub leased_at_unix_secs: i64,
@@ -165,6 +189,14 @@ impl ManagedOperationLeaseV1 {
             || !valid_ref("decl_", &self.declaration_fingerprint)
             || !valid_ref(self.phase.profile_prefix(), &self.profile_ref)
             || self.generation == 0
+            || match self.operation_kind {
+                ManagedOperationKind::Remove => self
+                    .purge_not_before_unix_secs
+                    .is_none_or(|deadline| deadline <= self.expires_at_unix_secs),
+                ManagedOperationKind::Create | ManagedOperationKind::Replace => {
+                    self.purge_not_before_unix_secs.is_some()
+                }
+            }
             || self.leased_at_unix_secs <= 0
             || self.expires_at_unix_secs <= self.leased_at_unix_secs
             || self.value_returned
@@ -200,6 +232,20 @@ pub struct ManagedRollbackEvidenceV1 {
     pub probe_observed_at_unix_secs: i64,
 }
 
+/// Fresh proof that the detached service stopped and its private material is
+/// absent from the active host paths while ciphertext remains recoverable.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRemovalEvidenceV1 {
+    pub generation: u64,
+    pub runtime_absent: bool,
+    pub process_state: ManagedProcessState,
+    pub cache_state: ManagedCacheState,
+    pub heartbeat_observed_at_unix_secs: i64,
+    pub process_observed_at_unix_secs: i64,
+    pub cache_observed_at_unix_secs: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedOperationResultV1 {
@@ -215,6 +261,8 @@ pub struct ManagedOperationResultV1 {
     pub health_evidence: Option<ManagedHealthEvidenceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_evidence: Option<ManagedRollbackEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_evidence: Option<ManagedRemovalEvidenceV1>,
     pub value_returned: bool,
 }
 
@@ -247,6 +295,21 @@ impl ManagedOperationResultV1 {
             })
             || self.outcome != ManagedOperationAgentOutcome::Failed
                 && self.rollback_evidence.is_some()
+            || self.removal_evidence.as_ref().is_some_and(|evidence| {
+                self.phase != ManagedOperationAgentPhase::Remove
+                    || self.outcome != ManagedOperationAgentOutcome::Succeeded
+                    || evidence.generation != self.generation
+                    || !evidence.runtime_absent
+                    || evidence.process_state != ManagedProcessState::Stopped
+                    || evidence.cache_state != ManagedCacheState::Quarantined
+                    || evidence.heartbeat_observed_at_unix_secs <= 0
+                    || evidence.process_observed_at_unix_secs <= 0
+                    || evidence.cache_observed_at_unix_secs <= 0
+            })
+            || self.phase == ManagedOperationAgentPhase::Remove
+                && self.outcome == ManagedOperationAgentOutcome::Succeeded
+                && self.removal_evidence.is_none()
+            || self.phase != ManagedOperationAgentPhase::Remove && self.removal_evidence.is_some()
         {
             return Err("managed_operation_result_invalid");
         }
@@ -275,6 +338,12 @@ fn agent_reason_matches_phase(
                 | ManagedOperationReason::EvidenceStale
                 | ManagedOperationReason::HeartbeatStale
                 | ManagedOperationReason::GenerationMismatch
+                | ManagedOperationReason::ExecutorFailed
+        ),
+        ManagedOperationAgentPhase::Remove => matches!(
+            reason,
+            ManagedOperationReason::RemovalFailed
+                | ManagedOperationReason::RemovalUncertain
                 | ManagedOperationReason::ExecutorFailed
         ),
     }
@@ -306,6 +375,7 @@ mod tests {
             generation: 1,
             health_evidence: None,
             rollback_evidence: None,
+            removal_evidence: None,
             value_returned: false,
         }
     }
@@ -323,6 +393,7 @@ mod tests {
             slot_ref: "slot_49c0e8a17d63".to_string(),
             declaration_fingerprint: "decl_a84f209c4b32".to_string(),
             generation: 1,
+            purge_not_before_unix_secs: None,
             phase: ManagedOperationAgentPhase::Install,
             profile_ref: "delivery_2d7a0f63c951".to_string(),
             leased_at_unix_secs: 1_800_000_000,
@@ -400,5 +471,58 @@ mod tests {
 
         wrong_phase_reason.reason_code = ManagedOperationReason::DeliveryFailed;
         wrong_phase_reason.validate_contract().unwrap();
+    }
+
+    #[test]
+    fn removal_requires_a_recovery_deadline_and_exact_absence_evidence() {
+        let lease = ManagedOperationLeaseV1 {
+            schema: MANAGED_OPERATION_LEASE_SCHEMA.to_string(),
+            schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+            lease_ref: "lease_49c0e8a17d63".to_string(),
+            operation_ref: "op_58f36c72a91e".to_string(),
+            operation_kind: ManagedOperationKind::Remove,
+            host_ref: "host_58f36c72a91e".to_string(),
+            service_ref: "svc_0bca8d31f7e2".to_string(),
+            slot_ref: "slot_49c0e8a17d63".to_string(),
+            declaration_fingerprint: "decl_a84f209c4b32".to_string(),
+            generation: 3,
+            purge_not_before_unix_secs: Some(1_800_086_400),
+            phase: ManagedOperationAgentPhase::Remove,
+            profile_ref: "detach_2d7a0f63c951".to_string(),
+            leased_at_unix_secs: 1_800_000_000,
+            expires_at_unix_secs: 1_800_000_060,
+            value_returned: false,
+        };
+        lease.validate_contract().unwrap();
+
+        let mut removal = ManagedOperationResultV1 {
+            schema: MANAGED_OPERATION_RESULT_SCHEMA.to_string(),
+            schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+            lease_ref: lease.lease_ref.clone(),
+            operation_ref: lease.operation_ref.clone(),
+            host_ref: lease.host_ref.clone(),
+            phase: ManagedOperationAgentPhase::Remove,
+            outcome: ManagedOperationAgentOutcome::Succeeded,
+            reason_code: ManagedOperationReason::PhaseSucceeded,
+            generation: lease.generation,
+            health_evidence: None,
+            rollback_evidence: None,
+            removal_evidence: Some(ManagedRemovalEvidenceV1 {
+                generation: lease.generation,
+                runtime_absent: true,
+                process_state: ManagedProcessState::Stopped,
+                cache_state: ManagedCacheState::Quarantined,
+                heartbeat_observed_at_unix_secs: 1_800_000_010,
+                process_observed_at_unix_secs: 1_800_000_010,
+                cache_observed_at_unix_secs: 1_800_000_010,
+            }),
+            value_returned: false,
+        };
+        removal.validate_contract().unwrap();
+        removal.removal_evidence.as_mut().unwrap().runtime_absent = false;
+        assert_eq!(
+            removal.validate_contract(),
+            Err("managed_operation_result_invalid")
+        );
     }
 }

@@ -14,9 +14,12 @@ document.querySelectorAll('[data-managed-secret-action]').forEach(button=>button
   const original=button.textContent;
   button.disabled=true;button.textContent='Opening Janus…';
   const replacing=button.dataset.operationKind==='replace';
-  if(status)status.textContent=replacing
-    ?'Creating a short-lived, value-free replacement request…'
-    :'Creating a short-lived, value-free setup request…';
+  const removing=button.dataset.operationKind==='remove';
+  if(status)status.textContent=removing
+    ?'Creating a short-lived, value-free removal request…'
+    :replacing
+      ?'Creating a short-lived, value-free replacement request…'
+      :'Creating a short-lived, value-free setup request…';
   try{
     const response=await fetch('/managed-service-setup-intents',{
       method:'POST',
@@ -42,6 +45,8 @@ document.querySelectorAll('[data-managed-secret-action]').forEach(button=>button
       ?'You are offline. Reconnect, then try again.'
       :error.message==='managed_intent_declaration_drift'
         ?'This declaration changed. Refresh the page before trying again.'
+        :removing
+          ?'Janus removal is unavailable right now. The encrypted generations remain recoverable; try again.'
         :replacing
           ?'Janus replacement is unavailable right now. The current secret is unchanged; try again.'
           :'Janus setup is unavailable right now. Nothing changed; try again.';
@@ -57,12 +62,15 @@ pub(crate) enum ManagedSecretSlotState {
     RollbackRestored,
     Replacing,
     Removing,
+    Removed,
+    RemovalFinalizing,
 }
 
 impl ManagedSecretSlotState {
     fn from_operation(operation_kind: Option<&str>, phase: Option<&str>) -> Self {
         match (operation_kind, phase) {
             (Some("replace"), Some("rolled_back")) => Self::RollbackRestored,
+            (Some("remove"), Some("removed")) => Self::Removed,
             (_, Some("active" | "healthy")) => Self::Active,
             (_, Some("failed" | "rolled_back")) => Self::ActionNeeded,
             (Some("remove"), Some(_)) => Self::Removing,
@@ -81,13 +89,18 @@ impl ManagedSecretSlotState {
             Self::RollbackRestored => "Active · replacement undone",
             Self::Replacing => "Replacing",
             Self::Removing => "Removing",
+            Self::Removed => "Removed · recovery window",
+            Self::RemovalFinalizing => "Removed · final cleanup",
         }
     }
 
     fn tone(self) -> &'static str {
         match self {
             Self::Missing => "missing",
-            Self::Installing | Self::Replacing | Self::Removing => "working",
+            Self::Installing | Self::Replacing | Self::Removing | Self::RemovalFinalizing => {
+                "working"
+            }
+            Self::Removed => "missing",
             Self::Active => "active",
             Self::RollbackRestored => "active",
             Self::ActionNeeded => "attention",
@@ -111,6 +124,12 @@ impl ManagedSecretSlotState {
             }
             Self::Replacing => "A replacement is being delivered and checked.",
             Self::Removing => "Removal is in progress and the service is being checked.",
+            Self::Removed => {
+                "The service is stopped and encrypted generations are quarantined until the recovery window ends."
+            }
+            Self::RemovalFinalizing => {
+                "The recovery window ended. Final encrypted cleanup is being retried safely."
+            }
         }
     }
 }
@@ -288,10 +307,17 @@ fn service_state(
                     | ManagedOperationPhase::Reloading
                     | ManagedOperationPhase::VerifyPending
                     | ManagedOperationPhase::Verifying
+                    | ManagedOperationPhase::RemovalPending
+                    | ManagedOperationPhase::Removing
             )
         )
     }) {
         ("working", "Setup running")
+    } else if phases
+        .iter()
+        .any(|phase| matches!(phase, Some(ManagedOperationPhase::Removed)))
+    {
+        ("missing", "Removed")
     } else {
         ("missing", "Needs setup")
     }
@@ -331,15 +357,26 @@ fn render_service_detail(
             .map(|operation| match operation.operation_kind {
                 pharos_core::managed_operations::ManagedOperationKind::Create => "create",
                 pharos_core::managed_operations::ManagedOperationKind::Replace => "replace",
+                pharos_core::managed_operations::ManagedOperationKind::Remove => "remove",
             });
         let phase = operation.as_ref().map(|operation| operation.phase.name());
+        let mut state = ManagedSecretSlotState::from_operation(operation_kind, phase);
+        if state == ManagedSecretSlotState::Removed
+            && operation
+                .as_ref()
+                .and_then(|operation| operation.purge_not_before_unix_secs)
+                .is_some_and(|deadline| now >= deadline)
+        {
+            state = ManagedSecretSlotState::RemovalFinalizing;
+        }
         slots.push_str(&render_slot(
             manifest,
             service,
             slot,
-            ManagedSecretSlotState::from_operation(operation_kind, phase),
+            state,
             operation.as_ref(),
             setup_enabled,
+            now,
         ));
     }
     format!(
@@ -366,6 +403,7 @@ fn render_slot(
     state: ManagedSecretSlotState,
     operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
     setup_enabled: bool,
+    now: i64,
 ) -> String {
     let action = if state == ManagedSecretSlotState::Missing && setup_enabled {
         format!(
@@ -381,9 +419,21 @@ fn render_slot(
         state,
         ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
     ) && setup_enabled
+        && slot.binding_state == pharos_core::managed_services::ManagedBindingState::Detached
     {
         format!(
-            r#"<button class="managed-secondary" type="button" data-managed-secret-action data-operation-kind="replace" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Replace / rotate secret</button>"#,
+            r#"<button class="managed-secondary managed-danger" type="button" data-managed-secret-action data-operation-kind="remove" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Remove secret safely</button>"#,
+            host_ref = html_escape(&manifest.host_ref),
+            service_ref = html_escape(&service.service_ref),
+            slot_ref = html_escape(&slot.slot_ref),
+        )
+    } else if matches!(
+        state,
+        ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
+    ) && setup_enabled
+    {
+        format!(
+            r#"<button class="managed-secondary" type="button" data-managed-secret-action data-operation-kind="replace" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Replace / rotate secret</button><button class="managed-link-danger" type="button" disabled aria-describedby="managed-detach-{slot_ref}">Remove secret…</button><span id="managed-detach-{slot_ref}" class="managed-detach-note">Detach this slot in nixcfg and deploy that reviewed change first.</span>"#,
             host_ref = html_escape(&manifest.host_ref),
             service_ref = html_escape(&service.service_ref),
             slot_ref = html_escape(&slot.slot_ref),
@@ -393,9 +443,15 @@ fn render_slot(
             .to_string()
     };
     let progress = operation
-        .map(|operation| render_operation_progress(operation.phase.name()))
+        .map(|operation| {
+            render_operation_progress(
+                operation.phase.name(),
+                operation.purge_not_before_unix_secs,
+                now,
+            )
+        })
         .unwrap_or_default();
-    let separation = render_operation_separation(operation);
+    let separation = render_operation_separation(operation, now);
     format!(
         r#"<article class="managed-slot-card"><div class="managed-slot-head"><div><span class="managed-kicker">Service secret</span><h2>{slot_label}</h2></div><span class="managed-state {tone}">{state_label}</span></div><p class="managed-slot-guidance">{guidance}</p><dl class="managed-slot-facts"><div><dt>Consumer</dt><dd>{service_label}</dd></div><div><dt>Delivery</dt><dd>Private environment file</dd></div><div><dt>Reveal</dt><dd>Never</dd></div></dl>{separation}{progress}<div class="managed-slot-action">{action}<p role="status" aria-live="polite" data-managed-action-status>{availability}</p></div></article>"#,
         slot_label = html_escape(&slot.safe_label),
@@ -410,8 +466,23 @@ fn render_slot(
             && matches!(
                 state,
                 ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
-            ) {
+            )
+            && slot.binding_state == pharos_core::managed_services::ManagedBindingState::Detached
+        {
+            "The reviewed binding is detached. Janus will stop and verify the exact service, revoke delivery, remove runtime material, and quarantine encrypted generations before destruction."
+        } else if setup_enabled
+            && matches!(
+                state,
+                ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
+            )
+        {
             "Janus will stage a new generation and keep the previous working generation recoverable until every check passes."
+        } else if state == ManagedSecretSlotState::Removing {
+            "The exact service stop, runtime absence check, and encrypted quarantine are still in progress."
+        } else if state == ManagedSecretSlotState::Removed {
+            "Active use has ended. Encrypted quarantine remains recoverable until the displayed recovery window closes."
+        } else if state == ManagedSecretSlotState::RemovalFinalizing {
+            "Active use remains stopped while exact encrypted cleanup is retried."
         } else if setup_enabled {
             "Janus will confirm the exact target and ask how to create the value."
         } else {
@@ -422,7 +493,16 @@ fn render_slot(
 
 fn render_operation_separation(
     operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
+    now: i64,
 ) -> String {
+    if operation.is_some_and(|operation| {
+        operation.phase == ManagedOperationPhase::Removed
+            && operation
+                .purge_not_before_unix_secs
+                .is_some_and(|deadline| now >= deadline)
+    }) {
+        return r#"<dl class="managed-operation-lanes" aria-label="Operation boundaries"><div><dt>Declaration</dt><dd>Locked by nixcfg</dd></div><div><dt>Janus delivery</dt><dd>Final encrypted cleanup due</dd></div><div><dt>Host execution</dt><dd>Declared service stopped</dd></div><div><dt>Observed health</dt><dd>Runtime material absent</dd></div></dl>"#.to_string();
+    }
     let (delivery, execution, health) = match operation.map(|operation| operation.phase) {
         None => ("Not delivered", "Not started", "Not observed"),
         Some(ManagedOperationPhase::InstallPending | ManagedOperationPhase::Installing) => (
@@ -440,10 +520,20 @@ fn render_operation_separation(
             "Declared reload completed",
             "Checking fresh evidence",
         ),
+        Some(ManagedOperationPhase::RemovalPending | ManagedOperationPhase::Removing) => (
+            "Delivery revoked",
+            "Stopping exact declared service",
+            "Verifying absence",
+        ),
         Some(ManagedOperationPhase::Active) => (
             "Installed on host",
             "Declared reload completed",
             "Fresh generation healthy",
+        ),
+        Some(ManagedOperationPhase::Removed) => (
+            "Encrypted generations quarantined",
+            "Declared service stopped",
+            "Runtime material absent",
         ),
         Some(ManagedOperationPhase::RolledBack) => (
             "Replacement withdrawn",
@@ -462,9 +552,22 @@ fn render_operation_separation(
     )
 }
 
-fn render_operation_progress(phase: &str) -> String {
+fn render_operation_progress(
+    phase: &str,
+    purge_not_before_unix_secs: Option<i64>,
+    now: i64,
+) -> String {
     if phase == "rolled_back" {
         return r#"<section class="managed-operation-progress" aria-label="Replacement recovery"><h3>Replacement safely undone</h3><p>The previous generation was restored and passed the declared service health check. The replacement value is not active.</p></section>"#.to_string();
+    }
+    if matches!(phase, "removal_pending" | "removing") {
+        return r#"<section class="managed-operation-progress" aria-label="Secret removal"><h3>Removing safely</h3><p>Delivery is revoked. The declared service must stop and the host must prove runtime material is absent before encrypted generations enter quarantine.</p></section>"#.to_string();
+    }
+    if phase == "removed" {
+        if purge_not_before_unix_secs.is_some_and(|deadline| now >= deadline) {
+            return r#"<section class="managed-operation-progress" aria-label="Secret removal"><h3>Recovery window ended</h3><p>The service remains stopped. Janus and the host will keep retrying exact, idempotent destruction of their encrypted quarantine copies until final cleanup succeeds.</p></section>"#.to_string();
+        }
+        return r#"<section class="managed-operation-progress" aria-label="Secret removal"><h3>Removed from active use</h3><p>The declared service is stopped, runtime material is absent, and encrypted generations are quarantined for the recovery window.</p></section>"#.to_string();
     }
     let achieved = match phase {
         "install_pending" | "installing" | "encrypted" => Some(0),
@@ -540,8 +643,11 @@ mod tests {
             ManagedSecretSlotState::Installing,
             ManagedSecretSlotState::Active,
             ManagedSecretSlotState::ActionNeeded,
+            ManagedSecretSlotState::RollbackRestored,
             ManagedSecretSlotState::Replacing,
             ManagedSecretSlotState::Removing,
+            ManagedSecretSlotState::Removed,
+            ManagedSecretSlotState::RemovalFinalizing,
         ];
         assert_eq!(
             states.map(ManagedSecretSlotState::label),
@@ -550,8 +656,11 @@ mod tests {
                 "Installing",
                 "Active",
                 "Action needed",
+                "Active · replacement undone",
                 "Replacing",
-                "Removing"
+                "Removing",
+                "Removed · recovery window",
+                "Removed · final cleanup"
             ]
         );
         for state in states {
@@ -571,6 +680,10 @@ mod tests {
             ManagedSecretSlotState::Removing
         );
         assert_eq!(
+            ManagedSecretSlotState::from_operation(Some("remove"), Some("removed")),
+            ManagedSecretSlotState::Removed
+        );
+        assert_eq!(
             ManagedSecretSlotState::from_operation(Some("create"), Some("healthy")),
             ManagedSecretSlotState::Active
         );
@@ -578,6 +691,63 @@ mod tests {
             ManagedSecretSlotState::from_operation(Some("create"), Some("failed")),
             ManagedSecretSlotState::ActionNeeded
         );
+    }
+
+    #[test]
+    fn remove_action_appears_only_after_reviewed_detach_and_explains_recovery() {
+        let mut manifest = fixture();
+        let service = manifest.services[0].clone();
+        let required = render_slot(
+            &manifest,
+            &service,
+            &service.slots[0],
+            ManagedSecretSlotState::Active,
+            None,
+            true,
+            1_800_000_000,
+        );
+        assert!(required.contains("Replace / rotate secret"));
+        assert!(required.contains("Detach this slot in nixcfg"));
+        assert!(required.contains(r#"data-operation-kind="replace""#));
+        assert!(!required.contains(r#"data-operation-kind="remove""#));
+
+        manifest.services[0].slots[0].binding_state =
+            pharos_core::managed_services::ManagedBindingState::Detached;
+        let detached_service = manifest.services[0].clone();
+        let detached = render_slot(
+            &manifest,
+            &detached_service,
+            &detached_service.slots[0],
+            ManagedSecretSlotState::Active,
+            None,
+            true,
+            1_800_000_000,
+        );
+        for expected in [
+            "Remove secret safely",
+            r#"data-operation-kind="remove""#,
+            "reviewed binding is detached",
+            "stop and verify the exact service",
+            "quarantine encrypted generations",
+        ] {
+            assert!(detached.contains(expected), "missing {expected}");
+        }
+        for forbidden in [
+            "Replace / rotate secret",
+            r#"name="secret_value""#,
+            r#"name="source""#,
+        ] {
+            assert!(!detached.contains(forbidden), "found {forbidden}");
+        }
+
+        let removed = render_operation_progress("removed", Some(1_800_086_400), 1_800_000_000);
+        assert!(removed.contains("Removed from active use"));
+        assert!(removed.contains("recovery window"));
+        let finalizing = render_operation_progress("removed", Some(1_800_086_400), 1_800_086_400);
+        assert!(finalizing.contains("Recovery window ended"));
+        assert!(finalizing.contains("keep retrying"));
+        assert!(HEAD.contains(".managed-danger"));
+        assert!(MANAGED_SETUP_RUNTIME.contains("value-free removal request"));
     }
 
     #[test]
@@ -625,7 +795,7 @@ mod tests {
 
     #[test]
     fn operation_progress_uses_plain_phases_and_keeps_evidence_out_of_the_summary() {
-        let html = render_operation_progress("reloaded");
+        let html = render_operation_progress("reloaded", None, 1_800_000_000);
         for expected in [
             "Encrypted",
             "Installed",
@@ -652,6 +822,7 @@ mod tests {
             ManagedSecretSlotState::Active,
             None,
             true,
+            1_800_000_000,
         );
         for expected in [
             "Replace / rotate secret",
@@ -665,7 +836,7 @@ mod tests {
             assert!(!active.contains(forbidden), "found {forbidden}");
         }
 
-        let rolled_back = render_operation_progress("rolled_back");
+        let rolled_back = render_operation_progress("rolled_back", None, 1_800_000_000);
         for expected in [
             "Replacement safely undone",
             "previous generation was restored",
@@ -692,6 +863,7 @@ mod tests {
                     slot_ref: manifest.services[0].slots[0].slot_ref.clone(),
                     declaration_fingerprint: manifest.declaration_fingerprint.clone(),
                     generation: 1,
+                    purge_not_before_unix_secs: None,
                     value_returned: false,
                 },
                 &manifest.services[0].slots[0],
