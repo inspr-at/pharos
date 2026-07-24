@@ -312,6 +312,10 @@ impl ManagedSetupIntentStore {
         database_path.map(|path| path.with_file_name("managed-setup-intents.json"))
     }
 
+    pub(crate) fn system_authorized(&self, bearer_token: &str) -> bool {
+        self.config.token_matches(bearer_token)
+    }
+
     pub(crate) fn issue(&self, mut request: IssueIntent) -> Result<IssuedIntent, IntentReason> {
         if request.now_unix_secs <= 0
             || !valid_ref("host_", &request.host_ref)

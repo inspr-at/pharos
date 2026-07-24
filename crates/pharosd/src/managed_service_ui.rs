@@ -5,6 +5,7 @@
 //! setup intent.
 
 use super::*;
+use crate::managed_service_operations::ManagedOperationPhase;
 
 const MANAGED_SETUP_RUNTIME: &str = r#"
 document.querySelectorAll('[data-managed-secret-add]').forEach(button=>button.addEventListener('click',async()=>{
@@ -124,6 +125,8 @@ pub(super) async fn services_page(
         state.manifests.managed_service_manifests(),
         state.manifests.managed_service_load_errors(),
         shell,
+        &state.managed_service_operations,
+        now_unix(),
     ))
 }
 
@@ -185,6 +188,8 @@ pub(super) async fn service_detail_page(
         service,
         shell,
         state.managed_setup_intents.is_some(),
+        &state.managed_service_operations,
+        now_unix(),
     ))
     .into_response()
 }
@@ -193,6 +198,8 @@ fn render_services_page(
     manifests: &[ManagedServiceManifestV1],
     load_errors: &[ManifestLoadIssue],
     shell: ShellContext<'_>,
+    operations: &ManagedServiceOperationStore,
+    now: i64,
 ) -> String {
     if !load_errors.is_empty() {
         return render_services_error(shell);
@@ -206,16 +213,16 @@ fn render_services_page(
     let mut cards = String::new();
     for manifest in manifests {
         for service in &manifest.services {
-            let missing = service.slots.len();
+            let (tone, state_label) = service_state(manifest, service, operations, now);
+            let slot_count = service.slots.len();
             cards.push_str(&format!(
-                r#"<a class="managed-service-card" href="/services/{host_ref}/{service_ref}"><span class="managed-service-icon">{icon}</span><span class="managed-service-copy"><b>{service_label}</b><small>{host_label}</small></span><span class="managed-service-count">{missing} {slot_word}</span><span class="managed-state missing">Needs setup</span></a>"#,
+                r#"<a class="managed-service-card" href="/services/{host_ref}/{service_ref}"><span class="managed-service-icon">{icon}</span><span class="managed-service-copy"><b>{service_label}</b><small>{host_label}</small></span><span class="managed-service-count">{slot_count} {slot_word}</span><span class="managed-state {tone}">{state_label}</span></a>"#,
                 host_ref = html_escape(&manifest.host_ref),
                 service_ref = html_escape(&service.service_ref),
                 icon = icons::KEY_ROUND,
                 service_label = html_escape(&service.safe_label),
                 host_label = html_escape(&managed_host_label(&manifest.host_ref)),
-                missing = missing,
-                slot_word = if missing == 1 { "secret" } else { "secrets" },
+                slot_word = if slot_count == 1 { "secret" } else { "secrets" },
             ));
         }
     }
@@ -229,6 +236,53 @@ fn render_services_page(
     format!(
         r#"{HEAD}{sidebar}<main class="managed-services-main">{header}{content}</main></div></body></html>"#
     )
+}
+
+fn service_state(
+    manifest: &ManagedServiceManifestV1,
+    service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
+    operations: &ManagedServiceOperationStore,
+    now: i64,
+) -> (&'static str, &'static str) {
+    let phases = service.slots.iter().map(|slot| {
+        operations
+            .latest_for_slot(
+                &manifest.host_ref,
+                &service.service_ref,
+                &slot.slot_ref,
+                now,
+            )
+            .map(|operation| operation.phase)
+    });
+    let phases: Vec<_> = phases.collect();
+    if phases
+        .iter()
+        .any(|phase| matches!(phase, Some(ManagedOperationPhase::Failed)))
+    {
+        ("attention", "Action needed")
+    } else if phases
+        .iter()
+        .all(|phase| matches!(phase, Some(ManagedOperationPhase::Active)))
+        && !phases.is_empty()
+    {
+        ("active", "Active")
+    } else if phases.iter().any(|phase| {
+        matches!(
+            phase,
+            Some(
+                ManagedOperationPhase::InstallPending
+                    | ManagedOperationPhase::Installing
+                    | ManagedOperationPhase::ReloadPending
+                    | ManagedOperationPhase::Reloading
+                    | ManagedOperationPhase::VerifyPending
+                    | ManagedOperationPhase::Verifying
+            )
+        )
+    }) {
+        ("working", "Setup running")
+    } else {
+        ("missing", "Needs setup")
+    }
 }
 
 fn render_services_error(shell: ShellContext<'_>) -> String {
@@ -248,16 +302,31 @@ fn render_service_detail(
     service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
     shell: ShellContext<'_>,
     setup_enabled: bool,
+    operations: &ManagedServiceOperationStore,
+    now: i64,
 ) -> String {
     let sidebar = sidebar(shell.user_label, shell.logout_enabled, "services");
     let mut slots = String::new();
     for slot in &service.slots {
+        let operation = operations.latest_for_slot(
+            &manifest.host_ref,
+            &service.service_ref,
+            &slot.slot_ref,
+            now,
+        );
+        let operation_kind = operation
+            .as_ref()
+            .map(|operation| match operation.operation_kind {
+                pharos_core::managed_operations::ManagedOperationKind::Create => "create",
+                pharos_core::managed_operations::ManagedOperationKind::Replace => "replace",
+            });
+        let phase = operation.as_ref().map(|operation| operation.phase.name());
         slots.push_str(&render_slot(
             manifest,
             service,
             slot,
-            ManagedSecretSlotState::from_operation(None, None),
-            None,
+            ManagedSecretSlotState::from_operation(operation_kind, phase),
+            operation.as_ref(),
             setup_enabled,
         ));
     }
@@ -283,7 +352,7 @@ fn render_slot(
     service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
     slot: &pharos_core::managed_services::ManagedSecretSlotDeclarationV1,
     state: ManagedSecretSlotState,
-    phase: Option<&str>,
+    operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
     setup_enabled: bool,
 ) -> String {
     let action = if state == ManagedSecretSlotState::Missing && setup_enabled {
@@ -300,14 +369,18 @@ fn render_slot(
         r#"<button class="managed-secondary" type="button" disabled>View operation details</button>"#
             .to_string()
     };
-    let progress = phase.map(render_operation_progress).unwrap_or_default();
+    let progress = operation
+        .map(|operation| render_operation_progress(operation.phase.name()))
+        .unwrap_or_default();
+    let separation = render_operation_separation(operation);
     format!(
-        r#"<article class="managed-slot-card"><div class="managed-slot-head"><div><span class="managed-kicker">Service secret</span><h2>{slot_label}</h2></div><span class="managed-state {tone}">{state_label}</span></div><p class="managed-slot-guidance">{guidance}</p><dl class="managed-slot-facts"><div><dt>Consumer</dt><dd>{service_label}</dd></div><div><dt>Delivery</dt><dd>Private environment file</dd></div><div><dt>Reveal</dt><dd>Never</dd></div></dl>{progress}<div class="managed-slot-action">{action}<p role="status" aria-live="polite" data-managed-action-status>{availability}</p></div></article>"#,
+        r#"<article class="managed-slot-card"><div class="managed-slot-head"><div><span class="managed-kicker">Service secret</span><h2>{slot_label}</h2></div><span class="managed-state {tone}">{state_label}</span></div><p class="managed-slot-guidance">{guidance}</p><dl class="managed-slot-facts"><div><dt>Consumer</dt><dd>{service_label}</dd></div><div><dt>Delivery</dt><dd>Private environment file</dd></div><div><dt>Reveal</dt><dd>Never</dd></div></dl>{separation}{progress}<div class="managed-slot-action">{action}<p role="status" aria-live="polite" data-managed-action-status>{availability}</p></div></article>"#,
         slot_label = html_escape(&slot.safe_label),
         tone = state.tone(),
         state_label = state.label(),
         guidance = state.guidance(),
         service_label = html_escape(&service.safe_label),
+        separation = separation,
         progress = progress,
         action = action,
         availability = if setup_enabled {
@@ -318,11 +391,48 @@ fn render_slot(
     )
 }
 
+fn render_operation_separation(
+    operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
+) -> String {
+    let (delivery, execution, health) = match operation.map(|operation| operation.phase) {
+        None => ("Not delivered", "Not started", "Not observed"),
+        Some(ManagedOperationPhase::InstallPending | ManagedOperationPhase::Installing) => (
+            "Encrypted in Janus",
+            "Waiting for host install",
+            "Not observed",
+        ),
+        Some(ManagedOperationPhase::ReloadPending | ManagedOperationPhase::Reloading) => (
+            "Installed on host",
+            "Reloading declared service",
+            "Not observed",
+        ),
+        Some(ManagedOperationPhase::VerifyPending | ManagedOperationPhase::Verifying) => (
+            "Installed on host",
+            "Declared reload completed",
+            "Checking fresh evidence",
+        ),
+        Some(ManagedOperationPhase::Active) => (
+            "Installed on host",
+            "Declared reload completed",
+            "Fresh generation healthy",
+        ),
+        Some(ManagedOperationPhase::Failed) => {
+            ("Delivery recorded", "Action stopped safely", "Not accepted")
+        }
+        Some(ManagedOperationPhase::Superseded) => {
+            ("Newer operation exists", "Superseded", "Not accepted")
+        }
+    };
+    format!(
+        r#"<dl class="managed-operation-lanes" aria-label="Operation boundaries"><div><dt>Declaration</dt><dd>Locked by nixcfg</dd></div><div><dt>Janus delivery</dt><dd>{delivery}</dd></div><div><dt>Host execution</dt><dd>{execution}</dd></div><div><dt>Observed health</dt><dd>{health}</dd></div></dl>"#
+    )
+}
+
 fn render_operation_progress(phase: &str) -> String {
     let achieved = match phase {
-        "encrypted" => Some(0),
-        "materialized" => Some(1),
-        "reloaded" => Some(2),
+        "install_pending" | "installing" | "encrypted" => Some(0),
+        "reload_pending" | "reloading" | "materialized" => Some(1),
+        "verify_pending" | "verifying" | "reloaded" => Some(2),
         "healthy" | "active" => Some(3),
         _ => None,
     };
@@ -367,6 +477,10 @@ fn managed_host_label(host_ref: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pharos_core::managed_operations::{
+        ManagedOperationKind, ManagedOperationReadyV1, MANAGED_OPERATION_CONTRACT_VERSION,
+        MANAGED_OPERATION_READY_SCHEMA,
+    };
 
     fn fixture() -> ManagedServiceManifestV1 {
         serde_json::from_str(include_str!(
@@ -432,13 +546,26 @@ mod tests {
     #[test]
     fn detail_locks_declared_target_and_exposes_no_value_or_source_input() {
         let manifest = fixture();
-        let html = render_service_detail(&manifest, &manifest.services[0], shell(), true);
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        let html = render_service_detail(
+            &manifest,
+            &manifest.services[0],
+            shell(),
+            true,
+            &operations,
+            1_800_000_000,
+        );
         for expected in [
             "Add missing secret",
             "Declared target",
             "Service secret",
             "Private environment file",
             "Reveal</dt><dd>Never",
+            "Operation boundaries",
+            "Declaration",
+            "Janus delivery",
+            "Host execution",
+            "Observed health",
             "data-host-ref=",
             "data-service-ref=",
             "data-slot-ref=",
@@ -477,14 +604,55 @@ mod tests {
     }
 
     #[test]
+    fn service_list_reports_running_work_instead_of_claiming_every_slot_is_missing() {
+        let manifest = fixture();
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        operations
+            .register(
+                &ManagedOperationReadyV1 {
+                    schema: MANAGED_OPERATION_READY_SCHEMA.to_string(),
+                    schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+                    operation_ref: "op_20000001".to_string(),
+                    operation_kind: ManagedOperationKind::Create,
+                    host_ref: manifest.host_ref.clone(),
+                    service_ref: manifest.services[0].service_ref.clone(),
+                    slot_ref: manifest.services[0].slots[0].slot_ref.clone(),
+                    declaration_fingerprint: manifest.declaration_fingerprint.clone(),
+                    generation: 1,
+                    value_returned: false,
+                },
+                &manifest.services[0].slots[0],
+                1_800_000_000,
+            )
+            .unwrap();
+        let html = render_services_page(
+            std::slice::from_ref(&manifest),
+            &[],
+            shell(),
+            &operations,
+            1_800_000_001,
+        );
+        assert!(html.contains("Setup running"));
+        assert!(!html.contains(">Needs setup</span>"));
+    }
+
+    #[test]
     fn service_labels_are_escaped_and_empty_and_failure_states_are_actionable() {
         let mut manifest = fixture();
         manifest.services[0].safe_label = "<Canary & service>".to_string();
-        let detail = render_service_detail(&manifest, &manifest.services[0], shell(), false);
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        let detail = render_service_detail(
+            &manifest,
+            &manifest.services[0],
+            shell(),
+            false,
+            &operations,
+            1_800_000_000,
+        );
         assert!(detail.contains("&lt;Canary &amp; service&gt;"));
         assert!(detail.contains("Setup unavailable"));
 
-        let empty = render_services_page(&[], &[], shell());
+        let empty = render_services_page(&[], &[], shell(), &operations, 1_800_000_000);
         assert!(empty.contains("No managed services yet"));
         assert!(empty.contains("other declared consumers"));
 
@@ -495,6 +663,8 @@ mod tests {
                 error: "invalid".to_string(),
             }],
             shell(),
+            &operations,
+            1_800_000_000,
         );
         assert!(failed.contains("Declarations need attention"));
         assert!(!failed.contains("/opaque/test"));

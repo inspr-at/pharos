@@ -5,6 +5,7 @@
 //! choice (PHAROS-2 / ADR-001). See PHAROS-3 (data model) and PHAROS-15
 //! (nix freshness) for the tickets these types back.
 
+pub mod managed_operations;
 pub mod managed_services;
 
 use std::collections::{BTreeMap, BTreeSet};
