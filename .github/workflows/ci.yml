@@ -120,7 +120,7 @@ jobs:
       - name: checkout the reviewed Janus producer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: markus-barta/janus
+          repository: inspr-at/janus
           ref: 37f94e34c50587952ac53b7ff2db80e85801f06e
           path: janus
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
