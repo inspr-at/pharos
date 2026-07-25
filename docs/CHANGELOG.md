@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.63 - 2026-07-25
+
+- Let a safely failed or rolled-back first managed-secret setup start a fresh passkey-confirmed attempt instead of leaving the operator on a disabled dead-end control.
+- Explain that the failed value was never activated, keep technical evidence optional, and preserve the no-reveal/value-free browser boundary.
+- Point source, CI, package, and Nix metadata at the transferred `inspr-at/pharos` repository.
+
 ## 0.1.62 - 2026-07-24
 
 - Add the managed-service secret CRUD control plane: declaration-locked service and slot selection, signed single-use Janus handoffs, value-free operation leases, exact host execution, health-confirmed activation, replacement rollback, and recoverable removal quarantine.
