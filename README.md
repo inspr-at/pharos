@@ -322,7 +322,7 @@ The flake exports `nixosModules.pharos-beacon`:
 
 ```nix
 {
-  inputs.pharos.url = "github:markus-barta/pharos";
+  inputs.pharos.url = "github:inspr-at/pharos";
   inputs.pharos.inputs.nixpkgs.follows = "nixpkgs";
 }
 ```
