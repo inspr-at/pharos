@@ -3,11 +3,11 @@ resolver = "2"
 members = ["crates/pharos-core", "crates/pharosd", "crates/pharos-beacon"]
 
 [workspace.package]
-version = "0.1.62"
+version = "0.1.63"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Markus Barta"]
-repository = "https://github.com/markus-barta/pharos"
+repository = "https://github.com/inspr-at/pharos"
 
 [workspace.dependencies]
 pharos-core = { path = "crates/pharos-core" }

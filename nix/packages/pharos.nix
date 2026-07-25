@@ -24,7 +24,7 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Pharos fleet management binary: ${binaryName}";
-    homepage = "https://github.com/markus-barta/pharos";
+    homepage = "https://github.com/inspr-at/pharos";
     license = lib.licenses.agpl3Only;
     mainProgram = binaryName;
     maintainers = [ ];

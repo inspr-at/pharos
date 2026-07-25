@@ -116,9 +116,7 @@ impl ManagedSecretSlotState {
             Self::Active => {
                 "The declared service accepted this secret and its health check passed."
             }
-            Self::ActionNeeded => {
-                "The last safe attempt stopped. Open the details before trying again."
-            }
+            Self::ActionNeeded => "The last safe attempt stopped safely.",
             Self::RollbackRestored => {
                 "The replacement did not pass every check, so the previous healthy secret was restored."
             }
@@ -412,6 +410,19 @@ fn render_slot(
             service_ref = html_escape(&service.service_ref),
             slot_ref = html_escape(&slot.slot_ref),
         )
+    } else if state == ManagedSecretSlotState::ActionNeeded
+        && setup_enabled
+        && operation.is_some_and(|operation| {
+            operation.operation_kind
+                == pharos_core::managed_operations::ManagedOperationKind::Create
+        })
+    {
+        format!(
+            r#"<button class="managed-primary" type="button" data-managed-secret-action data-operation-kind="create" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Try setup again</button>"#,
+            host_ref = html_escape(&manifest.host_ref),
+            service_ref = html_escape(&service.service_ref),
+            slot_ref = html_escape(&slot.slot_ref),
+        )
     } else if state == ManagedSecretSlotState::Missing {
         r#"<button class="managed-primary" type="button" disabled>Setup unavailable</button>"#
             .to_string()
@@ -483,6 +494,14 @@ fn render_slot(
             "Active use has ended. Encrypted quarantine remains recoverable until the displayed recovery window closes."
         } else if state == ManagedSecretSlotState::RemovalFinalizing {
             "Active use remains stopped while exact encrypted cleanup is retried."
+        } else if setup_enabled
+            && state == ManagedSecretSlotState::ActionNeeded
+            && operation.is_some_and(|operation| {
+                operation.operation_kind
+                    == pharos_core::managed_operations::ManagedOperationKind::Create
+            })
+        {
+            "Nothing from the previous attempt is active. Trying again starts a fresh passkey-confirmed operation."
         } else if setup_enabled {
             "Janus will confirm the exact target and ask how to create the value."
         } else {
@@ -791,6 +810,51 @@ mod tests {
         ] {
             assert!(!html.contains(forbidden), "found {forbidden}");
         }
+    }
+
+    #[test]
+    fn failed_create_offers_a_fresh_retry_without_hiding_the_safe_failure() {
+        let manifest = fixture();
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        operations
+            .register(
+                &ManagedOperationReadyV1 {
+                    schema: MANAGED_OPERATION_READY_SCHEMA.to_string(),
+                    schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+                    operation_ref: "op_retrycreate01".to_string(),
+                    operation_kind: ManagedOperationKind::Create,
+                    host_ref: manifest.host_ref.clone(),
+                    service_ref: manifest.services[0].service_ref.clone(),
+                    slot_ref: manifest.services[0].slots[0].slot_ref.clone(),
+                    declaration_fingerprint: manifest.declaration_fingerprint.clone(),
+                    generation: 1,
+                    purge_not_before_unix_secs: None,
+                    value_returned: false,
+                },
+                &manifest.services[0].slots[0],
+                1_800_000_000,
+            )
+            .unwrap();
+        let html = render_service_detail(
+            &manifest,
+            &manifest.services[0],
+            shell(),
+            true,
+            &operations,
+            1_800_001_800,
+        );
+        for expected in [
+            "Action needed",
+            "The last safe attempt stopped safely",
+            "Try setup again",
+            r#"data-operation-kind="create""#,
+            "Nothing from the previous attempt is active",
+            "fresh passkey-confirmed operation",
+        ] {
+            assert!(html.contains(expected), "missing {expected}");
+        }
+        assert!(!html.contains("View operation details"));
+        assert!(!html.contains("secret_value"));
     }
 
     #[test]
