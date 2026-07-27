@@ -91,6 +91,10 @@ fn human_routes() -> Router<AppState> {
             "/managed-service-setup-intents/{intent_ref}/cancel",
             post(cancel_managed_setup_intent),
         )
+        .route(
+            "/managed-service-operations/{operation_ref}/retry-verification",
+            post(retry_managed_service_verification),
+        )
         .route("/host-actions/system-update", post(request_system_update))
         .route(
             "/host-actions/{host}/update-restart/review",

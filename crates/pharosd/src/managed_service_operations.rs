@@ -235,6 +235,8 @@ pub(crate) struct ManagedOperationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removal: Option<ManagedRemovalSummary>,
     pub value_returned: bool,
+    #[serde(skip)]
+    pub verification_retryable: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -313,6 +315,7 @@ impl From<&ManagedOperationRecord> for ManagedOperationSummary {
                     accepted_at_unix_secs: removal.accepted_at_unix_secs,
                 }),
             value_returned: false,
+            verification_retryable: verification_retryable(record),
         }
     }
 }
@@ -510,6 +513,70 @@ impl ManagedServiceOperationStore {
             self.persist_or_restore(&mut document, previous)?;
         }
         summary.ok_or(ManagedOperationStoreError::NotFound)
+    }
+
+    pub(crate) fn retry_verification(
+        &self,
+        operation_ref: &str,
+        now: i64,
+    ) -> Result<ManagedOperationSummary, ManagedOperationStoreError> {
+        if !valid_ref("op_", operation_ref) || now <= 0 {
+            return Err(ManagedOperationStoreError::InvalidRequest);
+        }
+        let mut document = self.document.lock().expect("managed operation lock");
+        let previous = document.clone();
+        reconcile(&mut document, now);
+        let current = document
+            .operations
+            .get(operation_ref)
+            .cloned()
+            .ok_or(ManagedOperationStoreError::NotFound)?;
+        if matches!(
+            current.phase,
+            ManagedOperationPhase::VerifyPending | ManagedOperationPhase::Verifying
+        ) && current.reason_code == Some(ManagedOperationReason::EvidenceStale)
+        {
+            if *document != previous {
+                self.persist_or_restore(&mut document, previous)?;
+            }
+            return Ok(ManagedOperationSummary::from(&current));
+        }
+        if !verification_retryable(&current)
+            || document.operations.values().any(|candidate| {
+                candidate.host_ref == current.host_ref
+                    && candidate.service_ref == current.service_ref
+                    && candidate.slot_ref == current.slot_ref
+                    && (
+                        candidate.created_at_unix_secs,
+                        candidate.generation,
+                        candidate.operation_ref.as_str(),
+                    ) > (
+                        current.created_at_unix_secs,
+                        current.generation,
+                        current.operation_ref.as_str(),
+                    )
+            })
+        {
+            if *document != previous {
+                self.persist_or_restore(&mut document, previous)?;
+            }
+            return Err(ManagedOperationStoreError::Conflict);
+        }
+        let operation = document
+            .operations
+            .get_mut(operation_ref)
+            .expect("retry operation exists");
+        operation.phase = ManagedOperationPhase::VerifyPending;
+        operation.reason_code = Some(ManagedOperationReason::EvidenceStale);
+        operation.health = None;
+        operation.active_lease = None;
+        operation.uncertain_attempts = 0;
+        operation.last_result_sha256 = None;
+        operation.updated_at_unix_secs = now;
+        operation.deadline_unix_secs = now.saturating_add(OPERATION_TIMEOUT_SECONDS);
+        let summary = ManagedOperationSummary::from(&*operation);
+        self.persist_or_restore(&mut document, previous)?;
+        Ok(summary)
     }
 
     pub(crate) fn claim(
@@ -749,6 +816,28 @@ impl ManagedServiceOperationStore {
         }
         Ok(())
     }
+}
+
+fn verification_retryable(operation: &ManagedOperationRecord) -> bool {
+    matches!(
+        operation.operation_kind,
+        ManagedOperationKind::Create | ManagedOperationKind::Replace
+    ) && operation.phase == ManagedOperationPhase::Failed
+        && operation.delivery_completed_at_unix_secs.is_some()
+        && operation.reload_completed_at_unix_secs.is_some()
+        && operation.health.is_none()
+        && operation.rollback.is_none()
+        && operation.removal.is_none()
+        && operation.active_lease.is_none()
+        && matches!(
+            operation.reason_code,
+            Some(
+                ManagedOperationReason::VerificationFailed
+                    | ManagedOperationReason::ExecutorFailed
+                    | ManagedOperationReason::HeartbeatStale
+                    | ManagedOperationReason::OperationTimeout
+            )
+        )
 }
 
 fn apply_success(
@@ -1563,6 +1652,117 @@ mod tests {
                 .unwrap()
                 .phase,
             ManagedOperationPhase::Active
+        );
+    }
+
+    #[test]
+    fn failed_completed_delivery_can_retry_only_exact_generation_verification() {
+        let path = test_store_path("verification-retry");
+        let manifest = fixture();
+        let slot = &manifest.services[0].slots[0];
+        let operation_ref = "op_retry_verify01";
+        {
+            let store = ManagedServiceOperationStore::new(Some(path.clone())).unwrap();
+            store.register(&ready(operation_ref, 1), slot, NOW).unwrap();
+            for completed_at in [NOW + 2, NOW + 4] {
+                let lease = store
+                    .claim(&manifest.host_ref, completed_at - 1)
+                    .unwrap()
+                    .unwrap();
+                store
+                    .record_result(
+                        &result(
+                            &lease,
+                            ManagedOperationAgentOutcome::Succeeded,
+                            ManagedOperationReason::PhaseSucceeded,
+                        ),
+                        completed_at,
+                    )
+                    .unwrap();
+            }
+            let verify = store.claim(&manifest.host_ref, NOW + 5).unwrap().unwrap();
+            assert_eq!(verify.phase, ManagedOperationAgentPhase::Verify);
+            let failed = store
+                .record_result(
+                    &result(
+                        &verify,
+                        ManagedOperationAgentOutcome::Failed,
+                        ManagedOperationReason::VerificationFailed,
+                    ),
+                    NOW + 6,
+                )
+                .unwrap();
+            assert_eq!(failed.phase, ManagedOperationPhase::Failed);
+            assert!(failed.verification_retryable);
+            assert!(failed.health.is_none());
+            assert!(!failed.value_returned);
+        }
+
+        let store = ManagedServiceOperationStore::new(Some(path.clone())).unwrap();
+        let pending = store.retry_verification(operation_ref, NOW + 7).unwrap();
+        assert_eq!(pending.phase, ManagedOperationPhase::VerifyPending);
+        assert_eq!(
+            pending.reason_code,
+            Some(ManagedOperationReason::EvidenceStale)
+        );
+        assert!(!pending.verification_retryable);
+        assert!(pending.health.is_none());
+        assert!(!pending.value_returned);
+        assert_eq!(
+            store.retry_verification(operation_ref, NOW + 8).unwrap(),
+            pending
+        );
+
+        let verify = store.claim(&manifest.host_ref, NOW + 9).unwrap().unwrap();
+        assert_eq!(verify.operation_ref, operation_ref);
+        assert_eq!(verify.phase, ManagedOperationAgentPhase::Verify);
+        let mut verified = result(
+            &verify,
+            ManagedOperationAgentOutcome::Succeeded,
+            ManagedOperationReason::PhaseSucceeded,
+        );
+        verified.health_evidence = Some(ManagedHealthEvidenceV1 {
+            generation: 1,
+            materialized: true,
+            process_state: ManagedProcessState::Running,
+            probe_state: ManagedProbeState::Healthy,
+            heartbeat_observed_at_unix_secs: NOW + 9,
+            process_observed_at_unix_secs: NOW + 9,
+            probe_observed_at_unix_secs: NOW + 9,
+        });
+        let active = store.record_result(&verified, NOW + 10).unwrap();
+        assert_eq!(active.phase, ManagedOperationPhase::Active);
+        assert_eq!(active.health.as_ref().unwrap().generation, 1);
+        assert!(!active.verification_retryable);
+        assert_eq!(
+            store.retry_verification(operation_ref, NOW + 11),
+            Err(ManagedOperationStoreError::Conflict)
+        );
+        fs::remove_file(path).unwrap();
+
+        let incomplete = ManagedServiceOperationStore::new(None).unwrap();
+        incomplete
+            .register(&ready("op_retry_incomplete", 1), slot, NOW)
+            .unwrap();
+        let install = incomplete
+            .claim(&manifest.host_ref, NOW + 1)
+            .unwrap()
+            .unwrap();
+        let failed = incomplete
+            .record_result(
+                &result(
+                    &install,
+                    ManagedOperationAgentOutcome::Failed,
+                    ManagedOperationReason::DeliveryFailed,
+                ),
+                NOW + 2,
+            )
+            .unwrap();
+        assert_eq!(failed.phase, ManagedOperationPhase::Failed);
+        assert!(!failed.verification_retryable);
+        assert_eq!(
+            incomplete.retry_verification(&failed.operation_ref, NOW + 3),
+            Err(ManagedOperationStoreError::Conflict)
         );
     }
 

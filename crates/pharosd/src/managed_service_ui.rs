@@ -49,7 +49,39 @@ document.querySelectorAll('[data-managed-secret-action]').forEach(button=>button
           ?'Janus removal is unavailable right now. The encrypted generations remain recoverable; try again.'
         :replacing
           ?'Janus replacement is unavailable right now. The current secret is unchanged; try again.'
-          :'Janus setup is unavailable right now. Nothing changed; try again.';
+      :'Janus setup is unavailable right now. Nothing changed; try again.';
+  }
+}));
+document.querySelectorAll('[data-managed-verification-retry]').forEach(button=>button.addEventListener('click',async()=>{
+  if(button.disabled)return;
+  const status=button.closest('.managed-slot-card')?.querySelector('[data-managed-action-status]');
+  const original=button.textContent;
+  button.disabled=true;button.textContent='Requesting fresh check…';
+  if(status)status.textContent='Asking the declared host for fresh exact-generation health evidence…';
+  try{
+    const operationRef=button.dataset.operationRef||'';
+    const response=await fetch(`/managed-service-operations/${encodeURIComponent(operationRef)}/retry-verification`,{
+      method:'POST',
+      credentials:'same-origin',
+      headers:{'X-Pharos-Action':'1'}
+    });
+    const contentType=response.headers.get('content-type')||'';
+    if(!contentType.includes('application/json'))throw new Error('invalid_response');
+    const data=await response.json();
+    if(!response.ok
+      ||data.value_returned!==false
+      ||data.operation?.operation_ref!==operationRef
+      ||!['verify_pending','verifying','active'].includes(data.operation?.phase)
+    )throw new Error(data.reason_code||'verification_retry_unavailable');
+    if(status)status.textContent='Fresh verification requested. Waiting for the declared host…';
+    window.location.reload();
+  }catch(error){
+    button.disabled=false;button.textContent=original;
+    if(status)status.textContent=!navigator.onLine
+      ?'You are offline. Reconnect, then try again.'
+      :error.message==='managed_operation_declaration_drift'
+        ?'This declaration changed. Refresh the page before trying again.'
+        :'Fresh verification could not be requested. Nothing changed; try again.';
   }
 }));"#;
 
@@ -412,6 +444,18 @@ fn render_slot(
         )
     } else if state == ManagedSecretSlotState::ActionNeeded
         && setup_enabled
+        && operation.is_some_and(|operation| operation.verification_retryable)
+    {
+        format!(
+            r#"<button class="managed-primary" type="button" data-managed-verification-retry data-operation-ref="{operation_ref}">Recheck recovered service</button>"#,
+            operation_ref = html_escape(
+                &operation
+                    .expect("retryable verification has an operation")
+                    .operation_ref
+            ),
+        )
+    } else if state == ManagedSecretSlotState::ActionNeeded
+        && setup_enabled
         && operation.is_some_and(|operation| {
             operation.operation_kind
                 == pharos_core::managed_operations::ManagedOperationKind::Create
@@ -494,6 +538,11 @@ fn render_slot(
             "Active use has ended. Encrypted quarantine remains recoverable until the displayed recovery window closes."
         } else if state == ManagedSecretSlotState::RemovalFinalizing {
             "Active use remains stopped while exact encrypted cleanup is retried."
+        } else if setup_enabled
+            && state == ManagedSecretSlotState::ActionNeeded
+            && operation.is_some_and(|operation| operation.verification_retryable)
+        {
+            "The encrypted generation is already installed. Pharos will request fresh exact-generation health evidence; no secret is created or revealed."
         } else if setup_enabled
             && state == ManagedSecretSlotState::ActionNeeded
             && operation.is_some_and(|operation| {
@@ -637,8 +686,10 @@ fn managed_host_label(host_ref: &str) -> String {
 mod tests {
     use super::*;
     use pharos_core::managed_operations::{
-        ManagedOperationKind, ManagedOperationReadyV1, MANAGED_OPERATION_CONTRACT_VERSION,
-        MANAGED_OPERATION_READY_SCHEMA,
+        ManagedOperationAgentOutcome, ManagedOperationKind, ManagedOperationLeaseV1,
+        ManagedOperationReadyV1, ManagedOperationReason, ManagedOperationResultV1,
+        MANAGED_OPERATION_CONTRACT_VERSION, MANAGED_OPERATION_READY_SCHEMA,
+        MANAGED_OPERATION_RESULT_SCHEMA,
     };
 
     fn fixture() -> ManagedServiceManifestV1 {
@@ -652,6 +703,28 @@ mod tests {
         ShellContext {
             user_label: "markus",
             logout_enabled: true,
+        }
+    }
+
+    fn operation_result(
+        lease: &ManagedOperationLeaseV1,
+        outcome: ManagedOperationAgentOutcome,
+        reason_code: ManagedOperationReason,
+    ) -> ManagedOperationResultV1 {
+        ManagedOperationResultV1 {
+            schema: MANAGED_OPERATION_RESULT_SCHEMA.to_string(),
+            schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+            lease_ref: lease.lease_ref.clone(),
+            operation_ref: lease.operation_ref.clone(),
+            host_ref: lease.host_ref.clone(),
+            phase: lease.phase,
+            outcome,
+            reason_code,
+            generation: lease.generation,
+            health_evidence: None,
+            rollback_evidence: None,
+            removal_evidence: None,
+            value_returned: false,
         }
     }
 
@@ -855,6 +928,91 @@ mod tests {
         }
         assert!(!html.contains("View operation details"));
         assert!(!html.contains("secret_value"));
+    }
+
+    #[test]
+    fn completed_delivery_failure_offers_only_exact_generation_recheck() {
+        const NOW: i64 = 1_800_000_000;
+        let manifest = fixture();
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        let operation_ref = "op_retry_verify_ui";
+        operations
+            .register(
+                &ManagedOperationReadyV1 {
+                    schema: MANAGED_OPERATION_READY_SCHEMA.to_string(),
+                    schema_version: MANAGED_OPERATION_CONTRACT_VERSION,
+                    operation_ref: operation_ref.to_string(),
+                    operation_kind: ManagedOperationKind::Create,
+                    host_ref: manifest.host_ref.clone(),
+                    service_ref: manifest.services[0].service_ref.clone(),
+                    slot_ref: manifest.services[0].slots[0].slot_ref.clone(),
+                    declaration_fingerprint: manifest.declaration_fingerprint.clone(),
+                    generation: 1,
+                    purge_not_before_unix_secs: None,
+                    value_returned: false,
+                },
+                &manifest.services[0].slots[0],
+                NOW,
+            )
+            .unwrap();
+        for completed_at in [NOW + 2, NOW + 4] {
+            let lease = operations
+                .claim(&manifest.host_ref, completed_at - 1)
+                .unwrap()
+                .unwrap();
+            operations
+                .record_result(
+                    &operation_result(
+                        &lease,
+                        ManagedOperationAgentOutcome::Succeeded,
+                        ManagedOperationReason::PhaseSucceeded,
+                    ),
+                    completed_at,
+                )
+                .unwrap();
+        }
+        let verify = operations
+            .claim(&manifest.host_ref, NOW + 5)
+            .unwrap()
+            .unwrap();
+        operations
+            .record_result(
+                &operation_result(
+                    &verify,
+                    ManagedOperationAgentOutcome::Failed,
+                    ManagedOperationReason::VerificationFailed,
+                ),
+                NOW + 6,
+            )
+            .unwrap();
+
+        let html = render_service_detail(
+            &manifest,
+            &manifest.services[0],
+            shell(),
+            true,
+            &operations,
+            NOW + 7,
+        );
+        for expected in [
+            "Action needed",
+            "Recheck recovered service",
+            "data-managed-verification-retry",
+            operation_ref,
+            "already installed",
+            "fresh exact-generation health evidence",
+            "no secret is created or revealed",
+        ] {
+            assert!(html.contains(expected), "missing {expected}");
+        }
+        for forbidden in [
+            "Try setup again",
+            "data-managed-secret-action data-operation-kind",
+            "fresh passkey-confirmed operation",
+            "secret_value",
+        ] {
+            assert!(!html.contains(forbidden), "found {forbidden}");
+        }
     }
 
     #[test]

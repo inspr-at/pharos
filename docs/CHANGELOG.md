@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.64 - 2026-07-27
+
+- Let an authenticated operator request fresh exact-generation health evidence when delivery and reload completed but verification ended in a safe failure.
+- Reopen only the existing operation's verification phase: require the current declaration, reject newer work or incomplete delivery, and never create, rotate, transport, or reveal another secret.
+- Replace the misleading fresh-setup action with a focused “Recheck recovered service” path, preserving strict value-free responses, durable idempotency, and host-scoped verification leases.
+
 ## 0.1.63 - 2026-07-25
 
 - Let a safely failed or rolled-back first managed-secret setup start a fresh passkey-confirmed attempt instead of leaving the operator on a disabled dead-end control.
