@@ -2370,6 +2370,86 @@ async fn cancel_managed_setup_intent(
     }
 }
 
+async fn retry_managed_service_verification(
+    State(state): State<AppState>,
+    AxumPath(operation_ref): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !action_request_header(&headers) {
+        return managed_verification_retry_denial(
+            StatusCode::BAD_REQUEST,
+            "managed_verification_retry_invalid_request",
+        );
+    }
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.can_agora() {
+        return managed_verification_retry_denial(
+            StatusCode::FORBIDDEN,
+            "managed_verification_retry_forbidden",
+        );
+    }
+    if state
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.current_user(&headers))
+        .is_none()
+    {
+        return managed_verification_retry_denial(
+            StatusCode::UNAUTHORIZED,
+            "managed_verification_retry_authentication_required",
+        );
+    }
+    let now = now_unix();
+    let operation = match state.managed_service_operations.get(&operation_ref, now) {
+        Ok(operation) => operation,
+        Err(error) => return managed_operation_denial(error),
+    };
+    if state
+        .manifests
+        .managed_secret_slot_for_mutation(
+            &operation.host_ref,
+            &operation.service_ref,
+            &operation.slot_ref,
+            &operation.declaration_fingerprint,
+        )
+        .is_err()
+    {
+        return managed_operation_denial(ManagedOperationStoreError::DeclarationDrift);
+    }
+    match state
+        .managed_service_operations
+        .retry_verification(&operation_ref, now)
+    {
+        Ok(operation) => (
+            StatusCode::OK,
+            no_store_headers(),
+            Json(json!({
+                "schema": "inspr.pharos.managed-service-operation-status.v1",
+                "schema_version": 1,
+                "operation": operation,
+                "value_returned": false,
+            })),
+        )
+            .into_response(),
+        Err(error) => managed_operation_denial(error),
+    }
+}
+
+fn managed_verification_retry_denial(status: StatusCode, reason_code: &'static str) -> Response {
+    (
+        status,
+        no_store_headers(),
+        Json(json!({
+            "schema": "inspr.pharos.managed-service-operation-status.v1",
+            "schema_version": 1,
+            "outcome": "denied",
+            "reason_code": reason_code,
+            "value_returned": false,
+        })),
+    )
+        .into_response()
+}
+
 async fn retrieve_managed_setup_intent(
     State(state): State<AppState>,
     AxumPath(intent_ref): AxumPath<String>,
@@ -7112,6 +7192,34 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             payload["reason_code"],
             IntentReason::AuthenticationRequired.code()
         );
+
+        let response = retry_managed_service_verification(
+            State(state.clone()),
+            AxumPath("op_retry_verify01".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            payload["reason_code"],
+            "managed_verification_retry_invalid_request"
+        );
+        assert_eq!(payload["value_returned"], false);
+
+        let response = retry_managed_service_verification(
+            State(state.clone()),
+            AxumPath("op_retry_verify01".to_string()),
+            action_headers.clone(),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            payload["reason_code"],
+            "managed_verification_retry_authentication_required"
+        );
+        assert_eq!(payload["value_returned"], false);
 
         let response = cancel_managed_setup_intent(
             State(state),
