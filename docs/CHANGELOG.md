@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.65 - 2026-07-29
+
+- Reconcile an ambiguous Hetzner server deletion with bounded read-only inventory checks after exactly one destructive request, without automatically replaying the provider operation.
+- Recover a lost cleanup response from durable job state and refresh Fleet automatically once terminal removal is confirmed, including delayed identity retirement.
+
 ## 0.1.64 - 2026-07-27
 
 - Let an authenticated operator request fresh exact-generation health evidence when delivery and reload completed but verification ended in a safe failure.
