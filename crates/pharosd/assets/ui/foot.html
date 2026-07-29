@@ -2266,6 +2266,42 @@ async function createPaidProvisioningJob(overlay,start){
   renderProvisioningJob(overlay,payload.job);
   if(payload.job.id&&!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
 }
+const PROVIDER_CLEANUP_RECOVERY_DELAYS_MS=[250,750,1500,3000,6000,9000,10000];
+function providerCleanupRecorded(job){
+  return primaryProviderResource(job)?.state==='deleted';
+}
+function providerCleanupComplete(job){
+  return providerCleanupRecorded(job)&&
+    job?.state==='complete'&&
+    job?.terminal_outcome==='rolled-back';
+}
+function waitForProviderCleanupRecovery(delay){
+  return new Promise(resolve=>window.setTimeout(resolve,delay));
+}
+async function refreshFleetAfterProviderCleanup(overlay,job){
+  if(!providerCleanupComplete(job)||typeof refresh!=='function')return false;
+  const resource=primaryProviderResource(job);
+  const refreshKey=`${job.id||''}:${job.updated_at||''}:${resource?.provider_id||''}`;
+  if(overlay?.dataset.providerCleanupFleetRefresh===refreshKey)return false;
+  if(overlay)overlay.dataset.providerCleanupFleetRefresh=refreshKey;
+  return refresh('provider-cleanup',{force:true,recovery:true});
+}
+async function recoverTrackedProviderDeletion(overlay,jobId,status){
+  if(status)status.textContent='Confirming the provider result…';
+  for(const delay of PROVIDER_CLEANUP_RECOVERY_DELAYS_MS){
+    await waitForProviderCleanupRecovery(delay);
+    try{
+      const job=await fetchProvisioningJob(jobId);
+      renderProvisioningJob(overlay,job);
+      if(providerCleanupRecorded(job)){
+        if(!provisioningJobTerminal(job))scheduleProvisioningPoll(overlay,job.id);
+        await refreshFleetAfterProviderCleanup(overlay,job);
+        return true;
+      }
+    }catch(_error){}
+  }
+  return false;
+}
 async function deleteTrackedProviderServer(overlay,button){
   const job=overlay?.pharosProvisioningJob;
   if(!job?.id)throw new Error('The tracked setup job is not available.');
@@ -2275,16 +2311,32 @@ async function deleteTrackedProviderServer(overlay,button){
   button.disabled=true;
   button.setAttribute('aria-busy','true');
   if(status)status.textContent='Deleting the tracked server…';
-  const response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/cleanup`,{
-    method:'POST',
-    credentials:'same-origin',
-    headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
-    body:JSON.stringify({confirm:true}),
-    cache:'no-store'
-  });
+  let response;
+  try{
+    response=await fetch(`/setup/provisioning-jobs/${encodeURIComponent(job.id)}/cleanup`,{
+      method:'POST',
+      credentials:'same-origin',
+      headers:{'content-type':'application/json','accept':'application/json','X-Pharos-Action':'1'},
+      body:JSON.stringify({confirm:true}),
+      cache:'no-store'
+    });
+  }catch(_error){
+    if(await recoverTrackedProviderDeletion(overlay,job.id,status))return {state:'deleted',recovered:true};
+    throw new Error('Provider deletion is not confirmed. Pharos did not send a second delete request.');
+  }
   const payload=await response.json().catch(()=>({}));
   if(payload.job)renderProvisioningJob(overlay,payload.job);
-  if(!response.ok)throw new Error(payload.error||'Provider deletion could not be confirmed.');
+  if(!response.ok||!payload.job){
+    if(providerCleanupRecorded(payload.job)){
+      if(!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
+      await refreshFleetAfterProviderCleanup(overlay,payload.job);
+      return payload.cleanup||{state:'deleted',recovered:true};
+    }
+    if(await recoverTrackedProviderDeletion(overlay,job.id,status))return {state:'deleted',recovered:true};
+    throw new Error(payload.error||'Provider deletion is not confirmed. Pharos did not send a second delete request.');
+  }
+  if(!provisioningJobTerminal(payload.job))scheduleProvisioningPoll(overlay,payload.job.id);
+  await refreshFleetAfterProviderCleanup(overlay,payload.job);
   return payload.cleanup||{};
 }
 async function attestProvisioningHostKey(overlay,button){
@@ -2357,6 +2409,7 @@ function scheduleProvisioningPoll(overlay,id){
     try{
       const job=await fetchProvisioningJob(id);
       renderProvisioningJob(overlay,job);
+      await refreshFleetAfterProviderCleanup(overlay,job);
       if(!provisioningJobTerminal(job))scheduleProvisioningPoll(overlay,id);
     }catch(error){
       showAssistantError(overlay,error.message||'Setup status could not be refreshed.');

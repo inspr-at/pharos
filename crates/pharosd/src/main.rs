@@ -8170,9 +8170,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
         tokio::spawn(async move {
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let Ok(Ok((mut stream, _))) =
-                    timeout(Duration::from_millis(500), listener.accept()).await
+                    timeout(Duration::from_secs(2), listener.accept()).await
                 else {
                     break;
                 };
@@ -8206,6 +8206,76 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                     .write_all(response.as_bytes())
                     .await
                     .expect("write cleanup response");
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    async fn hcloud_cleanup_reconciliation_mock_server(
+        inventory_before_delete: String,
+        inventories_after_delete: Vec<String>,
+        delete_status: &'static str,
+        delete_body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<RecordedHcloudRequest>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        assert!(!inventories_after_delete.is_empty());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind cleanup reconciliation mock");
+        let addr = listener.local_addr().expect("cleanup mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            let mut delete_observed = false;
+            let mut post_delete_read = 0_usize;
+            for _ in 0..inventories_after_delete.len().saturating_add(2) {
+                let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_secs(2), listener.accept()).await
+                else {
+                    break;
+                };
+                let mut buf = vec![0; 8192];
+                let size = stream
+                    .read(&mut buf)
+                    .await
+                    .expect("read cleanup reconciliation request");
+                let request = String::from_utf8_lossy(&buf[..size]);
+                let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+                let mut request_line = head.lines().next().unwrap_or_default().split_whitespace();
+                let method = request_line.next().unwrap_or_default().to_string();
+                let path = request_line.next().unwrap_or_default().to_string();
+                recorded
+                    .lock()
+                    .expect("cleanup reconciliation request lock")
+                    .push(RecordedHcloudRequest {
+                        method: method.clone(),
+                        path: path.clone(),
+                        body: body.to_string(),
+                    });
+                let (status, response_body) = if method == "GET" && path.starts_with("/servers?") {
+                    if delete_observed {
+                        let index =
+                            post_delete_read.min(inventories_after_delete.len().saturating_sub(1));
+                        post_delete_read = post_delete_read.saturating_add(1);
+                        ("200 OK", inventories_after_delete[index].as_str())
+                    } else {
+                        ("200 OK", inventory_before_delete.as_str())
+                    }
+                } else if method == "DELETE" && path.starts_with("/servers/") {
+                    delete_observed = true;
+                    (delete_status, delete_body)
+                } else {
+                    ("404 Not Found", r#"{"error":"unexpected"}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write cleanup reconciliation response");
             }
         });
         (format!("http://{addr}"), requests)
@@ -8854,6 +8924,50 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn hetzner_cleanup_reconciles_absence_after_ambiguous_delete_response() {
+        let empty_inventory = r#"{"servers":[],"meta":{"pagination":{"page":1,"next_page":null,"last_page":1,"total_entries":0}}}"#.to_string();
+        let owned_inventory = owned_cleanup_inventory("4253");
+        let (api, requests) = hcloud_cleanup_reconciliation_mock_server(
+            owned_inventory.clone(),
+            vec![owned_inventory, empty_inventory],
+            "500 Internal Server Error",
+            r#"{"error":"result-lost"}"#,
+        )
+        .await;
+        let (state, token_path) = test_hcloud_state(api);
+        let job = tracked_hcloud_cleanup_job(&state, "4253");
+
+        let (deleted, already_absent) = execute_hetzner_cleanup_job(&state, job)
+            .await
+            .expect("read-only reconciliation proves ambiguous cleanup");
+
+        assert!(!already_absent);
+        assert_eq!(deleted.state, ProvisioningJobState::Complete);
+        assert_eq!(
+            deleted.terminal_outcome,
+            Some(ProvisioningTerminalOutcome::RolledBack)
+        );
+        assert_eq!(deleted.provider_resources[0].state, "deleted");
+        let recorded = requests.lock().expect("hcloud requests");
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GET", "DELETE", "GET", "GET"]
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|request| request.method == "DELETE")
+                .count(),
+            1
+        );
+        drop(recorded);
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
     async fn hetzner_cleanup_rejects_incomplete_inventory_as_absence_proof() {
         for inventory in [r#"{}"#, r#"{"servers":[]}"#] {
             let (api, requests) =
@@ -8932,7 +9046,15 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 .expect("safe recovery progress")
                 .message
                 .contains("deletion was not proven"));
-            assert_eq!(requests.lock().expect("hcloud requests").len(), 2);
+            let recorded = requests.lock().expect("hcloud requests");
+            assert_eq!(recorded.len(), 5);
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|request| request.method == "DELETE")
+                    .count(),
+                1
+            );
             let json = serde_json::to_string(&persisted).expect("job serializes");
             assert!(!json.contains("test-hcloud-token"));
             assert!(!json.to_ascii_lowercase().contains("bearer "));

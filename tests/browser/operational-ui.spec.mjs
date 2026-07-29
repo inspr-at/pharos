@@ -180,6 +180,109 @@ test("managed server progress follows the backend's kebab-case identity states",
   expect(serverSideRecoveryStillPolls).toBe(true);
 });
 
+test("provider cleanup recovers a lost response and refreshes fleet without replaying delete", async ({
+  page,
+}) => {
+  const activeJob = {
+    id: "setup-cleanup-recovery",
+    provider: "hetzner-cloud",
+    state: "cleanup-needed",
+    updated_at: 1,
+    host_name: "lab-01",
+    provider_resources: [
+      {
+        provider: "hetzner-cloud",
+        kind: "server",
+        provider_id: "4253",
+        name: "lab-01",
+        location: "fsn1",
+        state: "created",
+      },
+    ],
+    handoff: {
+      status: "provider-resource-created",
+      summary: "Managed installation stopped safely.",
+      next_steps: ["Review cleanup."],
+    },
+    managed_identity: {
+      credential_ref: "sec_00000000000000000000",
+      executor_owner: "csb1",
+      state: "retry-required",
+    },
+    progress: [],
+  };
+  const deletedJob = {
+    ...activeJob,
+    state: "complete",
+    updated_at: 2,
+    terminal_outcome: "rolled-back",
+    provider_resources: [
+      {
+        ...activeJob.provider_resources[0],
+        state: "deleted",
+      },
+    ],
+    handoff: {
+      status: "provider-resource-deleted",
+      summary: "The provider resource is deleted.",
+      next_steps: [],
+    },
+    managed_identity: null,
+  };
+  let cleanupRequests = 0;
+  let statusReads = 0;
+  await page.route("**/setup/provisioning-jobs/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "POST" && path.endsWith("/cleanup")) {
+      cleanupRequests += 1;
+      await route.fulfill({
+        status: 502,
+        contentType: "text/html",
+        body: "<p>upstream response lost</p>",
+      });
+      return;
+    }
+    if (request.method() === "GET" && path.endsWith("/setup-cleanup-recovery")) {
+      statusReads += 1;
+      await route.fulfill({ status: 200, json: { job: deletedJob } });
+      return;
+    }
+    await route.abort();
+  });
+
+  await page.goto("/");
+  const result = await page.evaluate(async (job) => {
+    const overlay = document.querySelector("[data-setup-assistant]");
+    overlay.hidden = false;
+    renderProvisioningJob(overlay, job);
+    overlay.querySelector("[data-created-delete-confirm]").checked = true;
+    const originalRefresh = refresh;
+    globalThis.__cleanupFleetRefresh = null;
+    refresh = async (reason, options) => {
+      globalThis.__cleanupFleetRefresh = { reason, options };
+      return true;
+    };
+    try {
+      return await deleteTrackedProviderServer(
+        overlay,
+        overlay.querySelector("[data-created-delete]"),
+      );
+    } finally {
+      refresh = originalRefresh;
+    }
+  }, activeJob);
+
+  expect(result).toEqual({ state: "deleted", recovered: true });
+  expect(cleanupRequests).toBe(1);
+  expect(statusReads).toBe(1);
+  await expect(page.locator("[data-created-ready-text]")).toHaveText("Removed");
+  expect(await page.evaluate(() => globalThis.__cleanupFleetRefresh)).toEqual({
+    reason: "provider-cleanup",
+    options: { force: true, recovery: true },
+  });
+});
+
 test("responsive layouts do not overflow and numbered guide circles stay centred", async ({
   page,
 }, testInfo) => {
