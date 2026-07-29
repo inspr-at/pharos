@@ -1,6 +1,6 @@
 # Pharos Changelog
 
-## Unreleased
+## 0.1.66 - 2026-07-29
 
 - Align the managed NixOS bootstrap lease with the reviewed executor's two-hour hard runtime so a legitimate long-running install does not become an ambiguous recovery solely because its one-hour lease elapsed.
 
