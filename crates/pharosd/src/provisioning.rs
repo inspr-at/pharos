@@ -3342,6 +3342,31 @@ pub(super) async fn delete_hetzner_server(
     ))
 }
 
+const HETZNER_CLEANUP_RECONCILE_DELAYS_MS: [u64; 3] = [0, 250, 750];
+const HETZNER_CLEANUP_RECONCILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) async fn reconcile_hetzner_server_absence(
+    provider_id: u64,
+    operation: &HetznerOperationContext,
+) -> bool {
+    for delay_ms in HETZNER_CLEANUP_RECONCILE_DELAYS_MS {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        if tokio::time::timeout(
+            HETZNER_CLEANUP_RECONCILE_REQUEST_TIMEOUT,
+            fetch_hetzner_servers(operation),
+        )
+        .await
+        .is_ok_and(|result| {
+            result.is_ok_and(|servers| servers.iter().all(|server| server.id != provider_id))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProvisioningCleanupError {
     UnsupportedJob,
@@ -6929,7 +6954,15 @@ pub(super) async fn execute_hetzner_cleanup_job(
     let provider_result = if provider_already_absent {
         Ok(HetznerDeleteResult::AlreadyAbsent)
     } else {
-        delete_hetzner_server(target.provider_id, &operation).await
+        match delete_hetzner_server(target.provider_id, &operation).await {
+            Ok(result) => Ok(result),
+            Err(_error)
+                if reconcile_hetzner_server_absence(target.provider_id, &operation).await =>
+            {
+                Ok(HetznerDeleteResult::Deleted)
+            }
+            Err(error) => Err(error),
+        }
     };
     let outcome = match provider_result {
         Ok(delete_result) => {
