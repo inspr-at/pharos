@@ -9292,6 +9292,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             lease.host_key_fingerprint.as_deref(),
             Some(fingerprint.as_str())
         );
+        assert_eq!(lease.lease_until - (created_at + 9), 2 * 60 * 60);
         assert_eq!(
             store.claim_managed_provisioning("csb1", created_at + 10),
             Ok(None)
@@ -9343,7 +9344,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("retry claim persists")
             .expect("retry bootstrap lease");
         assert_eq!(
-            store.claim_managed_provisioning("csb1", created_at + 10 + 60 * 60,),
+            store.claim_managed_provisioning("csb1", created_at + 10 + 2 * 60 * 60,),
             Ok(None)
         );
         let uncertain = store.get(&job.id).expect("uncertain job remains");
@@ -9468,7 +9469,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("reconciliation claim persists")
             .expect("reconciliation lease");
         assert_eq!(
-            store.claim_managed_provisioning("csb1", created_at + 10 + 60 * 60,),
+            store.claim_managed_provisioning("csb1", created_at + 10 + 2 * 60 * 60,),
             Ok(None)
         );
         let expired = store.get(&job.id).expect("expired reconciliation remains");
