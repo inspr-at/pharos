@@ -1022,7 +1022,12 @@ impl ProvisioningJobStore {
     }
 }
 
-const MANAGED_PROVISIONING_LEASE_SECS: i64 = 60 * 60;
+// The reviewed executor allows up to 110 minutes for nixos-anywhere and
+// reserves the remaining ten minutes for target verification plus durable
+// result delivery. Keep this lease aligned with the deployed executor's hard
+// systemd timeout; shortening it would turn a legitimate long install into an
+// ambiguous recovery state.
+const MANAGED_PROVISIONING_LEASE_SECS: i64 = 2 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProvisioningAgentStoreError {

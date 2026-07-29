@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## Unreleased
+
+- Align the managed NixOS bootstrap lease with the reviewed executor's two-hour hard runtime so a legitimate long-running install does not become an ambiguous recovery solely because its one-hour lease elapsed.
+
 ## 0.1.65 - 2026-07-29
 
 - Reconcile an ambiguous Hetzner server deletion with bounded read-only inventory checks after exactly one destructive request, without automatically replaying the provider operation.
