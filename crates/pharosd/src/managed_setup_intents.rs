@@ -23,7 +23,12 @@ pub(crate) const SIGNED_INTENT_SCHEMA: &str = "inspr.janus.signed-managed-servic
 pub(crate) const SETUP_INTENT_SCHEMA: &str = "inspr.janus.managed-service-setup-intent.v1";
 pub(crate) const DELIVERY_SCHEMA: &str = "inspr.pharos.managed-service-setup-intent-delivery.v1";
 pub(crate) const CONTRACT_VERSION: u16 = 1;
-pub(crate) const INTENT_TTL_SECS: i64 = 300;
+// Janus grants a passwordless step-up five minutes. The opaque outer intent
+// leaves ten more minutes for page review and redirect/password-manager delay;
+// Janus independently rejects any signed lifetime above this bound.
+pub(crate) const INTENT_TTL_SECS: i64 = 15 * 60;
+const JANUS_STEP_UP_TTL_SECS: i64 = 5 * 60;
+const _: () = assert!(INTENT_TTL_SECS > JANUS_STEP_UP_TTL_SECS);
 const STORE_SCHEMA: &str = "inspr.pharos.managed-service-setup-intent-store.v1";
 const SIGNING_KEY_SCHEMA: &str = "inspr.pharos.managed-service-setup-signing-key.v1";
 const SIGNATURE_DOMAIN: &[u8] = b"inspr.janus.signed-managed-service-setup-intent.v1";
@@ -710,12 +715,30 @@ mod tests {
         assert_eq!(intent.intent_ref, issued.intent_ref);
         assert_eq!(
             intent.expires_at_unix_secs - intent.issued_at_unix_secs,
-            300
+            INTENT_TTL_SECS
         );
         let encoded = serde_json::to_string(&envelope).unwrap();
         for forbidden in ["password", "ciphertext", "callback", "/run/", "permit"] {
             assert!(!encoded.contains(forbidden));
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn intent_outlives_one_step_up_but_expires_at_the_reviewed_boundary() {
+        let path = test_path();
+        let token = "w".repeat(32);
+        let config = ManagedSetupIntentConfig::for_test([13; 32], "key_window00001", &token);
+        let store = ManagedSetupIntentStore::new(path.clone(), config).unwrap();
+        let issued = store.issue(request(1_000)).unwrap();
+
+        store
+            .retrieve(&issued.intent_ref, &token, 1_000 + 5 * 60 + 1)
+            .expect("intent should survive the former five-minute boundary");
+        assert_eq!(
+            store.retrieve(&issued.intent_ref, &token, 1_000 + INTENT_TTL_SECS),
+            Err(IntentReason::Expired)
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -742,7 +765,7 @@ mod tests {
             Err(IntentReason::Cancelled)
         );
         assert_eq!(
-            store.retrieve(&issued.intent_ref, &token, 400),
+            store.retrieve(&issued.intent_ref, &token, 100 + INTENT_TTL_SECS),
             Err(IntentReason::Expired)
         );
         let _ = fs::remove_file(path);
