@@ -262,7 +262,11 @@ executor is enabled. They are not serialized into jobs, returned to the
 browser or written into the host store.
 
 The Janus provider-setup link carries value-free metadata only. Pharos is not a
-general secret manager.
+general secret manager. A signed setup intent lasts at most fifteen minutes so
+page review can precede one complete five-minute Janus passkey step-up. The
+browser still receives only an opaque reference; Janus independently caps the
+outer lifetime, keeps the passkey proof at five minutes, and consumes the exact
+intent once before reading any value bytes.
 
 ### 4. Automation is narrow and off by default
 
