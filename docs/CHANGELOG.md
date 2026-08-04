@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## Unreleased
+
+- Route per-backup Stale and Failed posture transitions through the durable alert incident/outbox pipeline, including preference suppression, stable deduplication, escalation, Telegram delivery, recovery, and in-place migration of existing host-down alert state.
+
 ## 0.1.68 - 2026-08-04
 
 - Polish Fleet host cards by moving settings into the actions menu, reducing backup posture to a color-aware ghost control, and compacting freshness, timestamps, availability, and heartbeat-window controls without changing list view.

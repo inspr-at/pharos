@@ -505,7 +505,7 @@ promised third-party API. The important boundaries are:
 | `PHAROS_BEACON_TOKEN_HASH_DIR` | Private Janus v2 token-generation root containing `current` and immutable generation files |
 | `PHAROS_MANIFEST_PATHS` | Read-only declared-host manifests |
 | `PHAROS_HOST_PREFERENCES_PATH` | Read-only declared preference registry |
-| `PHAROS_ALERT_WEBHOOK_URL` | Optional HTTP(S) or Telegram alert target; enables durable down, escalation and recovery delivery with redirects disabled |
+| `PHAROS_ALERT_WEBHOOK_URL` | Optional HTTP(S) or Telegram alert target; enables durable host-down and backup Stale/Failed incidents, escalation and recovery delivery with redirects disabled |
 | `PHAROS_ALERT_DB` | Optional explicit durable incident/outbox path; derived beside `PHAROS_DB` when unset and required when alert delivery is configured |
 | `PHAROS_ALERT_CHECK_SECS` | Durable alert sweep interval, minimum 5 seconds |
 | `PHAROS_ALERT_WEBHOOK_TIMEOUT_SECS` | Per-request alert delivery timeout, minimum 1 second |
@@ -530,7 +530,10 @@ outbox state has a durable path. Delivery is at least once: every event carries
 a stable `event_id` and HTTP `Idempotency-Key`, while failed attempts remain in
 the outbox with bounded exponential backoff and jitter. `/readyz` fails when the
 supervised worker stops or becomes stale; `pharos_alert_*` metrics expose worker
-health, restarts, the pending backlog, and delivery outcomes.
+health, restarts, the pending backlog, and delivery outcomes. Backup incidents
+are independent per host and observation ID, honor the applied Backup warnings
+preference, escalate after the same 15-minute and 60-minute windows as host
+incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
