@@ -212,6 +212,7 @@ fn machine_and_public_routes() -> Router<AppState> {
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
+        .route("/auth/recover", get(auth::recover))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/logged-out", get(auth::logged_out))
 }

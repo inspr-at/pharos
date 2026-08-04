@@ -21,6 +21,39 @@ test("fleet has no serious accessibility violations and serves hardened headers"
   expect(serious).toEqual([]);
 });
 
+test("sign-in recovery is accessible, no-store, and restarts with one safe action", async ({
+  page,
+}) => {
+  const response = await page.goto(
+    "/auth/recover?return_to=%2Fservices%3Fview%3Dmanaged",
+  );
+  expect(response?.status()).toBe(400);
+  expect(response?.headers()["cache-control"]).toContain("no-store");
+  expect(response?.headers()["content-security-policy"]).toContain(
+    "default-src 'self'",
+  );
+
+  const recovery = page.locator("[data-auth-recovery]");
+  await expect(recovery).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Start sign-in again" })).toBeVisible();
+  const actions = recovery.getByRole("link");
+  await expect(actions).toHaveCount(1);
+  await expect(actions).toHaveAttribute(
+    "href",
+    "/auth/login?return_to=%2Fservices%3Fview%3Dmanaged",
+  );
+
+  const results = await new AxeBuilder({ page }).analyze();
+  const serious = results.violations.filter(({ impact }) =>
+    ["serious", "critical"].includes(impact),
+  );
+  expect(serious).toEqual([]);
+
+  await actions.click();
+  await expect(page).toHaveURL(/\/services\?view=managed$/);
+  await expect(page.locator("main")).toBeVisible();
+});
+
 test("setup assistant traps focus, closes with Escape, and restores its trigger", async ({
   page,
 }) => {

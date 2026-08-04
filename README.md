@@ -203,7 +203,11 @@ secret manager or orchestrator rather than a committed environment file.
 The OIDC client is public and uses PKCE, so it has no client secret. Login state
 is browser-bound and expires after ten minutes; in-flight logins and sessions
 have hard count and creation-rate bounds. Session cookies use the `__Host-`
-prefix, and logout is a CSRF-protected POST.
+prefix, and logout is a CSRF-protected POST. Expired, replayed, restarted or
+superseded login flows fail closed into a no-store recovery page with one fresh
+sign-in action. Only validated local, non-authentication return paths survive a
+recovery; temporary provider transport failures remain distinct from OAuth
+rejection, malformed responses and token-verification failures.
 
 `PHAROS_ALLOWED_OPERATORS` grants full fleet access to explicit authorization
 identifiers. Prefer `operator-ref:<sha256>`, the value-free reference Pharos
