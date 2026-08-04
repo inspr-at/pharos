@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.71 - 2026-08-04
+
+- Complete logout with a POST-redirect-GET response so browsers reach the GET-only signed-out page without replaying the logout form, while preserving CSRF validation, session removal, and cookie expiry.
+
 ## 0.1.70 - 2026-08-04
 
 - Polish Fleet host-card lifecycle states with consistent “Change requested”, “Ready to apply”, “Restart required”, and quiet “Up to date” indicators.
