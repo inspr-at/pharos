@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.68 - 2026-08-04
+
+- Polish Fleet host cards by moving settings into the actions menu, reducing backup posture to a color-aware ghost control, and compacting freshness, timestamps, availability, and heartbeat-window controls without changing list view.
+- Add accessible hover, focus, and reduced-motion behavior for icon-backed flake.lock age and commits-behind facts while preserving their structure during live refreshes.
+
 ## 0.1.67 - 2026-07-30
 
 - Give the opaque, signed managed-service setup intent a bounded fifteen-minute outer window so page review and one complete five-minute Janus passkey step-up no longer share the same deadline; exact target/user binding, cancellation, expiry, and single-use consumption remain unchanged.
