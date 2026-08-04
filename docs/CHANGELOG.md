@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.70 - 2026-08-04
+
+- Polish Fleet host-card lifecycle states with consistent “Change requested”, “Ready to apply”, “Restart required”, and quiet “Up to date” indicators.
+- Align each lifecycle indicator to the combined width of the two fixed Nix freshness cells and their gap, remove duplicate freshness attention, and place the host actions menu before backup status.
+
 ## 0.1.69 - 2026-08-04
 
 - Route per-backup Stale and Failed posture transitions through the durable alert incident/outbox pipeline, including preference suppression, stable deduplication, escalation, Telegram delivery, recovery, and in-place migration of existing host-down alert state.
