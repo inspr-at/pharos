@@ -625,6 +625,7 @@ function setFreshRow(surface,kind,state){
   if(row.classList.contains('fresh-row-compact')){
     const label=row.querySelector('.fresh-row-label')?.textContent||kind;
     row.setAttribute('aria-label',label+': '+state.value);
+    row.title=label+': '+state.value;
   }
 }
 function updateFreshness(surface,f){
@@ -633,7 +634,7 @@ function updateFreshness(surface,f){
     setFreshRow(surface,'commits-behind',{value:'n/a',klass:'na'});
     return;
   }
-  const age=freshValue(f.flake_lock_age_days,'fresh');
+  const age=freshValue(f.flake_lock_age_days,'0d');
   const commits=freshValue(f.commits_behind,'0');
   if(age.klass==='warn')age.value=age.value+'d';
   setFreshRow(surface,'flake-lock-age',age);
@@ -643,7 +644,7 @@ function kernelNeedsRestart(kernel){
   return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
 }
 function kernelSearch(kernel){
-  return kernelNeedsRestart(kernel)?'restart needed kernel reboot required '+kernel.running_version+' '+kernel.expected_version:'';
+  return kernelNeedsRestart(kernel)?'restart required restart needed kernel reboot required '+kernel.running_version+' '+kernel.expected_version:'';
 }
 function updateKernel(surface,host){
   const slot=surface.querySelector('[data-kernel-slot]');
@@ -741,6 +742,18 @@ function setReason(surface,reason){
   const text=el.querySelector('span');
   if(text)text.textContent=reason.label;
 }
+function updateReasonVisibility(surface,reason,freshness,kernel){
+  const el=surface.querySelector('[data-reason]');
+  if(!el)return;
+  const restart=kernelNeedsRestart(kernel);
+  if(!surface.matches('.card')){
+    el.hidden=restart;
+    return;
+  }
+  const freshnessReason=freshnessAttention(freshness);
+  const duplicateFreshness=freshnessReason?.label===reason?.label;
+  el.hidden=restart||duplicateFreshness||reason?.label==='all clear';
+}
 function mutedInfo(preferences){
   const alerts=preferences?.alerts||{};
   const labels=[];
@@ -777,9 +790,10 @@ function updatePreferenceState(surface,host){
   if(validColor(pendingColor))surface.style.setProperty('--pending-color',pendingColor);
   else surface.style.removeProperty('--pending-color');
   const link=surface.querySelector('[data-settings-state]');
-  const label=state==='declared_not_applied'?'change waiting':state==='request_pending'?'change requested':'';
+  const lifecycleLabel=state==='declared_not_applied'?'Ready to apply':state==='request_pending'?'Change requested':'';
+  const label=lifecycleLabel||(surface.matches('.card')?'Up to date':'');
   const name=surface.dataset.host||'host';
-  const title=label?label+' for '+name:'Open host settings for '+name;
+  const title=lifecycleLabel?lifecycleLabel+' for '+name:'Open host settings for '+name;
   if(link){
     link.dataset.settingsState=state;
     link.title=title;
@@ -3158,6 +3172,7 @@ function applyFleetSnapshot(data){
       if(word)word.textContent=words[h.liveness]||h.liveness;
       setReason(card,attention);
       updateKernel(card,h);
+      updateReasonVisibility(card,attention,h.freshness,h.kernel);
       updateMuted(card,muted);
       updatePreferenceState(card,h);
       updateHostActionState(card,h,backup);
