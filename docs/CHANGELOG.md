@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## Unreleased
+
+- Route per-backup Stale and Failed posture transitions through the durable alert incident/outbox pipeline, including preference suppression, stable deduplication, escalation, Telegram delivery, recovery, and in-place migration of existing host-down alert state.
+
 ## 0.1.67 - 2026-07-30
 
 - Give the opaque, signed managed-service setup intent a bounded fifteen-minute outer window so page review and one complete five-minute Janus passkey step-up no longer share the same deadline; exact target/user binding, cancellation, expiry, and single-use consumption remain unchanged.

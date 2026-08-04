@@ -1,19 +1,22 @@
-//! Durable host-availability incidents and at-least-once alert outbox.
+//! Durable host-availability and backup-posture incidents with an at-least-once alert outbox.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use pharos_core::{liveness, Host, Liveness};
+use pharos_core::{liveness, BackupObservation, BackupPostureState, Host, Liveness};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::durable_file::{atomic_write_json, load_optional_json, DurableFileError};
 
-const STORE_SCHEMA: &str = "inspr.pharos.alert-state.v1";
-const STORE_VERSION: u16 = 1;
-const EVENT_SCHEMA: &str = "inspr.pharos.alert-event.v1";
+const STORE_SCHEMA: &str = "inspr.pharos.alert-state.v2";
+const PREVIOUS_STORE_SCHEMA: &str = "inspr.pharos.alert-state.v1";
+const STORE_VERSION: u16 = 2;
+const PREVIOUS_STORE_VERSION: u16 = 1;
+const EVENT_SCHEMA: &str = "inspr.pharos.alert-event.v2";
+const PREVIOUS_EVENT_SCHEMA: &str = "inspr.pharos.alert-event.v1";
 const FIRST_ESCALATION_SECS: i64 = 15 * 60;
 const SECOND_ESCALATION_SECS: i64 = 60 * 60;
 const HISTORY_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
@@ -159,6 +162,14 @@ pub(crate) enum AlertEventKind {
     DownEscalated,
     #[serde(rename = "host_recovered")]
     Recovered,
+    #[serde(rename = "backup_stale")]
+    BackupStale,
+    #[serde(rename = "backup_failed")]
+    BackupFailed,
+    #[serde(rename = "backup_escalated")]
+    BackupEscalated,
+    #[serde(rename = "backup_recovered")]
+    BackupRecovered,
 }
 
 impl AlertEventKind {
@@ -167,8 +178,20 @@ impl AlertEventKind {
             Self::Down => "host_down",
             Self::DownEscalated => "host_down_escalated",
             Self::Recovered => "host_recovered",
+            Self::BackupStale => "backup_stale",
+            Self::BackupFailed => "backup_failed",
+            Self::BackupEscalated => "backup_escalated",
+            Self::BackupRecovered => "backup_recovered",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum IncidentKind {
+    #[default]
+    HostDown,
+    Backup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,8 +217,16 @@ pub(crate) struct AlertEvent {
 #[serde(deny_unknown_fields)]
 struct Incident {
     incident_id: String,
+    #[serde(default)]
+    kind: IncidentKind,
     host: String,
     role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_state: Option<BackupPostureState>,
     last_seen: i64,
     heartbeat_interval_secs: u64,
     opened_at: i64,
@@ -240,10 +271,11 @@ pub(crate) struct AlertStore {
 
 impl AlertStore {
     pub(crate) fn new(path: Option<PathBuf>) -> Result<Self, AlertStoreError> {
-        let state = match path.as_deref() {
+        let mut state = match path.as_deref() {
             Some(path) => load_optional_json::<AlertState>(path)?.unwrap_or_default(),
             None => AlertState::default(),
         };
+        migrate_state(&mut state)?;
         validate_state(&state)?;
         Ok(Self {
             path,
@@ -397,38 +429,47 @@ impl AlertStore {
     }
 }
 
+fn migrate_state(state: &mut AlertState) -> Result<(), AlertStoreError> {
+    match (state.schema.as_str(), state.version) {
+        (STORE_SCHEMA, STORE_VERSION) => Ok(()),
+        (PREVIOUS_STORE_SCHEMA, PREVIOUS_STORE_VERSION) => {
+            state.schema = STORE_SCHEMA.to_string();
+            state.version = STORE_VERSION;
+            Ok(())
+        }
+        _ => Err(AlertStoreError::InvalidState("unsupported schema")),
+    }
+}
+
 fn reconcile(state: &mut AlertState, hosts: &[Host], now: i64) -> Result<(), AlertStoreError> {
     prune_history(state, now);
     let mut seen_hosts = BTreeSet::new();
+    let mut seen_backups = BTreeSet::new();
     for host in hosts {
         seen_hosts.insert(host.name.clone());
-        let active_id = state
-            .incidents
-            .values()
-            .find(|incident| incident.active && incident.host == host.name)
-            .map(|incident| incident.incident_id.clone());
-        let down = host.last_seen.is_some()
-            && liveness(host.last_seen, host.heartbeat_interval_secs, now) == Liveness::Down;
-        if down && !host.preferences.suppresses_down_alerts() {
-            let last_seen = host.last_seen.expect("down host has last_seen");
-            let incident_id = match active_id {
-                Some(incident_id) => incident_id,
-                None => open_incident(state, host, last_seen, now)?,
-            };
-            enqueue_escalations(state, &incident_id, now)?;
-        } else if let Some(incident_id) = active_id {
-            if down {
-                close_incident(state, &incident_id, now)?;
-            } else {
-                recover_incident(state, &incident_id, now)?;
+        reconcile_host_liveness(state, host, now)?;
+        for observation in &host.backup_observations {
+            if !seen_backups.insert((host.name.clone(), observation.id.clone())) {
+                return Err(AlertStoreError::InvalidState(
+                    "duplicate backup observation subject",
+                ));
             }
+            reconcile_backup(state, host, observation, now)?;
         }
     }
 
     let vanished = state
         .incidents
         .values()
-        .filter(|incident| incident.active && !seen_hosts.contains(&incident.host))
+        .filter(|incident| {
+            incident.active
+                && (!seen_hosts.contains(&incident.host)
+                    || incident.kind == IncidentKind::Backup
+                        && !seen_backups.contains(&(
+                            incident.host.clone(),
+                            incident.backup_id.clone().unwrap_or_default(),
+                        )))
+        })
         .map(|incident| incident.incident_id.clone())
         .collect::<Vec<_>>();
     for incident_id in vanished {
@@ -437,7 +478,100 @@ fn reconcile(state: &mut AlertState, hosts: &[Host], now: i64) -> Result<(), Ale
     Ok(())
 }
 
-fn open_incident(
+fn reconcile_host_liveness(
+    state: &mut AlertState,
+    host: &Host,
+    now: i64,
+) -> Result<(), AlertStoreError> {
+    let active_id = state
+        .incidents
+        .values()
+        .find(|incident| {
+            incident.active && incident.kind == IncidentKind::HostDown && incident.host == host.name
+        })
+        .map(|incident| incident.incident_id.clone());
+    let down = host.last_seen.is_some()
+        && liveness(host.last_seen, host.heartbeat_interval_secs, now) == Liveness::Down;
+    if down && !host.preferences.suppresses_down_alerts() {
+        let last_seen = host.last_seen.expect("down host has last_seen");
+        let incident_id = match active_id {
+            Some(incident_id) => incident_id,
+            None => open_host_incident(state, host, last_seen, now)?,
+        };
+        enqueue_escalations(state, &incident_id, now)?;
+    } else if let Some(incident_id) = active_id {
+        if down {
+            close_incident(state, &incident_id, now)?;
+        } else {
+            recover_incident(state, &incident_id, now)?;
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_backup(
+    state: &mut AlertState,
+    host: &Host,
+    observation: &BackupObservation,
+    now: i64,
+) -> Result<(), AlertStoreError> {
+    let active_id = state
+        .incidents
+        .values()
+        .find(|incident| {
+            incident.active
+                && incident.kind == IncidentKind::Backup
+                && incident.host == host.name
+                && incident.backup_id.as_deref() == Some(observation.id.as_str())
+        })
+        .map(|incident| incident.incident_id.clone());
+    let alerting = matches!(
+        observation.state,
+        BackupPostureState::Stale | BackupPostureState::Failed
+    );
+
+    if alerting && !host.preferences.alerts.suppress_backup {
+        let incident_id = match active_id {
+            Some(incident_id) => {
+                let was_failed = state.incidents.get(&incident_id).is_some_and(|incident| {
+                    incident.backup_state == Some(BackupPostureState::Failed)
+                });
+                if observation.state == BackupPostureState::Failed && !was_failed {
+                    record_backup_failure(state, &incident_id, now)?;
+                }
+                if let Some(incident) = state.incidents.get_mut(&incident_id) {
+                    incident.backup_label = Some(observation.label.clone());
+                }
+                incident_id
+            }
+            None => open_backup_incident(state, host, observation, now)?,
+        };
+        enqueue_escalations(state, &incident_id, now)?;
+    } else if let Some(incident_id) = active_id {
+        if observation.state == BackupPostureState::Healthy
+            && !host.preferences.alerts.suppress_backup
+        {
+            recover_incident(state, &incident_id, now)?;
+        } else if host.preferences.alerts.suppress_backup {
+            suppress_incident(state, &incident_id, now)?;
+        } else {
+            close_incident(state, &incident_id, now)?;
+        }
+    }
+    Ok(())
+}
+
+fn backup_anchor(host: &Host, observation: &BackupObservation, now: i64) -> i64 {
+    observation
+        .last_attempt_at
+        .or(observation.last_success_at)
+        .or(observation.last_check_at)
+        .or(host.last_seen)
+        .unwrap_or(now)
+        .min(now)
+}
+
+fn open_host_incident(
     state: &mut AlertState,
     host: &Host,
     last_seen: i64,
@@ -452,8 +586,12 @@ fn open_incident(
     );
     let incident = Incident {
         incident_id: incident_id.clone(),
+        kind: IncidentKind::HostDown,
         host: host.name.clone(),
         role: host.role.clone(),
+        backup_id: None,
+        backup_label: None,
+        backup_state: None,
         last_seen,
         heartbeat_interval_secs: host.heartbeat_interval_secs.unwrap_or(60),
         opened_at: now,
@@ -466,6 +604,73 @@ fn open_incident(
         .insert(incident_id.clone(), incident.clone());
     enqueue_event(state, &incident, AlertEventKind::Down, 0, now)?;
     Ok(incident_id)
+}
+
+fn open_backup_incident(
+    state: &mut AlertState,
+    host: &Host,
+    observation: &BackupObservation,
+    now: i64,
+) -> Result<String, AlertStoreError> {
+    if state.incidents.len() >= MAX_RECORDS || state.outbox.len() >= MAX_RECORDS {
+        return Err(AlertStoreError::InvalidState("record bound exceeded"));
+    }
+    let anchor = backup_anchor(host, observation, now);
+    let incident_id = stable_id(
+        "backup-incident",
+        &[
+            &host.name,
+            &observation.id,
+            &anchor.to_string(),
+            &now.to_string(),
+        ],
+    );
+    let incident = Incident {
+        incident_id: incident_id.clone(),
+        kind: IncidentKind::Backup,
+        host: host.name.clone(),
+        role: host.role.clone(),
+        backup_id: Some(observation.id.clone()),
+        backup_label: Some(observation.label.clone()),
+        backup_state: Some(observation.state),
+        last_seen: anchor,
+        heartbeat_interval_secs: host.heartbeat_interval_secs.unwrap_or(60),
+        opened_at: now,
+        highest_escalation: 0,
+        active: true,
+        recovered_at: None,
+    };
+    state
+        .incidents
+        .insert(incident_id.clone(), incident.clone());
+    let kind = if observation.state == BackupPostureState::Failed {
+        AlertEventKind::BackupFailed
+    } else {
+        AlertEventKind::BackupStale
+    };
+    enqueue_event(state, &incident, kind, 0, now)?;
+    Ok(incident_id)
+}
+
+fn record_backup_failure(
+    state: &mut AlertState,
+    incident_id: &str,
+    now: i64,
+) -> Result<(), AlertStoreError> {
+    let mut incident = state
+        .incidents
+        .get(incident_id)
+        .cloned()
+        .ok_or(AlertStoreError::NotFound)?;
+    incident.backup_state = Some(BackupPostureState::Failed);
+    enqueue_event(state, &incident, AlertEventKind::BackupFailed, 1, now)?;
+    let incident = state
+        .incidents
+        .get_mut(incident_id)
+        .ok_or(AlertStoreError::NotFound)?;
+    incident.backup_state = Some(BackupPostureState::Failed);
+    incident.highest_escalation = incident.highest_escalation.max(1);
+    Ok(())
 }
 
 fn enqueue_escalations(
@@ -486,8 +691,12 @@ fn enqueue_escalations(
     } else {
         0
     };
+    let event_kind = match incident.kind {
+        IncidentKind::HostDown => AlertEventKind::DownEscalated,
+        IncidentKind::Backup => AlertEventKind::BackupEscalated,
+    };
     for stage in (incident.highest_escalation + 1)..=target {
-        enqueue_event(state, &incident, AlertEventKind::DownEscalated, stage, now)?;
+        enqueue_event(state, &incident, event_kind, stage, now)?;
     }
     state
         .incidents
@@ -510,7 +719,11 @@ fn recover_incident(
     if !incident.active {
         return Ok(());
     }
-    enqueue_event(state, &incident, AlertEventKind::Recovered, 0, now)?;
+    let event_kind = match incident.kind {
+        IncidentKind::HostDown => AlertEventKind::Recovered,
+        IncidentKind::Backup => AlertEventKind::BackupRecovered,
+    };
+    enqueue_event(state, &incident, event_kind, 0, now)?;
     let incident = state
         .incidents
         .get_mut(incident_id)
@@ -534,6 +747,18 @@ fn close_incident(
     Ok(())
 }
 
+fn suppress_incident(
+    state: &mut AlertState,
+    incident_id: &str,
+    now: i64,
+) -> Result<(), AlertStoreError> {
+    close_incident(state, incident_id, now)?;
+    state.outbox.retain(|_, record| {
+        record.event.incident_id != incident_id || record.delivered_at.is_some()
+    });
+    Ok(())
+}
+
 fn enqueue_event(
     state: &mut AlertState,
     incident: &Incident,
@@ -552,6 +777,7 @@ fn enqueue_event(
         return Ok(());
     }
     let age_seconds = now.saturating_sub(incident.last_seen).max(0);
+    let backup_label = incident.backup_label.as_deref().unwrap_or("Backup");
     let (level, summary, next_action) = match kind {
         AlertEventKind::Down => (
             "critical",
@@ -576,6 +802,47 @@ fn enqueue_event(
             format!("{} is reporting to Pharos again.", incident.host),
             "Confirm the host is stable and close related incident work.".to_string(),
         ),
+        AlertEventKind::BackupStale => (
+            "warning",
+            format!(
+                "{}: {backup_label} backup evidence is stale by {}.",
+                incident.host,
+                crate::duration_label(age_seconds)
+            ),
+            "Confirm the backup schedule, runner, and latest successful snapshot.".to_string(),
+        ),
+        AlertEventKind::BackupFailed => (
+            "critical",
+            format!(
+                "{}: {backup_label} backup reported failure {} ago.",
+                incident.host,
+                crate::duration_label(age_seconds)
+            ),
+            "Inspect the backup job, fix the failure, then confirm the next successful run."
+                .to_string(),
+        ),
+        AlertEventKind::BackupEscalated => {
+            let failed = incident.backup_state == Some(BackupPostureState::Failed);
+            (
+                if failed || stage >= 2 {
+                    "critical"
+                } else {
+                    "warning"
+                },
+                format!(
+                    "{}: {backup_label} backup remains {} after {}.",
+                    incident.host,
+                    if failed { "failed" } else { "stale" },
+                    crate::duration_label(age_seconds)
+                ),
+                "Escalate to the backup owner and verify a fresh successful run.".to_string(),
+            )
+        }
+        AlertEventKind::BackupRecovered => (
+            "recovery",
+            format!("{}: {backup_label} backup is healthy again.", incident.host),
+            "Confirm the fresh backup evidence and close related incident work.".to_string(),
+        ),
     };
     let event = AlertEvent {
         schema: EVENT_SCHEMA.to_string(),
@@ -583,9 +850,11 @@ fn enqueue_event(
         incident_id: incident.incident_id.clone(),
         kind,
         sequence: match kind {
-            AlertEventKind::Down => 0,
-            AlertEventKind::DownEscalated => stage,
-            AlertEventKind::Recovered => 3,
+            AlertEventKind::Down | AlertEventKind::BackupStale => 0,
+            AlertEventKind::DownEscalated
+            | AlertEventKind::BackupFailed
+            | AlertEventKind::BackupEscalated => stage,
+            AlertEventKind::Recovered | AlertEventKind::BackupRecovered => 3,
         },
         level: level.to_string(),
         host: incident.host.clone(),
@@ -637,18 +906,47 @@ fn validate_state(state: &AlertState) -> Result<(), AlertStoreError> {
     if state.incidents.len() > MAX_RECORDS || state.outbox.len() > MAX_RECORDS {
         return Err(AlertStoreError::InvalidState("record bound exceeded"));
     }
-    let mut active_hosts = BTreeSet::new();
+    let mut active_subjects = BTreeSet::new();
     for (incident_id, incident) in &state.incidents {
-        let expected_incident_id = stable_id(
-            "incident",
-            &[
-                &incident.host,
-                &incident.last_seen.to_string(),
-                &incident.opened_at.to_string(),
-            ],
-        );
+        let expected_incident_id = match incident.kind {
+            IncidentKind::HostDown => stable_id(
+                "incident",
+                &[
+                    &incident.host,
+                    &incident.last_seen.to_string(),
+                    &incident.opened_at.to_string(),
+                ],
+            ),
+            IncidentKind::Backup => stable_id(
+                "backup-incident",
+                &[
+                    &incident.host,
+                    incident.backup_id.as_deref().unwrap_or_default(),
+                    &incident.last_seen.to_string(),
+                    &incident.opened_at.to_string(),
+                ],
+            ),
+        };
+        let valid_subject = match incident.kind {
+            IncidentKind::HostDown => {
+                incident.backup_id.is_none()
+                    && incident.backup_label.is_none()
+                    && incident.backup_state.is_none()
+            }
+            IncidentKind::Backup => {
+                incident.backup_id.as_deref().is_some_and(|id| {
+                    !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+                }) && incident.backup_label.as_deref().is_some_and(|label| {
+                    !label.is_empty() && label.len() <= 256 && !label.chars().any(char::is_control)
+                }) && matches!(
+                    incident.backup_state,
+                    Some(BackupPostureState::Stale | BackupPostureState::Failed)
+                )
+            }
+        };
         if incident_id != &incident.incident_id
             || incident_id != &expected_incident_id
+            || !valid_subject
             || incident.host.is_empty()
             || incident.host.len() > 253
             || incident.role.is_empty()
@@ -664,9 +962,12 @@ fn validate_state(state: &AlertState) -> Result<(), AlertStoreError> {
         {
             return Err(AlertStoreError::InvalidState("invalid incident"));
         }
-        if incident.active && !active_hosts.insert(&incident.host) {
+        let subject = incident.backup_id.clone().unwrap_or_default();
+        if incident.active
+            && !active_subjects.insert((incident.host.clone(), incident.kind, subject))
+        {
             return Err(AlertStoreError::InvalidState(
-                "multiple active incidents for host",
+                "multiple active incidents for subject",
             ));
         }
     }
@@ -680,8 +981,30 @@ fn validate_state(state: &AlertState) -> Result<(), AlertStoreError> {
                 record.event.sequence
             }
             AlertEventKind::Recovered if record.event.sequence == 3 => 0,
+            AlertEventKind::BackupStale if record.event.sequence == 0 => 0,
+            AlertEventKind::BackupFailed if matches!(record.event.sequence, 0 | 1) => {
+                record.event.sequence
+            }
+            AlertEventKind::BackupEscalated if matches!(record.event.sequence, 1 | 2) => {
+                record.event.sequence
+            }
+            AlertEventKind::BackupRecovered if record.event.sequence == 3 => 0,
             _ => return Err(AlertStoreError::InvalidState("invalid event sequence")),
         };
+        let kind_matches_incident = match record.event.kind {
+            AlertEventKind::Down | AlertEventKind::DownEscalated | AlertEventKind::Recovered => {
+                incident.kind == IncidentKind::HostDown
+            }
+            AlertEventKind::BackupStale
+            | AlertEventKind::BackupFailed
+            | AlertEventKind::BackupEscalated
+            | AlertEventKind::BackupRecovered => incident.kind == IncidentKind::Backup,
+        };
+        if !kind_matches_incident {
+            return Err(AlertStoreError::InvalidState(
+                "event kind does not match incident",
+            ));
+        }
         let expected_event_id = stable_id(
             "event",
             &[
@@ -690,18 +1013,35 @@ fn validate_state(state: &AlertState) -> Result<(), AlertStoreError> {
                 &stage.to_string(),
             ],
         );
-        let expected_level = match record.event.kind {
-            AlertEventKind::Down | AlertEventKind::DownEscalated => "critical",
-            AlertEventKind::Recovered => "recovery",
+        let valid_level = match record.event.kind {
+            AlertEventKind::Down | AlertEventKind::DownEscalated | AlertEventKind::BackupFailed => {
+                record.event.level == "critical"
+            }
+            AlertEventKind::Recovered | AlertEventKind::BackupRecovered => {
+                record.event.level == "recovery"
+            }
+            AlertEventKind::BackupStale => record.event.level == "warning",
+            AlertEventKind::BackupEscalated => {
+                matches!(record.event.level.as_str(), "warning" | "critical")
+            }
+        };
+        let valid_event_schema = match incident.kind {
+            IncidentKind::HostDown => {
+                matches!(
+                    record.event.schema.as_str(),
+                    EVENT_SCHEMA | PREVIOUS_EVENT_SCHEMA
+                )
+            }
+            IncidentKind::Backup => record.event.schema == EVENT_SCHEMA,
         };
         if event_id != &record.event.event_id
             || event_id != &expected_event_id
-            || record.event.schema != EVENT_SCHEMA
+            || !valid_event_schema
             || record.event.host != incident.host
             || record.event.role != incident.role
             || record.event.last_seen != incident.last_seen
             || record.event.heartbeat_interval_secs != incident.heartbeat_interval_secs
-            || record.event.level != expected_level
+            || !valid_level
             || record.event.occurred_at < incident.opened_at
             || record.event.age_seconds
                 != record
@@ -718,8 +1058,10 @@ fn validate_state(state: &AlertState) -> Result<(), AlertStoreError> {
             || record
                 .delivered_at
                 .is_some_and(|delivered_at| delivered_at < record.event.occurred_at)
-            || matches!(record.event.kind, AlertEventKind::Recovered)
-                && (incident.active || incident.recovered_at != Some(record.event.occurred_at))
+            || matches!(
+                record.event.kind,
+                AlertEventKind::Recovered | AlertEventKind::BackupRecovered
+            ) && (incident.active || incident.recovered_at != Some(record.event.occurred_at))
         {
             return Err(AlertStoreError::InvalidState("invalid outbox record"));
         }
@@ -761,7 +1103,10 @@ fn retry_delay_seconds(event_id: &str, attempts: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pharos_core::{HostPreferences, NixFreshness, HOST_REPORT_VERSION};
+    use pharos_core::{
+        BackupConfiguredState, BackupEngine, BackupRunState, HostPreferences, NixFreshness,
+        HOST_REPORT_VERSION,
+    };
 
     fn host(last_seen: i64) -> Host {
         Host {
@@ -781,6 +1126,34 @@ mod tests {
             backup_observations: vec![],
             preferences: HostPreferences::default(),
             requested_preferences: None,
+        }
+    }
+
+    fn backup(id: &str, state: BackupPostureState, anchor: i64) -> BackupObservation {
+        BackupObservation {
+            id: id.to_string(),
+            label: format!("Backup {id}"),
+            engine: BackupEngine::Restic,
+            state,
+            configured: BackupConfiguredState::Enabled,
+            summary: "sanitized backup posture".to_string(),
+            target_label: Some("off-box repository".to_string()),
+            repository_id: Some(format!("repository-{id}")),
+            schedule: Some("hourly".to_string()),
+            next_run_at: None,
+            last_attempt_at: Some(anchor),
+            last_attempt_state: Some(if state == BackupPostureState::Failed {
+                BackupRunState::Failed
+            } else {
+                BackupRunState::Succeeded
+            }),
+            last_success_at: Some(anchor),
+            snapshot_count: Some(3),
+            total_bytes: None,
+            latest_snapshot_bytes: None,
+            last_check_at: None,
+            last_check_state: None,
+            restore_validation: None,
         }
     }
 
@@ -832,6 +1205,183 @@ mod tests {
         assert_eq!(store.pending_count(), 4);
         store.reconcile_hosts(&[host(4_500)], 4_502).unwrap();
         assert_eq!(store.pending_count(), 4, "recovery is idempotent");
+    }
+
+    #[test]
+    fn backup_incident_escalates_transitions_to_failed_and_recovers_once() {
+        let store = AlertStore::new(None).unwrap();
+        let mut reporting = host(1_000);
+        reporting.backup_observations = vec![backup("restic-main", BackupPostureState::Stale, 100)];
+
+        store.reconcile_hosts(&[reporting.clone()], 1_000).unwrap();
+        assert_eq!(
+            store.pending_count(),
+            2,
+            "stale incident and first escalation are queued"
+        );
+        store.reconcile_hosts(&[reporting.clone()], 1_000).unwrap();
+        assert_eq!(store.pending_count(), 2, "stale events are idempotent");
+
+        reporting.last_seen = Some(4_000);
+        store.reconcile_hosts(&[reporting.clone()], 4_000).unwrap();
+        assert_eq!(store.pending_count(), 3, "second escalation is queued once");
+
+        reporting.backup_observations[0].state = BackupPostureState::Failed;
+        reporting.backup_observations[0].last_attempt_state = Some(BackupRunState::Failed);
+        reporting.last_seen = Some(4_001);
+        store.reconcile_hosts(&[reporting.clone()], 4_001).unwrap();
+        assert_eq!(store.pending_count(), 4, "failure raises severity once");
+        reporting.last_seen = Some(4_002);
+        store.reconcile_hosts(&[reporting.clone()], 4_002).unwrap();
+        assert_eq!(
+            store.pending_count(),
+            4,
+            "failure transition is deduplicated"
+        );
+
+        reporting.backup_observations[0].state = BackupPostureState::Healthy;
+        reporting.backup_observations[0].last_attempt_state = Some(BackupRunState::Succeeded);
+        reporting.last_seen = Some(4_003);
+        store.reconcile_hosts(&[reporting.clone()], 4_003).unwrap();
+        assert_eq!(store.pending_count(), 5, "healthy posture queues recovery");
+        reporting.last_seen = Some(4_004);
+        store.reconcile_hosts(&[reporting], 4_004).unwrap();
+        assert_eq!(store.pending_count(), 5, "recovery is idempotent");
+
+        let state = store.state.lock().unwrap();
+        let kinds = state
+            .outbox
+            .values()
+            .map(|record| record.event.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&AlertEventKind::BackupStale));
+        assert!(kinds.contains(&AlertEventKind::BackupFailed));
+        assert!(kinds.contains(&AlertEventKind::BackupRecovered));
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == AlertEventKind::BackupEscalated)
+                .count(),
+            2
+        );
+        let failed = state
+            .outbox
+            .values()
+            .find(|record| record.event.kind == AlertEventKind::BackupFailed)
+            .unwrap();
+        let telegram = crate::alerting::telegram_alert_text(&failed.event);
+        assert!(telegram.contains("Pharos critical alert"));
+        assert!(telegram.contains("Backup restic-main backup reported failure"));
+    }
+
+    #[test]
+    fn backup_preferences_suppress_delivery_and_close_active_incidents_silently() {
+        let store = AlertStore::new(None).unwrap();
+        let mut reporting = host(1_000);
+        reporting.backup_observations = vec![backup("restic-main", BackupPostureState::Stale, 995)];
+        reporting.preferences.alerts.suppress_backup = true;
+        store.reconcile_hosts(&[reporting.clone()], 1_000).unwrap();
+        assert_eq!(store.pending_count(), 0);
+
+        reporting.preferences.alerts.suppress_backup = false;
+        store.reconcile_hosts(&[reporting.clone()], 1_001).unwrap();
+        assert_eq!(store.pending_count(), 1);
+
+        reporting.preferences.alerts.suppress_backup = true;
+        store.reconcile_hosts(&[reporting.clone()], 1_002).unwrap();
+        assert_eq!(
+            store.pending_count(),
+            0,
+            "suppression drops pending delivery"
+        );
+        reporting.preferences.alerts.suppress_backup = false;
+        reporting.backup_observations[0].state = BackupPostureState::Healthy;
+        store.reconcile_hosts(&[reporting], 1_003).unwrap();
+        assert_eq!(
+            store.pending_count(),
+            0,
+            "suppression closes without a misleading recovery"
+        );
+    }
+
+    #[test]
+    fn host_down_and_multiple_backup_incidents_are_independent() {
+        let store = AlertStore::new(None).unwrap();
+        let mut reporting = host(100);
+        reporting.backup_observations = vec![
+            backup("restic-main", BackupPostureState::Stale, 990),
+            backup("restic-secondary", BackupPostureState::Failed, 995),
+        ];
+
+        store.reconcile_hosts(&[reporting], 1_000).unwrap();
+        let state = store.state.lock().unwrap();
+        assert_eq!(
+            state
+                .incidents
+                .values()
+                .filter(|incident| incident.active)
+                .count(),
+            3
+        );
+        assert_eq!(
+            state
+                .incidents
+                .values()
+                .filter(|incident| incident.kind == IncidentKind::Backup)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_backup_subjects_fail_the_alert_cycle_without_partial_incidents() {
+        let store = AlertStore::new(None).unwrap();
+        let mut reporting = host(1_000);
+        reporting.backup_observations = vec![
+            backup("restic-main", BackupPostureState::Stale, 995),
+            backup("restic-main", BackupPostureState::Failed, 996),
+        ];
+
+        assert!(matches!(
+            store.reconcile_hosts(&[reporting], 1_000),
+            Err(AlertStoreError::InvalidState(
+                "duplicate backup observation subject"
+            ))
+        ));
+        assert_eq!(store.pending_count(), 0);
+        assert!(store.state.lock().unwrap().incidents.is_empty());
+    }
+
+    #[test]
+    fn version_one_host_incidents_migrate_and_persist_as_version_two() {
+        let path = temp_path("v1-migration");
+        let store = AlertStore::new(Some(path.clone())).unwrap();
+        store.reconcile_hosts(&[host(100)], 1_000).unwrap();
+
+        let mut fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        fixture["schema"] = serde_json::json!(PREVIOUS_STORE_SCHEMA);
+        fixture["version"] = serde_json::json!(PREVIOUS_STORE_VERSION);
+        for incident in fixture["incidents"].as_object_mut().unwrap().values_mut() {
+            incident.as_object_mut().unwrap().remove("kind");
+        }
+        for record in fixture["outbox"].as_object_mut().unwrap().values_mut() {
+            record["event"]["schema"] = serde_json::json!(PREVIOUS_EVENT_SCHEMA);
+        }
+        std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+
+        let migrated = AlertStore::new(Some(path.clone())).unwrap();
+        migrated.reconcile_hosts(&[host(100)], 1_001).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["version"], STORE_VERSION);
+        assert_eq!(persisted["schema"], STORE_SCHEMA);
+        assert!(persisted["incidents"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|incident| incident["kind"] == "host_down"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
