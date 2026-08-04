@@ -4314,6 +4314,12 @@ mod tests {
         ));
         assert!(html.contains(r#"<button class="signal-window" type="button" data-signal-window"#));
         assert!(html.contains(r#"data-signal-window-key="10m""#));
+        assert!(
+            html.contains(r#"<div class="availability-head"><span class="signal availability""#)
+        );
+        assert!(html.contains(
+            r#"<button class="beat-window" type="button" data-signal-window data-history-window-label"#
+        ));
         assert!(html.contains(r#"data-beats="910,970""#));
         assert!(html.contains(r#"data-signal-beats="850,910,970""#));
         assert!(html.contains(r#"data-history-window="10m""#));
@@ -4327,9 +4333,13 @@ mod tests {
         assert!(html.contains(r#"--mark-x:58.7%""#));
         assert!(!html.contains(r#"--mark-x:64.0%""#));
         assert!(html.contains("Flake.lock age"));
-        assert!(html.contains(r#"<strong class="warn">1d</strong>"#));
+        assert!(html.contains(r#"data-fresh-kind="flake-lock-age" tabindex="0""#));
+        assert!(html.contains(r#"<strong class="warn" data-fresh-value>1d</strong>"#));
         assert!(html.contains("Commits behind"));
-        assert!(html.contains(r#"<strong class="warn">3</strong>"#));
+        assert!(html.contains(r#"data-fresh-kind="commits-behind" tabindex="0""#));
+        assert!(html.contains(r#"<strong class="warn" data-fresh-value>3</strong>"#));
+        assert!(html.contains(r#"data-seen data-seen-card>Seen 30s ago</span>"#));
+        assert!(html.contains(r#"data-card-asof data-card-asof-compact>00:16</span>"#));
         assert!(html.contains("beat-fill"));
         assert!(html.contains("beat-now"));
         assert!(html.contains("beat-current"));
@@ -4490,6 +4500,13 @@ mod tests {
         assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
         assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
         assert!(HEAD.contains(".header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1"));
+        assert!(HEAD.contains(
+            ".card .backup-chip:not(:hover):not(:focus-visible){border-color:transparent;background:transparent;box-shadow:none}"
+        ));
+        assert!(HEAD.contains(
+            ".card .fresh-row:hover .fresh-row-label,.card .fresh-row:focus-visible .fresh-row-label"
+        ));
+        assert!(HEAD.contains(".card .fresh-row-label,.card .fresh-row strong{transition:none}"));
     }
 
     #[test]
@@ -4522,6 +4539,10 @@ mod tests {
         );
         assert!(html.contains(r#"id="host-actions-hsb8-card" role="menu""#));
         assert!(html.contains(r#"id="host-actions-hsb8-row" role="menu""#));
+        assert_eq!(
+            html.matches(r#"data-host-action="host-settings""#).count(),
+            1
+        );
         assert_eq!(
             html.matches(
                 r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending""#
@@ -6595,9 +6616,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"data-settings-state="declared_not_applied""#));
         assert!(html.contains(r#"aria-label="change waiting for poseidon""#));
         assert!(html.contains(r#"style="--pending-color:#48b8a8""#));
-        assert!(html.contains(
-            r#"<a class="header-chip settings-card" data-settings-state="declared_not_applied""#
-        ));
+        assert_eq!(
+            html.matches(
+                r#"<a class="header-chip settings-card" data-settings-state="declared_not_applied""#
+            )
+            .count(),
+            1
+        );
+        assert!(html.contains(r#"data-host-action="host-settings" href="/agora?host=poseidon""#));
         assert!(html.contains(
             r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
         ));
@@ -6611,7 +6637,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!html.contains(r#"class="settings-wait-icon""#));
         assert!(!html.contains(r#"--host-color:#48b8a8""#));
         assert!(html.contains(r#"<div class="card-actions"><button class="drag-handle" type="button" data-drag-handle title="Move poseidon" aria-label="Move poseidon""#));
-        assert!(html.contains(r#"<div class="card-tools"><span class="signal" data-signal"#));
+        assert!(html.contains(
+            r#"<div class="availability-head"><span class="signal availability" data-signal"#
+        ));
+        assert!(!html.contains(r#"<div class="card-tools"><span class="signal" data-signal"#));
         assert!(!html.contains("Color and access"));
 
         host.preferences.accent = Some("#48b8a8".to_string());

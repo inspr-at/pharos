@@ -608,19 +608,36 @@ function historyInfo(beats,index,interval){
   if(gap<=interval*5)return {level:'stale',label:'stale gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
   return {level:'down',label:'offline gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
 }
-function freshRow(label,value,klass){return '<div class="fresh-row"><span>'+esc(label)+'</span><strong class="'+klass+'">'+esc(value)+'</strong></div>'}
 function freshValue(v,zero){
   const n=Number(v);
   if(v==null||!Number.isFinite(n))return {value:'unknown',klass:'na'};
   if(n===0)return {value:zero,klass:'ok'};
   return {value:String(n),klass:'warn'};
 }
-function freshHtml(f){
-  if(!f||f.applicable===false)return freshRow('Flake.lock age','n/a','na')+freshRow('Commits behind','n/a','na');
+function setFreshRow(surface,kind,state){
+  const row=surface.querySelector('[data-fresh-kind="'+kind+'"]');
+  if(!row)return;
+  const value=row.querySelector('[data-fresh-value]');
+  if(value){
+    value.className=state.klass;
+    value.textContent=state.value;
+  }
+  if(row.classList.contains('fresh-row-compact')){
+    const label=row.querySelector('.fresh-row-label')?.textContent||kind;
+    row.setAttribute('aria-label',label+': '+state.value);
+  }
+}
+function updateFreshness(surface,f){
+  if(!f||f.applicable===false){
+    setFreshRow(surface,'flake-lock-age',{value:'n/a',klass:'na'});
+    setFreshRow(surface,'commits-behind',{value:'n/a',klass:'na'});
+    return;
+  }
   const age=freshValue(f.flake_lock_age_days,'fresh');
   const commits=freshValue(f.commits_behind,'0');
   if(age.klass==='warn')age.value=age.value+'d';
-  return freshRow('Flake.lock age',age.value,age.klass)+freshRow('Commits behind',commits.value,commits.klass);
+  setFreshRow(surface,'flake-lock-age',age);
+  setFreshRow(surface,'commits-behind',commits);
 }
 function kernelNeedsRestart(kernel){
   return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';
@@ -962,15 +979,26 @@ function setSeen(card,last,now){
   const seen=card.querySelector('[data-seen]');
   if(!seen)return;
   const compact=seen.hasAttribute('data-seen-compact');
-  const text=last==null?(compact?'never':'never seen'):(compact?dur(now-last)+' ago':'last seen '+dur(now-last)+' ago');
+  const cardLabel=seen.hasAttribute('data-seen-card');
+  const text=last==null?(compact?'never':(cardLabel?'Never seen':'never seen')):(compact?dur(now-last)+' ago':(cardLabel?'Seen ':'last seen ')+dur(now-last)+' ago');
   seen.dataset.defaultText=text;
   if(card.dataset.historyHint!=='true')seen.textContent=text;
 }
 function setCardAsOf(card,now){
   const asof=card.querySelector('[data-card-asof]');
   if(!asof)return;
-  const text='as of '+clock(now);
+  const snapshot='Snapshot as of '+clock(now);
+  const text=asof.hasAttribute('data-card-asof-compact')?clock(now).slice(0,5):'as of '+clock(now);
   asof.dataset.defaultText=text;
+  if(asof.hasAttribute('data-card-asof-compact')){
+    asof.title=snapshot;
+    const meta=asof.closest('.card-meta');
+    if(meta){
+      meta.title=snapshot;
+      const seen=meta.querySelector('[data-seen]');
+      meta.setAttribute('aria-label',(seen?.dataset.defaultText||seen?.textContent||'Last seen')+'; '+snapshot.toLowerCase());
+    }
+  }
   if(card.dataset.historyHint!=='true')asof.textContent=text;
 }
 function sevFor(live){return live==='down'?0:live==='stale'?1:live==='awaiting_first_heartbeat'?2:3}
@@ -3133,8 +3161,7 @@ function applyFleetSnapshot(data){
       updateMuted(card,muted);
       updatePreferenceState(card,h);
       updateHostActionState(card,h,backup);
-      const fresh=card.querySelector('[data-fresh]');
-      if(fresh)fresh.innerHTML=freshHtml(h.freshness);
+      updateFreshness(card,h.freshness);
       updateBackup(card,backup);
       setSeen(card,h.last_seen,now);
       setCardAsOf(card,now);
