@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.72 - 2026-08-04
+
+- Replace dead-end OIDC callback failures with a branded, accessible one-action recovery flow that clears obsolete browser state and preserves only validated local return destinations.
+- Handle expired, replayed, wrong-browser, concurrent-tab, and post-restart login state deterministically without redirect loops or replaying non-idempotent requests.
+- Classify token exchange failures into value-free transport, provider, malformed-response, and verification categories with appropriate `503`, `502`, and `401` responses.
+
 ## 0.1.71 - 2026-08-04
 
 - Complete logout with a POST-redirect-GET response so browsers reach the GET-only signed-out page without replaying the logout form, while preserving CSRF validation, session removal, and cookie expiry.
