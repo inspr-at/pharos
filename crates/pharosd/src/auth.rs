@@ -1196,7 +1196,7 @@ pub async fn logout(
             .parse()
             .expect("logout CSRF clearing header"),
     );
-    (out, Redirect::temporary("/auth/logged-out")).into_response()
+    (out, Redirect::to("/auth/logged-out")).into_response()
 }
 
 /// `GET /auth/logged-out` — neutral landing page after local Pharos logout.
@@ -1418,6 +1418,60 @@ mod tests {
         assert_eq!(user.display_name, "oidc-e2e-user");
         assert_eq!(user.operator_ref.len(), 64);
 
+        let logout_csrf_cookie = response_cookie(&callback_response, LOGOUT_CSRF_COOKIE).unwrap();
+        let logout_csrf = logout_csrf_cookie
+            .split_once('=')
+            .map(|(_, value)| value)
+            .unwrap();
+        let mut logout_headers = HeaderMap::new();
+        logout_headers.insert(
+            header::COOKIE,
+            format!("{session_cookie}; {logout_csrf_cookie}")
+                .parse()
+                .unwrap(),
+        );
+        let rejected_logout = logout(
+            State(auth_state.clone()),
+            logout_headers.clone(),
+            Form(LogoutForm {
+                csrf: "wrong".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(rejected_logout.status(), StatusCode::FORBIDDEN);
+        assert!(auth_state
+            .as_ref()
+            .unwrap()
+            .current_user(&session_headers)
+            .is_some());
+
+        let logout_response = logout(
+            State(auth_state.clone()),
+            logout_headers,
+            Form(LogoutForm {
+                csrf: logout_csrf.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(logout_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            logout_response.headers().get(header::LOCATION).unwrap(),
+            "/auth/logged-out"
+        );
+        assert_eq!(
+            logout_response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .count(),
+            2
+        );
+        assert!(auth_state
+            .as_ref()
+            .unwrap()
+            .current_user(&session_headers)
+            .is_none());
+
         server.abort();
         let _ = server.await;
     }
@@ -1507,6 +1561,16 @@ mod tests {
 
     #[tokio::test]
     async fn logout_requires_matching_double_submit_csrf_value() {
+        let missing = logout(
+            State(None),
+            HeaderMap::new(),
+            Form(LogoutForm {
+                csrf: "csrf-fixture".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
@@ -1532,9 +1596,48 @@ mod tests {
             }),
         )
         .await;
-        assert!(accepted.status().is_redirection());
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            accepted.headers().get(header::LOCATION).unwrap(),
+            "/auth/logged-out"
+        );
         let cleared = accepted.headers().get_all(header::SET_COOKIE);
         assert_eq!(cleared.iter().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn logout_form_redirects_to_the_get_only_landing_page() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/auth/logout", post(logout))
+            .route("/auth/logged-out", get(logged_out))
+            .with_state(None::<Arc<Auth>>);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/auth/logout"))
+            .header(
+                reqwest::header::COOKIE,
+                format!("{LOGOUT_CSRF_COOKIE}=csrf-fixture"),
+            )
+            .form(&[("csrf", "csrf-fixture")])
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.url().path(), "/auth/logged-out");
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("<h1>Logged out</h1>"));
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
