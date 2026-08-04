@@ -548,13 +548,27 @@ pub(super) fn url_query_escape(s: &str) -> String {
     encoded
 }
 
-pub(super) fn freshness_row(label: &str, value: &str, class: &str) -> String {
-    format!(
-        r#"<div class="fresh-row"><span>{}</span><strong class="{}">{}</strong></div>"#,
-        html_escape(label),
-        html_escape(class),
-        html_escape(value)
-    )
+pub(super) fn freshness_row(
+    kind: &str,
+    label: &str,
+    value: &str,
+    class: &str,
+    icon: &str,
+    compact: bool,
+) -> String {
+    let label = html_escape(label);
+    let value = html_escape(value);
+    let class = html_escape(class);
+    let kind = html_escape(kind);
+    if compact {
+        format!(
+            r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="{kind}" tabindex="0" aria-label="{label}: {value}"><span class="fresh-row-icon" aria-hidden="true">{icon}</span><span class="fresh-row-label">{label}</span><strong class="{class}" data-fresh-value>{value}</strong></div>"#,
+        )
+    } else {
+        format!(
+            r#"<div class="fresh-row" data-fresh-kind="{kind}"><span class="fresh-row-label">{label}</span><strong class="{class}" data-fresh-value>{value}</strong></div>"#,
+        )
+    }
 }
 
 pub(super) fn freshness_value(value: Option<u32>, zero_label: &str) -> (String, &'static str) {
@@ -565,12 +579,26 @@ pub(super) fn freshness_value(value: Option<u32>, zero_label: &str) -> (String, 
     }
 }
 
-pub(super) fn freshness_markup(freshness: &NixFreshness) -> String {
+pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> String {
     if !freshness.applicable {
         return format!(
             "{}{}",
-            freshness_row("Flake.lock age", "n/a", "na"),
-            freshness_row("Commits behind", "n/a", "na")
+            freshness_row(
+                "flake-lock-age",
+                "Flake.lock age",
+                "n/a",
+                "na",
+                icons::PACKAGE_CALENDAR,
+                compact,
+            ),
+            freshness_row(
+                "commits-behind",
+                "Commits behind",
+                "n/a",
+                "na",
+                icons::GIT_COMMIT_HORIZONTAL,
+                compact,
+            )
         );
     }
 
@@ -581,8 +609,22 @@ pub(super) fn freshness_markup(freshness: &NixFreshness) -> String {
     let (commits, commits_class) = freshness_value(freshness.commits_behind, "0");
     format!(
         "{}{}",
-        freshness_row("Flake.lock age", &age, age_class),
-        freshness_row("Commits behind", &commits, commits_class)
+        freshness_row(
+            "flake-lock-age",
+            "Flake.lock age",
+            &age,
+            age_class,
+            icons::PACKAGE_CALENDAR,
+            compact,
+        ),
+        freshness_row(
+            "commits-behind",
+            "Commits behind",
+            &commits,
+            commits_class,
+            icons::GIT_COMMIT_HORIZONTAL,
+            compact,
+        )
     )
 }
 
@@ -1040,6 +1082,14 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
     let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
     let title = html_escape(&format!("Actions for {}", host.name));
     let settings_href = html_escape(context.settings_href);
+    let settings_menu_item = if context.surface == "card" {
+        format!(
+            r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="host-settings" href="{settings_href}">{icon}<span><strong>Host settings</strong><span>Color, alerts, and host type</span></span></a>"#,
+            icon = icons::SLIDERS,
+        )
+    } else {
+        String::new()
+    };
     let review_hidden = if context.settings_state == HostPreferencesState::Applied {
         " hidden"
     } else {
@@ -1070,12 +1120,15 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
     } else {
         " hidden"
     };
-    let primary_separator_hidden =
-        if review_hidden.is_empty() || update_hidden.is_empty() || restart_hidden.is_empty() {
-            ""
-        } else {
-            " hidden"
-        };
+    let primary_separator_hidden = if !settings_menu_item.is_empty()
+        || review_hidden.is_empty()
+        || update_hidden.is_empty()
+        || restart_hidden.is_empty()
+    {
+        ""
+    } else {
+        " hidden"
+    };
     let dot_hidden = if context.settings_state != HostPreferencesState::Applied || reboot.is_some()
     {
         ""
@@ -1104,7 +1157,7 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
         .unwrap_or("not reported");
 
     format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-settings-href="{settings_href}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong><a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending" href="{settings_href}"{review_hidden}>{clock}<span><strong>Review pending change</strong><span>See what is waiting for this host</span></span></a><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-settings-href="{settings_href}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending" href="{settings_href}"{review_hidden}>{clock}<span><strong>Review pending change</strong><span>See what is waiting for this host</span></span></a><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
         is_nix = host.is_nix,
         declared = context.declared,
         janus_ready = janus_ready,
@@ -3022,6 +3075,16 @@ pub(super) fn signal_markup(signal: &HeartbeatSignal) -> String {
     let title = html_escape(&signal.title);
     format!(
         r#"<span class="signal" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-orb" aria-hidden="true"></span><button class="signal-window" type="button" data-signal-window title="{title}">{window}</button></span>"#,
+        level = html_escape(signal.level),
+        text = html_escape(&signal.text),
+        window = html_escape(signal.window),
+    )
+}
+
+pub(super) fn availability_markup(signal: &HeartbeatSignal) -> String {
+    let title = html_escape(&signal.title);
+    format!(
+        r#"<span class="signal availability" data-signal data-signal-level="{level}" data-signal-window-key="{window}" title="{title}" aria-label="{title}"><span data-signal-percent>{text}</span><span class="signal-label">availability</span></span>"#,
         level = html_escape(signal.level),
         text = html_escape(&signal.text),
         window = html_escape(signal.window),
@@ -5500,6 +5563,7 @@ pub(super) fn heartbeat_card(
     interval_secs: Option<u64>,
     now: i64,
     is_self: bool,
+    window_control: bool,
 ) -> String {
     let interval = i64::try_from(interval_secs.unwrap_or(60))
         .unwrap_or(60)
@@ -5576,10 +5640,17 @@ pub(super) fn heartbeat_card(
             ),
         };
     let self_attr = if is_self { r#" data-self="true""# } else { "" };
+    let history_window_label = html_escape(SIGNAL_DEFAULT_WINDOW_LABEL);
+    let history_window_control = if window_control {
+        format!(
+            r#"<button class="beat-window" type="button" data-signal-window data-history-window-label title="Change availability window" aria-label="Change availability window; currently {history_window_label}">{history_window_label}</button>"#,
+        )
+    } else {
+        format!(r#"<span data-history-window-label>{history_window_label}</span>"#)
+    };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window}" style="--now-x:{now_x:.2}%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones"><span data-history-window-label>{history_window}</span><span>expected</span><span>late</span></span></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--now-x:{now_x:.2}%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones">{history_window_control}<span>expected</span><span>late</span></span></div></div>"#,
         count = visible_beats.len(),
-        history_window = html_escape(SIGNAL_DEFAULT_WINDOW_LABEL)
     )
 }
 
@@ -5661,7 +5732,8 @@ pub(super) fn render_home_with_capabilities(
         let name = html_escape(&h.name);
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
-        let fresh = freshness_markup(&h.freshness);
+        let card_fresh = freshness_markup(&h.freshness, true);
+        let list_fresh = freshness_markup(&h.freshness, false);
         let attention = attention_reason(
             live,
             &h.freshness,
@@ -5716,14 +5788,16 @@ pub(super) fn render_home_with_capabilities(
         let sort_name = html_escape(&h.name.to_lowercase());
         let last_sort = h.last_seen.unwrap_or(0);
         let sev = attention.rank;
-        let seen = match h.last_seen {
-            Some(t) => format!("last seen {} ago", duration_label(now - t)),
-            None => "never seen".to_string(),
+        let seen_card = match h.last_seen {
+            Some(t) => format!("Seen {} ago", duration_label(now - t)),
+            None => "Never seen".to_string(),
         };
         let seen_compact = match h.last_seen {
             Some(t) => format!("{} ago", duration_label(now - t)),
             None => "never".to_string(),
         };
+        let as_of = clock_label(now);
+        let as_of_short = as_of.get(..5).unwrap_or(&as_of);
         let light_cls = if is_self { " light" } else { "" };
         let self_attr = if is_self { r#" data-self="true""# } else { "" };
         let beam = if is_self {
@@ -5844,34 +5918,43 @@ pub(super) fn render_home_with_capabilities(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
         );
-        let heartbeat = heartbeat_card(
+        let card_heartbeat = heartbeat_card(
             h.last_seen,
             &h.heartbeat_log,
             h.heartbeat_interval_secs,
             now,
             is_self,
+            true,
+        );
+        let list_heartbeat = heartbeat_card(
+            h.last_seen,
+            &h.heartbeat_log,
+            h.heartbeat_interval_secs,
+            now,
+            is_self,
+            false,
         );
         let interval = i64::try_from(h.heartbeat_interval_secs.unwrap_or(60))
             .unwrap_or(60)
             .max(1);
-        let signal = signal_markup(&heartbeat_signal(
+        let heartbeat_signal = heartbeat_signal(
             &h.heartbeat_log,
             h.last_seen,
             interval,
             now,
             SIGNAL_DEFAULT_WINDOW_LABEL,
             SIGNAL_DEFAULT_WINDOW_SECS,
-        ));
+        );
+        let availability = availability_markup(&heartbeat_signal);
+        let signal = signal_markup(&heartbeat_signal);
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{settings_action}{card_host_actions}</div></header>{settings_note}{action_note}{reason}{kernel}{muted}<div class="fresh" data-fresh>{fresh}</div>{protection_card}<div class="meta"><span data-seen>{seen}</span><span data-card-asof>as of {as_of}</span></div>{heartbeat}<div class="card-tools">{signal}</div></article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{card_host_actions}</div></header>{settings_note}{action_note}{reason}{kernel}{muted}<div class="fresh" data-fresh>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
             live_key = live_key(live),
-            as_of = clock_label(now)
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{settings_note}{action_note}{reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{settings_note}{action_note}{reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
             live_key = live_key(live),
-            as_of = clock_label(now),
         ));
     }
     for job in setup_jobs {

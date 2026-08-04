@@ -58,6 +58,12 @@ pub const SHOPPING_CART: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="no
 /// Lucide `box` — a general managed infrastructure provider.
 pub const BOX: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 8-9-5-9 5 9 5 9-5Z"/><path d="m3 8 9 5 9-5"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>"#;
 
+/// Lucide-derived `package` + `calendar-days` composite — flake.lock age.
+pub const PACKAGE_CALENDAR: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="m3.29 7 4.21 2.42M20.71 7 16.5 9.42"/><rect x="7.5" y="8" width="9" height="8" rx="1.25" fill="white"/><path d="M9.75 7.25v2M14.25 7.25v2M7.5 11h9M11.95 13.5h.1"/></svg>"#;
+
+/// Lucide `git-commit-horizontal` — commits behind nixcfg.
+pub const GIT_COMMIT_HORIZONTAL: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><line x1="3" x2="9" y1="12" y2="12"/><line x1="15" x2="21" y1="12" y2="12"/></svg>"#;
+
 /// Lucide `hexagon` — a cloud provider without using a proprietary logo.
 pub const HEXAGON: &str = r#"<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>"#;
 
