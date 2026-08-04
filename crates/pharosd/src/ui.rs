@@ -562,7 +562,7 @@ pub(super) fn freshness_row(
     let kind = html_escape(kind);
     if compact {
         format!(
-            r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="{kind}" tabindex="0" aria-label="{label}: {value}"><span class="fresh-row-icon" aria-hidden="true">{icon}</span><span class="fresh-row-label">{label}</span><strong class="{class}" data-fresh-value>{value}</strong></div>"#,
+            r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="{kind}" tabindex="0" title="{label}: {value}" aria-label="{label}: {value}"><span class="fresh-row-icon" aria-hidden="true">{icon}</span><span class="fresh-row-label">{label}</span><strong class="{class}" data-fresh-value>{value}</strong></div>"#,
         )
     } else {
         format!(
@@ -602,7 +602,7 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
         );
     }
 
-    let (mut age, age_class) = freshness_value(freshness.flake_lock_age_days, "fresh");
+    let (mut age, age_class) = freshness_value(freshness.flake_lock_age_days, "0d");
     if age_class == "warn" {
         age.push('d');
     }
@@ -661,7 +661,7 @@ pub(super) fn kernel_posture_markup(
         .unwrap_or_default();
     let hidden = if reboot.is_none() { " hidden" } else { "" };
     format!(
-        r#"<div class="kernel-slot" data-kernel-slot{hidden}><details class="kernel-posture" data-kernel-posture><summary>{icon}<span>Restart needed</span></summary><div class="kernel-detail"><strong>Restart needed</strong><p data-kernel-explanation>{explanation}</p><dl><div><dt>Running</dt><dd data-kernel-running>{running}</dd></div><div><dt>Ready after restart</dt><dd data-kernel-expected>{expected}</dd></div></dl><p class="kernel-boundary">Pharos will not restart this host.</p></div></details></div>"#,
+        r#"<div class="kernel-slot" data-kernel-slot{hidden}><details class="kernel-posture" data-kernel-posture><summary>{icon}<span>Restart required</span></summary><div class="kernel-detail"><strong>Restart required</strong><p data-kernel-explanation>{explanation}</p><dl><div><dt>Running</dt><dd data-kernel-running>{running}</dd></div><div><dt>Ready after restart</dt><dd data-kernel-expected>{expected}</dd></div></dl><p class="kernel-boundary">Pharos will not restart this host.</p></div></details></div>"#,
         icon = icons::REFRESH_CW,
         explanation = html_escape(&explanation),
         running = html_escape(running),
@@ -3428,9 +3428,33 @@ impl HostPreferencesState {
         match self {
             Self::Applied => "",
             Self::RequestPending => "change requested",
-            Self::DeclaredNotApplied => "change waiting",
+            Self::DeclaredNotApplied => "ready to apply",
         }
     }
+}
+
+pub(super) fn settings_note_markup(
+    state: HostPreferencesState,
+    href: &str,
+    title: &str,
+    card: bool,
+) -> String {
+    let label = match state {
+        HostPreferencesState::Applied if card => "Up to date",
+        HostPreferencesState::Applied => "",
+        HostPreferencesState::RequestPending => "Change requested",
+        HostPreferencesState::DeclaredNotApplied => "Ready to apply",
+    };
+    let hidden = if label.is_empty() { " hidden" } else { "" };
+    format!(
+        r#"<a class="settings-wait-note" data-settings-note data-settings-state="{state}" href="{href}" title="{title}" aria-label="{title}"{hidden}><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span data-settings-note-copy>{label}</span></a>"#,
+        state = state.key(),
+        href = html_escape(href),
+        title = html_escape(title),
+        label = html_escape(label),
+        requested_icon = icons::CLOCK_3,
+        ready_icon = icons::DOWNLOAD,
+    )
 }
 
 pub(super) fn host_preferences_state(
@@ -5741,10 +5765,14 @@ pub(super) fn render_home_with_capabilities(
             &h.service_observations,
             &h.preferences,
         );
-        let reason = reason_markup(
+        let kernel_required = kernel_reboot_required(h.kernel.as_ref()).is_some();
+        let freshness_is_attention = freshness_attention_reason(&h.freshness)
+            .is_some_and(|freshness| freshness.label == attention.label);
+        let card_reason = reason_markup(
             &attention,
-            kernel_reboot_required(h.kernel.as_ref()).is_some(),
+            kernel_required || freshness_is_attention || attention.label == "all clear",
         );
+        let list_reason = reason_markup(&attention, kernel_required);
         let kernel = kernel_posture_markup(h.kernel.as_ref(), &h.name, live);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
@@ -5771,8 +5799,8 @@ pub(super) fn render_home_with_capabilities(
         if let Some(status) = &protection {
             search_parts.push(status.search_text().to_lowercase());
         }
-        if kernel_reboot_required(h.kernel.as_ref()).is_some() {
-            search_parts.push("restart needed kernel reboot required".to_string());
+        if kernel_required {
+            search_parts.push("restart required restart needed kernel reboot required".to_string());
         }
         if h.preferences.suppresses_down_alerts()
             || h.preferences.alerts.suppress_backup
@@ -5899,21 +5927,15 @@ pub(super) fn render_home_with_capabilities(
         } else {
             String::new()
         };
-        let settings_note = format!(
-            r#"<a class="settings-wait-note" data-settings-note data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"{settings_note_hidden}>{wait_icon}<span data-settings-note-copy>{settings_state_label}</span></a>"#,
-            wait_icon = icons::CLOCK_3,
-            settings_title = html_escape(&settings_title),
-            settings_state_label = html_escape(settings_state_label),
-            settings_note_hidden = if settings_state == HostPreferencesState::Applied {
-                " hidden"
-            } else {
-                ""
-            },
-        );
-        let action_note = format!(
+        let card_settings_note =
+            settings_note_markup(settings_state, &settings_href_raw, &settings_title, true);
+        let row_settings_note =
+            settings_note_markup(settings_state, &settings_href_raw, &settings_title, false);
+        let card_action_note = format!(
             r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note hidden>{icon}<span data-host-action-note-copy></span></button>"#,
             icon = icons::HISTORY,
         );
+        let row_action_note = card_action_note.clone();
         let drag_action = format!(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
@@ -5949,11 +5971,11 @@ pub(super) fn render_home_with_capabilities(
         let signal = signal_markup(&heartbeat_signal);
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{backup_chip}{card_host_actions}</div></header>{settings_note}{action_note}{reason}{kernel}{muted}<div class="fresh" data-fresh>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_settings_note}{card_action_note}{kernel}</div>{card_reason}{muted}<div class="fresh" data-fresh>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{settings_note}{action_note}{reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{row_settings_note}{row_action_note}{list_reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
             live_key = live_key(live),
         ));
     }

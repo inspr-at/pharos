@@ -4495,7 +4495,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_header_chips_are_icon_only_until_hover_or_focus() {
+    fn fleet_header_chips_expand_while_freshness_cells_stay_stable() {
         assert!(HEAD.contains(".header-chip{position:relative;appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:0;width:25px;height:25px"));
         assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
         assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
@@ -4504,8 +4504,9 @@ mod tests {
             ".card .backup-chip:not(:hover):not(:focus-visible){border-color:transparent;background:transparent;box-shadow:none}"
         ));
         assert!(HEAD.contains(
-            ".card .fresh-row:hover .fresh-row-label,.card .fresh-row:focus-visible .fresh-row-label"
+            ".card .fresh-row-compact{display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width)"
         ));
+        assert!(HEAD.contains(".card .fresh-row-label{display:none}"));
         assert!(HEAD.contains(".card .fresh-row-label,.card .fresh-row strong{transition:none}"));
     }
 
@@ -4972,11 +4973,11 @@ mod tests {
             true,
         );
         assert!(html.contains(r#"<div class="kernel-slot" data-kernel-slot><details"#));
-        assert!(html.contains("Restart needed"));
+        assert!(html.contains("Restart required"));
         assert!(html.contains("csb0 is healthy"));
         assert!(html.contains("Ready after restart"));
         assert!(html.contains("Pharos will not restart this host."));
-        assert!(html.contains("restart needed kernel reboot required"));
+        assert!(html.contains("restart required restart needed kernel reboot required"));
 
         let mut current = host_with_backups("hsb0", 970, vec![]);
         current.kernel = Some(KernelPosture::observed(
@@ -6614,7 +6615,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains(r#"class="card has-settings""#));
         assert!(html.contains(r#"data-settings-state="declared_not_applied""#));
-        assert!(html.contains(r#"aria-label="change waiting for poseidon""#));
+        assert!(html.contains(r#"aria-label="ready to apply for poseidon""#));
         assert!(html.contains(r#"style="--pending-color:#48b8a8""#));
         assert_eq!(
             html.matches(
@@ -6628,11 +6629,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
         ));
         assert!(html.contains(
-            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" href="/agora?host=poseidon" title="change waiting for poseidon" aria-label="change waiting for poseidon"><svg"#
+            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" href="/agora?host=poseidon" title="ready to apply for poseidon" aria-label="ready to apply for poseidon"><span class="settings-state-icon requested""#
         ));
-        assert!(html.contains(r#"<span data-settings-note-copy>change waiting</span></a>"#));
+        assert!(html.contains(r#"<span data-settings-note-copy>Ready to apply</span></a>"#));
         assert!(!html.contains(
-            r#"<span data-settings-note-copy>change waiting</span><span class="settings-swatch""#
+            r#"<span data-settings-note-copy>Ready to apply</span><span class="settings-swatch""#
         ));
         assert!(!html.contains(r#"class="settings-wait-icon""#));
         assert!(!html.contains(r#"--host-color:#48b8a8""#));
@@ -6653,9 +6654,76 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             true,
         );
         assert!(applied.contains(r#"class="card has-settings""#));
-        assert!(applied.contains(r#"data-settings-state="applied""#));
+        assert!(applied.contains(
+            r#"data-settings-state="applied" href="/agora?host=poseidon" title="Open host settings for poseidon" aria-label="Open host settings for poseidon"><span class="settings-state-icon requested""#
+        ));
+        assert!(applied.contains(r#"<span data-settings-note-copy>Up to date</span></a>"#));
         assert!(applied.contains(r#"style="--host-color:#48b8a8""#));
-        assert!(!applied.contains(r#"aria-label="change waiting for poseidon""#));
+        assert!(!applied.contains(r#"aria-label="ready to apply for poseidon""#));
+    }
+
+    #[test]
+    fn fleet_card_aligns_lifecycle_and_freshness_without_duplicate_attention() {
+        let mut drift = host_with_backups("drift", 970, vec![]);
+        drift.freshness = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(7),
+            commits_behind: Some(0),
+        };
+        let drift_html = render_home(
+            runtime(&[drift], &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(drift_html.contains(
+            r#"<div class="reason warn" data-reason hidden><span>flake.lock 7d</span></div>"#
+        ));
+        assert!(drift_html.contains(
+            r#"data-fresh-kind="flake-lock-age" tabindex="0" title="Flake.lock age: 7d" aria-label="Flake.lock age: 7d""#
+        ));
+
+        let mut lifecycle = host_with_backups("lifecycle", 970, vec![]);
+        lifecycle.requested_preferences = Some(HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        });
+        lifecycle.kernel = Some(reboot_required_kernel(965));
+        let lifecycle_html = render_home(
+            runtime(&[lifecycle], &[]),
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(lifecycle_html.contains(r#"<div class="card-maintenance">"#));
+        assert!(
+            lifecycle_html.contains(r#"<span data-settings-note-copy>Change requested</span></a>"#)
+        );
+        assert!(lifecycle_html.contains("Restart required"));
+        assert!(HEAD.contains(
+            "--lifecycle-width:calc(var(--fresh-cell-width) + var(--fresh-cell-width) + var(--indicator-gap))"
+        ));
+        assert!(HEAD.contains(".card-maintenance .settings-wait-note{width:var(--lifecycle-width)"));
+        assert!(HEAD.contains(".card .fresh-row-compact{display:flex"));
+        assert!(HEAD.contains("width:var(--fresh-cell-width)"));
+
+        let card_start = lifecycle_html
+            .find(r#"<article class="card"#)
+            .expect("runtime card rendered");
+        let card_end = lifecycle_html[card_start..]
+            .find("</article>")
+            .map(|end| card_start + end)
+            .expect("runtime card closes");
+        let card = &lifecycle_html[card_start..card_end];
+        let menu = card
+            .find("data-host-actions")
+            .expect("actions menu rendered");
+        let backup = card.find("backup-chip").expect("backup control rendered");
+        assert!(menu < backup, "ellipsis menu must precede backup control");
     }
 
     #[test]
