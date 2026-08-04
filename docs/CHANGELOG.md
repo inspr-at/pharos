@@ -1,6 +1,6 @@
 # Pharos Changelog
 
-## Unreleased
+## 0.1.69 - 2026-08-04
 
 - Route per-backup Stale and Failed posture transitions through the durable alert incident/outbox pipeline, including preference suppression, stable deduplication, escalation, Telegram delivery, recovery, and in-place migration of existing host-down alert state.
 
