@@ -15,23 +15,27 @@
 //! again.
 
 use std::collections::{BTreeSet, HashMap};
+use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Form, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use openidconnect::core::{
-    CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
-    CoreUserInfoClaims,
+    CoreAuthenticationFlow, CoreClient, CoreErrorResponseType, CoreIdToken, CoreIdTokenClaims,
+    CoreProviderMetadata, CoreRequestTokenError, CoreUserInfoClaims,
 };
 use openidconnect::reqwest;
 use openidconnect::{
     AccessToken, AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope, SubjectIdentifier, TokenResponse,
+    EndpointNotSet, EndpointSet, HttpClientError, IssuerUrl, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, SubjectIdentifier,
+    TokenResponse,
 };
 use sha2::{Digest, Sha256};
 
@@ -45,6 +49,7 @@ const MAX_PENDING_FLOWS: usize = 512;
 const MAX_SESSIONS: usize = 4_096;
 const MAX_LOGIN_STARTS_PER_WINDOW: u32 = 120;
 const MAX_SESSION_CREATES_PER_WINDOW: u32 = 120;
+const MAX_RETURN_TO_BYTES: usize = 2_048;
 const ALLOWED_OPERATORS_ENV: &str = "PHAROS_ALLOWED_OPERATORS";
 const ACCESS_POLICY_FILE_ENV: &str = "PHAROS_ACCESS_POLICY_FILE";
 const ALLOW_OPEN_ENV: &str = "PHAROS_ALLOW_OPEN";
@@ -75,7 +80,76 @@ struct Pending {
     verifier: PkceCodeVerifier,
     nonce: Nonce,
     flow_cookie_hash: [u8; 32],
+    return_to: String,
     created: i64,
+}
+
+enum PendingFlowOutcome {
+    Matched(Pending),
+    Missing,
+    Expired(String),
+    BrowserMismatch(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OidcTransportClass {
+    Dns,
+    Connection,
+    Tls,
+    Timeout,
+    Request,
+}
+
+impl OidcTransportClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::Connection => "connection",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Request => "request",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginRecovery {
+    FlowUnavailable,
+    ProviderRejected,
+    ProviderUnavailable,
+    MalformedProviderResponse,
+    VerificationFailed,
+}
+
+impl LoginRecovery {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::FlowUnavailable => StatusCode::BAD_REQUEST,
+            Self::ProviderRejected | Self::VerificationFailed => StatusCode::UNAUTHORIZED,
+            Self::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::MalformedProviderResponse => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::FlowUnavailable => {
+                "This sign-in is no longer active. It may have expired, Pharos may have restarted, or another tab may have started a newer sign-in."
+            }
+            Self::ProviderRejected => {
+                "The identity provider did not accept this sign-in. Start again when you are ready."
+            }
+            Self::ProviderUnavailable => {
+                "Pharos could not reach the identity provider safely. Try again in a moment."
+            }
+            Self::MalformedProviderResponse => {
+                "The identity provider returned an unexpected response. Start a fresh sign-in to continue."
+            }
+            Self::VerificationFailed => {
+                "Pharos could not verify this sign-in safely. Start again to get a fresh verification."
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -377,7 +451,7 @@ impl Auth {
     /// Refresh OIDC discovery/JWKS metadata. Zitadel can rotate signing keys
     /// while pharosd is running; retrying with a refreshed verifier avoids a
     /// manual restart without weakening token validation.
-    async fn refresh_client(&self) -> Result<(), String> {
+    async fn refresh_client(&self) -> Result<(), OidcTransportClass> {
         let client = discover_client(
             self.issuer.clone(),
             self.client_id.clone(),
@@ -385,7 +459,7 @@ impl Auth {
             &self.http_client,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| classify_error_chain(error.as_ref()))?;
         *self.client.lock().expect("client lock") = client;
         Ok(())
     }
@@ -433,9 +507,9 @@ impl Auth {
     fn take_pending(
         &self,
         state: &str,
-        flow_cookie_hash: &[u8; 32],
+        flow_cookie_hash: Option<&[u8; 32]>,
         current: i64,
-    ) -> Option<Pending> {
+    ) -> PendingFlowOutcome {
         take_pending_flow(&self.pending, state, flow_cookie_hash, current)
     }
 
@@ -504,19 +578,22 @@ impl Auth {
 fn take_pending_flow(
     pending: &Mutex<HashMap<String, Pending>>,
     state: &str,
-    flow_cookie_hash: &[u8; 32],
+    flow_cookie_hash: Option<&[u8; 32]>,
     current: i64,
-) -> Option<Pending> {
+) -> PendingFlowOutcome {
     let mut pending_flows = pending.lock().expect("pending lock");
-    let flow = pending_flows.get(state)?;
+    let Some(flow) = pending_flows.remove(state) else {
+        return PendingFlowOutcome::Missing;
+    };
     if current < flow.created || current.saturating_sub(flow.created) >= FLOW_TTL_SECS {
-        pending_flows.remove(state);
-        return None;
+        return PendingFlowOutcome::Expired(flow.return_to);
     }
-    if !constant_time_equal(&flow.flow_cookie_hash, flow_cookie_hash) {
-        return None;
+    if !flow_cookie_hash.is_some_and(|flow_cookie_hash| {
+        constant_time_equal(&flow.flow_cookie_hash, flow_cookie_hash)
+    }) {
+        return PendingFlowOutcome::BrowserMismatch(flow.return_to);
     }
-    pending_flows.remove(state)
+    PendingFlowOutcome::Matched(flow)
 }
 
 fn bounded_insert<K, V>(
@@ -810,8 +887,11 @@ async fn enrich_identity_from_user_info(
 ) {
     let request = match client.user_info(access_token, Some(identity.subject.clone())) {
         Ok(request) => request,
-        Err(err) => {
-            tracing::debug!("OIDC userinfo endpoint unavailable: {err}");
+        Err(_) => {
+            tracing::debug!(
+                category = "userinfo_endpoint_unavailable",
+                "OIDC userinfo enrichment skipped safely"
+            );
             return;
         }
     };
@@ -823,8 +903,11 @@ async fn enrich_identity_from_user_info(
                 identity.display_name = display_name;
             }
         }
-        Err(err) => {
-            tracing::warn!("OIDC userinfo request failed; using id_token claims: {err}");
+        Err(_) => {
+            tracing::warn!(
+                category = "userinfo_request_failed",
+                "OIDC userinfo enrichment failed; using verified id_token claims"
+            );
         }
     }
 }
@@ -869,6 +952,183 @@ fn set_cookie(name: &str, value: &str, max_age: i64, http_only: bool, same_site:
     format!("{name}={value}; Path=/; Secure{http_only}; SameSite={same_site}; Max-Age={max_age}")
 }
 
+fn new_flow_cookie(return_to: &str) -> String {
+    let secret = CsrfToken::new_random().secret().clone();
+    let encoded_return = URL_SAFE_NO_PAD.encode(return_to.as_bytes());
+    format!("{secret}.{encoded_return}")
+}
+
+fn return_to_from_flow_cookie(value: Option<&str>) -> String {
+    let Some((_, encoded_return)) = value.and_then(|value| value.split_once('.')) else {
+        return "/".to_string();
+    };
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(encoded_return) else {
+        return "/".to_string();
+    };
+    let Ok(return_to) = String::from_utf8(decoded) else {
+        return "/".to_string();
+    };
+    validated_return_to(Some(&return_to))
+}
+
+fn validated_return_to(candidate: Option<&str>) -> String {
+    let Some(candidate) = candidate else {
+        return "/".to_string();
+    };
+    if candidate.is_empty()
+        || candidate.len() > MAX_RETURN_TO_BYTES
+        || !candidate.starts_with('/')
+        || candidate.starts_with("//")
+        || candidate.contains('\\')
+        || candidate.contains('#')
+        || candidate.chars().any(char::is_control)
+    {
+        return "/".to_string();
+    }
+    let Ok(uri) = candidate.parse::<Uri>() else {
+        return "/".to_string();
+    };
+    if uri.scheme().is_some() || uri.authority().is_some() {
+        return "/".to_string();
+    }
+    let path = uri.path();
+    if path == "/auth" || path.starts_with("/auth/") {
+        return "/".to_string();
+    }
+    candidate.to_string()
+}
+
+fn login_location(return_to: &str) -> String {
+    if return_to == "/" {
+        return "/auth/login".to_string();
+    }
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("return_to", return_to);
+    format!("/auth/login?{}", query.finish())
+}
+
+fn classify_transport_signals(
+    timeout: bool,
+    connect: bool,
+    diagnostic: &str,
+) -> OidcTransportClass {
+    if timeout {
+        return OidcTransportClass::Timeout;
+    }
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    if diagnostic.contains("dns")
+        || diagnostic.contains("name resolution")
+        || diagnostic.contains("failed to lookup address")
+    {
+        return OidcTransportClass::Dns;
+    }
+    if diagnostic.contains("tls")
+        || diagnostic.contains("certificate")
+        || diagnostic.contains("rustls")
+        || diagnostic.contains("handshake")
+    {
+        return OidcTransportClass::Tls;
+    }
+    if connect {
+        return OidcTransportClass::Connection;
+    }
+    OidcTransportClass::Request
+}
+
+fn error_chain_diagnostic(error: &(dyn StdError + 'static)) -> String {
+    let mut diagnostic = String::new();
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if !diagnostic.is_empty() {
+            diagnostic.push(' ');
+        }
+        diagnostic.push_str(&error.to_string());
+        current = error.source();
+    }
+    diagnostic
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> OidcTransportClass {
+    classify_transport_signals(
+        error.is_timeout(),
+        error.is_connect(),
+        &error_chain_diagnostic(error),
+    )
+}
+
+fn classify_error_chain(error: &(dyn StdError + 'static)) -> OidcTransportClass {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
+            return classify_reqwest_error(reqwest_error);
+        }
+        current = error.source();
+    }
+    classify_transport_signals(false, false, &error_chain_diagnostic(error))
+}
+
+fn classify_http_client_error(error: &HttpClientError<reqwest::Error>) -> OidcTransportClass {
+    match error {
+        HttpClientError::Reqwest(error) => classify_reqwest_error(error),
+        HttpClientError::Io(_) => OidcTransportClass::Connection,
+        HttpClientError::Http(_) | HttpClientError::Other(_) => OidcTransportClass::Request,
+        _ => OidcTransportClass::Request,
+    }
+}
+
+fn provider_response_class(error: &CoreErrorResponseType) -> &'static str {
+    match error {
+        CoreErrorResponseType::InvalidClient => "invalid_client",
+        CoreErrorResponseType::InvalidGrant => "invalid_grant",
+        CoreErrorResponseType::InvalidRequest => "invalid_request",
+        CoreErrorResponseType::InvalidScope => "invalid_scope",
+        CoreErrorResponseType::UnauthorizedClient => "unauthorized_client",
+        CoreErrorResponseType::UnsupportedGrantType => "unsupported_grant_type",
+        CoreErrorResponseType::Extension(_) => "extension",
+    }
+}
+
+fn classify_token_exchange_error(
+    error: &CoreRequestTokenError<HttpClientError<reqwest::Error>>,
+) -> (LoginRecovery, &'static str) {
+    match error {
+        RequestTokenError::ServerResponse(response) => (
+            LoginRecovery::ProviderRejected,
+            provider_response_class(response.error()),
+        ),
+        RequestTokenError::Request(error) => {
+            let class = classify_http_client_error(error);
+            (LoginRecovery::ProviderUnavailable, class.as_str())
+        }
+        RequestTokenError::Parse(_, _) => (
+            LoginRecovery::MalformedProviderResponse,
+            "malformed_response",
+        ),
+        RequestTokenError::Other(_) => (
+            LoginRecovery::MalformedProviderResponse,
+            "unexpected_response",
+        ),
+    }
+}
+
+fn login_recovery_response(recovery: LoginRecovery, return_to: &str) -> Response {
+    let return_to = validated_return_to(Some(return_to));
+    let login = login_location(&return_to);
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign-in recovery · Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>:root{{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#17658f;--sun:#d69b31}}*{{box-sizing:border-box}}body{{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}}main{{width:min(440px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}}.mark{{display:grid;place-items:center;width:44px;height:44px;margin:0 auto 16px;border:1px solid #f0d49f;border-radius:50%;background:#fff9ef;color:#b87808;font-size:22px}}h1{{margin:0 0 8px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}}p{{margin:0 0 22px;color:var(--muted)}}a{{display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:0 17px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}}a:focus-visible{{outline:3px solid rgba(23,101,143,.28);outline-offset:3px}}</style></head><body><main data-auth-recovery><span class="mark" aria-hidden="true">↻</span><h1>Start sign-in again</h1><p>{}</p><a href="{}">Try signing in again</a></main></body></html>"#,
+        recovery.message(),
+        login,
+    );
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SET_COOKIE,
+        set_cookie(FLOW_COOKIE, "", 0, true, "Lax")
+            .parse()
+            .expect("flow cookie clearing header"),
+    );
+    (recovery.status(), headers, Html(html)).into_response()
+}
+
 fn rate_limited_response() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -884,14 +1144,27 @@ pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> R
     match &auth {
         None => next.run(req).await,
         Some(a) if a.is_authed(req.headers()) => next.run(req).await,
-        Some(_) => Redirect::temporary("/auth/login").into_response(),
+        Some(_) => {
+            let return_to = if matches!(*req.method(), Method::GET | Method::HEAD) {
+                validated_return_to(req.uri().path_and_query().map(|value| value.as_str()))
+            } else {
+                "/".to_string()
+            };
+            Redirect::to(&login_location(&return_to)).into_response()
+        }
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+pub struct LoginParams {
+    return_to: Option<String>,
+}
+
 /// `GET /auth/login` — start the PKCE flow, redirect to the IdP.
-pub async fn login(State(auth): State<AuthState>) -> Response {
+pub async fn login(State(auth): State<AuthState>, Query(params): Query<LoginParams>) -> Response {
+    let return_to = validated_return_to(params.return_to.as_deref());
     let Some(auth) = auth else {
-        return Redirect::temporary("/").into_response();
+        return Redirect::to(&return_to).into_response();
     };
     auth.sweep();
     let current = now();
@@ -912,7 +1185,7 @@ pub async fn login(State(auth): State<AuthState>) -> Response {
     }
 
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let flow_cookie = CsrfToken::new_random().secret().clone();
+    let flow_cookie = new_flow_cookie(&return_to);
     let client = auth.client();
     let (url, csrf, nonce) = client
         .authorize_url(
@@ -941,6 +1214,7 @@ pub async fn login(State(auth): State<AuthState>) -> Response {
             verifier,
             nonce,
             flow_cookie_hash: secret_hash(&flow_cookie),
+            return_to,
             created: current,
         },
         MAX_PENDING_FLOWS,
@@ -968,6 +1242,7 @@ pub async fn login(State(auth): State<AuthState>) -> Response {
 pub struct CallbackParams {
     code: Option<String>,
     state: Option<String>,
+    error: Option<String>,
 }
 
 /// `GET /auth/callback` — verify state, exchange the code (with the PKCE
@@ -978,30 +1253,67 @@ pub async fn callback(
     Query(p): Query<CallbackParams>,
 ) -> Response {
     let Some(auth) = auth else {
-        return Redirect::temporary("/").into_response();
+        return Redirect::to("/").into_response();
     };
-    let (Some(code), Some(state)) = (p.code, p.state) else {
-        return (StatusCode::BAD_REQUEST, "missing code/state").into_response();
+    let flow_cookie = cookie(&headers, FLOW_COOKIE);
+    let cookie_return_to = return_to_from_flow_cookie(flow_cookie.as_deref());
+    let Some(state) = p.state else {
+        tracing::info!(
+            category = "missing_state",
+            "OIDC callback requires a fresh login"
+        );
+        return login_recovery_response(LoginRecovery::FlowUnavailable, &cookie_return_to);
     };
-    let Some(flow_cookie) = cookie(&headers, FLOW_COOKIE) else {
-        return (StatusCode::BAD_REQUEST, "unknown or expired login").into_response();
+    let flow_cookie_hash = flow_cookie.as_deref().map(secret_hash);
+    let pending = match auth.take_pending(&state, flow_cookie_hash.as_ref(), now()) {
+        PendingFlowOutcome::Matched(pending) => pending,
+        PendingFlowOutcome::Missing => {
+            tracing::info!(
+                category = "unknown_or_replayed_state",
+                "OIDC callback requires a fresh login"
+            );
+            return login_recovery_response(LoginRecovery::FlowUnavailable, &cookie_return_to);
+        }
+        PendingFlowOutcome::Expired(return_to) => {
+            tracing::info!(
+                category = "expired_state",
+                "OIDC callback requires a fresh login"
+            );
+            return login_recovery_response(LoginRecovery::FlowUnavailable, &return_to);
+        }
+        PendingFlowOutcome::BrowserMismatch(return_to) => {
+            tracing::info!(
+                category = "superseded_or_wrong_browser",
+                "OIDC callback requires a fresh login"
+            );
+            return login_recovery_response(LoginRecovery::FlowUnavailable, &return_to);
+        }
     };
-    let flow_cookie_hash = secret_hash(&flow_cookie);
-    let current = now();
-    let Some(pending) = auth.take_pending(&state, &flow_cookie_hash, current) else {
-        return (StatusCode::BAD_REQUEST, "unknown or expired login").into_response();
+    let return_to = pending.return_to.clone();
+    if p.error.is_some() {
+        tracing::warn!(
+            category = "authorization_provider_rejection",
+            "OIDC provider rejected the authorization request"
+        );
+        return login_recovery_response(LoginRecovery::ProviderRejected, &return_to);
+    }
+    let Some(code) = p.code else {
+        tracing::warn!(
+            category = "authorization_response_malformed",
+            "OIDC provider response omitted the authorization code"
+        );
+        return login_recovery_response(LoginRecovery::MalformedProviderResponse, &return_to);
     };
 
     let client = auth.client();
     let token_request = match client.exchange_code(AuthorizationCode::new(code)) {
         Ok(request) => request,
-        Err(e) => {
-            tracing::warn!("OIDC token endpoint unavailable: {e}");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "login temporarily unavailable; please retry",
-            )
-                .into_response();
+        Err(_) => {
+            tracing::warn!(
+                category = "token_endpoint_unavailable",
+                "OIDC token exchange could not be started"
+            );
+            return login_recovery_response(LoginRecovery::ProviderUnavailable, &return_to);
         }
     };
     let token = match token_request
@@ -1010,27 +1322,37 @@ pub async fn callback(
         .await
     {
         Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("token exchange failed: {e}");
-            return (StatusCode::UNAUTHORIZED, "token exchange failed").into_response();
+        Err(error) => {
+            let (recovery, source) = classify_token_exchange_error(&error);
+            tracing::warn!(
+                category = "token_exchange_failed",
+                source,
+                "OIDC token exchange failed safely"
+            );
+            return login_recovery_response(recovery, &return_to);
         }
     };
     let Some(id_token) = token.id_token() else {
-        return (StatusCode::UNAUTHORIZED, "no id_token").into_response();
+        tracing::warn!(
+            category = "token_response_missing_id_token",
+            "OIDC token response was malformed"
+        );
+        return login_recovery_response(LoginRecovery::MalformedProviderResponse, &return_to);
     };
     let mut identity = match auth.verify_id_token_identity(&client, id_token, &pending.nonce) {
         Ok(identity) => identity,
-        Err(ClaimsVerificationError::SignatureVerification(e)) => {
+        Err(ClaimsVerificationError::SignatureVerification(_)) => {
             tracing::warn!(
-                "id_token signature verification failed; refreshing OIDC metadata and retrying: {e}"
+                category = "signature_metadata_stale",
+                "OIDC id_token signature requires a metadata refresh"
             );
-            if let Err(refresh_err) = auth.refresh_client().await {
-                tracing::warn!("OIDC metadata refresh failed: {refresh_err}");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "login verification temporarily unavailable; please retry",
-                )
-                    .into_response();
+            if let Err(source) = auth.refresh_client().await {
+                tracing::warn!(
+                    category = "metadata_refresh_failed",
+                    source = source.as_str(),
+                    "OIDC metadata refresh failed safely"
+                );
+                return login_recovery_response(LoginRecovery::ProviderUnavailable, &return_to);
             }
             let refreshed = auth.client();
             match auth.verify_id_token_identity(&refreshed, id_token, &pending.nonce) {
@@ -1038,23 +1360,21 @@ pub async fn callback(
                     tracing::info!("id_token verified after OIDC metadata refresh");
                     identity
                 }
-                Err(e) => {
-                    tracing::warn!("id_token verification failed after OIDC metadata refresh: {e}");
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        "login verification failed; please retry",
-                    )
-                        .into_response();
+                Err(_) => {
+                    tracing::warn!(
+                        category = "id_token_verification_failed_after_refresh",
+                        "OIDC id_token verification failed safely"
+                    );
+                    return login_recovery_response(LoginRecovery::VerificationFailed, &return_to);
                 }
             }
         }
-        Err(e) => {
-            tracing::warn!("id_token verification failed: {e}");
-            return (
-                StatusCode::UNAUTHORIZED,
-                "login verification failed; please retry",
-            )
-                .into_response();
+        Err(_) => {
+            tracing::warn!(
+                category = "id_token_verification_failed",
+                "OIDC id_token verification failed safely"
+            );
+            return login_recovery_response(LoginRecovery::VerificationFailed, &return_to);
         }
     };
     enrich_identity_from_user_info(
@@ -1136,7 +1456,13 @@ pub async fn callback(
             .parse()
             .expect("flow cookie clearing header"),
     );
-    (headers, Redirect::temporary("/")).into_response()
+    (headers, Redirect::to(&return_to)).into_response()
+}
+
+/// `GET /auth/recover` — stable recovery surface for stale browser auth state.
+pub async fn recover(Query(params): Query<LoginParams>) -> Response {
+    let return_to = validated_return_to(params.return_to.as_deref());
+    login_recovery_response(LoginRecovery::FlowUnavailable, &return_to)
 }
 
 #[cfg(test)]
@@ -1221,9 +1547,7 @@ pub async fn logged_out() -> impl IntoResponse {
 mod tests {
     use super::*;
     use axum::routing::{get, post};
-    use axum::{Json, Router};
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine as _;
+    use axum::{middleware, Json, Router};
     use rand::rngs::OsRng;
     use rsa::pkcs1v15::SigningKey;
     use rsa::signature::{SignatureEncoding as _, Signer as _};
@@ -1236,6 +1560,17 @@ mod tests {
         issuer: String,
         signing_key: Arc<RsaPrivateKey>,
         nonce: Arc<Mutex<Option<String>>>,
+        token_mode: Arc<Mutex<MockTokenMode>>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum MockTokenMode {
+        #[default]
+        Success,
+        ProviderReject,
+        Malformed,
+        MissingIdToken,
+        InvalidIdToken,
     }
 
     async fn mock_discovery(State(provider): State<MockOidcProvider>) -> Json<serde_json::Value> {
@@ -1268,18 +1603,12 @@ mod tests {
         }))
     }
 
-    fn mock_id_token(provider: &MockOidcProvider) -> String {
+    fn mock_id_token_with_nonce(provider: &MockOidcProvider, nonce: String) -> String {
         let header = serde_json::json!({
             "alg": "RS256",
             "kid": "pharos-oidc-e2e",
             "typ": "JWT"
         });
-        let nonce = provider
-            .nonce
-            .lock()
-            .expect("mock nonce lock")
-            .clone()
-            .expect("login nonce captured");
         let issued_at = now();
         let claims = serde_json::json!({
             "iss": provider.issuer,
@@ -1303,13 +1632,49 @@ mod tests {
         )
     }
 
-    async fn mock_token(State(provider): State<MockOidcProvider>) -> Json<serde_json::Value> {
-        Json(serde_json::json!({
-            "access_token": "opaque-test-access-token",
-            "token_type": "Bearer",
-            "expires_in": 300,
-            "id_token": mock_id_token(&provider)
-        }))
+    fn mock_id_token(provider: &MockOidcProvider) -> String {
+        let nonce = provider
+            .nonce
+            .lock()
+            .expect("mock nonce lock")
+            .clone()
+            .expect("login nonce captured");
+        mock_id_token_with_nonce(provider, nonce)
+    }
+
+    async fn mock_token(State(provider): State<MockOidcProvider>) -> Response {
+        let mode = *provider.token_mode.lock().expect("mock token mode lock");
+        match mode {
+            MockTokenMode::Success => Json(serde_json::json!({
+                "access_token": "opaque-test-access-token",
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "id_token": mock_id_token(&provider)
+            }))
+            .into_response(),
+            MockTokenMode::ProviderReject => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "fixture rejection"
+                })),
+            )
+                .into_response(),
+            MockTokenMode::Malformed => (StatusCode::OK, "not a token response").into_response(),
+            MockTokenMode::MissingIdToken => Json(serde_json::json!({
+                "access_token": "opaque-test-access-token",
+                "token_type": "Bearer",
+                "expires_in": 300
+            }))
+            .into_response(),
+            MockTokenMode::InvalidIdToken => Json(serde_json::json!({
+                "access_token": "opaque-test-access-token",
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "id_token": mock_id_token_with_nonce(&provider, "wrong-nonce".to_string())
+            }))
+            .into_response(),
+        }
     }
 
     async fn mock_userinfo() -> Json<serde_json::Value> {
@@ -1328,6 +1693,7 @@ mod tests {
             issuer,
             signing_key: Arc::new(RsaPrivateKey::new(&mut OsRng, 2048).unwrap()),
             nonce: Arc::new(Mutex::new(None)),
+            token_mode: Arc::new(Mutex::new(MockTokenMode::Success)),
         };
         let app = Router::new()
             .route("/.well-known/openid-configuration", get(mock_discovery))
@@ -1339,6 +1705,20 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (provider, task)
+    }
+
+    async fn auth_for_provider(provider: &MockOidcProvider) -> AuthState {
+        let config = AuthConfig::from_values(
+            true,
+            Some(provider.issuer.clone()),
+            Some("pharos-oidc-e2e".to_string()),
+            Some("https://pharos.example.test/auth/callback".to_string()),
+            false,
+            OperatorPolicy::from_raw(None).unwrap(),
+            None,
+        )
+        .unwrap();
+        Auth::from_config(config).await.unwrap()
     }
 
     fn response_cookie(response: &Response, name: &str) -> Option<String> {
@@ -1356,25 +1736,30 @@ mod tests {
             })
     }
 
-    #[tokio::test]
-    async fn oidc_authorization_code_pkce_flow_creates_a_browser_bound_session() {
-        let (provider, server) = start_mock_oidc().await;
-        let config = AuthConfig::from_values(
-            true,
-            Some(provider.issuer.clone()),
-            Some("pharos-oidc-e2e".to_string()),
-            Some("https://pharos.example.test/auth/callback".to_string()),
-            false,
-            OperatorPolicy::from_raw(None).unwrap(),
-            None,
-        )
-        .unwrap();
-        let auth_state = Auth::from_config(config).await.unwrap();
+    fn login_params(return_to: Option<&str>) -> Query<LoginParams> {
+        Query(LoginParams {
+            return_to: return_to.map(ToString::to_string),
+        })
+    }
 
-        let login_response = login(State(auth_state.clone())).await;
-        assert_eq!(login_response.status(), StatusCode::TEMPORARY_REDIRECT);
+    fn callback_params(
+        code: Option<&str>,
+        state: Option<String>,
+        error: Option<&str>,
+    ) -> Query<CallbackParams> {
+        Query(CallbackParams {
+            code: code.map(ToString::to_string),
+            state,
+            error: error.map(ToString::to_string),
+        })
+    }
+
+    fn authorization_parameters(
+        response: &Response,
+        provider: &MockOidcProvider,
+    ) -> HashMap<String, String> {
         let authorization_url = Url::parse(
-            login_response
+            response
                 .headers()
                 .get(header::LOCATION)
                 .unwrap()
@@ -1386,8 +1771,44 @@ mod tests {
             .query_pairs()
             .into_owned()
             .collect::<HashMap<_, _>>();
-        let state = parameters.get("state").cloned().unwrap();
         *provider.nonce.lock().unwrap() = parameters.get("nonce").cloned();
+        parameters
+    }
+
+    async fn response_html(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        String::from_utf8(body.to_vec()).expect("response html")
+    }
+
+    async fn begin_login(
+        auth_state: &AuthState,
+        provider: &MockOidcProvider,
+        return_to: &str,
+    ) -> (String, String) {
+        let response = login(State(auth_state.clone()), login_params(Some(return_to))).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let parameters = authorization_parameters(&response, provider);
+        (
+            parameters.get("state").cloned().unwrap(),
+            response_cookie(&response, FLOW_COOKIE).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn oidc_authorization_code_pkce_flow_creates_a_browser_bound_session() {
+        let (provider, server) = start_mock_oidc().await;
+        let auth_state = auth_for_provider(&provider).await;
+
+        let login_response = login(
+            State(auth_state.clone()),
+            login_params(Some("/services?view=managed")),
+        )
+        .await;
+        assert_eq!(login_response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let parameters = authorization_parameters(&login_response, &provider);
+        let state = parameters.get("state").cloned().unwrap();
         assert_eq!(
             parameters.get("code_challenge_method").map(String::as_str),
             Some("S256")
@@ -1399,14 +1820,15 @@ mod tests {
         let callback_response = callback(
             State(auth_state.clone()),
             callback_headers,
-            Query(CallbackParams {
-                code: Some("single-use-code".to_string()),
-                state: Some(state),
-            }),
+            callback_params(Some("single-use-code"), Some(state), None),
         )
         .await;
 
-        assert_eq!(callback_response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(callback_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            callback_response.headers().get(header::LOCATION).unwrap(),
+            "/services?view=managed"
+        );
         let session_cookie = response_cookie(&callback_response, SESSION_COOKIE).unwrap();
         let mut session_headers = HeaderMap::new();
         session_headers.insert(header::COOKIE, session_cookie.parse().unwrap());
@@ -1482,47 +1904,352 @@ mod tests {
             verifier,
             nonce: Nonce::new("nonce-fixture".to_string()),
             flow_cookie_hash: secret_hash(flow_cookie),
+            return_to: "/services".to_string(),
             created,
         }
     }
 
     #[test]
-    fn pending_flow_is_browser_bound_expiring_and_single_use() {
+    fn pending_flow_is_browser_bound_expiring_single_use_and_deterministically_superseded() {
         let pending = Mutex::new(HashMap::from([(
             "state-fixture".to_string(),
             pending_flow("browser-a", 100),
         )]));
 
+        let browser_b_hash = secret_hash("browser-b");
+        assert!(matches!(
+            take_pending_flow(&pending, "state-fixture", Some(&browser_b_hash), 101),
+            PendingFlowOutcome::BrowserMismatch(return_to) if return_to == "/services"
+        ));
         assert!(
-            take_pending_flow(&pending, "state-fixture", &secret_hash("browser-b"), 101).is_none()
-        );
-        assert_eq!(
-            pending.lock().unwrap().len(),
-            1,
-            "wrong browser cannot consume flow"
-        );
-        assert!(
-            take_pending_flow(&pending, "state-fixture", &secret_hash("browser-a"), 101).is_some()
-        );
-        assert!(
-            take_pending_flow(&pending, "state-fixture", &secret_hash("browser-a"), 101).is_none()
+            pending.lock().unwrap().is_empty(),
+            "superseded flow is consumed into recovery"
         );
 
         pending
             .lock()
             .unwrap()
+            .insert("matched".to_string(), pending_flow("browser-a", 100));
+        let browser_a_hash = secret_hash("browser-a");
+        assert!(matches!(
+            take_pending_flow(&pending, "matched", Some(&browser_a_hash), 101),
+            PendingFlowOutcome::Matched(_)
+        ));
+        assert!(matches!(
+            take_pending_flow(&pending, "matched", Some(&browser_a_hash), 101),
+            PendingFlowOutcome::Missing
+        ));
+
+        pending
+            .lock()
+            .unwrap()
             .insert("expired".to_string(), pending_flow("browser-a", 100));
-        assert!(take_pending_flow(
-            &pending,
-            "expired",
-            &secret_hash("browser-a"),
-            100 + FLOW_TTL_SECS
-        )
-        .is_none());
+        assert!(matches!(
+            take_pending_flow(
+                &pending,
+                "expired",
+                Some(&browser_a_hash),
+                100 + FLOW_TTL_SECS
+            ),
+            PendingFlowOutcome::Expired(return_to) if return_to == "/services"
+        ));
         assert!(
             pending.lock().unwrap().is_empty(),
             "expired flow is removed"
         );
+    }
+
+    #[test]
+    fn return_destinations_are_local_bounded_and_never_reenter_auth() {
+        assert_eq!(
+            validated_return_to(Some("/services?view=managed")),
+            "/services?view=managed"
+        );
+        for unsafe_target in [
+            "https://attacker.invalid/",
+            "//attacker.invalid/",
+            "/\\attacker.invalid/",
+            "/auth/login",
+            "/auth/callback?code=fixture",
+            "/auth/recover",
+            "services",
+            "/fleet#fragment",
+        ] {
+            assert_eq!(validated_return_to(Some(unsafe_target)), "/");
+        }
+        assert_eq!(
+            validated_return_to(Some(&format!("/{}", "a".repeat(MAX_RETURN_TO_BYTES)))),
+            "/"
+        );
+        assert_eq!(
+            login_location("/services?view=managed"),
+            "/auth/login?return_to=%2Fservices%3Fview%3Dmanaged"
+        );
+        let flow_cookie = new_flow_cookie("/services?view=managed");
+        assert_eq!(
+            return_to_from_flow_cookie(Some(&flow_cookie)),
+            "/services?view=managed"
+        );
+        assert_eq!(return_to_from_flow_cookie(Some("tampered")), "/");
+        assert_eq!(return_to_from_flow_cookie(Some("fixture.%%%")), "/");
+    }
+
+    #[test]
+    fn transport_failures_have_only_fixed_value_free_classes() {
+        assert_eq!(
+            classify_transport_signals(false, true, "dns error while resolving a private host"),
+            OidcTransportClass::Dns
+        );
+        assert_eq!(
+            classify_transport_signals(false, true, "certificate verify failed"),
+            OidcTransportClass::Tls
+        );
+        assert_eq!(
+            classify_transport_signals(true, true, "request timed out"),
+            OidcTransportClass::Timeout
+        );
+        assert_eq!(
+            classify_transport_signals(false, true, "connection refused"),
+            OidcTransportClass::Connection
+        );
+        assert_eq!(
+            classify_transport_signals(false, false, "opaque internal failure"),
+            OidcTransportClass::Request
+        );
+        assert_eq!(
+            [
+                OidcTransportClass::Dns,
+                OidcTransportClass::Connection,
+                OidcTransportClass::Tls,
+                OidcTransportClass::Timeout,
+                OidcTransportClass::Request,
+            ]
+            .map(OidcTransportClass::as_str),
+            ["dns", "connection", "tls", "timeout", "request"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_missing_and_replayed_callbacks_render_one_safe_recovery_action() {
+        let (provider, server) = start_mock_oidc().await;
+        let auth_state = auth_for_provider(&provider).await;
+
+        let missing_state = callback(
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            callback_params(Some("unused"), None, None),
+        )
+        .await;
+        assert_eq!(missing_state.status(), StatusCode::BAD_REQUEST);
+        assert!(response_cookie(&missing_state, FLOW_COOKIE)
+            .unwrap()
+            .ends_with('='));
+        let missing_html = response_html(missing_state).await;
+        assert!(missing_html.contains("data-auth-recovery"));
+        assert_eq!(missing_html.matches("<a href=").count(), 1);
+        assert!(missing_html.contains(r#"href="/auth/login""#));
+        assert!(!missing_html.contains("unknown or expired login"));
+
+        let (state, flow_cookie) = begin_login(&auth_state, &provider, "/services").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+        let accepted = callback(
+            State(auth_state.clone()),
+            headers.clone(),
+            callback_params(Some("single-use"), Some(state.clone()), None),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+
+        let replay = callback(
+            State(auth_state.clone()),
+            headers,
+            callback_params(Some("single-use"), Some(state), None),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        assert!(response_html(replay).await.contains("Start sign-in again"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_tabs_supersede_deterministically_without_breaking_the_newer_flow() {
+        let (provider, server) = start_mock_oidc().await;
+        let auth_state = auth_for_provider(&provider).await;
+        let (older_state, _older_cookie) = begin_login(&auth_state, &provider, "/services").await;
+        let (newer_state, newer_cookie) = begin_login(&auth_state, &provider, "/backups").await;
+
+        let mut newer_headers = HeaderMap::new();
+        newer_headers.insert(header::COOKIE, newer_cookie.parse().unwrap());
+        let superseded = callback(
+            State(auth_state.clone()),
+            newer_headers.clone(),
+            callback_params(Some("older-code"), Some(older_state), None),
+        )
+        .await;
+        assert_eq!(superseded.status(), StatusCode::BAD_REQUEST);
+        let superseded_html = response_html(superseded).await;
+        assert!(superseded_html.contains(r#"href="/auth/login?return_to=%2Fservices""#));
+
+        let newer = callback(
+            State(auth_state.clone()),
+            newer_headers,
+            callback_params(Some("newer-code"), Some(newer_state), None),
+        )
+        .await;
+        assert_eq!(newer.status(), StatusCode::SEE_OTHER);
+        assert_eq!(newer.headers().get(header::LOCATION).unwrap(), "/backups");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn restart_during_login_recovers_instead_of_dead_ending() {
+        let (provider, server) = start_mock_oidc().await;
+        let before_restart = auth_for_provider(&provider).await;
+        let (state, flow_cookie) = begin_login(&before_restart, &provider, "/settings").await;
+        let after_restart = auth_for_provider(&provider).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+
+        let response = callback(
+            State(after_restart),
+            headers,
+            callback_params(Some("unused-after-restart"), Some(state), None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let html = response_html(response).await;
+        assert!(html.contains("Pharos may have restarted"));
+        assert!(html.contains(r#"href="/auth/login?return_to=%2Fsettings""#));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn missing_session_uses_get_recovery_without_replaying_post_routes() {
+        let (provider, oidc_server) = start_mock_oidc().await;
+        let auth_state = auth_for_provider(&provider).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/services",
+                get(|| async { "services" }).post(|| async { "changed" }),
+            )
+            .route_layer(middleware::from_fn_with_state(auth_state, guard));
+        let app_server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let get_response = client
+            .get(format!("http://{address}/services?view=managed"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            get_response.headers().get(header::LOCATION).unwrap(),
+            "/auth/login?return_to=%2Fservices%3Fview%3Dmanaged"
+        );
+
+        let post_response = client
+            .post(format!("http://{address}/services"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(post_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            post_response.headers().get(header::LOCATION).unwrap(),
+            "/auth/login"
+        );
+
+        app_server.abort();
+        let _ = app_server.await;
+        oidc_server.abort();
+        let _ = oidc_server.await;
+    }
+
+    #[tokio::test]
+    async fn provider_failures_are_classified_and_keep_a_one_click_recovery_path() {
+        let (provider, server) = start_mock_oidc().await;
+        let auth_state = auth_for_provider(&provider).await;
+
+        for (mode, expected_status, expected_copy) in [
+            (
+                MockTokenMode::ProviderReject,
+                StatusCode::UNAUTHORIZED,
+                "identity provider did not accept",
+            ),
+            (
+                MockTokenMode::Malformed,
+                StatusCode::BAD_GATEWAY,
+                "unexpected response",
+            ),
+            (
+                MockTokenMode::MissingIdToken,
+                StatusCode::BAD_GATEWAY,
+                "unexpected response",
+            ),
+            (
+                MockTokenMode::InvalidIdToken,
+                StatusCode::UNAUTHORIZED,
+                "could not verify",
+            ),
+        ] {
+            *provider.token_mode.lock().unwrap() = mode;
+            let (state, flow_cookie) =
+                begin_login(&auth_state, &provider, "/settings/providers").await;
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+            let response = callback(
+                State(auth_state.clone()),
+                headers,
+                callback_params(Some("fixture-code"), Some(state), None),
+            )
+            .await;
+            assert_eq!(response.status(), expected_status);
+            let html = response_html(response).await;
+            assert!(html.contains(expected_copy));
+            assert!(html.contains(r#"href="/auth/login?return_to=%2Fsettings%2Fproviders""#));
+            assert_eq!(html.matches("<a href=").count(), 1);
+        }
+
+        *provider.token_mode.lock().unwrap() = MockTokenMode::Success;
+        let (state, flow_cookie) = begin_login(&auth_state, &provider, "/").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+        let authorization_rejection = callback(
+            State(auth_state.clone()),
+            headers,
+            callback_params(None, Some(state), Some("access_denied")),
+        )
+        .await;
+        assert_eq!(authorization_rejection.status(), StatusCode::UNAUTHORIZED);
+
+        let (state, flow_cookie) = begin_login(&auth_state, &provider, "/").await;
+        server.abort();
+        let _ = server.await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
+        let transport_failure = callback(
+            State(auth_state),
+            headers,
+            callback_params(Some("fixture-code"), Some(state), None),
+        )
+        .await;
+        assert_eq!(transport_failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response_html(transport_failure)
+            .await
+            .contains("could not reach the identity provider"));
     }
 
     #[test]
