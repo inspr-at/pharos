@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.76 - 2026-08-08
+
+- Report the age and channel of the nixpkgs a host is actually built from, rather than the oldest input whose name resembles nixpkgs, so an unreferenced or transitive stale input no longer reads as a patching gap on an otherwise current host.
+
 ## 0.1.75 - 2026-08-08
 
 - Report the age of the oldest nixpkgs input and the release channel it tracks, so a frozen nixpkgs no longer reads as fresh because some other flake input moved recently.
