@@ -237,11 +237,25 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
+    // PHAROS-194: the removal dialog must name credential retirement before the
+    // operator confirms. An unavailable generation is reported as unmanaged here;
+    // the removal endpoint still fails closed on the same lookup.
+    let janus_managed_hosts: BTreeSet<String> = hosts
+        .iter()
+        .filter(|host| {
+            state
+                .beacon_auth
+                .janus_manages_host(&host.name)
+                .unwrap_or(false)
+        })
+        .map(|host| host.name.clone())
+        .collect();
     no_store_html(render_home_with_capabilities(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
             declared_preferences: Some(&declared_preferences),
+            janus_managed_hosts: Some(&janus_managed_hosts),
         },
         &self_host(),
         now_unix(),
@@ -335,6 +349,7 @@ pub(super) async fn alerts_page(
             hosts: &hosts,
             jobs: &jobs,
             declared_preferences: None,
+            janus_managed_hosts: None,
         },
         &self_host(),
         now,
@@ -388,6 +403,7 @@ pub(super) async fn activity_page(
             hosts: &hosts,
             jobs: &jobs,
             declared_preferences: None,
+            janus_managed_hosts: None,
         },
         &self_host(),
         now,
@@ -1157,9 +1173,10 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
         .unwrap_or("not reported");
 
     format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-settings-href="{settings_href}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending" href="{settings_href}"{review_hidden}>{clock}<span><strong>Review pending change</strong><span>See what is waiting for this host</span></span></a><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-settings-href="{settings_href}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending" href="{settings_href}"{review_hidden}>{clock}<span><strong>Review pending change</strong><span>See what is waiting for this host</span></span></a><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
         is_nix = host.is_nix,
         declared = context.declared,
+        credential_retirement = context.credential_retirement_required,
         janus_ready = janus_ready,
         can_manage_fleet = capabilities.can_manage_fleet,
         system_update_available = capabilities.system_update_available,
@@ -2510,6 +2527,9 @@ pub(super) struct RuntimeSnapshot<'a> {
     pub(super) hosts: &'a [Host],
     pub(super) jobs: &'a [ProvisioningJob],
     pub(super) declared_preferences: Option<&'a BTreeMap<String, HostPreferences>>,
+    /// PHAROS-194: hosts whose beacon credential Janus owns, so removal must also
+    /// retire that credential. Independent of whether the host is declared.
+    pub(super) janus_managed_hosts: Option<&'a BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2523,6 +2543,7 @@ pub(super) struct FleetCapabilities {
 pub(super) struct HostActionRenderContext<'a> {
     pub(super) manifest: Option<&'a HostManifest>,
     pub(super) declared: bool,
+    pub(super) credential_retirement_required: bool,
     pub(super) settings_state: HostPreferencesState,
     pub(super) settings_href: &'a str,
     pub(super) backup: &'a BackupUiSummary,
@@ -5895,12 +5916,16 @@ pub(super) fn render_home_with_capabilities(
             settings_title = html_escape(&settings_title),
         );
         let declared = manifest.is_some() || declared_preferences.is_some();
+        let credential_retirement_required = runtime
+            .janus_managed_hosts
+            .is_some_and(|managed| managed.contains(&h.name));
         let card_host_actions = if can_onboard {
             host_actions_markup(
                 h,
                 HostActionRenderContext {
                     manifest,
                     declared,
+                    credential_retirement_required,
                     settings_state,
                     settings_href: &settings_href_raw,
                     backup: &backup,
@@ -5917,6 +5942,7 @@ pub(super) fn render_home_with_capabilities(
                 HostActionRenderContext {
                     manifest,
                     declared,
+                    credential_retirement_required,
                     settings_state,
                     settings_href: &settings_href_raw,
                     backup: &backup,

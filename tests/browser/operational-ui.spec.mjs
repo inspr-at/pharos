@@ -413,3 +413,85 @@ test("managed service secrets stay value-free, accessible, and narrow-screen saf
   );
   expect(overflow).toBeLessThanOrEqual(1);
 });
+
+test("removal dialog names credential retirement for an undeclared Janus-managed host", async ({
+  page,
+}) => {
+  // The shared removal dialog is only rendered once the fleet has a host, so
+  // onboard a throwaway one and hand it back at the end of the test.
+  const host = "browser-remove-copy";
+  const report = await page.request.post("/report", {
+    data: {
+      schema: "inspr.pharos.host-report.v2",
+      version: 2,
+      name: host,
+      role: "server",
+      is_nix: false,
+      heartbeat_interval_secs: 60,
+      freshness: { applicable: false },
+    },
+  });
+  expect(report.status()).toBe(204);
+
+  await page.goto("/");
+  await expect(page.locator("[data-host-action-overlay]")).toHaveCount(1);
+
+  const scopeFor = async (dataset) =>
+    page.evaluate((attributes) => {
+      const root = document.createElement("span");
+      root.setAttribute("data-host-actions", "");
+      Object.assign(root.dataset, {
+        host: "dsc0",
+        backupLabel: "Not observed",
+        kernelState: "current",
+        ...attributes,
+      });
+      document.body.append(root);
+      try {
+        openHostActionDialog("remove", root);
+        const overlay = document.querySelector("[data-host-action-overlay]");
+        return {
+          scope: overlay.querySelector('[data-host-action-fact="scope"]')?.textContent,
+          infoTitle: overlay.querySelector("[data-host-action-info-title]")?.textContent,
+          infoCopy: overlay.querySelector("[data-host-action-info-copy]")?.textContent,
+        };
+      } finally {
+        root.remove();
+      }
+    }, dataset);
+
+  // PHAROS-194: the case that used to be labelled registration-only and then
+  // failed with a 409 must now state the credential retirement up front.
+  const janusOnly = await scopeFor({ declared: "false", credentialRetirement: "true" });
+  expect(janusOnly.scope).toBe("Pharos registration + Janus credential retirement");
+  expect(janusOnly.infoTitle).toBe("Credential retirement required");
+  expect(janusOnly.infoCopy).toContain("retired");
+
+  const both = await scopeFor({ declared: "true", credentialRetirement: "true" });
+  expect(both.scope).toBe(
+    "Pharos registration + nixcfg review + Janus credential retirement",
+  );
+
+  const runtimeOnly = await scopeFor({ declared: "false", credentialRetirement: "false" });
+  expect(runtimeOnly.scope).toBe("Pharos registration only");
+  expect(runtimeOnly.infoTitle).toBe("Runtime-only removal");
+
+  await page.evaluate(() => closeHostActionDialog());
+
+  // Return the fleet to empty so the rest of the suite sees its usual state.
+  const removal = await page.request.post(
+    `/host-actions/${host}/remove`,
+    {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host, disposition: "unmanaged", successor: null },
+    },
+  );
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+  await page.goto("/");
+  await expect(page.locator("[data-host-action-overlay]")).toHaveCount(0);
+});

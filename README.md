@@ -298,6 +298,12 @@ is an explicitly confirmed cleanup endpoint for the single Hetzner server
 recorded by an incomplete provisioning job. Uncertain provider responses remain
 visible for operator review.
 
+Declarative cleanup and credential retirement are independent stages, because a
+declared manifest and a Janus-issued beacon credential come from separate
+sources. A removal runs whichever stages apply, the dialog names them before
+confirmation, and the host stays durably visible as a pending removal until
+every applicable stage completes.
+
 ### 7. The browser boundary is deny-by-default
 
 Every response carries anti-framing, MIME-sniffing, referrer, permissions,
