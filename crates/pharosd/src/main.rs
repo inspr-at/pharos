@@ -1442,7 +1442,10 @@ async fn allow_host_reonboarding(
     )
 }
 
-fn reconcile_completed_removals(state: &AppState, now: i64) {
+/// Returns how many removals newly reached a terminal state on this pass.
+/// Callers ignore it; tests use it to prove the pass is idempotent.
+fn reconcile_completed_removals(state: &AppState, now: i64) -> usize {
+    let mut transitions = 0usize;
     for retired in state.retired_hosts.list() {
         if state
             .host_actions
@@ -1467,16 +1470,21 @@ fn reconcile_completed_removals(state: &AppState, now: i64) {
         // A Janus-managed host can have no declaration left to remove while its
         // credential retirement is still outstanding, and removing it here would
         // hide that unfinished work behind an apparently completed removal.
-        let completed = match state
+        let (completed, transitioned) = match state
             .host_actions
             .complete_removal(&retired.removal_job_id, now)
         {
-            Ok(Some(_)) => true,
+            Ok(Some(_)) => (true, true),
             // Already terminal from an earlier pass whose durable cleanup failed.
-            Ok(None) => state
-                .host_actions
-                .get(&retired.removal_job_id)
-                .is_some_and(|job| job.state == HostActionState::Succeeded),
+            // Retry that cleanup, but do not re-announce a finished transition:
+            // retirement records are durable, so this branch repeats forever.
+            Ok(None) => (
+                state
+                    .host_actions
+                    .get(&retired.removal_job_id)
+                    .is_some_and(|job| job.state == HostActionState::Succeeded),
+                false,
+            ),
             Err(_) => {
                 tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciliation could not be persisted");
                 continue;
@@ -1489,8 +1497,12 @@ fn reconcile_completed_removals(state: &AppState, now: i64) {
             tracing::warn!(host = %retired.host, error = %error, ticket = "PHAROS-163", "declarative host removal could not be persisted");
             continue;
         }
-        tracing::info!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciled");
+        if transitioned {
+            transitions += 1;
+            tracing::info!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciled");
+        }
     }
+    transitions
 }
 
 fn agent_authorized(state: &AppState, headers: &HeaderMap, host: &str) -> Result<(), StatusCode> {
@@ -1670,7 +1682,7 @@ async fn claim_retirement_action(
     if let Err(status) = retirement_owner_authorized(&state, &headers, &owner) {
         return status.into_response();
     }
-    reconcile_completed_removals(&state, now_unix());
+    let _ = reconcile_completed_removals(&state, now_unix());
     match state.host_actions.claim_retirement(&owner, now_unix()) {
         Ok(Some(lease)) => (StatusCode::OK, Json(lease)).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
@@ -3476,7 +3488,7 @@ async fn main() {
         retired_hosts,
         alert_health,
     };
-    reconcile_completed_removals(&state, now_unix());
+    let _ = reconcile_completed_removals(&state, now_unix());
     spawn_alert_loop(state.clone(), alert_notifier);
 
     let app = build_router(state);
@@ -12642,7 +12654,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(state.store.get("dsc0").is_some());
 
         // Reconciliation must not shortcut the unfinished checklist either.
-        reconcile_completed_removals(&state, now_unix());
+        assert_eq!(reconcile_completed_removals(&state, now_unix()), 0);
         assert!(state.store.get("dsc0").is_some());
         let job = state
             .host_actions
@@ -12690,6 +12702,72 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(state.store.get("dsc0").is_none());
 
         let _ = std::fs::remove_dir_all(generation_root);
+    }
+
+    /// PHAROS-194: retirement records are durable, so reconciliation keeps
+    /// revisiting terminal removals. Only the pass that actually completes one
+    /// may announce it; later passes must stay silent and stable.
+    #[tokio::test]
+    async fn completed_removal_reconciliation_announces_each_removal_once() {
+        let state = report_test_state(true);
+        register_test_token(&state, "gpc0", "remove-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
+        let job = state
+            .host_actions
+            .begin_removal(
+                "gpc0",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Unmanaged,
+                    successor: None,
+                    declaration_pending: true,
+                    credential_retirement_required: false,
+                },
+                100,
+            )
+            .expect("removal recorded");
+        state
+            .retired_hosts
+            .retire(RetiredHost {
+                host: "gpc0".to_string(),
+                requested_by: "markus".to_string(),
+                removal_job_id: job.id.clone(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
+                declaration_pending: true,
+                retired_at: 100,
+            })
+            .expect("retirement recorded");
+
+        // The declaration is gone, so this pass finishes the removal exactly once.
+        assert_eq!(reconcile_completed_removals(&state, now_unix()), 1);
+        assert!(state.store.get("gpc0").is_none());
+        assert_eq!(
+            state
+                .host_actions
+                .get(&job.id)
+                .expect("completed removal")
+                .state,
+            HostActionState::Succeeded
+        );
+
+        // The durable retirement record survives, and further passes are quiet.
+        assert!(state.retired_hosts.is_retired("gpc0"));
+        for _ in 0..3 {
+            assert_eq!(reconcile_completed_removals(&state, now_unix()), 0);
+        }
+        assert!(state.store.get("gpc0").is_none());
+        assert_eq!(
+            state
+                .host_actions
+                .get(&job.id)
+                .expect("completed removal")
+                .state,
+            HostActionState::Succeeded
+        );
     }
 
     #[tokio::test]
