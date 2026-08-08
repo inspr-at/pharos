@@ -1554,6 +1554,8 @@ mod tests {
                 applicable: true,
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(0),
+                nixpkgs_age_days: None,
+                nixpkgs_channel: None,
             },
             kernel: None,
             service_observations: vec![],

@@ -90,15 +90,23 @@ layer. There is no separate frontend build or client framework.
 | --- | --- |
 | `pharos-core` | Versioned host, report, liveness, preferences, provisioning and manifest contracts shared by server and agent |
 | `pharosd` | Fleet store, OIDC guard, machine APIs, server-rendered dashboard, provider connections and guarded workflows |
-| `pharos-beacon` | Small per-host reporter for heartbeat, Nix freshness, kernel, backup, location and bounded service observations |
+| `pharos-beacon` | Small per-host reporter for heartbeat, Nix freshness (including nixpkgs age and its release channel), kernel, backup, location and bounded service observations |
 
 The shared Rust contracts matter: server and beacon cannot silently drift onto
 different report schemas. The current report contract is
-`inspr.pharos.host-report.v2`; the local onboarding envelope is
+`inspr.pharos.host-report.v3`; the local onboarding envelope is
 `inspr.pharos.host-registration.v1`. Both require explicit schema/version
 fields and reject extensions. Reports are limited to 64 KiB, heartbeat cadence
 is 10–3600 seconds, and all identities, freshness values, and observation text
 are bounded before persistence or alerting.
+
+Nix freshness reports the age of the oldest nixpkgs input and the release
+channel it tracks, not only the age of the newest input in `flake.lock`. The
+newest input answers "when was this flake last updated" and reads as fresh the
+moment any trivial input moves, which hides a frozen nixpkgs. The beacon reports
+the observed channel and the control plane applies the release calendar, so an
+end-of-life channel becomes a distinct louder signal than any age number and a
+newly expired release needs no fleet-wide beacon roll.
 
 For an ordered fleet rollout, the control plane accepts the current report
 contract and exactly its immediate predecessor. Deploy the new control plane
