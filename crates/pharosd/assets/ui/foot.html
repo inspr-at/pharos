@@ -207,7 +207,14 @@ function openHostActionDialog(action,root,returnFocus){
       infoTitle.textContent='Beacon access revoked';
       infoCopy.textContent='The host remains visible so this unfinished removal cannot be mistaken for completion.';
       const dispositionLabel={destroyed:'Host no longer exists',unmanaged:'Host remains unmanaged',rebuilt:'Replaced by '+root.dataset.retirementSuccessor}[root.dataset.retirementDisposition]||'Lifecycle recorded';
-      setHostActionFact('scope',dispositionLabel+' · waiting for nixcfg removal',true);
+      const waitingFor=[];
+      if(root.dataset.retirementDeclarationPending==='true')waitingFor.push('nixcfg removal');
+      if(root.dataset.retirementCredentialPending==='true')waitingFor.push('Janus credential retirement');
+      setHostActionFact('scope',dispositionLabel+(waitingFor.length?' · waiting for '+waitingFor.join(' and '):''),true);
+      if(waitingFor.length===1&&root.dataset.retirementCredentialPending==='true'){
+        copy.textContent='Pharos has revoked this host’s reporting access. The server and its data remain untouched while Janus retires its beacon credential.';
+        infoCopy.textContent='The host remains visible until the credential is retired, so this unfinished removal cannot be mistaken for completion.';
+      }
       if(primary)primary.hidden=true;
       if(cancel)cancel.textContent='Close';
       if(status)status.textContent='Removal is still pending.';
@@ -215,11 +222,23 @@ function openHostActionDialog(action,root,returnFocus){
     title.textContent='Remove '+root.dataset.host+' from Pharos?';
     copy.textContent='Pharos will stop managing and accepting reports from this host. The server, disks, services, and application data stay untouched.';
     const needsCleanup=root.dataset.declared==='true';
-    infoTitle.textContent=needsCleanup?'Nix cleanup review required':'Runtime-only removal';
-    infoCopy.textContent=needsCleanup
-      ?'A nixcfg proposal must remove the declaration. Until it is applied, Pharos keeps the removal visibly pending.'
-      :'The runtime registration and beacon access will be revoked after confirmation.';
-    setHostActionFact('scope',needsCleanup?'Pharos registration + nixcfg review':'Pharos registration only',true);
+    // PHAROS-194: declarative cleanup and credential retirement are independent.
+    // Name every stage this removal will actually run before confirmation.
+    const needsCredentialRetirement=root.dataset.credentialRetirement==='true';
+    if(needsCleanup){
+      infoTitle.textContent='Nix cleanup review required';
+      infoCopy.textContent='A nixcfg proposal must remove the declaration. Until it is applied, Pharos keeps the removal visibly pending.';
+    }else if(needsCredentialRetirement){
+      infoTitle.textContent='Credential retirement required';
+      infoCopy.textContent='Janus owns this host’s beacon credential. Reporting access stops on confirmation, and Pharos keeps the removal visibly pending until that credential is retired.';
+    }else{
+      infoTitle.textContent='Runtime-only removal';
+      infoCopy.textContent='The runtime registration and beacon access will be revoked after confirmation.';
+    }
+    const scopeParts=['Pharos registration'];
+    if(needsCleanup)scopeParts.push('nixcfg review');
+    if(needsCredentialRetirement)scopeParts.push('Janus credential retirement');
+    setHostActionFact('scope',scopeParts.length>1?scopeParts.join(' + '):'Pharos registration only',true);
     if(dispositionField)dispositionField.hidden=false;
     if(confirm)confirm.hidden=false;
     if(removeName)removeName.textContent=root.dataset.host;
@@ -450,6 +469,8 @@ function updateHostActionState(surface,host,backup){
   root.dataset.retired=retirement?.pending===true?'true':'false';
   root.dataset.retirementDisposition=String(retirement?.disposition||'');
   root.dataset.retirementSuccessor=String(retirement?.successor||'');
+  root.dataset.retirementDeclarationPending=retirement?.declaration_pending===true?'true':'false';
+  root.dataset.retirementCredentialPending=retirement?.credential_retirement_pending===true?'true':'false';
   if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(workflow?.kind||job.kind||'');root.dataset.actionState=String(job.state||'')}
   else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
   if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}

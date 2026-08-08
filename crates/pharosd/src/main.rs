@@ -1237,12 +1237,10 @@ async fn request_host_removal(
             "Move retirement ownership to another host before removing this owner",
         );
     }
-    if credential_retirement_required && !declaration_pending {
-        return action_error(
-            StatusCode::CONFLICT,
-            "This Janus-managed host needs a declared retirement path before removal",
-        );
-    }
+    // PHAROS-194: a Janus-issued credential and a declared manifest come from
+    // independent sources, so a managed host can legitimately be undeclared.
+    // Such a removal still runs the full credential retirement checklist; it is
+    // the declarative cleanup that is not required.
     let removal_plan = HostRemovalPlan {
         disposition: request.disposition,
         successor,
@@ -1347,7 +1345,10 @@ async fn request_host_removal(
             );
         }
     };
-    if !declaration_pending {
+    // PHAROS-194: keep the host durably visible while any part of the removal is
+    // still outstanding. Dropping it here while credential retirement is pending
+    // would hide an unfinished workflow behind an apparently completed removal.
+    if !declaration_pending && !credential_retirement_required {
         if let Err(error) = state.store.remove(&host) {
             tracing::error!(host = %host, error = %error, "retired host could not be removed from the durable fleet store");
             return action_response_with_message(
@@ -1357,7 +1358,7 @@ async fn request_host_removal(
             );
         }
     }
-    tracing::info!(host = %host, actor = %actor, declaration_pending, disposition = ?removal_plan.disposition, successor = ?removal_plan.successor, ticket = "PHAROS-127", "host removal requested and beacon access revoked");
+    tracing::info!(host = %host, actor = %actor, declaration_pending, credential_retirement_required, disposition = ?removal_plan.disposition, successor = ?removal_plan.successor, ticket = "PHAROS-127", "host removal requested and beacon access revoked");
     action_response(StatusCode::ACCEPTED, &job)
 }
 
@@ -1462,22 +1463,33 @@ fn reconcile_completed_removals(state: &AppState, now: i64) {
             tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "declarative removal completion could not be persisted");
             continue;
         }
+        // PHAROS-194: complete the checklist before dropping the durable record.
+        // A Janus-managed host can have no declaration left to remove while its
+        // credential retirement is still outstanding, and removing it here would
+        // hide that unfinished work behind an apparently completed removal.
+        let completed = match state
+            .host_actions
+            .complete_removal(&retired.removal_job_id, now)
+        {
+            Ok(Some(_)) => true,
+            // Already terminal from an earlier pass whose durable cleanup failed.
+            Ok(None) => state
+                .host_actions
+                .get(&retired.removal_job_id)
+                .is_some_and(|job| job.state == HostActionState::Succeeded),
+            Err(_) => {
+                tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciliation could not be persisted");
+                continue;
+            }
+        };
+        if !completed {
+            continue;
+        }
         if let Err(error) = state.store.remove(&retired.host) {
             tracing::warn!(host = %retired.host, error = %error, ticket = "PHAROS-163", "declarative host removal could not be persisted");
             continue;
         }
-        match state
-            .host_actions
-            .complete_removal(&retired.removal_job_id, now)
-        {
-            Ok(Some(_)) => {
-                tracing::info!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciled");
-            }
-            Ok(None) => {}
-            Err(_) => {
-                tracing::warn!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciliation could not be persisted");
-            }
-        }
+        tracing::info!(host = %retired.host, ticket = "PHAROS-127", "declarative host removal reconciled");
     }
 }
 
@@ -2135,11 +2147,24 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
                 host["host_action"] = serde_json::to_value(action.summary()).unwrap_or_default();
             }
             if let Some(retired) = state.retired_hosts.get(&name) {
+                // PHAROS-194: a pending removal can be waiting on declarative
+                // cleanup, credential retirement, or both. Name which one.
+                let credential_retirement_pending = state
+                    .host_actions
+                    .get(&retired.removal_job_id)
+                    .is_some_and(|job| {
+                        job.state != HostActionState::Succeeded
+                            && job
+                                .removal_plan
+                                .as_ref()
+                                .is_some_and(|plan| plan.credential_retirement_required)
+                    });
                 host["retirement"] = json!({
                     "pending": true,
                     "disposition": retired.disposition,
                     "successor": retired.successor,
                     "declaration_pending": retired.declaration_pending,
+                    "credential_retirement_pending": credential_retirement_pending,
                     "retired_at": retired.retired_at,
                 });
             }
@@ -3849,6 +3874,7 @@ mod tests {
             hosts,
             jobs,
             declared_preferences: None,
+            janus_managed_hosts: None,
         }
     }
 
@@ -4707,6 +4733,7 @@ mod tests {
             HostActionRenderContext {
                 manifest: Some(&manifest),
                 declared: true,
+                credential_retirement_required: false,
                 settings_state: HostPreferencesState::Applied,
                 settings_href: "/agora?host=hsb8",
                 backup: &backup,
@@ -4731,6 +4758,7 @@ mod tests {
             HostActionRenderContext {
                 manifest: None,
                 declared: false,
+                credential_retirement_required: false,
                 settings_state: HostPreferencesState::Applied,
                 settings_href: "/agora?host=hsb8",
                 backup: &backup,
@@ -4745,6 +4773,31 @@ mod tests {
         );
         assert!(runtime_only_markup.contains(r#"data-host-action="remove"><svg"#));
         assert!(runtime_only_markup.contains(r#"data-declared="false""#));
+        assert!(runtime_only_markup.contains(r#"data-credential-retirement="false""#));
+
+        // PHAROS-194: an undeclared host can still be Janus-managed, and the
+        // removal dialog needs that fact before the operator confirms.
+        let janus_managed_markup = host_actions_markup(
+            &host,
+            HostActionRenderContext {
+                manifest: None,
+                declared: false,
+                credential_retirement_required: true,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: false,
+                    host_removal_available: false,
+                },
+            },
+        );
+        assert!(janus_managed_markup.contains(r#"data-declared="false""#));
+        assert!(janus_managed_markup.contains(r#"data-credential-retirement="true""#));
+        assert!(janus_managed_markup.contains(r#"data-host-action="remove"><svg"#));
 
         let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
         pending_update.freshness.commits_behind = Some(2);
@@ -4760,6 +4813,7 @@ mod tests {
             HostActionRenderContext {
                 manifest: Some(&ready_manifest),
                 declared: true,
+                credential_retirement_required: false,
                 settings_state: HostPreferencesState::Applied,
                 settings_href: "/agora?host=hsb8",
                 backup: &backup,
@@ -6741,6 +6795,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 hosts: &hosts,
                 jobs: &[],
                 declared_preferences: Some(&declarations),
+                janus_managed_hosts: None,
             },
             "csb1",
             1000,
@@ -12529,6 +12584,165 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let _ = std::fs::remove_dir_all(generation_root);
         let _ = std::fs::remove_file(manifest_path);
+    }
+
+    /// PHAROS-194: a Janus-issued credential and a declared manifest come from
+    /// independent sources. An undeclared managed host must still be removable,
+    /// and must stay durably visible until its credential is retired.
+    fn janus_managed_undeclared_state() -> (PathBuf, AppState) {
+        let (generation_root, janus_tokens) =
+            janus_test_store(&[("dsc0", "beacon-token"), ("own0", "owner-token")]);
+        let mut state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Janus,
+            janus_tokens: Some(janus_tokens),
+            local_register_enabled: false,
+        });
+        state.retirement_owner = RetirementOwnerAuth {
+            owner_host: Some("own0".to_string()),
+        };
+        for host in ["dsc0", "own0"] {
+            state
+                .store
+                .record(test_report(host), now_unix())
+                .expect("test report persists");
+        }
+        assert!(!host_is_declared(&state, "dsc0"));
+        (generation_root, state)
+    }
+
+    #[tokio::test]
+    async fn janus_managed_host_without_a_declaration_can_be_removed_and_retired() {
+        let (generation_root, state) = janus_managed_undeclared_state();
+
+        let (status, Json(payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "dsc0".to_string(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "removal_pending");
+        assert_eq!(payload["job"]["removal_plan"]["declaration_pending"], false);
+        assert_eq!(
+            payload["job"]["removal_plan"]["credential_retirement_required"],
+            true
+        );
+        assert!(state.retired_hosts.is_retired("dsc0"));
+        // Beacon access is revoked immediately, but the host stays durably
+        // visible so the outstanding credential retirement cannot be mistaken
+        // for a finished removal.
+        assert!(state.store.get("dsc0").is_some());
+
+        // Reconciliation must not shortcut the unfinished checklist either.
+        reconcile_completed_removals(&state, now_unix());
+        assert!(state.store.get("dsc0").is_some());
+        let job = state
+            .host_actions
+            .latest_for_host("dsc0")
+            .expect("removal checklist retained");
+        assert_eq!(job.state, HostActionState::RemovalPending);
+
+        assert_eq!(
+            claim_retirement_action(
+                State(state.clone()),
+                bearer_headers("owner-token"),
+                Json(RetirementAgentClaimRequest {
+                    owner: "own0".to_string(),
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            record_retirement_action_result(
+                State(state.clone()),
+                bearer_headers("owner-token"),
+                AxumPath(job.id.clone()),
+                Json(RetirementAgentResultRequest {
+                    owner: "own0".to_string(),
+                    host: "dsc0".to_string(),
+                    outcome: host_actions::RetirementAgentOutcome::Succeeded,
+                    reason: None,
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        assert_eq!(
+            state
+                .host_actions
+                .get(&job.id)
+                .expect("completed retirement")
+                .state,
+            HostActionState::Succeeded
+        );
+        assert!(state.store.get("dsc0").is_none());
+
+        let _ = std::fs::remove_dir_all(generation_root);
+    }
+
+    #[tokio::test]
+    async fn janus_managed_undeclared_removal_still_fails_closed_on_real_invariants() {
+        let (generation_root, mut state) = janus_managed_undeclared_state();
+
+        let unconfigured = std::mem::take(&mut state.retirement_owner);
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "dsc0".to_string(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!state.retired_hosts.is_retired("dsc0"));
+        state.retirement_owner = unconfigured;
+
+        // The retirement owner itself still cannot be removed.
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("own0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "own0".to_string(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!state.retired_hosts.is_retired("own0"));
+
+        // A mistyped confirmation is still refused.
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "dsc".to_string(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!state.retired_hosts.is_retired("dsc0"));
+
+        let _ = std::fs::remove_dir_all(generation_root);
     }
 
     #[tokio::test]
