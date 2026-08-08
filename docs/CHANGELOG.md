@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.75 - 2026-08-08
+
+- Report the age of the oldest nixpkgs input and the release channel it tracks, so a frozen nixpkgs no longer reads as fresh because some other flake input moved recently.
+- Flag an end-of-life NixOS release channel as a distinct signal that outranks any age number, classified by the control plane so a newly expired release needs no fleet-wide beacon roll.
+- Move the host report contract to `inspr.pharos.host-report.v3`, keeping v2 as the accepted predecessor; deploy the control plane before rolling beacons.
+
 ## 0.1.74 - 2026-08-08
 
 - Announce a completed host-removal reconciliation once instead of on every reconciliation pass, so a durable retirement record no longer emits a steady operational log line after its removal has finished.
