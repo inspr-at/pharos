@@ -121,7 +121,10 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: inspr-at/janus
-          ref: 37f94e34c50587952ac53b7ff2db80e85801f06e
+          # PHAROS-195: go-envelope-v1.178, the version deployed in production.
+          # Keep this at or ahead of the deployed Janus line, otherwise the
+          # contract check proves compatibility against a producer nobody runs.
+          ref: b40026f00b232b60237ed37349e8cd6e071be156
           path: janus
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
