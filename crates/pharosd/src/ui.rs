@@ -1237,8 +1237,12 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
         } else {
             " hidden"
         };
+    // PHAROS-197: a removal needs the nixcfg proposal whenever it must remove a
+    // declaration or record a retirement intent. Offering it without a working
+    // dispatch would only produce a refusal.
+    let needs_removal_proposal = context.declared || context.credential_retirement_required;
     let remove_hidden = if capabilities.can_manage_fleet
-        && (!context.declared || capabilities.host_removal_available)
+        && (!needs_removal_proposal || capabilities.host_removal_available)
     {
         ""
     } else {

@@ -485,7 +485,10 @@ function updateHostActionState(surface,host,backup){
   const updatePending=kernelState==='reboot_required'||commitsBehind>0;
   root.dataset.updatePending=updatePending?'true':'false';
   const retired=retirement?.pending===true;
-  const removalReady=root.dataset.declared!=='true'||hostRemovalAvailable;
+  // PHAROS-197: mirrors the server gate — a removal that must record a nixcfg
+  // declaration change or a retirement intent needs the proposal available.
+  const needsRemovalProposal=root.dataset.declared==='true'||root.dataset.credentialRetirement==='true';
+  const removalReady=!needsRemovalProposal||hostRemovalAvailable;
   if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
   if(restart){
     restart.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&(updatePending||updateJobActive));

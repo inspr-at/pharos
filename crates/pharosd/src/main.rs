@@ -1287,13 +1287,19 @@ async fn request_host_removal(
             );
         }
     };
-    if declaration_pending {
+    // PHAROS-197: the proposal is what records the retirement intent the
+    // retirement agent reads, so it is needed whenever a credential must be
+    // retired, not only when a declaration must be removed. Without it an
+    // undeclared Janus-managed host revokes reporting and then strands, failing
+    // credential retirement on every attempt with its credential still live.
+    if declaration_pending || credential_retirement_required {
         if let Err(error) = state
             .nixcfg_dispatch
             .dispatch_host_removal(
                 &host,
                 removal_plan.disposition.key(),
                 removal_plan.successor.as_deref(),
+                credential_retirement_required,
             )
             .await
         {
@@ -4813,7 +4819,30 @@ mod tests {
         );
         assert!(janus_managed_markup.contains(r#"data-declared="false""#));
         assert!(janus_managed_markup.contains(r#"data-credential-retirement="true""#));
-        assert!(janus_managed_markup.contains(r#"data-host-action="remove"><svg"#));
+        // PHAROS-197: this removal must record a retirement intent through the
+        // nixcfg proposal, so without that dispatch it is not offered at all
+        // rather than offered and then refused.
+        assert!(janus_managed_markup.contains(r#"data-host-action="remove" hidden"#));
+
+        let janus_managed_ready = host_actions_markup(
+            &host,
+            HostActionRenderContext {
+                manifest: None,
+                declared: false,
+                credential_retirement_required: true,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: false,
+                    host_removal_available: true,
+                },
+            },
+        );
+        assert!(janus_managed_ready.contains(r#"data-host-action="remove"><svg"#));
 
         let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
         pending_update.freshness.commits_behind = Some(2);
@@ -12625,6 +12654,56 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     /// PHAROS-194: a Janus-issued credential and a declared manifest come from
     /// independent sources. An undeclared managed host must still be removable,
     /// and must stay durably visible until its credential is retired.
+    /// PHAROS-197: a one-shot local endpoint standing in for the nixcfg
+    /// workflow dispatch, returning the request body it received.
+    fn mock_dispatch_endpoint() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock dispatch");
+        let address = listener.local_addr().expect("mock address");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length: ")
+                                .or_else(|| line.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        let _ = sender.send(body.to_string());
+                        break;
+                    }
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+            let _ = stream.flush();
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    fn dispatch_token_file() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-197-dispatch-token-{}-{}",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "test-dispatch-token\n").expect("write dispatch token fixture");
+        path
+    }
+
     fn janus_managed_undeclared_state() -> (PathBuf, AppState) {
         let (generation_root, janus_tokens) =
             janus_test_store(&[("dsc0", "beacon-token"), ("own0", "owner-token")]);
@@ -12648,9 +12727,48 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         (generation_root, state)
     }
 
+    /// PHAROS-197: the proposal records the retirement intent the retirement
+    /// agent reads, so without a working dispatch this removal must fail closed
+    /// rather than revoke reporting and strand the credential.
+    #[tokio::test]
+    async fn janus_managed_undeclared_removal_fails_closed_without_a_proposal() {
+        let (generation_root, state) = janus_managed_undeclared_state();
+        assert!(!state.nixcfg_dispatch.host_removal_available());
+
+        let (status, _) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(RemoveHostActionRequest {
+                confirmation: "dsc0".to_string(),
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(!state.retired_hosts.is_retired("dsc0"));
+        assert!(state.store.get("dsc0").is_some());
+        assert_eq!(
+            state
+                .host_actions
+                .latest_for_host("dsc0")
+                .expect("checklist retained")
+                .state,
+            HostActionState::Failed
+        );
+
+        let _ = std::fs::remove_dir_all(generation_root);
+    }
+
     #[tokio::test]
     async fn janus_managed_host_without_a_declaration_can_be_removed_and_retired() {
-        let (generation_root, state) = janus_managed_undeclared_state();
+        let (generation_root, mut state) = janus_managed_undeclared_state();
+        // PHAROS-197: a reachable proposal endpoint, so the retirement intent
+        // this removal depends on is actually requested.
+        let (api_base, dispatched) = mock_dispatch_endpoint();
+        state.nixcfg_dispatch = NixcfgDispatch::for_test(Some(dispatch_token_file()), api_base);
 
         let (status, Json(payload)) = request_host_removal(
             State(state.clone()),
@@ -12665,6 +12783,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
 
         assert_eq!(status, StatusCode::ACCEPTED);
+        // The proposal that records the retirement intent was requested, and it
+        // told nixcfg this is the undeclared credential-retirement case.
+        let body = dispatched
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("removal proposal dispatched");
+        assert!(body.contains("\"host\":\"dsc0\""), "{body}");
+        assert!(
+            body.contains("\"credential_retirement_required\":\"true\""),
+            "{body}"
+        );
         assert_eq!(payload["job"]["state"], "removal_pending");
         assert_eq!(payload["job"]["removal_plan"]["declaration_pending"], false);
         assert_eq!(

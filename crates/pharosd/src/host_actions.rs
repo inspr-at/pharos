@@ -153,7 +153,10 @@ impl RetirementFailureReason {
     fn label(self) -> &'static str {
         match self {
             Self::CheckoutNotReady => "reviewed checkout not ready",
-            Self::RetirementContractInvalid => "retirement contract invalid",
+            // PHAROS-197: the agent reports this when it finds no declared
+            // retirement intent for the host, which retrying cannot change.
+            // Name the missing artefact rather than the contract check.
+            Self::RetirementContractInvalid => "no declared retirement intent for this host",
             Self::JanusUnavailable => "Janus unavailable",
             Self::JanusRejected => "Janus rejected retirement",
             Self::ResultContractInvalid => "retirement result invalid",
