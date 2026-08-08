@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.73 - 2026-08-08
+
+- Allow removal of a Janus-managed host that has no declared manifest, which previously dead-ended on a conflict because declarative cleanup and credential retirement were treated as one stage.
+- Keep a retired host durably visible until every applicable removal stage completes, so an outstanding credential retirement can no longer be hidden behind an apparently finished removal.
+- Name declarative cleanup and credential retirement separately in the removal dialog before confirmation, replacing the registration-only scope previously shown for undeclared managed hosts.
+
 ## 0.1.72 - 2026-08-04
 
 - Replace dead-end OIDC callback failures with a branded, accessible one-action recovery flow that clears obsolete browser state and preserves only validated local return destinations.
