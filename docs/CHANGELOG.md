@@ -1,5 +1,9 @@
 # Pharos Changelog
 
+## 0.1.74 - 2026-08-08
+
+- Announce a completed host-removal reconciliation once instead of on every reconciliation pass, so a durable retirement record no longer emits a steady operational log line after its removal has finished.
+
 ## 0.1.73 - 2026-08-08
 
 - Allow removal of a Janus-managed host that has no declared manifest, which previously dead-ended on a conflict because declarative cleanup and credential retirement were treated as one stage.
