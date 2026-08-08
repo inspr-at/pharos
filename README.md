@@ -100,13 +100,17 @@ fields and reject extensions. Reports are limited to 64 KiB, heartbeat cadence
 is 10–3600 seconds, and all identities, freshness values, and observation text
 are bounded before persistence or alerting.
 
-Nix freshness reports the age of the oldest nixpkgs input and the release
-channel it tracks, not only the age of the newest input in `flake.lock`. The
-newest input answers "when was this flake last updated" and reads as fresh the
-moment any trivial input moves, which hides a frozen nixpkgs. The beacon reports
-the observed channel and the control plane applies the release calendar, so an
-end-of-life channel becomes a distinct louder signal than any age number and a
-newly expired release needs no fleet-wide beacon roll.
+Nix freshness reports the age of the nixpkgs the host's configuration is built
+from, and the release channel it tracks, rather than the age of the newest input
+in `flake.lock`. The newest input answers "when was this flake last updated" and
+reads as fresh the moment any trivial input moves, which hides a frozen nixpkgs.
+The reported input is the flake's own `nixpkgs`, not the oldest node whose name
+resembles it: a lock also carries other root inputs that may be unreferenced and
+transitive inputs of unrelated flakes, and reporting the worst of those describes
+the lock file rather than the host. The beacon reports the observed channel and
+the control plane applies the release calendar, so an end-of-life channel becomes
+a distinct louder signal than any age number and a newly expired release needs no
+fleet-wide beacon roll.
 
 For an ordered fleet rollout, the control plane accepts the current report
 contract and exactly its immediate predecessor. Deploy the new control plane

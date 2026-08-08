@@ -287,15 +287,20 @@ pub struct NixFreshness {
     pub flake_lock_age_days: Option<u32>,
     /// How many commits the running config is behind the host's nixcfg.
     pub commits_behind: Option<u32>,
-    /// PHAROS-193: age of the *oldest* nixpkgs-family input, which is the one
-    /// that actually carries security fixes. Worst case rather than average,
-    /// because a single frozen nixpkgs is what strands a host.
+    /// Age of the nixpkgs this host's configuration is built from, which is the
+    /// input that carries its security fixes.
+    ///
+    /// PHAROS-196: specifically the flake's own `nixpkgs` input, not the oldest
+    /// node whose name contains "nixpkgs". A lock also holds other root inputs
+    /// that may be unreferenced and transitive inputs of unrelated flakes;
+    /// reporting the worst of those describes the lock file, not the host, and
+    /// reads as a patching gap that does not exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs_age_days: Option<u32>,
-    /// PHAROS-193: the release channel that oldest nixpkgs input tracks, such
-    /// as `nixos-25.05`. The beacon reports the observed channel only; the
-    /// control plane decides whether it is end-of-life, so a newly expired
-    /// release needs no fleet-wide beacon roll.
+    /// PHAROS-193: the release channel that nixpkgs input tracks, such as
+    /// `nixos-25.05`. The beacon reports the observed channel only; the control
+    /// plane decides whether it is end-of-life, so a newly expired release
+    /// needs no fleet-wide beacon roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs_channel: Option<String>,
 }
@@ -5025,8 +5030,10 @@ mod tests {
 
     #[test]
     fn freshness_reports_nixpkgs_rather_than_the_newest_input() {
-        // The exact shape from the fleet: a trivial input moved today while
-        // nixpkgs sat frozen, so the old signal read as completely fresh.
+        // A host whose *system* nixpkgs is frozen on an expired release while a
+        // trivial input moved today, so the lock age alone reads as fresh.
+        // PHAROS-196: which input produces these numbers is the beacon's job;
+        // here the contract only has to escalate correctly once they arrive.
         let freshness = NixFreshness {
             applicable: true,
             flake_lock_age_days: Some(0),
