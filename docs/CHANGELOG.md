@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.77 - 2026-08-08
+
+- Request the nixcfg retirement proposal whenever a removal must retire a credential, not only when it must remove a declaration, so removing a Janus-managed host that nixcfg does not declare no longer revokes reporting and then strands with the credential live.
+- Fail such a removal closed when the proposal cannot be requested, and stop offering it in Fleet, instead of starting a removal that can never complete.
+- Report a stuck credential retirement as a missing declared retirement intent rather than an invalid contract, since retrying cannot change it.
+
 ## 0.1.76 - 2026-08-08
 
 - Report the age and channel of the nixpkgs a host is actually built from, rather than the oldest input whose name resembles nixpkgs, so an unreferenced or transitive stale input no longer reads as a patching gap on an otherwise current host.
