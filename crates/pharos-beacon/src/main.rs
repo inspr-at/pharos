@@ -436,30 +436,38 @@ fn nixpkgs_freshness(dir: &str) -> Option<(u32, Option<String>)> {
     let raw = std::fs::read_to_string(format!("{dir}/flake.lock")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let nodes = v.get("nodes")?.as_object()?;
-    let oldest = nodes
-        .iter()
-        .filter(|(name, _)| is_nixpkgs_input(name))
-        .filter_map(|(_, node)| {
-            let locked = node.get("locked")?;
-            let modified = locked.get("lastModified")?.as_i64()?;
-            // A dated channel is declared in `original`; `locked` carries the
-            // resolved revision, which is not a channel name.
-            let channel = node
-                .get("original")
-                .and_then(|original| original.get("ref"))
-                .and_then(|reference| reference.as_str())
-                .filter(|reference| pharos_core::valid_nix_channel(reference))
-                .map(str::to_string);
-            Some((modified, channel))
-        })
-        .min_by_key(|(modified, _)| *modified)?;
-    Some((days_since(oldest.0)?, oldest.1))
+    // PHAROS-196: resolve the flake's own `nixpkgs` input rather than scanning
+    // for the oldest node whose name happens to contain "nixpkgs". A lock mixes
+    // the input the system is built from, other root inputs that may be
+    // unreferenced, and transitive inputs of unrelated flakes. Reporting the
+    // worst of all three describes the lock file, not the host.
+    let root_name = v
+        .get("root")
+        .and_then(|root| root.as_str())
+        .unwrap_or("root");
+    let target = nodes.get(root_name)?.get("inputs")?.get("nixpkgs")?;
+    let node_name = input_target_name(target)?;
+    let node = nodes.get(node_name)?;
+    let modified = node.get("locked")?.get("lastModified")?.as_i64()?;
+    // A dated channel is declared in `original`; `locked` carries the resolved
+    // revision, which is not a channel name.
+    let channel = node
+        .get("original")
+        .and_then(|original| original.get("ref"))
+        .and_then(|reference| reference.as_str())
+        .filter(|reference| pharos_core::valid_nix_channel(reference))
+        .map(str::to_string);
+    Some((days_since(modified)?, channel))
 }
 
-/// Node names in a lock are suffixed on collision (`nixpkgs`, `nixpkgs_2`,
-/// `nixpkgs-stable`), so match the family rather than an exact name.
-fn is_nixpkgs_input(name: &str) -> bool {
-    name.to_ascii_lowercase().contains("nixpkgs")
+/// An `inputs` entry is either a node name or, for a `follows`, the path to the
+/// node being followed. Only the first element names a node.
+fn input_target_name(target: &serde_json::Value) -> Option<&str> {
+    match target {
+        serde_json::Value::String(name) => Some(name.as_str()),
+        serde_json::Value::Array(path) => path.first()?.as_str(),
+        _ => None,
+    }
 }
 
 /// Commits the checkout is behind its upstream (best-effort fetch first).
@@ -2438,81 +2446,159 @@ mod tests {
 
     // PHAROS-193 --------------------------------------------------------------
 
-    fn write_lock(nodes: serde_json::Value) -> std::path::PathBuf {
+    /// Tests run in parallel and each removes its own directory, so the name
+    /// needs a counter: a timestamp alone can collide and one test then deletes
+    /// another's lock mid-run.
+    static LOCK_FIXTURE_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn write_lock_document(document: serde_json::Value) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "pharos-beacon-lock-{}-{:?}",
+            "pharos-beacon-lock-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
+            LOCK_FIXTURE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("temp flake dir");
         std::fs::write(
             dir.join("flake.lock"),
-            serde_json::to_vec(&serde_json::json!({ "nodes": nodes })).expect("lock serializes"),
+            serde_json::to_vec(&document).expect("lock serializes"),
         )
         .expect("write lock");
         dir
+    }
+
+    fn write_lock_with_root(
+        root_inputs: serde_json::Value,
+        nodes: serde_json::Value,
+    ) -> std::path::PathBuf {
+        let mut all = nodes.as_object().expect("nodes object").clone();
+        all.insert(
+            "root".to_string(),
+            serde_json::json!({ "inputs": root_inputs }),
+        );
+        write_lock_document(serde_json::json!({
+            "root": "root",
+            "nodes": serde_json::Value::Object(all)
+        }))
     }
 
     fn days_ago(days: i64) -> i64 {
         now_unix() - days * 86_400
     }
 
+    /// The real csb1 lock shape. The system tracks nixos-unstable and is 21
+    /// days old, while a separate root input sits 218 days stale on an expired
+    /// channel and transitive inputs of nixos-hardware are older still.
+    /// PHAROS-196: only the system input may drive the reported number.
+    fn fleet_shaped_lock() -> std::path::PathBuf {
+        write_lock_with_root(
+            serde_json::json!({
+                "nixpkgs": "nixpkgs_6",
+                "nixpkgs-stable": "nixpkgs-stable_2",
+                "nixos-hardware": "nixos-hardware"
+            }),
+            serde_json::json!({
+                "nixpkgs_6": {
+                    "locked":   { "lastModified": days_ago(21) },
+                    "original": { "ref": "nixos-unstable" }
+                },
+                "nixpkgs-stable_2": {
+                    "locked":   { "lastModified": days_ago(218) },
+                    "original": { "ref": "nixos-25.05" }
+                },
+                "nixos-hardware": {
+                    "inputs": { "nixpkgs": "nixpkgs_3" },
+                    "locked": { "lastModified": days_ago(30) }
+                },
+                "nixpkgs_3": { "locked": { "lastModified": days_ago(211) } },
+                "disko":   { "locked": { "lastModified": days_ago(0) } },
+                "systems": { "locked": { "lastModified": days_ago(1217) } }
+            }),
+        )
+    }
+
     #[test]
-    fn nixpkgs_freshness_reports_the_oldest_nixpkgs_not_the_newest_input() {
-        // The shape observed on the fleet: a helper input bumped today while
-        // nixpkgs sat 218 days old on an expired channel.
-        let dir = write_lock(serde_json::json!({
-            "disko":   { "locked": { "lastModified": days_ago(0) } },
-            "systems": { "locked": { "lastModified": days_ago(1217) } },
-            "nixpkgs-stable_2": {
-                "locked":   { "lastModified": days_ago(218), "rev": "deadbeef" },
-                "original": { "ref": "nixos-25.05" }
-            },
-            "nixpkgs_3": { "locked": { "lastModified": days_ago(211) } },
-            "nixpkgs-zfs": { "locked": { "lastModified": days_ago(36) } }
-        }));
+    fn nixpkgs_freshness_reports_the_system_input_not_the_oldest_lookalike() {
+        let dir = fleet_shaped_lock();
         let path = dir.to_str().expect("utf-8 path");
 
-        // The old signal reads as completely fresh.
+        // The original signal reads as completely fresh because disko moved today.
         assert_eq!(flake_lock_age_days(path), Some(0));
 
-        // The new one reports the worst nixpkgs case and names its channel,
-        // ignoring the 1217-day helper that never moves.
+        // PHAROS-193 replaced that with the oldest nixpkgs-family node, which
+        // reported 218d on an expired channel and reads as a patching gap the
+        // host does not have. The system input is what decides its posture.
         let (days, channel) = nixpkgs_freshness(path).expect("nixpkgs observed");
-        assert_eq!(days, 218);
-        assert_eq!(channel.as_deref(), Some("nixos-25.05"));
+        assert_eq!(days, 21, "must report the flake's own nixpkgs input");
+        assert_eq!(channel.as_deref(), Some("nixos-unstable"));
+
+        // An unstable channel is rolling, so it is never flagged end of life.
+        assert_eq!(
+            pharos_core::nix_channel_state("nixos-unstable", 2026, 8),
+            pharos_core::NixChannelState::Rolling
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn nixpkgs_freshness_handles_missing_absent_and_unsafe_channels() {
-        // No nixpkgs at all: nothing to report rather than a fabricated age.
-        let dir = write_lock(serde_json::json!({
-            "systems": { "locked": { "lastModified": days_ago(10) } }
-        }));
+    fn nixpkgs_freshness_still_flags_a_system_input_on_an_expired_channel() {
+        // The case that must keep working: the system itself is on a dead release.
+        let dir = write_lock_with_root(
+            serde_json::json!({ "nixpkgs": "nixpkgs" }),
+            serde_json::json!({
+                "nixpkgs": {
+                    "locked":   { "lastModified": days_ago(218) },
+                    "original": { "ref": "nixos-25.05" }
+                },
+                "disko": { "locked": { "lastModified": days_ago(0) } }
+            }),
+        );
+        let (days, channel) = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
+        assert_eq!(days, 218);
+        assert_eq!(channel.as_deref(), Some("nixos-25.05"));
+        assert_eq!(
+            pharos_core::nix_channel_state("nixos-25.05", 2026, 8),
+            pharos_core::NixChannelState::EndOfLife
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nixpkgs_freshness_resolves_a_follows_target_and_tolerates_odd_locks() {
+        // A `follows` entry is a path; only its first element names a node.
+        let dir = write_lock_with_root(
+            serde_json::json!({ "nixpkgs": ["nixpkgs_2"] }),
+            serde_json::json!({
+                "nixpkgs_2": {
+                    "locked":   { "lastModified": days_ago(9) },
+                    "original": { "ref": "nixos-26.05" }
+                }
+            }),
+        );
+        let (days, channel) = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
+        assert_eq!(days, 9);
+        assert_eq!(channel.as_deref(), Some("nixos-26.05"));
+        let _ = std::fs::remove_dir_all(dir);
+
+        // No nixpkgs input at all: report nothing rather than guess.
+        let dir = write_lock_with_root(
+            serde_json::json!({ "disko": "disko" }),
+            serde_json::json!({ "disko": { "locked": { "lastModified": days_ago(3) } } }),
+        );
         assert_eq!(nixpkgs_freshness(dir.to_str().expect("path")), None);
         let _ = std::fs::remove_dir_all(dir);
 
-        // A rolling nixpkgs with no declared ref still reports its age.
-        let dir = write_lock(serde_json::json!({
-            "nixpkgs": { "locked": { "lastModified": days_ago(7) } }
-        }));
-        let (days, channel) = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
-        assert_eq!(days, 7);
-        assert_eq!(channel, None);
-        let _ = std::fs::remove_dir_all(dir);
-
         // An unsafe ref is dropped rather than propagated into the report.
-        let dir = write_lock(serde_json::json!({
-            "nixpkgs": {
-                "locked":   { "lastModified": days_ago(4) },
-                "original": { "ref": "https://example.invalid/x?token=abc" }
-            }
-        }));
+        let dir = write_lock_with_root(
+            serde_json::json!({ "nixpkgs": "nixpkgs" }),
+            serde_json::json!({
+                "nixpkgs": {
+                    "locked":   { "lastModified": days_ago(4) },
+                    "original": { "ref": "https://example.invalid/x?token=abc" }
+                }
+            }),
+        );
         let (days, channel) = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
         assert_eq!(days, 4);
         assert_eq!(channel, None, "an unsafe ref must not reach the report");
