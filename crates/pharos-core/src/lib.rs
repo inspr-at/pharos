@@ -24,6 +24,8 @@ pub const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 10;
 pub const MAX_HEARTBEAT_INTERVAL_SECS: u64 = 3_600;
 pub const MAX_FLAKE_LOCK_AGE_DAYS: u32 = 36_500;
 pub const MAX_COMMITS_BEHIND: u32 = 1_000_000;
+/// PHAROS-193: a release channel name such as `nixos-25.05`.
+pub const MAX_NIX_CHANNEL_BYTES: usize = 64;
 pub const MAX_SERVICE_OBSERVATIONS: usize = 64;
 pub const MAX_BACKUP_OBSERVATIONS: usize = 64;
 pub const MAX_HOST_REPORT_BYTES: usize = 64 * 1024;
@@ -277,9 +279,116 @@ pub struct NixFreshness {
     /// `false` for non-Nix hosts → renders `nix: n/a`.
     pub applicable: bool,
     /// Age of `flake.lock` in days (time since the last `nix flake update`).
+    ///
+    /// This is the age of the *newest* input, so it answers "when did someone
+    /// last update this flake" and not "is anything here stale". PHAROS-193: a
+    /// lock whose nixpkgs is frozen still reports `0d` here the moment any
+    /// trivial input moves, so never read this alone as a security posture.
     pub flake_lock_age_days: Option<u32>,
     /// How many commits the running config is behind the host's nixcfg.
     pub commits_behind: Option<u32>,
+    /// PHAROS-193: age of the *oldest* nixpkgs-family input, which is the one
+    /// that actually carries security fixes. Worst case rather than average,
+    /// because a single frozen nixpkgs is what strands a host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixpkgs_age_days: Option<u32>,
+    /// PHAROS-193: the release channel that oldest nixpkgs input tracks, such
+    /// as `nixos-25.05`. The beacon reports the observed channel only; the
+    /// control plane decides whether it is end-of-life, so a newly expired
+    /// release needs no fleet-wide beacon roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixpkgs_channel: Option<String>,
+}
+
+/// Support state of a NixOS release channel (PHAROS-193).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NixChannelState {
+    /// A dated `nixos-YY.MM` release that is past end of life.
+    EndOfLife,
+    /// A dated release still inside its support window.
+    Supported,
+    /// A rolling channel such as `nixos-unstable`, or anything undated. Age is
+    /// the only available signal for these.
+    Rolling,
+}
+
+/// End of life for a dated NixOS release, as a `(year, month)` pair.
+///
+/// NixOS supports a release until roughly one month after its successor ships,
+/// and releases ship in May and November. So `YY.05` ends shortly after
+/// `YY.11` + one month, and `YY.11` ends shortly after `(YY+1).05` + one month.
+/// Deliberately coarse: it resolves to the first day of the month after that
+/// window, so a channel is only ever flagged once it is unambiguously expired.
+fn nixos_release_end_of_life(year: u32, month: u32) -> Option<(u32, u32)> {
+    match month {
+        5 => Some((year + 1, 1)),
+        11 => Some((year + 1, 7)),
+        _ => None,
+    }
+}
+
+/// `(year, month)` in UTC for a Unix timestamp.
+///
+/// Days-to-civil after Howard Hinnant: shift the epoch to 0000-03-01 so leap
+/// days land at the end of the cycle, then unwind the 400/100/4-year eras. Only
+/// year and month are needed here, so the day of month is discarded.
+pub fn utc_year_month(unix_seconds: i64) -> (u32, u32) {
+    let days = unix_seconds.div_euclid(86_400) + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    // Months run March..February in the shifted calendar; map back to Jan..Dec.
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (
+        u32::try_from(year).unwrap_or(0),
+        u32::try_from(month).unwrap_or(1),
+    )
+}
+
+/// Classify a reported channel against the release calendar.
+///
+/// `now_year`/`now_month` come from the caller so this stays a pure function
+/// and tests do not depend on the wall clock.
+pub fn nix_channel_state(channel: &str, now_year: u32, now_month: u32) -> NixChannelState {
+    let Some(release) = channel.strip_prefix("nixos-") else {
+        return NixChannelState::Rolling;
+    };
+    let Some((year, month)) = release.split_once('.') else {
+        return NixChannelState::Rolling;
+    };
+    let (Ok(year), Ok(month)) = (year.parse::<u32>(), month.parse::<u32>()) else {
+        return NixChannelState::Rolling;
+    };
+    // Two-digit release years are 20YY; anything else is not a dated release.
+    if year > 99 || !(1..=12).contains(&month) {
+        return NixChannelState::Rolling;
+    }
+    let Some((eol_year, eol_month)) = nixos_release_end_of_life(2000 + year, month) else {
+        return NixChannelState::Rolling;
+    };
+    if (now_year, now_month) >= (eol_year, eol_month) {
+        NixChannelState::EndOfLife
+    } else {
+        NixChannelState::Supported
+    }
+}
+
+/// A channel name is a short, bounded, value-free identifier.
+pub fn valid_nix_channel(channel: &str) -> bool {
+    !channel.is_empty()
+        && channel.len() <= MAX_NIX_CHANNEL_BYTES
+        && channel
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
 impl NixFreshness {
@@ -298,11 +407,37 @@ impl NixFreshness {
         {
             return Err(format!("commits_behind must be <= {MAX_COMMITS_BEHIND}"));
         }
-        if !self.applicable && (self.flake_lock_age_days.is_some() || self.commits_behind.is_some())
+        if self
+            .nixpkgs_age_days
+            .is_some_and(|days| days > MAX_FLAKE_LOCK_AGE_DAYS)
+        {
+            return Err(format!(
+                "nixpkgs_age_days must be <= {MAX_FLAKE_LOCK_AGE_DAYS}"
+            ));
+        }
+        if self
+            .nixpkgs_channel
+            .as_deref()
+            .is_some_and(|channel| !valid_nix_channel(channel))
+        {
+            return Err("nixpkgs_channel must be a bounded channel name".to_string());
+        }
+        if !self.applicable
+            && (self.flake_lock_age_days.is_some()
+                || self.commits_behind.is_some()
+                || self.nixpkgs_age_days.is_some()
+                || self.nixpkgs_channel.is_some())
         {
             return Err("non-Nix freshness must not carry Nix values".to_string());
         }
         Ok(())
+    }
+
+    /// PHAROS-193: how the reported channel stands against the release calendar.
+    pub fn channel_state(&self, now_year: u32, now_month: u32) -> Option<NixChannelState> {
+        self.nixpkgs_channel
+            .as_deref()
+            .map(|channel| nix_channel_state(channel, now_year, now_month))
     }
 
     /// Human one-liner TL;DR, e.g. `flake.lock 12d old · 3 commits behind nixcfg`,
@@ -312,8 +447,19 @@ impl NixFreshness {
             return "nix: n/a".to_string();
         }
         let mut parts = Vec::new();
-        if let Some(d) = self.flake_lock_age_days {
+        // PHAROS-193: nixpkgs leads, because it is the number that decides
+        // whether the host is receiving security fixes at all.
+        if let Some(d) = self.nixpkgs_age_days {
             if d > 0 {
+                match self.nixpkgs_channel.as_deref() {
+                    Some(channel) => parts.push(format!("nixpkgs {d}d old on {channel}")),
+                    None => parts.push(format!("nixpkgs {d}d old")),
+                }
+            }
+        }
+        if let Some(d) = self.flake_lock_age_days {
+            // Only worth saying when it is not already implied by nixpkgs.
+            if d > 0 && self.nixpkgs_age_days.is_none() {
                 parts.push(format!("flake.lock {d}d old"));
             }
         }
@@ -2280,10 +2426,14 @@ pub fn liveness(
     }
 }
 
-pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v2";
-pub const HOST_REPORT_VERSION: u16 = 2;
-pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v1";
-pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 1;
+// PHAROS-193 moved the contract to v3 by adding the nixpkgs freshness fields.
+// `deny_unknown_fields` makes any addition breaking for an older consumer, so
+// the version moves with it and the rollout order in README applies: control
+// plane first, then beacons.
+pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v3";
+pub const HOST_REPORT_VERSION: u16 = 3;
+pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v2";
+pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 2;
 pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 2] = [
     (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
     (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
@@ -2494,14 +2644,34 @@ impl ServiceObservation {
     }
 
     pub fn nix_freshness(freshness: &NixFreshness) -> Self {
+        Self::nix_freshness_at(freshness, None)
+    }
+
+    /// PHAROS-193: `now` is `(year, month)` for the release-calendar check, and
+    /// is `None` where the caller has no calendar to apply (the beacon reports
+    /// the observed channel; the control plane classifies it).
+    pub fn nix_freshness_at(freshness: &NixFreshness, now: Option<(u32, u32)>) -> Self {
+        let end_of_life = now.and_then(|(year, month)| freshness.channel_state(year, month))
+            == Some(NixChannelState::EndOfLife);
         let (state, summary) = if !freshness.applicable {
             (ServiceObservationState::Unknown, "nix: n/a".to_string())
+        } else if end_of_life {
+            // A stale channel outranks any age number: no age is small enough
+            // to make an end-of-life release safe.
+            (
+                ServiceObservationState::Stale,
+                match freshness.nixpkgs_channel.as_deref() {
+                    Some(channel) => format!("{channel} is end of life; no security fixes"),
+                    None => "nixpkgs channel is end of life; no security fixes".to_string(),
+                },
+            )
         } else if freshness.flake_lock_age_days.is_none() || freshness.commits_behind.is_none() {
             (
                 ServiceObservationState::Unknown,
                 "freshness partially observed".to_string(),
             )
-        } else if freshness.flake_lock_age_days.unwrap_or(0) > 0
+        } else if freshness.nixpkgs_age_days.unwrap_or(0) > 0
+            || freshness.flake_lock_age_days.unwrap_or(0) > 0
             || freshness.commits_behind.unwrap_or(0) > 0
         {
             (ServiceObservationState::Warning, freshness.tldr())
@@ -3224,6 +3394,8 @@ mod tests {
             applicable: true,
             flake_lock_age_days: Some(12),
             commits_behind: Some(3),
+            nixpkgs_age_days: None,
+            nixpkgs_channel: None,
         };
         assert_eq!(
             behind.tldr(),
@@ -3479,6 +3651,8 @@ mod tests {
                 applicable: true,
                 flake_lock_age_days: Some(1),
                 commits_behind: Some(0),
+                nixpkgs_age_days: None,
+                nixpkgs_channel: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation {
@@ -3856,6 +4030,8 @@ mod tests {
             applicable: true,
             flake_lock_age_days: Some(2),
             commits_behind: Some(0),
+            nixpkgs_age_days: None,
+            nixpkgs_channel: None,
         });
         assert_eq!(warning.id, "nix-freshness");
         assert_eq!(warning.state, ServiceObservationState::Warning);
@@ -3865,6 +4041,8 @@ mod tests {
             applicable: true,
             flake_lock_age_days: Some(0),
             commits_behind: Some(0),
+            nixpkgs_age_days: None,
+            nixpkgs_channel: None,
         });
         assert_eq!(healthy.state, ServiceObservationState::Healthy);
     }
@@ -4002,12 +4180,16 @@ mod tests {
                 applicable: true,
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(0),
+                nixpkgs_age_days: None,
+                nixpkgs_channel: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
                 applicable: true,
                 flake_lock_age_days: Some(0),
                 commits_behind: Some(0),
+                nixpkgs_age_days: None,
+                nixpkgs_channel: None,
             })],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -4758,5 +4940,187 @@ mod tests {
             "policy": { "declaredOnly": true }
         }));
         assert!(partial_location.is_err());
+    }
+
+    // PHAROS-193 --------------------------------------------------------------
+
+    #[test]
+    fn utc_year_month_handles_epoch_leap_years_and_year_boundaries() {
+        assert_eq!(utc_year_month(0), (1970, 1));
+        // 2026-08-08T07:00:00Z, the day this was written.
+        assert_eq!(utc_year_month(1_786_000_000), (2026, 8));
+        // Leap day and the instant either side of a year boundary.
+        assert_eq!(utc_year_month(1_709_164_800), (2024, 2)); // 2024-02-29
+        assert_eq!(utc_year_month(1_735_689_599), (2024, 12)); // 2024-12-31T23:59:59Z
+        assert_eq!(utc_year_month(1_735_689_600), (2025, 1)); // 2025-01-01T00:00:00Z
+                                                              // Every month of a leap and a non-leap year resolves in range.
+        for stamp in (1_704_067_200..1_767_225_600).step_by(86_400 * 7) {
+            let (year, month) = utc_year_month(stamp);
+            assert!((2024..=2026).contains(&year), "year {year} out of range");
+            assert!((1..=12).contains(&month), "month {month} out of range");
+        }
+    }
+
+    #[test]
+    fn nix_channel_state_follows_the_release_support_window() {
+        // nixos-25.05 went end of life at the start of 2026, which is the case
+        // that produced this ticket.
+        assert_eq!(
+            nix_channel_state("nixos-25.05", 2025, 12),
+            NixChannelState::Supported
+        );
+        assert_eq!(
+            nix_channel_state("nixos-25.05", 2026, 1),
+            NixChannelState::EndOfLife
+        );
+        // A November release is supported roughly a month past the next May.
+        assert_eq!(
+            nix_channel_state("nixos-25.11", 2026, 6),
+            NixChannelState::Supported
+        );
+        assert_eq!(
+            nix_channel_state("nixos-25.11", 2026, 7),
+            NixChannelState::EndOfLife
+        );
+        // The current release is not flagged.
+        assert_eq!(
+            nix_channel_state("nixos-26.05", 2026, 8),
+            NixChannelState::Supported
+        );
+        // Rolling and unparseable channels are never flagged as expired.
+        for rolling in [
+            "nixos-unstable",
+            "nixpkgs-unstable",
+            "master",
+            "nixos-",
+            "nixos-25",
+            "nixos-25.13",
+            "nixos-2025.05",
+            "",
+        ] {
+            assert_eq!(
+                nix_channel_state(rolling, 2026, 8),
+                NixChannelState::Rolling,
+                "{rolling} should not be classified as a dated release"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_nix_channel_rejects_unbounded_or_unsafe_names() {
+        assert!(valid_nix_channel("nixos-25.05"));
+        assert!(valid_nix_channel("nixos-unstable"));
+        assert!(!valid_nix_channel(""));
+        assert!(!valid_nix_channel(&"n".repeat(MAX_NIX_CHANNEL_BYTES + 1)));
+        for bad in [
+            "nixos 25.05",
+            "nixos-25.05/../etc",
+            "a?b",
+            "https://x",
+            "a\nb",
+        ] {
+            assert!(!valid_nix_channel(bad), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn freshness_reports_nixpkgs_rather_than_the_newest_input() {
+        // The exact shape from the fleet: a trivial input moved today while
+        // nixpkgs sat frozen, so the old signal read as completely fresh.
+        let freshness = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(218),
+            nixpkgs_channel: Some("nixos-25.05".to_string()),
+        };
+        freshness.validate_contract().expect("valid freshness");
+        assert!(
+            freshness.tldr().contains("nixpkgs 218d old on nixos-25.05"),
+            "tldr was {}",
+            freshness.tldr()
+        );
+        assert_eq!(
+            freshness.channel_state(2026, 8),
+            Some(NixChannelState::EndOfLife)
+        );
+
+        // Without a calendar the observation still warns rather than claiming health.
+        let unclassified = ServiceObservation::nix_freshness(&freshness);
+        assert_eq!(unclassified.state, ServiceObservationState::Warning);
+
+        // With one, an expired channel outranks the reassuring 0d lock age.
+        let classified = ServiceObservation::nix_freshness_at(&freshness, Some((2026, 8)));
+        assert_eq!(classified.state, ServiceObservationState::Stale);
+        assert!(classified.summary.contains("end of life"));
+    }
+
+    #[test]
+    fn freshness_stays_healthy_when_nixpkgs_is_current() {
+        let freshness = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(0),
+            nixpkgs_channel: Some("nixos-26.05".to_string()),
+        };
+        freshness.validate_contract().expect("valid freshness");
+        assert_eq!(freshness.tldr(), "up to date");
+        assert_eq!(
+            ServiceObservation::nix_freshness_at(&freshness, Some((2026, 8))).state,
+            ServiceObservationState::Healthy
+        );
+    }
+
+    #[test]
+    fn freshness_rejects_unbounded_or_non_nix_nixpkgs_values() {
+        let over_bound = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(MAX_FLAKE_LOCK_AGE_DAYS + 1),
+            nixpkgs_channel: None,
+        };
+        assert!(over_bound.validate_contract().is_err());
+
+        let bad_channel = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(1),
+            nixpkgs_channel: Some("nixos 25.05".to_string()),
+        };
+        assert!(bad_channel.validate_contract().is_err());
+
+        let non_nix = NixFreshness {
+            applicable: false,
+            flake_lock_age_days: None,
+            commits_behind: None,
+            nixpkgs_age_days: Some(1),
+            nixpkgs_channel: None,
+        };
+        assert!(non_nix.validate_contract().is_err());
+    }
+
+    #[test]
+    fn previous_contract_reports_without_nixpkgs_fields_are_still_accepted() {
+        // A v2 beacon that has not rolled yet must keep reporting. PHAROS-193
+        // added fields, and the rollout order is control plane first.
+        let report: HostReport = serde_json::from_value(serde_json::json!({
+            "schema": PREVIOUS_HOST_REPORT_SCHEMA,
+            "version": PREVIOUS_HOST_REPORT_VERSION,
+            "name": "hsb8",
+            "role": "server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60,
+            "freshness": {"applicable": true, "flake_lock_age_days": 3, "commits_behind": 0}
+        }))
+        .expect("a v2 report still deserializes");
+        report.validate_contract().expect("v2 remains valid");
+        assert_eq!(report.freshness.nixpkgs_age_days, None);
+        assert_eq!(report.freshness.nixpkgs_channel, None);
+        // It degrades honestly rather than claiming nixpkgs is fresh.
+        assert_eq!(report.freshness.channel_state(2026, 8), None);
+        assert!(report.freshness.tldr().contains("flake.lock 3d old"));
     }
 }

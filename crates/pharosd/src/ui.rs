@@ -111,6 +111,65 @@ mod module_tests {
         assert!(SETUP_ASSISTANT_TEMPLATE.contains("data-setup-assistant"));
         assert_eq!(html_escape("<&\"'>"), "&lt;&amp;&quot;&#39;&gt;");
     }
+
+    /// PHAROS-193: the fleet showed a reassuring `0d` while nixpkgs was frozen
+    /// on an expired channel. The operator-visible signal must say so.
+    #[test]
+    fn frozen_nixpkgs_is_visible_instead_of_the_newest_input_age() {
+        let frozen = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(218),
+            nixpkgs_channel: Some("nixos-25.05".to_string()),
+        };
+
+        let markup = freshness_markup(&frozen, false);
+        assert!(
+            markup.contains("218d"),
+            "nixpkgs age must be shown: {markup}"
+        );
+        assert!(
+            markup.contains("EOL"),
+            "expired channel must be shown: {markup}"
+        );
+        assert!(
+            markup.contains("nixpkgs age"),
+            "the label must name the value it shows: {markup}"
+        );
+
+        let reason = freshness_attention_reason(&frozen).expect("frozen nixpkgs needs attention");
+        assert!(reason.label.contains("end of life"), "{}", reason.label);
+        assert_eq!(reason.level, "warn");
+        assert_eq!(reason.rank, 1, "an expired channel outranks age drift");
+    }
+
+    #[test]
+    fn a_current_nixpkgs_raises_no_attention_and_keeps_the_lock_label() {
+        let current = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(0),
+            nixpkgs_channel: Some("nixos-26.05".to_string()),
+        };
+        assert!(freshness_attention_reason(&current).is_none());
+        assert!(!freshness_markup(&current, false).contains("EOL"));
+
+        // A beacon that has not rolled yet reports no nixpkgs fields, so the
+        // panel falls back to the lock age and labels it honestly.
+        let legacy = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(3),
+            commits_behind: Some(0),
+            nixpkgs_age_days: None,
+            nixpkgs_channel: None,
+        };
+        let markup = freshness_markup(&legacy, false);
+        assert!(markup.contains("Flake.lock age"), "{markup}");
+        assert!(markup.contains("3d"), "{markup}");
+        assert!(!markup.contains("EOL"));
+    }
 }
 
 pub(super) fn render_no_access_page(
@@ -618,16 +677,40 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
         );
     }
 
-    let (mut age, age_class) = freshness_value(freshness.flake_lock_age_days, "0d");
+    // PHAROS-193: show the nixpkgs age when it is known, because the flake.lock
+    // age is the newest input and reads reassuringly while nixpkgs is frozen.
+    // Fall back to the lock age only where a beacon has not reported nixpkgs yet.
+    let (mut age, age_class) = match freshness.nixpkgs_age_days {
+        Some(days) => freshness_value(Some(days), "0d"),
+        None => freshness_value(freshness.flake_lock_age_days, "0d"),
+    };
     if age_class == "warn" {
         age.push('d');
     }
+    let (year, month) = pharos_core::utc_year_month(now_unix());
+    let end_of_life =
+        freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife);
+    let (age, age_class) = if end_of_life {
+        (format!("{age} · EOL"), "warn")
+    } else {
+        (age, age_class)
+    };
     let (commits, commits_class) = freshness_value(freshness.commits_behind, "0");
+    // The label has to name whichever value is shown; a nixpkgs age under a
+    // "Flake.lock age" label is the same misreading PHAROS-193 set out to fix.
+    let age_label = match (
+        freshness.nixpkgs_age_days,
+        freshness.nixpkgs_channel.as_deref(),
+    ) {
+        (Some(_), Some(channel)) => format!("nixpkgs age ({channel})"),
+        (Some(_), None) => "nixpkgs age".to_string(),
+        (None, _) => "Flake.lock age".to_string(),
+    };
     format!(
         "{}{}",
         freshness_row(
             "flake-lock-age",
-            "Flake.lock age",
+            &age_label,
             &age,
             age_class,
             icons::PACKAGE_CALENDAR,
@@ -702,6 +785,31 @@ pub(super) fn self_attention_reason() -> AttentionReason {
 pub(super) fn freshness_attention_reason(freshness: &NixFreshness) -> Option<AttentionReason> {
     if !freshness.applicable {
         return None;
+    }
+
+    // PHAROS-193: an end-of-life channel outranks every age number, because no
+    // age is small enough to make an unsupported release safe. The control
+    // plane owns this calendar so an expiring release needs no beacon roll.
+    let (year, month) = pharos_core::utc_year_month(now_unix());
+    if freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife) {
+        let channel = freshness.nixpkgs_channel.as_deref().unwrap_or("nixpkgs");
+        return Some(AttentionReason {
+            label: format!("{channel} end of life"),
+            level: "warn",
+            rank: 1,
+        });
+    }
+
+    let nixpkgs_warn = freshness.nixpkgs_age_days.filter(|d| *d > 0);
+    if let Some(days) = nixpkgs_warn {
+        return Some(AttentionReason {
+            label: match freshness.nixpkgs_channel.as_deref() {
+                Some(channel) => format!("nixpkgs {days}d on {channel}"),
+                None => format!("nixpkgs {days}d"),
+            },
+            level: "warn",
+            rank: 2,
+        });
     }
 
     let age_warn = freshness.flake_lock_age_days.filter(|d| *d > 0);
