@@ -151,6 +151,7 @@ impl NixcfgDispatch {
         host: &str,
         disposition: &str,
         successor: Option<&str>,
+        credential_retirement_required: bool,
     ) -> Result<String, NixcfgDispatchError> {
         if !self.host_removal_available() {
             return Err(NixcfgDispatchError::Disabled);
@@ -169,6 +170,11 @@ impl NixcfgDispatch {
                 disposition,
                 successor: successor.unwrap_or_default(),
                 request_id: &request_id,
+                credential_retirement_required: if credential_retirement_required {
+                    "true"
+                } else {
+                    "false"
+                },
             },
         };
         self.send(HOST_REMOVAL_DISPATCH_PATH, &request).await?;
@@ -295,6 +301,10 @@ struct HostRemovalDispatchInputs<'a> {
     disposition: &'a str,
     successor: &'a str,
     request_id: &'a str,
+    // PHAROS-197: nixcfg refuses an undeclared host unless the proposal exists
+    // to record a retirement intent. Sent as a string because workflow_dispatch
+    // boolean inputs arrive as strings.
+    credential_retirement_required: &'static str,
 }
 
 fn enabled_value(value: &str) -> bool {
@@ -473,7 +483,7 @@ mod tests {
         let client = NixcfgDispatch::for_test(Some(token_path.clone()), base);
 
         let request_id = client
-            .dispatch_host_removal("hsb8", "rebuilt", Some("stm2607"))
+            .dispatch_host_removal("hsb8", "rebuilt", Some("stm2607"), false)
             .await
             .expect("dispatch accepted");
         let raw = request.recv().expect("request captured");
@@ -507,19 +517,19 @@ mod tests {
         );
         assert_eq!(
             unavailable
-                .dispatch_host_removal("../gpc0", "destroyed", None)
+                .dispatch_host_removal("../gpc0", "destroyed", None, false)
                 .await,
             Err(NixcfgDispatchError::InvalidHost)
         );
         assert_eq!(
             unavailable
-                .dispatch_host_removal("gpc0", "rebuilt", None)
+                .dispatch_host_removal("gpc0", "rebuilt", None, false)
                 .await,
             Err(NixcfgDispatchError::InvalidRemovalIntent)
         );
         assert_eq!(
             unavailable
-                .dispatch_host_removal("gpc0", "unmanaged", Some("stm2607"))
+                .dispatch_host_removal("gpc0", "unmanaged", Some("stm2607"), false)
                 .await,
             Err(NixcfgDispatchError::InvalidRemovalIntent)
         );
