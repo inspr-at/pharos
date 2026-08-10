@@ -4268,6 +4268,7 @@ mod tests {
                     commits_behind: Some(3),
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
+                    secondary_nixpkgs: None,
                 },
                 kernel: None,
                 service_observations: vec![],
@@ -4292,6 +4293,7 @@ mod tests {
                     commits_behind: Some(3),
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
+                    secondary_nixpkgs: None,
                 },
                 kernel: None,
                 service_observations: vec![],
@@ -5215,6 +5217,7 @@ mod tests {
                     commits_behind: Some(3),
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
+                    secondary_nixpkgs: None,
                 },
                 kernel: None,
                 service_observations: vec![
@@ -5224,6 +5227,7 @@ mod tests {
                         commits_behind: Some(3),
                         nixpkgs_age_days: None,
                         nixpkgs_channel: None,
+                        secondary_nixpkgs: None,
                     }),
                     ServiceObservation {
                         id: "nginx".to_string(),
@@ -5253,6 +5257,7 @@ mod tests {
                     commits_behind: Some(3),
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
+                    secondary_nixpkgs: None,
                 },
                 kernel: None,
                 service_observations: vec![],
@@ -5368,6 +5373,7 @@ mod tests {
                     commits_behind: Some(0),
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
+                    secondary_nixpkgs: None,
                 },
                 kernel: None,
                 service_observations: vec![],
@@ -5392,6 +5398,7 @@ mod tests {
                     commits_behind: Some(1),
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
+                    secondary_nixpkgs: None,
                 },
                 kernel: None,
                 service_observations: vec![
@@ -5401,6 +5408,7 @@ mod tests {
                         commits_behind: Some(1),
                         nixpkgs_age_days: None,
                         nixpkgs_channel: None,
+                        secondary_nixpkgs: None,
                     }),
                     ServiceObservation {
                         id: "ssh".to_string(),
@@ -5628,6 +5636,7 @@ mod tests {
                 commits_behind: Some(2),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation {
@@ -6786,6 +6795,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             commits_behind: Some(0),
             nixpkgs_age_days: None,
             nixpkgs_channel: None,
+            secondary_nixpkgs: None,
         };
         let drift_html = render_home(
             runtime(&[drift], &[]),
@@ -7981,6 +7991,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 commits_behind: Some(1),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
@@ -7989,6 +8000,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 commits_behind: Some(1),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             })],
             backup_observations: vec![backup_observation(BackupPostureState::Warning)],
             preferences: Default::default(),

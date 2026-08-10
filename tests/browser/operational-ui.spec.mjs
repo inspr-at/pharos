@@ -422,8 +422,8 @@ test("removal dialog names credential retirement for an undeclared Janus-managed
   const host = "browser-remove-copy";
   const report = await page.request.post("/report", {
     data: {
-      schema: "inspr.pharos.host-report.v2",
-      version: 2,
+      schema: "inspr.pharos.host-report.v3",
+      version: 3,
       name: host,
       role: "server",
       is_nix: false,
@@ -494,4 +494,57 @@ test("removal dialog names credential retirement for an undeclared Janus-managed
   expect(reonboard.ok()).toBe(true);
   await page.goto("/");
   await expect(page.locator("[data-host-action-overlay]")).toHaveCount(0);
+});
+
+test("stale side nixpkgs is visible as neutral context without host attention", async ({
+  page,
+}) => {
+  const host = "browser-secondary-nixpkgs";
+  const report = await page.request.post("/report", {
+    data: {
+      schema: "inspr.pharos.host-report.v4",
+      version: 4,
+      name: host,
+      role: "server",
+      is_nix: true,
+      heartbeat_interval_secs: 60,
+      freshness: {
+        applicable: true,
+        flake_lock_age_days: 0,
+        commits_behind: 0,
+        nixpkgs_age_days: 0,
+        nixpkgs_channel: "nixos-unstable",
+        secondary_nixpkgs: {
+          input: "nixpkgs-stable",
+          age_days: 218,
+          channel: "nixos-25.05",
+        },
+      },
+    },
+  });
+  expect(report.status()).toBe(204);
+
+  await page.goto("/");
+  const card = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
+    .first();
+  await expect(card).toBeVisible();
+  await expect(card.locator("[data-reason]")).toContainText("all clear");
+  const secondary = card.locator('[data-fresh-kind="secondary-nixpkgs"]');
+  await expect(secondary).toContainText("Other root nixpkgs");
+  await expect(secondary).toContainText("nixpkgs-stable");
+  await expect(secondary).toContainText("nixos-25.05");
+  await expect(secondary).toContainText("218d");
+  await expect(secondary.locator("[data-fresh-value]")).toHaveClass("na");
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
 });

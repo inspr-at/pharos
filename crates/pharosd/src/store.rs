@@ -320,8 +320,9 @@ mod tests {
     use super::*;
     use pharos_core::{
         BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
-        KernelPosture, KernelPostureState, NixFreshness, HOST_REGISTRATION_SCHEMA,
-        HOST_REGISTRATION_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+        KernelPosture, KernelPostureState, NixFreshness, NixpkgsInputFreshness,
+        HOST_REGISTRATION_SCHEMA, HOST_REGISTRATION_VERSION, HOST_REPORT_SCHEMA,
+        HOST_REPORT_VERSION,
     };
     use std::sync::Arc;
 
@@ -480,6 +481,35 @@ mod tests {
     }
 
     #[test]
+    fn secondary_nixpkgs_survives_durable_store_round_trip() {
+        let directory = temporary_directory("secondary-nixpkgs");
+        let path = directory.join("hosts.json");
+        let store = Store::new(Some(path.clone())).expect("durable store starts");
+        let mut report = basic_report("athena");
+        report.freshness.nixpkgs_age_days = Some(0);
+        report.freshness.nixpkgs_channel = Some("nixos-unstable".to_string());
+        report.freshness.secondary_nixpkgs = Some(NixpkgsInputFreshness {
+            input: "nixpkgs-stable".to_string(),
+            age_days: 218,
+            channel: Some("nixos-25.05".to_string()),
+        });
+        store.record(report, 120).expect("v4 report persists");
+        drop(store);
+
+        let reloaded = Store::new(Some(path)).expect("durable store reloads");
+        let host = reloaded.get("athena").expect("host survives reload");
+        assert_eq!(
+            host.freshness.secondary_nixpkgs,
+            Some(NixpkgsInputFreshness {
+                input: "nixpkgs-stable".to_string(),
+                age_days: 218,
+                channel: Some("nixos-25.05".to_string()),
+            })
+        );
+        std::fs::remove_dir_all(directory).expect("temporary directory removed");
+    }
+
+    #[test]
     fn concurrent_mutations_persist_in_lock_order_without_lost_hosts() {
         let directory = temporary_directory("concurrency");
         let path = directory.join("hosts.json");
@@ -607,6 +637,7 @@ mod tests {
                         commits_behind: Some(0),
                         nixpkgs_age_days: None,
                         nixpkgs_channel: None,
+                        secondary_nixpkgs: None,
                     },
                     kernel: Some(KernelPosture::observed(
                         true,
@@ -621,6 +652,7 @@ mod tests {
                             commits_behind: Some(0),
                             nixpkgs_age_days: None,
                             nixpkgs_channel: None,
+                            secondary_nixpkgs: None,
                         },
                     )],
                     backup_observations: vec![backup.clone()],
@@ -675,6 +707,7 @@ mod tests {
                         commits_behind: Some(0),
                         nixpkgs_age_days: None,
                         nixpkgs_channel: None,
+                        secondary_nixpkgs: None,
                     },
                     kernel: None,
                     service_observations: vec![],

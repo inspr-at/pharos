@@ -122,6 +122,7 @@ mod module_tests {
             commits_behind: Some(0),
             nixpkgs_age_days: Some(218),
             nixpkgs_channel: Some("nixos-25.05".to_string()),
+            secondary_nixpkgs: None,
         };
 
         let markup = freshness_markup(&frozen, false);
@@ -152,6 +153,7 @@ mod module_tests {
             commits_behind: Some(0),
             nixpkgs_age_days: Some(0),
             nixpkgs_channel: Some("nixos-26.05".to_string()),
+            secondary_nixpkgs: None,
         };
         assert!(freshness_attention_reason(&current).is_none());
         assert!(!freshness_markup(&current, false).contains("EOL"));
@@ -164,11 +166,43 @@ mod module_tests {
             commits_behind: Some(0),
             nixpkgs_age_days: None,
             nixpkgs_channel: None,
+            secondary_nixpkgs: None,
         };
         let markup = freshness_markup(&legacy, false);
         assert!(markup.contains("Flake.lock age"), "{markup}");
         assert!(markup.contains("3d"), "{markup}");
         assert!(!markup.contains("EOL"));
+    }
+
+    #[test]
+    fn stale_side_nixpkgs_is_secondary_context_not_host_attention() {
+        let current = NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(0),
+            nixpkgs_channel: Some("nixos-unstable".to_string()),
+            secondary_nixpkgs: Some(pharos_core::NixpkgsInputFreshness {
+                input: "nixpkgs-stable".to_string(),
+                age_days: 218,
+                channel: Some("nixos-25.05".to_string()),
+            }),
+        };
+
+        let markup = freshness_markup(&current, false);
+        assert!(markup.contains("Other root nixpkgs"), "{markup}");
+        assert!(markup.contains("nixpkgs-stable"), "{markup}");
+        assert!(markup.contains("nixos-25.05"), "{markup}");
+        assert!(markup.contains("218d"), "{markup}");
+        assert!(
+            !markup.contains("218d · EOL"),
+            "a side input must not look like host patch posture: {markup}"
+        );
+        assert!(freshness_attention_reason(&current).is_none());
+        assert_eq!(
+            ServiceObservation::nix_freshness_at(&current, Some((2026, 8))).state,
+            ServiceObservationState::Healthy
+        );
     }
 }
 
@@ -657,7 +691,7 @@ pub(super) fn freshness_value(value: Option<u32>, zero_label: &str) -> (String, 
 pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> String {
     if !freshness.applicable {
         return format!(
-            "{}{}",
+            "{}{}{}",
             freshness_row(
                 "flake-lock-age",
                 "Flake.lock age",
@@ -672,6 +706,14 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
                 "n/a",
                 "na",
                 icons::GIT_COMMIT_HORIZONTAL,
+                compact,
+            ),
+            freshness_row(
+                "secondary-nixpkgs",
+                "Other root nixpkgs",
+                "n/a",
+                "na",
+                icons::PACKAGE_CALENDAR,
                 compact,
             )
         );
@@ -706,8 +748,18 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
         (Some(_), None) => "nixpkgs age".to_string(),
         (None, _) => "Flake.lock age".to_string(),
     };
+    let (secondary_label, secondary_age) = match &freshness.secondary_nixpkgs {
+        Some(secondary) => {
+            let label = match secondary.channel.as_deref() {
+                Some(channel) => format!("Other root nixpkgs · {} ({channel})", secondary.input),
+                None => format!("Other root nixpkgs · {}", secondary.input),
+            };
+            (label, format!("{}d", secondary.age_days))
+        }
+        None => ("Other root nixpkgs".to_string(), "not reported".to_string()),
+    };
     format!(
-        "{}{}",
+        "{}{}{}",
         freshness_row(
             "flake-lock-age",
             &age_label,
@@ -722,6 +774,14 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
             &commits,
             commits_class,
             icons::GIT_COMMIT_HORIZONTAL,
+            compact,
+        ),
+        freshness_row(
+            "secondary-nixpkgs",
+            &secondary_label,
+            &secondary_age,
+            "na",
+            icons::PACKAGE_CALENDAR,
             compact,
         )
     )

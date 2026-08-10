@@ -94,7 +94,7 @@ layer. There is no separate frontend build or client framework.
 
 The shared Rust contracts matter: server and beacon cannot silently drift onto
 different report schemas. The current report contract is
-`inspr.pharos.host-report.v3`; the local onboarding envelope is
+`inspr.pharos.host-report.v4`; the local onboarding envelope is
 `inspr.pharos.host-registration.v1`. Both require explicit schema/version
 fields and reject extensions. Reports are limited to 64 KiB, heartbeat cadence
 is 10–3600 seconds, and all identities, freshness values, and observation text
@@ -110,7 +110,11 @@ transitive inputs of unrelated flakes, and reporting the worst of those describe
 the lock file rather than the host. The beacon reports the observed channel and
 the control plane applies the release calendar, so an end-of-life channel becomes
 a distinct louder signal than any age number and a newly expired release needs no
-fleet-wide beacon roll.
+fleet-wide beacon roll. If another root input is also nixpkgs-family, the beacon
+reports the stalest one separately by input name, age, and channel. The dashboard
+labels that observation as other-root lock-maintenance context; it never changes
+the host's primary nixpkgs age, end-of-life state, attention reason, or freshness
+service posture. Transitive nixpkgs inputs remain excluded.
 
 For an ordered fleet rollout, the control plane accepts the current report
 contract and exactly its immediate predecessor. Deploy the new control plane

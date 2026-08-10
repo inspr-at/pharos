@@ -1556,6 +1556,7 @@ mod tests {
                 commits_behind: Some(0),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             },
             kernel: None,
             service_observations: vec![],

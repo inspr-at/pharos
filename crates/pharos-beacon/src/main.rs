@@ -26,9 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pharos_core::{
     BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
     HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
-    HostReportResponse, KernelPosture, NixFreshness, ServiceObservation, ServiceObservationState,
-    HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS,
-    MIN_HEARTBEAT_INTERVAL_SECS,
+    HostReportResponse, KernelPosture, NixFreshness, NixpkgsInputFreshness, ServiceObservation,
+    ServiceObservationState, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS,
+    MAX_INBOUND_RTT_MS, MIN_HEARTBEAT_INTERVAL_SECS,
 };
 use url::Url;
 
@@ -414,12 +414,20 @@ fn days_since(unix_seconds: i64) -> Option<u32> {
     u32::try_from((now_unix() - unix_seconds).max(0) / 86_400).ok()
 }
 
-/// PHAROS-193: the oldest nixpkgs-family input and the channel it tracks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollectedNixpkgsFreshness {
+    age_days: u32,
+    channel: Option<String>,
+    secondary: Option<NixpkgsInputFreshness>,
+}
+
+/// PHAROS-193/196/201: the system nixpkgs plus secondary root-input context.
 ///
 /// `flake_lock_age_days` reports the newest input, so one freshly bumped helper
 /// hides a frozen nixpkgs behind a reassuring `0d`. Security fixes arrive
-/// through nixpkgs, so report its worst case separately and name its channel.
-fn nixpkgs_freshness(dir: &str) -> Option<(u32, Option<String>)> {
+/// through the system nixpkgs, so report that as primary posture and preserve
+/// the stalest other root nixpkgs input as explicitly secondary context.
+fn nixpkgs_freshness(dir: &str) -> Option<CollectedNixpkgsFreshness> {
     let raw = std::fs::read_to_string(format!("{dir}/flake.lock")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let nodes = v.get("nodes")?.as_object()?;
@@ -432,19 +440,60 @@ fn nixpkgs_freshness(dir: &str) -> Option<(u32, Option<String>)> {
         .get("root")
         .and_then(|root| root.as_str())
         .unwrap_or("root");
-    let target = nodes.get(root_name)?.get("inputs")?.get("nixpkgs")?;
+    let root_inputs = nodes.get(root_name)?.get("inputs")?.as_object()?;
+    let target = root_inputs.get("nixpkgs")?;
     let node_name = input_target_name(target)?;
     let node = nodes.get(node_name)?;
     let modified = node.get("locked")?.get("lastModified")?.as_i64()?;
     // A dated channel is declared in `original`; `locked` carries the resolved
     // revision, which is not a channel name.
-    let channel = node
-        .get("original")
+    let channel = nixpkgs_channel(node);
+
+    // Only other root inputs are secondary context. Transitive nixpkgs nodes
+    // belong to unrelated flakes and must not be presented as this host's lock
+    // maintenance. Aliases that resolve to the system node are excluded too.
+    let secondary = root_inputs
+        .iter()
+        .filter(|(input, _)| {
+            input.as_str() != "nixpkgs"
+                && input.to_ascii_lowercase().contains("nixpkgs")
+                && pharos_core::valid_nix_input_name(input)
+        })
+        .filter_map(|(input, target)| {
+            let secondary_node_name = input_target_name(target)?;
+            if secondary_node_name == node_name {
+                return None;
+            }
+            let secondary_node = nodes.get(secondary_node_name)?;
+            let modified = secondary_node
+                .get("locked")?
+                .get("lastModified")?
+                .as_i64()?;
+            Some(NixpkgsInputFreshness {
+                input: input.clone(),
+                age_days: days_since(modified)?,
+                channel: nixpkgs_channel(secondary_node),
+            })
+        })
+        .max_by(|left, right| {
+            left.age_days
+                .cmp(&right.age_days)
+                .then_with(|| right.input.cmp(&left.input))
+        });
+
+    Some(CollectedNixpkgsFreshness {
+        age_days: days_since(modified)?,
+        channel,
+        secondary,
+    })
+}
+
+fn nixpkgs_channel(node: &serde_json::Value) -> Option<String> {
+    node.get("original")
         .and_then(|original| original.get("ref"))
         .and_then(|reference| reference.as_str())
         .filter(|reference| pharos_core::valid_nix_channel(reference))
-        .map(str::to_string);
-    Some((days_since(modified)?, channel))
+        .map(str::to_string)
 }
 
 /// An `inputs` entry is either a node name or, for a `follows`, the path to the
@@ -1530,8 +1579,11 @@ fn main() {
                 applicable: true,
                 flake_lock_age_days: dir.as_deref().and_then(flake_lock_age_days),
                 commits_behind: dir.as_deref().and_then(commits_behind),
-                nixpkgs_age_days: nixpkgs.as_ref().map(|(days, _)| *days),
-                nixpkgs_channel: nixpkgs.and_then(|(_, channel)| channel),
+                nixpkgs_age_days: nixpkgs.as_ref().map(|freshness| freshness.age_days),
+                nixpkgs_channel: nixpkgs
+                    .as_ref()
+                    .and_then(|freshness| freshness.channel.clone()),
+                secondary_nixpkgs: nixpkgs.and_then(|freshness| freshness.secondary),
             }
         } else {
             NixFreshness::default()
@@ -1955,6 +2007,7 @@ mod tests {
                 commits_behind: Some(0),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             },
             None,
             &[],
@@ -2520,9 +2573,21 @@ mod tests {
         // PHAROS-193 replaced that with the oldest nixpkgs-family node, which
         // reported 218d on an expired channel and reads as a patching gap the
         // host does not have. The system input is what decides its posture.
-        let (days, channel) = nixpkgs_freshness(path).expect("nixpkgs observed");
-        assert_eq!(days, 21, "must report the flake's own nixpkgs input");
-        assert_eq!(channel.as_deref(), Some("nixos-unstable"));
+        let freshness = nixpkgs_freshness(path).expect("nixpkgs observed");
+        assert_eq!(
+            freshness.age_days, 21,
+            "must report the flake's own nixpkgs input"
+        );
+        assert_eq!(freshness.channel.as_deref(), Some("nixos-unstable"));
+        assert_eq!(
+            freshness.secondary,
+            Some(NixpkgsInputFreshness {
+                input: "nixpkgs-stable".to_string(),
+                age_days: 218,
+                channel: Some("nixos-25.05".to_string()),
+            }),
+            "the stale root side input remains visible as secondary context"
+        );
 
         // An unstable channel is rolling, so it is never flagged end of life.
         assert_eq!(
@@ -2546,9 +2611,10 @@ mod tests {
                 "disko": { "locked": { "lastModified": days_ago(0) } }
             }),
         );
-        let (days, channel) = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
-        assert_eq!(days, 218);
-        assert_eq!(channel.as_deref(), Some("nixos-25.05"));
+        let freshness = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
+        assert_eq!(freshness.age_days, 218);
+        assert_eq!(freshness.channel.as_deref(), Some("nixos-25.05"));
+        assert_eq!(freshness.secondary, None);
         assert_eq!(
             pharos_core::nix_channel_state("nixos-25.05", 2026, 8),
             pharos_core::NixChannelState::EndOfLife
@@ -2568,9 +2634,9 @@ mod tests {
                 }
             }),
         );
-        let (days, channel) = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
-        assert_eq!(days, 9);
-        assert_eq!(channel.as_deref(), Some("nixos-26.05"));
+        let freshness = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
+        assert_eq!(freshness.age_days, 9);
+        assert_eq!(freshness.channel.as_deref(), Some("nixos-26.05"));
         let _ = std::fs::remove_dir_all(dir);
 
         // No nixpkgs input at all: report nothing rather than guess.
@@ -2591,9 +2657,12 @@ mod tests {
                 }
             }),
         );
-        let (days, channel) = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
-        assert_eq!(days, 4);
-        assert_eq!(channel, None, "an unsafe ref must not reach the report");
+        let freshness = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
+        assert_eq!(freshness.age_days, 4);
+        assert_eq!(
+            freshness.channel, None,
+            "an unsafe ref must not reach the report"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

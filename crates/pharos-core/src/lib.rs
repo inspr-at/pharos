@@ -27,6 +27,8 @@ pub const MAX_FLAKE_LOCK_AGE_DAYS: u32 = 36_500;
 pub const MAX_COMMITS_BEHIND: u32 = 1_000_000;
 /// PHAROS-193: a release channel name such as `nixos-25.05`.
 pub const MAX_NIX_CHANNEL_BYTES: usize = 64;
+/// PHAROS-201: a root flake input name such as `nixpkgs-stable`.
+pub const MAX_NIX_INPUT_NAME_BYTES: usize = 64;
 pub const MAX_SERVICE_OBSERVATIONS: usize = 64;
 pub const MAX_BACKUP_OBSERVATIONS: usize = 64;
 pub const MAX_HOST_REPORT_BYTES: usize = 64 * 1024;
@@ -273,6 +275,47 @@ pub struct Host {
     pub requested_preferences: Option<HostPreferences>,
 }
 
+/// A non-system root nixpkgs input observed for lock-maintenance context.
+///
+/// This must never drive the host's patch posture: only `NixFreshness`'s
+/// primary `nixpkgs_*` fields describe the nixpkgs the system is built from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NixpkgsInputFreshness {
+    pub input: String,
+    pub age_days: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+}
+
+impl NixpkgsInputFreshness {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        let family_name = self.input.to_ascii_lowercase();
+        if !valid_nix_input_name(&self.input)
+            || !family_name.contains("nixpkgs")
+            || family_name == "nixpkgs"
+        {
+            return Err(
+                "secondary nixpkgs input must be a bounded non-system nixpkgs-family name"
+                    .to_string(),
+            );
+        }
+        if self.age_days > MAX_FLAKE_LOCK_AGE_DAYS {
+            return Err(format!(
+                "secondary nixpkgs age_days must be <= {MAX_FLAKE_LOCK_AGE_DAYS}"
+            ));
+        }
+        if self
+            .channel
+            .as_deref()
+            .is_some_and(|channel| !valid_nix_channel(channel))
+        {
+            return Err("secondary nixpkgs channel must be a bounded channel name".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Nix freshness for a host (PHAROS-15): what it is "missing".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -304,6 +347,11 @@ pub struct NixFreshness {
     /// needs no fleet-wide beacon roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs_channel: Option<String>,
+    /// PHAROS-201: the stalest other root input whose declared name identifies
+    /// it as nixpkgs-family. This is secondary lock-maintenance context only;
+    /// it does not participate in attention or service-posture classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_nixpkgs: Option<NixpkgsInputFreshness>,
 }
 
 /// Support state of a NixOS release channel (PHAROS-193).
@@ -397,6 +445,15 @@ pub fn valid_nix_channel(channel: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
+/// A root flake input name is a short value-free identifier.
+pub fn valid_nix_input_name(input: &str) -> bool {
+    !input.is_empty()
+        && input.len() <= MAX_NIX_INPUT_NAME_BYTES
+        && input
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl NixFreshness {
     pub fn validate_contract(&self) -> Result<(), String> {
         if self
@@ -428,11 +485,20 @@ impl NixFreshness {
         {
             return Err("nixpkgs_channel must be a bounded channel name".to_string());
         }
+        if let Some(secondary) = &self.secondary_nixpkgs {
+            secondary.validate_contract()?;
+            if self.nixpkgs_age_days.is_none() {
+                return Err(
+                    "secondary nixpkgs context requires primary nixpkgs freshness".to_string(),
+                );
+            }
+        }
         if !self.applicable
             && (self.flake_lock_age_days.is_some()
                 || self.commits_behind.is_some()
                 || self.nixpkgs_age_days.is_some()
-                || self.nixpkgs_channel.is_some())
+                || self.nixpkgs_channel.is_some()
+                || self.secondary_nixpkgs.is_some())
         {
             return Err("non-Nix freshness must not carry Nix values".to_string());
         }
@@ -2432,14 +2498,14 @@ pub fn liveness(
     }
 }
 
-// PHAROS-193 moved the contract to v3 by adding the nixpkgs freshness fields.
+// PHAROS-201 moved the contract to v4 by adding secondary nixpkgs context.
 // `deny_unknown_fields` makes any addition breaking for an older consumer, so
 // the version moves with it and the rollout order in README applies: control
 // plane first, then beacons.
-pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v3";
-pub const HOST_REPORT_VERSION: u16 = 3;
-pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v2";
-pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 2;
+pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v4";
+pub const HOST_REPORT_VERSION: u16 = 4;
+pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v3";
+pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 3;
 pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 2] = [
     (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
     (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
@@ -2487,6 +2553,11 @@ impl HostReport {
             .any(|(schema, version)| self.schema == *schema && self.version == *version)
         {
             return Err("unsupported report schema/version pair".to_string());
+        }
+        if self.version == PREVIOUS_HOST_REPORT_VERSION
+            && self.freshness.secondary_nixpkgs.is_some()
+        {
+            return Err("report v3 must not carry v4 secondary nixpkgs context".to_string());
         }
         validate_report_identity(&self.name, &self.role)?;
         validate_heartbeat_interval(self.heartbeat_interval_secs)?;
@@ -3402,6 +3473,7 @@ mod tests {
             commits_behind: Some(3),
             nixpkgs_age_days: None,
             nixpkgs_channel: None,
+            secondary_nixpkgs: None,
         };
         assert_eq!(
             behind.tldr(),
@@ -3659,6 +3731,7 @@ mod tests {
                 commits_behind: Some(0),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation {
@@ -4038,6 +4111,7 @@ mod tests {
             commits_behind: Some(0),
             nixpkgs_age_days: None,
             nixpkgs_channel: None,
+            secondary_nixpkgs: None,
         });
         assert_eq!(warning.id, "nix-freshness");
         assert_eq!(warning.state, ServiceObservationState::Warning);
@@ -4049,6 +4123,7 @@ mod tests {
             commits_behind: Some(0),
             nixpkgs_age_days: None,
             nixpkgs_channel: None,
+            secondary_nixpkgs: None,
         });
         assert_eq!(healthy.state, ServiceObservationState::Healthy);
     }
@@ -4188,6 +4263,7 @@ mod tests {
                 commits_behind: Some(0),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
@@ -4196,6 +4272,7 @@ mod tests {
                 commits_behind: Some(0),
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
+                secondary_nixpkgs: None,
             })],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -5041,6 +5118,7 @@ mod tests {
             commits_behind: Some(0),
             nixpkgs_age_days: Some(218),
             nixpkgs_channel: Some("nixos-25.05".to_string()),
+            secondary_nixpkgs: None,
         };
         freshness.validate_contract().expect("valid freshness");
         assert!(
@@ -5071,6 +5149,7 @@ mod tests {
             commits_behind: Some(0),
             nixpkgs_age_days: Some(0),
             nixpkgs_channel: Some("nixos-26.05".to_string()),
+            secondary_nixpkgs: None,
         };
         freshness.validate_contract().expect("valid freshness");
         assert_eq!(freshness.tldr(), "up to date");
@@ -5088,6 +5167,7 @@ mod tests {
             commits_behind: Some(0),
             nixpkgs_age_days: Some(MAX_FLAKE_LOCK_AGE_DAYS + 1),
             nixpkgs_channel: None,
+            secondary_nixpkgs: None,
         };
         assert!(over_bound.validate_contract().is_err());
 
@@ -5097,6 +5177,7 @@ mod tests {
             commits_behind: Some(0),
             nixpkgs_age_days: Some(1),
             nixpkgs_channel: Some("nixos 25.05".to_string()),
+            secondary_nixpkgs: None,
         };
         assert!(bad_channel.validate_contract().is_err());
 
@@ -5106,14 +5187,15 @@ mod tests {
             commits_behind: None,
             nixpkgs_age_days: Some(1),
             nixpkgs_channel: None,
+            secondary_nixpkgs: None,
         };
         assert!(non_nix.validate_contract().is_err());
     }
 
     #[test]
-    fn previous_contract_reports_without_nixpkgs_fields_are_still_accepted() {
-        // A v2 beacon that has not rolled yet must keep reporting. PHAROS-193
-        // added fields, and the rollout order is control plane first.
+    fn previous_contract_reports_without_secondary_nixpkgs_are_still_accepted() {
+        // A v3 beacon that has not rolled yet must keep reporting. PHAROS-201
+        // added secondary context, and the rollout order is control plane first.
         let report: HostReport = serde_json::from_value(serde_json::json!({
             "schema": PREVIOUS_HOST_REPORT_SCHEMA,
             "version": PREVIOUS_HOST_REPORT_VERSION,
@@ -5123,12 +5205,82 @@ mod tests {
             "heartbeat_interval_secs": 60,
             "freshness": {"applicable": true, "flake_lock_age_days": 3, "commits_behind": 0}
         }))
-        .expect("a v2 report still deserializes");
-        report.validate_contract().expect("v2 remains valid");
+        .expect("a v3 report still deserializes");
+        report.validate_contract().expect("v3 remains valid");
         assert_eq!(report.freshness.nixpkgs_age_days, None);
         assert_eq!(report.freshness.nixpkgs_channel, None);
+        assert_eq!(report.freshness.secondary_nixpkgs, None);
         // It degrades honestly rather than claiming nixpkgs is fresh.
         assert_eq!(report.freshness.channel_state(2026, 8), None);
         assert!(report.freshness.tldr().contains("flake.lock 3d old"));
+    }
+
+    #[test]
+    fn secondary_nixpkgs_is_bounded_and_requires_the_v4_contract() {
+        let secondary = NixpkgsInputFreshness {
+            input: "nixpkgs-stable".to_string(),
+            age_days: 218,
+            channel: Some("nixos-25.05".to_string()),
+        };
+        secondary.validate_contract().expect("bounded context");
+
+        let invalid_name = NixpkgsInputFreshness {
+            input: "../nixpkgs?token=value".to_string(),
+            ..secondary.clone()
+        };
+        assert!(invalid_name.validate_contract().is_err());
+        let unrelated_name = NixpkgsInputFreshness {
+            input: "disko".to_string(),
+            ..secondary.clone()
+        };
+        assert!(unrelated_name.validate_contract().is_err());
+        let primary_name = NixpkgsInputFreshness {
+            input: "nixpkgs".to_string(),
+            ..secondary.clone()
+        };
+        assert!(primary_name.validate_contract().is_err());
+        let invalid_age = NixpkgsInputFreshness {
+            age_days: MAX_FLAKE_LOCK_AGE_DAYS + 1,
+            ..secondary.clone()
+        };
+        assert!(invalid_age.validate_contract().is_err());
+
+        let secondary_without_primary = NixFreshness {
+            applicable: true,
+            secondary_nixpkgs: Some(secondary.clone()),
+            ..Default::default()
+        };
+        assert!(secondary_without_primary.validate_contract().is_err());
+
+        let previous: HostReport = serde_json::from_value(serde_json::json!({
+            "schema": PREVIOUS_HOST_REPORT_SCHEMA,
+            "version": PREVIOUS_HOST_REPORT_VERSION,
+            "name": "hsb8",
+            "role": "server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60,
+            "freshness": {
+                "applicable": true,
+                "flake_lock_age_days": 0,
+                "commits_behind": 0,
+                "nixpkgs_age_days": 0,
+                "nixpkgs_channel": "nixos-unstable",
+                "secondary_nixpkgs": secondary
+            }
+        }))
+        .expect("shared type can decode for version-aware validation");
+        assert!(previous.validate_contract().is_err());
+
+        let v2: HostReport = serde_json::from_value(serde_json::json!({
+            "schema": "inspr.pharos.host-report.v2",
+            "version": 2,
+            "name": "hsb8",
+            "role": "server",
+            "is_nix": true,
+            "heartbeat_interval_secs": 60,
+            "freshness": {"applicable": true, "flake_lock_age_days": 0, "commits_behind": 0}
+        }))
+        .expect("old shape still decodes before contract validation");
+        assert!(v2.validate_contract().is_err());
     }
 }
