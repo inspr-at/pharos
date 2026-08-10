@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## 0.1.81 - 2026-08-10
+
+- Resolve the official NixOS channel tip from its bounded HTTPS `git-revision` publication instead of downloading GitHub's complete nixpkgs ref advertisement, eliminating host-speed-dependent comparison timeouts.
+- Accept only a size-bounded exact lowercase Git object ID over HTTPS and allow only the official channel-to-release redirect; every network, redirect, size, or parse failure remains explicitly unknown.
+- Keep exact fail-closed Git comparison for explicitly configured custom nixpkgs remotes and expose an optional channel-publication base for controlled deployments.
+
 ## 0.1.80 - 2026-08-10
 
 - Tie Nix freshness to strict active-generation evidence containing the exact nixcfg revision, flake.lock SHA-256, and resolved nixpkgs revision instead of trusting a mutable checkout.
