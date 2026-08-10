@@ -24,7 +24,7 @@ let
 
   pharosdTestRunner = pkgs.writeShellScript "pharosd-test-runner" ''
     set -euo pipefail
-    export PHAROS_REGISTRATION_TOKEN="$(<"$CREDENTIALS_DIRECTORY/registration-token")"
+    export PHAROS_REGISTRATION_TOKEN_FILE="$CREDENTIALS_DIRECTORY/registration-token"
     exec ${pharosd}/bin/pharosd
   '';
 
@@ -39,7 +39,7 @@ let
     } >"$work/register.headers"
     chmod 0600 "$work/register.headers"
 
-    printf '%s' '{"name":"vm-beacon","role":"NixOS integration test","is_nix":true,"heartbeat_interval_secs":1}' \
+    printf '%s' '{"schema":"inspr.pharos.host-registration.v1","version":1,"name":"vm-beacon","role":"NixOS integration test","is_nix":true,"heartbeat_interval_secs":10}' \
       >"$work/register.json"
     ${pkgs.curl}/bin/curl \
       --fail \
@@ -100,7 +100,7 @@ pkgs.testers.nixosTest {
         enable = true;
         package = pharosBeacon;
         url = "http://127.0.0.1:18080";
-        interval = 1;
+        interval = 10;
         hostName = "vm-beacon";
         role = "NixOS integration test";
         tokenFile = "/run/pharos-test/beacon-token";

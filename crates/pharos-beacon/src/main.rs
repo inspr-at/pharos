@@ -8,7 +8,7 @@
 //! Env: PHAROS_URL (required pharosd base),
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
 //!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
-//!      PHAROS_TOKEN (per-host bearer token from /register),
+//!      PHAROS_TOKEN / PHAROS_TOKEN_FILE (per-host bearer token from /register),
 //!      PHAROS_BACKUP_MODE (auto/off/restic/status-file/command).
 
 use std::fs::{File, OpenOptions};
@@ -202,21 +202,8 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn bearer_token() -> Option<String> {
-    std::env::var("PHAROS_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let path = std::env::var("PHAROS_TOKEN_FILE")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())?;
-            std::fs::read_to_string(path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
+fn bearer_token() -> Result<Option<String>, pharos_core::secret_input::SecretInputError> {
+    pharos_core::secret_input::optional_secret("PHAROS_TOKEN")
 }
 
 fn parse_host_preferences(raw: &str, host: &str) -> Result<HostPreferences, &'static str> {
@@ -1499,7 +1486,10 @@ fn main() {
     let is_nix = Path::new("/etc/NIXOS").exists();
     let dir = nixcfg_dir();
     let role = std::env::var("PHAROS_ROLE").unwrap_or_else(|_| "server".into());
-    let token = bearer_token();
+    let token = bearer_token().unwrap_or_else(|error| {
+        eprintln!("pharos-beacon: {error}");
+        std::process::exit(2);
+    });
     let preferences_path = env_value("PHAROS_PREFERENCES_FILE").map(std::path::PathBuf::from);
     let mut preferences = HostPreferences::default();
     let mut preferences_error_reported = false;
@@ -2429,19 +2419,21 @@ mod tests {
     }
 
     #[test]
-    fn bearer_token_prefers_env_over_file_and_trims() {
+    fn bearer_token_prefers_file_and_fails_closed() {
         let temp = std::env::temp_dir().join(format!("pharos-token-test-{}", std::process::id()));
         std::fs::write(&temp, "file-token\n").expect("write token fixture");
         std::env::set_var("PHAROS_TOKEN", " env-token ");
         std::env::set_var("PHAROS_TOKEN_FILE", &temp);
 
-        assert_eq!(bearer_token(), Some("env-token".to_string()));
+        assert_eq!(bearer_token().unwrap(), Some("file-token".to_string()));
+
+        std::fs::remove_file(&temp).expect("remove token fixture");
+        let error = bearer_token().expect_err("missing configured file must fail closed");
+        assert!(error.to_string().contains("PHAROS_TOKEN_FILE"));
+        assert!(!error.to_string().contains("env-token"));
 
         std::env::remove_var("PHAROS_TOKEN");
-        assert_eq!(bearer_token(), Some("file-token".to_string()));
-
         std::env::remove_var("PHAROS_TOKEN_FILE");
-        let _ = std::fs::remove_file(temp);
     }
 
     // PHAROS-193 --------------------------------------------------------------

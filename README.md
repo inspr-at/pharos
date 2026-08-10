@@ -200,13 +200,16 @@ export PHAROS_OIDC_REDIRECT_URI=https://pharos.example/auth/callback
 export PHAROS_ALLOWED_OPERATORS=email:alice@example.com
 export PHAROS_BIND=127.0.0.1:8080
 
-read -rsp "Pharos registration token: " PHAROS_REGISTRATION_TOKEN
-echo
-export PHAROS_REGISTRATION_TOKEN
+export PHAROS_REGISTRATION_TOKEN_FILE=/run/secrets/pharos-registration-token
 
 docker compose -f docker-compose.selfhost.yml config
 docker compose -f docker-compose.selfhost.yml up -d
 ```
+
+Mount the secret-manager-owned registration-token file read-only at that exact
+container path with a private Compose override. The file path, not the token,
+is placed in the process environment. In Janus token mode, leave both the
+direct and file-backed registration-token variables unset.
 
 Put an HTTPS reverse proxy or a private tailnet endpoint in front of
 `PHAROS_BIND`. For durable operation, supply runtime values through your host
@@ -521,7 +524,7 @@ promised third-party API. The important boundaries are:
 | `PHAROS_OIDC_REDIRECT_URI` | Exact callback URI |
 | `PHAROS_ALLOWED_OPERATORS` | Comma/space-separated `operator-ref:<sha256>`, `verified-email-ref:<sha256>`, or `email:<verified-address>` full-fleet identities |
 | `PHAROS_ACCESS_POLICY_FILE` | Optional scoped policy using the same strict OIDC authorization identifiers |
-| `PHAROS_REGISTRATION_TOKEN` | Bootstrap authorization for local registration |
+| `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for local registration; the file form wins and is preferred |
 | `PHAROS_REQUIRE_BEACON_TOKEN` | Require a valid machine token on every report |
 | `PHAROS_BEACON_TOKEN_MODE` | `local`, `dual` or `janus` |
 | `PHAROS_BEACON_TOKEN_HASH_DIR` | Private Janus v2 token-generation root containing `current` and immutable generation files |
@@ -539,13 +542,18 @@ promised third-party API. The important boundaries are:
 | `PHAROS_URL` | Validated HTTP(S) base URL of `pharosd`; userinfo, query strings and fragments are rejected |
 | `PHAROS_INTERVAL` | Recurring report interval from 10–3600 seconds; unset means report once |
 | `PHAROS_HOSTNAME`, `PHAROS_ROLE` | Explicit reported identity |
-| `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE` | Per-host bearer credential |
+| `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE` | Per-host bearer credential; the file form wins and is preferred |
 | `NIXCFG_DIR` | Checkout used for Nix freshness |
 | `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
 | `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
 | `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
 
 See the committed Compose files and NixOS module for the complete wiring.
+
+For both token pairs, a non-empty `_FILE` variable takes precedence over the
+direct value. Pharos removes one trailing LF or CRLF from the file and preserves
+all other bytes. A configured file that is unreadable, invalid UTF-8, or empty
+fails startup; Pharos never falls back to the direct value after a file error.
 
 When alert delivery is enabled, pharosd fails startup unless the incident and
 outbox state has a durable path. Delivery is at least once: every event carries
