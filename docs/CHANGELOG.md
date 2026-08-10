@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.79 - 2026-08-10
+
+- Report the stalest other root nixpkgs-family input by name, age, and channel as neutral lock-maintenance context while keeping transitive inputs excluded and the system nixpkgs as the sole source of host patch posture.
+- Move the host report contract to `inspr.pharos.host-report.v4`, keeping v3 as the accepted predecessor for the control-plane-first rollout and rejecting v2.
+
 ## 0.1.78 - 2026-08-10
 
 - Load local registration and beacon credentials from read-only runtime files with `_FILE` precedence, remove exactly one trailing line ending, and fail startup on a missing, invalid or empty file instead of falling back to an environment value.
