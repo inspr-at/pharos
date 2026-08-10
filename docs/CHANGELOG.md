@@ -1,5 +1,10 @@
 # Pharos Changelog
 
+## 0.1.78 - 2026-08-10
+
+- Load local registration and beacon credentials from read-only runtime files with `_FILE` precedence, remove exactly one trailing line ending, and fail startup on a missing, invalid or empty file instead of falling back to an environment value.
+- Move the self-host and NixOS integration paths to file-backed registration so credential values no longer need to enter the service environment.
+
 ## 0.1.77 - 2026-08-08
 
 - Request the nixcfg retirement proposal whenever a removal must retire a credential, not only when it must remove a declaration, so removing a Janus-managed host that nixcfg does not declare no longer revokes reporting and then strands with the credential live.
