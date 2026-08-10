@@ -6,8 +6,9 @@
 # this file to production.
 #
 # Secrets are intentionally not committed here. If you need to test strict
-# token behavior locally, export PHAROS_REGISTRATION_TOKEN / PHAROS_TOKEN in
-# your shell or use an untracked local env file.
+# token behavior locally, prefer read-only files with
+# PHAROS_REGISTRATION_TOKEN_FILE / PHAROS_TOKEN_FILE. Direct values remain a
+# compatibility path for local smoke tests only.
 
 name: pharos-local
 
@@ -49,7 +50,8 @@ services:
       PHAROS_HOSTNAME: ${PHAROS_HOSTNAME:-local-dev}
       PHAROS_ROLE: ${PHAROS_ROLE:-local}
       # Optional for strict-token local tests; leave unset for legacy-mode
-      # local smoke tests.
+      # local smoke tests. A private override can instead mount a token file
+      # and set PHAROS_TOKEN_FILE to its container path.
       PHAROS_TOKEN: ${PHAROS_TOKEN:-}
 
 volumes:

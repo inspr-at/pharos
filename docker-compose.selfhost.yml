@@ -40,9 +40,10 @@ services:
       # Use operator-ref:<sha256>, or email:<address> only when the IdP marks it verified.
       PHAROS_ALLOWED_OPERATORS: ${PHAROS_ALLOWED_OPERATORS:?set PHAROS_ALLOWED_OPERATORS}
 
-      # Machine routes. Local mode requires a runtime registration value;
+      # Machine routes. Local mode requires a read-only registration-token
+      # mount at this container path; add it with a private Compose override.
       # Janus mode requires this to remain unset.
-      PHAROS_REGISTRATION_TOKEN: ${PHAROS_REGISTRATION_TOKEN:-}
+      PHAROS_REGISTRATION_TOKEN_FILE: ${PHAROS_REGISTRATION_TOKEN_FILE:-}
       PHAROS_REQUIRE_BEACON_TOKEN: "1"
       PHAROS_BEACON_TOKEN_MODE: ${PHAROS_BEACON_TOKEN_MODE:-local}
 
@@ -79,6 +80,8 @@ services:
       # - ./manifests:/manifests:ro
       # Optional bootstrap SSH mount (use a private local compose override):
       # - ./private/pharos-ssh:/run/pharos/ssh:ro
+      # Local registration token mount (required in local token mode):
+      # - ./private/pharos-registration-token:/run/secrets/pharos-registration-token:ro
       # Optional provider token mount (use a private local compose override):
       # - ./private/hcloud-token:/run/pharos/hcloud-token:ro
 

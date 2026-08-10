@@ -7,6 +7,7 @@
 
 pub mod managed_operations;
 pub mod managed_services;
+pub mod secret_input;
 
 use std::collections::{BTreeMap, BTreeSet};
 

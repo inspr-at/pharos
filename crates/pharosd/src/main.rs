@@ -168,7 +168,9 @@ struct BeaconAuth {
 
 impl BeaconAuth {
     fn from_env() -> Result<Self, String> {
-        let registration_token = env_nonempty("PHAROS_REGISTRATION_TOKEN");
+        let registration_token =
+            pharos_core::secret_input::optional_secret("PHAROS_REGISTRATION_TOKEN")
+                .map_err(|error| error.to_string())?;
         let janus_tokens = janus_token_generation_root_from_env()?
             .map(JanusTokenStore::load)
             .transpose()
@@ -224,7 +226,7 @@ impl BeaconAuth {
             }
             if registration_token.is_some() {
                 return Err(
-                    "PHAROS_REGISTRATION_TOKEN must be absent when PHAROS_BEACON_TOKEN_MODE=janus"
+                    "PHAROS_REGISTRATION_TOKEN and PHAROS_REGISTRATION_TOKEN_FILE must be absent when PHAROS_BEACON_TOKEN_MODE=janus"
                         .to_string(),
                 );
             }
