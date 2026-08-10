@@ -8,6 +8,9 @@
 //! Env: PHAROS_URL (required pharosd base),
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
 //!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
+//!      PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE (active-generation evidence),
+//!      PHAROS_NIXCFG_REMOTE_URL / PHAROS_NIXCFG_REMOTE_REF (authoritative Git),
+//!      PHAROS_NIXPKGS_REMOTE_URL (authoritative nixpkgs repository),
 //!      PHAROS_TOKEN / PHAROS_TOKEN_FILE (per-host bearer token from /register),
 //!      PHAROS_BACKUP_MODE (auto/off/restic/status-file/command).
 
@@ -25,15 +28,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
     BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
-    HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
-    HostReportResponse, KernelPosture, NixFreshness, NixpkgsInputFreshness, ServiceObservation,
-    ServiceObservationState, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS,
-    MAX_INBOUND_RTT_MS, MIN_HEARTBEAT_INTERVAL_SECS,
+    GitRevisionRelation, HostLocation, HostLocationSource, HostPreferences,
+    HostPreferencesRegistry, HostReport, HostReportResponse, KernelPosture, NixDeploymentEvidence,
+    NixFreshness, NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness,
+    NixpkgsRevisionRelation, ServiceObservation, ServiceObservationState, HOST_REPORT_SCHEMA,
+    HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS,
+    MIN_HEARTBEAT_INTERVAL_SECS,
 };
+use sha2::{Digest, Sha256};
 use url::Url;
 
 const MAX_REPORT_RESPONSE_BYTES: u64 = 64 * 1024;
 const LOCATION_COMMAND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const GIT_COMPARISON_TIMEOUT: Duration = Duration::from_secs(12);
+const MAX_DEPLOYMENT_EVIDENCE_BYTES: u64 = 4 * 1024;
+const MAX_FLAKE_LOCK_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportEndpoint {
@@ -396,11 +405,63 @@ fn collect_kernel_posture(is_nix: bool, observed_at: i64) -> KernelPosture {
     )
 }
 
-/// Days since the newest input in flake.lock (i.e. since the last `nix flake
-/// update`).
-fn flake_lock_age_days(dir: &str) -> Option<u32> {
-    let raw = std::fs::read_to_string(format!("{dir}/flake.lock")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+fn deployment_evidence_path() -> PathBuf {
+    env_value("PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/host/pharos-deployment/evidence.json"))
+}
+
+fn read_deployment_evidence(path: &Path) -> Option<NixDeploymentEvidence> {
+    let mut raw = String::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_DEPLOYMENT_EVIDENCE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .ok()?;
+    if raw.len() as u64 > MAX_DEPLOYMENT_EVIDENCE_BYTES {
+        return None;
+    }
+    let evidence: NixDeploymentEvidence = serde_json::from_str(&raw).ok()?;
+    evidence.validate_contract().ok()?;
+    Some(evidence)
+}
+
+fn sha256_hex(raw: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(raw))
+}
+
+/// Read the checkout lock only when its digest and primary node exactly match
+/// the active generation. A checkout may move independently after activation;
+/// treating that newer mutable file as deployed state would be false evidence.
+fn matching_flake_lock(dir: &str, evidence: &NixDeploymentEvidence) -> Option<serde_json::Value> {
+    let path = format!("{dir}/flake.lock");
+    if std::fs::metadata(&path).ok()?.len() > MAX_FLAKE_LOCK_BYTES {
+        return None;
+    }
+    let raw = std::fs::read(path).ok()?;
+    if sha256_hex(&raw) != evidence.flake_lock_sha256 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let nodes = value.get("nodes")?.as_object()?;
+    let root_name = value
+        .get("root")
+        .and_then(|root| root.as_str())
+        .unwrap_or("root");
+    let target = nodes.get(root_name)?.get("inputs")?.get("nixpkgs")?;
+    let node = nodes.get(input_target_name(target)?)?;
+    if node.get("locked")?.get("rev")?.as_str()? != evidence.nixpkgs_revision
+        || node.get("locked")?.get("lastModified")?.as_i64()? != evidence.nixpkgs_last_modified
+        || nixpkgs_channel(node).as_deref() != Some(evidence.nixpkgs_channel.as_str())
+    {
+        return None;
+    }
+    Some(value)
+}
+
+/// Days since the newest input in the generation-matched flake.lock.
+fn flake_lock_age_days(lock: &serde_json::Value) -> Option<u32> {
+    let v = lock;
     let newest = v
         .get("nodes")?
         .as_object()?
@@ -427,9 +488,10 @@ struct CollectedNixpkgsFreshness {
 /// hides a frozen nixpkgs behind a reassuring `0d`. Security fixes arrive
 /// through the system nixpkgs, so report that as primary posture and preserve
 /// the stalest other root nixpkgs input as explicitly secondary context.
-fn nixpkgs_freshness(dir: &str) -> Option<CollectedNixpkgsFreshness> {
-    let raw = std::fs::read_to_string(format!("{dir}/flake.lock")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+fn nixpkgs_freshness(
+    v: &serde_json::Value,
+    evidence: &NixDeploymentEvidence,
+) -> Option<CollectedNixpkgsFreshness> {
     let nodes = v.get("nodes")?.as_object()?;
     // PHAROS-196: resolve the flake's own `nixpkgs` input rather than scanning
     // for the oldest node whose name happens to contain "nixpkgs". A lock mixes
@@ -445,9 +507,13 @@ fn nixpkgs_freshness(dir: &str) -> Option<CollectedNixpkgsFreshness> {
     let node_name = input_target_name(target)?;
     let node = nodes.get(node_name)?;
     let modified = node.get("locked")?.get("lastModified")?.as_i64()?;
-    // A dated channel is declared in `original`; `locked` carries the resolved
-    // revision, which is not a channel name.
     let channel = nixpkgs_channel(node);
+    if modified != evidence.nixpkgs_last_modified
+        || channel.as_deref() != Some(evidence.nixpkgs_channel.as_str())
+        || node.get("locked")?.get("rev")?.as_str()? != evidence.nixpkgs_revision
+    {
+        return None;
+    }
 
     // Only other root inputs are secondary context. Transitive nixpkgs nodes
     // belong to unrelated flakes and must not be presented as this host's lock
@@ -482,8 +548,8 @@ fn nixpkgs_freshness(dir: &str) -> Option<CollectedNixpkgsFreshness> {
         });
 
     Some(CollectedNixpkgsFreshness {
-        age_days: days_since(modified)?,
-        channel,
+        age_days: days_since(evidence.nixpkgs_last_modified)?,
+        channel: Some(evidence.nixpkgs_channel.clone()),
         secondary,
     })
 }
@@ -506,21 +572,202 @@ fn input_target_name(target: &serde_json::Value) -> Option<&str> {
     }
 }
 
-/// Commits the checkout is behind its upstream (best-effort fetch first).
-fn commits_behind(dir: &str) -> Option<u32> {
-    let _ = Command::new("git")
-        .args(["-C", dir, "fetch", "--quiet"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let out = Command::new("git")
-        .args(["-C", dir, "rev-list", "--count", "HEAD..@{u}"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+fn safe_git_remote(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.len() > 2_048 {
         return None;
     }
-    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    let url = Url::parse(raw).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| url.to_string())
+}
+
+fn safe_git_branch_ref(raw: &str) -> Option<String> {
+    let reference = raw.trim();
+    let branch = reference.strip_prefix("refs/heads/")?;
+    (!branch.is_empty()
+        && reference.len() <= 256
+        && !reference.contains("..")
+        && !reference.contains("@{")
+        && !reference.ends_with('/')
+        && !reference.ends_with('.')
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._/".contains(&byte)))
+    .then(|| reference.to_string())
+}
+
+fn git_output(args: &[String]) -> Option<String> {
+    run_location_command("git", args, GIT_COMPARISON_TIMEOUT).ok()
+}
+
+fn exact_revision(raw: &str) -> Option<String> {
+    let revision = raw.trim();
+    ((revision.len() == 40 || revision.len() == 64)
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| revision.to_string())
+}
+
+fn git_success(args: &[String]) -> bool {
+    run_location_command("git", args, GIT_COMPARISON_TIMEOUT).is_ok()
+}
+
+fn nixcfg_reference_dir() -> PathBuf {
+    PathBuf::from("/tmp/pharos-nixcfg-reference.git")
+}
+
+fn prepare_reference_repo(reference_dir: &Path, checkout: &str) -> Option<()> {
+    if !reference_dir.is_absolute() || !reference_dir.starts_with(std::env::temp_dir()) {
+        return None;
+    }
+    if std::fs::symlink_metadata(reference_dir)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return None;
+    }
+    if !reference_dir.join("HEAD").is_file() {
+        let path = reference_dir.to_str()?.to_string();
+        git_success(&["init".into(), "--bare".into(), "--quiet".into(), path]).then_some(())?;
+    }
+    let git_dir = git_output(&[
+        "-C".into(),
+        checkout.into(),
+        "rev-parse".into(),
+        "--absolute-git-dir".into(),
+    ])?;
+    let objects = PathBuf::from(git_dir.trim()).join("objects");
+    if !objects.is_dir() {
+        return None;
+    }
+    let info = reference_dir.join("objects/info");
+    std::fs::create_dir_all(&info).ok()?;
+    std::fs::write(info.join("alternates"), format!("{}\n", objects.display())).ok()?;
+    Some(())
+}
+
+fn nixcfg_git_comparison(checkout: &str, deployed_revision: &str) -> Option<NixcfgGitComparison> {
+    let remote = safe_git_remote(&env_value("PHAROS_NIXCFG_REMOTE_URL")?)?;
+    let remote_ref = safe_git_branch_ref(&env_value("PHAROS_NIXCFG_REMOTE_REF")?)?;
+    let reference_dir = nixcfg_reference_dir();
+    nixcfg_git_comparison_from_remote(
+        checkout,
+        deployed_revision,
+        &remote,
+        &remote_ref,
+        &reference_dir,
+    )
+}
+
+fn nixcfg_git_comparison_from_remote(
+    checkout: &str,
+    deployed_revision: &str,
+    remote: &str,
+    remote_ref: &str,
+    reference_dir: &Path,
+) -> Option<NixcfgGitComparison> {
+    prepare_reference_repo(reference_dir, checkout)?;
+    let reference_dir = reference_dir.to_str()?.to_string();
+    let local_ref = "refs/remotes/pharos/authoritative";
+    let refspec = format!("+{remote_ref}:{local_ref}");
+    git_success(&[
+        "-C".into(),
+        reference_dir.clone(),
+        "fetch".into(),
+        "--quiet".into(),
+        "--force".into(),
+        "--no-tags".into(),
+        "--filter=blob:none".into(),
+        remote.to_string(),
+        refspec,
+    ])
+    .then_some(())?;
+    let upstream_revision = exact_revision(&git_output(&[
+        "-C".into(),
+        reference_dir.clone(),
+        "rev-parse".into(),
+        format!("{local_ref}^{{commit}}"),
+    ])?)?;
+    let deployed_revision = exact_revision(deployed_revision)?;
+    if upstream_revision == deployed_revision {
+        return Some(NixcfgGitComparison {
+            upstream_revision,
+            relation: GitRevisionRelation::Current,
+            commits_behind: Some(0),
+        });
+    }
+    let merge_base = exact_revision(&git_output(&[
+        "-C".into(),
+        reference_dir.clone(),
+        "merge-base".into(),
+        deployed_revision.clone(),
+        upstream_revision.clone(),
+    ])?)?;
+    if merge_base == deployed_revision {
+        let count = git_output(&[
+            "-C".into(),
+            reference_dir.clone(),
+            "rev-list".into(),
+            "--count".into(),
+            format!("{deployed_revision}..{upstream_revision}"),
+        ])?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|count| *count > 0)?;
+        return Some(NixcfgGitComparison {
+            upstream_revision,
+            relation: GitRevisionRelation::Behind,
+            commits_behind: Some(count),
+        });
+    }
+    let relation = if merge_base == upstream_revision {
+        GitRevisionRelation::Ahead
+    } else {
+        GitRevisionRelation::Diverged
+    };
+    Some(NixcfgGitComparison {
+        upstream_revision,
+        relation,
+        commits_behind: None,
+    })
+}
+
+fn nixpkgs_git_comparison(evidence: &NixDeploymentEvidence) -> Option<NixpkgsGitComparison> {
+    let remote = safe_git_remote(&env_value("PHAROS_NIXPKGS_REMOTE_URL")?)?;
+    nixpkgs_git_comparison_from_remote(evidence, &remote)
+}
+
+fn nixpkgs_git_comparison_from_remote(
+    evidence: &NixDeploymentEvidence,
+    remote: &str,
+) -> Option<NixpkgsGitComparison> {
+    let remote_ref = safe_git_branch_ref(&format!("refs/heads/{}", evidence.nixpkgs_channel))?;
+    let output = git_output(&[
+        "ls-remote".into(),
+        "--exit-code".into(),
+        "--refs".into(),
+        remote.to_string(),
+        remote_ref.clone(),
+    ])?;
+    let mut fields = output.split_whitespace();
+    let upstream_revision = exact_revision(fields.next()?)?;
+    (fields.next()? == remote_ref && fields.next().is_none()).then_some(())?;
+    Some(NixpkgsGitComparison {
+        relation: if upstream_revision == evidence.nixpkgs_revision {
+            NixpkgsRevisionRelation::Current
+        } else {
+            NixpkgsRevisionRelation::Different
+        },
+        upstream_revision,
+    })
 }
 
 fn freshness_log_summary(freshness: &NixFreshness) -> String {
@@ -528,15 +775,32 @@ fn freshness_log_summary(freshness: &NixFreshness) -> String {
         return "nix=n/a".to_string();
     }
 
-    let age = freshness
-        .flake_lock_age_days
-        .map(|days| format!("{days}d"))
-        .unwrap_or_else(|| "unknown".to_string());
-    let behind = freshness
-        .commits_behind
-        .map(|commits| commits.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("flake_lock_age={age}; commits_behind={behind}")
+    let generation = if freshness.deployment_evidence.is_some() {
+        "verified"
+    } else {
+        "unverified"
+    };
+    let nixcfg = match freshness
+        .nixcfg_comparison
+        .as_ref()
+        .map(|comparison| comparison.relation)
+    {
+        Some(GitRevisionRelation::Current) => "current",
+        Some(GitRevisionRelation::Behind) => "behind",
+        Some(GitRevisionRelation::Ahead) => "ahead",
+        Some(GitRevisionRelation::Diverged) => "diverged",
+        None => "unknown",
+    };
+    let nixpkgs = match freshness
+        .nixpkgs_comparison
+        .as_ref()
+        .map(|comparison| comparison.relation)
+    {
+        Some(NixpkgsRevisionRelation::Current) => "current",
+        Some(NixpkgsRevisionRelation::Different) => "different",
+        None => "unknown",
+    };
+    format!("generation={generation}; nixcfg={nixcfg}; nixpkgs={nixpkgs}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1574,16 +1838,38 @@ fn main() {
             }
         }
         let freshness = if is_nix {
-            let nixpkgs = dir.as_deref().and_then(nixpkgs_freshness);
+            let evidence = read_deployment_evidence(&deployment_evidence_path());
+            let matching_lock = match (dir.as_deref(), evidence.as_ref()) {
+                (Some(dir), Some(evidence)) => matching_flake_lock(dir, evidence),
+                _ => None,
+            };
+            let nixpkgs = match (matching_lock.as_ref(), evidence.as_ref()) {
+                (Some(lock), Some(evidence)) => nixpkgs_freshness(lock, evidence),
+                _ => None,
+            };
+            let nixcfg_comparison = match (dir.as_deref(), evidence.as_ref()) {
+                (Some(dir), Some(evidence)) => {
+                    nixcfg_git_comparison(dir, &evidence.source_revision)
+                }
+                _ => None,
+            };
+            let nixpkgs_comparison = evidence.as_ref().and_then(nixpkgs_git_comparison);
             NixFreshness {
                 applicable: true,
-                flake_lock_age_days: dir.as_deref().and_then(flake_lock_age_days),
-                commits_behind: dir.as_deref().and_then(commits_behind),
-                nixpkgs_age_days: nixpkgs.as_ref().map(|freshness| freshness.age_days),
-                nixpkgs_channel: nixpkgs
+                flake_lock_age_days: matching_lock.as_ref().and_then(flake_lock_age_days),
+                commits_behind: nixcfg_comparison
                     .as_ref()
-                    .and_then(|freshness| freshness.channel.clone()),
+                    .and_then(|comparison| comparison.commits_behind),
+                nixpkgs_age_days: evidence
+                    .as_ref()
+                    .and_then(|evidence| days_since(evidence.nixpkgs_last_modified)),
+                nixpkgs_channel: evidence
+                    .as_ref()
+                    .map(|evidence| evidence.nixpkgs_channel.clone()),
                 secondary_nixpkgs: nixpkgs.and_then(|freshness| freshness.secondary),
+                deployment_evidence: evidence,
+                nixcfg_comparison,
+                nixpkgs_comparison,
             }
         } else {
             NixFreshness::default()
@@ -2008,6 +2294,9 @@ mod tests {
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
                 secondary_nixpkgs: None,
+                deployment_evidence: None,
+                nixcfg_comparison: None,
+                nixpkgs_comparison: None,
             },
             None,
             &[],
@@ -2016,8 +2305,9 @@ mod tests {
         assert!(line.contains("hsb8"));
         assert!(line.contains("http://pharos.example/report"));
         assert!(line.contains("HTTP 204"));
-        assert!(line.contains("flake_lock_age=1d"));
-        assert!(line.contains("commits_behind=0"));
+        assert!(line.contains("generation=unverified"));
+        assert!(line.contains("nixcfg=unknown"));
+        assert!(line.contains("nixpkgs=unknown"));
         assert!(line.contains("location=off"));
         assert!(!line.contains("\"name\""));
         assert!(!line.contains("heartbeat_interval_secs"));
@@ -2531,6 +2821,25 @@ mod tests {
         now_unix() - days * 86_400
     }
 
+    fn fixture_lock_and_evidence(dir: &Path) -> Option<(serde_json::Value, NixDeploymentEvidence)> {
+        let raw = std::fs::read(dir.join("flake.lock")).ok()?;
+        let lock: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let nodes = lock.get("nodes")?.as_object()?;
+        let root = lock.get("root")?.as_str()?;
+        let target = nodes.get(root)?.get("inputs")?.get("nixpkgs")?;
+        let node = nodes.get(input_target_name(target)?)?;
+        let evidence = NixDeploymentEvidence {
+            schema: pharos_core::NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+            version: pharos_core::NIX_DEPLOYMENT_EVIDENCE_VERSION,
+            source_revision: "a".repeat(40),
+            flake_lock_sha256: sha256_hex(&raw),
+            nixpkgs_revision: node.get("locked")?.get("rev")?.as_str()?.to_string(),
+            nixpkgs_last_modified: node.get("locked")?.get("lastModified")?.as_i64()?,
+            nixpkgs_channel: nixpkgs_channel(node)?,
+        };
+        Some((matching_flake_lock(dir.to_str()?, &evidence)?, evidence))
+    }
+
     /// The real csb1 lock shape. The system tracks nixos-unstable and is 21
     /// days old, while a separate root input sits 218 days stale on an expired
     /// channel and transitive inputs of nixos-hardware are older still.
@@ -2544,7 +2853,7 @@ mod tests {
             }),
             serde_json::json!({
                 "nixpkgs_6": {
-                    "locked":   { "lastModified": days_ago(21) },
+                    "locked":   { "lastModified": days_ago(21), "rev": "1111111111111111111111111111111111111111" },
                     "original": { "ref": "nixos-unstable" }
                 },
                 "nixpkgs-stable_2": {
@@ -2565,15 +2874,15 @@ mod tests {
     #[test]
     fn nixpkgs_freshness_reports_the_system_input_not_the_oldest_lookalike() {
         let dir = fleet_shaped_lock();
-        let path = dir.to_str().expect("utf-8 path");
 
         // The original signal reads as completely fresh because disko moved today.
-        assert_eq!(flake_lock_age_days(path), Some(0));
+        let (lock, evidence) = fixture_lock_and_evidence(&dir).expect("generation evidence");
+        assert_eq!(flake_lock_age_days(&lock), Some(0));
 
         // PHAROS-193 replaced that with the oldest nixpkgs-family node, which
         // reported 218d on an expired channel and reads as a patching gap the
         // host does not have. The system input is what decides its posture.
-        let freshness = nixpkgs_freshness(path).expect("nixpkgs observed");
+        let freshness = nixpkgs_freshness(&lock, &evidence).expect("nixpkgs observed");
         assert_eq!(
             freshness.age_days, 21,
             "must report the flake's own nixpkgs input"
@@ -2605,13 +2914,14 @@ mod tests {
             serde_json::json!({ "nixpkgs": "nixpkgs" }),
             serde_json::json!({
                 "nixpkgs": {
-                    "locked":   { "lastModified": days_ago(218) },
+                    "locked":   { "lastModified": days_ago(218), "rev": "2222222222222222222222222222222222222222" },
                     "original": { "ref": "nixos-25.05" }
                 },
                 "disko": { "locked": { "lastModified": days_ago(0) } }
             }),
         );
-        let freshness = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
+        let (lock, evidence) = fixture_lock_and_evidence(&dir).expect("generation evidence");
+        let freshness = nixpkgs_freshness(&lock, &evidence).expect("observed");
         assert_eq!(freshness.age_days, 218);
         assert_eq!(freshness.channel.as_deref(), Some("nixos-25.05"));
         assert_eq!(freshness.secondary, None);
@@ -2629,12 +2939,13 @@ mod tests {
             serde_json::json!({ "nixpkgs": ["nixpkgs_2"] }),
             serde_json::json!({
                 "nixpkgs_2": {
-                    "locked":   { "lastModified": days_ago(9) },
+                    "locked":   { "lastModified": days_ago(9), "rev": "3333333333333333333333333333333333333333" },
                     "original": { "ref": "nixos-26.05" }
                 }
             }),
         );
-        let freshness = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
+        let (lock, evidence) = fixture_lock_and_evidence(&dir).expect("generation evidence");
+        let freshness = nixpkgs_freshness(&lock, &evidence).expect("observed");
         assert_eq!(freshness.age_days, 9);
         assert_eq!(freshness.channel.as_deref(), Some("nixos-26.05"));
         let _ = std::fs::remove_dir_all(dir);
@@ -2644,7 +2955,7 @@ mod tests {
             serde_json::json!({ "disko": "disko" }),
             serde_json::json!({ "disko": { "locked": { "lastModified": days_ago(3) } } }),
         );
-        assert_eq!(nixpkgs_freshness(dir.to_str().expect("path")), None);
+        assert_eq!(fixture_lock_and_evidence(&dir), None);
         let _ = std::fs::remove_dir_all(dir);
 
         // An unsafe ref is dropped rather than propagated into the report.
@@ -2652,23 +2963,233 @@ mod tests {
             serde_json::json!({ "nixpkgs": "nixpkgs" }),
             serde_json::json!({
                 "nixpkgs": {
-                    "locked":   { "lastModified": days_ago(4) },
+                    "locked":   { "lastModified": days_ago(4), "rev": "4444444444444444444444444444444444444444" },
                     "original": { "ref": "https://example.invalid/x?token=abc" }
                 }
             }),
         );
-        let freshness = nixpkgs_freshness(dir.to_str().expect("path")).expect("observed");
-        assert_eq!(freshness.age_days, 4);
-        assert_eq!(
-            freshness.channel, None,
-            "an unsafe ref must not reach the report"
-        );
+        assert_eq!(fixture_lock_and_evidence(&dir), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn nixpkgs_freshness_is_absent_without_a_readable_lock() {
-        assert_eq!(nixpkgs_freshness("/nonexistent/pharos-193"), None);
-        assert_eq!(flake_lock_age_days("/nonexistent/pharos-193"), None);
+        assert_eq!(
+            fixture_lock_and_evidence(Path::new("/nonexistent/pharos-193")),
+            None
+        );
+    }
+
+    fn test_git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run fixture git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output utf-8")
+            .trim()
+            .to_string()
+    }
+
+    fn commit_fixture(checkout: &Path, name: &str, body: &str) -> String {
+        std::fs::write(checkout.join(name), body).expect("write fixture file");
+        test_git(checkout, &["add", name]);
+        test_git(
+            checkout,
+            &[
+                "-c",
+                "user.name=Pharos Test",
+                "-c",
+                "user.email=pharos@example.invalid",
+                "commit",
+                "-m",
+                name,
+            ],
+        );
+        test_git(checkout, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn exact_git_comparison_proves_current_behind_ahead_and_diverged() {
+        let root = std::env::temp_dir().join(format!(
+            "pharos-git-proof-{}-{}",
+            std::process::id(),
+            LOCK_FIXTURE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let checkout = root.join("checkout");
+        let remote = root.join("remote.git");
+        let reference = root.join("reference.git");
+        std::fs::create_dir_all(&checkout).expect("create checkout");
+        test_git(&checkout, &["init", "--initial-branch=main"]);
+        let first = commit_fixture(&checkout, "first", "one");
+        std::fs::create_dir_all(&remote).expect("create remote");
+        test_git(&remote, &["init", "--bare"]);
+        test_git(
+            &checkout,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        test_git(&checkout, &["push", "-u", "origin", "main"]);
+
+        let current = nixcfg_git_comparison_from_remote(
+            checkout.to_str().expect("checkout path"),
+            &first,
+            remote.to_str().expect("remote path"),
+            "refs/heads/main",
+            &reference,
+        )
+        .expect("current comparison");
+        assert_eq!(current.relation, GitRevisionRelation::Current);
+        assert_eq!(current.commits_behind, Some(0));
+
+        let second = commit_fixture(&checkout, "second", "two");
+        test_git(&checkout, &["push", "origin", "main"]);
+        let behind = nixcfg_git_comparison_from_remote(
+            checkout.to_str().expect("checkout path"),
+            &first,
+            remote.to_str().expect("remote path"),
+            "refs/heads/main",
+            &reference,
+        )
+        .expect("behind comparison");
+        assert_eq!(behind.upstream_revision, second);
+        assert_eq!(behind.relation, GitRevisionRelation::Behind);
+        assert_eq!(behind.commits_behind, Some(1));
+
+        let ahead_revision = commit_fixture(&checkout, "ahead", "three");
+        let ahead = nixcfg_git_comparison_from_remote(
+            checkout.to_str().expect("checkout path"),
+            &ahead_revision,
+            remote.to_str().expect("remote path"),
+            "refs/heads/main",
+            &reference,
+        )
+        .expect("ahead comparison");
+        assert_eq!(ahead.relation, GitRevisionRelation::Ahead);
+        assert_eq!(ahead.commits_behind, None);
+
+        test_git(&checkout, &["checkout", "-b", "divergent", &first]);
+        let divergent_revision = commit_fixture(&checkout, "divergent", "other");
+        let diverged = nixcfg_git_comparison_from_remote(
+            checkout.to_str().expect("checkout path"),
+            &divergent_revision,
+            remote.to_str().expect("remote path"),
+            "refs/heads/main",
+            &reference,
+        )
+        .expect("diverged comparison");
+        assert_eq!(diverged.relation, GitRevisionRelation::Diverged);
+        assert_eq!(diverged.commits_behind, None);
+
+        assert_eq!(
+            nixcfg_git_comparison_from_remote(
+                checkout.to_str().expect("checkout path"),
+                &first,
+                root.join("missing.git").to_str().expect("missing path"),
+                "refs/heads/main",
+                &reference,
+            ),
+            None,
+            "a failed authoritative fetch must never reuse the previous success"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nixpkgs_comparison_is_exact_or_unknown_never_inferred() {
+        let root = std::env::temp_dir().join(format!(
+            "pharos-nixpkgs-proof-{}-{}",
+            std::process::id(),
+            LOCK_FIXTURE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let checkout = root.join("checkout");
+        let remote = root.join("remote.git");
+        std::fs::create_dir_all(&checkout).expect("create checkout");
+        test_git(&checkout, &["init", "--initial-branch=main"]);
+        let revision = commit_fixture(&checkout, "nixpkgs", "locked");
+        std::fs::create_dir_all(&remote).expect("create remote");
+        test_git(&remote, &["init", "--bare"]);
+        test_git(
+            &checkout,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        test_git(&checkout, &["push", "origin", "main"]);
+
+        let mut evidence = NixDeploymentEvidence {
+            schema: pharos_core::NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+            version: pharos_core::NIX_DEPLOYMENT_EVIDENCE_VERSION,
+            source_revision: "1".repeat(40),
+            flake_lock_sha256: "2".repeat(64),
+            nixpkgs_revision: revision,
+            nixpkgs_last_modified: 1_700_000_000,
+            nixpkgs_channel: "main".to_string(),
+        };
+        let current =
+            nixpkgs_git_comparison_from_remote(&evidence, remote.to_str().expect("remote path"))
+                .expect("exact comparison");
+        assert_eq!(current.relation, NixpkgsRevisionRelation::Current);
+
+        evidence.nixpkgs_revision = "9".repeat(40);
+        let different =
+            nixpkgs_git_comparison_from_remote(&evidence, remote.to_str().expect("remote path"))
+                .expect("different comparison");
+        assert_eq!(different.relation, NixpkgsRevisionRelation::Different);
+        assert_eq!(
+            nixpkgs_git_comparison_from_remote(
+                &evidence,
+                root.join("missing.git").to_str().expect("missing path")
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generation_lock_and_remote_configuration_fail_closed() {
+        assert!(safe_git_remote("https://github.com/markus-barta/nixcfg.git").is_some());
+        for unsafe_remote in [
+            "http://github.com/markus-barta/nixcfg.git",
+            "https://user:secret@github.com/repo.git",
+            "https://github.com/repo.git?token=value",
+            "file:///tmp/repo.git",
+        ] {
+            assert!(safe_git_remote(unsafe_remote).is_none(), "{unsafe_remote}");
+        }
+        assert!(safe_git_branch_ref("refs/heads/main").is_some());
+        for unsafe_ref in [
+            "main",
+            "refs/tags/main",
+            "refs/heads/../main",
+            "refs/heads/x@{1}",
+        ] {
+            assert!(safe_git_branch_ref(unsafe_ref).is_none(), "{unsafe_ref}");
+        }
+
+        let dir = fleet_shaped_lock();
+        let (_, evidence) = fixture_lock_and_evidence(&dir).expect("fixture evidence");
+        std::fs::write(dir.join("flake.lock"), b"{}").expect("replace mutable checkout lock");
+        assert_eq!(
+            matching_flake_lock(dir.to_str().expect("path"), &evidence),
+            None,
+            "a checkout lock that differs from the generation digest is not evidence"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

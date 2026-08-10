@@ -226,10 +226,17 @@ impl Store {
 
     /// Upsert from a beacon report. `now` is the **server** receive time — the
     /// agent never asserts its own liveness (PHAROS-9).
-    pub(crate) fn record(&self, report: HostReport, now: UnixSeconds) -> Result<(), StoreError> {
+    pub(crate) fn record(
+        &self,
+        mut report: HostReport,
+        now: UnixSeconds,
+    ) -> Result<(), StoreError> {
         report
             .validate_contract()
             .map_err(|_| StoreError::InvalidContract)?;
+        if report.freshness.deployment_evidence.is_some() {
+            report.freshness.nixpkgs_age_days = report.freshness.nixpkgs_age_days_at(now);
+        }
         let mut map = self.hosts.write().expect("store lock");
         let existing = map.get(&report.name);
         let token_hash = existing.and_then(|h| h.token_hash.clone());
@@ -320,9 +327,10 @@ mod tests {
     use super::*;
     use pharos_core::{
         BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
-        KernelPosture, KernelPostureState, NixFreshness, NixpkgsInputFreshness,
-        HOST_REGISTRATION_SCHEMA, HOST_REGISTRATION_VERSION, HOST_REPORT_SCHEMA,
-        HOST_REPORT_VERSION,
+        GitRevisionRelation, KernelPosture, KernelPostureState, NixDeploymentEvidence,
+        NixFreshness, NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness,
+        NixpkgsRevisionRelation, HOST_REGISTRATION_SCHEMA, HOST_REGISTRATION_VERSION,
+        HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
     };
     use std::sync::Arc;
 
@@ -481,19 +489,43 @@ mod tests {
     }
 
     #[test]
-    fn secondary_nixpkgs_survives_durable_store_round_trip() {
+    fn generation_proof_and_secondary_nixpkgs_survive_durable_store_round_trip() {
         let directory = temporary_directory("secondary-nixpkgs");
         let path = directory.join("hosts.json");
         let store = Store::new(Some(path.clone())).expect("durable store starts");
         let mut report = basic_report("athena");
-        report.freshness.nixpkgs_age_days = Some(0);
+        // The beacon-provided display age is untrusted context. Persistence
+        // must replace it using the server receive time and proven timestamp.
+        report.freshness.nixpkgs_age_days = Some(999);
         report.freshness.nixpkgs_channel = Some("nixos-unstable".to_string());
         report.freshness.secondary_nixpkgs = Some(NixpkgsInputFreshness {
             input: "nixpkgs-stable".to_string(),
             age_days: 218,
             channel: Some("nixos-25.05".to_string()),
         });
-        store.record(report, 120).expect("v4 report persists");
+        let evidence = NixDeploymentEvidence {
+            schema: pharos_core::NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+            version: pharos_core::NIX_DEPLOYMENT_EVIDENCE_VERSION,
+            source_revision: "1".repeat(40),
+            flake_lock_sha256: "2".repeat(64),
+            nixpkgs_revision: "3".repeat(40),
+            nixpkgs_last_modified: 1_700_000_000,
+            nixpkgs_channel: "nixos-unstable".to_string(),
+        };
+        report.freshness.deployment_evidence = Some(evidence.clone());
+        report.freshness.commits_behind = Some(0);
+        report.freshness.nixcfg_comparison = Some(NixcfgGitComparison {
+            upstream_revision: evidence.source_revision.clone(),
+            relation: GitRevisionRelation::Current,
+            commits_behind: Some(0),
+        });
+        report.freshness.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: evidence.nixpkgs_revision.clone(),
+            relation: NixpkgsRevisionRelation::Current,
+        });
+        store
+            .record(report, evidence.nixpkgs_last_modified + 2 * 86_400)
+            .expect("v5 report persists");
         drop(store);
 
         let reloaded = Store::new(Some(path)).expect("durable store reloads");
@@ -506,6 +538,9 @@ mod tests {
                 channel: Some("nixos-25.05".to_string()),
             })
         );
+        assert_eq!(host.freshness.deployment_evidence, Some(evidence));
+        assert_eq!(host.freshness.nixpkgs_age_days, Some(2));
+        assert!(host.freshness.has_verified_current_state());
         std::fs::remove_dir_all(directory).expect("temporary directory removed");
     }
 
@@ -638,6 +673,9 @@ mod tests {
                         nixpkgs_age_days: None,
                         nixpkgs_channel: None,
                         secondary_nixpkgs: None,
+                        deployment_evidence: None,
+                        nixcfg_comparison: None,
+                        nixpkgs_comparison: None,
                     },
                     kernel: Some(KernelPosture::observed(
                         true,
@@ -653,6 +691,9 @@ mod tests {
                             nixpkgs_age_days: None,
                             nixpkgs_channel: None,
                             secondary_nixpkgs: None,
+                            deployment_evidence: None,
+                            nixcfg_comparison: None,
+                            nixpkgs_comparison: None,
                         },
                     )],
                     backup_observations: vec![backup.clone()],
@@ -708,6 +749,9 @@ mod tests {
                         nixpkgs_age_days: None,
                         nixpkgs_channel: None,
                         secondary_nixpkgs: None,
+                        deployment_evidence: None,
+                        nixcfg_comparison: None,
+                        nixpkgs_comparison: None,
                     },
                     kernel: None,
                     service_observations: vec![],

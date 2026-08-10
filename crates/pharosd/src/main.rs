@@ -63,10 +63,11 @@ use pharos_core::{
     AccessSetupIntent, BackupObservation, BackupPostureState, BackupSetupIntent, BootstrapMethod,
     ExistingHostBootstrapOption, ExistingHostPreflightCheck, ExistingHostPreflightFacts,
     ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary,
-    ExistingHostSetupContext, Host, HostKind, HostLocation, HostLocationSource, HostManifest,
-    HostPreferences, HostRegistration, HostRegistrationResponse, HostReport, HostReportResponse,
-    KernelPosture, KernelPostureState, Liveness, LocationSetupIntent, ManifestLocationMode,
-    ManifestProbePolicy, ManifestService, ManifestStatusSource, NixFreshness, PreflightCheckState,
+    ExistingHostSetupContext, GitRevisionRelation, Host, HostKind, HostLocation,
+    HostLocationSource, HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse,
+    HostReport, HostReportResponse, KernelPosture, KernelPostureState, Liveness,
+    LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
+    ManifestStatusSource, NixFreshness, NixpkgsRevisionRelation, PreflightCheckState,
     PrivilegedActionMode, ProvisioningBackupProposal, ProvisioningBackupProposalKind,
     ProvisioningBackupSecretFile, ProvisioningHandoff, ProvisioningJob, ProvisioningJobState,
     ProvisioningManagedFailure, ProvisioningManagedIdentity, ProvisioningManagedIdentityState,
@@ -77,6 +78,8 @@ use pharos_core::{
     HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, MAX_HOST_REGISTRATION_BYTES,
     MAX_HOST_REPORT_BYTES, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
 };
+#[cfg(test)]
+use pharos_core::{NixDeploymentEvidence, NixcfgGitComparison, NixpkgsGitComparison};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -824,7 +827,7 @@ fn update_restart_target_error(state: &AppState, host: &str) -> Option<(StatusCo
         ));
     }
     if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
-        && runtime.freshness.commits_behind.unwrap_or(0) == 0
+        && !runtime.freshness.has_proven_deployable_update()
     {
         return Some((
             StatusCode::CONFLICT,
@@ -3518,6 +3521,50 @@ mod tests {
 
     static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    fn proven_freshness(
+        channel: &str,
+        git_relation: GitRevisionRelation,
+        commits_behind: Option<u32>,
+        nixpkgs_relation: NixpkgsRevisionRelation,
+    ) -> NixFreshness {
+        let deployed_revision = "1".repeat(40);
+        let nixpkgs_revision = "2".repeat(40);
+        NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind,
+            nixpkgs_age_days: Some(0),
+            nixpkgs_channel: Some(channel.to_string()),
+            secondary_nixpkgs: None,
+            deployment_evidence: Some(NixDeploymentEvidence {
+                schema: pharos_core::NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+                version: pharos_core::NIX_DEPLOYMENT_EVIDENCE_VERSION,
+                source_revision: deployed_revision.clone(),
+                flake_lock_sha256: "3".repeat(64),
+                nixpkgs_revision: nixpkgs_revision.clone(),
+                nixpkgs_last_modified: 1_700_000_000,
+                nixpkgs_channel: channel.to_string(),
+            }),
+            nixcfg_comparison: Some(NixcfgGitComparison {
+                upstream_revision: if git_relation == GitRevisionRelation::Current {
+                    deployed_revision
+                } else {
+                    "4".repeat(40)
+                },
+                relation: git_relation,
+                commits_behind,
+            }),
+            nixpkgs_comparison: Some(NixpkgsGitComparison {
+                upstream_revision: if nixpkgs_relation == NixpkgsRevisionRelation::Current {
+                    nixpkgs_revision
+                } else {
+                    "5".repeat(40)
+                },
+                relation: nixpkgs_relation,
+            }),
+        }
+    }
+
     async fn json_response(response: Response) -> (StatusCode, HeaderMap, serde_json::Value) {
         let status = response.status();
         let headers = response.headers().clone();
@@ -4262,14 +4309,12 @@ mod tests {
                 heartbeat_interval_secs: Some(60),
                 inbound_rtt: None,
                 location: None,
-                freshness: NixFreshness {
-                    applicable: true,
-                    flake_lock_age_days: Some(1),
-                    commits_behind: Some(3),
-                    nixpkgs_age_days: None,
-                    nixpkgs_channel: None,
-                    secondary_nixpkgs: None,
-                },
+                freshness: proven_freshness(
+                    "nixos-unstable",
+                    GitRevisionRelation::Behind,
+                    Some(3),
+                    NixpkgsRevisionRelation::Current,
+                ),
                 kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
@@ -4287,14 +4332,12 @@ mod tests {
                 heartbeat_interval_secs: Some(60),
                 inbound_rtt: None,
                 location: None,
-                freshness: NixFreshness {
-                    applicable: true,
-                    flake_lock_age_days: Some(1),
-                    commits_behind: Some(3),
-                    nixpkgs_age_days: None,
-                    nixpkgs_channel: None,
-                    secondary_nixpkgs: None,
-                },
+                freshness: proven_freshness(
+                    "nixos-unstable",
+                    GitRevisionRelation::Behind,
+                    Some(3),
+                    NixpkgsRevisionRelation::Current,
+                ),
                 kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
@@ -4384,12 +4427,12 @@ mod tests {
         assert!(html.contains(r#"--mark-x:29.3%""#));
         assert!(html.contains(r#"--mark-x:58.7%""#));
         assert!(!html.contains(r#"--mark-x:64.0%""#));
-        assert!(html.contains("Flake.lock age"));
+        assert!(html.contains("nixpkgs lock (nixos-unstable)"));
         assert!(html.contains(r#"data-fresh-kind="flake-lock-age" tabindex="0""#));
-        assert!(html.contains(r#"<strong class="warn" data-fresh-value>1d</strong>"#));
-        assert!(html.contains("Commits behind"));
+        assert!(html.contains(r#"<strong class="ok" data-fresh-value>0d · exact</strong>"#));
+        assert!(html.contains("nixcfg revision"));
         assert!(html.contains(r#"data-fresh-kind="commits-behind" tabindex="0""#));
-        assert!(html.contains(r#"<strong class="warn" data-fresh-value>3</strong>"#));
+        assert!(html.contains(r#"<strong class="warn" data-fresh-value>3 behind</strong>"#));
         assert!(html.contains(r#"data-seen data-seen-card>Seen 30s ago</span>"#));
         assert!(html.contains(r#"data-card-asof data-card-asof-compact>00:16</span>"#));
         assert!(html.contains("beat-fill"));
@@ -4403,9 +4446,9 @@ mod tests {
         assert!(HEAD.contains(
             "@keyframes tide{from{background-position:100% 0}to{background-position:0 0}}"
         ));
-        assert!(html.contains("nix drift: 1d"));
+        assert!(html.contains("3 commits behind nixcfg"));
         assert!(html.contains("3 commits"));
-        assert!(html.contains(r#"data-search="poseidon nixos host flake.lock 1d old · 3 commits behind nixcfg nix drift: 1d · 3 commits""#));
+        assert!(html.contains("data-search=\"poseidon nixos host 3 commits behind nixcfg"));
         assert!(html.contains(r#"data-host="poseidon" data-live="live" data-sev="3""#));
         assert!(html.contains(r#"data-host="hades" data-live="stale""#));
         assert!(html.contains(r#"data-sev="1""#));
@@ -4849,7 +4892,12 @@ mod tests {
         assert!(janus_managed_ready.contains(r#"data-host-action="remove"><svg"#));
 
         let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
-        pending_update.freshness.commits_behind = Some(2);
+        pending_update.freshness = proven_freshness(
+            "nixos-unstable",
+            GitRevisionRelation::Behind,
+            Some(2),
+            NixpkgsRevisionRelation::Current,
+        );
         pending_update.kernel = Some(KernelPosture::observed(
             true,
             Some("7.0.14".to_string()),
@@ -5211,24 +5259,20 @@ mod tests {
                 heartbeat_interval_secs: Some(60),
                 inbound_rtt: None,
                 location: None,
-                freshness: NixFreshness {
-                    applicable: true,
-                    flake_lock_age_days: Some(2),
-                    commits_behind: Some(3),
-                    nixpkgs_age_days: None,
-                    nixpkgs_channel: None,
-                    secondary_nixpkgs: None,
-                },
+                freshness: proven_freshness(
+                    "nixos-unstable",
+                    GitRevisionRelation::Behind,
+                    Some(3),
+                    NixpkgsRevisionRelation::Current,
+                ),
                 kernel: None,
                 service_observations: vec![
-                    ServiceObservation::nix_freshness(&NixFreshness {
-                        applicable: true,
-                        flake_lock_age_days: Some(2),
-                        commits_behind: Some(3),
-                        nixpkgs_age_days: None,
-                        nixpkgs_channel: None,
-                        secondary_nixpkgs: None,
-                    }),
+                    ServiceObservation::nix_freshness(&proven_freshness(
+                        "nixos-unstable",
+                        GitRevisionRelation::Behind,
+                        Some(3),
+                        NixpkgsRevisionRelation::Current,
+                    )),
                     ServiceObservation {
                         id: "nginx".to_string(),
                         label: "nginx".to_string(),
@@ -5251,14 +5295,12 @@ mod tests {
                 heartbeat_interval_secs: Some(60),
                 inbound_rtt: None,
                 location: None,
-                freshness: NixFreshness {
-                    applicable: true,
-                    flake_lock_age_days: Some(2),
-                    commits_behind: Some(3),
-                    nixpkgs_age_days: None,
-                    nixpkgs_channel: None,
-                    secondary_nixpkgs: None,
-                },
+                freshness: proven_freshness(
+                    "nixos-unstable",
+                    GitRevisionRelation::Behind,
+                    Some(3),
+                    NixpkgsRevisionRelation::Current,
+                ),
                 kernel: None,
                 service_observations: vec![],
                 backup_observations: vec![],
@@ -5374,6 +5416,9 @@ mod tests {
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
                     secondary_nixpkgs: None,
+                    deployment_evidence: None,
+                    nixcfg_comparison: None,
+                    nixpkgs_comparison: None,
                 },
                 kernel: None,
                 service_observations: vec![],
@@ -5399,6 +5444,9 @@ mod tests {
                     nixpkgs_age_days: None,
                     nixpkgs_channel: None,
                     secondary_nixpkgs: None,
+                    deployment_evidence: None,
+                    nixcfg_comparison: None,
+                    nixpkgs_comparison: None,
                 },
                 kernel: None,
                 service_observations: vec![
@@ -5409,6 +5457,9 @@ mod tests {
                         nixpkgs_age_days: None,
                         nixpkgs_channel: None,
                         secondary_nixpkgs: None,
+                        deployment_evidence: None,
+                        nixcfg_comparison: None,
+                        nixpkgs_comparison: None,
                     }),
                     ServiceObservation {
                         id: "ssh".to_string(),
@@ -5637,6 +5688,9 @@ mod tests {
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
                 secondary_nixpkgs: None,
+                deployment_evidence: None,
+                nixcfg_comparison: None,
+                nixpkgs_comparison: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation {
@@ -6789,14 +6843,12 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     #[test]
     fn fleet_card_aligns_lifecycle_and_freshness_without_duplicate_attention() {
         let mut drift = host_with_backups("drift", 970, vec![]);
-        drift.freshness = NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(7),
-            commits_behind: Some(0),
-            nixpkgs_age_days: None,
-            nixpkgs_channel: None,
-            secondary_nixpkgs: None,
-        };
+        drift.freshness = proven_freshness(
+            "nixos-unstable",
+            GitRevisionRelation::Current,
+            Some(0),
+            NixpkgsRevisionRelation::Different,
+        );
         let drift_html = render_home(
             runtime(&[drift], &[]),
             "csb1",
@@ -6806,10 +6858,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             true,
         );
         assert!(drift_html.contains(
-            r#"<div class="reason warn" data-reason hidden><span>flake.lock 7d</span></div>"#
+            r#"<div class="reason warn" data-reason hidden><span>nixpkgs differs from nixos-unstable</span></div>"#
         ));
         assert!(drift_html.contains(
-            r#"data-fresh-kind="flake-lock-age" tabindex="0" title="Flake.lock age: 7d" aria-label="Flake.lock age: 7d""#
+            r#"data-fresh-kind="flake-lock-age" tabindex="0" title="nixpkgs lock (nixos-unstable): 0d · differs" aria-label="nixpkgs lock (nixos-unstable): 0d · differs""#
         ));
 
         let mut lifecycle = host_with_backups("lifecycle", 970, vec![]);
@@ -7992,6 +8044,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
                 secondary_nixpkgs: None,
+                deployment_evidence: None,
+                nixcfg_comparison: None,
+                nixpkgs_comparison: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
@@ -8001,6 +8056,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
                 secondary_nixpkgs: None,
+                deployment_evidence: None,
+                nixcfg_comparison: None,
+                nixpkgs_comparison: None,
             })],
             backup_observations: vec![backup_observation(BackupPostureState::Warning)],
             preferences: Default::default(),

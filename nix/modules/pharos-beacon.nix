@@ -22,6 +22,18 @@ let
   // lib.optionalAttrs (cfg.nixcfgDir != null) {
     NIXCFG_DIR = cfg.nixcfgDir;
   }
+  // lib.optionalAttrs (cfg.deploymentEvidenceFile != null) {
+    PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE = cfg.deploymentEvidenceFile;
+  }
+  // lib.optionalAttrs (cfg.nixcfgRemoteUrl != null) {
+    PHAROS_NIXCFG_REMOTE_URL = cfg.nixcfgRemoteUrl;
+  }
+  // lib.optionalAttrs (cfg.nixcfgRemoteRef != null) {
+    PHAROS_NIXCFG_REMOTE_REF = cfg.nixcfgRemoteRef;
+  }
+  // lib.optionalAttrs (cfg.nixpkgsRemoteUrl != null) {
+    PHAROS_NIXPKGS_REMOTE_URL = cfg.nixpkgsRemoteUrl;
+  }
   // lib.optionalAttrs (cfg.preferencesFile != null) {
     PHAROS_PREFERENCES_FILE = cfg.preferencesFile;
   }
@@ -70,7 +82,42 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       example = "/srv/nixcfg";
-      description = "Optional nixcfg checkout path used for flake.lock age and commits-behind freshness.";
+      description = ''
+        Optional read-only nixcfg checkout. Report v5 uses it only as a Git
+        object source and accepts lock context only when its SHA-256 matches
+        the active-generation evidence.
+      '';
+    };
+
+    deploymentEvidenceFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/etc/pharos-deployment/evidence.json";
+      description = ''
+        Generation-owned inspr.pharos.nix-deployment-evidence.v1 document.
+        Without valid evidence, Nix freshness is explicitly unverified.
+      '';
+    };
+
+    nixcfgRemoteUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://github.com/example/nixcfg.git";
+      description = "Credential-free HTTPS Git repository used for the authoritative nixcfg comparison.";
+    };
+
+    nixcfgRemoteRef = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "refs/heads/main";
+      description = "Exact refs/heads/* branch used as authoritative nixcfg state.";
+    };
+
+    nixpkgsRemoteUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://github.com/NixOS/nixpkgs.git";
+      description = "Credential-free HTTPS Git repository used to compare the locked nixpkgs revision with its declared channel tip.";
     };
 
     preferencesFile = lib.mkOption {
@@ -197,9 +244,9 @@ in
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
         SystemCallArchitectures = "native";
-      }
-      // lib.optionalAttrs (cfg.preferencesFile != null) {
-        ReadOnlyPaths = [ cfg.preferencesFile ];
+        ReadOnlyPaths =
+          lib.optional (cfg.preferencesFile != null) cfg.preferencesFile
+          ++ lib.optional (cfg.deploymentEvidenceFile != null) cfg.deploymentEvidenceFile;
       }
       // lib.optionalAttrs (cfg.tokenFile != null) {
         LoadCredential = "pharos-token:${cfg.tokenFile}";
