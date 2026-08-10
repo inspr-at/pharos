@@ -22,6 +22,18 @@ let
     }
   );
 
+  deploymentEvidence = pkgs.writeText "pharos-test-deployment-evidence.json" (
+    builtins.toJSON {
+      schema = "inspr.pharos.nix-deployment-evidence.v1";
+      version = 1;
+      source_revision = builtins.concatStringsSep "" (builtins.genList (_: "1") 40);
+      flake_lock_sha256 = builtins.concatStringsSep "" (builtins.genList (_: "2") 64);
+      nixpkgs_revision = builtins.concatStringsSep "" (builtins.genList (_: "3") 40);
+      nixpkgs_last_modified = 1700000000;
+      nixpkgs_channel = "nixos-unstable";
+    }
+  );
+
   pharosdTestRunner = pkgs.writeShellScript "pharosd-test-runner" ''
     set -euo pipefail
     export PHAROS_REGISTRATION_TOKEN_FILE="$CREDENTIALS_DIRECTORY/registration-token"
@@ -72,6 +84,13 @@ let
           and .preferences.kind == "workstation"
           and .preferences.alerts.suppress_down == true
           and .preferences.alerts.suppress_nix_freshness == true
+          and .freshness.deployment_evidence.schema == "inspr.pharos.nix-deployment-evidence.v1"
+          and .freshness.deployment_evidence.version == 1
+          and .freshness.deployment_evidence.source_revision == ("1" * 40)
+          and .freshness.deployment_evidence.flake_lock_sha256 == ("2" * 64)
+          and .freshness.deployment_evidence.nixpkgs_revision == ("3" * 40)
+          and .freshness.nixcfg_comparison == null
+          and .freshness.nixpkgs_comparison == null
         )' \
       >/dev/null
   '';
@@ -105,6 +124,7 @@ pkgs.testers.nixosTest {
         role = "NixOS integration test";
         tokenFile = "/run/pharos-test/beacon-token";
         preferencesFile = toString preferencesRegistry;
+        deploymentEvidenceFile = toString deploymentEvidence;
         extraEnvironment = {
           PHAROS_BACKUP_MODE = "off";
           PHAROS_LOCATION_MODE = "off";

@@ -455,7 +455,10 @@ function updateHostActionState(surface,host,backup){
   const state=String(host.preferences_state||'applied');
   const kernel=host.kernel||{};
   const kernelState=String(kernel.state||'unknown');
-  const commitsBehind=Number(host.freshness?.commits_behind||0);
+  const nixcfgComparison=host.freshness?.nixcfg_comparison;
+  const nixpkgsComparison=host.freshness?.nixpkgs_comparison;
+  const provenGitUpdate=nixcfgComparison?.relation==='behind'&&Number(nixcfgComparison.commits_behind)>0;
+  const provenNixpkgsUpdate=nixpkgsComparison?.relation==='different';
   const canManage=root.dataset.canManage==='true';
   const systemUpdateAvailable=root.dataset.systemUpdateAvailable==='true';
   const hostRemovalAvailable=root.dataset.hostRemovalAvailable==='true';
@@ -482,7 +485,7 @@ function updateHostActionState(surface,host,backup){
   const removeSeparator=root.querySelector('[data-remove-separator]');
   if(review)review.hidden=state==='applied';
   const updateJobActive=workflow?.kind==='update_restart'&&!['succeeded','cancelled'].includes(job.state);
-  const updatePending=kernelState==='reboot_required'||commitsBehind>0;
+  const updatePending=kernelState==='reboot_required'||provenGitUpdate||provenNixpkgsUpdate;
   root.dataset.updatePending=updatePending?'true':'false';
   const retired=retirement?.pending===true;
   // PHAROS-197: mirrors the server gate — a removal that must record a nixcfg
@@ -632,12 +635,6 @@ function historyInfo(beats,index,interval){
   if(gap<=interval*5)return {level:'stale',label:'stale gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
   return {level:'down',label:'offline gap recovered',detail:dur(gap)+' after previous · '+clock(stamp)};
 }
-function freshValue(v,zero){
-  const n=Number(v);
-  if(v==null||!Number.isFinite(n))return {value:'unknown',klass:'na'};
-  if(n===0)return {value:zero,klass:'ok'};
-  return {value:String(n),klass:'warn'};
-}
 function setFreshRow(surface,kind,state){
   const row=surface.querySelector('[data-fresh-kind="'+kind+'"]');
   if(!row)return;
@@ -654,20 +651,56 @@ function setFreshRow(surface,kind,state){
     row.title=label+': '+state.value;
   }
 }
-function updateFreshness(surface,f){
+function nixChannelEndOfLife(channel,now){
+  const match=/^nixos-(\d{2})\.(05|11)$/.exec(String(channel||''));
+  if(!match||!Number.isFinite(Number(now)))return false;
+  const releaseYear=2000+Number(match[1]);
+  const eolMonth=match[2]==='05'?1:7;
+  const date=new Date(Number(now)*1000);
+  const year=date.getUTCFullYear();
+  const month=date.getUTCMonth()+1;
+  return year>releaseYear+1||(year===releaseYear+1&&month>=eolMonth);
+}
+function updateFreshness(surface,f,now){
   if(!f||f.applicable===false){
     setFreshRow(surface,'flake-lock-age',{value:'n/a',klass:'na',label:'Flake.lock age'});
     setFreshRow(surface,'commits-behind',{value:'n/a',klass:'na'});
+    setFreshRow(surface,'deployment-evidence',{value:'n/a',klass:'na',label:'Active generation'});
     setFreshRow(surface,'secondary-nixpkgs',{value:'n/a',klass:'na',label:'Other root nixpkgs'});
     return;
   }
-  const primaryKnown=f.nixpkgs_age_days!=null;
-  const age=freshValue(primaryKnown?f.nixpkgs_age_days:f.flake_lock_age_days,'0d');
-  const commits=freshValue(f.commits_behind,'0');
-  if(age.klass==='warn')age.value=age.value+'d';
-  age.label=primaryKnown?(f.nixpkgs_channel?'nixpkgs age ('+f.nixpkgs_channel+')':'nixpkgs age'):'Flake.lock age';
+  const evidence=f.deployment_evidence;
+  const nixcfg=f.nixcfg_comparison;
+  const nixpkgs=f.nixpkgs_comparison;
+  const ageDays=Number(f.nixpkgs_age_days);
+  const hasAge=f.nixpkgs_age_days!=null&&Number.isFinite(ageDays);
+  const channel=String(evidence?.nixpkgs_channel||f.nixpkgs_channel||'');
+  const relation=nixpkgs?.relation;
+  const suffix=relation==='current'?'exact':relation==='different'?'differs':'unknown';
+  const age=evidence&&hasAge
+    ? {value:String(ageDays)+'d · '+suffix,klass:relation==='current'?'ok':relation==='different'?'warn':'na'}
+    : {value:'unverified',klass:'na'};
+  if(evidence&&nixChannelEndOfLife(channel,now)){
+    age.value=age.value+' · EOL';
+    age.klass='warn';
+  }
+  age.label=channel?'nixpkgs lock ('+channel+')':'nixpkgs lock';
+  const commits=nixcfg?.relation==='current'
+    ? {value:'exact',klass:'ok'}
+    : nixcfg?.relation==='behind'
+      ? {value:String(Number(nixcfg.commits_behind))+' behind',klass:'warn'}
+      : nixcfg?.relation==='ahead'
+        ? {value:'ahead',klass:'warn'}
+        : nixcfg?.relation==='diverged'
+          ? {value:'diverged',klass:'warn'}
+          : {value:'unknown',klass:'na'};
   setFreshRow(surface,'flake-lock-age',age);
   setFreshRow(surface,'commits-behind',commits);
+  setFreshRow(surface,'deployment-evidence',evidence?{
+    value:'deployed '+String(evidence.source_revision)+' · nixcfg '+String(nixcfg?.upstream_revision||'unknown')+' · lock '+String(evidence.flake_lock_sha256)+' · nixpkgs '+String(evidence.nixpkgs_revision)+' → '+String(nixpkgs?.upstream_revision||'unknown'),
+    klass:'ok',
+    label:'Active generation'
+  }:{value:'unverified',klass:'na',label:'Active generation'});
   const secondary=f.secondary_nixpkgs;
   if(secondary&&typeof secondary.input==='string'&&Number.isFinite(Number(secondary.age_days))){
     const channel=typeof secondary.channel==='string'?' ('+secondary.channel+')':'';
@@ -709,28 +742,28 @@ function updateKernel(surface,host){
   if(running)running.textContent=host.kernel.running_version;
   if(expected)expected.textContent=host.kernel.expected_version;
 }
-function freshnessAttention(f){
+function freshnessAttention(f,now){
   if(!f||f.applicable===false)return null;
-  const age=Number(f.flake_lock_age_days);
-  const commits=Number(f.commits_behind);
-  const hasAge=f.flake_lock_age_days!=null&&Number.isFinite(age);
-  const hasCommits=f.commits_behind!=null&&Number.isFinite(commits);
-  const ageWarn=hasAge&&age>0;
-  const commitsWarn=hasCommits&&commits>0;
-  if(ageWarn&&commitsWarn)return {label:'nix drift: '+age+'d · '+commits+' commits',level:'warn',rank:3};
-  if(ageWarn)return {label:'flake.lock '+age+'d',level:'warn',rank:3};
-  if(commitsWarn)return {label:commits+' commits behind',level:'warn',rank:3};
-  if(!hasAge||!hasCommits)return {label:'freshness unknown',level:'wait',rank:3};
-  return null;
+  const evidence=f.deployment_evidence;
+  if(!evidence)return {label:'freshness unverified',level:'wait',rank:1};
+  if(nixChannelEndOfLife(evidence.nixpkgs_channel,now))return {label:String(evidence.nixpkgs_channel)+' end of life',level:'warn',rank:1};
+  if(!f.nixpkgs_comparison)return {label:'nixpkgs comparison unknown',level:'wait',rank:2};
+  if(f.nixpkgs_comparison.relation==='different')return {label:'nixpkgs differs from '+String(evidence.nixpkgs_channel),level:'warn',rank:2};
+  const nixcfg=f.nixcfg_comparison;
+  if(!nixcfg)return {label:'nixcfg comparison unknown',level:'wait',rank:3};
+  if(nixcfg.relation==='behind')return {label:String(Number(nixcfg.commits_behind))+' commits behind',level:'warn',rank:3};
+  if(nixcfg.relation==='ahead')return {label:'deployed revision ahead',level:'warn',rank:3};
+  if(nixcfg.relation==='diverged')return {label:'deployed revision diverged',level:'warn',rank:3};
+  return nixcfg.relation==='current'?null:{label:'nixcfg comparison unknown',level:'wait',rank:3};
 }
 function downAlertsSuppressed(preferences){
   return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
 }
-function attentionFor(live,f,preferences){
+function attentionFor(live,f,preferences,now){
   if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
   if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
   if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
-  const freshness=freshnessAttention(f);
+  const freshness=freshnessAttention(f,now);
   if(freshness)return freshness;
   if(live==='down')return {label:preferences?.kind==='workstation'?'offline as expected':'down alerts muted',level:'ok',rank:4};
   return {label:'all clear',level:'ok',rank:4};
@@ -782,7 +815,7 @@ function setReason(surface,reason){
   const text=el.querySelector('span');
   if(text)text.textContent=reason.label;
 }
-function updateReasonVisibility(surface,reason,freshness,kernel){
+function updateReasonVisibility(surface,reason,freshness,kernel,now){
   const el=surface.querySelector('[data-reason]');
   if(!el)return;
   const restart=kernelNeedsRestart(kernel);
@@ -790,7 +823,7 @@ function updateReasonVisibility(surface,reason,freshness,kernel){
     el.hidden=restart;
     return;
   }
-  const freshnessReason=freshnessAttention(freshness);
+  const freshnessReason=freshnessAttention(freshness,now);
   const duplicateFreshness=freshnessReason?.label===reason?.label;
   el.hidden=restart||duplicateFreshness||reason?.label==='all clear';
 }
@@ -3202,7 +3235,7 @@ function applyFleetSnapshot(data){
     for(const card of surfaces){
       const live=h.liveness;
       card.dataset.live=live;
-      const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences);
+      const attention=h.attention||attentionFor(h.liveness,h.freshness,h.preferences,now);
       const backup=backupInfo(h,now);
       const muted=mutedInfo(h.preferences);
       card.dataset.sev=String(attention.rank ?? sevFor(live));
@@ -3212,11 +3245,11 @@ function applyFleetSnapshot(data){
       if(word)word.textContent=words[h.liveness]||h.liveness;
       setReason(card,attention);
       updateKernel(card,h);
-      updateReasonVisibility(card,attention,h.freshness,h.kernel);
+      updateReasonVisibility(card,attention,h.freshness,h.kernel,now);
       updateMuted(card,muted);
       updatePreferenceState(card,h);
       updateHostActionState(card,h,backup);
-      updateFreshness(card,h.freshness);
+      updateFreshness(card,h.freshness,now);
       updateBackup(card,backup);
       setSeen(card,h.last_seen,now);
       setCardAsOf(card,now);

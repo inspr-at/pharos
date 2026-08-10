@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 pharos-core = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 libc = "0.2"
 url = "2"
 # rustls-backed TLS keeps HTTPS available without adding an OpenSSL runtime.

@@ -29,6 +29,14 @@ pub const MAX_COMMITS_BEHIND: u32 = 1_000_000;
 pub const MAX_NIX_CHANNEL_BYTES: usize = 64;
 /// PHAROS-201: a root flake input name such as `nixpkgs-stable`.
 pub const MAX_NIX_INPUT_NAME_BYTES: usize = 64;
+/// Git object identifiers are SHA-1 today; accept SHA-256 repositories without
+/// weakening the exact-identity check.
+pub const MIN_GIT_REVISION_HEX_BYTES: usize = 40;
+pub const MAX_GIT_REVISION_HEX_BYTES: usize = 64;
+pub const SHA256_HEX_BYTES: usize = 64;
+pub const NIX_DEPLOYMENT_EVIDENCE_SCHEMA: &str = "inspr.pharos.nix-deployment-evidence.v1";
+pub const NIX_DEPLOYMENT_EVIDENCE_VERSION: u16 = 1;
+const MAX_UNIX_TIMESTAMP: UnixSeconds = 253_402_300_799;
 pub const MAX_SERVICE_OBSERVATIONS: usize = 64;
 pub const MAX_BACKUP_OBSERVATIONS: usize = 64;
 pub const MAX_HOST_REPORT_BYTES: usize = 64 * 1024;
@@ -316,6 +324,150 @@ impl NixpkgsInputFreshness {
     }
 }
 
+fn valid_hex_identifier(value: &str, allowed_lengths: &[usize]) -> bool {
+    allowed_lengths.contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Exact, generation-owned facts embedded by the NixOS evaluation that built
+/// `/run/current-system`. Unlike a mutable checkout, these values move only
+/// when the active system generation moves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NixDeploymentEvidence {
+    pub schema: String,
+    pub version: u16,
+    pub source_revision: String,
+    pub flake_lock_sha256: String,
+    pub nixpkgs_revision: String,
+    pub nixpkgs_last_modified: UnixSeconds,
+    pub nixpkgs_channel: String,
+}
+
+impl NixDeploymentEvidence {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.schema != NIX_DEPLOYMENT_EVIDENCE_SCHEMA
+            || self.version != NIX_DEPLOYMENT_EVIDENCE_VERSION
+        {
+            return Err("unsupported Nix deployment evidence schema/version pair".to_string());
+        }
+        if !valid_hex_identifier(
+            &self.source_revision,
+            &[MIN_GIT_REVISION_HEX_BYTES, MAX_GIT_REVISION_HEX_BYTES],
+        ) {
+            return Err("deployment source_revision must be an exact Git object id".to_string());
+        }
+        if !valid_hex_identifier(&self.flake_lock_sha256, &[SHA256_HEX_BYTES]) {
+            return Err("deployment flake_lock_sha256 must be a SHA-256 hex digest".to_string());
+        }
+        if !valid_hex_identifier(
+            &self.nixpkgs_revision,
+            &[MIN_GIT_REVISION_HEX_BYTES, MAX_GIT_REVISION_HEX_BYTES],
+        ) {
+            return Err("deployment nixpkgs_revision must be an exact Git object id".to_string());
+        }
+        if !(1..=MAX_UNIX_TIMESTAMP).contains(&self.nixpkgs_last_modified) {
+            return Err("deployment nixpkgs_last_modified must be a bounded timestamp".to_string());
+        }
+        if !valid_nix_channel(&self.nixpkgs_channel) {
+            return Err("deployment nixpkgs_channel must be a bounded channel name".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRevisionRelation {
+    Current,
+    Behind,
+    Ahead,
+    Diverged,
+}
+
+/// Fresh comparison of the deployed generation against one explicitly
+/// configured authoritative Git branch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NixcfgGitComparison {
+    pub upstream_revision: String,
+    pub relation: GitRevisionRelation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits_behind: Option<u32>,
+}
+
+impl NixcfgGitComparison {
+    pub fn validate_contract(&self, deployed_revision: &str) -> Result<(), String> {
+        if !valid_hex_identifier(
+            &self.upstream_revision,
+            &[MIN_GIT_REVISION_HEX_BYTES, MAX_GIT_REVISION_HEX_BYTES],
+        ) {
+            return Err("upstream_revision must be an exact Git object id".to_string());
+        }
+        if self
+            .commits_behind
+            .is_some_and(|commits| commits > MAX_COMMITS_BEHIND)
+        {
+            return Err(format!("commits_behind must be <= {MAX_COMMITS_BEHIND}"));
+        }
+        match self.relation {
+            GitRevisionRelation::Current
+                if self.upstream_revision == deployed_revision
+                    && self.commits_behind == Some(0) => {}
+            GitRevisionRelation::Behind
+                if self.upstream_revision != deployed_revision
+                    && self.commits_behind.is_some_and(|commits| commits > 0) => {}
+            GitRevisionRelation::Ahead | GitRevisionRelation::Diverged
+                if self.upstream_revision != deployed_revision && self.commits_behind.is_none() => {
+            }
+            _ => {
+                return Err(
+                    "Git relation, exact revisions, and commits_behind are inconsistent"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NixpkgsRevisionRelation {
+    Current,
+    Different,
+}
+
+/// Exact comparison of the generation's locked nixpkgs revision with the
+/// freshly observed tip of its declared channel. `Different` deliberately
+/// does not claim ancestry that was not fetched and proven.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NixpkgsGitComparison {
+    pub upstream_revision: String,
+    pub relation: NixpkgsRevisionRelation,
+}
+
+impl NixpkgsGitComparison {
+    pub fn validate_contract(&self, deployed_revision: &str) -> Result<(), String> {
+        if !valid_hex_identifier(
+            &self.upstream_revision,
+            &[MIN_GIT_REVISION_HEX_BYTES, MAX_GIT_REVISION_HEX_BYTES],
+        ) {
+            return Err("nixpkgs upstream_revision must be an exact Git object id".to_string());
+        }
+        let consistent = match self.relation {
+            NixpkgsRevisionRelation::Current => self.upstream_revision == deployed_revision,
+            NixpkgsRevisionRelation::Different => self.upstream_revision != deployed_revision,
+        };
+        consistent
+            .then_some(())
+            .ok_or_else(|| "nixpkgs relation and exact revisions are inconsistent".to_string())
+    }
+}
+
 /// Nix freshness for a host (PHAROS-15): what it is "missing".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -329,10 +481,12 @@ pub struct NixFreshness {
     /// lock whose nixpkgs is frozen still reports `0d` here the moment any
     /// trivial input moves, so never read this alone as a security posture.
     pub flake_lock_age_days: Option<u32>,
-    /// How many commits the running config is behind the host's nixcfg.
+    /// Compatibility mirror of the exact proven count in `nixcfg_comparison`.
+    /// It is absent for unknown, ahead, or diverged state and must never be
+    /// calculated from a stale local tracking ref.
     pub commits_behind: Option<u32>,
-    /// Age of the nixpkgs this host's configuration is built from, which is the
-    /// input that carries its security fixes.
+    /// Server-normalized age context for the exact generation-owned nixpkgs
+    /// revision. Age alone never proves whether the lock matches its channel.
     ///
     /// PHAROS-196: specifically the flake's own `nixpkgs` input, not the oldest
     /// node whose name contains "nixpkgs". A lock also holds other root inputs
@@ -352,6 +506,18 @@ pub struct NixFreshness {
     /// it does not participate in attention or service-posture classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_nixpkgs: Option<NixpkgsInputFreshness>,
+    /// PHAROS-202: facts tied to the active NixOS generation. Absence means
+    /// freshness is unverified; callers must never fall back to claiming that
+    /// the host is up to date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_evidence: Option<NixDeploymentEvidence>,
+    /// Fresh authoritative nixcfg comparison. Absence is explicitly unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixcfg_comparison: Option<NixcfgGitComparison>,
+    /// Fresh exact comparison with the declared nixpkgs channel tip. Absence
+    /// is explicitly unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixpkgs_comparison: Option<NixpkgsGitComparison>,
 }
 
 /// Support state of a NixOS release channel (PHAROS-193).
@@ -493,12 +659,45 @@ impl NixFreshness {
                 );
             }
         }
+        if let Some(evidence) = &self.deployment_evidence {
+            evidence.validate_contract()?;
+            if self.nixpkgs_channel.as_deref() != Some(evidence.nixpkgs_channel.as_str()) {
+                return Err(
+                    "reported nixpkgs_channel must match active-generation evidence".to_string(),
+                );
+            }
+        }
+        if let Some(comparison) = &self.nixcfg_comparison {
+            let evidence = self.deployment_evidence.as_ref().ok_or_else(|| {
+                "nixcfg comparison requires active-generation evidence".to_string()
+            })?;
+            comparison.validate_contract(&evidence.source_revision)?;
+            if self.commits_behind != comparison.commits_behind {
+                return Err(
+                    "legacy commits_behind must exactly mirror the proven comparison".to_string(),
+                );
+            }
+        } else if self.deployment_evidence.is_some() && self.commits_behind.is_some() {
+            return Err(
+                "commits_behind must be absent when the authoritative comparison is unknown"
+                    .to_string(),
+            );
+        }
+        if let Some(comparison) = &self.nixpkgs_comparison {
+            let evidence = self.deployment_evidence.as_ref().ok_or_else(|| {
+                "nixpkgs comparison requires active-generation evidence".to_string()
+            })?;
+            comparison.validate_contract(&evidence.nixpkgs_revision)?;
+        }
         if !self.applicable
             && (self.flake_lock_age_days.is_some()
                 || self.commits_behind.is_some()
                 || self.nixpkgs_age_days.is_some()
                 || self.nixpkgs_channel.is_some()
-                || self.secondary_nixpkgs.is_some())
+                || self.secondary_nixpkgs.is_some()
+                || self.deployment_evidence.is_some()
+                || self.nixcfg_comparison.is_some()
+                || self.nixpkgs_comparison.is_some())
         {
             return Err("non-Nix freshness must not carry Nix values".to_string());
         }
@@ -507,9 +706,47 @@ impl NixFreshness {
 
     /// PHAROS-193: how the reported channel stands against the release calendar.
     pub fn channel_state(&self, now_year: u32, now_month: u32) -> Option<NixChannelState> {
-        self.nixpkgs_channel
-            .as_deref()
+        self.deployment_evidence
+            .as_ref()
+            .map(|evidence| evidence.nixpkgs_channel.as_str())
+            .or(self.nixpkgs_channel.as_deref())
             .map(|channel| nix_channel_state(channel, now_year, now_month))
+    }
+
+    pub fn has_verified_current_state(&self) -> bool {
+        self.deployment_evidence.is_some()
+            && self
+                .nixcfg_comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.relation == GitRevisionRelation::Current)
+            && self
+                .nixpkgs_comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.relation == NixpkgsRevisionRelation::Current)
+    }
+
+    pub fn has_proven_deployable_update(&self) -> bool {
+        self.nixcfg_comparison.as_ref().is_some_and(|comparison| {
+            comparison.relation == GitRevisionRelation::Behind
+                && comparison.commits_behind.is_some_and(|commits| commits > 0)
+        }) || self
+            .nixpkgs_comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.relation == NixpkgsRevisionRelation::Different)
+    }
+
+    /// Server-clock age of the generation's exact locked nixpkgs revision.
+    /// Legacy reports have no generation timestamp and retain their explicitly
+    /// unverified numeric context, but v5 proof never trusts the host clock.
+    pub fn nixpkgs_age_days_at(&self, now: UnixSeconds) -> Option<u32> {
+        match self.deployment_evidence.as_ref() {
+            Some(evidence) => {
+                u32::try_from(now.saturating_sub(evidence.nixpkgs_last_modified).max(0) / 86_400)
+                    .ok()
+                    .filter(|days| *days <= MAX_FLAKE_LOCK_AGE_DAYS)
+            }
+            None => self.nixpkgs_age_days,
+        }
     }
 
     /// Human one-liner TL;DR, e.g. `flake.lock 12d old · 3 commits behind nixcfg`,
@@ -518,27 +755,31 @@ impl NixFreshness {
         if !self.applicable {
             return "nix: n/a".to_string();
         }
+        let Some(evidence) = &self.deployment_evidence else {
+            return "freshness unverified".to_string();
+        };
         let mut parts = Vec::new();
-        // PHAROS-193: nixpkgs leads, because it is the number that decides
-        // whether the host is receiving security fixes at all.
-        if let Some(d) = self.nixpkgs_age_days {
-            if d > 0 {
-                match self.nixpkgs_channel.as_deref() {
-                    Some(channel) => parts.push(format!("nixpkgs {d}d old on {channel}")),
-                    None => parts.push(format!("nixpkgs {d}d old")),
-                }
+        match self.nixpkgs_comparison.as_ref().map(|value| value.relation) {
+            Some(NixpkgsRevisionRelation::Current) => {}
+            Some(NixpkgsRevisionRelation::Different) => {
+                parts.push(format!("nixpkgs differs from {}", evidence.nixpkgs_channel))
             }
+            None => parts.push("nixpkgs comparison unknown".to_string()),
         }
-        if let Some(d) = self.flake_lock_age_days {
-            // Only worth saying when it is not already implied by nixpkgs.
-            if d > 0 && self.nixpkgs_age_days.is_none() {
-                parts.push(format!("flake.lock {d}d old"));
+        match self.nixcfg_comparison.as_ref() {
+            Some(comparison) if comparison.relation == GitRevisionRelation::Current => {}
+            Some(comparison) if comparison.relation == GitRevisionRelation::Behind => {
+                let commits = comparison.commits_behind.unwrap_or(0);
+                parts.push(format!("{commits} commits behind nixcfg"));
             }
-        }
-        if let Some(c) = self.commits_behind {
-            if c > 0 {
-                parts.push(format!("{c} commits behind nixcfg"));
+            Some(comparison) if comparison.relation == GitRevisionRelation::Ahead => {
+                parts.push("deployed revision is ahead of nixcfg".to_string());
             }
+            Some(comparison) if comparison.relation == GitRevisionRelation::Diverged => {
+                parts.push("deployed revision diverges from nixcfg".to_string());
+            }
+            None => parts.push("nixcfg comparison unknown".to_string()),
+            Some(_) => {}
         }
         if parts.is_empty() {
             "up to date".to_string()
@@ -2498,14 +2739,15 @@ pub fn liveness(
     }
 }
 
-// PHAROS-201 moved the contract to v4 by adding secondary nixpkgs context.
+// PHAROS-202 moved the contract to v5 by adding generation-owned deployment
+// evidence and fresh exact upstream comparisons.
 // `deny_unknown_fields` makes any addition breaking for an older consumer, so
 // the version moves with it and the rollout order in README applies: control
 // plane first, then beacons.
-pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v4";
-pub const HOST_REPORT_VERSION: u16 = 4;
-pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v3";
-pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 3;
+pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v5";
+pub const HOST_REPORT_VERSION: u16 = 5;
+pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v4";
+pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 4;
 pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 2] = [
     (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
     (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
@@ -2555,12 +2797,17 @@ impl HostReport {
             return Err("unsupported report schema/version pair".to_string());
         }
         if self.version == PREVIOUS_HOST_REPORT_VERSION
-            && self.freshness.secondary_nixpkgs.is_some()
+            && (self.freshness.deployment_evidence.is_some()
+                || self.freshness.nixcfg_comparison.is_some()
+                || self.freshness.nixpkgs_comparison.is_some())
         {
-            return Err("report v3 must not carry v4 secondary nixpkgs context".to_string());
+            return Err("report v4 must not carry v5 deployment evidence".to_string());
         }
         validate_report_identity(&self.name, &self.role)?;
         validate_heartbeat_interval(self.heartbeat_interval_secs)?;
+        if self.is_nix != self.freshness.applicable {
+            return Err("is_nix and freshness applicability must match".to_string());
+        }
         self.freshness.validate_contract()?;
         if self.service_observations.len() > MAX_SERVICE_OBSERVATIONS {
             return Err(format!(
@@ -2732,25 +2979,31 @@ impl ServiceObservation {
             == Some(NixChannelState::EndOfLife);
         let (state, summary) = if !freshness.applicable {
             (ServiceObservationState::Unknown, "nix: n/a".to_string())
+        } else if freshness.deployment_evidence.is_none() {
+            (
+                ServiceObservationState::Unknown,
+                "active-generation freshness unverified".to_string(),
+            )
         } else if end_of_life {
             // A stale channel outranks any age number: no age is small enough
             // to make an end-of-life release safe.
             (
                 ServiceObservationState::Stale,
-                match freshness.nixpkgs_channel.as_deref() {
+                match freshness
+                    .deployment_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.nixpkgs_channel.as_str())
+                {
                     Some(channel) => format!("{channel} is end of life; no security fixes"),
                     None => "nixpkgs channel is end of life; no security fixes".to_string(),
                 },
             )
-        } else if freshness.flake_lock_age_days.is_none() || freshness.commits_behind.is_none() {
+        } else if freshness.nixcfg_comparison.is_none() || freshness.nixpkgs_comparison.is_none() {
             (
                 ServiceObservationState::Unknown,
-                "freshness partially observed".to_string(),
+                "authoritative freshness comparison unavailable".to_string(),
             )
-        } else if freshness.nixpkgs_age_days.unwrap_or(0) > 0
-            || freshness.flake_lock_age_days.unwrap_or(0) > 0
-            || freshness.commits_behind.unwrap_or(0) > 0
-        {
+        } else if !freshness.has_verified_current_state() {
             (ServiceObservationState::Warning, freshness.tldr())
         } else {
             (ServiceObservationState::Healthy, "up to date".to_string())
@@ -3398,6 +3651,40 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
 
+    fn test_deployment_evidence(channel: &str) -> NixDeploymentEvidence {
+        NixDeploymentEvidence {
+            schema: NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+            version: NIX_DEPLOYMENT_EVIDENCE_VERSION,
+            source_revision: "1".repeat(40),
+            flake_lock_sha256: "2".repeat(64),
+            nixpkgs_revision: "3".repeat(40),
+            nixpkgs_last_modified: 1_700_000_000,
+            nixpkgs_channel: channel.to_string(),
+        }
+    }
+
+    fn proven_current_freshness(channel: &str) -> NixFreshness {
+        let evidence = test_deployment_evidence(channel);
+        NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(0),
+            nixpkgs_channel: Some(channel.to_string()),
+            secondary_nixpkgs: None,
+            deployment_evidence: Some(evidence.clone()),
+            nixcfg_comparison: Some(NixcfgGitComparison {
+                upstream_revision: evidence.source_revision.clone(),
+                relation: GitRevisionRelation::Current,
+                commits_behind: Some(0),
+            }),
+            nixpkgs_comparison: Some(NixpkgsGitComparison {
+                upstream_revision: evidence.nixpkgs_revision.clone(),
+                relation: NixpkgsRevisionRelation::Current,
+            }),
+        }
+    }
+
     #[test]
     fn managed_identity_states_serialize_as_the_ui_contract() {
         let cases = [
@@ -3465,20 +3752,16 @@ mod tests {
             applicable: true,
             ..Default::default()
         };
-        assert_eq!(fresh.tldr(), "up to date");
+        assert_eq!(fresh.tldr(), "freshness unverified");
 
-        let behind = NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(12),
+        let mut behind = proven_current_freshness("nixos-unstable");
+        behind.commits_behind = Some(3);
+        behind.nixcfg_comparison = Some(NixcfgGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: GitRevisionRelation::Behind,
             commits_behind: Some(3),
-            nixpkgs_age_days: None,
-            nixpkgs_channel: None,
-            secondary_nixpkgs: None,
-        };
-        assert_eq!(
-            behind.tldr(),
-            "flake.lock 12d old · 3 commits behind nixcfg"
-        );
+        });
+        assert_eq!(behind.tldr(), "3 commits behind nixcfg");
     }
 
     #[test]
@@ -3732,6 +4015,9 @@ mod tests {
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
                 secondary_nixpkgs: None,
+                deployment_evidence: None,
+                nixcfg_comparison: None,
+                nixpkgs_comparison: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation {
@@ -4105,26 +4391,23 @@ mod tests {
 
     #[test]
     fn nix_freshness_observation_is_coarse_and_non_secret() {
-        let warning = ServiceObservation::nix_freshness(&NixFreshness {
+        let unverified = ServiceObservation::nix_freshness(&NixFreshness {
             applicable: true,
             flake_lock_age_days: Some(2),
             commits_behind: Some(0),
             nixpkgs_age_days: None,
             nixpkgs_channel: None,
             secondary_nixpkgs: None,
+            deployment_evidence: None,
+            nixcfg_comparison: None,
+            nixpkgs_comparison: None,
         });
-        assert_eq!(warning.id, "nix-freshness");
-        assert_eq!(warning.state, ServiceObservationState::Warning);
-        assert_eq!(warning.summary, "flake.lock 2d old");
+        assert_eq!(unverified.id, "nix-freshness");
+        assert_eq!(unverified.state, ServiceObservationState::Unknown);
+        assert_eq!(unverified.summary, "active-generation freshness unverified");
 
-        let healthy = ServiceObservation::nix_freshness(&NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(0),
-            commits_behind: Some(0),
-            nixpkgs_age_days: None,
-            nixpkgs_channel: None,
-            secondary_nixpkgs: None,
-        });
+        let healthy =
+            ServiceObservation::nix_freshness(&proven_current_freshness("nixos-unstable"));
         assert_eq!(healthy.state, ServiceObservationState::Healthy);
     }
 
@@ -4264,6 +4547,9 @@ mod tests {
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
                 secondary_nixpkgs: None,
+                deployment_evidence: None,
+                nixcfg_comparison: None,
+                nixpkgs_comparison: None,
             },
             kernel: None,
             service_observations: vec![ServiceObservation::nix_freshness(&NixFreshness {
@@ -4273,6 +4559,9 @@ mod tests {
                 nixpkgs_age_days: None,
                 nixpkgs_channel: None,
                 secondary_nixpkgs: None,
+                deployment_evidence: None,
+                nixcfg_comparison: None,
+                nixpkgs_comparison: None,
             })],
             backup_observations: vec![],
             preferences: Default::default(),
@@ -4283,7 +4572,7 @@ mod tests {
         assert_eq!(observed.liveness, Liveness::Live);
         assert_eq!(observed.last_seen, Some(1_000));
         assert_eq!(observed.inbound_rtt.map(|rtt| rtt.millis), Some(42));
-        assert_eq!(observed.freshness.tldr(), "up to date");
+        assert_eq!(observed.freshness.tldr(), "freshness unverified");
         assert!(observed.backup_observations.is_empty());
     }
 
@@ -5107,22 +5396,37 @@ mod tests {
     }
 
     #[test]
+    fn deployment_evidence_requires_canonical_lowercase_digests() {
+        let mut evidence = test_deployment_evidence("nixos-unstable");
+        evidence.source_revision = "A".repeat(40);
+        assert!(evidence.validate_contract().is_err());
+
+        let mut evidence = test_deployment_evidence("nixos-unstable");
+        evidence.flake_lock_sha256 = "B".repeat(64);
+        assert!(evidence.validate_contract().is_err());
+
+        let mut evidence = test_deployment_evidence("nixos-unstable");
+        evidence.nixpkgs_revision = "C".repeat(40);
+        assert!(evidence.validate_contract().is_err());
+    }
+
+    #[test]
     fn freshness_reports_nixpkgs_rather_than_the_newest_input() {
         // A host whose *system* nixpkgs is frozen on an expired release while a
         // trivial input moved today, so the lock age alone reads as fresh.
         // PHAROS-196: which input produces these numbers is the beacon's job;
         // here the contract only has to escalate correctly once they arrive.
-        let freshness = NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(0),
-            commits_behind: Some(0),
-            nixpkgs_age_days: Some(218),
-            nixpkgs_channel: Some("nixos-25.05".to_string()),
-            secondary_nixpkgs: None,
-        };
+        let mut freshness = proven_current_freshness("nixos-25.05");
+        freshness.nixpkgs_age_days = Some(218);
+        freshness.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: NixpkgsRevisionRelation::Different,
+        });
         freshness.validate_contract().expect("valid freshness");
         assert!(
-            freshness.tldr().contains("nixpkgs 218d old on nixos-25.05"),
+            freshness
+                .tldr()
+                .contains("nixpkgs differs from nixos-25.05"),
             "tldr was {}",
             freshness.tldr()
         );
@@ -5143,14 +5447,7 @@ mod tests {
 
     #[test]
     fn freshness_stays_healthy_when_nixpkgs_is_current() {
-        let freshness = NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(0),
-            commits_behind: Some(0),
-            nixpkgs_age_days: Some(0),
-            nixpkgs_channel: Some("nixos-26.05".to_string()),
-            secondary_nixpkgs: None,
-        };
+        let freshness = proven_current_freshness("nixos-26.05");
         freshness.validate_contract().expect("valid freshness");
         assert_eq!(freshness.tldr(), "up to date");
         assert_eq!(
@@ -5168,6 +5465,9 @@ mod tests {
             nixpkgs_age_days: Some(MAX_FLAKE_LOCK_AGE_DAYS + 1),
             nixpkgs_channel: None,
             secondary_nixpkgs: None,
+            deployment_evidence: None,
+            nixcfg_comparison: None,
+            nixpkgs_comparison: None,
         };
         assert!(over_bound.validate_contract().is_err());
 
@@ -5178,6 +5478,9 @@ mod tests {
             nixpkgs_age_days: Some(1),
             nixpkgs_channel: Some("nixos 25.05".to_string()),
             secondary_nixpkgs: None,
+            deployment_evidence: None,
+            nixcfg_comparison: None,
+            nixpkgs_comparison: None,
         };
         assert!(bad_channel.validate_contract().is_err());
 
@@ -5188,14 +5491,17 @@ mod tests {
             nixpkgs_age_days: Some(1),
             nixpkgs_channel: None,
             secondary_nixpkgs: None,
+            deployment_evidence: None,
+            nixcfg_comparison: None,
+            nixpkgs_comparison: None,
         };
         assert!(non_nix.validate_contract().is_err());
     }
 
     #[test]
     fn previous_contract_reports_without_secondary_nixpkgs_are_still_accepted() {
-        // A v3 beacon that has not rolled yet must keep reporting. PHAROS-201
-        // added secondary context, and the rollout order is control plane first.
+        // A v4 beacon that has not rolled yet must keep reporting. PHAROS-202
+        // added exact evidence, and the rollout order is control plane first.
         let report: HostReport = serde_json::from_value(serde_json::json!({
             "schema": PREVIOUS_HOST_REPORT_SCHEMA,
             "version": PREVIOUS_HOST_REPORT_VERSION,
@@ -5205,18 +5511,18 @@ mod tests {
             "heartbeat_interval_secs": 60,
             "freshness": {"applicable": true, "flake_lock_age_days": 3, "commits_behind": 0}
         }))
-        .expect("a v3 report still deserializes");
-        report.validate_contract().expect("v3 remains valid");
+        .expect("a v4 report still deserializes");
+        report.validate_contract().expect("v4 remains valid");
         assert_eq!(report.freshness.nixpkgs_age_days, None);
         assert_eq!(report.freshness.nixpkgs_channel, None);
         assert_eq!(report.freshness.secondary_nixpkgs, None);
         // It degrades honestly rather than claiming nixpkgs is fresh.
         assert_eq!(report.freshness.channel_state(2026, 8), None);
-        assert!(report.freshness.tldr().contains("flake.lock 3d old"));
+        assert_eq!(report.freshness.tldr(), "freshness unverified");
     }
 
     #[test]
-    fn secondary_nixpkgs_is_bounded_and_requires_the_v4_contract() {
+    fn secondary_nixpkgs_is_bounded_and_v4_cannot_forge_v5_evidence() {
         let secondary = NixpkgsInputFreshness {
             input: "nixpkgs-stable".to_string(),
             age_days: 218,
@@ -5248,6 +5554,9 @@ mod tests {
         let secondary_without_primary = NixFreshness {
             applicable: true,
             secondary_nixpkgs: Some(secondary.clone()),
+            deployment_evidence: None,
+            nixcfg_comparison: None,
+            nixpkgs_comparison: None,
             ..Default::default()
         };
         assert!(secondary_without_primary.validate_contract().is_err());
@@ -5269,7 +5578,13 @@ mod tests {
             }
         }))
         .expect("shared type can decode for version-aware validation");
-        assert!(previous.validate_contract().is_err());
+        previous
+            .validate_contract()
+            .expect("secondary nixpkgs is valid in predecessor v4");
+
+        let mut forged = previous;
+        forged.freshness = proven_current_freshness("nixos-unstable");
+        assert!(forged.validate_contract().is_err());
 
         let v2: HostReport = serde_json::from_value(serde_json::json!({
             "schema": "inspr.pharos.host-report.v2",

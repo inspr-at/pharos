@@ -90,31 +90,37 @@ layer. There is no separate frontend build or client framework.
 | --- | --- |
 | `pharos-core` | Versioned host, report, liveness, preferences, provisioning and manifest contracts shared by server and agent |
 | `pharosd` | Fleet store, OIDC guard, machine APIs, server-rendered dashboard, provider connections and guarded workflows |
-| `pharos-beacon` | Small per-host reporter for heartbeat, Nix freshness (including nixpkgs age and its release channel), kernel, backup, location and bounded service observations |
+| `pharos-beacon` | Small per-host reporter for heartbeat, generation-proven Nix freshness, kernel, backup, location and bounded service observations |
 
 The shared Rust contracts matter: server and beacon cannot silently drift onto
 different report schemas. The current report contract is
-`inspr.pharos.host-report.v4`; the local onboarding envelope is
+`inspr.pharos.host-report.v5`; the local onboarding envelope is
 `inspr.pharos.host-registration.v1`. Both require explicit schema/version
 fields and reject extensions. Reports are limited to 64 KiB, heartbeat cadence
 is 10–3600 seconds, and all identities, freshness values, and observation text
 are bounded before persistence or alerting.
 
-Nix freshness reports the age of the nixpkgs the host's configuration is built
-from, and the release channel it tracks, rather than the age of the newest input
-in `flake.lock`. The newest input answers "when was this flake last updated" and
-reads as fresh the moment any trivial input moves, which hides a frozen nixpkgs.
-The reported input is the flake's own `nixpkgs`, not the oldest node whose name
-resembles it: a lock also carries other root inputs that may be unreferenced and
-transitive inputs of unrelated flakes, and reporting the worst of those describes
-the lock file rather than the host. The beacon reports the observed channel and
-the control plane applies the release calendar, so an end-of-life channel becomes
-a distinct louder signal than any age number and a newly expired release needs no
-fleet-wide beacon roll. If another root input is also nixpkgs-family, the beacon
-reports the stalest one separately by input name, age, and channel. The dashboard
-labels that observation as other-root lock-maintenance context; it never changes
-the host's primary nixpkgs age, end-of-life state, attention reason, or freshness
-service posture. Transitive nixpkgs inputs remain excluded.
+Nix freshness is tied to the active NixOS generation, not inferred from a mutable
+checkout. A strict value-free evidence document identifies the exact nixcfg
+revision, SHA-256 of the evaluated `flake.lock`, resolved primary nixpkgs
+revision, last-modified timestamp, and channel. The beacon accepts checkout lock
+context only when its digest and primary node exactly match that evidence.
+
+The beacon fetches the configured authoritative nixcfg branch into an isolated
+writable reference repository; `/nixcfg` remains read-only. Exact ancestry
+distinguishes current, behind with a proven commit count, ahead, and diverged.
+Fetch, timeout, parse, missing-object, evidence, or consistency failure produces
+unknown and never falls back to a local upstream-tracking ref. The locked
+nixpkgs revision is separately compared with a fresh exact tip of its declared
+channel. Age is context only: Pharos claims current only when the active
+generation, authoritative nixcfg revision, and nixpkgs channel revision all
+match exactly.
+
+The control plane still applies the release calendar, so an end-of-life channel
+outranks revision age. Another root nixpkgs-family input may be shown separately
+as neutral lock-maintenance context only when the checkout lock matches the
+generation digest; transitive inputs remain excluded and secondary context never
+changes host patch posture.
 
 For an ordered fleet rollout, the control plane accepts the current report
 contract and exactly its immediate predecessor. Deploy the new control plane
@@ -506,7 +512,7 @@ promised third-party API. The important boundaries are:
 | --- | --- |
 | `GET /healthz`, `GET /version` | Public health and build metadata |
 | `POST /register` | Strict versioned registration contract plus deployment bootstrap token; issues one per-host token |
-| `POST /report` | Strict 64 KiB beacon v2 contract and per-host bearer token |
+| `POST /report` | Strict 64 KiB beacon v5/v4 contract and per-host bearer token |
 | `GET /hosts.json`, `GET /declared-hosts.json` | OIDC/access-policy guarded fleet views |
 | `POST /setup/existing-host/preflight` | Guarded read-only onboarding facts |
 | `/host-actions/...` | OIDC/operator guarded workflow requests |
@@ -547,7 +553,11 @@ promised third-party API. The important boundaries are:
 | `PHAROS_INTERVAL` | Recurring report interval from 10–3600 seconds; unset means report once |
 | `PHAROS_HOSTNAME`, `PHAROS_ROLE` | Explicit reported identity |
 | `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE` | Per-host bearer credential; the file form wins and is preferred |
-| `NIXCFG_DIR` | Checkout used for Nix freshness |
+| `NIXCFG_DIR` | Read-only checkout used as a Git object source; lock context is accepted only when its digest matches the active generation |
+| `PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE` | Strict generation-owned deployment evidence; missing or malformed evidence renders freshness unverified |
+| `PHAROS_NIXCFG_REMOTE_URL` | Credential-free HTTPS Git repository used as authoritative nixcfg source |
+| `PHAROS_NIXCFG_REMOTE_REF` | Exact `refs/heads/*` authoritative nixcfg branch |
+| `PHAROS_NIXPKGS_REMOTE_URL` | Credential-free HTTPS Git repository used for exact declared-channel comparison |
 | `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
 | `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
 | `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |

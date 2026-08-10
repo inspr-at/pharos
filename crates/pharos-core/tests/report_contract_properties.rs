@@ -1,5 +1,6 @@
 use pharos_core::{
-    HostPreferences, HostRegistration, HostReport, NixFreshness, HOST_REGISTRATION_SCHEMA,
+    GitRevisionRelation, HostPreferences, HostRegistration, HostReport, NixFreshness,
+    NixcfgGitComparison, NixpkgsGitComparison, NixpkgsRevisionRelation, HOST_REGISTRATION_SCHEMA,
     HOST_REGISTRATION_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_HOST_REPORT_BYTES,
     PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION, SUPPORTED_HOST_REPORT_CONTRACTS,
 };
@@ -13,7 +14,10 @@ fn report(name: String, role: String, heartbeat_interval_secs: u64) -> HostRepor
         role,
         is_nix: true,
         heartbeat_interval_secs,
-        freshness: NixFreshness::default(),
+        freshness: NixFreshness {
+            applicable: true,
+            ..Default::default()
+        },
         kernel: None,
         service_observations: Vec::new(),
         backup_observations: Vec::new(),
@@ -117,5 +121,24 @@ proptest! {
             }
         });
         prop_assert!(result.is_ok());
+    }
+
+    #[test]
+    fn exact_revision_relations_never_validate_a_false_current_claim(
+        deployed in "[0-9a-f]{40}",
+        upstream in "[0-9a-f]{40}",
+    ) {
+        let nixcfg = NixcfgGitComparison {
+            upstream_revision: upstream.clone(),
+            relation: GitRevisionRelation::Current,
+            commits_behind: Some(0),
+        };
+        prop_assert_eq!(nixcfg.validate_contract(&deployed).is_ok(), deployed == upstream);
+
+        let nixpkgs = NixpkgsGitComparison {
+            upstream_revision: upstream.clone(),
+            relation: NixpkgsRevisionRelation::Current,
+        };
+        prop_assert_eq!(nixpkgs.validate_contract(&deployed).is_ok(), deployed == upstream);
     }
 }

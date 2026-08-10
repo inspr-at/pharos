@@ -1169,6 +1169,7 @@ dependencies = [
  "libc",
  "pharos-core",
  "serde_json",
+ "sha2",
  "ureq",
  "url",
 ]

@@ -422,8 +422,8 @@ test("removal dialog names credential retirement for an undeclared Janus-managed
   const host = "browser-remove-copy";
   const report = await page.request.post("/report", {
     data: {
-      schema: "inspr.pharos.host-report.v3",
-      version: 3,
+      schema: "inspr.pharos.host-report.v4",
+      version: 4,
       name: host,
       role: "server",
       is_nix: false,
@@ -502,8 +502,8 @@ test("stale side nixpkgs is visible as neutral context without host attention", 
   const host = "browser-secondary-nixpkgs";
   const report = await page.request.post("/report", {
     data: {
-      schema: "inspr.pharos.host-report.v4",
-      version: 4,
+      schema: "inspr.pharos.host-report.v5",
+      version: 5,
       name: host,
       role: "server",
       is_nix: true,
@@ -519,23 +519,106 @@ test("stale side nixpkgs is visible as neutral context without host attention", 
           age_days: 218,
           channel: "nixos-25.05",
         },
+        deployment_evidence: {
+          schema: "inspr.pharos.nix-deployment-evidence.v1",
+          version: 1,
+          source_revision: "1111111111111111111111111111111111111111",
+          flake_lock_sha256:
+            "2222222222222222222222222222222222222222222222222222222222222222",
+          nixpkgs_revision: "3333333333333333333333333333333333333333",
+          nixpkgs_last_modified: 1700000000,
+          nixpkgs_channel: "nixos-unstable",
+        },
+        nixcfg_comparison: {
+          upstream_revision: "1111111111111111111111111111111111111111",
+          relation: "current",
+          commits_behind: 0,
+        },
+        nixpkgs_comparison: {
+          upstream_revision: "3333333333333333333333333333333333333333",
+          relation: "current",
+        },
       },
     },
   });
   expect(report.status()).toBe(204);
 
   await page.goto("/");
+  const snapshot = await page.request.get("/hosts.json");
+  expect(snapshot.ok()).toBe(true);
+  expect(
+    await page.evaluate((payload) => applyFleetSnapshot(payload), await snapshot.json()),
+  ).toBe(true);
   const card = page
     .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
     .first();
   await expect(card).toBeVisible();
   await expect(card.locator("[data-reason]")).toContainText("all clear");
+  await expect(card.locator('[data-fresh-kind="flake-lock-age"]')).toContainText(
+    "exact",
+  );
+  await expect(card.locator('[data-fresh-kind="commits-behind"]')).toContainText(
+    "exact",
+  );
+  await expect(card.locator('[data-fresh-kind="deployment-evidence"]')).toContainText(
+    "111111111111",
+  );
   const secondary = card.locator('[data-fresh-kind="secondary-nixpkgs"]');
   await expect(secondary).toContainText("Other root nixpkgs");
   await expect(secondary).toContainText("nixpkgs-stable");
   await expect(secondary).toContainText("nixos-25.05");
   await expect(secondary).toContainText("218d");
   await expect(secondary.locator("[data-fresh-value]")).toHaveClass("na");
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("legacy numeric freshness is unverified rather than up to date", async ({ page }) => {
+  const host = "browser-unverified-nix";
+  const report = await page.request.post("/report", {
+    data: {
+      schema: "inspr.pharos.host-report.v4",
+      version: 4,
+      name: host,
+      role: "server",
+      is_nix: true,
+      heartbeat_interval_secs: 60,
+      freshness: {
+        applicable: true,
+        flake_lock_age_days: 0,
+        commits_behind: 0,
+        nixpkgs_age_days: 0,
+        nixpkgs_channel: "nixos-unstable",
+      },
+    },
+  });
+  expect(report.status()).toBe(204);
+
+  await page.goto("/");
+  const snapshot = await page.request.get("/hosts.json");
+  expect(snapshot.ok()).toBe(true);
+  expect(
+    await page.evaluate((payload) => applyFleetSnapshot(payload), await snapshot.json()),
+  ).toBe(true);
+  const card = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
+    .first();
+  await expect(card.locator("[data-reason]")).toContainText("freshness unverified");
+  await expect(card.locator('[data-fresh-kind="deployment-evidence"]')).toContainText(
+    "unverified",
+  );
+  await expect(card.locator('[data-fresh-kind="commits-behind"]')).toContainText(
+    "unknown",
+  );
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },

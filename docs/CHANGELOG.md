@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## Unreleased
+
+- Tie Nix freshness to strict active-generation evidence containing the exact nixcfg revision, flake.lock SHA-256, and resolved nixpkgs revision instead of trusting a mutable checkout.
+- Compare the deployed revision with a freshly fetched authoritative branch in an isolated writable reference repository, distinguishing current, behind, ahead, diverged, and unknown; a failed fetch never reuses a stale tracking ref.
+- Compare the locked nixpkgs revision with the exact current tip of its declared channel. Lock age remains context, while only exact revision equality can claim current.
+- Move the host report contract to `inspr.pharos.host-report.v5`, keeping v4 as the accepted predecessor; predecessor or incomplete evidence renders unverified rather than up to date.
+
 ## 0.1.79 - 2026-08-10
 
 - Report the stalest other root nixpkgs-family input by name, age, and channel as neutral lock-maintenance context while keeping transitive inputs excluded and the system nixpkgs as the sole source of host patch posture.

@@ -102,6 +102,37 @@ pub(super) const SETUP_ASSISTANT_TEMPLATE: &str = include_str!("../assets/ui/set
 mod module_tests {
     use super::*;
 
+    fn proven_current(channel: &str) -> NixFreshness {
+        let source_revision = "1".repeat(40);
+        let nixpkgs_revision = "2".repeat(40);
+        NixFreshness {
+            applicable: true,
+            flake_lock_age_days: Some(0),
+            commits_behind: Some(0),
+            nixpkgs_age_days: Some(0),
+            nixpkgs_channel: Some(channel.to_string()),
+            secondary_nixpkgs: None,
+            deployment_evidence: Some(NixDeploymentEvidence {
+                schema: pharos_core::NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+                version: pharos_core::NIX_DEPLOYMENT_EVIDENCE_VERSION,
+                source_revision: source_revision.clone(),
+                flake_lock_sha256: "3".repeat(64),
+                nixpkgs_revision: nixpkgs_revision.clone(),
+                nixpkgs_last_modified: 1_700_000_000,
+                nixpkgs_channel: channel.to_string(),
+            }),
+            nixcfg_comparison: Some(NixcfgGitComparison {
+                upstream_revision: source_revision,
+                relation: GitRevisionRelation::Current,
+                commits_behind: Some(0),
+            }),
+            nixpkgs_comparison: Some(NixpkgsGitComparison {
+                upstream_revision: nixpkgs_revision,
+                relation: NixpkgsRevisionRelation::Current,
+            }),
+        }
+    }
+
     #[test]
     fn external_ui_assets_are_embedded_and_html_escaping_is_safe() {
         assert!(HEAD.contains("<style"));
@@ -116,16 +147,20 @@ mod module_tests {
     /// on an expired channel. The operator-visible signal must say so.
     #[test]
     fn frozen_nixpkgs_is_visible_instead_of_the_newest_input_age() {
-        let frozen = NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(0),
-            commits_behind: Some(0),
-            nixpkgs_age_days: Some(218),
-            nixpkgs_channel: Some("nixos-25.05".to_string()),
-            secondary_nixpkgs: None,
-        };
+        let now = 1_786_310_400;
+        let mut frozen = proven_current("nixos-25.05");
+        frozen.nixpkgs_age_days = Some(218);
+        frozen
+            .deployment_evidence
+            .as_mut()
+            .expect("proof fixture")
+            .nixpkgs_last_modified = now - 218 * 86_400;
+        frozen.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: NixpkgsRevisionRelation::Different,
+        });
 
-        let markup = freshness_markup(&frozen, false);
+        let markup = freshness_markup(&frozen, false, now);
         assert!(
             markup.contains("218d"),
             "nixpkgs age must be shown: {markup}"
@@ -135,7 +170,7 @@ mod module_tests {
             "expired channel must be shown: {markup}"
         );
         assert!(
-            markup.contains("nixpkgs age"),
+            markup.contains("nixpkgs lock"),
             "the label must name the value it shows: {markup}"
         );
 
@@ -147,19 +182,12 @@ mod module_tests {
 
     #[test]
     fn a_current_nixpkgs_raises_no_attention_and_keeps_the_lock_label() {
-        let current = NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(0),
-            commits_behind: Some(0),
-            nixpkgs_age_days: Some(0),
-            nixpkgs_channel: Some("nixos-26.05".to_string()),
-            secondary_nixpkgs: None,
-        };
+        let current = proven_current("nixos-26.05");
         assert!(freshness_attention_reason(&current).is_none());
-        assert!(!freshness_markup(&current, false).contains("EOL"));
+        assert!(!freshness_markup(&current, false, 1_700_000_000).contains("EOL"));
 
-        // A beacon that has not rolled yet reports no nixpkgs fields, so the
-        // panel falls back to the lock age and labels it honestly.
+        // A beacon that has not rolled yet may report old numeric fields, but
+        // those cannot prove the active generation and must remain unverified.
         let legacy = NixFreshness {
             applicable: true,
             flake_lock_age_days: Some(3),
@@ -167,29 +195,25 @@ mod module_tests {
             nixpkgs_age_days: None,
             nixpkgs_channel: None,
             secondary_nixpkgs: None,
+            deployment_evidence: None,
+            nixcfg_comparison: None,
+            nixpkgs_comparison: None,
         };
-        let markup = freshness_markup(&legacy, false);
-        assert!(markup.contains("Flake.lock age"), "{markup}");
-        assert!(markup.contains("3d"), "{markup}");
+        let markup = freshness_markup(&legacy, false, 1_700_000_000);
+        assert!(markup.contains("unverified"), "{markup}");
         assert!(!markup.contains("EOL"));
     }
 
     #[test]
     fn stale_side_nixpkgs_is_secondary_context_not_host_attention() {
-        let current = NixFreshness {
-            applicable: true,
-            flake_lock_age_days: Some(0),
-            commits_behind: Some(0),
-            nixpkgs_age_days: Some(0),
-            nixpkgs_channel: Some("nixos-unstable".to_string()),
-            secondary_nixpkgs: Some(pharos_core::NixpkgsInputFreshness {
-                input: "nixpkgs-stable".to_string(),
-                age_days: 218,
-                channel: Some("nixos-25.05".to_string()),
-            }),
-        };
+        let mut current = proven_current("nixos-unstable");
+        current.secondary_nixpkgs = Some(pharos_core::NixpkgsInputFreshness {
+            input: "nixpkgs-stable".to_string(),
+            age_days: 218,
+            channel: Some("nixos-25.05".to_string()),
+        });
 
-        let markup = freshness_markup(&current, false);
+        let markup = freshness_markup(&current, false, 1_700_000_000);
         assert!(markup.contains("Other root nixpkgs"), "{markup}");
         assert!(markup.contains("nixpkgs-stable"), "{markup}");
         assert!(markup.contains("nixos-25.05"), "{markup}");
@@ -680,18 +704,10 @@ pub(super) fn freshness_row(
     }
 }
 
-pub(super) fn freshness_value(value: Option<u32>, zero_label: &str) -> (String, &'static str) {
-    match value {
-        Some(0) => (zero_label.to_string(), "ok"),
-        Some(v) => (v.to_string(), "warn"),
-        None => ("unknown".to_string(), "na"),
-    }
-}
-
-pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> String {
+pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool, now: i64) -> String {
     if !freshness.applicable {
         return format!(
-            "{}{}{}",
+            "{}{}{}{}",
             freshness_row(
                 "flake-lock-age",
                 "Flake.lock age",
@@ -709,6 +725,14 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
                 compact,
             ),
             freshness_row(
+                "deployment-evidence",
+                "Active generation",
+                "n/a",
+                "na",
+                icons::GIT_COMMIT_HORIZONTAL,
+                compact,
+            ),
+            freshness_row(
                 "secondary-nixpkgs",
                 "Other root nixpkgs",
                 "n/a",
@@ -719,17 +743,31 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
         );
     }
 
-    // PHAROS-193: show the nixpkgs age when it is known, because the flake.lock
-    // age is the newest input and reads reassuringly while nixpkgs is frozen.
-    // Fall back to the lock age only where a beacon has not reported nixpkgs yet.
-    let (mut age, age_class) = match freshness.nixpkgs_age_days {
-        Some(days) => freshness_value(Some(days), "0d"),
-        None => freshness_value(freshness.flake_lock_age_days, "0d"),
+    // PHAROS-202: age is context, not proof of currency. Only an exact
+    // generation-owned revision compared with a freshly observed channel tip
+    // can say `exact`; every missing link renders unknown.
+    let server_age = freshness.nixpkgs_age_days_at(now);
+    let (age, age_class) = match (
+        freshness.deployment_evidence.as_ref(),
+        freshness.nixpkgs_comparison.as_ref(),
+        server_age,
+    ) {
+        (Some(_), Some(comparison), Some(days)) => {
+            let suffix = match comparison.relation {
+                NixpkgsRevisionRelation::Current => "exact",
+                NixpkgsRevisionRelation::Different => "differs",
+            };
+            let class = if comparison.relation == NixpkgsRevisionRelation::Current {
+                "ok"
+            } else {
+                "warn"
+            };
+            (format!("{days}d · {suffix}"), class)
+        }
+        (Some(_), None, Some(days)) => (format!("{days}d · unknown"), "na"),
+        _ => ("unverified".to_string(), "na"),
     };
-    if age_class == "warn" {
-        age.push('d');
-    }
-    let (year, month) = pharos_core::utc_year_month(now_unix());
+    let (year, month) = pharos_core::utc_year_month(now);
     let end_of_life =
         freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife);
     let (age, age_class) = if end_of_life {
@@ -737,16 +775,53 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
     } else {
         (age, age_class)
     };
-    let (commits, commits_class) = freshness_value(freshness.commits_behind, "0");
+    let (commits, commits_class) = match freshness.nixcfg_comparison.as_ref() {
+        Some(comparison) => match comparison.relation {
+            GitRevisionRelation::Current => ("exact".to_string(), "ok"),
+            GitRevisionRelation::Behind => (
+                format!("{} behind", comparison.commits_behind.unwrap_or(0)),
+                "warn",
+            ),
+            GitRevisionRelation::Ahead => ("ahead".to_string(), "warn"),
+            GitRevisionRelation::Diverged => ("diverged".to_string(), "warn"),
+        },
+        None => ("unknown".to_string(), "na"),
+    };
     // The label has to name whichever value is shown; a nixpkgs age under a
     // "Flake.lock age" label is the same misreading PHAROS-193 set out to fix.
     let age_label = match (
         freshness.nixpkgs_age_days,
         freshness.nixpkgs_channel.as_deref(),
     ) {
-        (Some(_), Some(channel)) => format!("nixpkgs age ({channel})"),
+        (Some(_), Some(channel)) => format!("nixpkgs lock ({channel})"),
         (Some(_), None) => "nixpkgs age".to_string(),
-        (None, _) => "Flake.lock age".to_string(),
+        (None, _) => "nixpkgs lock".to_string(),
+    };
+    let (evidence_value, evidence_class) = match freshness.deployment_evidence.as_ref() {
+        Some(evidence) => {
+            let nixcfg_upstream = freshness
+                .nixcfg_comparison
+                .as_ref()
+                .map(|comparison| comparison.upstream_revision.as_str())
+                .unwrap_or("unknown");
+            let nixpkgs_upstream = freshness
+                .nixpkgs_comparison
+                .as_ref()
+                .map(|comparison| comparison.upstream_revision.as_str())
+                .unwrap_or("unknown");
+            (
+                format!(
+                    "deployed {} · nixcfg {} · lock {} · nixpkgs {} → {}",
+                    evidence.source_revision,
+                    nixcfg_upstream,
+                    evidence.flake_lock_sha256,
+                    evidence.nixpkgs_revision,
+                    nixpkgs_upstream
+                ),
+                "ok",
+            )
+        }
+        None => ("unverified".to_string(), "na"),
     };
     let (secondary_label, secondary_age) = match &freshness.secondary_nixpkgs {
         Some(secondary) => {
@@ -759,7 +834,7 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
         None => ("Other root nixpkgs".to_string(), "not reported".to_string()),
     };
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         freshness_row(
             "flake-lock-age",
             &age_label,
@@ -770,9 +845,17 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool) -> Strin
         ),
         freshness_row(
             "commits-behind",
-            "Commits behind",
+            "nixcfg revision",
             &commits,
             commits_class,
+            icons::GIT_COMMIT_HORIZONTAL,
+            compact,
+        ),
+        freshness_row(
+            "deployment-evidence",
+            "Active generation",
+            &evidence_value,
+            evidence_class,
             icons::GIT_COMMIT_HORIZONTAL,
             compact,
         ),
@@ -847,12 +930,20 @@ pub(super) fn freshness_attention_reason(freshness: &NixFreshness) -> Option<Att
         return None;
     }
 
+    let Some(evidence) = freshness.deployment_evidence.as_ref() else {
+        return Some(AttentionReason {
+            label: "freshness unverified".to_string(),
+            level: "wait",
+            rank: 1,
+        });
+    };
+
     // PHAROS-193: an end-of-life channel outranks every age number, because no
     // age is small enough to make an unsupported release safe. The control
     // plane owns this calendar so an expiring release needs no beacon roll.
     let (year, month) = pharos_core::utc_year_month(now_unix());
     if freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife) {
-        let channel = freshness.nixpkgs_channel.as_deref().unwrap_or("nixpkgs");
+        let channel = evidence.nixpkgs_channel.as_str();
         return Some(AttentionReason {
             label: format!("{channel} end of life"),
             level: "warn",
@@ -860,42 +951,51 @@ pub(super) fn freshness_attention_reason(freshness: &NixFreshness) -> Option<Att
         });
     }
 
-    let nixpkgs_warn = freshness.nixpkgs_age_days.filter(|d| *d > 0);
-    if let Some(days) = nixpkgs_warn {
-        return Some(AttentionReason {
-            label: match freshness.nixpkgs_channel.as_deref() {
-                Some(channel) => format!("nixpkgs {days}d on {channel}"),
-                None => format!("nixpkgs {days}d"),
-            },
-            level: "warn",
-            rank: 2,
-        });
+    match freshness.nixpkgs_comparison.as_ref() {
+        Some(comparison) if comparison.relation == NixpkgsRevisionRelation::Different => {
+            return Some(AttentionReason {
+                label: format!("nixpkgs differs from {}", evidence.nixpkgs_channel),
+                level: "warn",
+                rank: 2,
+            });
+        }
+        None => {
+            return Some(AttentionReason {
+                label: "nixpkgs comparison unknown".to_string(),
+                level: "wait",
+                rank: 2,
+            });
+        }
+        _ => {}
     }
 
-    let age_warn = freshness.flake_lock_age_days.filter(|d| *d > 0);
-    let commits_warn = freshness.commits_behind.filter(|c| *c > 0);
-    let label = match (age_warn, commits_warn) {
-        (Some(days), Some(commits)) => format!("nix drift: {days}d · {commits} commits"),
-        (Some(days), None) => format!("flake.lock {days}d"),
-        (None, Some(commits)) => format!("{commits} commits behind"),
-        (None, None) => {
-            if freshness.flake_lock_age_days.is_none() || freshness.commits_behind.is_none() {
-                "freshness unknown".to_string()
-            } else {
-                return None;
-            }
+    match freshness.nixcfg_comparison.as_ref() {
+        Some(comparison) if comparison.relation == GitRevisionRelation::Current => None,
+        Some(comparison) if comparison.relation == GitRevisionRelation::Behind => {
+            Some(AttentionReason {
+                label: format!("{} commits behind", comparison.commits_behind.unwrap_or(0)),
+                level: "warn",
+                rank: 3,
+            })
         }
-    };
-
-    Some(AttentionReason {
-        label,
-        level: if age_warn.is_some() || commits_warn.is_some() {
-            "warn"
-        } else {
-            "wait"
-        },
-        rank: 3,
-    })
+        Some(comparison) if comparison.relation == GitRevisionRelation::Ahead => {
+            Some(AttentionReason {
+                label: "deployed revision ahead".to_string(),
+                level: "warn",
+                rank: 3,
+            })
+        }
+        Some(_) => Some(AttentionReason {
+            label: "deployed revision diverged".to_string(),
+            level: "warn",
+            rank: 3,
+        }),
+        None => Some(AttentionReason {
+            label: "nixcfg comparison unknown".to_string(),
+            level: "wait",
+            rank: 3,
+        }),
+    }
 }
 
 pub(super) fn service_observation_attention_reason(
@@ -1290,7 +1390,7 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
             && manifest.policy.privileged_actions.janus_required
     });
     let reboot = kernel_reboot_required(host.kernel.as_ref());
-    let update_pending = reboot.is_some() || host.freshness.commits_behind.unwrap_or(0) > 0;
+    let update_pending = reboot.is_some() || host.freshness.has_proven_deployable_update();
     let restart_hidden =
         if host.is_nix && capabilities.can_manage_fleet && janus_ready && update_pending {
             ""
@@ -4167,31 +4267,41 @@ pub(super) fn freshness_alert(freshness: &NixFreshness) -> Option<(&'static str,
     if !freshness.applicable {
         return None;
     }
-
-    let age = freshness.flake_lock_age_days;
-    let commits = freshness.commits_behind;
-    if age.is_none() || commits.is_none() {
+    if freshness.deployment_evidence.is_none() {
         return Some((
             "watch",
-            "Freshness is only partially observed".to_string(),
-            "Confirm the beacon can read nixcfg freshness.".to_string(),
+            "Active-generation freshness is unverified".to_string(),
+            "Install generation-owned deployment evidence; do not infer state from the checkout."
+                .to_string(),
         ));
     }
-
-    let days = age.unwrap_or(0);
-    let behind = commits.unwrap_or(0);
-    if behind > 0 || days >= 30 {
+    let (year, month) = pharos_core::utc_year_month(now_unix());
+    if freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife) {
+        let channel = freshness
+            .deployment_evidence
+            .as_ref()
+            .map(|evidence| evidence.nixpkgs_channel.as_str())
+            .unwrap_or("nixpkgs");
+        return Some((
+            "warning",
+            format!("{channel} is end of life"),
+            "Move the active generation to a supported nixpkgs channel before calling it current."
+                .to_string(),
+        ));
+    }
+    if freshness.nixcfg_comparison.is_none() || freshness.nixpkgs_comparison.is_none() {
+        return Some((
+            "watch",
+            "Authoritative freshness comparison is unavailable".to_string(),
+            "Restore the bounded Git comparison; unknown must never be treated as current."
+                .to_string(),
+        ));
+    }
+    if !freshness.has_verified_current_state() {
         return Some((
             "warning",
             freshness.tldr(),
-            "Review nixcfg, then update or deploy when safe.".to_string(),
-        ));
-    }
-    if days > 0 {
-        return Some((
-            "watch",
-            freshness.tldr(),
-            "Consider a normal flake update during the next maintenance window.".to_string(),
+            "Review the exact deployed, nixcfg, and nixpkgs revisions before updating.".to_string(),
         ));
     }
     None
@@ -5949,8 +6059,8 @@ pub(super) fn render_home_with_capabilities(
         let name = html_escape(&h.name);
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
-        let card_fresh = freshness_markup(&h.freshness, true);
-        let list_fresh = freshness_markup(&h.freshness, false);
+        let card_fresh = freshness_markup(&h.freshness, true, now);
+        let list_fresh = freshness_markup(&h.freshness, false, now);
         let attention = attention_reason(
             live,
             &h.freshness,
