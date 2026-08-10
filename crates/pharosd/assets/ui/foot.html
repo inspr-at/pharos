@@ -641,28 +641,44 @@ function freshValue(v,zero){
 function setFreshRow(surface,kind,state){
   const row=surface.querySelector('[data-fresh-kind="'+kind+'"]');
   if(!row)return;
+  const labelNode=row.querySelector('.fresh-row-label');
+  if(labelNode&&state.label)labelNode.textContent=state.label;
   const value=row.querySelector('[data-fresh-value]');
   if(value){
     value.className=state.klass;
     value.textContent=state.value;
   }
   if(row.classList.contains('fresh-row-compact')){
-    const label=row.querySelector('.fresh-row-label')?.textContent||kind;
+    const label=labelNode?.textContent||kind;
     row.setAttribute('aria-label',label+': '+state.value);
     row.title=label+': '+state.value;
   }
 }
 function updateFreshness(surface,f){
   if(!f||f.applicable===false){
-    setFreshRow(surface,'flake-lock-age',{value:'n/a',klass:'na'});
+    setFreshRow(surface,'flake-lock-age',{value:'n/a',klass:'na',label:'Flake.lock age'});
     setFreshRow(surface,'commits-behind',{value:'n/a',klass:'na'});
+    setFreshRow(surface,'secondary-nixpkgs',{value:'n/a',klass:'na',label:'Other root nixpkgs'});
     return;
   }
-  const age=freshValue(f.flake_lock_age_days,'0d');
+  const primaryKnown=f.nixpkgs_age_days!=null;
+  const age=freshValue(primaryKnown?f.nixpkgs_age_days:f.flake_lock_age_days,'0d');
   const commits=freshValue(f.commits_behind,'0');
   if(age.klass==='warn')age.value=age.value+'d';
+  age.label=primaryKnown?(f.nixpkgs_channel?'nixpkgs age ('+f.nixpkgs_channel+')':'nixpkgs age'):'Flake.lock age';
   setFreshRow(surface,'flake-lock-age',age);
   setFreshRow(surface,'commits-behind',commits);
+  const secondary=f.secondary_nixpkgs;
+  if(secondary&&typeof secondary.input==='string'&&Number.isFinite(Number(secondary.age_days))){
+    const channel=typeof secondary.channel==='string'?' ('+secondary.channel+')':'';
+    setFreshRow(surface,'secondary-nixpkgs',{
+      value:String(Number(secondary.age_days))+'d',
+      klass:'na',
+      label:'Other root nixpkgs · '+secondary.input+channel
+    });
+  }else{
+    setFreshRow(surface,'secondary-nixpkgs',{value:'not reported',klass:'na',label:'Other root nixpkgs'});
+  }
 }
 function kernelNeedsRestart(kernel){
   return kernel?.state==='reboot_required'&&typeof kernel.running_version==='string'&&typeof kernel.expected_version==='string';

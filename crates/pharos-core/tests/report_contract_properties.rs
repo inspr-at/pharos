@@ -51,10 +51,17 @@ fn control_plane_accepts_current_and_previous_reports_for_ordered_rollouts() {
     };
     assert!(mismatched.validate_contract().is_err());
 
+    let v2 = HostReport {
+        schema: "inspr.pharos.host-report.v2".to_string(),
+        version: 2,
+        ..mismatched
+    };
+    assert!(v2.validate_contract().is_err());
+
     let older = HostReport {
         schema: "inspr.pharos.host-report.v0".to_string(),
         version: 0,
-        ..mismatched
+        ..v2
     };
     assert!(older.validate_contract().is_err());
 }
