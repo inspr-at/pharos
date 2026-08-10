@@ -1,6 +1,6 @@
 # Pharos Changelog
 
-## Unreleased
+## 0.1.80 - 2026-08-10
 
 - Tie Nix freshness to strict active-generation evidence containing the exact nixcfg revision, flake.lock SHA-256, and resolved nixpkgs revision instead of trusting a mutable checkout.
 - Compare the deployed revision with a freshly fetched authoritative branch in an isolated writable reference repository, distinguishing current, behind, ahead, diverged, and unknown; a failed fetch never reuses a stale tracking ref.
