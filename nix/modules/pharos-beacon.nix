@@ -34,6 +34,9 @@ let
   // lib.optionalAttrs (cfg.nixpkgsRemoteUrl != null) {
     PHAROS_NIXPKGS_REMOTE_URL = cfg.nixpkgsRemoteUrl;
   }
+  // lib.optionalAttrs (cfg.nixpkgsChannelBaseUrl != null) {
+    PHAROS_NIXPKGS_CHANNEL_BASE_URL = cfg.nixpkgsChannelBaseUrl;
+  }
   // lib.optionalAttrs (cfg.preferencesFile != null) {
     PHAROS_PREFERENCES_FILE = cfg.preferencesFile;
   }
@@ -117,7 +120,23 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       example = "https://github.com/NixOS/nixpkgs.git";
-      description = "Credential-free HTTPS Git repository used to compare the locked nixpkgs revision with its declared channel tip.";
+      description = ''
+        Credential-free HTTPS Git repository used for custom nixpkgs sources.
+        The official NixOS/nixpkgs repository is resolved through the bounded
+        official channel publication instead of downloading GitHub's complete
+        ref advertisement.
+      '';
+    };
+
+    nixpkgsChannelBaseUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://channels.nixos.org/";
+      description = ''
+        Optional credential-free HTTPS base URL for exact channel
+        git-revision documents. When unset, the official NixOS/nixpkgs Git
+        remote uses https://channels.nixos.org/ automatically.
+      '';
     };
 
     preferencesFile = lib.mkOption {
