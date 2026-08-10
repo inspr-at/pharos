@@ -10,7 +10,8 @@
 //!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
 //!      PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE (active-generation evidence),
 //!      PHAROS_NIXCFG_REMOTE_URL / PHAROS_NIXCFG_REMOTE_REF (authoritative Git),
-//!      PHAROS_NIXPKGS_REMOTE_URL (authoritative nixpkgs repository),
+//!      PHAROS_NIXPKGS_CHANNEL_BASE_URL (authoritative channel publication),
+//!      PHAROS_NIXPKGS_REMOTE_URL (legacy/custom authoritative Git fallback),
 //!      PHAROS_TOKEN / PHAROS_TOKEN_FILE (per-host bearer token from /register),
 //!      PHAROS_BACKUP_MODE (auto/off/restic/status-file/command).
 
@@ -41,6 +42,10 @@ use url::Url;
 const MAX_REPORT_RESPONSE_BYTES: u64 = 64 * 1024;
 const LOCATION_COMMAND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const GIT_COMPARISON_TIMEOUT: Duration = Duration::from_secs(12);
+const NIXPKGS_CHANNEL_TIMEOUT: Duration = Duration::from_secs(12);
+const MAX_NIXPKGS_REVISION_BYTES: u64 = 128;
+const DEFAULT_NIXPKGS_CHANNEL_BASE_URL: &str = "https://channels.nixos.org/";
+const OFFICIAL_NIXPKGS_GIT_REMOTE: &str = "https://github.com/NixOS/nixpkgs.git";
 const MAX_DEPLOYMENT_EVIDENCE_BYTES: u64 = 4 * 1024;
 const MAX_FLAKE_LOCK_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -740,9 +745,127 @@ fn nixcfg_git_comparison_from_remote(
     })
 }
 
-fn nixpkgs_git_comparison(evidence: &NixDeploymentEvidence) -> Option<NixpkgsGitComparison> {
+fn safe_nixpkgs_channel_base_url(raw: &str) -> Option<Url> {
+    let mut url = Url::parse(raw.trim()).ok()?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    if !url.path().ends_with('/') {
+        let mut path = url.path().to_string();
+        path.push('/');
+        url.set_path(&path);
+    }
+    Some(url)
+}
+
+fn nixpkgs_channel_revision_url(channel: &str, base_url: &str) -> Option<Url> {
+    if !pharos_core::valid_nix_channel(channel) {
+        return None;
+    }
+    let base = safe_nixpkgs_channel_base_url(base_url)?;
+    base.join(&format!("{channel}/git-revision")).ok()
+}
+
+fn safe_nixpkgs_channel_redirect(source: &Url, location: &str) -> Option<Url> {
+    let target = source.join(location).ok()?;
+    if target.scheme() != "https"
+        || target.host_str().is_none()
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.query().is_some()
+        || target.fragment().is_some()
+        || !target.path().ends_with("/git-revision")
+    {
+        return None;
+    }
+    let same_host = target.host_str() == source.host_str()
+        && target.port_or_known_default() == source.port_or_known_default();
+    let official_release_redirect = source.host_str() == Some("channels.nixos.org")
+        && target.host_str() == Some("releases.nixos.org")
+        && target.path().starts_with("/nixos/");
+    (same_host || official_release_redirect).then_some(target)
+}
+
+fn read_bounded_nixpkgs_revision(reader: impl Read) -> Option<String> {
+    let mut body = String::new();
+    reader
+        .take(MAX_NIXPKGS_REVISION_BYTES + 1)
+        .read_to_string(&mut body)
+        .ok()?;
+    ((body.len() as u64) <= MAX_NIXPKGS_REVISION_BYTES)
+        .then_some(())
+        .and_then(|()| exact_revision(&body))
+}
+
+fn fetch_nixpkgs_channel_revision(url: &Url) -> Option<String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_send_request(Some(Duration::from_secs(5)))
+        .timeout_recv_response(Some(Duration::from_secs(10)))
+        .timeout_recv_body(Some(Duration::from_secs(10)))
+        .timeout_global(Some(NIXPKGS_CHANNEL_TIMEOUT))
+        .max_redirects(0)
+        .build()
+        .into();
+    let response = agent.get(url.as_str()).call().ok()?;
+    if response.status().is_success() {
+        return read_bounded_nixpkgs_revision(response.into_body().into_reader());
+    }
+    if !matches!(response.status().as_u16(), 301 | 302 | 307 | 308) {
+        return None;
+    }
+    let location = response.headers().get("location")?.to_str().ok()?;
+    let target = safe_nixpkgs_channel_redirect(url, location)?;
+    let response = agent.get(target.as_str()).call().ok()?;
+    response
+        .status()
+        .is_success()
+        .then(|| read_bounded_nixpkgs_revision(response.into_body().into_reader()))?
+}
+
+fn nixpkgs_comparison_from_revision(
+    evidence: &NixDeploymentEvidence,
+    upstream_revision: &str,
+) -> Option<NixpkgsGitComparison> {
+    let upstream_revision = exact_revision(upstream_revision)?;
+    Some(NixpkgsGitComparison {
+        relation: if upstream_revision == evidence.nixpkgs_revision {
+            NixpkgsRevisionRelation::Current
+        } else {
+            NixpkgsRevisionRelation::Different
+        },
+        upstream_revision,
+    })
+}
+
+fn is_official_nixpkgs_git_remote(remote: &str) -> bool {
+    safe_git_remote(remote).as_deref() == safe_git_remote(OFFICIAL_NIXPKGS_GIT_REMOTE).as_deref()
+}
+
+fn nixpkgs_comparison(evidence: &NixDeploymentEvidence) -> Option<NixpkgsGitComparison> {
+    if let Some(base_url) = env_value("PHAROS_NIXPKGS_CHANNEL_BASE_URL") {
+        let url = nixpkgs_channel_revision_url(&evidence.nixpkgs_channel, &base_url)?;
+        let revision = fetch_nixpkgs_channel_revision(&url)?;
+        return nixpkgs_comparison_from_revision(evidence, &revision);
+    }
+
     let remote = safe_git_remote(&env_value("PHAROS_NIXPKGS_REMOTE_URL")?)?;
-    nixpkgs_git_comparison_from_remote(evidence, &remote)
+    if is_official_nixpkgs_git_remote(&remote) {
+        let url = nixpkgs_channel_revision_url(
+            &evidence.nixpkgs_channel,
+            DEFAULT_NIXPKGS_CHANNEL_BASE_URL,
+        )?;
+        let revision = fetch_nixpkgs_channel_revision(&url)?;
+        nixpkgs_comparison_from_revision(evidence, &revision)
+    } else {
+        nixpkgs_git_comparison_from_remote(evidence, &remote)
+    }
 }
 
 fn nixpkgs_git_comparison_from_remote(
@@ -1853,7 +1976,7 @@ fn main() {
                 }
                 _ => None,
             };
-            let nixpkgs_comparison = evidence.as_ref().and_then(nixpkgs_git_comparison);
+            let channel_comparison = evidence.as_ref().and_then(nixpkgs_comparison);
             NixFreshness {
                 applicable: true,
                 flake_lock_age_days: matching_lock.as_ref().and_then(flake_lock_age_days),
@@ -1869,7 +1992,7 @@ fn main() {
                 secondary_nixpkgs: nixpkgs.and_then(|freshness| freshness.secondary),
                 deployment_evidence: evidence,
                 nixcfg_comparison,
-                nixpkgs_comparison,
+                nixpkgs_comparison: channel_comparison,
             }
         } else {
             NixFreshness::default()
@@ -3159,6 +3282,80 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn official_nixpkgs_channel_revision_is_bounded_exact_and_fail_closed() {
+        let evidence = NixDeploymentEvidence {
+            schema: pharos_core::NIX_DEPLOYMENT_EVIDENCE_SCHEMA.to_string(),
+            version: pharos_core::NIX_DEPLOYMENT_EVIDENCE_VERSION,
+            source_revision: "1".repeat(40),
+            flake_lock_sha256: "2".repeat(64),
+            nixpkgs_revision: "3".repeat(40),
+            nixpkgs_last_modified: 1_700_000_000,
+            nixpkgs_channel: "nixos-unstable".to_string(),
+        };
+        let current = nixpkgs_comparison_from_revision(&evidence, &format!("{}\n", "3".repeat(40)))
+            .expect("exact channel revision");
+        assert_eq!(current.relation, NixpkgsRevisionRelation::Current);
+        let different = nixpkgs_comparison_from_revision(&evidence, &"4".repeat(40))
+            .expect("different channel revision");
+        assert_eq!(different.relation, NixpkgsRevisionRelation::Different);
+        for malformed in ["", "3", &"G".repeat(40), &"3".repeat(129)] {
+            assert_eq!(nixpkgs_comparison_from_revision(&evidence, malformed), None);
+        }
+        assert_eq!(
+            read_bounded_nixpkgs_revision(format!("{}\n", "3".repeat(40)).as_bytes()),
+            Some("3".repeat(40))
+        );
+        assert_eq!(
+            read_bounded_nixpkgs_revision("3".repeat(129).as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn official_nixpkgs_channel_urls_reject_unsafe_authorities_and_redirects() {
+        let source =
+            nixpkgs_channel_revision_url("nixos-unstable", DEFAULT_NIXPKGS_CHANNEL_BASE_URL)
+                .expect("official channel URL");
+        assert_eq!(
+            source.as_str(),
+            "https://channels.nixos.org/nixos-unstable/git-revision"
+        );
+        for base in [
+            "http://channels.nixos.org/",
+            "https://user:secret@channels.nixos.org/",
+            "https://channels.nixos.org/?token=value",
+            "file:///tmp/channels/",
+        ] {
+            assert!(nixpkgs_channel_revision_url("nixos-unstable", base).is_none());
+        }
+        for channel in ["", "../unstable", "nixos unstable", "nixos/unstable"] {
+            assert!(
+                nixpkgs_channel_revision_url(channel, DEFAULT_NIXPKGS_CHANNEL_BASE_URL).is_none()
+            );
+        }
+
+        let release = safe_nixpkgs_channel_redirect(
+            &source,
+            "https://releases.nixos.org/nixos/unstable/nixos-test/git-revision",
+        )
+        .expect("official release redirect");
+        assert_eq!(release.host_str(), Some("releases.nixos.org"));
+        for location in [
+            "http://releases.nixos.org/nixos/unstable/nixos-test/git-revision",
+            "https://example.com/nixos/unstable/nixos-test/git-revision",
+            "https://releases.nixos.org/other/git-revision",
+            "https://releases.nixos.org/nixos/unstable/nixos-test/archive.tar.xz",
+            "https://user:secret@releases.nixos.org/nixos/unstable/nixos-test/git-revision",
+        ] {
+            assert!(safe_nixpkgs_channel_redirect(&source, location).is_none());
+        }
+        assert!(is_official_nixpkgs_git_remote(OFFICIAL_NIXPKGS_GIT_REMOTE));
+        assert!(!is_official_nixpkgs_git_remote(
+            "https://github.com/example/nixpkgs.git"
+        ));
     }
 
     #[test]

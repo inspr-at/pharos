@@ -111,8 +111,12 @@ writable reference repository; `/nixcfg` remains read-only. Exact ancestry
 distinguishes current, behind with a proven commit count, ahead, and diverged.
 Fetch, timeout, parse, missing-object, evidence, or consistency failure produces
 unknown and never falls back to a local upstream-tracking ref. The locked
-nixpkgs revision is separately compared with a fresh exact tip of its declared
-channel. Age is context only: Pharos claims current only when the active
+nixpkgs revision is separately compared with the bounded `git-revision`
+published for its declared channel. For the official NixOS source, Pharos reads
+the HTTPS channel document and permits only its single documented redirect to
+`releases.nixos.org`; the response is size-bounded and must contain exactly one
+full lowercase Git object ID. Custom Git remotes retain the exact fail-closed
+Git comparison. Age is context only: Pharos claims current only when the active
 generation, authoritative nixcfg revision, and nixpkgs channel revision all
 match exactly.
 
@@ -557,7 +561,8 @@ promised third-party API. The important boundaries are:
 | `PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE` | Strict generation-owned deployment evidence; missing or malformed evidence renders freshness unverified |
 | `PHAROS_NIXCFG_REMOTE_URL` | Credential-free HTTPS Git repository used as authoritative nixcfg source |
 | `PHAROS_NIXCFG_REMOTE_REF` | Exact `refs/heads/*` authoritative nixcfg branch |
-| `PHAROS_NIXPKGS_REMOTE_URL` | Credential-free HTTPS Git repository used for exact declared-channel comparison |
+| `PHAROS_NIXPKGS_REMOTE_URL` | Credential-free HTTPS nixpkgs Git repository; the official NixOS/nixpkgs remote uses the bounded official channel publication, while custom remotes use exact fail-closed Git comparison |
+| `PHAROS_NIXPKGS_CHANNEL_BASE_URL` | Optional credential-free HTTPS base for bounded `<channel>/git-revision` documents; overrides the automatic official channel base |
 | `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
 | `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
 | `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
