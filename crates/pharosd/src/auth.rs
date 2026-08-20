@@ -1321,16 +1321,6 @@ pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> R
     }
 }
 
-fn requires_authenticated_operator(path: &str) -> bool {
-    // Inventory GETs stay on the open loopback UI so the dashboard can poll.
-    // Writes and gated proof/action routes do not inherit PHAROS_ALLOW_OPEN.
-    matches!(path, "/host-need-intents")
-        || path.starts_with("/host-actions/")
-        || path.starts_with("/proof/")
-        || path == "/setup/provisioning-jobs"
-        || path.starts_with("/setup/provisioning-jobs/")
-}
-
 #[derive(Default, serde::Deserialize)]
 pub struct LoginParams {
     return_to: Option<String>,
@@ -2452,23 +2442,6 @@ mod tests {
         assert!(!session.to_ascii_lowercase().contains("domain="));
     }
 
-    #[test]
-    fn fleet_automation_routes_never_inherit_explicit_open_ui_mode() {
-        for path in [
-            "/host-need-intents",
-            "/host-actions/jobs/job-1",
-            "/proof/ares",
-            "/setup/provisioning-jobs",
-            "/setup/provisioning-jobs/job-1",
-        ] {
-            assert!(requires_authenticated_operator(path), "{path}");
-        }
-        assert!(!requires_authenticated_operator("/hosts.json"));
-        assert!(!requires_authenticated_operator("/declared-hosts.json"));
-        assert!(!requires_authenticated_operator("/"));
-        assert!(!requires_authenticated_operator("/healthz"));
-        assert!(!requires_authenticated_operator("/agent/actions/claim"));
-    }
 
     #[tokio::test]
     async fn logout_requires_matching_double_submit_csrf_value() {
