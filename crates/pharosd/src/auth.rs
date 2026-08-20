@@ -1308,9 +1308,6 @@ pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> R
     }
     match auth.human() {
         None if auth.machine.is_some() => StatusCode::UNAUTHORIZED.into_response(),
-        None if requires_authenticated_operator(req.uri().path()) => {
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
         None => next.run(req).await,
         Some(human) if human.is_authed(req.headers()) => next.run(req).await,
         Some(_) => {

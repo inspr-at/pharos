@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -462,9 +461,12 @@ pub(crate) fn write_test_generation(
     fs::write(&current_path, format!("{generation}\n"))
         .expect("write machine-operator fixture pointer");
     #[cfg(unix)]
-    for path in [generation_path, current_path] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .expect("secure machine-operator fixture file");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [generation_path, current_path] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("secure machine-operator fixture file");
+        }
     }
     generation
 }
