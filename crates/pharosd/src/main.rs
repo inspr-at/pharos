@@ -12351,12 +12351,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let fleet_read_machine = AccessGrant::fleet_read();
         state.auth = AuthState::for_test_access(fleet_read_machine);
-        let (status, _) = host_action_job_json(
-            State(state),
-            HeaderMap::new(),
-            AxumPath(job.id),
-        )
-        .await;
+        let (status, _) =
+            host_action_job_json(State(state), HeaderMap::new(), AxumPath(job.id)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 

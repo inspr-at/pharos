@@ -537,9 +537,8 @@ mod tests {
         let legacy_schema_root = fixture_root();
         let legacy_schema_generation =
             write_generation(&legacy_schema_root, "unused", &["fleet:read"]);
-        let legacy_schema_path = legacy_schema_root.join(format!(
-            "generation-{legacy_schema_generation}.json"
-        ));
+        let legacy_schema_path =
+            legacy_schema_root.join(format!("generation-{legacy_schema_generation}.json"));
         let mut legacy_document: serde_json::Value =
             serde_json::from_slice(&fs::read(&legacy_schema_path).unwrap()).unwrap();
         legacy_document["schema"] =
@@ -555,11 +554,8 @@ mod tests {
         );
 
         let tampered_root = fixture_root();
-        let tampered_generation =
-            write_generation(&tampered_root, "unused", &["fleet:read"]);
-        let tampered_path = tampered_root.join(format!(
-            "generation-{tampered_generation}.json"
-        ));
+        let tampered_generation = write_generation(&tampered_root, "unused", &["fleet:read"]);
+        let tampered_path = tampered_root.join(format!("generation-{tampered_generation}.json"));
         let mut document: serde_json::Value =
             serde_json::from_slice(&fs::read(&tampered_path).unwrap()).unwrap();
         document["operators"][0]["label"] = serde_json::json!("changed operator");
