@@ -1175,6 +1175,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-cli"
+version = "0.1.81"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "pharos-core"
 version = "0.1.81"
 dependencies = [

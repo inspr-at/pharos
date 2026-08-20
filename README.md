@@ -58,7 +58,7 @@ operation.
 | **Onboarding** | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions |
 | **Providers** | English/German Hetzner portal guidance with Fish-safe commands and exact destination paths, read-only provider checks, exact paid-plan review, attended authorization, single-use creation and ownership-checked cleanup |
 | **Guarded actions** | Fixed review/apply/restart, fleet-update proposal and host-retirement workflows with leases, confirmation and recovery evidence |
-| **Access** | OIDC Authorization Code + PKCE for people; independent per-host bearer authentication for machines |
+| **Access** | OIDC Authorization Code + PKCE for people; scoped machine-operator credentials for read-only clients; independent per-host bearer authentication for beacons |
 
 The UI is server-rendered HTML with a focused vanilla-JavaScript interaction
 layer. There is no separate frontend build or client framework.
@@ -91,6 +91,7 @@ layer. There is no separate frontend build or client framework.
 | `pharos-core` | Versioned host, report, liveness, preferences, provisioning and manifest contracts shared by server and agent |
 | `pharosd` | Fleet store, OIDC guard, machine APIs, server-rendered dashboard, provider connections and guarded workflows |
 | `pharos-beacon` | Small per-host reporter for heartbeat, generation-proven Nix freshness, kernel, backup, location and bounded service observations |
+| `pharos-cli` | Read-only `pharos` operator CLI for health/version, hosts, declarations, beacon last-seen, proofs and provisioning jobs |
 
 The shared Rust contracts matter: server and beacon cannot silently drift onto
 different report schemas. The current report contract is
@@ -265,7 +266,16 @@ Registration, reports and target-agent routes use bearer credentials instead
 of browser sessions. Liveness (`/healthz`), readiness (`/readyz`), metrics,
 version and authentication endpoints remain public.
 
-### 2. Machine identity is per host
+### 2. Machine credentials are purpose-specific
+
+Machine-operator credentials are separate from registration and beacon tokens.
+Janus projects only scoped SHA-256 verifiers to pharosd; clients read their raw
+credential from `PHAROS_OPERATOR_TOKEN_FILE`. `fleet:read` can inspect guarded
+fleet JSON and job evidence. `fleet:write` additionally reaches existing write
+handlers, which still require `X-Pharos-Action: 1` and every workflow-specific
+review, enablement and attended-authorization gate.
+
+Beacon identity remains per host.
 
 Local registration returns a raw beacon token exactly once and stores only its
 SHA-256 hash. Report verification uses constant-time comparison.
@@ -517,7 +527,8 @@ promised third-party API. The important boundaries are:
 | `GET /healthz`, `GET /version` | Public health and build metadata |
 | `POST /register` | Strict versioned registration contract plus deployment bootstrap token; issues one per-host token |
 | `POST /report` | Strict 64 KiB beacon v5/v4 contract and per-host bearer token |
-| `GET /hosts.json`, `GET /declared-hosts.json` | OIDC/access-policy guarded fleet views |
+| `GET /hosts.json`, `GET /declared-hosts.json`, `GET /proof/{host}` | OIDC/access-policy or scoped machine-operator guarded fleet views |
+| `POST /host-need-intents` | Stores a typed need and creates only the existing immutable Hetzner plan review; authorization and create remain separate |
 | `POST /setup/existing-host/preflight` | Guarded read-only onboarding facts |
 | `/host-actions/...` | OIDC/operator guarded workflow requests |
 | `/agent/actions/...`, `/agent/retirements/...` | Machine-authenticated fixed leases and value-free results |
@@ -538,6 +549,8 @@ promised third-party API. The important boundaries are:
 | `PHAROS_OIDC_REDIRECT_URI` | Exact callback URI |
 | `PHAROS_ALLOWED_OPERATORS` | Comma/space-separated `operator-ref:<sha256>`, `verified-email-ref:<sha256>`, or `email:<verified-address>` full-fleet identities |
 | `PHAROS_ACCESS_POLICY_FILE` | Optional scoped policy using the same strict OIDC authorization identifiers |
+| `PHAROS_JANUS_PROJECTION_ROOT` | Capability-named Janus projection root; Pharos resolves `pharos-beacon-token` and `pharos-machine-operator` beneath it |
+| `PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR` | Migration-compatible direct root for the scoped machine-operator verifier generation (`current` plus immutable JSON); cannot be combined with the capability root |
 | `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for local registration; the file form wins and is preferred |
 | `PHAROS_REQUIRE_BEACON_TOKEN` | Require a valid machine token on every report |
 | `PHAROS_BEACON_TOKEN_MODE` | `local`, `dual` or `janus` |
@@ -566,6 +579,14 @@ promised third-party API. The important boundaries are:
 | `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
 | `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
 | `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
+
+### Read-only CLI
+
+Set `PHAROS_URL` and `PHAROS_OPERATOR_TOKEN_FILE`, then use `pharos hosts`,
+`pharos declared status`, `pharos beacon last-seen [HOST]`, `pharos proof HOST`
+or `pharos job ID`. `pharos health` and `pharos version` use the intentionally
+public service endpoints. The CLI has no write command and never calls
+`/agent/*`.
 
 See the committed Compose files and NixOS module for the complete wiring.
 
