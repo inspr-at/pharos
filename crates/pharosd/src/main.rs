@@ -1138,7 +1138,7 @@ async fn host_action_job_json(
         return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
     };
     let access = access_for_headers(&state.auth, &headers);
-    if !access.allows_host(&job.host) {
+    if !access.can_agora() || !access.allows_host(&job.host) {
         return action_error(
             StatusCode::FORBIDDEN,
             "Guarded action access is not granted",
@@ -12329,6 +12329,35 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let mut headers = HeaderMap::new();
         headers.insert("X-Pharos-Action", axum::http::HeaderValue::from_static("1"));
         headers
+    }
+
+    #[tokio::test]
+    async fn host_action_job_reads_require_agora_and_host_access() {
+        let mut state = report_test_state(false);
+        let job = state
+            .host_actions
+            .create_update_review("hsb8", "fixture-operator", now_unix())
+            .expect("host-action fixture starts");
+
+        let host_limited_human = AccessGrant::limited(["hsb8"], false);
+        state.auth = AuthState::for_test_access(host_limited_human);
+        let (status, _) = host_action_job_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath(job.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let fleet_read_machine = AccessGrant::fleet_read();
+        state.auth = AuthState::for_test_access(fleet_read_machine);
+        let (status, _) = host_action_job_json(
+            State(state),
+            HeaderMap::new(),
+            AxumPath(job.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     fn state_with_janus_manifest(host: &str, token: &str) -> (AppState, PathBuf) {

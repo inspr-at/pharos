@@ -211,7 +211,7 @@ impl AccessGrant {
         }
     }
 
-    fn fleet_read() -> Self {
+    pub(crate) fn fleet_read() -> Self {
         Self {
             all_hosts: true,
             hosts: BTreeSet::new(),
@@ -282,6 +282,8 @@ pub struct Auth {
 pub struct AuthState {
     human: Option<Arc<Auth>>,
     machine: Option<MachineOperatorTokenStore>,
+    #[cfg(test)]
+    fixed_access: Option<AccessGrant>,
 }
 
 /// Fully validated human-authentication startup configuration.
@@ -430,6 +432,8 @@ impl Auth {
             return Ok(AuthState {
                 human: None,
                 machine,
+                #[cfg(test)]
+                fixed_access: None,
             });
         };
         let OidcAuthConfig {
@@ -480,6 +484,8 @@ impl Auth {
                 session_rate: Mutex::new(RateWindow::default()),
             })),
             machine,
+            #[cfg(test)]
+            fixed_access: None,
         })
     }
 
@@ -623,6 +629,15 @@ enum MachineAuthentication {
 }
 
 impl AuthState {
+    #[cfg(test)]
+    pub(crate) fn for_test_access(access: AccessGrant) -> Self {
+        Self {
+            human: None,
+            machine: None,
+            fixed_access: Some(access),
+        }
+    }
+
     fn human(&self) -> Option<&Arc<Auth>> {
         self.human.as_ref()
     }
@@ -698,6 +713,10 @@ impl AuthState {
     }
 
     fn current_access(&self, headers: &HeaderMap) -> AccessGrant {
+        #[cfg(test)]
+        if let Some(access) = &self.fixed_access {
+            return access.clone();
+        }
         match self.machine_authentication(headers) {
             MachineAuthentication::Authenticated(principal) if principal.can_write => {
                 AccessGrant::full()
@@ -2912,26 +2931,17 @@ mod tests {
         }
         let credential = format!("machine-fixture-{}-{sequence}", std::process::id());
         let credential_hash = format!("{:x}", Sha256::digest(credential.as_bytes()));
-        let generation = format!("{:x}", Sha256::digest(b"auth-machine-generation"));
-        let document = serde_json::json!({
-            "schema": crate::janus_projections::MACHINE_OPERATOR_SCHEMA,
-            "generation": generation,
-            "operators": [{
-                "operator_ref": "operator:machine-fixture",
-                "label": "machine fixture",
-                "token_sha256": credential_hash,
-                "scopes": scopes,
-            }]
-        });
-        std::fs::write(
-            root.join(format!("{generation}.json")),
-            serde_json::to_vec(&document).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(root.join("current"), format!("{generation}\n")).unwrap();
+        crate::janus_projections::write_test_generation(
+            &root,
+            "operator:machine-fixture",
+            "machine fixture",
+            &credential_hash,
+            scopes,
+        );
         let state = AuthState {
             human: None,
             machine: Some(MachineOperatorTokenStore::load(root.clone()).unwrap()),
+            fixed_access: None,
         };
         (state, credential, root)
     }

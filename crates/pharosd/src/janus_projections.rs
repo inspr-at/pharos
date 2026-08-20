@@ -10,16 +10,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::janus_auth::{read_hash_dir_file, validate_hash_dir_root, JanusTokenHashError};
 
 pub(crate) const JANUS_PROJECTION_ROOT_ENV: &str = "PHAROS_JANUS_PROJECTION_ROOT";
 pub(crate) const MACHINE_OPERATOR_HASH_DIR_ENV: &str = "PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR";
 pub(crate) const MACHINE_OPERATOR_SCHEMA: &str =
-    "inspr.pharos.machine-operator-token-generation.v1";
+    "inspr.pharos.machine-operator-token-generation.v2";
 const MAX_CURRENT_BYTES: u64 = 65;
 const MAX_GENERATION_BYTES: u64 = 1024 * 1024;
 const MAX_OPERATORS: usize = 256;
@@ -147,7 +146,7 @@ pub(crate) struct MachineOperatorTokenStore {
     root: Arc<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperatorGeneration {
     schema: String,
@@ -155,7 +154,7 @@ struct OperatorGeneration {
     operators: Vec<OperatorVerifier>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperatorVerifier {
     operator_ref: String,
@@ -206,7 +205,7 @@ impl std::fmt::Display for MachineOperatorError {
 
 impl MachineOperatorTokenStore {
     pub(crate) fn load(root: PathBuf) -> Result<Self, MachineOperatorError> {
-        validate_directory(&root)?;
+        validate_hash_dir_root(&root).map_err(map_hash_dir_error)?;
         let store = Self {
             root: Arc::new(root),
         };
@@ -243,8 +242,9 @@ impl MachineOperatorTokenStore {
 
     fn read_generation(&self) -> Result<OperatorGeneration, MachineOperatorError> {
         let generation_id = read_current(&self.root)?;
-        let generation_path = self.root.join(format!("{generation_id}.json"));
-        let bytes = read_regular_file(&generation_path, MAX_GENERATION_BYTES)?;
+        let generation_file = format!("generation-{generation_id}.json");
+        let bytes = read_hash_dir_file(&self.root, &generation_file, MAX_GENERATION_BYTES)
+            .map_err(map_hash_dir_error)?;
         let generation: OperatorGeneration =
             serde_json::from_slice(&bytes).map_err(|_| MachineOperatorError::Parse)?;
         validate_generation(&generation, &generation_id)?;
@@ -283,6 +283,7 @@ fn validate_generation(
                 .iter()
                 .any(|scope| MachineOperatorScope::parse(scope).is_none())
             || !operator.scopes.iter().any(|scope| scope == "fleet:read")
+            || operator.scopes.iter().collect::<BTreeSet<_>>().len() != operator.scopes.len()
         {
             return Err(MachineOperatorError::InvalidScope);
         }
@@ -292,71 +293,85 @@ fn validate_generation(
             return Err(MachineOperatorError::DuplicateOperator);
         }
     }
+    if machine_operator_generation_id(&generation.operators) != expected_id {
+        return Err(MachineOperatorError::InvalidGeneration);
+    }
     Ok(())
 }
 
 fn read_current(root: &Path) -> Result<String, MachineOperatorError> {
-    let bytes = read_regular_file(&root.join("current"), MAX_CURRENT_BYTES).map_err(|error| {
-        if matches!(error, MachineOperatorError::Read) {
-            MachineOperatorError::MissingCurrent
-        } else {
-            error
-        }
-    })?;
-    let value = std::str::from_utf8(&bytes)
-        .map_err(|_| MachineOperatorError::InvalidGeneration)?
-        .trim();
+    let bytes = read_hash_dir_file(root, "current", MAX_CURRENT_BYTES)
+        .map_err(map_hash_dir_error)
+        .map_err(|error| {
+            if matches!(error, MachineOperatorError::Read) {
+                MachineOperatorError::MissingCurrent
+            } else {
+                error
+            }
+        })?;
+    let current =
+        std::str::from_utf8(&bytes).map_err(|_| MachineOperatorError::InvalidGeneration)?;
+    let value = current.strip_suffix('\n').unwrap_or(current);
     if !valid_generation_id(value) {
         return Err(MachineOperatorError::InvalidGeneration);
     }
     Ok(value.to_string())
 }
 
-fn validate_directory(path: &Path) -> Result<(), MachineOperatorError> {
-    if !path.is_absolute() {
-        return Err(MachineOperatorError::InvalidRoot);
+fn map_hash_dir_error(error: JanusTokenHashError) -> MachineOperatorError {
+    match error {
+        JanusTokenHashError::InvalidRoot => MachineOperatorError::InvalidRoot,
+        JanusTokenHashError::UnsafeMetadata => MachineOperatorError::UnsafeMetadata,
+        JanusTokenHashError::InputTooLarge => MachineOperatorError::InputTooLarge,
+        JanusTokenHashError::ChangedDuringLoad => MachineOperatorError::ChangedDuringLoad,
+        JanusTokenHashError::Read | JanusTokenHashError::MissingCurrent => {
+            MachineOperatorError::Read
+        }
+        JanusTokenHashError::NotConfigured
+        | JanusTokenHashError::Parse
+        | JanusTokenHashError::UnsupportedSchema
+        | JanusTokenHashError::InvalidGeneration
+        | JanusTokenHashError::InvalidHost
+        | JanusTokenHashError::InvalidHash
+        | JanusTokenHashError::DuplicateHost
+        | JanusTokenHashError::EmptyGeneration
+        | JanusTokenHashError::StateUnavailable => MachineOperatorError::Read,
     }
-    let metadata = fs::symlink_metadata(path).map_err(|_| MachineOperatorError::InvalidRoot)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(MachineOperatorError::InvalidRoot);
-    }
-    #[cfg(unix)]
-    if metadata.mode() & 0o027 != 0 {
-        return Err(MachineOperatorError::UnsafeMetadata);
-    }
-    Ok(())
 }
 
-fn read_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>, MachineOperatorError> {
-    let before = fs::symlink_metadata(path).map_err(|_| MachineOperatorError::Read)?;
-    if before.file_type().is_symlink() || !before.is_file() {
-        return Err(MachineOperatorError::UnsafeMetadata);
+fn machine_operator_generation_id(operators: &[OperatorVerifier]) -> String {
+    let mut sorted = operators.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.operator_ref.cmp(&right.operator_ref));
+
+    let mut digest = Sha256::new();
+    digest.update(MACHINE_OPERATOR_SCHEMA.as_bytes());
+    digest.update([0]);
+    for operator in sorted {
+        hash_generation_field(&mut digest, &operator.operator_ref);
+        hash_generation_field(&mut digest, &operator.label);
+        hash_generation_field(&mut digest, &operator.token_sha256);
+        let mut scopes = operator.scopes.iter().collect::<Vec<_>>();
+        scopes.sort();
+        digest.update((scopes.len() as u64).to_be_bytes());
+        for scope in scopes {
+            hash_generation_field(&mut digest, scope);
+        }
     }
-    if before.len() > maximum {
-        return Err(MachineOperatorError::InputTooLarge);
+    hex_digest(&digest.finalize())
+}
+
+fn hash_generation_field(digest: &mut Sha256, value: &str) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
     }
-    #[cfg(unix)]
-    if before.mode() & 0o022 != 0 {
-        return Err(MachineOperatorError::UnsafeMetadata);
-    }
-    let bytes = fs::read(path).map_err(|_| MachineOperatorError::Read)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum {
-        return Err(MachineOperatorError::InputTooLarge);
-    }
-    let after = fs::symlink_metadata(path).map_err(|_| MachineOperatorError::Read)?;
-    #[cfg(unix)]
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mode() != after.mode()
-    {
-        return Err(MachineOperatorError::ChangedDuringLoad);
-    }
-    #[cfg(not(unix))]
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-        return Err(MachineOperatorError::ChangedDuringLoad);
-    }
-    Ok(bytes)
+    output
 }
 
 fn valid_generation_id(value: &str) -> bool {
@@ -410,6 +425,50 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn write_test_generation(
+    root: &Path,
+    operator_ref: &str,
+    label: &str,
+    token_sha256: &str,
+    scopes: &[&str],
+) -> String {
+    let operators = vec![OperatorVerifier {
+        operator_ref: operator_ref.to_string(),
+        label: label.to_string(),
+        token_sha256: token_sha256.to_string(),
+        scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+    }];
+    let generation = machine_operator_generation_id(&operators);
+    let document = OperatorGeneration {
+        schema: MACHINE_OPERATOR_SCHEMA.to_string(),
+        generation: generation.clone(),
+        operators,
+    };
+    fs::create_dir_all(root).expect("create machine-operator fixture root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+            .expect("secure machine-operator fixture root");
+    }
+    let generation_path = root.join(format!("generation-{generation}.json"));
+    fs::write(
+        &generation_path,
+        serde_json::to_vec(&document).expect("encode machine-operator fixture"),
+    )
+    .expect("write machine-operator fixture");
+    let current_path = root.join("current");
+    fs::write(&current_path, format!("{generation}\n"))
+        .expect("write machine-operator fixture pointer");
+    #[cfg(unix)]
+    for path in [generation_path, current_path] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("secure machine-operator fixture file");
+    }
+    generation
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -431,25 +490,15 @@ mod tests {
         path
     }
 
-    fn write_generation(root: &Path, token: &str, scopes: &[&str]) {
+    fn write_generation(root: &Path, token: &str, scopes: &[&str]) -> String {
         let token_hash = sha256_hex(token.as_bytes());
-        let generation = sha256_hex(b"machine-operator-fixture-generation");
-        let document = serde_json::json!({
-            "schema": MACHINE_OPERATOR_SCHEMA,
-            "generation": generation,
-            "operators": [{
-                "operator_ref": "operator:automation",
-                "label": "automation operator",
-                "token_sha256": token_hash,
-                "scopes": scopes,
-            }]
-        });
-        fs::write(
-            root.join(format!("{generation}.json")),
-            serde_json::to_vec(&document).unwrap(),
+        write_test_generation(
+            root,
+            "operator:automation",
+            "automation operator",
+            &token_hash,
+            scopes,
         )
-        .unwrap();
-        fs::write(root.join("current"), format!("{generation}\n")).unwrap();
     }
 
     #[test]
@@ -471,9 +520,82 @@ mod tests {
     }
 
     #[test]
+    fn legacy_layout_and_tampered_v2_content_fail_closed() {
+        let legacy_root = fixture_root();
+        let legacy_generation = write_generation(&legacy_root, "unused", &["fleet:read"]);
+        fs::rename(
+            legacy_root.join(format!("generation-{legacy_generation}.json")),
+            legacy_root.join(format!("{legacy_generation}.json")),
+        )
+        .unwrap();
+        assert_eq!(
+            MachineOperatorTokenStore::load(legacy_root.clone()).unwrap_err(),
+            MachineOperatorError::Read
+        );
+
+        let legacy_schema_root = fixture_root();
+        let legacy_schema_generation =
+            write_generation(&legacy_schema_root, "unused", &["fleet:read"]);
+        let legacy_schema_path = legacy_schema_root.join(format!(
+            "generation-{legacy_schema_generation}.json"
+        ));
+        let mut legacy_document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&legacy_schema_path).unwrap()).unwrap();
+        legacy_document["schema"] =
+            serde_json::json!("inspr.pharos.machine-operator-token-generation.v1");
+        fs::write(
+            &legacy_schema_path,
+            serde_json::to_vec(&legacy_document).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            MachineOperatorTokenStore::load(legacy_schema_root.clone()).unwrap_err(),
+            MachineOperatorError::UnsupportedSchema
+        );
+
+        let tampered_root = fixture_root();
+        let tampered_generation =
+            write_generation(&tampered_root, "unused", &["fleet:read"]);
+        let tampered_path = tampered_root.join(format!(
+            "generation-{tampered_generation}.json"
+        ));
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&tampered_path).unwrap()).unwrap();
+        document["operators"][0]["label"] = serde_json::json!("changed operator");
+        fs::write(&tampered_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(
+            MachineOperatorTokenStore::load(tampered_root.clone()).unwrap_err(),
+            MachineOperatorError::InvalidGeneration
+        );
+
+        fs::remove_dir_all(legacy_root).unwrap();
+        fs::remove_dir_all(legacy_schema_root).unwrap();
+        fs::remove_dir_all(tampered_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_symlinks_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let root = fixture_root();
+        let generation = write_generation(&root, "unused", &["fleet:read"]);
+        let generation_path = root.join(format!("generation-{generation}.json"));
+        let target_path = root.join("generation-target.json");
+        fs::rename(&generation_path, &target_path).unwrap();
+        symlink(&target_path, &generation_path).unwrap();
+
+        assert_eq!(
+            MachineOperatorTokenStore::load(root.clone()).unwrap_err(),
+            MachineOperatorError::UnsafeMetadata
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unknown_scope_and_world_writable_generation_fail_closed() {
         let root = fixture_root();
-        write_generation(&root, "unused", &["fleet:admin"]);
+        let generation = write_generation(&root, "unused", &["fleet:admin"]);
         assert_eq!(
             MachineOperatorTokenStore::load(root.clone()).unwrap_err(),
             MachineOperatorError::InvalidScope
@@ -482,9 +604,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let generation = sha256_hex(b"machine-operator-fixture-generation");
             fs::set_permissions(
-                root.join(format!("{generation}.json")),
+                root.join(format!("generation-{generation}.json")),
                 fs::Permissions::from_mode(0o666),
             )
             .unwrap();

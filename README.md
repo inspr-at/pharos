@@ -550,7 +550,7 @@ promised third-party API. The important boundaries are:
 | `PHAROS_ALLOWED_OPERATORS` | Comma/space-separated `operator-ref:<sha256>`, `verified-email-ref:<sha256>`, or `email:<verified-address>` full-fleet identities |
 | `PHAROS_ACCESS_POLICY_FILE` | Optional scoped policy using the same strict OIDC authorization identifiers |
 | `PHAROS_JANUS_PROJECTION_ROOT` | Capability-named Janus projection root; Pharos resolves `pharos-beacon-token` and `pharos-machine-operator` beneath it |
-| `PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR` | Migration-compatible direct root for the scoped machine-operator verifier generation (`current` plus immutable JSON); cannot be combined with the capability root |
+| `PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR` | Migration-compatible direct root for the scoped machine-operator hash-dir v2 (`current` plus immutable `generation-{id}.json` documents using schema `inspr.pharos.machine-operator-token-generation.v2`); cannot be combined with the capability root |
 | `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for local registration; the file form wins and is preferred |
 | `PHAROS_REQUIRE_BEACON_TOKEN` | Require a valid machine token on every report |
 | `PHAROS_BEACON_TOKEN_MODE` | `local`, `dual` or `janus` |
