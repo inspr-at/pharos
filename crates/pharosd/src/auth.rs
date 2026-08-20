@@ -1325,10 +1325,10 @@ pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> R
 }
 
 fn requires_authenticated_operator(path: &str) -> bool {
-    matches!(
-        path,
-        "/hosts.json" | "/declared-hosts.json" | "/host-need-intents"
-    ) || path.starts_with("/host-actions/")
+    // Inventory GETs stay on the open loopback UI so the dashboard can poll.
+    // Writes and gated proof/action routes do not inherit PHAROS_ALLOW_OPEN.
+    matches!(path, "/host-need-intents")
+        || path.starts_with("/host-actions/")
         || path.starts_with("/proof/")
         || path == "/setup/provisioning-jobs"
         || path.starts_with("/setup/provisioning-jobs/")
@@ -2458,8 +2458,6 @@ mod tests {
     #[test]
     fn fleet_automation_routes_never_inherit_explicit_open_ui_mode() {
         for path in [
-            "/hosts.json",
-            "/declared-hosts.json",
             "/host-need-intents",
             "/host-actions/jobs/job-1",
             "/proof/ares",
@@ -2468,6 +2466,8 @@ mod tests {
         ] {
             assert!(requires_authenticated_operator(path), "{path}");
         }
+        assert!(!requires_authenticated_operator("/hosts.json"));
+        assert!(!requires_authenticated_operator("/declared-hosts.json"));
         assert!(!requires_authenticated_operator("/"));
         assert!(!requires_authenticated_operator("/healthz"));
         assert!(!requires_authenticated_operator("/agent/actions/claim"));
