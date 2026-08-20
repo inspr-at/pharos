@@ -375,6 +375,7 @@ impl ProvisioningJobStore {
             role,
             is_nix: request.is_nix,
             heartbeat_interval_secs: request.heartbeat_interval_secs.filter(|value| *value > 0),
+            host_need_intent: request.host_need_intent.clone(),
             existing_host_context,
             state,
             terminal_outcome: None,
@@ -1656,6 +1657,8 @@ pub(super) struct ProvisioningJobStartRequest {
     pub(super) template: String,
     #[serde(default)]
     pub(super) apply: bool,
+    #[serde(skip)]
+    pub(super) host_need_intent: Option<HostNeedIntent>,
     #[serde(default)]
     pub(super) host_name: Option<String>,
     #[serde(default)]
@@ -5626,6 +5629,67 @@ pub(super) async fn create_provisioning_job(
     }
 }
 
+/// Accept a typed, value-free host requirement and turn it into the existing
+/// immutable paid-plan review. This endpoint never confirms or executes that
+/// plan; those remain separate action-header requests.
+pub(super) async fn create_host_need_intent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(intent): Json<HostNeedIntent>,
+) -> Response {
+    if !action_request_header(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(json!({ "error": "A guarded action request is required." })),
+        )
+            .into_response();
+    }
+    if intent.validate_contract().is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store_headers(),
+            Json(json!({ "error": "The host-need intent contract is invalid." })),
+        )
+            .into_response();
+    }
+    if state.provisioning_jobs.list().iter().any(|job| {
+        job.host_need_intent
+            .as_ref()
+            .is_some_and(|existing| existing.intent_ref == intent.intent_ref)
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            no_store_headers(),
+            Json(json!({ "error": "That host-need intent is already recorded." })),
+        )
+            .into_response();
+    }
+    let request = ProvisioningJobStartRequest {
+        provider: intent.provider.clone(),
+        template: intent.template.clone(),
+        apply: false,
+        host_need_intent: Some(intent.clone()),
+        host_name: Some(intent.host_name.clone()),
+        role: Some(intent.role.clone()),
+        is_nix: Some(true),
+        heartbeat_interval_secs: Some(intent.heartbeat_interval_secs),
+        backup_intent: Some(intent.backup),
+        location_intent: Some(intent.location_intent),
+        access_intent: Some(intent.access),
+        location: Some(intent.location.clone()),
+        server_type: Some(intent.server_type.clone()),
+        image: Some(intent.image.clone()),
+        ssh_key_ref: Some(intent.ssh_key_ref.clone()),
+        ssh: None,
+        preflight_summary: None,
+        preflight_checks: Vec::new(),
+    };
+    create_provisioning_job(State(state), headers, Json(request))
+        .await
+        .into_response()
+}
+
 pub(super) fn paid_operator(
     state: &AppState,
     headers: &HeaderMap,
@@ -5642,16 +5706,16 @@ pub(super) fn paid_operator(
             "Fleet management access is required for paid provider actions.",
         ));
     }
-    let Some(auth) = state.auth.as_ref() else {
+    if !state.auth.operator_configured() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "Paid provider actions require configured OIDC authentication.",
+            "Paid provider actions require configured operator authentication.",
         ));
-    };
-    let Some(user) = auth.current_user(headers) else {
+    }
+    let Some(user) = state.auth.current_user(headers) else {
         return Err((
             StatusCode::UNAUTHORIZED,
-            "Sign in again before reviewing or authorizing paid provider work.",
+            "Authenticate again before reviewing or authorizing paid provider work.",
         ));
     };
     if !safe_paid_display_text(&user.display_name, 200) {

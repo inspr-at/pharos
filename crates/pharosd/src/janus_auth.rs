@@ -126,7 +126,7 @@ impl std::fmt::Display for JanusTokenHashError {
 
 impl JanusTokenStore {
     pub(crate) fn load(root: PathBuf) -> Result<Self, JanusTokenHashError> {
-        validate_root(&root)?;
+        validate_hash_dir_root(&root)?;
         let store = Self {
             root: Arc::new(root),
             state: Arc::new(RwLock::new(JanusTokenState::default())),
@@ -243,7 +243,7 @@ impl JanusTokenStore {
     }
 }
 
-fn validate_root(root: &Path) -> Result<(), JanusTokenHashError> {
+pub(crate) fn validate_hash_dir_root(root: &Path) -> Result<(), JanusTokenHashError> {
     if !root.is_absolute() {
         return Err(JanusTokenHashError::InvalidRoot);
     }
@@ -256,6 +256,21 @@ fn validate_root(root: &Path) -> Result<(), JanusTokenHashError> {
         return Err(JanusTokenHashError::UnsafeMetadata);
     }
     Ok(())
+}
+
+pub(crate) fn read_hash_dir_file(
+    root: &Path,
+    file_name: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, JanusTokenHashError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|_| JanusTokenHashError::InvalidRoot)?;
+    read_bounded_regular_file(
+        &root.join(file_name),
+        max_bytes,
+        #[cfg(unix)]
+        root_metadata.uid(),
+    )
+    .map(|(bytes, _)| bytes)
 }
 
 fn read_current_id(root: &Path) -> Result<String, JanusTokenHashError> {

@@ -39,6 +39,11 @@ use openidconnect::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::janus_projections::{
+    optional_capability_root_from_env, JanusCapability, MachineOperatorPrincipal,
+    MachineOperatorTokenStore, MACHINE_OPERATOR_HASH_DIR_ENV,
+};
+
 const SESSION_COOKIE: &str = "__Host-pharos_session";
 const FLOW_COOKIE: &str = "__Host-pharos_flow";
 const LOGOUT_CSRF_COOKIE: &str = "__Host-pharos_logout_csrf";
@@ -206,6 +211,15 @@ impl AccessGrant {
         }
     }
 
+    pub(crate) fn fleet_read() -> Self {
+        Self {
+            all_hosts: true,
+            hosts: BTreeSet::new(),
+            agora: false,
+        }
+    }
+
+    #[cfg(test)]
     pub fn limited<I, S>(hosts: I, agora: bool) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -263,12 +277,19 @@ pub struct Auth {
     session_rate: Mutex<RateWindow>,
 }
 
-/// `None` = auth disabled (open). `Some` = OIDC enforced.
-pub type AuthState = Option<Arc<Auth>>;
+/// Human OIDC plus the independent scoped machine-operator verifier.
+#[derive(Clone, Default)]
+pub struct AuthState {
+    human: Option<Arc<Auth>>,
+    machine: Option<MachineOperatorTokenStore>,
+    #[cfg(test)]
+    fixed_access: Option<AccessGrant>,
+}
 
 /// Fully validated human-authentication startup configuration.
 pub(crate) struct AuthConfig {
     mode: AuthConfigMode,
+    machine_root: Option<PathBuf>,
 }
 
 enum AuthConfigMode {
@@ -291,7 +312,7 @@ impl AuthConfig {
         let redirect = env_nonempty("PHAROS_OIDC_REDIRECT_URI");
         let allow_open = env_bool(ALLOW_OPEN_ENV)?.unwrap_or(false);
         let operator_policy = OperatorPolicy::from_env()?;
-        Self::from_values(
+        let mut config = Self::from_values(
             listener_is_loopback,
             issuer,
             client_id,
@@ -299,7 +320,12 @@ impl AuthConfig {
             allow_open,
             operator_policy,
             access_policy_file_from_env(),
-        )
+        )?;
+        config.machine_root = optional_capability_root_from_env(
+            JanusCapability::PharosMachineOperator,
+            MACHINE_OPERATOR_HASH_DIR_ENV,
+        )?;
+        Ok(config)
     }
 
     fn from_values(
@@ -335,6 +361,7 @@ impl AuthConfig {
             }
             return Ok(Self {
                 mode: AuthConfigMode::Open,
+                machine_root: None,
             });
         };
 
@@ -363,6 +390,7 @@ impl AuthConfig {
                 operator_policy,
                 access_policy_file,
             })),
+            machine_root: None,
         })
     }
 }
@@ -392,9 +420,21 @@ impl Auth {
     /// metadata. Configuration and discovery errors are returned to the caller
     /// so startup can fail visibly.
     pub(crate) async fn from_config(config: AuthConfig) -> Result<AuthState, String> {
+        let machine = config
+            .machine_root
+            .map(MachineOperatorTokenStore::load)
+            .transpose()
+            .map_err(|error| {
+                format!("machine-operator projection failed startup validation: {error}")
+            })?;
         let AuthConfigMode::Oidc(config) = config.mode else {
             tracing::warn!("human routes are open on an explicitly allowed loopback listener");
-            return Ok(None);
+            return Ok(AuthState {
+                human: None,
+                machine,
+                #[cfg(test)]
+                fixed_access: None,
+            });
         };
         let OidcAuthConfig {
             issuer: issuer_url,
@@ -429,19 +469,24 @@ impl Auth {
                 "OIDC authorization policy is absent on a loopback listener; all authenticated users are allowed"
             );
         }
-        Ok(Some(Arc::new(Auth {
-            issuer: issuer_url,
-            client_id,
-            redirect,
-            http_client,
-            client: Mutex::new(client),
-            operator_policy,
-            access_policy_file,
-            pending: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            login_rate: Mutex::new(RateWindow::default()),
-            session_rate: Mutex::new(RateWindow::default()),
-        })))
+        Ok(AuthState {
+            human: Some(Arc::new(Auth {
+                issuer: issuer_url,
+                client_id,
+                redirect,
+                http_client,
+                client: Mutex::new(client),
+                operator_policy,
+                access_policy_file,
+                pending: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::new()),
+                login_rate: Mutex::new(RateWindow::default()),
+                session_rate: Mutex::new(RateWindow::default()),
+            })),
+            machine,
+            #[cfg(test)]
+            fixed_access: None,
+        })
     }
 
     fn client(&self) -> OidcClient {
@@ -571,6 +616,120 @@ impl Auth {
                 tracing::warn!(path = %path.display(), error = %err, "could not read Pharos access policy; denying non-operator access");
                 AccessGrant::empty()
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MachineAuthentication {
+    Absent,
+    Authenticated(MachineOperatorPrincipal),
+    Denied,
+    Unavailable,
+}
+
+impl AuthState {
+    #[cfg(test)]
+    pub(crate) fn for_test_access(access: AccessGrant) -> Self {
+        Self {
+            human: None,
+            machine: None,
+            fixed_access: Some(access),
+        }
+    }
+
+    fn human(&self) -> Option<&Arc<Auth>> {
+        self.human.as_ref()
+    }
+
+    pub(crate) fn human_configured(&self) -> bool {
+        self.human.is_some()
+    }
+
+    pub(crate) fn operator_configured(&self) -> bool {
+        self.human.is_some() || self.machine.is_some()
+    }
+
+    pub(crate) fn is_some(&self) -> bool {
+        self.human_configured()
+    }
+
+    pub(crate) fn machine_readiness(&self) -> Option<bool> {
+        self.machine.as_ref().map(MachineOperatorTokenStore::ready)
+    }
+
+    fn machine_authentication(&self, headers: &HeaderMap) -> MachineAuthentication {
+        let Some(value) = headers.get(header::AUTHORIZATION) else {
+            return MachineAuthentication::Absent;
+        };
+        let Some(token) = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return MachineAuthentication::Denied;
+        };
+        let Some(store) = self.machine.as_ref() else {
+            return MachineAuthentication::Denied;
+        };
+        match store.authenticate(token) {
+            Ok(Some(principal)) => MachineAuthentication::Authenticated(principal),
+            Ok(None) => MachineAuthentication::Denied,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    capability = JanusCapability::PharosMachineOperator.as_str(),
+                    "machine-operator verifier unavailable"
+                );
+                MachineAuthentication::Unavailable
+            }
+        }
+    }
+
+    pub(crate) fn current_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
+        match self.machine_authentication(headers) {
+            MachineAuthentication::Authenticated(principal) => Some(AuthUser {
+                operator_ref: principal.operator_ref,
+                managed_human_session_ref: String::new(),
+                display_name: principal.label,
+            }),
+            MachineAuthentication::Denied | MachineAuthentication::Unavailable => None,
+            MachineAuthentication::Absent => self
+                .human
+                .as_ref()
+                .and_then(|auth| auth.current_user(headers)),
+        }
+    }
+
+    pub(crate) fn human_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
+        if headers.contains_key(header::AUTHORIZATION) {
+            return None;
+        }
+        self.human
+            .as_ref()
+            .and_then(|auth| auth.current_user(headers))
+    }
+
+    fn current_access(&self, headers: &HeaderMap) -> AccessGrant {
+        #[cfg(test)]
+        if let Some(access) = &self.fixed_access {
+            return access.clone();
+        }
+        match self.machine_authentication(headers) {
+            MachineAuthentication::Authenticated(principal) if principal.can_write => {
+                AccessGrant::full()
+            }
+            MachineAuthentication::Authenticated(_) => AccessGrant::fleet_read(),
+            MachineAuthentication::Denied | MachineAuthentication::Unavailable => {
+                AccessGrant::empty()
+            }
+            MachineAuthentication::Absent => match &self.human {
+                Some(auth) => auth.current_access(headers),
+                None if self.machine.is_some() => AccessGrant::empty(),
+                None => AccessGrant::full(),
+            },
         }
     }
 }
@@ -761,10 +920,7 @@ fn access_policy_file_from_env() -> Option<PathBuf> {
 }
 
 pub fn access_for_headers(auth: &AuthState, headers: &HeaderMap) -> AccessGrant {
-    match auth {
-        None => AccessGrant::full(),
-        Some(auth) => auth.current_access(headers),
-    }
+    auth.current_access(headers)
 }
 
 impl LoginIdentity {
@@ -1138,12 +1294,22 @@ fn rate_limited_response() -> Response {
         .into_response()
 }
 
-/// Middleware gating the human routes. Open when auth is disabled; otherwise
-/// requires a valid session cookie, else redirects to the login.
+/// Middleware gating operator routes. Browser sessions and scoped machine
+/// bearer credentials share the route group; invalid or unavailable machine
+/// authentication never falls back to a cookie or open mode.
 pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
-    match &auth {
+    match auth.machine_authentication(req.headers()) {
+        MachineAuthentication::Authenticated(_) => return next.run(req).await,
+        MachineAuthentication::Denied => return StatusCode::UNAUTHORIZED.into_response(),
+        MachineAuthentication::Unavailable => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        MachineAuthentication::Absent => {}
+    }
+    match auth.human() {
+        None if auth.machine.is_some() => StatusCode::UNAUTHORIZED.into_response(),
         None => next.run(req).await,
-        Some(a) if a.is_authed(req.headers()) => next.run(req).await,
+        Some(human) if human.is_authed(req.headers()) => next.run(req).await,
         Some(_) => {
             let return_to = if matches!(*req.method(), Method::GET | Method::HEAD) {
                 validated_return_to(req.uri().path_and_query().map(|value| value.as_str()))
@@ -1163,7 +1329,7 @@ pub struct LoginParams {
 /// `GET /auth/login` — start the PKCE flow, redirect to the IdP.
 pub async fn login(State(auth): State<AuthState>, Query(params): Query<LoginParams>) -> Response {
     let return_to = validated_return_to(params.return_to.as_deref());
-    let Some(auth) = auth else {
+    let Some(auth) = auth.human().cloned() else {
         return Redirect::to(&return_to).into_response();
     };
     auth.sweep();
@@ -1252,7 +1418,7 @@ pub async fn callback(
     headers: HeaderMap,
     Query(p): Query<CallbackParams>,
 ) -> Response {
-    let Some(auth) = auth else {
+    let Some(auth) = auth.human().cloned() else {
         return Redirect::to("/").into_response();
     };
     let flow_cookie = cookie(&headers, FLOW_COOKIE);
@@ -1504,7 +1670,7 @@ pub async fn logout(
     {
         return (StatusCode::FORBIDDEN, "logout CSRF check failed").into_response();
     }
-    if let Some(auth) = &auth {
+    if let Some(auth) = auth.human() {
         if let Some(sid) = cookie(&headers, SESSION_COOKIE) {
             auth.sessions.lock().expect("sessions lock").remove(&sid);
         }
@@ -1833,8 +1999,6 @@ mod tests {
         let mut session_headers = HeaderMap::new();
         session_headers.insert(header::COOKIE, session_cookie.parse().unwrap());
         let user = auth_state
-            .as_ref()
-            .unwrap()
             .current_user(&session_headers)
             .expect("OIDC callback creates a session");
         assert_eq!(user.display_name, "oidc-e2e-user");
@@ -1861,11 +2025,7 @@ mod tests {
         )
         .await;
         assert_eq!(rejected_logout.status(), StatusCode::FORBIDDEN);
-        assert!(auth_state
-            .as_ref()
-            .unwrap()
-            .current_user(&session_headers)
-            .is_some());
+        assert!(auth_state.current_user(&session_headers).is_some());
 
         let logout_response = logout(
             State(auth_state.clone()),
@@ -1888,11 +2048,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(auth_state
-            .as_ref()
-            .unwrap()
-            .current_user(&session_headers)
-            .is_none());
+        assert!(auth_state.current_user(&session_headers).is_none());
 
         server.abort();
         let _ = server.await;
@@ -2289,7 +2445,7 @@ mod tests {
     #[tokio::test]
     async fn logout_requires_matching_double_submit_csrf_value() {
         let missing = logout(
-            State(None),
+            State(AuthState::default()),
             HeaderMap::new(),
             Form(LogoutForm {
                 csrf: "csrf-fixture".to_string(),
@@ -2306,7 +2462,7 @@ mod tests {
                 .unwrap(),
         );
         let denied = logout(
-            State(None),
+            State(AuthState::default()),
             headers.clone(),
             Form(LogoutForm {
                 csrf: "wrong".to_string(),
@@ -2316,7 +2472,7 @@ mod tests {
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
         let accepted = logout(
-            State(None),
+            State(AuthState::default()),
             headers,
             Form(LogoutForm {
                 csrf: "csrf-fixture".to_string(),
@@ -2339,7 +2495,7 @@ mod tests {
         let app = Router::new()
             .route("/auth/logout", post(logout))
             .route("/auth/logged-out", get(logged_out))
-            .with_state(None::<Arc<Auth>>);
+            .with_state(AuthState::default());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -2725,5 +2881,73 @@ mod tests {
         let result =
             AuthConfig::from_values(true, issuer, client_id, redirect, true, policy(None), None);
         assert!(result.is_err());
+    }
+
+    fn machine_auth_state(scopes: &[&str]) -> (AuthState, String, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "pharos-auth-machine-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let credential = format!("machine-fixture-{}-{sequence}", std::process::id());
+        let credential_hash = format!("{:x}", Sha256::digest(credential.as_bytes()));
+        crate::janus_projections::write_test_generation(
+            &root,
+            "operator:machine-fixture",
+            "machine fixture",
+            &credential_hash,
+            scopes,
+        );
+        let state = AuthState {
+            human: None,
+            machine: Some(MachineOperatorTokenStore::load(root.clone()).unwrap()),
+            fixed_access: None,
+        };
+        (state, credential, root)
+    }
+
+    #[test]
+    fn machine_operator_scope_is_independent_and_fail_closed() {
+        let (read_state, credential, read_root) = machine_auth_state(&["fleet:read"]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {credential}").parse().unwrap(),
+        );
+        let read_access = access_for_headers(&read_state, &headers);
+        assert!(read_access.allows_host("any-host"));
+        assert!(!read_access.can_manage_fleet());
+        assert_eq!(
+            read_state.current_user(&headers).unwrap().operator_ref,
+            "operator:machine-fixture"
+        );
+        assert!(access_for_headers(&read_state, &HeaderMap::new()).is_empty());
+
+        let (write_state, write_credential, write_root) =
+            machine_auth_state(&["fleet:read", "fleet:write"]);
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {write_credential}").parse().unwrap(),
+        );
+        assert!(access_for_headers(&write_state, &headers).can_manage_fleet());
+
+        let unconfigured = AuthState::default();
+        assert!(access_for_headers(&unconfigured, &headers).is_empty());
+        assert!(matches!(
+            unconfigured.machine_authentication(&headers),
+            MachineAuthentication::Denied
+        ));
+
+        std::fs::remove_dir_all(read_root).unwrap();
+        std::fs::remove_dir_all(write_root).unwrap();
     }
 }

@@ -49,6 +49,7 @@ fn human_routes() -> Router<AppState> {
         .route("/hosts.json", get(hosts_json))
         .route("/setup/provider-plan.json", get(setup_provider_plan_json))
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
+        .route("/host-need-intents", post(create_host_need_intent))
         .route("/setup/provisioning-jobs/{id}", get(provisioning_job_json))
         .route(
             "/setup/provisioning-jobs/{id}/confirm",
@@ -79,6 +80,7 @@ fn human_routes() -> Router<AppState> {
             post(existing_host_preflight_json),
         )
         .route("/declared-hosts.json", get(declared_hosts_json))
+        .route("/proof/{host}", get(host_proof_json))
         .route(
             "/managed-service-declarations.json",
             get(managed_service_declarations_json),

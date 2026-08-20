@@ -1,0 +1,17 @@
+[package]
+name = "pharos-cli"
+description = "Read-only operator CLI for Pharos fleet evidence."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pharos"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"

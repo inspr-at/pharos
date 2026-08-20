@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1.20.0@sha256:26147acbda4f14c5add9946e2fd2ed543fc402884fd75146bd342a7f6271dc1d
-# Multi-stage build. Ships BOTH binaries: pharosd (the server) + pharos-beacon
-# (the agent, so it can be extracted onto hosts: docker cp ...).
+# Multi-stage build. Ships pharosd, pharos-beacon, and the read-only pharos CLI.
 # Full (non-slim) toolchain: pharosd's OIDC stack pulls ring (rustls), which
 # needs a C compiler. The runtime image stays slim — ring links statically and
 # rustls uses bundled roots, so no system OpenSSL at build or runtime.
@@ -9,8 +8,8 @@ FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f9
 ARG GIT_COMMIT=dev
 WORKDIR /src
 COPY . .
-RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p pharos-beacon \
-    && strip target/release/pharosd target/release/pharos-beacon
+RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p pharos-beacon -p pharos-cli \
+    && strip target/release/pharosd target/release/pharos-beacon target/release/pharos
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 ARG DEBIAN_SNAPSHOT=20260713T000000Z
@@ -46,6 +45,7 @@ RUN useradd --system --uid 10001 pharos
 RUN install -d -o pharos -g pharos /data
 COPY --from=build /src/target/release/pharosd /usr/local/bin/pharosd
 COPY --from=build /src/target/release/pharos-beacon /usr/local/bin/pharos-beacon
+COPY --from=build /src/target/release/pharos /usr/local/bin/pharos
 COPY --from=build /src/LICENSE /usr/share/licenses/pharos/LICENSE
 COPY --chmod=0755 scripts/install-pharos-beacon-systemd.sh /usr/local/share/pharos/install-pharos-beacon-systemd.sh
 USER pharos

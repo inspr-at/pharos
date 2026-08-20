@@ -2137,11 +2137,10 @@ pub(super) fn summary_cards(hosts: &[Host], _self_name: &str, now: i64) -> Strin
 }
 
 pub(super) fn sidebar_user_label(auth: &AuthState, headers: &HeaderMap) -> String {
-    auth.as_ref()
-        .and_then(|auth| auth.current_user(headers))
+    auth.current_user(headers)
         .map(|user| user.display_name)
         .unwrap_or_else(|| {
-            if auth.is_some() {
+            if auth.human_configured() {
                 "signed in".to_string()
             } else {
                 "local access".to_string()

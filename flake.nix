@@ -46,6 +46,11 @@
         rec {
           pharosd = mkPharosPackage pkgs "pharosd";
           pharos-beacon = mkPharosPackage pkgs "pharos-beacon";
+          pharos = pkgs.callPackage ./nix/packages/pharos.nix {
+            binaryName = "pharos";
+            cargoPackage = "pharos-cli";
+            src = pharosSource;
+          };
           default = pharosd;
         }
       );
@@ -58,6 +63,7 @@
         {
           pharos-beacon = self.packages.${system}.pharos-beacon;
           pharosd = self.packages.${system}.pharosd;
+          pharos = self.packages.${system}.pharos;
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           pharos-beacon-vm = import ./nix/tests/pharos-beacon-vm.nix {

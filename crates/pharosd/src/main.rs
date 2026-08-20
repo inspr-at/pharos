@@ -16,6 +16,7 @@ mod durable_file;
 mod host_actions;
 mod icons;
 mod janus_auth;
+mod janus_projections;
 mod managed_service_operations;
 mod managed_service_ui;
 mod managed_setup_intents;
@@ -64,9 +65,9 @@ use pharos_core::{
     ExistingHostBootstrapOption, ExistingHostPreflightCheck, ExistingHostPreflightFacts,
     ExistingHostPreflightReport, ExistingHostPreflightRequest, ExistingHostPreflightSummary,
     ExistingHostSetupContext, GitRevisionRelation, Host, HostKind, HostLocation,
-    HostLocationSource, HostManifest, HostPreferences, HostRegistration, HostRegistrationResponse,
-    HostReport, HostReportResponse, KernelPosture, KernelPostureState, Liveness,
-    LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
+    HostLocationSource, HostManifest, HostNeedIntent, HostPreferences, HostRegistration,
+    HostRegistrationResponse, HostReport, HostReportResponse, KernelPosture, KernelPostureState,
+    Liveness, LocationSetupIntent, ManifestLocationMode, ManifestProbePolicy, ManifestService,
     ManifestStatusSource, NixFreshness, NixpkgsRevisionRelation, PreflightCheckState,
     PrivilegedActionMode, ProvisioningBackupProposal, ProvisioningBackupProposalKind,
     ProvisioningBackupSecretFile, ProvisioningHandoff, ProvisioningJob, ProvisioningJobState,
@@ -98,6 +99,7 @@ use crate::host_actions::{
     RetiredHostStore, RetirementAgentResultRequest,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
+use crate::janus_projections::{capability_root_from_env, JanusCapability};
 use crate::managed_service_operations::{
     ManagedOperationPhase, ManagedOperationStoreError, ManagedServiceOperationStore,
 };
@@ -437,7 +439,10 @@ fn janus_token_generation_root_from_env() -> Result<Option<PathBuf>, String> {
             ));
         }
     }
-    Ok(env_nonempty("PHAROS_BEACON_TOKEN_HASH_DIR").map(PathBuf::from))
+    capability_root_from_env(
+        JanusCapability::PharosBeaconToken,
+        Some("PHAROS_BEACON_TOKEN_HASH_DIR"),
+    )
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1836,8 +1841,11 @@ async fn healthz() -> &'static str {
 
 async fn readyz(State(state): State<AppState>) -> Response {
     let readiness = state.beacon_auth.janus_readiness();
+    let machine_operator_ready = state.auth.machine_readiness();
     let alert_worker = state.alert_health.snapshot(now_unix());
-    let ready = readiness.as_ref().is_none_or(|status| status.ready) && alert_worker.ready;
+    let ready = readiness.as_ref().is_none_or(|status| status.ready)
+        && machine_operator_ready.is_none_or(|ready| ready)
+        && alert_worker.ready;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1849,6 +1857,11 @@ async fn readyz(State(state): State<AppState>) -> Response {
         Json(json!({
             "ready": ready,
             "janus_sidecar": readiness,
+            "machine_operator": machine_operator_ready.map(|ready| json!({
+                "capability": JanusCapability::PharosMachineOperator.as_str(),
+                "ready": ready,
+                "value_returned": false,
+            })),
             "alert_worker": alert_worker,
         })),
     )
@@ -2287,6 +2300,75 @@ async fn declared_hosts_json(
     ))
 }
 
+async fn host_proof_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(host): AxumPath<String>,
+) -> Response {
+    let access = access_for_headers(&state.auth, &headers);
+    if !valid_action_host_name(&host) || !access.allows_host(&host) {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(json!({ "error": "Host proof access is not granted" })),
+        )
+            .into_response();
+    }
+    let runtime = state.store.get(&host);
+    let declared = host_is_declared(&state, &host);
+    let job = state
+        .provisioning_jobs
+        .list()
+        .into_iter()
+        .filter(|job| provisioning_job_host_name(job) == Some(host.as_str()))
+        .max_by_key(|job| (job.updated_at, job.created_at));
+    if runtime.is_none() && !declared && job.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            no_store_headers(),
+            Json(json!({ "error": "Host proof was not found" })),
+        )
+            .into_response();
+    }
+    let last_seen = runtime.as_ref().and_then(|host| host.last_seen);
+    let liveness = runtime
+        .as_ref()
+        .map(|host| liveness(host.last_seen, host.heartbeat_interval_secs, now_unix()));
+    let verified = last_seen.is_some()
+        && job.as_ref().is_none_or(|job| {
+            job.terminal_outcome == Some(ProvisioningTerminalOutcome::Provisioned)
+        });
+    (
+        StatusCode::OK,
+        no_store_headers(),
+        Json(json!({
+            "schema": "inspr.pharos.host-proof.v1",
+            "version": 1,
+            "host": host,
+            "declared": declared,
+            "reporting": runtime.is_some(),
+            "last_seen": last_seen,
+            "liveness": liveness,
+            "verified": verified,
+            "provisioning": job.as_ref().map(|job| json!({
+                "job_id": job.id,
+                "state": job.state,
+                "terminal_outcome": job.terminal_outcome,
+                "host_need_intent_ref": job.host_need_intent.as_ref().map(|intent| &intent.intent_ref),
+                "reason_ref": job.host_need_intent.as_ref().map(|intent| &intent.reason_ref),
+            })),
+            "janus": state.beacon_auth.janus_readiness().map(|readiness| json!({
+                "capability": JanusCapability::PharosBeaconToken.as_str(),
+                "ready": readiness.ready,
+                "generation": readiness.generation,
+                "host_count": readiness.host_count,
+            })),
+            "value_returned": false,
+        })),
+    )
+        .into_response()
+}
+
 async fn managed_service_declarations_json(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2336,11 +2418,7 @@ async fn create_managed_setup_intent(
     if !access.can_agora() {
         return managed_intent_denial(IntentReason::Forbidden);
     }
-    let Some(user) = state
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.current_user(&headers))
-    else {
+    let Some(user) = state.auth.human_user(&headers) else {
         return managed_intent_denial(IntentReason::AuthenticationRequired);
     };
     let Some(store) = state.managed_setup_intents.as_ref() else {
@@ -2390,11 +2468,7 @@ async fn cancel_managed_setup_intent(
     if !action_request_header(&headers) {
         return managed_intent_denial(IntentReason::InvalidRequest);
     }
-    let Some(user) = state
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.current_user(&headers))
-    else {
+    let Some(user) = state.auth.human_user(&headers) else {
         return managed_intent_denial(IntentReason::AuthenticationRequired);
     };
     let Some(store) = state.managed_setup_intents.as_ref() else {
@@ -2436,12 +2510,7 @@ async fn retry_managed_service_verification(
             "managed_verification_retry_forbidden",
         );
     }
-    if state
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.current_user(&headers))
-        .is_none()
-    {
+    if state.auth.human_user(&headers).is_none() {
         return managed_verification_retry_denial(
             StatusCode::UNAUTHORIZED,
             "managed_verification_retry_authentication_required",
@@ -3808,6 +3877,7 @@ mod tests {
             role: Some("server".to_string()),
             is_nix: Some(true),
             heartbeat_interval_secs: Some(60),
+            host_need_intent: None,
             existing_host_context: None,
             state,
             terminal_outcome: None,
@@ -8261,6 +8331,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "hetzner-cloud".to_string(),
             template: "hetzner-small-nixos".to_string(),
             apply: false,
+            host_need_intent: None,
             host_name: None,
             role: None,
             is_nix: None,
@@ -8575,6 +8646,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "hetzner-cloud".to_string(),
             template: "hetzner-small-nixos".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some(host_name.to_string()),
             role: Some("server".to_string()),
             is_nix: Some(true),
@@ -8595,6 +8667,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     fn hcloud_review_request(host_name: &str) -> ProvisioningJobStartRequest {
         ProvisioningJobStartRequest {
             apply: false,
+            host_need_intent: None,
             ..hcloud_apply_request(host_name)
         }
     }
@@ -10414,6 +10487,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "manual-deferred".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("reconcile-1".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(true),
@@ -10465,6 +10539,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "manual-deferred".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("reconcile-stale".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -10507,6 +10582,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "manual-deferred".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("reconcile-uncertain".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -10557,6 +10633,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "manual-deferred".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("reconcile-2".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -10595,6 +10672,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "hetzner-cloud".to_string(),
             template: "hetzner-small-nixos".to_string(),
             apply: false,
+            host_need_intent: None,
             host_name: Some("hcloud-lab-2".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(true),
@@ -10887,6 +10965,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "manual-deferred".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("legacy-1".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -10966,6 +11045,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "native-systemd".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("legacy-2".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -11057,6 +11137,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "native-systemd".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("missing-ssh".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -11095,6 +11176,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "native-systemd".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("needs-preflight".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -11145,6 +11227,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "native-systemd".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("failed-preflight".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(false),
@@ -11199,6 +11282,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "existing-host".to_string(),
             template: "nixos-anywhere".to_string(),
             apply: true,
+            host_need_intent: None,
             host_name: Some("nix-1".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(true),
@@ -11428,6 +11512,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             provider: "hetzner-cloud".to_string(),
             template: "nixos-pharos".to_string(),
             apply: false,
+            host_need_intent: None,
             host_name: Some("lab-01".to_string()),
             role: Some("server".to_string()),
             is_nix: Some(true),
@@ -12092,7 +12177,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ManagedServiceOperationStore::new(None)
                     .expect("in-memory managed operation store starts"),
             ),
-            auth: None,
+            auth: AuthState::default(),
             beacon_auth,
             provider_runtime: ProviderRuntimeConfig::default(),
             provider_connections: Arc::new(
@@ -12244,6 +12329,31 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let mut headers = HeaderMap::new();
         headers.insert("X-Pharos-Action", axum::http::HeaderValue::from_static("1"));
         headers
+    }
+
+    #[tokio::test]
+    async fn host_action_job_reads_require_agora_and_host_access() {
+        let mut state = report_test_state(false);
+        let job = state
+            .host_actions
+            .create_update_review("hsb8", "fixture-operator", now_unix())
+            .expect("host-action fixture starts");
+
+        let host_limited_human = AccessGrant::limited(["hsb8"], false);
+        state.auth = AuthState::for_test_access(host_limited_human);
+        let (status, _) = host_action_job_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath(job.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let fleet_read_machine = AccessGrant::fleet_read();
+        state.auth = AuthState::for_test_access(fleet_read_machine);
+        let (status, _) =
+            host_action_job_json(State(state), HeaderMap::new(), AxumPath(job.id)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     fn state_with_janus_manifest(host: &str, token: &str) -> (AppState, PathBuf) {

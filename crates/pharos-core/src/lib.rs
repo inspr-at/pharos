@@ -998,6 +998,8 @@ pub const SERVER_LIFECYCLE_SCHEMA: &str = "inspr.pharos.server-lifecycle.v1";
 pub const SERVER_LIFECYCLE_VERSION: u16 = 1;
 pub const PROVISIONING_JOB_SCHEMA: &str = "inspr.pharos.provisioning-job.v1";
 pub const PROVISIONING_JOB_VERSION: u16 = 1;
+pub const HOST_NEED_INTENT_SCHEMA: &str = "inspr.pharos.host-need-intent.v1";
+pub const HOST_NEED_INTENT_VERSION: u16 = 1;
 pub const EXISTING_HOST_PREFLIGHT_SCHEMA: &str = "inspr.pharos.existing-host-preflight.v1";
 pub const EXISTING_HOST_PREFLIGHT_VERSION: u16 = 1;
 
@@ -1015,6 +1017,14 @@ fn default_provisioning_job_schema() -> String {
 
 fn default_provisioning_job_version() -> u16 {
     PROVISIONING_JOB_VERSION
+}
+
+fn default_host_need_intent_schema() -> String {
+    HOST_NEED_INTENT_SCHEMA.to_string()
+}
+
+fn default_host_need_intent_version() -> u16 {
+    HOST_NEED_INTENT_VERSION
 }
 
 fn default_existing_host_preflight_schema() -> String {
@@ -2299,6 +2309,56 @@ impl ProvisioningManagedIdentity {
     }
 }
 
+/// Value-free fleet intent accepted from a work system or operator. It records
+/// what capacity is needed and an opaque reason reference; it cannot authorize
+/// a provider request. Fulfilment still uses the separate reviewed-plan,
+/// attended-authorization, and create gates on `ProvisioningJob`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostNeedIntent {
+    #[serde(default = "default_host_need_intent_schema")]
+    pub schema: String,
+    #[serde(default = "default_host_need_intent_version")]
+    pub version: u16,
+    pub intent_ref: String,
+    pub reason_ref: String,
+    pub host_name: String,
+    pub role: String,
+    pub provider: String,
+    pub template: String,
+    pub location: String,
+    pub server_type: String,
+    pub image: String,
+    pub ssh_key_ref: String,
+    pub heartbeat_interval_secs: u64,
+    pub backup: BackupSetupIntent,
+    pub location_intent: LocationSetupIntent,
+    pub access: AccessSetupIntent,
+}
+
+impl HostNeedIntent {
+    pub fn validate_contract(&self) -> Result<(), ServerLifecycleContractError> {
+        let bounded_ref = |value: &str| safe_paid_identifier(value, 160);
+        if self.schema != HOST_NEED_INTENT_SCHEMA
+            || self.version != HOST_NEED_INTENT_VERSION
+            || !bounded_ref(&self.intent_ref)
+            || !bounded_ref(&self.reason_ref)
+            || !safe_paid_identifier(&self.host_name, 63)
+            || !safe_paid_text(&self.role, 80)
+            || self.provider != "hetzner-cloud"
+            || self.template != "hetzner-small-nixos"
+            || !safe_paid_identifier(&self.location, 64)
+            || !safe_paid_identifier(&self.server_type, 64)
+            || !safe_paid_identifier(&self.image, 128)
+            || !safe_paid_identifier(&self.ssh_key_ref, 128)
+            || !(10..=3_600).contains(&self.heartbeat_interval_secs)
+        {
+            return Err(ServerLifecycleContractError::InvalidHostNeedIntent);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisioningJob {
     #[serde(default = "default_provisioning_job_schema")]
@@ -2316,6 +2376,8 @@ pub struct ProvisioningJob {
     pub is_nix: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_need_intent: Option<HostNeedIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing_host_context: Option<ExistingHostSetupContext>,
     pub state: ProvisioningJobState,
@@ -2365,6 +2427,22 @@ impl ProvisioningJob {
         }
         if self.template.trim().is_empty() {
             return Err(ServerLifecycleContractError::EmptyTemplate);
+        }
+        if let Some(intent) = &self.host_need_intent {
+            intent.validate_contract()?;
+            if self.provider != intent.provider
+                || self.template != intent.template
+                || self.host_name.as_deref() != Some(intent.host_name.as_str())
+                || self.role.as_deref() != Some(intent.role.as_str())
+                || self.heartbeat_interval_secs != Some(intent.heartbeat_interval_secs)
+                || self.setup_intent.as_ref().is_none_or(|setup| {
+                    setup.backup != intent.backup
+                        || setup.location != intent.location_intent
+                        || setup.access != intent.access
+                })
+            {
+                return Err(ServerLifecycleContractError::InvalidHostNeedIntent);
+            }
         }
         if let Some(handoff) = &self.handoff {
             handoff.validate_contract()?;
@@ -2582,6 +2660,7 @@ pub enum ServerLifecycleContractError {
     InvalidPaidAuthorization,
     InvalidPaidExecution,
     InvalidManagedIdentity,
+    InvalidHostNeedIntent,
     PaidAuthorizationWithoutReviewedPlan,
     PaidExecutionWithoutAuthorization,
     PaidPlanHashMismatch,
@@ -2650,6 +2729,9 @@ impl std::fmt::Display for ServerLifecycleContractError {
             }
             Self::InvalidManagedIdentity => {
                 write!(f, "managed provisioning identity is invalid")
+            }
+            Self::InvalidHostNeedIntent => {
+                write!(f, "host-need intent is invalid or does not match its job")
             }
             Self::PaidAuthorizationWithoutReviewedPlan => {
                 write!(f, "paid authorization requires an exact reviewed plan")
@@ -4629,6 +4711,7 @@ mod tests {
             role: Some("server".to_string()),
             is_nix: Some(true),
             heartbeat_interval_secs: Some(60),
+            host_need_intent: None,
             existing_host_context: None,
             state: ProvisioningJobState::Planning,
             terminal_outcome: None,
@@ -4672,6 +4755,42 @@ mod tests {
             progress: vec![entry],
         };
         job.validate_contract().expect("job contract is valid");
+        let intent = HostNeedIntent {
+            schema: HOST_NEED_INTENT_SCHEMA.to_string(),
+            version: HOST_NEED_INTENT_VERSION,
+            intent_ref: "need:capacity:ares".to_string(),
+            reason_ref: "work:PHAROS-208".to_string(),
+            host_name: "hcloud-lab-1".to_string(),
+            role: "server".to_string(),
+            provider: "hetzner-cloud".to_string(),
+            template: "hetzner-small-nixos".to_string(),
+            location: "fsn1".to_string(),
+            server_type: "cx22".to_string(),
+            image: "debian-13".to_string(),
+            ssh_key_ref: "operator-key".to_string(),
+            heartbeat_interval_secs: 60,
+            backup: BackupSetupIntent::External,
+            location_intent: LocationSetupIntent::SiteFallback,
+            access: AccessSetupIntent::LimitedUsers,
+        };
+        intent
+            .validate_contract()
+            .expect("typed host need is value-free and valid");
+        let need_job = ProvisioningJob {
+            host_need_intent: Some(intent.clone()),
+            ..job.clone()
+        };
+        need_job
+            .validate_contract()
+            .expect("matching typed need attaches to reviewed workflow");
+        let mismatched_need = ProvisioningJob {
+            host_name: Some("another-host".to_string()),
+            ..need_job
+        };
+        assert_eq!(
+            mismatched_need.validate_contract(),
+            Err(ServerLifecycleContractError::InvalidHostNeedIntent)
+        );
         let active_json = serde_json::to_string(&job).expect("active job serializes");
         assert!(!active_json.contains("terminal_outcome"));
 
@@ -4821,6 +4940,7 @@ mod tests {
             role: Some("server".to_string()),
             is_nix: Some(true),
             heartbeat_interval_secs: Some(60),
+            host_need_intent: None,
             existing_host_context: None,
             state: ProvisioningJobState::Planning,
             terminal_outcome: None,
