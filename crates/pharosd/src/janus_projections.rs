@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
