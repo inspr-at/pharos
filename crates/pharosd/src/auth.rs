@@ -2442,7 +2442,6 @@ mod tests {
         assert!(!session.to_ascii_lowercase().contains("domain="));
     }
 
-
     #[tokio::test]
     async fn logout_requires_matching_double_submit_csrf_value() {
         let missing = logout(
