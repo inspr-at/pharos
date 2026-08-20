@@ -1,5 +1,12 @@
 # Pharos Changelog
 
+## 0.1.82 - 2026-08-20
+
+- Independent machine-operator credential verifier using SHA-256 bearer tokens instead of OIDC. Invalid or unavailable bearer credentials fail closed (401/503) without falling back to cookie authentication or open mode.
+- Typed `HostNeedIntent` resource via `POST /host-need-intents` creates Hetzner paid-plan review records (`apply: false`). No PPM webhook integration.
+- Capability-named Janus projection roots for `pharos-beacon-token` and `pharos-machine-operator` credentials, both using hash-dir v2 format (`generation-{id}.json`).
+- Read-only `pharos` CLI gated by `PHAROS_OPERATOR_TOKEN_FILE` environment variable. No agent endpoints (`/agent/*`).
+
 ## 0.1.81 - 2026-08-10
 
 - Resolve the official NixOS channel tip from its bounded HTTPS `git-revision` publication instead of downloading GitHub's complete nixpkgs ref advertisement, eliminating host-speed-dependent comparison timeouts.
