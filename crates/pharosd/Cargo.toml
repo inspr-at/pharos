@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+paimos-compression-test = [
+    "reqwest/brotli",
+    "reqwest/deflate",
+    "reqwest/gzip",
+    "reqwest/zstd",
+]
+
 [dependencies]
 pharos-core = { workspace = true }
 axum = { workspace = true }
@@ -30,5 +38,7 @@ openidconnect = "4"
 libc = "0.2"
 
 [dev-dependencies]
+async-compression = { version = "0.4", default-features = false, features = ["brotli", "deflate", "gzip", "tokio", "zstd"] }
 rand = "=0.8.6"
 rsa = { version = "=0.9.10", features = ["sha2"] }
+tokio = { workspace = true, features = ["io-util"] }
