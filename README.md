@@ -322,6 +322,29 @@ Host-action state contains no credentials, arbitrary commands, Nix store paths
 or command output. Target agents can claim only a fixed phase of a persisted
 workflow for a bounded lease.
 
+The optional Paimos delivery-stage adapter is reporter-only. Its owner-written
+local intent file fixes the Paimos origin, handoff IDs, host, one of the two
+compiled workflows (`deploy-production` or `verify-production`), symbolic
+environment, exact artifact tuple and existing guarded `UpdateRestart` binding.
+Paimos supplies none of those authority-bearing selectors, and no Paimos field
+can become a command, path, callback, host selector or arbitrary workflow.
+
+Every external call requires the registered API key and the handoff's separate
+32-byte credential from different owner-only, current-user-owned, single-link
+files. Before a mutation, Pharos durably stores the exact safe JSON request and
+an idempotency key derived from handoff ID, sequence and request digest. A crash
+or ambiguous response replays those exact bytes; credential rotation does not
+change request identity. The adapter emits only sequence 1 `accepted` followed
+by sequence 2 `succeeded` or `failed`—never `active` or a heartbeat.
+
+Deployment success requires an already operator-confirmed `UpdateRestart` to
+finish and a newer fresh beacon to report Nix generation evidence whose source
+revision and `flake.lock` digest match the locally configured commit and
+artifact digest. Verification uses a separate handoff and remains unreported
+until another fresh beacon arrives after Paimos received deployment, with the
+identical host, environment and artifact tuple. Wrong artifact, wrong
+environment, stale, missing or pre-deployment evidence fails closed.
+
 ### 5. Requested is never presented as applied
 
 Nix host settings become declared only after the configured nixcfg artifact is
@@ -543,6 +566,7 @@ promised third-party API. The important boundaries are:
 | `PHAROS_PUBLIC_ADDR` | Optional effective public bind used to validate explicit loopback-only open mode behind a local container port mapping |
 | `PHAROS_ALLOW_OPEN` | Explicitly allow unauthenticated human routes; valid only for a loopback public address |
 | `PHAROS_DB` | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly |
+| `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE` | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files |
 | `PHAROS_PROVISIONING_JOBS_DB` | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset |
 | `PHAROS_OIDC_ISSUER` | OIDC discovery issuer |
 | `PHAROS_OIDC_CLIENT_ID` | Public OIDC client identifier |
@@ -589,6 +613,20 @@ public service endpoints. The CLI has no write command and never calls
 `/agent/*`.
 
 See the committed Compose files and NixOS module for the complete wiring.
+
+The Paimos adapter config uses schema
+`inspr.pharos.paimos-delivery-adapter.v1`. It requires a credential-free HTTPS
+origin (loopback HTTP is accepted for tests), `poll_interval_secs` from 5–3600,
+`verification_freshness_secs` from 30–900, one `api_key_file`, and 1–128 strict
+intents. A deployment intent has `stage: "deployment"`,
+`workflow: "deploy-production"` and `update_restart_job_id`; a verification
+intent has `stage: "verification"`, `workflow: "verify-production"` and
+`deployment_handoff_id`. Both carry locally selected `handoff_id`,
+`handoff_secret_file`, `host`, `environment`, and an artifact containing a
+bounded version, `sha256:` digest and lowercase 40- or 64-hex commit digest.
+Unknown fields, unsafe origins, mismatched deployment/verification pairs and
+shared credential files reject startup. The bundled contract verifier is
+`scripts/check-paimos-delivery-contract.sh`.
 
 For both token pairs, a non-empty `_FILE` variable takes precedence over the
 direct value. Pharos removes one trailing LF or CRLF from the file and preserves
