@@ -17,7 +17,8 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE,
+    USER_AGENT,
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,7 @@ const CONTRACT_MEDIA_TYPE: &str = "application/vnd.paimos.external-stage.v1+json
 const HANDOFF_SECRET_HEADER: &str = "X-PAIMOS-Handoff-Secret";
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const USER_AGENT_VALUE: &str = "pharosd-paimos-delivery/1";
+const IDENTITY_ENCODING: &str = "identity";
 const HANDOFF_SECRET_BYTES: usize = 32;
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_API_KEY_BYTES: u64 = 512;
@@ -846,6 +848,7 @@ impl PaimosClient {
             .request(method, url)
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, CONTRACT_MEDIA_TYPE)
+            .header(ACCEPT_ENCODING, IDENTITY_ENCODING)
             .header(AUTHORIZATION, authorization_value)
             .header(HANDOFF_SECRET_HEADER, secret_value);
         if let Some(idempotency_key) = idempotency_key {
@@ -1355,6 +1358,31 @@ fn parse_origin(value: &str) -> Result<Url, AdapterError> {
     Ok(url)
 }
 
+/// The only place cleartext loopback HTTP is reachable. It is `#[cfg(test)]`,
+/// so it is compiled out of every shipped binary: the production entry points
+/// (`from_env` -> `AdapterConfig::load`) can reach only `parse_origin`, which
+/// requires HTTPS.
+#[cfg(test)]
+fn loopback_origin_for_tests(value: &str) -> Url {
+    let url = Url::parse(value).expect("test loopback origin parses");
+    assert_eq!(url.scheme(), "http", "test origin is cleartext loopback");
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => assert!(address.is_loopback()),
+        Some(url::Host::Ipv6(address)) => assert!(address.is_loopback()),
+        Some(url::Host::Domain("localhost")) => {}
+        _ => panic!("test origin must be a loopback host"),
+    }
+    assert!(
+        matches!(parse_origin(value), Err(AdapterError::Configuration)),
+        "production parsing must still refuse this origin"
+    );
+    url
+}
+
+/// Exactly one canonical `Content-Type` and no `Content-Encoding` at all. The
+/// request side pins `Accept-Encoding: identity`, and the HTTP client is built
+/// without any decompression feature, so an encoded body reaches this check
+/// with its header intact instead of being transparently decoded away.
 fn response_media_valid(headers: &HeaderMap) -> bool {
     let mut content_types = headers.get_all(CONTENT_TYPE).iter();
     content_types.next().and_then(|value| value.to_str().ok()) == Some(CONTRACT_MEDIA_TYPE)
@@ -1839,7 +1867,7 @@ mod tests {
             .unwrap();
         });
         (
-            Url::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap(),
+            loopback_origin_for_tests(&format!("http://127.0.0.1:{}", address.port())),
             task,
         )
     }
@@ -2299,6 +2327,202 @@ mod tests {
         server.abort();
     }
 
+    /// A Paimos impersonator that answers the accept mutation with a response
+    /// shape the contract forbids. Every field here is something a compromised
+    /// or buggy peer controls.
+    #[derive(Clone)]
+    struct WireAbuse {
+        status: StatusCode,
+        content_types: Vec<String>,
+        content_encoding: Option<String>,
+        duplicate: bool,
+    }
+
+    impl WireAbuse {
+        fn canonical() -> Self {
+            Self {
+                status: StatusCode::CREATED,
+                content_types: vec![CONTRACT_MEDIA_TYPE.to_string()],
+                content_encoding: None,
+                duplicate: false,
+            }
+        }
+
+        fn media(content_types: &[&str]) -> Self {
+            Self {
+                content_types: content_types
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect(),
+                ..Self::canonical()
+            }
+        }
+
+        fn encoding(value: &str) -> Self {
+            Self {
+                content_encoding: Some(value.to_string()),
+                ..Self::canonical()
+            }
+        }
+
+        fn receipt(status: StatusCode, duplicate: bool) -> Self {
+            Self {
+                status,
+                duplicate,
+                ..Self::canonical()
+            }
+        }
+    }
+
+    async fn wire_abuse_handler(
+        State(abuse): State<WireAbuse>,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        let method = request.method().to_string();
+        let handoff_id = request
+            .uri()
+            .path()
+            .split('/')
+            .nth(4)
+            .expect("abusive handoff id in fixed route")
+            .to_string();
+        if method == "GET" {
+            return fake_json_response(
+                StatusCode::OK,
+                json!({
+                    "handoff_id": handoff_id,
+                    "contract_major": 1,
+                    "fixture_digest": PAIMOS_FIXTURE_DIGEST,
+                    "credential_epoch": 9,
+                    "expires_at": "2030-01-01T00:00:00Z",
+                    "state": HandoffState::Issued,
+                    "reporter_class": "pharos",
+                    "reporter_role": "owner",
+                    "evidence_ceiling": ["deployment"],
+                    "stage_key": "deployment",
+                    "execution_number": 1,
+                    "plan_digest": format!("sha256:{}", "2".repeat(64)),
+                    "predecessor_digest": format!("sha256:{}", "3".repeat(64)),
+                    "authority_epoch": 4,
+                    "context_digest": format!("sha256:{}", "4".repeat(64))
+                }),
+            );
+        }
+        let body = serde_json::to_vec(&json!({
+            "handoff_id": handoff_id,
+            "sequence": 1,
+            "state": HandoffState::Accepted,
+            "credential_epoch": 9,
+            "duplicate": abuse.duplicate,
+            "server_received_at": "2026-08-20T10:00:01Z"
+        }))
+        .expect("abusive receipt body");
+        let mut builder = Response::builder().status(abuse.status);
+        for content_type in &abuse.content_types {
+            builder = builder.header(CONTENT_TYPE, content_type);
+        }
+        if let Some(encoding) = &abuse.content_encoding {
+            builder = builder.header(CONTENT_ENCODING, encoding);
+        }
+        builder.body(Body::from(body)).expect("abusive response")
+    }
+
+    async fn serve_wire_abuse(abuse: WireAbuse) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind abusive Paimos");
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(wire_abuse_handler).with_state(abuse),
+            )
+            .await
+            .unwrap();
+        });
+        (
+            loopback_origin_for_tests(&format!("http://127.0.0.1:{}", address.port())),
+            task,
+        )
+    }
+
+    /// Drives one accept mutation against an abusive peer and reports whether
+    /// the adapter refused and whether anything reached the durable journal.
+    async fn wire_abuse_outcome(abuse: WireAbuse) -> (Result<(), AdapterError>, bool) {
+        let directory = temporary_directory("wire-abuse");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        let (origin, server) = serve_wire_abuse(abuse).await;
+        let adapter = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            directory.join("journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            Arc::new(HostActionStore::new(None)),
+        );
+        let outcome = adapter.process_intent(&deployment).await;
+        let journaled = adapter.journal.receipt(DEPLOYMENT_HANDOFF, 1).is_some();
+        server.abort();
+        (outcome, journaled)
+    }
+
+    /// Exercises the real reqwest/hyper path, not just the header predicate, so
+    /// a client rebuilt with transparent decompression or a relaxed media check
+    /// fails here instead of shipping.
+    #[tokio::test]
+    async fn wire_level_media_and_receipt_abuse_fails_closed() {
+        let charset = format!("{CONTRACT_MEDIA_TYPE}; charset=utf-8");
+        let list = format!("{CONTRACT_MEDIA_TYPE}, application/json");
+        let refused = vec![
+            (
+                "duplicate content-type",
+                WireAbuse::media(&[CONTRACT_MEDIA_TYPE, CONTRACT_MEDIA_TYPE]),
+            ),
+            ("parameterised content-type", WireAbuse::media(&[&charset])),
+            ("ambiguous content-type list", WireAbuse::media(&[&list])),
+            (
+                "foreign content-type",
+                WireAbuse::media(&["application/json"]),
+            ),
+            ("absent content-type", WireAbuse::media(&[])),
+            ("compressed body", WireAbuse::encoding("gzip")),
+            ("identity content-encoding", WireAbuse::encoding("identity")),
+            (
+                "created claims duplicate",
+                WireAbuse::receipt(StatusCode::CREATED, true),
+            ),
+            (
+                "ok denies duplicate",
+                WireAbuse::receipt(StatusCode::OK, false),
+            ),
+        ];
+        for (label, abuse) in refused {
+            let (outcome, journaled) = wire_abuse_outcome(abuse).await;
+            assert!(
+                matches!(outcome, Err(AdapterError::Contract)),
+                "{label} must fail closed, got {outcome:?}"
+            );
+            assert!(!journaled, "{label} must not journal a receipt");
+        }
+
+        for (label, abuse) in [
+            (
+                "created for a new receipt",
+                WireAbuse::receipt(StatusCode::CREATED, false),
+            ),
+            (
+                "ok for a replayed receipt",
+                WireAbuse::receipt(StatusCode::OK, true),
+            ),
+        ] {
+            let (outcome, journaled) = wire_abuse_outcome(abuse).await;
+            assert!(outcome.is_ok(), "{label} must be accepted, got {outcome:?}");
+            assert!(journaled, "{label} must journal its receipt");
+        }
+    }
+
     #[test]
     fn wrong_artifact_and_predeploy_verification_fail_closed() {
         let now = now_unix();
@@ -2398,5 +2622,32 @@ mod tests {
             AdapterConfig::load(&config_path),
             Err(AdapterError::Configuration)
         ));
+
+        document["intents"][1]
+            .as_object_mut()
+            .expect("intent object")
+            .remove("callback");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        AdapterConfig::load(&config_path).expect("repaired document loads");
+
+        // Defect class: cleartext delivery of the handoff secret. The loopback
+        // forms the conformance harness uses must stay unreachable from the
+        // production document, not merely discouraged.
+        for origin in [
+            "http://localhost",
+            "http://localhost:8080",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8080",
+            "http://[::1]",
+            "http://paimos.example.test",
+        ] {
+            document["paimos_origin"] = json!(origin);
+            write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+            let loaded = AdapterConfig::load(&config_path);
+            assert!(
+                matches!(loaded, Err(AdapterError::Configuration)),
+                "{origin} must not configure a production reporter"
+            );
+        }
     }
 }
