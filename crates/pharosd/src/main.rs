@@ -22,6 +22,7 @@ mod managed_service_ui;
 mod managed_setup_intents;
 mod manifests;
 mod nixcfg_dispatch;
+mod paimos_delivery;
 mod provider_connections;
 mod provisioning;
 mod routes;
@@ -3507,7 +3508,7 @@ async fn main() {
         ProviderConnectionStore::path_for(host_store_path.as_deref());
     let alert_store_path = AlertStore::path_for(host_store_path.as_deref());
     let store = Arc::new(
-        Store::new(host_store_path)
+        Store::new(host_store_path.clone())
             .unwrap_or_else(|error| panic!("host store startup failed: {error}")),
     );
     let provisioning_jobs = Arc::new(ProvisioningJobStore::new(provisioning_job_store_path));
@@ -3551,6 +3552,12 @@ async fn main() {
     let alert_notifier = AlertNotifier::from_env(alert_store)
         .unwrap_or_else(|error| panic!("alert notifier startup failed: {error}"));
     let alert_health = alert_notifier.health.clone();
+    let paimos_delivery = paimos_delivery::PaimosDeliveryAdapter::from_env(
+        host_store_path.as_deref(),
+        Arc::clone(&store),
+        Arc::clone(&host_actions),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     let state = AppState {
         store,
         provisioning_jobs,
@@ -3570,6 +3577,9 @@ async fn main() {
     };
     let _ = reconcile_completed_removals(&state, now_unix());
     spawn_alert_loop(state.clone(), alert_notifier);
+    if let Some(adapter) = paimos_delivery {
+        adapter.spawn();
+    }
 
     let app = build_router(state);
 

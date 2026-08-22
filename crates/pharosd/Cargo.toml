@@ -20,6 +20,7 @@ base64 = "=0.22.1"
 ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 # OIDC (Authorization Code + PKCE) against Zitadel (PHAROS-4). Default features
 # pull reqwest + rustls (ring), so no system OpenSSL — but ring needs a C
 # compiler, hence the non-slim build stage in the Dockerfile.
