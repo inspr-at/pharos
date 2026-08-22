@@ -112,6 +112,8 @@ jobs:
         run: cargo test -p pharosd --locked rendered_html_receives_nonce_csp_and_browser_security_headers
       - name: managed-service secret assurance
         run: scripts/assure-managed-service-secrets.sh
+      - name: Paimos encoded-response boundary
+        run: cargo test -p pharosd --locked --features paimos-compression-test paimos_delivery::tests::wire_level_media_and_receipt_abuse_fails_closed
       - name: test
         run: cargo test --all --locked
 

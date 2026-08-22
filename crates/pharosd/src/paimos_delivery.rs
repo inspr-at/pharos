@@ -746,6 +746,10 @@ struct PaimosClient {
 impl PaimosClient {
     fn new(origin: Url, api_key_file: PathBuf) -> Result<Self, AdapterError> {
         let client = reqwest::Client::builder()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(REQUEST_TIMEOUT)
@@ -1380,8 +1384,8 @@ fn loopback_origin_for_tests(value: &str) -> Url {
 }
 
 /// Exactly one canonical `Content-Type` and no `Content-Encoding` at all. The
-/// request side pins `Accept-Encoding: identity`, and the HTTP client is built
-/// without any decompression feature, so an encoded body reaches this check
+/// request side pins `Accept-Encoding: identity`, and the HTTP client disables
+/// every reqwest response decompressor, so an encoded body reaches this check
 /// with its header intact instead of being transparently decoded away.
 fn response_media_valid(headers: &HeaderMap) -> bool {
     let mut content_types = headers.get_all(CONTENT_TYPE).iter();
@@ -1524,6 +1528,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use async_compression::tokio::write::{
+        BrotliEncoder, DeflateEncoder, GzipEncoder, ZstdEncoder,
+    };
     use axum::body::{to_bytes, Body};
     use axum::extract::State;
     use axum::http::{Request, Response};
@@ -1533,6 +1540,7 @@ mod tests {
         NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
     use serde_json::{json, Value};
+    use tokio::io::AsyncWriteExt;
 
     use crate::host_actions::{
         AgentActionOutcome, AgentActionPhase, AgentActionResultRequest, HostActionPlan,
@@ -2327,6 +2335,46 @@ mod tests {
         server.abort();
     }
 
+    #[derive(Clone, Copy)]
+    enum WireEncoding {
+        Brotli,
+        Deflate,
+        Gzip,
+        Identity,
+        Zstd,
+    }
+
+    impl WireEncoding {
+        fn header(self) -> &'static str {
+            match self {
+                Self::Brotli => "br",
+                Self::Deflate => "deflate",
+                Self::Gzip => "gzip",
+                Self::Identity => IDENTITY_ENCODING,
+                Self::Zstd => "zstd",
+            }
+        }
+
+        async fn encode(self, body: &[u8]) -> Vec<u8> {
+            macro_rules! encode {
+                ($encoder:ty) => {{
+                    let mut encoder = <$encoder>::new(Vec::new());
+                    encoder.write_all(body).await.expect("encode abusive body");
+                    encoder.shutdown().await.expect("finish abusive body");
+                    encoder.into_inner()
+                }};
+            }
+
+            match self {
+                Self::Brotli => encode!(BrotliEncoder<Vec<u8>>),
+                Self::Deflate => encode!(DeflateEncoder<Vec<u8>>),
+                Self::Gzip => encode!(GzipEncoder<Vec<u8>>),
+                Self::Identity => body.to_vec(),
+                Self::Zstd => encode!(ZstdEncoder<Vec<u8>>),
+            }
+        }
+    }
+
     /// A Paimos impersonator that answers the accept mutation with a response
     /// shape the contract forbids. Every field here is something a compromised
     /// or buggy peer controls.
@@ -2334,7 +2382,7 @@ mod tests {
     struct WireAbuse {
         status: StatusCode,
         content_types: Vec<String>,
-        content_encoding: Option<String>,
+        content_encoding: Option<WireEncoding>,
         duplicate: bool,
     }
 
@@ -2358,9 +2406,9 @@ mod tests {
             }
         }
 
-        fn encoding(value: &str) -> Self {
+        fn encoding(value: WireEncoding) -> Self {
             Self {
-                content_encoding: Some(value.to_string()),
+                content_encoding: Some(value),
                 ..Self::canonical()
             }
         }
@@ -2378,6 +2426,18 @@ mod tests {
         State(abuse): State<WireAbuse>,
         request: Request<Body>,
     ) -> Response<Body> {
+        let mut accept_encodings = request.headers().get_all(ACCEPT_ENCODING).iter();
+        assert_eq!(
+            accept_encodings
+                .next()
+                .and_then(|value| value.to_str().ok()),
+            Some(IDENTITY_ENCODING),
+            "reporter must request only identity encoding"
+        );
+        assert!(
+            accept_encodings.next().is_none(),
+            "reporter must send exactly one Accept-Encoding header"
+        );
         let method = request.method().to_string();
         let handoff_id = request
             .uri()
@@ -2408,7 +2468,7 @@ mod tests {
                 }),
             );
         }
-        let body = serde_json::to_vec(&json!({
+        let mut body = serde_json::to_vec(&json!({
             "handoff_id": handoff_id,
             "sequence": 1,
             "state": HandoffState::Accepted,
@@ -2421,8 +2481,9 @@ mod tests {
         for content_type in &abuse.content_types {
             builder = builder.header(CONTENT_TYPE, content_type);
         }
-        if let Some(encoding) = &abuse.content_encoding {
-            builder = builder.header(CONTENT_ENCODING, encoding);
+        if let Some(encoding) = abuse.content_encoding {
+            body = encoding.encode(&body).await;
+            builder = builder.header(CONTENT_ENCODING, encoding.header());
         }
         builder.body(Body::from(body)).expect("abusive response")
     }
@@ -2468,9 +2529,9 @@ mod tests {
         (outcome, journaled)
     }
 
-    /// Exercises the real reqwest/hyper path, not just the header predicate, so
-    /// a client rebuilt with transparent decompression or a relaxed media check
-    /// fails here instead of shipping.
+    /// Exercises the real reqwest/hyper path. The CI feature gate compiles in
+    /// every transparent decoder, so removing decoder shutdown or relaxing the
+    /// media check fails here instead of shipping.
     #[tokio::test]
     async fn wire_level_media_and_receipt_abuse_fails_closed() {
         let charset = format!("{CONTRACT_MEDIA_TYPE}; charset=utf-8");
@@ -2487,8 +2548,20 @@ mod tests {
                 WireAbuse::media(&["application/json"]),
             ),
             ("absent content-type", WireAbuse::media(&[])),
-            ("compressed body", WireAbuse::encoding("gzip")),
-            ("identity content-encoding", WireAbuse::encoding("identity")),
+            ("gzip-encoded body", WireAbuse::encoding(WireEncoding::Gzip)),
+            (
+                "Brotli-encoded body",
+                WireAbuse::encoding(WireEncoding::Brotli),
+            ),
+            ("zstd-encoded body", WireAbuse::encoding(WireEncoding::Zstd)),
+            (
+                "deflate-encoded body",
+                WireAbuse::encoding(WireEncoding::Deflate),
+            ),
+            (
+                "identity content-encoding",
+                WireAbuse::encoding(WireEncoding::Identity),
+            ),
             (
                 "created claims duplicate",
                 WireAbuse::receipt(StatusCode::CREATED, true),
