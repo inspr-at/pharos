@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.84 - 2026-08-22
+
+- Bind Paimos crash replay to the exact current owner intent and canonical origin, rejecting configuration drift before any network access while preserving credential rotation.
+- Keep cleartext loopback transport test-only and require exactly one canonical response media type, no content encoding, and exact HTTP status-to-duplicate receipt semantics.
+- Disable every reqwest transparent response decoder, retain identity-only negotiation, and prove gzip, Brotli, zstd, and deflate refusal over the real client path with feature-unified CI.
+
 ## 0.1.83 - 2026-08-22
 
 - Add the opt-in, reporter-only Paimos external-stage adapter pinned to schema major 1, Paimos v5.11.0, certified commit `e5f4c86bc061775c853d5847e8fb8bb7e3a31c34`, and the exact released owner/dependency fixture bytes.
