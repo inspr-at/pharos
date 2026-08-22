@@ -2,9 +2,12 @@
 
 ## Unreleased
 
+## 0.1.83 - 2026-08-22
+
 - Add the opt-in, reporter-only Paimos external-stage adapter pinned to schema major 1, Paimos v5.11.0, certified commit `e5f4c86bc061775c853d5847e8fb8bb7e3a31c34`, and the exact released owner/dependency fixture bytes.
 - Require separate owner-only API-key and per-handoff credential files, journal exact requests before sending, and replay with idempotency derived only from handoff, sequence, and request digest.
 - Report deployment only from an existing completed guarded `UpdateRestart` plus matching later Nix-generation evidence, and report verification only from a separate handoff after a still-later fresh beacon for the identical locally configured artifact and environment.
+- Bind ambiguous crash replay to the exact current owner intent, keep cleartext loopback transport test-only, and require singleton JSON media, no content encoding, and exact duplicate/status semantics.
 
 ## 0.1.82 - 2026-08-20
 
