@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, USER_AGENT,
+};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +38,7 @@ pub(crate) const PAIMOS_FIXTURE_DIGEST: &str =
 
 const CONFIG_SCHEMA: &str = "inspr.pharos.paimos-delivery-adapter.v1";
 const JOURNAL_SCHEMA: &str = "inspr.pharos.paimos-delivery-journal.v1";
+const INTENT_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-intent.v1";
 const CONTRACT_MEDIA_TYPE: &str = "application/vnd.paimos.external-stage.v1+json";
 const HANDOFF_SECRET_HEADER: &str = "X-PAIMOS-Handoff-Secret";
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
@@ -180,6 +183,37 @@ impl DeliveryIntent {
                             .is_some_and(valid_handoff_id)
                 }
             }
+    }
+
+    fn binding_digest(&self, paimos_origin: &Url) -> Result<String, AdapterError> {
+        #[derive(Serialize)]
+        struct IntentBinding<'a> {
+            domain: &'static str,
+            paimos_origin: &'a str,
+            handoff_id: &'a str,
+            stage: &'static str,
+            workflow: &'static str,
+            environment: &'a str,
+            host: &'a str,
+            artifact: &'a ArtifactEvidence,
+            update_restart_job_id: Option<&'a str>,
+            deployment_handoff_id: Option<&'a str>,
+        }
+
+        let binding = IntentBinding {
+            domain: INTENT_BINDING_DOMAIN,
+            paimos_origin: paimos_origin.as_str(),
+            handoff_id: &self.handoff_id,
+            stage: self.stage.key(),
+            workflow: self.workflow.key(),
+            environment: &self.environment,
+            host: &self.host,
+            artifact: &self.artifact,
+            update_restart_job_id: self.update_restart_job_id.as_deref(),
+            deployment_handoff_id: self.deployment_handoff_id.as_deref(),
+        };
+        let bytes = serde_json::to_vec(&binding).map_err(|_| AdapterError::Contract)?;
+        Ok(hex_digest(&bytes))
     }
 }
 
@@ -443,6 +477,7 @@ enum JournalRequestKind {
 #[serde(deny_unknown_fields)]
 struct JournalRecord {
     handoff_id: String,
+    intent_digest: String,
     sequence: i64,
     request_kind: JournalRequestKind,
     request_digest: String,
@@ -454,17 +489,19 @@ struct JournalRecord {
 
 impl JournalRecord {
     fn new(
-        handoff_id: &str,
+        intent: &DeliveryIntent,
+        paimos_origin: &Url,
         sequence: i64,
         request_kind: JournalRequestKind,
         body: &[u8],
     ) -> Result<Self, AdapterError> {
         let request_digest = hex_digest(body);
         Ok(Self {
-            handoff_id: handoff_id.to_string(),
+            handoff_id: intent.handoff_id.clone(),
+            intent_digest: intent.binding_digest(paimos_origin)?,
             sequence,
             request_kind,
-            idempotency_key: idempotency_key(handoff_id, sequence, &request_digest),
+            idempotency_key: idempotency_key(&intent.handoff_id, sequence, &request_digest),
             request_digest,
             body_json: String::from_utf8(body.to_vec()).map_err(|_| AdapterError::Contract)?,
             receipt: None,
@@ -501,6 +538,7 @@ impl JournalRecord {
                 JournalRequestKind::Report => 2,
             }
             && valid_handoff_id(&self.handoff_id)
+            && valid_lower_hex(&self.intent_digest, &[64])
             && self.request_digest == hex_digest(self.body_json.as_bytes())
             && self.idempotency_key
                 == idempotency_key(&self.handoff_id, self.sequence, &self.request_digest)
@@ -512,6 +550,13 @@ impl JournalRecord {
                         .is_ok()
                 })
             })
+    }
+
+    fn bound_to(&self, intent: &DeliveryIntent, paimos_origin: &Url) -> bool {
+        self.handoff_id == intent.handoff_id
+            && intent
+                .binding_digest(paimos_origin)
+                .is_ok_and(|digest| digest == self.intent_digest)
     }
 }
 
@@ -570,6 +615,23 @@ impl JournalStore {
             .values()
             .find(|record| record.handoff_id == handoff_id && record.receipt.is_none())
             .cloned()
+    }
+
+    fn assert_bound(
+        &self,
+        intent: &DeliveryIntent,
+        paimos_origin: &Url,
+    ) -> Result<(), AdapterError> {
+        let document = self.document.lock().expect("Paimos delivery journal lock");
+        if document
+            .records
+            .values()
+            .filter(|record| record.handoff_id == intent.handoff_id)
+            .any(|record| !record.bound_to(intent, paimos_origin))
+        {
+            return Err(AdapterError::LocalBinding);
+        }
+        Ok(())
     }
 
     fn ensure(&self, record: JournalRecord) -> Result<JournalRecord, AdapterError> {
@@ -733,8 +795,9 @@ impl PaimosClient {
                 &credentials,
             )
             .await?;
-        if response.status() != StatusCode::CREATED && response.status() != StatusCode::OK {
-            return Err(AdapterError::Refused(response.status()));
+        let status = response.status();
+        if status != StatusCode::CREATED && status != StatusCode::OK {
+            return Err(AdapterError::Refused(status));
         }
         let receipt: ReportReceipt = self
             .decode_response(response, &credentials, Some(&record.idempotency_key))
@@ -744,6 +807,9 @@ impl PaimosClient {
             record.sequence,
             record.expected_state()?,
         )?;
+        if !receipt_status_valid(status, receipt.duplicate) {
+            return Err(AdapterError::Contract);
+        }
         Ok(receipt)
     }
 
@@ -799,12 +865,7 @@ impl PaimosClient {
         credentials: &Credentials,
         idempotency_key: Option<&str>,
     ) -> Result<T, AdapterError> {
-        if response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            != Some(CONTRACT_MEDIA_TYPE)
-        {
+        if !response_media_valid(response.headers()) {
             return Err(AdapterError::Contract);
         }
         reject_reflected_headers(
@@ -917,6 +978,8 @@ impl PaimosDeliveryAdapter {
     }
 
     async fn process_intent(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
+        self.journal
+            .assert_bound(intent, &self.config.paimos_origin)?;
         if let Some(pending) = self.journal.pending_for(&intent.handoff_id) {
             return self.replay(intent, pending).await;
         }
@@ -976,7 +1039,8 @@ impl PaimosDeliveryAdapter {
             JournalRequestKind::Report => 2,
         };
         let record = self.journal.ensure(JournalRecord::new(
-            &intent.handoff_id,
+            intent,
+            &self.config.paimos_origin,
             sequence,
             kind,
             &body,
@@ -989,7 +1053,7 @@ impl PaimosDeliveryAdapter {
         intent: &DeliveryIntent,
         record: JournalRecord,
     ) -> Result<(), AdapterError> {
-        if record.handoff_id != intent.handoff_id || !record.valid() {
+        if !record.bound_to(intent, &self.config.paimos_origin) || !record.valid() {
             return Err(AdapterError::Journal);
         }
         let receipt = self.paimos.mutate(intent, &record).await?;
@@ -1049,6 +1113,17 @@ impl PaimosDeliveryAdapter {
             .deployment_handoff_id
             .as_deref()
             .ok_or(AdapterError::LocalBinding)?;
+        let deployment_intent = self
+            .config
+            .intents
+            .iter()
+            .find(|candidate| {
+                candidate.handoff_id == deployment_handoff
+                    && candidate.stage == IntentStage::Deployment
+            })
+            .ok_or(AdapterError::LocalBinding)?;
+        self.journal
+            .assert_bound(deployment_intent, &self.config.paimos_origin)?;
         let Some(receipt) = self.journal.receipt(deployment_handoff, 2) else {
             return Ok(None);
         };
@@ -1267,9 +1342,7 @@ fn private_file_metadata(
 
 fn parse_origin(value: &str) -> Result<Url, AdapterError> {
     let url = Url::parse(value).map_err(|_| AdapterError::Configuration)?;
-    let loopback_http =
-        url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
-    if (url.scheme() != "https" && !loopback_http)
+    if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -1280,6 +1353,20 @@ fn parse_origin(value: &str) -> Result<Url, AdapterError> {
         return Err(AdapterError::Configuration);
     }
     Ok(url)
+}
+
+fn response_media_valid(headers: &HeaderMap) -> bool {
+    let mut content_types = headers.get_all(CONTENT_TYPE).iter();
+    content_types.next().and_then(|value| value.to_str().ok()) == Some(CONTRACT_MEDIA_TYPE)
+        && content_types.next().is_none()
+        && !headers.contains_key(CONTENT_ENCODING)
+}
+
+fn receipt_status_valid(status: StatusCode, duplicate: bool) -> bool {
+    matches!(
+        (status, duplicate),
+        (StatusCode::CREATED, false) | (StatusCode::OK, true)
+    )
 }
 
 fn derived_journal_path(host_store_path: &Path) -> PathBuf {
@@ -1835,6 +1922,98 @@ mod tests {
     }
 
     #[test]
+    fn production_origin_and_response_semantics_fail_closed() {
+        assert!(parse_origin("https://paimos.example.test").is_ok());
+        for origin in [
+            "http://localhost",
+            "http://127.0.0.1",
+            "http://[::1]",
+            "http://paimos.example.test",
+        ] {
+            assert!(matches!(
+                parse_origin(origin),
+                Err(AdapterError::Configuration)
+            ));
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTRACT_MEDIA_TYPE));
+        assert!(response_media_valid(&headers));
+
+        headers.append(CONTENT_TYPE, HeaderValue::from_static(CONTRACT_MEDIA_TYPE));
+        assert!(!response_media_valid(&headers));
+        headers.remove(CONTENT_TYPE);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTRACT_MEDIA_TYPE));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(!response_media_valid(&headers));
+
+        assert!(receipt_status_valid(StatusCode::CREATED, false));
+        assert!(receipt_status_valid(StatusCode::OK, true));
+        assert!(!receipt_status_valid(StatusCode::CREATED, true));
+        assert!(!receipt_status_valid(StatusCode::OK, false));
+    }
+
+    #[test]
+    fn journal_binding_covers_every_non_secret_authority_selector() {
+        let origin = Url::parse("https://paimos.example.test").unwrap();
+        let base = intent(
+            DEPLOYMENT_HANDOFF,
+            PathBuf::from("/run/credentials/handoff-secret"),
+            IntentStage::Deployment,
+        );
+        let base_digest = base.binding_digest(&origin).unwrap();
+
+        let mut variants = Vec::new();
+        let mut changed = base.clone();
+        changed.handoff_id = VERIFICATION_HANDOFF.to_string();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.stage = IntentStage::Verification;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.workflow = GuardedWorkflow::VerifyProduction;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.environment = "production-eu2".to_string();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.host = "hsb9".to_string();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.artifact.version = "1.2.4".to_string();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.artifact.digest = format!("sha256:{}", "2".repeat(64));
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.artifact.commit_digest = "b".repeat(40);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.update_restart_job_id = Some("action-update-restart-hsb9".to_string());
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.deployment_handoff_id = Some(VERIFICATION_HANDOFF.to_string());
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(changed.binding_digest(&origin).unwrap(), base_digest);
+        }
+        assert_ne!(
+            base.binding_digest(&Url::parse("https://replacement.example.test").unwrap())
+                .unwrap(),
+            base_digest
+        );
+
+        let mut credential_rotation = base.clone();
+        credential_rotation.handoff_secret_file =
+            PathBuf::from("/run/credentials/rotated-handoff-secret");
+        assert_eq!(
+            credential_rotation.binding_digest(&origin).unwrap(),
+            base_digest
+        );
+    }
+
+    #[test]
     fn private_separate_credentials_and_config_fail_closed() {
         let directory = temporary_directory("credentials");
         let api_path = directory.join("api-key");
@@ -1881,16 +2060,24 @@ mod tests {
     fn journal_contains_exact_safe_request_but_no_credentials() {
         let directory = temporary_directory("sentinel-journal");
         let journal_path = directory.join("journal.json");
+        let secret_path = directory.join("handoff-secret");
         let journal = JournalStore::new(journal_path.clone()).unwrap();
         let body = serde_json::to_vec(&AcceptRequest {
             sequence: 1,
             observed_at: "2026-08-20T10:00:00Z".to_string(),
         })
         .unwrap();
+        let deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
         journal
             .ensure(
-                JournalRecord::new(DEPLOYMENT_HANDOFF, 1, JournalRequestKind::Accept, &body)
-                    .unwrap(),
+                JournalRecord::new(
+                    &deployment,
+                    &Url::parse("https://paimos.example.test").unwrap(),
+                    1,
+                    JournalRequestKind::Accept,
+                    &body,
+                )
+                .unwrap(),
             )
             .unwrap();
         let durable = std::fs::read(&journal_path).unwrap();
@@ -2036,8 +2223,51 @@ mod tests {
             make_adapter().process_intent(&deployment).await,
             Err(AdapterError::Refused(StatusCode::SERVICE_UNAVAILABLE))
         ));
+        let captures_before_drift = fake.captures.lock().unwrap().len();
+
+        let replacement_fake = FakePaimos::new(now);
+        let (replacement_origin, replacement_server) = serve_fake(replacement_fake.clone()).await;
+        let replacement_adapter = test_adapter(
+            config(
+                replacement_origin,
+                api_path.clone(),
+                vec![deployment.clone()],
+            ),
+            journal_path.clone(),
+            Arc::new(Store::new(None).unwrap()),
+            Arc::new(HostActionStore::new(None)),
+        );
+        assert!(matches!(
+            replacement_adapter.process_intent(&deployment).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        assert!(replacement_fake.captures.lock().unwrap().is_empty());
+
+        let mut changed_intent = deployment.clone();
+        changed_intent.environment = "production-eu2".to_string();
+        let changed_adapter = test_adapter(
+            config(
+                origin.clone(),
+                api_path.clone(),
+                vec![changed_intent.clone()],
+            ),
+            journal_path.clone(),
+            Arc::new(Store::new(None).unwrap()),
+            Arc::new(HostActionStore::new(None)),
+        );
+        assert!(matches!(
+            changed_adapter.process_intent(&changed_intent).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        assert_eq!(fake.captures.lock().unwrap().len(), captures_before_drift);
+
+        let rotated_api_key = [b'K'; 40];
+        let rotated_handoff_secret = [b'S'; HANDOFF_SECRET_BYTES];
+        write_private(&api_path, &rotated_api_key);
+        write_private(&deployment.handoff_secret_file, &rotated_handoff_secret);
         // A fresh adapter instance models a process restart. It sends the
-        // journaled request before another pull and preserves exact bytes/key.
+        // journaled request before another pull, preserves exact bytes/key,
+        // and deliberately uses the newly rotated credentials.
         make_adapter().process_intent(&deployment).await.unwrap();
         let captures = fake.captures.lock().unwrap().clone();
         let posts: Vec<_> = captures
@@ -2048,6 +2278,16 @@ mod tests {
         assert_eq!(posts[0].path, posts[1].path);
         assert_eq!(posts[0].body, posts[1].body);
         assert_eq!(posts[0].idempotency_key, posts[1].idempotency_key);
+        assert_ne!(posts[0].authorization, posts[1].authorization);
+        assert_ne!(posts[0].handoff_secret, posts[1].handoff_secret);
+        assert_eq!(
+            posts[1].authorization,
+            format!("Bearer {}", String::from_utf8_lossy(&rotated_api_key))
+        );
+        assert_eq!(
+            posts[1].handoff_secret,
+            URL_SAFE_NO_PAD.encode(rotated_handoff_secret)
+        );
         assert_eq!(
             captures
                 .iter()
@@ -2055,6 +2295,7 @@ mod tests {
                 .count(),
             1
         );
+        replacement_server.abort();
         server.abort();
     }
 

@@ -332,8 +332,12 @@ can become a command, path, callback, host selector or arbitrary workflow.
 Every external call requires the registered API key and the handoff's separate
 32-byte credential from different owner-only, current-user-owned, single-link
 files. Before a mutation, Pharos durably stores the exact safe JSON request and
-an idempotency key derived from handoff ID, sequence and request digest. A crash
-or ambiguous response replays those exact bytes; credential rotation does not
+an idempotency key derived from handoff ID, sequence and request digest. The
+journal also stores a domain-separated digest of the canonical Paimos origin
+and every non-secret owner-intent selector, so a crash replay is rejected if
+the destination, workflow, environment, host, artifact or guarded action
+binding changed. An unchanged intent replays the
+exact bytes after a crash or ambiguous response; credential rotation does not
 change request identity. The adapter emits only sequence 1 `accepted` followed
 by sequence 2 `succeeded` or `failed`—never `active` or a heartbeat.
 
@@ -616,7 +620,7 @@ See the committed Compose files and NixOS module for the complete wiring.
 
 The Paimos adapter config uses schema
 `inspr.pharos.paimos-delivery-adapter.v1`. It requires a credential-free HTTPS
-origin (loopback HTTP is accepted for tests), `poll_interval_secs` from 5–3600,
+origin, `poll_interval_secs` from 5–3600,
 `verification_freshness_secs` from 30–900, one `api_key_file`, and 1–128 strict
 intents. A deployment intent has `stage: "deployment"`,
 `workflow: "deploy-production"` and `update_restart_job_id`; a verification
@@ -627,6 +631,10 @@ bounded version, `sha256:` digest and lowercase 40- or 64-hex commit digest.
 Unknown fields, unsafe origins, mismatched deployment/verification pairs and
 shared credential files reject startup. The bundled contract verifier is
 `scripts/check-paimos-delivery-contract.sh`.
+
+The in-process conformance harness injects its loopback URL directly into a
+test-only configuration value; the production config parser never accepts
+cleartext HTTP.
 
 For both token pairs, a non-empty `_FILE` variable takes precedence over the
 direct value. Pharos removes one trailing LF or CRLF from the file and preserves
