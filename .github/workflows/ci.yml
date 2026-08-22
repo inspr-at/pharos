@@ -45,6 +45,8 @@ jobs:
         run: node --test tests/fleet-refresh.test.mjs
       - name: release consistency
         run: scripts/check-release-consistency.sh
+      - name: pinned Paimos delivery contract
+        run: scripts/check-paimos-delivery-contract.sh
       - name: native systemd settings state dry run
         run: |
           work="$(mktemp -d)"

@@ -1,5 +1,11 @@
 # Pharos Changelog
 
+## Unreleased
+
+- Add the opt-in, reporter-only Paimos external-stage adapter pinned to schema major 1, Paimos v5.11.0, certified commit `e5f4c86bc061775c853d5847e8fb8bb7e3a31c34`, and the exact released owner/dependency fixture bytes.
+- Require separate owner-only API-key and per-handoff credential files, journal exact requests before sending, and replay with idempotency derived only from handoff, sequence, and request digest.
+- Report deployment only from an existing completed guarded `UpdateRestart` plus matching later Nix-generation evidence, and report verification only from a separate handoff after a still-later fresh beacon for the identical locally configured artifact and environment.
+
 ## 0.1.82 - 2026-08-20
 
 - Independent machine-operator credential verifier using SHA-256 bearer tokens instead of OIDC. Invalid or unavailable bearer credentials fail closed (401/503) without falling back to cookie authentication or open mode.
