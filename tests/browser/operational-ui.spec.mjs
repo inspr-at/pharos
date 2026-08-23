@@ -560,7 +560,7 @@ test("stale side nixpkgs is visible as neutral context without host attention", 
   await expect(card.locator('[data-fresh-kind="commits-behind"]')).toContainText(
     "exact",
   );
-  await expect(card.locator('[data-fresh-kind="deployment-evidence"]')).toContainText(
+  await expect(card.locator('[data-fresh-kind="deployed-sha"]')).toContainText(
     "111111111111",
   );
   const secondary = card.locator('[data-fresh-kind="secondary-nixpkgs"]');
@@ -613,8 +613,8 @@ test("legacy numeric freshness is unverified rather than up to date", async ({ p
     .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
     .first();
   await expect(card.locator("[data-reason]")).toContainText("freshness unverified");
-  await expect(card.locator('[data-fresh-kind="deployment-evidence"]')).toContainText(
-    "unverified",
+  await expect(card.locator('[data-fresh-kind="deployed-sha"]')).toContainText(
+    "n/a",
   );
   await expect(card.locator('[data-fresh-kind="commits-behind"]')).toContainText(
     "unknown",

@@ -91,12 +91,13 @@ main[data-fleet-sync-state="syncing"] .summary,main[data-fleet-sync-state="synci
 .fresh-row strong{font-size:12px;font-weight:650;color:var(--ink)}
 .fresh-row strong.ok{color:var(--live)}.fresh-row strong.warn{color:var(--stale)}.fresh-row strong.na{color:var(--wait)}
 .fresh-row-icon{display:none}
-.card .fresh{display:flex;align-items:center;gap:var(--indicator-gap);min-height:28px;margin:2px 0 11px}
-.card .fresh-row-compact{display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width);min-height:28px;padding:0 8px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,251,252,.82);outline:0}
+.card .fresh{display:flex;align-items:center;gap:6px;min-height:28px;margin:2px 0 11px;flex-wrap:nowrap}
+.card .fresh-row-compact{position:relative;display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width);min-height:28px;padding:0 8px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,251,252,.82);outline:0;overflow:hidden}
+.card .fresh-row-compact::after{content:"";position:absolute;right:0;top:0;bottom:0;width:24px;background:linear-gradient(90deg,transparent,rgba(247,251,252,1));pointer-events:none;border-radius:0 7px 7px 0}
 .card .fresh-row-icon{display:grid;place-items:center;flex:0 0 16px;width:16px;height:16px;color:#4c6780}
 .card .fresh-row-icon .ico{width:15px;height:15px;stroke-width:1.8}
 .card .fresh-row-label{display:none}
-.card .fresh-row strong{margin-left:6px;font-size:12px}
+.card .fresh-row strong{margin-left:6px;font-size:12px;white-space:nowrap;overflow:hidden}
 .card .fresh-row:focus-visible{border-color:rgba(31,127,181,.34);box-shadow:0 0 0 2px rgba(31,127,181,.12)}
 .header-chip{position:relative;appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:0;width:25px;height:25px;min-width:25px;margin:0;padding:0;border:1px solid rgba(210,226,234,.76);border-radius:999px;background:rgba(255,255,255,.58);font-size:11px;font-weight:760;line-height:1;text-decoration:none;white-space:nowrap;box-sizing:border-box;overflow:visible;transition:width .2s cubic-bezier(.2,.75,.3,1),padding .2s cubic-bezier(.2,.75,.3,1),gap .2s ease,background-color .16s ease,border-color .16s ease,box-shadow .16s ease,transform .16s ease}
 .header-chip:hover,.header-chip:focus-visible{width:86px;padding:0 8px;gap:5px;transform:translateY(-1px);outline:0}

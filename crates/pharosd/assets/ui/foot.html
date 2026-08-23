@@ -696,11 +696,21 @@ function updateFreshness(surface,f,now){
           : {value:'unknown',klass:'na'};
   setFreshRow(surface,'flake-lock-age',age);
   setFreshRow(surface,'commits-behind',commits);
-  setFreshRow(surface,'deployment-evidence',evidence?{
-    value:'deployed '+String(evidence.source_revision)+' · nixcfg '+String(nixcfg?.upstream_revision||'unknown')+' · lock '+String(evidence.flake_lock_sha256)+' · nixpkgs '+String(evidence.nixpkgs_revision)+' → '+String(nixpkgs?.upstream_revision||'unknown'),
+  setFreshRow(surface,'deployed-sha',evidence?{
+    value:String(evidence.source_revision).substring(0,12),
     klass:'ok',
-    label:'Active generation'
-  }:{value:'unverified',klass:'na',label:'Active generation'});
+    label:'Deployed SHA'
+  }:{value:'n/a',klass:'na',label:'Deployed SHA'});
+  setFreshRow(surface,'nixcfg-sha',nixcfg?{
+    value:String(nixcfg.upstream_revision).substring(0,12),
+    klass:'ok',
+    label:'nixcfg SHA'
+  }:{value:'n/a',klass:'na',label:'nixcfg SHA'});
+  setFreshRow(surface,'nixpkgs-sha',evidence?{
+    value:String(evidence.nixpkgs_revision).substring(0,12),
+    klass:'ok',
+    label:'nixpkgs SHA'
+  }:{value:'n/a',klass:'na',label:'nixpkgs SHA'});
   const secondary=f.secondary_nixpkgs;
   if(secondary&&typeof secondary.input==='string'&&Number.isFinite(Number(secondary.age_days))){
     const channel=typeof secondary.channel==='string'?' ('+secondary.channel+')':'';
