@@ -678,15 +678,17 @@ test("fleet host cards do not overlap in grid or list view", async ({ page }) =>
   await page.setViewportSize({ width: 1280, height: 1024 });
   await expect(page.locator("[data-grid]")).toBeVisible();
 
-  const cards = page.locator(
-    '[data-host="browser-card-a"][data-host-surface="runtime"], ' +
-    '[data-host="browser-card-b"][data-host-surface="runtime"], ' +
-    '[data-host="browser-card-c"][data-host-surface="runtime"]'
-  );
-  await expect(cards).toHaveCount(3);
+  const gridCards = page.locator('[data-grid] article').filter({
+    or: [
+      { hasAttribute: 'data-host', value: 'browser-card-a' },
+      { hasAttribute: 'data-host', value: 'browser-card-b' },
+      { hasAttribute: 'data-host', value: 'browser-card-c' },
+    ],
+  });
+  await expect(gridCards).toHaveCount(3);
 
-  const checkNoOverlap = async () => {
-    const boxes = await cards.evaluateAll((elements) =>
+  const checkNoOverlap = async (locator) => {
+    const boxes = await locator.evaluateAll((elements) =>
       elements.map((el) => {
         const rect = el.getBoundingClientRect();
         return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
@@ -705,17 +707,19 @@ test("fleet host cards do not overlap in grid or list view", async ({ page }) =>
     }
   };
 
-  await checkNoOverlap();
+  await checkNoOverlap(gridCards);
 
   await page.locator('[data-view-toggle="list"]').click();
   await expect(page.locator("main[data-view='list']")).toBeVisible();
-  const rows = page.locator(
-    '[data-host="browser-card-a"][data-host-surface="runtime"], ' +
-    '[data-host="browser-card-b"][data-host-surface="runtime"], ' +
-    '[data-host="browser-card-c"][data-host-surface="runtime"]'
-  );
-  await expect(rows).toHaveCount(3);
-  await checkNoOverlap();
+  const listRows = page.locator('.list tbody tr').filter({
+    or: [
+      { hasAttribute: 'data-host', value: 'browser-card-a' },
+      { hasAttribute: 'data-host', value: 'browser-card-b' },
+      { hasAttribute: 'data-host', value: 'browser-card-c' },
+    ],
+  });
+  await expect(listRows).toHaveCount(3);
+  await checkNoOverlap(listRows);
 
   for (const host of hosts) {
     const removal = await page.request.post(`/host-actions/${host}/remove`, {
