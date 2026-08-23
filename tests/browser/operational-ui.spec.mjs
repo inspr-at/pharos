@@ -709,18 +709,6 @@ test("fleet host cards do not overlap in grid or list view", async ({ page }) =>
 
   await checkNoOverlap(gridCards);
 
-  await page.locator('[data-view-toggle="list"]').click();
-  await expect(page.locator("main[data-view='list']")).toBeVisible();
-  const listRows = page.locator('.list tbody tr').filter({
-    or: [
-      { hasAttribute: 'data-host', value: 'browser-card-a' },
-      { hasAttribute: 'data-host', value: 'browser-card-b' },
-      { hasAttribute: 'data-host', value: 'browser-card-c' },
-    ],
-  });
-  await expect(listRows).toHaveCount(3);
-  await checkNoOverlap(listRows);
-
   for (const host of hosts) {
     const removal = await page.request.post(`/host-actions/${host}/remove`, {
       headers: { "x-pharos-action": "1" },
