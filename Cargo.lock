@@ -1285,7 +1285,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pharos-beacon"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "libc",
  "pharos-core",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "pharos-cli"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "pharos-core"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "proptest",
  "serde",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "pharosd"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "async-compression",
  "axum",

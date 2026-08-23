@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.85 - 2026-08-23
+
+- Fleet grid host cards no longer overlap (clip heartbeat stage, contain card layout, align grid items to start). PHAROS-211.
+
 ## 0.1.84 - 2026-08-22
 
 - Bind Paimos crash replay to the exact current owner intent and canonical origin, rejecting configuration drift before any network access while preserving credential rotation.
