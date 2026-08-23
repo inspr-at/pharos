@@ -4679,7 +4679,7 @@ mod tests {
             ".card .backup-chip:not(:hover):not(:focus-visible){border-color:transparent;background:transparent;box-shadow:none}"
         ));
         assert!(HEAD.contains(
-            ".card .fresh-row-compact{display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width)"
+            ".card .fresh-row-compact{position:relative;display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width);min-height:28px;padding:0 8px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,251,252,.82);outline:0;overflow:hidden}"
         ));
         assert!(HEAD.contains(".card .fresh-row-label{display:none}"));
         assert!(HEAD.contains(".card .fresh-row-label,.card .fresh-row strong{transition:none}"));
@@ -6967,7 +6967,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             "--lifecycle-width:calc(var(--fresh-cell-width) + var(--fresh-cell-width) + var(--indicator-gap))"
         ));
         assert!(HEAD.contains(".card-maintenance .settings-wait-note{width:var(--lifecycle-width)"));
-        assert!(HEAD.contains(".card .fresh-row-compact{display:flex"));
+        assert!(HEAD.contains(".card .fresh-row-compact{position:relative;display:flex"));
         assert!(HEAD.contains("width:var(--fresh-cell-width)"));
 
         let card_start = lifecycle_html
