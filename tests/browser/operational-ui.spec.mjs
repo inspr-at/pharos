@@ -678,7 +678,11 @@ test("fleet host cards do not overlap in grid or list view", async ({ page }) =>
   await page.setViewportSize({ width: 1280, height: 1024 });
   await expect(page.locator("[data-grid]")).toBeVisible();
 
-  const cards = page.locator('[data-host-surface="runtime"]');
+  const cards = page.locator(
+    '[data-host="browser-card-a"][data-host-surface="runtime"], ' +
+    '[data-host="browser-card-b"][data-host-surface="runtime"], ' +
+    '[data-host="browser-card-c"][data-host-surface="runtime"]'
+  );
   await expect(cards).toHaveCount(3);
 
   const checkNoOverlap = async () => {
@@ -705,7 +709,11 @@ test("fleet host cards do not overlap in grid or list view", async ({ page }) =>
 
   await page.locator('[data-view-toggle="list"]').click();
   await expect(page.locator("main[data-view='list']")).toBeVisible();
-  const rows = page.locator('[data-host-surface="runtime"]');
+  const rows = page.locator(
+    '[data-host="browser-card-a"][data-host-surface="runtime"], ' +
+    '[data-host="browser-card-b"][data-host-surface="runtime"], ' +
+    '[data-host="browser-card-c"][data-host-surface="runtime"]'
+  );
   await expect(rows).toHaveCount(3);
   await checkNoOverlap();
 
