@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.86 - 2026-08-23
+
+- Fleet host cards show deployed / nixcfg / nixpkgs as three one-line chips that share the card width, with a right-edge fade (PHAROS-211).
+
 ## 0.1.85 - 2026-08-23
 
 - Fleet grid host cards no longer overlap (clip heartbeat stage, contain card layout, align grid items to start). PHAROS-211.
