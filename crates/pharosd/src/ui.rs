@@ -813,19 +813,39 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool, now: i64
         (Some(_), None) => "nixpkgs age".to_string(),
         (None, _) => "nixpkgs lock".to_string(),
     };
-    let (deployed_sha, nixcfg_sha, nixpkgs_sha, evidence_class) = match freshness.deployment_evidence.as_ref() {
-        Some(evidence) => {
-            let deployed = evidence.source_revision.chars().take(12).collect::<String>();
-            let nixcfg_upstream = freshness
-                .nixcfg_comparison
-                .as_ref()
-                .map(|comparison| comparison.upstream_revision.chars().take(12).collect::<String>())
-                .unwrap_or_else(|| "unknown".to_string());
-            let nixpkgs = evidence.nixpkgs_revision.chars().take(12).collect::<String>();
-            (deployed, nixcfg_upstream, nixpkgs, "ok")
-        }
-        None => ("n/a".to_string(), "n/a".to_string(), "n/a".to_string(), "na"),
-    };
+    let (deployed_sha, nixcfg_sha, nixpkgs_sha, evidence_class) =
+        match freshness.deployment_evidence.as_ref() {
+            Some(evidence) => {
+                let deployed = evidence
+                    .source_revision
+                    .chars()
+                    .take(12)
+                    .collect::<String>();
+                let nixcfg_upstream = freshness
+                    .nixcfg_comparison
+                    .as_ref()
+                    .map(|comparison| {
+                        comparison
+                            .upstream_revision
+                            .chars()
+                            .take(12)
+                            .collect::<String>()
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                let nixpkgs = evidence
+                    .nixpkgs_revision
+                    .chars()
+                    .take(12)
+                    .collect::<String>();
+                (deployed, nixcfg_upstream, nixpkgs, "ok")
+            }
+            None => (
+                "n/a".to_string(),
+                "n/a".to_string(),
+                "n/a".to_string(),
+                "na",
+            ),
+        };
     let (secondary_label, secondary_age) = match &freshness.secondary_nixpkgs {
         Some(secondary) => {
             let label = match secondary.channel.as_deref() {
