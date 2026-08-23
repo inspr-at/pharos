@@ -631,3 +631,94 @@ test("legacy numeric freshness is unverified rather than up to date", async ({ p
   );
   expect(reonboard.ok()).toBe(true);
 });
+
+test("fleet host cards do not overlap in grid or list view", async ({ page }) => {
+  const hosts = ["browser-card-a", "browser-card-b", "browser-card-c"];
+  for (const host of hosts) {
+    const report = await page.request.post("/report", {
+      data: {
+        schema: "inspr.pharos.host-report.v5",
+        version: 5,
+        name: host,
+        role: "server",
+        is_nix: true,
+        heartbeat_interval_secs: 60,
+        freshness: {
+          applicable: true,
+          flake_lock_age_days: 1,
+          commits_behind: 0,
+          nixpkgs_age_days: 2,
+          nixpkgs_channel: "nixos-unstable",
+          secondary_nixpkgs: null,
+          deployment_evidence: {
+            schema: "inspr.pharos.nix-deployment-evidence.v1",
+            version: 1,
+            source_revision: "a".repeat(40),
+            flake_lock_sha256: "b".repeat(64),
+            nixpkgs_revision: "c".repeat(40),
+            nixpkgs_last_modified: 1700000000,
+            nixpkgs_channel: "nixos-unstable",
+          },
+          nixcfg_comparison: {
+            upstream_revision: "a".repeat(40),
+            relation: "current",
+            commits_behind: 0,
+          },
+          nixpkgs_comparison: {
+            upstream_revision: "c".repeat(40),
+            relation: "current",
+          },
+        },
+      },
+    });
+    expect(report.status()).toBe(204);
+  }
+
+  await page.goto("/");
+  await page.setViewportSize({ width: 1280, height: 1024 });
+  await expect(page.locator("[data-grid]")).toBeVisible();
+
+  const gridCards = page.locator('[data-grid] article').filter({
+    or: [
+      { hasAttribute: 'data-host', value: 'browser-card-a' },
+      { hasAttribute: 'data-host', value: 'browser-card-b' },
+      { hasAttribute: 'data-host', value: 'browser-card-c' },
+    ],
+  });
+  await expect(gridCards).toHaveCount(3);
+
+  const checkNoOverlap = async (locator) => {
+    const boxes = await locator.evaluateAll((elements) =>
+      elements.map((el) => {
+        const rect = el.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
+      }),
+    );
+
+    for (let i = 0; i < boxes.length; i += 1) {
+      for (let j = i + 1; j < boxes.length; j += 1) {
+        const a = boxes[i];
+        const b = boxes[j];
+        const overlapX = a.left < b.right && a.right > b.left;
+        const overlapY = a.top < b.bottom && a.bottom > b.top;
+        const overlaps = overlapX && overlapY;
+        expect(overlaps).toBe(false);
+      }
+    }
+  };
+
+  await checkNoOverlap(gridCards);
+
+  for (const host of hosts) {
+    const removal = await page.request.post(`/host-actions/${host}/remove`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host, disposition: "unmanaged", successor: null },
+    });
+    expect(removal.status()).toBe(202);
+    const reonboard = await page.request.post(
+      `/host-actions/${host}/allow-reonboarding`,
+      { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+    );
+    expect(reonboard.ok()).toBe(true);
+  }
+});
