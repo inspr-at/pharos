@@ -722,3 +722,89 @@ test("fleet host cards do not overlap in grid or list view", async ({ page }) =>
     expect(reonboard.ok()).toBe(true);
   }
 });
+
+test("chip row does not overflow card boundary or paint into neighbors", async ({ page }) => {
+  const host = "browser-chip-overflow";
+  const report = await page.request.post("/report", {
+    data: {
+      schema: "inspr.pharos.host-report.v5",
+      version: 5,
+      name: host,
+      role: "test server",
+      is_nix: true,
+      heartbeat_interval_secs: 60,
+      freshness: {
+        applicable: true,
+        flake_lock_age_days: 0,
+        commits_behind: 0,
+        nixpkgs_age_days: 36,
+        nixpkgs_channel: "nixos-24.05",
+        deployment_evidence: {
+          schema: "inspr.pharos.nix-deployment-evidence.v1",
+          version: 1,
+          source_revision: "1111111111111111111111111111111111111111",
+          flake_lock_sha256:
+            "2222222222222222222222222222222222222222222222222222222222222222",
+          nixpkgs_revision: "3333333333333333333333333333333333333333",
+          nixpkgs_last_modified: 1700000000,
+          nixpkgs_channel: "nixos-24.05",
+        },
+        nixcfg_comparison: {
+          upstream_revision: "1111111111111111111111111111111111111111",
+          relation: "current",
+          commits_behind: 0,
+        },
+        nixpkgs_comparison: {
+          upstream_revision: "3333333333333333333333333333333333333333",
+          relation: "current",
+        },
+      },
+    },
+  });
+  expect(report.status()).toBe(204);
+
+  await page.goto("/");
+  await page.setViewportSize({ width: 1280, height: 1024 });
+
+  const card = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
+    .first();
+  await expect(card).toBeVisible();
+
+  const chipRow = card.locator('.fresh[data-fresh]');
+  await expect(chipRow).toBeVisible();
+
+  const chips = chipRow.locator('.fresh-row-compact');
+  const chipCount = await chips.count();
+  expect(chipCount).toBeGreaterThan(0);
+
+  const cardBox = await card.boundingBox();
+  expect(cardBox).not.toBeNull();
+
+  const visibleChips = await chips.evaluateAll((elements, parentBox) => {
+    return elements.map((el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        left: rect.left,
+        right: rect.right,
+        width: rect.width,
+        overflows: rect.right > parentBox.left + parentBox.width,
+      };
+    });
+  }, cardBox);
+
+  visibleChips.forEach((chip, index) => {
+    expect(chip.overflows).toBe(false);
+  });
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
