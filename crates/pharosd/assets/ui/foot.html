@@ -3369,6 +3369,118 @@ function resumeRefresh(reason){
   }
   return recoverFleet(reason);
 }
+function initFreshnessChipScroll(){
+  const chevronLeftIcon='<svg class="ico" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>';
+  const chevronRightIcon='<svg class="ico" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>';
+  let activePopover=null;
+  let popoverTimeout=null;
+  function createPopover(){
+    const popover=document.createElement('div');
+    popover.className='fresh-popover';
+    popover.dataset.freshPopover='true';
+    document.body.appendChild(popover);
+    return popover;
+  }
+  function showPopover(chip,event){
+    if(popoverTimeout)clearTimeout(popoverTimeout);
+    if(!activePopover)activePopover=createPopover();
+    const kind=chip.dataset.freshKind;
+    const label=chip.querySelector('.fresh-row-label')?.textContent||chip.getAttribute('aria-label')?.split(':')[0]||kind;
+    const value=chip.querySelector('[data-fresh-value]')?.textContent||'';
+    const valueClass=chip.querySelector('[data-fresh-value]')?.className||'';
+    activePopover.innerHTML='<div class="fresh-popover-row"><span class="fresh-popover-label">'+label+'</span><span class="fresh-popover-value '+valueClass+'">'+value+'</span></div>';
+    activePopover.classList.add('visible');
+    updatePopoverPosition(event);
+  }
+  function updatePopoverPosition(event){
+    if(!activePopover||!activePopover.classList.contains('visible'))return;
+    const offset=10;
+    const x=event.clientX+offset;
+    const y=event.clientY+offset;
+    const rect=activePopover.getBoundingClientRect();
+    const viewportWidth=window.innerWidth;
+    const viewportHeight=window.innerHeight;
+    let finalX=x;
+    let finalY=y;
+    if(x+rect.width>viewportWidth)finalX=event.clientX-rect.width-offset;
+    if(y+rect.height>viewportHeight)finalY=event.clientY-rect.height-offset;
+    activePopover.style.left=finalX+'px';
+    activePopover.style.top=finalY+'px';
+  }
+  function hidePopover(){
+    if(popoverTimeout)clearTimeout(popoverTimeout);
+    popoverTimeout=setTimeout(()=>{
+      if(activePopover){
+        activePopover.classList.remove('visible');
+        popoverTimeout=null;
+      }
+    },50);
+  }
+  function updateChevronVisibility(container,chevronLeft,chevronRight){
+    const scrollLeft=container.scrollLeft;
+    const scrollWidth=container.scrollWidth;
+    const clientWidth=container.clientWidth;
+    const canScrollLeft=scrollLeft>1;
+    const canScrollRight=scrollLeft<scrollWidth-clientWidth-1;
+    if(canScrollLeft)chevronLeft.classList.add('visible');else chevronLeft.classList.remove('visible');
+    if(canScrollRight)chevronRight.classList.add('visible');else chevronRight.classList.remove('visible');
+  }
+  document.querySelectorAll('.card .fresh[data-fresh]').forEach(fresh=>{
+    const chips=Array.from(fresh.querySelectorAll('.fresh-row-compact'));
+    if(chips.length===0)return;
+    const container=document.createElement('div');
+    container.className='fresh-scroll-container';
+    container.dataset.freshScrollContainer='true';
+    chips.forEach(chip=>container.appendChild(chip));
+    fresh.innerHTML='';
+    fresh.appendChild(container);
+    const chevronLeft=document.createElement('button');
+    chevronLeft.className='fresh-chevron fresh-chevron-left';
+    chevronLeft.innerHTML=chevronLeftIcon;
+    chevronLeft.setAttribute('type','button');
+    chevronLeft.setAttribute('aria-label','Scroll left');
+    chevronLeft.addEventListener('click',()=>{
+      container.scrollBy({left:-120,behavior:'smooth'});
+    });
+    const chevronRight=document.createElement('button');
+    chevronRight.className='fresh-chevron fresh-chevron-right';
+    chevronRight.innerHTML=chevronRightIcon;
+    chevronRight.setAttribute('type','button');
+    chevronRight.setAttribute('aria-label','Scroll right');
+    chevronRight.addEventListener('click',()=>{
+      container.scrollBy({left:120,behavior:'smooth'});
+    });
+    fresh.appendChild(chevronLeft);
+    fresh.appendChild(chevronRight);
+    container.addEventListener('wheel',event=>{
+      if(Math.abs(event.deltaY)>0){
+        event.preventDefault();
+        container.scrollLeft+=event.deltaY;
+        updateChevronVisibility(container,chevronLeft,chevronRight);
+      }
+    },{passive:false});
+    container.addEventListener('scroll',()=>{
+      updateChevronVisibility(container,chevronLeft,chevronRight);
+    });
+    chips.forEach(chip=>{
+      chip.removeAttribute('title');
+      chip.addEventListener('mouseenter',event=>{
+        if(popoverTimeout)clearTimeout(popoverTimeout);
+        showPopover(chip,event);
+      });
+      chip.addEventListener('mousemove',event=>{
+        if(activePopover&&activePopover.classList.contains('visible')){
+          updatePopoverPosition(event);
+        }
+      });
+      chip.addEventListener('mouseleave',()=>{
+        hidePopover();
+      });
+    });
+    container.addEventListener('scroll',hidePopover);
+    setTimeout(()=>updateChevronVisibility(container,chevronLeft,chevronRight),0);
+  });
+}
 document.addEventListener('visibilitychange',()=>{if(document.hidden)suspendFleet();else recoverFleet('visible')});
 window.addEventListener('blur',suspendFleet);
 window.addEventListener('focus',()=>recoverFleet('focus'));
@@ -3376,6 +3488,7 @@ window.addEventListener('pageshow',event=>{if(event.persisted||!fleetSnapshotFre
 window.addEventListener('online',()=>recoverFleet('online'));
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
+initFreshnessChipScroll();
 initControls();
 initProviderConnection();
 initProviderSetupGuide();

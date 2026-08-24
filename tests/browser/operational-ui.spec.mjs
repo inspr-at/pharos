@@ -808,3 +808,103 @@ test("chip row does not overflow card boundary or paint into neighbors", async (
   );
   expect(reonboard.ok()).toBe(true);
 });
+
+test("freshness chips scroll horizontally without wrapping and show chevrons only when scrollable", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.setViewportSize({ width: 1280, height: 1024 });
+
+  const card = page.locator('[data-host-surface="runtime"].card').first();
+  await expect(card).toBeVisible();
+
+  const freshContainer = card.locator('.fresh[data-fresh]');
+  await expect(freshContainer).toBeVisible();
+
+  const scrollContainer = freshContainer.locator('.fresh-scroll-container');
+  await expect(scrollContainer).toBeVisible();
+
+  const chips = scrollContainer.locator('.fresh-row-compact');
+  const chipCount = await chips.count();
+  expect(chipCount).toBeGreaterThan(0);
+
+  const chipsAreOnOneLine = await scrollContainer.evaluate((container) => {
+    const chips = Array.from(container.querySelectorAll('.fresh-row-compact'));
+    if (chips.length === 0) return true;
+    const firstTop = chips[0].getBoundingClientRect().top;
+    return chips.every(chip => {
+      const top = chip.getBoundingClientRect().top;
+      return Math.abs(top - firstTop) < 2;
+    });
+  });
+  expect(chipsAreOnOneLine).toBe(true);
+
+  const chipsStayInCard = await chips.evaluateAll((elements) => {
+    const card = elements[0]?.closest('.card');
+    if (!card) return true;
+    const cardRect = card.getBoundingClientRect();
+    return elements.every(chip => {
+      const chipRect = chip.getBoundingClientRect();
+      return chipRect.left >= cardRect.left && chipRect.right <= cardRect.right + 100;
+    });
+  });
+  expect(chipsStayInCard).toBe(true);
+
+  const chevronLeft = freshContainer.locator('.fresh-chevron-left');
+  const chevronRight = freshContainer.locator('.fresh-chevron-right');
+  await expect(chevronLeft).toBeAttached();
+  await expect(chevronRight).toBeAttached();
+
+  const scrollInfo = await scrollContainer.evaluate((container) => {
+    return {
+      scrollWidth: container.scrollWidth,
+      clientWidth: container.clientWidth,
+      hasOverflow: container.scrollWidth > container.clientWidth,
+    };
+  });
+
+  const leftVisible = await chevronLeft.evaluate((el) => el.classList.contains('visible'));
+  const rightVisible = await chevronRight.evaluate((el) => el.classList.contains('visible'));
+
+  if (scrollInfo.hasOverflow) {
+    expect(leftVisible || rightVisible).toBe(true);
+  } else {
+    expect(leftVisible).toBe(false);
+    expect(rightVisible).toBe(false);
+  }
+
+  const chipsHaveNoTitleAttr = await chips.evaluateAll((elements) => {
+    return elements.every(chip => !chip.hasAttribute('title'));
+  });
+  expect(chipsHaveNoTitleAttr).toBe(true);
+
+  const popoverExists = await page.evaluate(() => {
+    return document.querySelector('[data-fresh-popover]') !== null;
+  });
+  expect(popoverExists).toBe(true);
+
+  const firstChip = chips.first();
+  await firstChip.hover();
+  await page.waitForTimeout(100);
+
+  const popoverVisible = await page.evaluate(() => {
+    const popover = document.querySelector('[data-fresh-popover]');
+    return popover && popover.classList.contains('visible');
+  });
+  expect(popoverVisible).toBe(true);
+
+  const popoverContent = await page.evaluate(() => {
+    const popover = document.querySelector('[data-fresh-popover]');
+    return popover?.textContent || '';
+  });
+  expect(popoverContent.length).toBeGreaterThan(0);
+
+  await page.mouse.move(0, 0);
+  await page.waitForTimeout(100);
+
+  const popoverHidden = await page.evaluate(() => {
+    const popover = document.querySelector('[data-fresh-popover]');
+    return !popover || !popover.classList.contains('visible');
+  });
+  expect(popoverHidden).toBe(true);
+});
