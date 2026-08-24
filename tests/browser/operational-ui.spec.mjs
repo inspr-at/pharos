@@ -893,6 +893,13 @@ test("freshness chips scroll horizontally without wrapping and show chevrons onl
   });
   expect(popoverVisible).toBe(true);
 
+  const popoverRowCount = await page.evaluate(() => {
+    const popover = document.querySelector('[data-fresh-popover]');
+    return popover?.querySelectorAll('.fresh-popover-row').length || 0;
+  });
+  expect(popoverRowCount).toBeGreaterThan(0);
+  expect(popoverRowCount).toBeLessThanOrEqual(3);
+
   const popoverContent = await page.evaluate(() => {
     const popover = document.querySelector('[data-fresh-popover]');
     return popover?.textContent || '';

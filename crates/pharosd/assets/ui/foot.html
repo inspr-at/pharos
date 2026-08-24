@@ -3384,11 +3384,23 @@ function initFreshnessChipScroll(){
   function showPopover(chip,event){
     if(popoverTimeout)clearTimeout(popoverTimeout);
     if(!activePopover)activePopover=createPopover();
-    const kind=chip.dataset.freshKind;
-    const label=chip.querySelector('.fresh-row-label')?.textContent||chip.getAttribute('aria-label')?.split(':')[0]||kind;
-    const value=chip.querySelector('[data-fresh-value]')?.textContent||'';
-    const valueClass=chip.querySelector('[data-fresh-value]')?.className||'';
-    activePopover.innerHTML='<div class="fresh-popover-row"><span class="fresh-popover-label">'+label+'</span><span class="fresh-popover-value '+valueClass+'">'+value+'</span></div>';
+    const container=chip.closest('[data-fresh]');
+    if(!container)return;
+    const allChips=container.querySelectorAll('.fresh-row-compact');
+    const chipData=[];
+    const kindOrder=['deployed-sha','commits-behind','flake-lock-age'];
+    kindOrder.forEach(kind=>{
+      const targetChip=Array.from(allChips).find(c=>c.dataset.freshKind===kind);
+      if(targetChip){
+        const label=targetChip.querySelector('.fresh-row-label')?.textContent||targetChip.getAttribute('aria-label')?.split(':')[0]||kind;
+        const valueEl=targetChip.querySelector('[data-fresh-value]');
+        const value=valueEl?.textContent||'';
+        const valueClass=valueEl?.className||'';
+        chipData.push({label,value,valueClass});
+      }
+    });
+    if(chipData.length===0)return;
+    activePopover.innerHTML=chipData.map(d=>'<div class="fresh-popover-row"><span class="fresh-popover-label">'+d.label+'</span><span class="fresh-popover-value '+d.valueClass+'">'+d.value+'</span></div>').join('');
     activePopover.classList.add('visible');
     updatePopoverPosition(event);
   }
