@@ -3388,7 +3388,7 @@ function initFreshnessChipScroll(){
     if(!container)return;
     const allChips=container.querySelectorAll('.fresh-row-compact');
     const chipData=[];
-    const kindOrder=['deployed-sha','commits-behind','flake-lock-age'];
+    const kindOrder=['deployed-sha','nixcfg-sha','nixpkgs-sha'];
     kindOrder.forEach(kind=>{
       const targetChip=Array.from(allChips).find(c=>c.dataset.freshKind===kind);
       if(targetChip){
