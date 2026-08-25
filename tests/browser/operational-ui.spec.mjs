@@ -2462,8 +2462,18 @@ test("preference drift host_report resolver uses blocked_by without active run",
   await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(
     "Change requested",
   );
-  await expect(chip).toHaveAttribute("data-lifecycle-declared-summary", /48b8a8/);
-  await expect(chip).toHaveAttribute("data-lifecycle-observed-summary", /111111/);
+  await expect(chip).toHaveAttribute(
+    "data-lifecycle-declared-summary",
+    "accent #48b8a8",
+  );
+  await expect(chip).toHaveAttribute("data-lifecycle-observed-summary", "accent #111111");
+
+  expect(await page.evaluate((body) => applyFleetSnapshot(body), payload)).toBe(true);
+  await expect(chip).toHaveAttribute(
+    "data-lifecycle-declared-summary",
+    "accent #48b8a8",
+  );
+  await expect(chip).toHaveAttribute("data-lifecycle-observed-summary", "accent #111111");
 
   const jobPolls = [];
   page.on("request", (request) => {
@@ -2514,12 +2524,22 @@ test("preference drift declared_not_applied sheet resolves in host settings", as
   const chip = card.locator("[data-host-lifecycle-chip]");
   await expect(chip).toHaveCount(1);
   await expect(chip).toHaveAttribute("data-lifecycle-slot", "prefs_drift");
-  await expect(chip).toHaveAttribute("data-lifecycle-declared-summary", /48b8a8/);
-  await expect(chip).toHaveAttribute("data-lifecycle-observed-summary", /111111/);
+  await expect(chip).toHaveAttribute(
+    "data-lifecycle-declared-summary",
+    "accent #48b8a8",
+  );
+  await expect(chip).toHaveAttribute("data-lifecycle-observed-summary", "accent #111111");
   await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(
     "Ready to apply",
   );
   await expect(chip).toHaveAttribute("data-lifecycle-level", "info");
+
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await expect(chip).toHaveAttribute(
+    "data-lifecycle-declared-summary",
+    "accent #48b8a8",
+  );
+  await expect(chip).toHaveAttribute("data-lifecycle-observed-summary", "accent #111111");
   const cardInfoColor = await card.evaluate((surface) =>
     getComputedStyle(surface.querySelector(".host-lifecycle-chip")).color,
   );

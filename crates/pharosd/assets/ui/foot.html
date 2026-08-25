@@ -909,7 +909,7 @@ function formatPreferencesSummary(prefs){
   if(!prefs||typeof prefs!=='object')return 'not reported';
   const parts=[];
   if(typeof prefs.accent==='string'&&prefs.accent)parts.push('accent '+prefs.accent);
-  if(typeof prefs.kind==='string'&&prefs.kind)parts.push(String(prefs.kind));
+  if(typeof prefs.kind==='string'&&prefs.kind&&prefs.kind!=='server')parts.push(String(prefs.kind));
   const alerts=prefs.alerts;
   if(alerts&&typeof alerts==='object'){
     const muted=[];
