@@ -1192,65 +1192,87 @@ impl HostActionJob {
         Vec<HostWorkflowStep>,
     ) {
         let failed = self.state == HostActionState::Failed;
+        let succeeded = self.state == HostActionState::Succeeded;
         let accepted = self
             .events
             .iter()
             .any(|event| event.kind == HostActionEventKind::DispatchAccepted);
+        let (guidance, status_label, status_level) = match self.state {
+            HostActionState::Succeeded => (
+                "The update review was handed to nixcfg. Pharos did not deploy or verify any host change.",
+                "review handed to nixcfg",
+                "clear",
+            ),
+            HostActionState::Failed => (
+                "The repository review request stopped. No host change was authorized.",
+                "update review stopped",
+                "warning",
+            ),
+            _ => (
+                "The proposal is saved outside the live-change path. Repository checks and review must finish before any host action.",
+                "review requested",
+                "warning",
+            ),
+        };
+        let request_state = if failed && !accepted {
+            WorkflowStepState::Failed
+        } else if accepted || succeeded {
+            WorkflowStepState::Passed
+        } else {
+            WorkflowStepState::Running
+        };
+        let downstream_state = if failed || succeeded {
+            WorkflowStepState::Skipped
+        } else if accepted {
+            WorkflowStepState::Waiting
+        } else {
+            WorkflowStepState::Queued
+        };
         (
             "Review system updates".to_string(),
-            if failed {
-                "The repository review request stopped. No host change was authorized."
-            } else {
-                "The proposal is saved outside the live-change path. Repository checks and review must finish before any host action."
-            }
-            .to_string(),
-            if failed {
-                "update review stopped"
-            } else {
-                "review requested"
-            }
-            .to_string(),
-            "warning",
+            guidance.to_string(),
+            status_label.to_string(),
+            status_level,
             None,
             vec![
                 workflow_step(
                     "request",
                     "PREPARE",
                     "Create an isolated update proposal",
-                    if failed {
-                        WorkflowStepState::Failed
+                    request_state,
+                    if succeeded {
+                        "The review request was handed to nixcfg."
+                    } else if failed {
+                        "The repository dispatch did not accept the review request."
                     } else if accepted {
-                        WorkflowStepState::Passed
+                        "The durable dispatch workflow accepted the review request."
                     } else {
-                        WorkflowStepState::Running
+                        "Pharos is recording the review request."
                     },
-                    "This step cannot merge or deploy a host.",
                 )
                 .at(HostWorkflowExecutionLocation::Github),
                 workflow_step(
                     "validate",
                     "VALIDATE",
                     "Run repository and all-host checks",
-                    if failed {
-                        WorkflowStepState::Skipped
-                    } else if accepted {
-                        WorkflowStepState::Waiting
+                    downstream_state,
+                    if succeeded {
+                        "Repository checks continue in nixcfg outside Pharos."
                     } else {
-                        WorkflowStepState::Queued
+                        "Completion is reported by the repository workflow."
                     },
-                    "Completion is reported by the repository workflow.",
                 )
                 .at(HostWorkflowExecutionLocation::Github),
                 workflow_step(
                     "review",
                     "APPROVE",
                     "Review the proposal",
-                    if failed {
-                        WorkflowStepState::Skipped
+                    downstream_state,
+                    if succeeded {
+                        "Review continues in nixcfg outside Pharos."
                     } else {
-                        WorkflowStepState::Queued
+                        "A separate reviewed workflow is required before deployment."
                     },
-                    "A separate reviewed workflow is required before deployment.",
                 )
                 .at(HostWorkflowExecutionLocation::Github),
                 workflow_step(
@@ -2407,6 +2429,7 @@ impl HostActionStore {
         self.insert(job)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_system_update_proposal(
         &self,
         id: String,
@@ -2432,7 +2455,40 @@ impl HostActionStore {
         actor: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        self.create_system_update_proposal(action_id("system-update", host, now), host, actor, now)
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        if Self::has_active_system_update_proposal(&jobs) {
+            return Err(HostActionStoreError::ActiveJob);
+        }
+        let mut job = HostActionJob {
+            schema: ACTION_SCHEMA.to_string(),
+            version: ACTION_VERSION,
+            id: action_id("system-update", host, now),
+            host: host.to_string(),
+            kind: HostActionKind::SystemUpdateProposal,
+            workflow_kind: None,
+            state: HostActionState::ProposalRequested,
+            requested_by: actor.to_string(),
+            ticket: "PHAROS-125".to_string(),
+            retry_of: None,
+            created_at: now,
+            updated_at: now,
+            confirmed_at: None,
+            plan: None,
+            removal_plan: None,
+            result: None,
+            recovery_started_at: None,
+            events: Vec::new(),
+            lease_phase: None,
+            lease_until: None,
+            retirement_lease_until: None,
+        };
+        job.record_event(
+            now,
+            HostActionEventSource::Operator,
+            HostActionEventKind::Requested,
+            Some(actor),
+        );
+        self.insert_locked(&mut jobs, job)
     }
 
     pub(crate) fn accept_system_update_proposal(
@@ -2466,9 +2522,11 @@ impl HostActionStore {
                 return Err(HostActionStoreError::InvalidTransition);
             }
             let previous = job.clone();
-            if failed {
-                job.state = HostActionState::Failed;
-            }
+            job.state = if failed {
+                HostActionState::Failed
+            } else {
+                HostActionState::Succeeded
+            };
             job.updated_at = now;
             job.record_event(
                 now,
@@ -3452,6 +3510,13 @@ impl HostActionStore {
             .any(|job| job.host == host && job.kind == kind && !job.state.is_terminal())
     }
 
+    fn has_active_system_update_proposal(jobs: &BTreeMap<String, HostActionJob>) -> bool {
+        jobs.values().any(|job| {
+            job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
+                && !job.state.is_terminal()
+        })
+    }
+
     fn latest_update_for<'a>(
         jobs: &'a BTreeMap<String, HostActionJob>,
         host: &str,
@@ -3537,6 +3602,9 @@ fn legacy_state_event_kind(job: &HostActionJob) -> HostActionEventKind {
         }
         (HostWorkflowKind::SettingsChange, HostActionState::Failed) => {
             HostActionEventKind::SettingsFailed
+        }
+        (HostWorkflowKind::SystemUpdateProposal, HostActionState::Succeeded) => {
+            HostActionEventKind::DispatchAccepted
         }
         (HostWorkflowKind::SystemUpdateProposal, HostActionState::ProposalRequested) => {
             HostActionEventKind::DispatchAccepted
@@ -4985,8 +5053,11 @@ mod tests {
             .expect("proposal dispatch accepted");
         let workflow = accepted.summary().workflow;
 
+        assert_eq!(accepted.state, HostActionState::Succeeded);
         assert_eq!(workflow.kind, HostWorkflowKind::SystemUpdateProposal);
-        assert_eq!(workflow.status_label, "review requested");
+        assert_eq!(workflow.status_label, "review handed to nixcfg");
+        assert_eq!(workflow.status_level, "clear");
+        assert_eq!(workflow.guidance, "The update review was handed to nixcfg. Pharos did not deploy or verify any host change.");
         assert_eq!(
             workflow
                 .steps
@@ -4994,7 +5065,7 @@ mod tests {
                 .find(|step| step.key == "validate")
                 .expect("validation step")
                 .state,
-            WorkflowStepState::Waiting
+            WorkflowStepState::Skipped
         );
         assert_eq!(
             workflow
@@ -5005,6 +5076,72 @@ mod tests {
                 .state,
             WorkflowStepState::Skipped
         );
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "deploy")
+                .expect("deployment boundary")
+                .detail,
+            "This proposal workflow never deploys hosts."
+        );
+    }
+
+    #[test]
+    fn system_update_proposal_rejects_a_second_fleet_wide_invoke() {
+        let store = HostActionStore::new(None);
+        let first = store
+            .begin_system_update_proposal("hsb8", "markus", 460)
+            .expect("first proposal workflow created");
+        assert_eq!(
+            store.begin_system_update_proposal("gpc0", "markus", 461),
+            Err(HostActionStoreError::ActiveJob)
+        );
+        assert_eq!(
+            store
+                .list()
+                .into_iter()
+                .filter(|job| job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal)
+                .count(),
+            1
+        );
+        assert_eq!(first.id, store.get(&first.id).expect("job retained").id);
+    }
+
+    #[test]
+    fn system_update_proposal_leaves_host_chip_after_dispatch_acceptance() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_system_update_proposal("hsb8", "markus", 470)
+            .expect("proposal workflow created");
+        let accepted = store
+            .accept_system_update_proposal(&job.id, 471)
+            .expect("proposal dispatch accepted");
+        let relevant = store
+            .most_relevant_for_host("hsb8")
+            .expect("relevant proposal workflow");
+        assert_eq!(relevant.id, accepted.id);
+        assert_eq!(relevant.state, HostActionState::Succeeded);
+        assert_eq!(
+            relevant.summary().workflow.status_label,
+            "review handed to nixcfg"
+        );
+    }
+
+    #[test]
+    fn system_update_proposal_allows_a_new_invoke_after_terminal_success() {
+        let store = HostActionStore::new(None);
+        let first = store
+            .begin_system_update_proposal("hsb8", "markus", 480)
+            .expect("first proposal workflow created");
+        store
+            .accept_system_update_proposal(&first.id, 481)
+            .expect("first proposal completed");
+        let second = store
+            .begin_system_update_proposal("gpc0", "markus", 482)
+            .expect("second proposal workflow created");
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.state, HostActionState::ProposalRequested);
     }
 
     #[test]
