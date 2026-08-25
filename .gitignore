@@ -15,3 +15,5 @@ result-*
 /node_modules
 /playwright-report
 /test-results
+/tests/browser/.dispatch-token
+/tests/browser/.dispatch-accept

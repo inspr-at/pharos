@@ -1,5 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
 import { test as base, expect } from "@playwright/test";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   expectSettingsSurfaces,
   newAuthedContext,
@@ -19,6 +22,11 @@ const test = base.extend({
 function openHostSettingsTitle(host) {
   return `Open host settings for ${host}`;
 }
+
+const browserDir = path.dirname(fileURLToPath(import.meta.url));
+const dispatchAcceptFlag = path.join(browserDir, ".dispatch-accept");
+const dispatchMockBase =
+  process.env.PHAROS_BROWSER_DISPATCH_BASE ?? "http://127.0.0.1:18981";
 
 test("fleet has no serious accessibility violations and serves hardened headers", async ({
   page,
@@ -1357,4 +1365,160 @@ test("fleet refresh hides kernel slot when UpdateRestart lifecycle wins", async 
   expect(await applyServerFleetSnapshot(page)).toBe(true);
   await expectDormantKernelMetadataAbsent();
   await expect(card.locator("[data-host-action-note]")).toBeVisible();
+});
+
+test("system update uncertainty dialog acknowledges and retries once", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(60_000);
+  fs.writeFileSync(dispatchAcceptFlag, "false");
+
+  const host = `browser-uncertain-${testInfo.project.name}`;
+  const report = await page.request.post("/report", {
+    data: {
+      schema: "inspr.pharos.host-report.v4",
+      version: 4,
+      name: host,
+      role: "server",
+      is_nix: true,
+      heartbeat_interval_secs: 60,
+      freshness: { applicable: true },
+    },
+  });
+  expect(report.status()).toBe(204);
+
+  const readDispatchCount = async () =>
+    Number((await fetch(`${dispatchMockBase}/test/dispatch-count`)).text());
+  const dispatchAtStart = await readDispatchCount();
+
+  const uncertain = await page.request.post("/host-actions/system-update", {
+    headers: { "X-Pharos-Action": "1" },
+    data: { host },
+  });
+  expect(uncertain.status()).toBe(409);
+  const uncertainPayload = await uncertain.json();
+  expect(uncertainPayload.job.state).toBe("failed");
+  expect(uncertainPayload.job.workflow.status_label).toBe(
+    "dispatch outcome uncertain",
+  );
+  expect(uncertainPayload.job.workflow.evidence).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        label: "Repository dispatch",
+        value: "outcome uncertain",
+      }),
+    ]),
+  );
+  expect(uncertainPayload.workflow_html).toContain("outcome uncertain");
+  expect(uncertainPayload.workflow_html).toContain("not confirmed");
+  const priorJobId = uncertainPayload.job.id;
+  expect(await readDispatchCount()).toBe(dispatchAtStart);
+
+  const blocked = await page.request.post("/host-actions/system-update", {
+    headers: { "X-Pharos-Action": "1" },
+    data: { host },
+  });
+  expect(blocked.status()).toBe(409);
+  expect(await readDispatchCount()).toBe(dispatchAtStart);
+
+  const invalidAck = await page.request.post("/host-actions/system-update", {
+    headers: {
+      "X-Pharos-Action": "1",
+      "X-Pharos-Acknowledge-Uncertainty": "not-a-valid-job-id!!!",
+    },
+    data: { host },
+  });
+  expect(invalidAck.status()).toBe(400);
+
+  await page.goto("/");
+  const card = page.locator(`article.card[data-host="${host}"]`);
+  await expect(card).toBeVisible();
+
+  const overlay = page.locator("[data-host-action-overlay]");
+  await card.locator("[data-host-action-note]").click();
+  await expect(overlay).toBeVisible();
+
+  const primary = overlay.locator("[data-host-action-primary]");
+  await expect(primary).toBeVisible();
+  await expect(primary).toHaveText("I verified nixcfg — request again");
+  await expect(overlay.locator("[data-host-workflow]")).toContainText(
+    "not confirmed",
+  );
+  await expect(overlay.locator("[data-host-action-copy]")).toContainText(
+    "Verify nixcfg",
+  );
+
+  await page.keyboard.press("Escape");
+  await expect(overlay).toBeHidden();
+  await card.locator("[data-host-action-note]").click();
+  await expect(primary).toBeVisible();
+
+  fs.writeFileSync(dispatchAcceptFlag, "true");
+
+  const [retryResponse] = await Promise.all([
+    page.waitForResponse(
+      (response) =>
+        response.url().includes("/host-actions/system-update") &&
+        response.request().method() === "POST",
+    ),
+    primary.scrollIntoViewIfNeeded().then(() => primary.click({ force: true })),
+  ]);
+  expect(retryResponse.status()).toBe(202);
+  const replacementPayload = await retryResponse.json();
+  expect(replacementPayload.job.id).not.toBe(priorJobId);
+  expect(replacementPayload.job.state).toBe("succeeded");
+  await expect(overlay.locator("[data-host-workflow]")).toContainText(
+    "continues in nixcfg",
+  );
+  await expect(primary).toBeHidden();
+  expect(await readDispatchCount()).toBe(dispatchAtStart + 1);
+
+  const priorJob = await page.request.get(
+    `/host-actions/jobs/${encodeURIComponent(priorJobId)}`,
+  );
+  expect(priorJob.ok()).toBe(true);
+  const priorPayload = await priorJob.json();
+  expect(priorPayload.job.id).toBe(priorJobId);
+  expect(priorPayload.job.state).toBe("failed");
+  expect(
+    priorPayload.job.workflow.events.some((event) =>
+      String(event.label).toLowerCase().includes("uncertainty acknowledged"),
+    ),
+  ).toBe(true);
+  expect(priorPayload.job.workflow.evidence).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        label: "Repository dispatch",
+        value: "outcome uncertain",
+      }),
+    ]),
+  );
+
+  expect(replacementPayload.job.workflow.status_label).toBe(
+    "review handed to nixcfg",
+  );
+  expect(replacementPayload.job.workflow.evidence).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        label: "Repository dispatch",
+        value: "accepted",
+      }),
+    ]),
+  );
+  expect(replacementPayload.workflow_html).toContain(
+    "Repository dispatch</dt><dd>accepted</dd>",
+  );
+
+  await page.keyboard.press("Escape");
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+  fs.writeFileSync(dispatchAcceptFlag, "false");
 });

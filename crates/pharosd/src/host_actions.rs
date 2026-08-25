@@ -952,11 +952,17 @@ impl HostActionJob {
                     .events
                     .iter()
                     .any(|event| event.kind == HostActionEventKind::DispatchAccepted);
+                let outcome_uncertain =
+                    self.has_event(HostActionEventKind::DispatchOutcomeUncertain);
                 evidence.push(workflow_evidence(
                     "Repository dispatch",
                     if self.state == HostActionState::Failed {
-                        "stopped"
-                    } else if accepted {
+                        if outcome_uncertain {
+                            "outcome uncertain"
+                        } else {
+                            "stopped"
+                        }
+                    } else if accepted || self.state == HostActionState::Succeeded {
                         "accepted"
                     } else {
                         "recording"
@@ -2506,6 +2512,9 @@ impl HostActionStore {
             self.persist_jobs(&jobs)?;
         }
         if let Some(id) = acknowledge_uncertainty_id {
+            if !safe_action_id(id) {
+                return Err(HostActionStoreError::InvalidJob);
+            }
             if let Some(job) = jobs.get(id) {
                 if system_update_uncertainty_requires_acknowledgement(job) {
                     self.acknowledge_system_update_proposal_uncertainty_locked(
@@ -4082,6 +4091,10 @@ fn valid_ticket(value: &str) -> bool {
         && project.bytes().all(|byte| byte.is_ascii_uppercase())
         && !number.is_empty()
         && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+pub(crate) fn system_update_uncertainty_acknowledgement_id_valid(value: &str) -> bool {
+    safe_action_id(value)
 }
 
 fn safe_action_id(value: &str) -> bool {

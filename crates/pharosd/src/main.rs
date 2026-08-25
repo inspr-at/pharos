@@ -929,6 +929,14 @@ async fn request_system_update(
     let now = now_unix();
     let acknowledge_uncertainty =
         system_update_uncertainty_acknowledgement(&headers).map(str::to_string);
+    if let Some(id) = acknowledge_uncertainty.as_deref() {
+        if !host_actions::system_update_uncertainty_acknowledgement_id_valid(id) {
+            return action_error(
+                StatusCode::BAD_REQUEST,
+                "The uncertainty acknowledgement reference is invalid",
+            );
+        }
+    }
     let workflow = match state.host_actions.begin_system_update_proposal(
         host,
         &actor,
@@ -936,6 +944,12 @@ async fn request_system_update(
         acknowledge_uncertainty.as_deref(),
     ) {
         Ok(workflow) => workflow,
+        Err(HostActionStoreError::InvalidJob) => {
+            return action_error(
+                StatusCode::BAD_REQUEST,
+                "The uncertainty acknowledgement reference is invalid",
+            );
+        }
         Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(job)) => {
             return action_response_with_message(
                 StatusCode::CONFLICT,
@@ -13760,6 +13774,28 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(uncertain_html.contains("not confirmed"));
         assert!(!uncertain_html.contains("did not accept"));
         assert!(!uncertain_html.contains("continues in nixcfg"));
+
+        let handoff_dispatch = handoff_workflow
+            .evidence
+            .iter()
+            .find(|item| item.label == "Repository dispatch")
+            .expect("handoff dispatch evidence");
+        assert_eq!(handoff_dispatch.value, "accepted");
+        let rejected_dispatch = rejected_workflow
+            .evidence
+            .iter()
+            .find(|item| item.label == "Repository dispatch")
+            .expect("rejected dispatch evidence");
+        assert_eq!(rejected_dispatch.value, "stopped");
+        let uncertain_dispatch = uncertain_workflow
+            .evidence
+            .iter()
+            .find(|item| item.label == "Repository dispatch")
+            .expect("uncertain dispatch evidence");
+        assert_eq!(uncertain_dispatch.value, "outcome uncertain");
+        assert!(handoff_html.contains("Repository dispatch</dt><dd>accepted</dd>"));
+        assert!(rejected_html.contains("Repository dispatch</dt><dd>stopped</dd>"));
+        assert!(uncertain_html.contains("Repository dispatch</dt><dd>outcome uncertain</dd>"));
     }
 
     #[tokio::test]

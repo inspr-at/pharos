@@ -258,11 +258,20 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
   const jobId=lifecycleRunId||(storedMatches?root.dataset.actionJobId:null);
   if(action!=='technical'&&jobId&&storedMatches)pollHostActionJob(jobId,true);
 }
-async function requestHostAction(path,body){
-  const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},body:JSON.stringify(body||{})});
+async function requestHostAction(path,body,extraHeaders={}){
+  const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1',...extraHeaders},body:JSON.stringify(body||{})});
   const payload=await response.json().catch(()=>({}));
   if(!response.ok&&!payload.job)throw new Error(payload.error||payload.message||'The guarded action could not be requested.');
   return payload;
+}
+function hostWorkflowUncertaintyAcknowledged(workflow){
+  return Array.isArray(workflow?.events)&&workflow.events.some(event=>String(event.label||'').toLowerCase().includes('uncertainty acknowledged'));
+}
+function systemUpdateUncertaintyNeedsAcknowledgement(job,workflow){
+  return workflow?.kind==='system_update_proposal'
+    &&job?.state==='failed'
+    &&workflow.status_label==='dispatch outcome uncertain'
+    &&!hostWorkflowUncertaintyAcknowledged(workflow);
 }
 function hostActionStateLabel(state){
   return ({proposal_requested:'review requested',queued_review:'review queued',reviewing:'reviewing on host',awaiting_confirmation:'ready for confirmation',queued_apply:'confirmed',applying:'applying on host',rebooting:'restarting and verifying',removal_pending:'removal pending',succeeded:'completed',failed:'failed',cancelled:'cancelled safely'})[state]||String(state||'recorded').replaceAll('_',' ');
@@ -362,7 +371,15 @@ function renderHostActionJob(job,message,workflowHtml){
   if(attended)attended.hidden=primaryAction?.kind!=='confirm';
   if(removeName)removeName.textContent=hostActionContext.host;
   hostActionContext.stage=primaryAction?.kind||'observe';
-  if(primaryAction&&primary){
+  const needsUncertaintyAck=systemUpdateUncertaintyNeedsAcknowledgement(job,workflow);
+  hostActionContext.uncertaintyJobId=needsUncertaintyAck?job.id:null;
+  if(needsUncertaintyAck&&primary){
+    primary.hidden=false;
+    primary.classList.remove('danger');
+    primary.textContent='I verified nixcfg — request again';
+    primary.disabled=false;
+    hostActionContext.stage='acknowledge-uncertainty';
+  }else if(primaryAction&&primary){
     primary.hidden=false;
     primary.classList.remove('danger');
     primary.textContent=primaryAction.label||'Continue';
@@ -411,12 +428,17 @@ async function submitHostAction(){
   primary.disabled=true;
   status.textContent=action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
     :action==='remove'?'Recording retirement and revoking reports…'
+    :action==='system-update'&&hostActionContext.stage==='acknowledge-uncertainty'?'Recording nixcfg verification and requesting again…'
     :hostActionContext.stage==='recover'?'Queueing target-local recovery checks…'
     :hostActionContext.stage==='confirm'?'Recording attended confirmation…'
     :'Requesting a guarded review…';
   try{
     let result;
-    if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
+    if(action==='system-update'&&hostActionContext.stage==='acknowledge-uncertainty'){
+      result=await requestHostAction('/host-actions/system-update',{host},{
+        'X-Pharos-Acknowledge-Uncertainty':hostActionContext.uncertaintyJobId||''
+      });
+    }else if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
     else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
