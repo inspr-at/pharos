@@ -51,12 +51,14 @@ function positionHostActions(root){
   const menu=root.querySelector('[data-host-actions-menu]');
   if(!trigger||!menu||menu.hidden)return;
   const anchor=trigger.getBoundingClientRect();
-  const box=menu.getBoundingClientRect();
+  const origin=root.getBoundingClientRect();
+  const menuWidth=menu.offsetWidth;
+  const menuHeight=menu.offsetHeight;
   const margin=12;
-  const left=Math.max(margin,Math.min(window.innerWidth-box.width-margin,anchor.right-box.width));
-  const below=anchor.bottom+7;
-  const above=anchor.top-box.height-7;
-  const top=below+box.height<=window.innerHeight-margin?below:Math.max(margin,above);
+  const left=Math.max(margin-origin.left,Math.min(window.innerWidth-menuWidth-margin-origin.left,anchor.right-origin.left-menuWidth));
+  const below=anchor.bottom-origin.top+7;
+  const above=anchor.top-origin.top-menuHeight-7;
+  const top=origin.top+below+menuHeight<=window.innerHeight-margin?below:Math.max(margin-origin.top,above);
   menu.style.left=left+'px';
   menu.style.top=top+'px';
 }
