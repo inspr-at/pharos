@@ -2168,11 +2168,9 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    let action_jobs: Vec<_> = state
-        .host_actions
-        .list()
-        .into_iter()
-        .filter(|job| access.allows_host(&job.host))
+    let action_jobs: Vec<_> = runtime_hosts
+        .iter()
+        .filter_map(|host| state.host_actions.most_relevant_for_host(&host.name))
         .collect();
     let mut payload = hosts_payload(
         runtime_hosts,

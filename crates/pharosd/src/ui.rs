@@ -354,11 +354,9 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    let action_jobs: Vec<_> = state
-        .host_actions
-        .list()
-        .into_iter()
-        .filter(|job| access.allows_host(&job.host))
+    let action_jobs: Vec<_> = hosts
+        .iter()
+        .filter_map(|host| state.host_actions.most_relevant_for_host(&host.name))
         .collect();
     // PHAROS-194: the removal dialog must name credential retirement before the
     // operator confirms. An unavailable generation is reported as unmanaged here;
