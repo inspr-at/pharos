@@ -4803,7 +4803,8 @@ mod tests {
         assert!(html.contains("document.addEventListener('visibilitychange'"));
         assert!(html.contains("const storedMatches=action==='workflow'"));
         assert!(!html.contains("action==='system-update'&&storedKind"));
-        assert!(html.contains("const action=kind==='update_restart'?'update-restart':'workflow'"));
+        assert!(html.contains("actionNote.dataset.lifecycleInvoke"));
+        assert!(html.contains("actionNote.dataset.lifecycleRunId"));
         assert!(html.contains(r#"data-host-remove-disposition"#));
         assert!(html.contains("It no longer exists"));
         assert!(html.contains("It still exists; stop managing it"));
@@ -4932,6 +4933,7 @@ mod tests {
                 },
             },
             None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
 
         assert!(markup.contains(r#"data-can-manage="false""#));
@@ -4958,6 +4960,7 @@ mod tests {
                 },
             },
             None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(runtime_only_markup.contains(r#"data-host-action="remove"><svg"#));
         assert!(runtime_only_markup.contains(r#"data-declared="false""#));
@@ -4983,6 +4986,7 @@ mod tests {
                 },
             },
             None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(janus_managed_markup.contains(r#"data-declared="false""#));
         assert!(janus_managed_markup.contains(r#"data-credential-retirement="true""#));
@@ -5009,6 +5013,7 @@ mod tests {
                 },
             },
             None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(janus_managed_ready.contains(r#"data-host-action="remove"><svg"#));
 
@@ -5044,6 +5049,7 @@ mod tests {
                 },
             },
             None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, false),
         );
         assert!(pending_markup.contains(r#"data-update-pending="true""#));
         assert!(pending_markup.contains(r#"data-host-action="update-restart"><svg"#));
@@ -7152,8 +7158,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let run_card = rendered_card(&html, "run-target");
         assert!(run_card.contains(
-            r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note data-action-level="warning" data-lifecycle-slot="settings_change" data-lifecycle-level="warning" data-lifecycle-invoke="workflow">"#
+            r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note data-action-level="warning" data-lifecycle-slot="settings_change" data-lifecycle-level="warning" data-lifecycle-invoke="workflow" data-lifecycle-run-id=""#
         ));
+        assert!(run_card.contains(&format!(r#"data-lifecycle-run-id="{}"#, settings_run.id)));
         assert!(run_card.contains(
             r#"<span data-host-action-note-copy>settings request stopped</span></button>"#
         ));
@@ -7190,7 +7197,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         // These are the existing handlers: this ticket changes no destinations.
         assert!(FOOT.contains("event.target.closest('[data-host-action-note]')"));
-        assert!(FOOT.contains("const action=kind==='update_restart'?'update-restart':'workflow';"));
+        assert!(FOOT.contains("actionNote.dataset.lifecycleInvoke"));
+        assert!(FOOT.contains("actionNote.dataset.lifecycleRunId"));
         assert!(FOOT.contains("const details=slot.querySelector('[data-kernel-posture]');"));
     }
 

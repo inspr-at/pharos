@@ -119,7 +119,7 @@ function closeHostActionDialog(restore=true){
   if(restore)hostActionReturnFocus?.focus();
   hostActionReturnFocus=null;
 }
-function openHostActionDialog(action,root,returnFocus){
+function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
   const overlay=document.querySelector('[data-host-action-overlay]');
   const dialog=overlay?.querySelector('[data-host-action-dialog]');
   if(!overlay||!dialog)return;
@@ -250,10 +250,11 @@ function openHostActionDialog(action,root,returnFocus){
   stopBeatClock();
   scheduleRefresh(DIALOG_REFRESH_MS);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
-  const storedKind=root.dataset.actionKind;
-  const storedMatches=action==='workflow'
-    ||(action==='update-restart'&&storedKind==='update_restart');
-  if(action!=='technical'&&root.dataset.actionJobId&&storedMatches)pollHostActionJob(root.dataset.actionJobId,true);
+  const invoke=root.querySelector('[data-host-action-note]')?.dataset.lifecycleInvoke||'';
+  const storedKind=invoke==='update_restart'?'update_restart':root.dataset.actionKind;
+  const storedMatches=action==='workflow'||(action==='update-restart'&&storedKind==='update_restart');
+  const jobId=lifecycleRunId||(storedMatches?root.dataset.actionJobId:null);
+  if(action!=='technical'&&jobId&&storedMatches)pollHostActionJob(jobId,true);
 }
 async function requestHostAction(path,body){
   const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},body:JSON.stringify(body||{})});
@@ -501,16 +502,6 @@ function updateHostActionState(surface,host,backup){
   if(remove)remove.hidden=!removalReady||!canManage||retired;
   if(primarySeparator)primarySeparator.hidden=[review,update,restart].every(item=>!item||item.hidden);
   if(removeSeparator)removeSeparator.hidden=!removalReady||!canManage||retired;
-  const note=surface.querySelector('[data-host-action-note]');
-  const noteCopy=note?.querySelector('[data-host-action-note-copy]');
-  if(note){
-    const show=retired||(job&&!['succeeded','cancelled'].includes(job.state));
-    note.hidden=!show;
-    note.dataset.actionLevel=retired?'warning':String(workflow?.status_level||'warning');
-    if(noteCopy)noteCopy.textContent=retired?'removal pending':String(workflow?.status_label||hostActionStateLabel(job?.state));
-  }
-  const dot=root.querySelector('[data-host-action-dot]');
-  if(dot)dot.hidden=state==='applied'&&kernelState!=='reboot_required'&&!retired&&!(job&&!['succeeded','cancelled'].includes(job.state));
   if(openHostActionsRoot===root)positionHostActions(root);
 }
 function initHostActions(){
@@ -523,9 +514,9 @@ function initHostActions(){
       const surface=actionNote.closest('[data-host-surface="runtime"]');
       const root=surface?.querySelector('[data-host-actions]');
       if(root){
-        const kind=root.dataset.actionKind;
-        const action=kind==='update_restart'?'update-restart':'workflow';
-        openHostActionDialog(action,root,actionNote);
+        const invoke=actionNote.dataset.lifecycleInvoke||'';
+        const action=invoke==='update_restart'?'update-restart':'workflow';
+        openHostActionDialog(action,root,actionNote,actionNote.dataset.lifecycleRunId||'');
       }
       return;
     }
@@ -731,16 +722,8 @@ function kernelSearch(kernel){
 }
 function updateKernel(surface,host){
   const slot=surface.querySelector('[data-kernel-slot]');
-  if(!slot)return;
-  const required=kernelNeedsRestart(host.kernel);
-  slot.hidden=!required;
-  const reason=surface.querySelector('[data-reason]');
-  if(reason)reason.hidden=required;
+  if(!slot||slot.hidden)return;
   const details=slot.querySelector('[data-kernel-posture]');
-  if(!required){
-    if(details)details.open=false;
-    return;
-  }
   const healthy=host.liveness==='live';
   const explanation=healthy
     ? String(host.name||'This host')+' is healthy. A newer system kernel is ready for its next planned restart.'
@@ -858,6 +841,76 @@ function updateMuted(surface,info){
   const text=el.querySelector('span');
   if(text)text.textContent=info.label;
 }
+function lifecycleSettingsLabel(lifecycle,surface){
+  const invoke=String(lifecycle?.invoke||'');
+  const slot=String(lifecycle?.slot||'');
+  if(invoke!=='host_settings')return '';
+  if(slot==='quiet')return surface.matches('.card')?'Up to date':'';
+  return String(lifecycle?.label||'');
+}
+function lifecycleWorkflowShown(lifecycle){
+  return lifecycle&&(lifecycle.invoke==='workflow'||lifecycle.invoke==='update_restart');
+}
+function updateHostLifecycle(surface,host){
+  const lifecycle=host.lifecycle||null;
+  const slot=String(lifecycle?.slot||'quiet');
+  const invoke=String(lifecycle?.invoke||'host_settings');
+  const label=String(lifecycle?.label||'');
+  const level=String(lifecycle?.level||'clear');
+  const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
+  const name=surface.dataset.host||'host';
+  const settingsLabel=lifecycleSettingsLabel(lifecycle,surface);
+  const settingsTitle=settingsLabel?(settingsLabel+' for '+name):('Open host settings for '+name);
+  const settingsLink=surface.querySelector('[data-settings-state]');
+  if(settingsLink){
+    settingsLink.title=settingsTitle;
+    settingsLink.setAttribute('aria-label',settingsTitle);
+  }
+  const settingsNote=surface.querySelector('[data-settings-note]');
+  if(settingsNote){
+    settingsNote.hidden=!settingsLabel;
+    settingsNote.dataset.lifecycleSlot=slot;
+    settingsNote.dataset.lifecycleLevel=level;
+    settingsNote.dataset.lifecycleInvoke=invoke;
+    if(runId)settingsNote.dataset.lifecycleRunId=runId;
+    else delete settingsNote.dataset.lifecycleRunId;
+    const copy=settingsNote.querySelector('[data-settings-note-copy]');
+    if(copy)copy.textContent=settingsLabel;
+  }
+  const actionNote=surface.querySelector('[data-host-action-note]');
+  const workflowShown=lifecycleWorkflowShown(lifecycle);
+  if(actionNote){
+    actionNote.hidden=!workflowShown;
+    actionNote.dataset.actionLevel=level;
+    actionNote.dataset.lifecycleSlot=slot;
+    actionNote.dataset.lifecycleLevel=level;
+    actionNote.dataset.lifecycleInvoke=invoke;
+    if(runId)actionNote.dataset.lifecycleRunId=runId;
+    else delete actionNote.dataset.lifecycleRunId;
+    const copy=actionNote.querySelector('[data-host-action-note-copy]');
+    if(copy)copy.textContent=workflowShown?label:'';
+  }
+  const kernelSlot=surface.querySelector('[data-kernel-slot]');
+  const kernelSelected=slot==='kernel_drift';
+  if(kernelSlot){
+    kernelSlot.hidden=!kernelSelected;
+    const details=kernelSlot.querySelector('[data-kernel-posture]');
+    if(details){
+      details.dataset.lifecycleSlot=slot;
+      details.dataset.lifecycleLevel=level;
+      details.dataset.lifecycleInvoke=invoke;
+      const summaryLabel=details.querySelector('summary span');
+      if(summaryLabel&&kernelSelected)summaryLabel.textContent=label||'Restart required';
+      if(!kernelSelected&&details.open)details.open=false;
+    }
+  }
+  const reason=surface.querySelector('[data-reason]');
+  if(reason)reason.hidden=kernelSelected;
+  const actionsRoot=surface.querySelector('[data-host-actions]');
+  const dot=actionsRoot?.querySelector('[data-host-action-dot]');
+  if(dot)dot.hidden=slot==='quiet';
+  if(openHostActionsRoot===actionsRoot)positionHostActions(actionsRoot);
+}
 function updatePreferenceState(surface,host){
   const applied=host.preferences||{};
   const declared=host.declared_preferences||null;
@@ -873,22 +926,7 @@ function updatePreferenceState(surface,host){
   if(validColor(pendingColor))surface.style.setProperty('--pending-color',pendingColor);
   else surface.style.removeProperty('--pending-color');
   const link=surface.querySelector('[data-settings-state]');
-  const lifecycleLabel=state==='declared_not_applied'?'Ready to apply':state==='request_pending'?'Change requested':'';
-  const label=lifecycleLabel||(surface.matches('.card')?'Up to date':'');
-  const name=surface.dataset.host||'host';
-  const title=lifecycleLabel?lifecycleLabel+' for '+name:'Open host settings for '+name;
-  if(link){
-    link.dataset.settingsState=state;
-    link.title=title;
-    link.setAttribute('aria-label',title);
-  }
-  const note=surface.querySelector('[data-settings-note]');
-  if(note){
-    note.hidden=!label;
-    note.dataset.settingsState=state;
-    const copy=note.querySelector('[data-settings-note-copy]');
-    if(copy)copy.textContent=label;
-  }
+  if(link)link.dataset.settingsState=state;
 }
 function markHtml(beats,interval,windowDef=signalWindow){
   const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
@@ -3250,7 +3288,7 @@ function applyFleetSnapshot(data){
       const muted=mutedInfo(h.preferences);
       card.dataset.sev=String(attention.rank ?? sevFor(live));
       card.dataset.last=h.last_seen ?? 0;
-      card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+kernelSearch(h.kernel)+' '+muted.search).toLowerCase().trim();
+      card.dataset.search=(String(h.name||'')+' '+String(h.role||'')+' '+String(h.freshness_tldr||'')+' '+String(attention.label||'')+' '+String(backup.search||'')+' '+String(h.lifecycle?.label||'')+' '+kernelSearch(h.kernel)+' '+muted.search).toLowerCase().trim();
       const word=card.querySelector('[data-status-word]');
       if(word)word.textContent=words[h.liveness]||h.liveness;
       setReason(card,attention);
@@ -3259,6 +3297,7 @@ function applyFleetSnapshot(data){
       updateMuted(card,muted);
       updatePreferenceState(card,h);
       updateHostActionState(card,h,backup);
+      updateHostLifecycle(card,h);
       updateFreshness(card,h.freshness,now);
       updateBackup(card,backup);
       setSeen(card,h.last_seen,now);

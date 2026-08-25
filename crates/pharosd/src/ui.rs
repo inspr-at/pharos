@@ -1422,6 +1422,7 @@ pub(super) fn host_actions_markup(
     host: &Host,
     context: HostActionRenderContext<'_>,
     action: Option<&HostActionJob>,
+    lifecycle: &HostLifecycle,
 ) -> String {
     let capabilities = context.capabilities;
     let name = html_escape(&host.name);
@@ -1453,12 +1454,6 @@ pub(super) fn host_actions_markup(
             && manifest.policy.privileged_actions.janus_required
     });
     let reboot = kernel_reboot_required(host.kernel.as_ref());
-    let lifecycle = host_lifecycle(
-        action.map(std::slice::from_ref).unwrap_or_default(),
-        &host.name,
-        context.settings_state,
-        reboot.is_some(),
-    );
     let update_pending = reboot.is_some() || host.freshness.has_proven_deployable_update();
     let restart_hidden =
         if host.is_nix && capabilities.can_manage_fleet && janus_ready && update_pending {
@@ -3812,11 +3807,17 @@ pub(super) fn host_action_note_markup(lifecycle: &HostLifecycle, interactive: bo
     ) && interactive;
     let hidden = if shown { "" } else { " hidden" };
     let label = if shown { lifecycle.label.as_str() } else { "" };
+    let run_id_attr = lifecycle
+        .run_id
+        .as_ref()
+        .map(|id| format!(r#" data-lifecycle-run-id="{}""#, html_escape(id)))
+        .unwrap_or_default();
     format!(
-        r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note{hidden} data-action-level="{level}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}">{icon}<span data-host-action-note-copy>{label}</span></button>"#,
+        r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note{hidden} data-action-level="{level}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}"{run_id_attr}>{icon}<span data-host-action-note-copy>{label}</span></button>"#,
         level = lifecycle.level,
         slot = lifecycle.slot.key(),
         invoke = lifecycle.invoke.key(),
+        run_id_attr = run_id_attr,
         icon = icons::HISTORY,
         label = html_escape(label),
     )
@@ -6275,6 +6276,7 @@ pub(super) fn render_home_with_capabilities(
                     capabilities,
                 },
                 relevant_action,
+                &lifecycle,
             )
         } else {
             String::new()
@@ -6293,6 +6295,7 @@ pub(super) fn render_home_with_capabilities(
                     capabilities,
                 },
                 relevant_action,
+                &lifecycle,
             )
         } else {
             String::new()

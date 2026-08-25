@@ -1946,8 +1946,33 @@ pub(crate) struct HostActionSummary {
     pub(crate) workflow: HostWorkflowSummary,
 }
 
+fn host_action_priority(job: &HostActionJob) -> u8 {
+    match (job.workflow_kind(), job.state) {
+        (HostWorkflowKind::RemoveHost, HostActionState::Succeeded | HostActionState::Cancelled) => {
+            0
+        }
+        (HostWorkflowKind::RemoveHost, _) => 4,
+        (
+            HostWorkflowKind::UpdateRestart,
+            HostActionState::Succeeded | HostActionState::Cancelled,
+        ) => 0,
+        (HostWorkflowKind::UpdateRestart, _) => 3,
+        (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => 0,
+        (HostWorkflowKind::SettingsChange, HostActionState::Cancelled) => 0,
+        (HostWorkflowKind::SettingsChange, _) => 2,
+        (
+            HostWorkflowKind::SystemUpdateProposal,
+            HostActionState::Succeeded | HostActionState::Cancelled,
+        ) => 0,
+        (HostWorkflowKind::SystemUpdateProposal, _) => 1,
+    }
+}
+
 fn lifecycle_run_slot(job: &HostActionJob) -> Option<HostLifecycleSlot> {
     match (job.workflow_kind(), job.state) {
+        (HostWorkflowKind::RemoveHost, HostActionState::Succeeded | HostActionState::Cancelled) => {
+            None
+        }
         (HostWorkflowKind::RemoveHost, _) => Some(HostLifecycleSlot::RemoveHost),
         (
             HostWorkflowKind::UpdateRestart,
@@ -1981,28 +2006,72 @@ fn lifecycle_run_priority(job: &HostActionJob) -> u8 {
     }
 }
 
-fn most_relevant_action<'a, I>(jobs: I, host: &str) -> Option<&'a HostActionJob>
-where
-    I: Iterator<Item = &'a HostActionJob> + Clone,
-{
-    jobs.clone()
-        .filter(|job| job.host == host)
+fn dedupe_latest_workflow_jobs<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Vec<&'a HostActionJob> {
+    jobs.iter()
         .filter(|job| {
-            !jobs.clone().any(|other| {
-                other.host == host
-                    && other.workflow_kind() == job.workflow_kind()
-                    && (other.created_at, other.updated_at, &other.id)
-                        > (job.created_at, job.updated_at, &job.id)
-            })
+            job.host == host
+                && !jobs.iter().any(|other| {
+                    other.host == host
+                        && other.workflow_kind() == job.workflow_kind()
+                        && (other.created_at, other.updated_at, &other.id)
+                            > (job.created_at, job.updated_at, &job.id)
+                })
         })
-        .max_by_key(|job| (lifecycle_run_priority(job), job.updated_at, job.created_at))
+        .collect()
+}
+
+fn most_relevant_action_with_priority<'a, F>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+    priority: F,
+) -> Option<&'a HostActionJob>
+where
+    F: Fn(&HostActionJob) -> u8,
+{
+    dedupe_latest_workflow_jobs(jobs, host)
+        .into_iter()
+        .max_by_key(|job| (priority(job), job.updated_at, job.created_at))
+}
+
+fn most_relevant_action<'a>(jobs: &'a [HostActionJob], host: &str) -> Option<&'a HostActionJob> {
+    most_relevant_action_with_priority(jobs, host, host_action_priority)
 }
 
 pub(crate) fn most_relevant_host_action<'a>(
     jobs: &'a [HostActionJob],
     host: &str,
 ) -> Option<&'a HostActionJob> {
-    most_relevant_action(jobs.iter(), host)
+    most_relevant_action(jobs, host)
+}
+
+fn most_relevant_lifecycle_run<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    dedupe_latest_workflow_jobs(jobs, host)
+        .into_iter()
+        .filter(|job| lifecycle_run_slot(job).is_some())
+        .max_by_key(|job| (lifecycle_run_priority(job), job.updated_at, job.created_at))
+}
+
+fn most_relevant_host_action_refs<'a>(
+    jobs: &'a BTreeMap<String, HostActionJob>,
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    jobs.values()
+        .filter(|job| job.host == host)
+        .filter(|job| {
+            !jobs.values().any(|other| {
+                other.host == host
+                    && other.workflow_kind() == job.workflow_kind()
+                    && (other.created_at, other.updated_at, &other.id)
+                        > (job.created_at, job.updated_at, &job.id)
+            })
+        })
+        .max_by_key(|job| (host_action_priority(job), job.updated_at, job.created_at))
 }
 
 fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle {
@@ -2049,7 +2118,7 @@ pub(crate) fn host_lifecycle(
     preferences: HostPreferencesState,
     kernel_drift: bool,
 ) -> HostLifecycle {
-    let action = most_relevant_host_action(jobs, host);
+    let action = most_relevant_lifecycle_run(jobs, host);
     if let Some((job, slot)) = action
         .and_then(|job| lifecycle_run_slot(job).map(|slot| (job, slot)))
         .filter(|(_, slot)| *slot != HostLifecycleSlot::SystemUpdateProposal)
@@ -2318,7 +2387,7 @@ impl HostActionStore {
 
     pub(crate) fn most_relevant_for_host(&self, host: &str) -> Option<HostActionJob> {
         let jobs = self.jobs.read().expect("host action store lock");
-        most_relevant_action(jobs.values(), host).cloned()
+        most_relevant_host_action_refs(&jobs, host).cloned()
     }
 
     fn record_proposal(
@@ -4732,6 +4801,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn terminal_removal_does_not_mask_live_update_restart_in_host_action_selector() {
+        let jobs = vec![
+            lifecycle_job(
+                HostWorkflowKind::RemoveHost,
+                HostActionState::Succeeded,
+                100,
+            ),
+            lifecycle_job(
+                HostWorkflowKind::UpdateRestart,
+                HostActionState::QueuedReview,
+                200,
+            ),
+        ];
+        let legacy = most_relevant_host_action(&jobs, "hsb8").expect("live update restart");
+        assert_eq!(legacy.workflow_kind(), HostWorkflowKind::UpdateRestart);
+        assert_eq!(legacy.state, HostActionState::QueuedReview);
+
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::Applied, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::UpdateRestart);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[1].id.as_str()));
+    }
+
+    #[test]
+    fn cancelled_settings_wins_lifecycle_but_live_proposal_wins_host_action_selector() {
+        let jobs = vec![
+            lifecycle_job(
+                HostWorkflowKind::SettingsChange,
+                HostActionState::Cancelled,
+                100,
+            ),
+            lifecycle_job(
+                HostWorkflowKind::SystemUpdateProposal,
+                HostActionState::ProposalRequested,
+                200,
+            ),
+        ];
+        let legacy = most_relevant_host_action(&jobs, "hsb8").expect("live proposal");
+        assert_eq!(
+            legacy.workflow_kind(),
+            HostWorkflowKind::SystemUpdateProposal
+        );
+        assert_eq!(legacy.id, jobs[1].id);
+
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::RequestPending, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::SettingsChange);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[0].id.as_str()));
+        assert_ne!(lifecycle.label, "Change requested");
+    }
+
+    #[test]
+    fn completed_removal_does_not_hold_lifecycle_forever() {
+        let jobs = vec![lifecycle_job(
+            HostWorkflowKind::RemoveHost,
+            HostActionState::Succeeded,
+            100,
+        )];
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::Applied, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::Quiet);
+        assert_eq!(lifecycle.run_id, None);
     }
 
     #[test]

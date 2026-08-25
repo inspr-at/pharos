@@ -808,3 +808,152 @@ test("chip row does not overflow card boundary or paint into neighbors", async (
   );
   expect(reonboard.ok()).toBe(true);
 });
+
+test("fleet refresh consumes lifecycle projection for settings runs and precedence", async ({
+  page,
+}) => {
+  const failedHost = "bl-lifecycle-failed";
+  const cancelledHost = "bl-lifecycle-cancelled";
+  const runHost = "bl-lifecycle-run-kernel";
+
+  for (const host of [failedHost, cancelledHost, runHost]) {
+    const report = await page.request.post("/report", {
+      data: {
+        schema: "inspr.pharos.host-report.v4",
+        version: 4,
+        name: host,
+        role: "server",
+        is_nix: false,
+        heartbeat_interval_secs: 60,
+        freshness: { applicable: false },
+      },
+    });
+    expect(report.status()).toBe(204);
+  }
+
+  await page.goto("/");
+
+  const applyLifecycleRefresh = async (hostName, lifecycleOverrides, extra = {}) => {
+    const snapshot = await page.request.get("/hosts.json");
+    const payload = await snapshot.json();
+    const host = payload.hosts.find((entry) => entry.name === hostName);
+    expect(host).toBeTruthy();
+    Object.assign(host, extra);
+    host.lifecycle = {
+      schema: "inspr.pharos.host-lifecycle.v1",
+      version: 1,
+      blocked_by: [],
+      detail: "browser lifecycle projection regression",
+      ...lifecycleOverrides,
+    };
+    return page.evaluate((body) => applyFleetSnapshot(body), payload);
+  };
+
+  expect(
+    await applyLifecycleRefresh(
+      failedHost,
+      {
+        slot: "settings_change",
+        label: "settings request stopped",
+        level: "warning",
+        invoke: "workflow",
+        run_id: "failed-settings-run",
+      },
+      {
+        preferences_state: "request_pending",
+        requested_preferences: { accent: "#48b8a8" },
+        host_action: {
+          id: "failed-settings-run",
+          state: "failed",
+          workflow: {
+            kind: "settings_change",
+            status_label: "settings request stopped",
+            status_level: "warning",
+          },
+        },
+      },
+    ),
+  ).toBe(true);
+
+  const failedCard = page.locator(`[data-host="${failedHost}"]`).first();
+  await expect(failedCard.locator("[data-host-action-note-copy]")).toContainText(
+    "settings request stopped",
+  );
+  await expect(failedCard.locator("[data-settings-note]")).toBeHidden();
+
+  expect(
+    await applyLifecycleRefresh(
+      cancelledHost,
+      {
+        slot: "settings_change",
+        label: "settings change cancelled",
+        level: "clear",
+        invoke: "workflow",
+        run_id: "cancelled-settings-run",
+      },
+      {
+        preferences_state: "request_pending",
+        requested_preferences: { accent: "#9868d0" },
+      },
+    ),
+  ).toBe(true);
+
+  const cancelledCard = page.locator(`[data-host="${cancelledHost}"]`).first();
+  await expect(cancelledCard.locator("[data-host-action-note-copy]")).toContainText(
+    "settings change cancelled",
+  );
+  await expect(cancelledCard.locator("[data-settings-note]")).toBeHidden();
+
+  expect(
+    await applyLifecycleRefresh(
+      runHost,
+      {
+        slot: "update_restart",
+        label: "review queued",
+        level: "warning",
+        invoke: "update_restart",
+        run_id: "update-restart-run",
+      },
+      {
+        kernel: {
+          state: "reboot_required",
+          running_version: "6.18.26",
+          expected_version: "7.0.14",
+          observed_at: 1_700_000_000,
+        },
+        host_action: {
+          id: "live-proposal-run",
+          state: "proposal_requested",
+          workflow: {
+            kind: "system_update_proposal",
+            status_label: "review requested",
+            status_level: "warning",
+          },
+        },
+      },
+    ),
+  ).toBe(true);
+
+  const runCard = page.locator(`[data-host="${runHost}"]`).first();
+  await expect(runCard.locator("[data-host-action-note-copy]")).toContainText(
+    "review queued",
+  );
+  await expect(runCard.locator("[data-kernel-slot]")).toBeHidden();
+  await expect(runCard.locator("[data-host-action-note]")).toHaveAttribute(
+    "data-lifecycle-run-id",
+    "update-restart-run",
+  );
+
+  for (const host of [failedHost, cancelledHost, runHost]) {
+    const removal = await page.request.post(`/host-actions/${host}/remove`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host, disposition: "unmanaged", successor: null },
+    });
+    expect(removal.status()).toBe(202);
+    const reonboard = await page.request.post(
+      `/host-actions/${host}/allow-reonboarding`,
+      { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+    );
+    expect(reonboard.ok()).toBe(true);
+  }
+});
