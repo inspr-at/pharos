@@ -54,12 +54,14 @@ impl NixcfgDispatch {
         let host_removal_enabled = std::env::var("PHAROS_HOST_REMOVAL_DISPATCH_ENABLED")
             .ok()
             .is_some_and(|value| enabled_value(&value));
+        let override_value = std::env::var("PHAROS_NIXCFG_DISPATCH_API_BASE").ok();
+        let api_base = resolve_dispatch_api_base(cfg!(debug_assertions), override_value.as_deref());
         Self::new(
             enabled,
             system_update_enabled,
             host_removal_enabled,
             token_file,
-            GITHUB_API_BASE.to_string(),
+            api_base,
         )
     }
 
@@ -314,6 +316,52 @@ fn enabled_value(value: &str) -> bool {
     )
 }
 
+/// Loopback-only override for browser harness / local mocks. Production and release
+/// builds always pin to `GITHUB_API_BASE`.
+fn validate_loopback_dispatch_origin(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    let path = parsed.path();
+    if !path.is_empty() && path != "/" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if host != "127.0.0.1" && host != "localhost" {
+        return None;
+    }
+    let port = parsed.port_or_known_default()?;
+    if port == 0 {
+        return None;
+    }
+    Some(format!("http://{}:{}", host, port))
+}
+
+fn resolve_dispatch_api_base(allow_debug_override: bool, override_value: Option<&str>) -> String {
+    if !allow_debug_override {
+        return GITHUB_API_BASE.to_string();
+    }
+    match override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => validate_loopback_dispatch_origin(value).unwrap_or_else(|| {
+            tracing::warn!(
+                "PHAROS_NIXCFG_DISPATCH_API_BASE is invalid; using pinned GitHub API base"
+            );
+            GITHUB_API_BASE.to_string()
+        }),
+        None => GITHUB_API_BASE.to_string(),
+    }
+}
+
 fn valid_host_name(host: &str) -> bool {
     let bytes = host.as_bytes();
     (1..=63).contains(&bytes.len())
@@ -345,6 +393,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use pharos_core::{HostAlertPreferences, HostKind};
 
@@ -543,6 +592,104 @@ mod tests {
         assert_eq!(rejected, NixcfgDispatchError::Rejected(401));
         assert!(!rejected.safe_message().contains("test-dispatch-token"));
         request.recv().expect("rejected request captured");
+
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[test]
+    fn validate_loopback_dispatch_origin_rejects_hostile_values() {
+        assert!(validate_loopback_dispatch_origin("https://api.github.com").is_none());
+        assert!(validate_loopback_dispatch_origin("http://evil.example:9").is_none());
+        assert!(validate_loopback_dispatch_origin("http://127.0.0.1:9/exfil").is_none());
+        assert!(validate_loopback_dispatch_origin("http://user@127.0.0.1:9").is_none());
+        assert!(validate_loopback_dispatch_origin("http://127.0.0.1:9?token=1").is_none());
+        assert_eq!(
+            validate_loopback_dispatch_origin("http://127.0.0.1:9"),
+            Some("http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            validate_loopback_dispatch_origin("http://localhost:4242"),
+            Some("http://localhost:4242".to_string())
+        );
+    }
+
+    #[test]
+    fn release_mode_ignores_hostile_override() {
+        assert_eq!(
+            resolve_dispatch_api_base(false, Some("http://evil.example:9")),
+            GITHUB_API_BASE
+        );
+    }
+
+    #[test]
+    fn debug_invalid_override_fails_closed_to_github() {
+        assert_eq!(
+            resolve_dispatch_api_base(true, Some("http://evil.example:9")),
+            GITHUB_API_BASE
+        );
+    }
+
+    #[test]
+    fn debug_valid_loopback_override_is_honored() {
+        assert_eq!(
+            resolve_dispatch_api_base(true, Some("http://127.0.0.1:4242")),
+            "http://127.0.0.1:4242"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_responses_do_not_forward_credentials() {
+        let token_path = token_file();
+        let evil_listener = TcpListener::bind("127.0.0.1:0").expect("bind evil listener");
+        evil_listener
+            .set_nonblocking(true)
+            .expect("evil nonblocking");
+        let evil_address = evil_listener.local_addr().expect("evil address");
+        let (evil_tx, evil_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut connected = false;
+            while Instant::now() < deadline {
+                match evil_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("evil stream timeout");
+                        let mut buffer = [0_u8; 256];
+                        connected = stream.read(&mut buffer).unwrap_or(0) > 0;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
+            }
+            evil_tx.send(connected).expect("evil signal");
+        });
+
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect listener");
+        let redirect_address = redirect_listener.local_addr().expect("redirect address");
+        let redirect_base = format!("http://{}", redirect_address);
+        let evil_url = format!("http://{evil_address}/steal");
+        std::thread::spawn(move || {
+            let (mut stream, _) = redirect_listener.accept().expect("redirect accept");
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {evil_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("redirect write");
+        });
+
+        let client = NixcfgDispatch::for_test(Some(token_path.clone()), redirect_base);
+        let result = client.dispatch("gpc0", &preferences()).await;
+        assert_eq!(result, Err(NixcfgDispatchError::RequestFailed));
+
+        let evil_connected = evil_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or(false);
+        assert!(!evil_connected);
 
         let _ = std::fs::remove_file(token_path);
     }

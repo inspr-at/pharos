@@ -1,5 +1,24 @@
 import AxeBuilder from "@axe-core/playwright";
-import { expect, test } from "@playwright/test";
+import { test as base, expect } from "@playwright/test";
+import {
+  expectSettingsSurfaces,
+  newAuthedContext,
+  waitForHarnessTokens,
+} from "./harness.mjs";
+
+const test = base.extend({
+  page: async ({ browser }, use) => {
+    await waitForHarnessTokens();
+    const context = await newAuthedContext(browser, "write");
+    const page = await context.newPage();
+    await use(page);
+    await context.close();
+  },
+});
+
+function openHostSettingsTitle(host) {
+  return `Open host settings for ${host}`;
+}
 
 test("fleet has no serious accessibility violations and serves hardened headers", async ({
   page,
@@ -809,151 +828,426 @@ test("chip row does not overflow card boundary or paint into neighbors", async (
   expect(reonboard.ok()).toBe(true);
 });
 
-test("fleet refresh consumes lifecycle projection for settings runs and precedence", async ({
+async function reportRuntimeHost(page, name, extra = {}) {
+  const isNix = extra.is_nix ?? false;
+  const freshness =
+    extra.freshness ??
+    (isNix
+      ? {
+          applicable: true,
+          flake_lock_age_days: 0,
+          commits_behind: 0,
+          nixpkgs_age_days: 0,
+          nixpkgs_channel: "nixos-unstable",
+          deployment_evidence: {
+            schema: "inspr.pharos.nix-deployment-evidence.v1",
+            version: 1,
+            source_revision: "1111111111111111111111111111111111111111",
+            flake_lock_sha256:
+              "2222222222222222222222222222222222222222222222222222222222222222",
+            nixpkgs_revision: "3333333333333333333333333333333333333333",
+            nixpkgs_last_modified: 1_700_000_000,
+            nixpkgs_channel: "nixos-unstable",
+          },
+          nixcfg_comparison: {
+            upstream_revision: "1111111111111111111111111111111111111111",
+            relation: "current",
+            commits_behind: 0,
+          },
+          nixpkgs_comparison: {
+            upstream_revision: "3333333333333333333333333333333333333333",
+            relation: "current",
+          },
+        }
+      : { applicable: false });
+  const kernel =
+    extra.kernel == null
+      ? undefined
+      : {
+          schema: "inspr.pharos.kernel-posture.v1",
+          version: 1,
+          state: extra.kernel.state,
+          running_version: extra.kernel.running_version,
+          expected_version: extra.kernel.expected_version,
+          observed_at: extra.kernel.observed_at,
+        };
+  const response = await page.request.post("/report", {
+    data: {
+      schema: isNix
+        ? "inspr.pharos.host-report.v5"
+        : "inspr.pharos.host-report.v4",
+      version: isNix ? 5 : 4,
+      name,
+      role: "server",
+      is_nix: isNix,
+      heartbeat_interval_secs: 60,
+      freshness,
+      preferences: extra.preferences,
+      kernel,
+    },
+  });
+  expect(response.status()).toBe(204);
+}
+
+async function applyServerFleetSnapshot(page) {
+  const snapshot = await page.request.get("/hosts.json");
+  expect(snapshot.ok()).toBe(true);
+  const payload = await snapshot.json();
+  return page.evaluate((body) => applyFleetSnapshot(body), payload);
+}
+
+test("fleet refresh consumes server-emitted lifecycle for failed settings", async ({
   page,
 }) => {
-  const failedHost = "bl-lifecycle-failed";
-  const cancelledHost = "bl-lifecycle-cancelled";
-  const runHost = "bl-lifecycle-run-kernel";
-
-  for (const host of [failedHost, cancelledHost, runHost]) {
-    const report = await page.request.post("/report", {
-      data: {
-        schema: "inspr.pharos.host-report.v4",
-        version: 4,
-        name: host,
-        role: "server",
-        is_nix: false,
-        heartbeat_interval_secs: 60,
-        freshness: { applicable: false },
-      },
-    });
-    expect(report.status()).toBe(204);
-  }
-
+  const host = "bl-server-failed-settings";
+  await reportRuntimeHost(page, host, { is_nix: true });
   await page.goto("/");
 
-  const applyLifecycleRefresh = async (hostName, lifecycleOverrides, extra = {}) => {
-    const snapshot = await page.request.get("/hosts.json");
-    const payload = await snapshot.json();
-    const host = payload.hosts.find((entry) => entry.name === hostName);
-    expect(host).toBeTruthy();
-    Object.assign(host, extra);
-    host.lifecycle = {
-      schema: "inspr.pharos.host-lifecycle.v1",
-      version: 1,
-      blocked_by: [],
-      detail: "browser lifecycle projection regression",
-      ...lifecycleOverrides,
-    };
-    return page.evaluate((body) => applyFleetSnapshot(body), payload);
-  };
+  const agora = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#48b8a8" } },
+  });
+  expect(agora.status()).toBe(502);
 
-  expect(
-    await applyLifecycleRefresh(
-      failedHost,
-      {
-        slot: "settings_change",
-        label: "settings request stopped",
-        level: "warning",
-        invoke: "workflow",
-        run_id: "failed-settings-run",
-      },
-      {
-        preferences_state: "request_pending",
-        requested_preferences: { accent: "#48b8a8" },
-        host_action: {
-          id: "failed-settings-run",
-          state: "failed",
-          workflow: {
-            kind: "settings_change",
-            status_label: "settings request stopped",
-            status_level: "warning",
-          },
-        },
-      },
-    ),
-  ).toBe(true);
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData?.lifecycle?.slot).toBe("settings_change");
+  expect(hostData?.lifecycle?.label).not.toBe("Change requested");
 
-  const failedCard = page.locator(`[data-host="${failedHost}"]`).first();
-  await expect(failedCard.locator("[data-host-action-note-copy]")).toContainText(
-    "settings request stopped",
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  await expect(card.locator("[data-settings-note]")).toBeHidden();
+  await expect(card.locator("[data-host-action-note-copy]")).not.toContainText(
+    "Change requested",
   );
-  await expect(failedCard.locator("[data-settings-note]")).toBeHidden();
-
-  expect(
-    await applyLifecycleRefresh(
-      cancelledHost,
-      {
-        slot: "settings_change",
-        label: "settings change cancelled",
-        level: "clear",
-        invoke: "workflow",
-        run_id: "cancelled-settings-run",
-      },
-      {
-        preferences_state: "request_pending",
-        requested_preferences: { accent: "#9868d0" },
-      },
-    ),
-  ).toBe(true);
-
-  const cancelledCard = page.locator(`[data-host="${cancelledHost}"]`).first();
-  await expect(cancelledCard.locator("[data-host-action-note-copy]")).toContainText(
-    "settings change cancelled",
-  );
-  await expect(cancelledCard.locator("[data-settings-note]")).toBeHidden();
-
-  expect(
-    await applyLifecycleRefresh(
-      runHost,
-      {
-        slot: "update_restart",
-        label: "review queued",
-        level: "warning",
-        invoke: "update_restart",
-        run_id: "update-restart-run",
-      },
-      {
-        kernel: {
-          state: "reboot_required",
-          running_version: "6.18.26",
-          expected_version: "7.0.14",
-          observed_at: 1_700_000_000,
-        },
-        host_action: {
-          id: "live-proposal-run",
-          state: "proposal_requested",
-          workflow: {
-            kind: "system_update_proposal",
-            status_label: "review requested",
-            status_level: "warning",
-          },
-        },
-      },
-    ),
-  ).toBe(true);
-
-  const runCard = page.locator(`[data-host="${runHost}"]`).first();
-  await expect(runCard.locator("[data-host-action-note-copy]")).toContainText(
-    "review queued",
-  );
-  await expect(runCard.locator("[data-kernel-slot]")).toBeHidden();
-  await expect(runCard.locator("[data-host-action-note]")).toHaveAttribute(
-    "data-lifecycle-run-id",
-    "update-restart-run",
-  );
-
-  for (const host of [failedHost, cancelledHost, runHost]) {
-    const removal = await page.request.post(`/host-actions/${host}/remove`, {
-      headers: { "x-pharos-action": "1" },
-      data: { confirmation: host, disposition: "unmanaged", successor: null },
-    });
-    expect(removal.status()).toBe(202);
-    const reonboard = await page.request.post(
-      `/host-actions/${host}/allow-reonboarding`,
-      { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  if (hostData.lifecycle?.run_id) {
+    await expect(card.locator("[data-host-action-note]")).toHaveAttribute(
+      "data-lifecycle-run-id",
+      hostData.lifecycle.run_id,
     );
-    expect(reonboard.ok()).toBe(true);
   }
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("fleet refresh applies server lifecycle when run_id differs from host_action", async ({
+  page,
+}) => {
+  const host = "bl-server-lifecycle-diverge";
+  await reportRuntimeHost(page, host, { is_nix: true });
+  await page.goto("/");
+
+  const agora = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#48b8a8" } },
+  });
+  expect(agora.status()).toBe(502);
+
+  const proposal = await page.request.post("/host-actions/system-update", {
+    headers: { "x-pharos-action": "1" },
+    data: { host },
+  });
+  expect(proposal.status()).toBe(202);
+
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData?.lifecycle?.slot).toBe("settings_change");
+  expect(hostData?.lifecycle?.run_id).toBeTruthy();
+  expect(hostData?.host_action?.id).toBeTruthy();
+  expect(hostData.lifecycle.run_id).not.toBe(hostData.host_action.id);
+
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  await expect(card.locator("[data-host-action-note]")).toHaveAttribute(
+    "data-lifecycle-run-id",
+    hostData.lifecycle.run_id,
+  );
+
+  const lifecycleRunId = hostData.lifecycle.run_id;
+  const legacyJobId = hostData.host_action.id;
+  const pollResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(
+        `/host-actions/jobs/${encodeURIComponent(lifecycleRunId)}`,
+      ) && response.request().method() === "GET",
+  );
+  await card.locator("[data-host-action-note]").click();
+  const pollResponse = await pollResponsePromise;
+  expect(pollResponse.ok()).toBe(true);
+  const pollPayload = await pollResponse.json();
+  expect(pollPayload.job.id).toBe(lifecycleRunId);
+  expect(pollPayload.job.id).not.toBe(legacyJobId);
+  expect(pollPayload.job.workflow?.kind).toBe("settings_change");
+  await expect(page.locator("[data-host-action-overlay]")).toBeVisible();
+  await page.evaluate(() => closeHostActionDialog());
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("fleet refresh kernel slot follows server lifecycle transitions", async ({ page }) => {
+  const host = "bl-kernel-lifecycle";
+  await reportRuntimeHost(page, host, {
+    kernel: {
+      state: "reboot_required",
+      running_version: "6.18.26",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  });
+  await page.goto("/");
+
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  await expect(card.locator("[data-kernel-slot]")).toBeVisible();
+  await expect(card.locator("[data-kernel-slot] [data-kernel-running]")).toHaveText("6.18.26");
+  await expect(card.locator("[data-kernel-slot] [data-kernel-expected]")).toHaveText("7.0.14");
+
+  await reportRuntimeHost(page, host, {
+    kernel: {
+      state: "current",
+      running_version: "7.0.14",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_100,
+    },
+  });
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await expect(card.locator("[data-kernel-slot]")).toBeHidden();
+  await expect(card.locator("[data-settings-note-copy]")).toContainText("Up to date");
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("fleet refresh keeps workflow note inert without host actions root", async ({
+  browser,
+}) => {
+  await waitForHarnessTokens();
+  const host = "bl-readonly-lifecycle";
+  const writeContext = await newAuthedContext(browser, "write");
+  const writePage = await writeContext.newPage();
+  await reportRuntimeHost(writePage, host, { is_nix: true });
+  const agora = await writePage.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#9868d0" } },
+  });
+  expect(agora.status()).toBe(502);
+  await writeContext.close();
+
+  const readContext = await newAuthedContext(browser, "read");
+  const page = await readContext.newPage();
+  await page.goto("/");
+
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData?.lifecycle?.invoke).toBe("workflow");
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const row = page.locator(`tr[data-host="${host}"][data-host-surface="runtime"]`).first();
+  await expect(card.locator("[data-host-actions]")).toHaveCount(0);
+  await expect(row.locator("[data-host-actions]")).toHaveCount(0);
+  await expect(card.locator("[data-host-action-note]")).toBeHidden();
+  await expect(row.locator("[data-host-action-note]")).toBeHidden();
+
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await expect(card.locator("[data-host-action-note]")).toBeHidden();
+  await expect(row.locator("[data-host-action-note]")).toBeHidden();
+  await expect(card.locator("[data-host-action-note]")).not.toBeFocused();
+  await readContext.close();
+
+  const cleanupContext = await newAuthedContext(browser, "write");
+  const cleanupPage = await cleanupContext.newPage();
+  const removal = await cleanupPage.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await cleanupPage.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+  await cleanupContext.close();
+});
+
+test("fleet refresh keeps sequential settings surfaces aligned on card and row", async ({
+  page,
+}) => {
+  const host = "bl-settings-sequential";
+  const settingsTitle = openHostSettingsTitle(host);
+  await reportRuntimeHost(page, host, {
+    preferences: { accent: "#111111" },
+  });
+  await page.goto("/");
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const row = page.locator(`tr[data-host="${host}"][data-host-surface="runtime"]`).first();
+
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await expectSettingsSurfaces(card, {
+    state: "applied",
+    title: settingsTitle,
+    noteVisible: true,
+    noteCopy: "Up to date",
+  });
+  await expectSettingsSurfaces(row, {
+    state: "applied",
+    title: settingsTitle,
+    noteVisible: false,
+  });
+
+  const agora = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#48b8a8" } },
+  });
+  expect(agora.status()).toBe(200);
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await expectSettingsSurfaces(card, {
+    state: "request_pending",
+    title: settingsTitle,
+    noteVisible: false,
+    requestedIconVisible: false,
+  });
+  await expectSettingsSurfaces(row, {
+    state: "request_pending",
+    title: settingsTitle,
+    noteVisible: false,
+  });
+  await expect(card.locator("[data-host-action-note-copy]")).not.toBeEmpty();
+
+  await reportRuntimeHost(page, host, {
+    preferences: { accent: "#48b8a8" },
+  });
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await expectSettingsSurfaces(card, {
+    state: "applied",
+    title: settingsTitle,
+    noteVisible: true,
+    noteCopy: "Up to date",
+  });
+  await expectSettingsSurfaces(row, {
+    state: "applied",
+    title: settingsTitle,
+    noteVisible: false,
+  });
+  await expect(card.locator("[data-host-action-note]")).toBeHidden();
+  await expect(row.locator("[data-host-action-note]")).toBeHidden();
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("settings naming applies only to settings surfaces, not generic host actions", async ({
+  page,
+}) => {
+  const host = "bl-settings-accessibility";
+  const settingsTitle = openHostSettingsTitle(host);
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  await page.goto("/");
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const hostActions = card.locator("[data-host-actions]").first();
+  await expect(hostActions).toHaveAttribute("data-settings-state", "applied");
+  await expect(hostActions).not.toHaveAttribute("title", settingsTitle);
+  await expect(hostActions).not.toHaveAttribute("aria-label", settingsTitle);
+
+  const settingsLink = card.locator("a[data-settings-state]").first();
+  await expect(settingsLink).toHaveAttribute("title", settingsTitle);
+  await expect(settingsLink).toHaveAttribute("aria-label", settingsTitle);
+
+  const results = await new AxeBuilder({ page })
+    .include(`[data-host="${host}"][data-host-surface="runtime"].card`)
+    .analyze();
+  const serious = results.violations.filter(({ impact }) =>
+    ["serious", "critical"].includes(impact),
+  );
+  expect(serious).toEqual([]);
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("fleet refresh hides kernel slot when UpdateRestart lifecycle wins", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "chromium-mobile",
+    "covered once in the final mobile lifecycle regression",
+  );
+  const host = `bl-kernel-vs-restart-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    kernel: {
+      state: "reboot_required",
+      running_version: "6.18.26",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  });
+
+  const review = await page.request.post(`/host-actions/${host}/update-restart/review`, {
+    headers: { "x-pharos-action": "1" },
+    data: {},
+  });
+  expect(review.status()).toBe(202);
+
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData?.kernel?.state).toBe("reboot_required");
+  expect(hostData?.lifecycle?.slot).toBe("update_restart");
+
+  await page.goto("/");
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const kernelDetails = card.locator("[data-kernel-posture]");
+  const expectDormantKernelMetadataAbsent = async () => {
+    await expect(card.locator("[data-kernel-slot]")).toBeHidden();
+    await expect(kernelDetails).not.toHaveAttribute("data-lifecycle-slot");
+    await expect(kernelDetails).not.toHaveAttribute("data-lifecycle-level");
+    await expect(kernelDetails).not.toHaveAttribute("data-lifecycle-invoke");
+  };
+  await expectDormantKernelMetadataAbsent();
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await expectDormantKernelMetadataAbsent();
+  await expect(card.locator("[data-host-action-note]")).toBeVisible();
 });

@@ -354,9 +354,11 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    let action_jobs: Vec<_> = hosts
-        .iter()
-        .filter_map(|host| state.host_actions.most_relevant_for_host(&host.name))
+    let action_jobs: Vec<_> = state
+        .host_actions
+        .list()
+        .into_iter()
+        .filter(|job| access.allows_host(&job.host))
         .collect();
     // PHAROS-194: the removal dialog must name credential retirement before the
     // operator confirms. An unavailable generation is reported as unmanaged here;
@@ -957,12 +959,19 @@ pub(super) fn kernel_posture_markup(
     } else {
         "Restart required"
     };
+    let lifecycle_attributes = if selected {
+        format!(
+            r#" data-lifecycle-slot="{}" data-lifecycle-level="{}" data-lifecycle-invoke="{}""#,
+            lifecycle.slot.key(),
+            lifecycle.level,
+            lifecycle.invoke.key(),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<div class="kernel-slot" data-kernel-slot{hidden}><details class="kernel-posture" data-kernel-posture data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}"><summary>{icon}<span>{label}</span></summary><div class="kernel-detail"><strong>{label}</strong><p data-kernel-explanation>{explanation}</p><dl><div><dt>Running</dt><dd data-kernel-running>{running}</dd></div><div><dt>Ready after restart</dt><dd data-kernel-expected>{expected}</dd></div></dl><p class="kernel-boundary">Pharos will not restart this host.</p></div></details></div>"#,
+        r#"<div class="kernel-slot" data-kernel-slot{hidden}><details class="kernel-posture" data-kernel-posture{lifecycle_attributes}><summary>{icon}<span>{label}</span></summary><div class="kernel-detail"><strong>{label}</strong><p data-kernel-explanation>{explanation}</p><dl><div><dt>Running</dt><dd data-kernel-running>{running}</dd></div><div><dt>Ready after restart</dt><dd data-kernel-expected>{expected}</dd></div></dl><p class="kernel-boundary">Pharos will not restart this host.</p></div></details></div>"#,
         icon = icons::REFRESH_CW,
-        slot = lifecycle.slot.key(),
-        level = lifecycle.level,
-        invoke = lifecycle.invoke.key(),
         label = html_escape(label),
         explanation = html_escape(&explanation),
         running = html_escape(running),

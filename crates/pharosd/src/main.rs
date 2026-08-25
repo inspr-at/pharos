@@ -2168,9 +2168,11 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    let action_jobs: Vec<_> = runtime_hosts
-        .iter()
-        .filter_map(|host| state.host_actions.most_relevant_for_host(&host.name))
+    let action_jobs: Vec<_> = state
+        .host_actions
+        .list()
+        .into_iter()
+        .filter(|job| access.allows_host(&job.host))
         .collect();
     let mut payload = hosts_payload(
         runtime_hosts,
@@ -5307,6 +5309,65 @@ mod tests {
     }
 
     #[test]
+    fn hosts_payload_lifecycle_run_id_differs_from_legacy_host_action() {
+        let store = HostActionStore::new(None);
+        let mut cancelled_settings = store
+            .begin_settings_change("diverge-host", "markus", 100)
+            .expect("settings workflow created");
+        cancelled_settings.state = HostActionState::Cancelled;
+        cancelled_settings.updated_at = 101;
+        let proposal = store
+            .begin_system_update_proposal("diverge-host", "markus", 200)
+            .expect("system update proposal created");
+        let action_jobs = vec![cancelled_settings, proposal];
+        let host = host_with_backups("diverge-host", 970, vec![]);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &action_jobs, 1000);
+        let emitted = payload["hosts"][0].as_object().expect("host object");
+        let lifecycle = emitted["lifecycle"].as_object().expect("lifecycle object");
+        let host_action = emitted["host_action"]
+            .as_object()
+            .expect("host_action object");
+        assert_eq!(lifecycle["slot"], "settings_change");
+        assert_eq!(lifecycle["run_id"], action_jobs[0].id);
+        assert_eq!(host_action["id"], action_jobs[1].id);
+        assert_ne!(lifecycle["run_id"], host_action["id"]);
+    }
+
+    #[test]
+    fn fleet_render_hides_kernel_drift_when_update_restart_wins_lifecycle() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 100)
+            .expect("settings workflow created");
+        store
+            .fail_settings_change(&settings.id, 101)
+            .expect("settings workflow failed");
+        store
+            .create_update_review("hsb8", "markus", 200)
+            .expect("update restart review created");
+        let mut host = host_with_backups("hsb8", 970, vec![]);
+        host.kernel = Some(reboot_required_kernel(965));
+        let action_jobs = store.list();
+        let html = render_home(
+            RuntimeSnapshot {
+                hosts: std::slice::from_ref(&host),
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: None,
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(html.contains("review queued"));
+        assert!(html.contains(r#"data-lifecycle-invoke="update_restart""#));
+        assert!(html.contains(r#"data-kernel-slot hidden"#));
+    }
+
+    #[test]
     fn hosts_payload_and_fleet_expose_only_actionable_kernel_posture() {
         let mut staged = host_with_backups("csb0", 970, vec![]);
         staged.kernel = Some(reboot_required_kernel(965));
@@ -7199,6 +7260,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(FOOT.contains("event.target.closest('[data-host-action-note]')"));
         assert!(FOOT.contains("actionNote.dataset.lifecycleInvoke"));
         assert!(FOOT.contains("actionNote.dataset.lifecycleRunId"));
+        assert!(FOOT.contains("workflowInteractive"));
         assert!(FOOT.contains("const details=slot.querySelector('[data-kernel-posture]');"));
     }
 

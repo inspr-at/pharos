@@ -720,10 +720,35 @@ function kernelNeedsRestart(kernel){
 function kernelSearch(kernel){
   return kernelNeedsRestart(kernel)?'restart required restart needed kernel reboot required '+kernel.running_version+' '+kernel.expected_version:'';
 }
+function kernelLifecycleActive(lifecycle){
+  return String(lifecycle?.slot||'')==='kernel_drift';
+}
 function updateKernel(surface,host){
+  const lifecycle=host.lifecycle||null;
+  const kernelSelected=kernelLifecycleActive(lifecycle);
   const slot=surface.querySelector('[data-kernel-slot]');
-  if(!slot||slot.hidden)return;
+  if(!slot)return;
+  slot.hidden=!kernelSelected;
   const details=slot.querySelector('[data-kernel-posture]');
+  if(!kernelSelected){
+    if(details?.open)details.open=false;
+    if(details){
+      delete details.dataset.lifecycleSlot;
+      delete details.dataset.lifecycleLevel;
+      delete details.dataset.lifecycleInvoke;
+    }
+    return;
+  }
+  const kernel=host.kernel||{};
+  const level=String(lifecycle?.level||'warning');
+  const invoke=String(lifecycle?.invoke||'kernel_details');
+  if(details){
+    details.dataset.lifecycleSlot='kernel_drift';
+    details.dataset.lifecycleLevel=level;
+    details.dataset.lifecycleInvoke=invoke;
+    const summaryLabel=details.querySelector('summary span');
+    if(summaryLabel)summaryLabel.textContent=String(lifecycle?.label||'Restart required');
+  }
   const healthy=host.liveness==='live';
   const explanation=healthy
     ? String(host.name||'This host')+' is healthy. A newer system kernel is ready for its next planned restart.'
@@ -732,8 +757,8 @@ function updateKernel(surface,host){
   const running=slot.querySelector('[data-kernel-running]');
   const expected=slot.querySelector('[data-kernel-expected]');
   if(explanationNode)explanationNode.textContent=explanation;
-  if(running)running.textContent=host.kernel.running_version;
-  if(expected)expected.textContent=host.kernel.expected_version;
+  if(running)running.textContent=kernel.running_version||'not reported';
+  if(expected)expected.textContent=kernel.expected_version||'not reported';
 }
 function freshnessAttention(f,now){
   if(!f||f.applicable===false)return null;
@@ -808,9 +833,13 @@ function setReason(surface,reason){
   const text=el.querySelector('span');
   if(text)text.textContent=reason.label;
 }
-function updateReasonVisibility(surface,reason,freshness,kernel,now){
+function updateReasonVisibility(surface,reason,freshness,kernel,now,lifecycle){
   const el=surface.querySelector('[data-reason]');
   if(!el)return;
+  if(kernelLifecycleActive(lifecycle)){
+    el.hidden=true;
+    return;
+  }
   const restart=kernelNeedsRestart(kernel);
   if(!surface.matches('.card')){
     el.hidden=restart;
@@ -851,24 +880,28 @@ function lifecycleSettingsLabel(lifecycle,surface){
 function lifecycleWorkflowShown(lifecycle){
   return lifecycle&&(lifecycle.invoke==='workflow'||lifecycle.invoke==='update_restart');
 }
-function updateHostLifecycle(surface,host){
-  const lifecycle=host.lifecycle||null;
-  const slot=String(lifecycle?.slot||'quiet');
-  const invoke=String(lifecycle?.invoke||'host_settings');
-  const label=String(lifecycle?.label||'');
-  const level=String(lifecycle?.level||'clear');
-  const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
-  const name=surface.dataset.host||'host';
+function updateSettingsStateSurfaces(surface,host,lifecycle){
+  const state=String(host.preferences_state||'applied');
   const settingsLabel=lifecycleSettingsLabel(lifecycle,surface);
-  const settingsTitle=settingsLabel?(settingsLabel+' for '+name):('Open host settings for '+name);
-  const settingsLink=surface.querySelector('[data-settings-state]');
-  if(settingsLink){
-    settingsLink.title=settingsTitle;
-    settingsLink.setAttribute('aria-label',settingsTitle);
-  }
+  const name=surface.dataset.host||'host';
+  const settingsTitle=(lifecycle?.invoke==='host_settings'&&String(lifecycle?.slot||'quiet')!=='quiet'&&settingsLabel)
+    ? (settingsLabel+' for '+name)
+    : ('Open host settings for '+name);
+  surface.querySelectorAll('[data-settings-state]').forEach(node=>{
+    node.dataset.settingsState=state;
+  });
+  surface.querySelectorAll('a[data-settings-state], [data-settings-note]').forEach(link=>{
+    link.title=settingsTitle;
+    link.setAttribute('aria-label',settingsTitle);
+  });
   const settingsNote=surface.querySelector('[data-settings-note]');
   if(settingsNote){
     settingsNote.hidden=!settingsLabel;
+    settingsNote.dataset.settingsState=state;
+    const slot=String(lifecycle?.slot||'quiet');
+    const invoke=String(lifecycle?.invoke||'host_settings');
+    const level=String(lifecycle?.level||'clear');
+    const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
     settingsNote.dataset.lifecycleSlot=slot;
     settingsNote.dataset.lifecycleLevel=level;
     settingsNote.dataset.lifecycleInvoke=invoke;
@@ -877,8 +910,19 @@ function updateHostLifecycle(surface,host){
     const copy=settingsNote.querySelector('[data-settings-note-copy]');
     if(copy)copy.textContent=settingsLabel;
   }
+}
+function updateHostLifecycle(surface,host){
+  const lifecycle=host.lifecycle||null;
+  const slot=String(lifecycle?.slot||'quiet');
+  const invoke=String(lifecycle?.invoke||'host_settings');
+  const label=String(lifecycle?.label||'');
+  const level=String(lifecycle?.level||'clear');
+  const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
+  const actionsRoot=surface.querySelector('[data-host-actions]');
+  const workflowInteractive=Boolean(actionsRoot);
+  updateSettingsStateSurfaces(surface,host,lifecycle);
   const actionNote=surface.querySelector('[data-host-action-note]');
-  const workflowShown=lifecycleWorkflowShown(lifecycle);
+  const workflowShown=lifecycleWorkflowShown(lifecycle)&&workflowInteractive;
   if(actionNote){
     actionNote.hidden=!workflowShown;
     actionNote.dataset.actionLevel=level;
@@ -890,26 +934,9 @@ function updateHostLifecycle(surface,host){
     const copy=actionNote.querySelector('[data-host-action-note-copy]');
     if(copy)copy.textContent=workflowShown?label:'';
   }
-  const kernelSlot=surface.querySelector('[data-kernel-slot]');
-  const kernelSelected=slot==='kernel_drift';
-  if(kernelSlot){
-    kernelSlot.hidden=!kernelSelected;
-    const details=kernelSlot.querySelector('[data-kernel-posture]');
-    if(details){
-      details.dataset.lifecycleSlot=slot;
-      details.dataset.lifecycleLevel=level;
-      details.dataset.lifecycleInvoke=invoke;
-      const summaryLabel=details.querySelector('summary span');
-      if(summaryLabel&&kernelSelected)summaryLabel.textContent=label||'Restart required';
-      if(!kernelSelected&&details.open)details.open=false;
-    }
-  }
-  const reason=surface.querySelector('[data-reason]');
-  if(reason)reason.hidden=kernelSelected;
-  const actionsRoot=surface.querySelector('[data-host-actions]');
   const dot=actionsRoot?.querySelector('[data-host-action-dot]');
   if(dot)dot.hidden=slot==='quiet';
-  if(openHostActionsRoot===actionsRoot)positionHostActions(actionsRoot);
+  if(actionsRoot&&openHostActionsRoot===actionsRoot)positionHostActions(actionsRoot);
 }
 function updatePreferenceState(surface,host){
   const applied=host.preferences||{};
@@ -925,8 +952,6 @@ function updatePreferenceState(surface,host){
   else surface.style.removeProperty('--host-color');
   if(validColor(pendingColor))surface.style.setProperty('--pending-color',pendingColor);
   else surface.style.removeProperty('--pending-color');
-  const link=surface.querySelector('[data-settings-state]');
-  if(link)link.dataset.settingsState=state;
 }
 function markHtml(beats,interval,windowDef=signalWindow){
   const kept=Array.from(new Set(beats)).sort((a,b)=>a-b);
@@ -3292,12 +3317,12 @@ function applyFleetSnapshot(data){
       const word=card.querySelector('[data-status-word]');
       if(word)word.textContent=words[h.liveness]||h.liveness;
       setReason(card,attention);
-      updateKernel(card,h);
-      updateReasonVisibility(card,attention,h.freshness,h.kernel,now);
-      updateMuted(card,muted);
       updatePreferenceState(card,h);
       updateHostActionState(card,h,backup);
       updateHostLifecycle(card,h);
+      updateKernel(card,h);
+      updateReasonVisibility(card,attention,h.freshness,h.kernel,now,h.lifecycle);
+      updateMuted(card,muted);
       updateFreshness(card,h.freshness,now);
       updateBackup(card,backup);
       setSeen(card,h.last_seen,now);

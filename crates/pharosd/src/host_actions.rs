@@ -1958,11 +1958,14 @@ fn host_action_priority(job: &HostActionJob) -> u8 {
         ) => 0,
         (HostWorkflowKind::UpdateRestart, _) => 3,
         (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => 0,
-        (HostWorkflowKind::SettingsChange, HostActionState::Cancelled) => 0,
+        (
+            HostWorkflowKind::SettingsChange,
+            HostActionState::Cancelled | HostActionState::Failed,
+        ) => 0,
         (HostWorkflowKind::SettingsChange, _) => 2,
         (
             HostWorkflowKind::SystemUpdateProposal,
-            HostActionState::Succeeded | HostActionState::Cancelled,
+            HostActionState::Succeeded | HostActionState::Cancelled | HostActionState::Failed,
         ) => 0,
         (HostWorkflowKind::SystemUpdateProposal, _) => 1,
     }
@@ -2055,23 +2058,6 @@ fn most_relevant_lifecycle_run<'a>(
         .into_iter()
         .filter(|job| lifecycle_run_slot(job).is_some())
         .max_by_key(|job| (lifecycle_run_priority(job), job.updated_at, job.created_at))
-}
-
-fn most_relevant_host_action_refs<'a>(
-    jobs: &'a BTreeMap<String, HostActionJob>,
-    host: &str,
-) -> Option<&'a HostActionJob> {
-    jobs.values()
-        .filter(|job| job.host == host)
-        .filter(|job| {
-            !jobs.values().any(|other| {
-                other.host == host
-                    && other.workflow_kind() == job.workflow_kind()
-                    && (other.created_at, other.updated_at, &other.id)
-                        > (job.created_at, job.updated_at, &job.id)
-            })
-        })
-        .max_by_key(|job| (host_action_priority(job), job.updated_at, job.created_at))
 }
 
 fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle {
@@ -2383,11 +2369,6 @@ impl HostActionStore {
             .filter(|job| job.host == host)
             .max_by_key(|job| job.updated_at)
             .cloned()
-    }
-
-    pub(crate) fn most_relevant_for_host(&self, host: &str) -> Option<HostActionJob> {
-        let jobs = self.jobs.read().expect("host action store lock");
-        most_relevant_host_action_refs(&jobs, host).cloned()
     }
 
     fn record_proposal(
@@ -4721,9 +4702,9 @@ mod tests {
             .expect("replacement settings workflow persisted")
             .expect("replacement settings workflow completed");
 
-        let relevant = store
-            .most_relevant_for_host("hsb8")
-            .expect("relevant settings workflow");
+        let jobs = store.list();
+        let relevant =
+            most_relevant_host_action(&jobs, "hsb8").expect("relevant settings workflow");
         assert_eq!(relevant.id, retry.id);
         assert_eq!(relevant.state, HostActionState::Succeeded);
     }
@@ -4851,6 +4832,33 @@ mod tests {
         assert_eq!(lifecycle.slot, HostLifecycleSlot::SettingsChange);
         assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[0].id.as_str()));
         assert_ne!(lifecycle.label, "Change requested");
+    }
+
+    #[test]
+    fn failed_settings_wins_lifecycle_but_live_proposal_wins_host_action_selector() {
+        let jobs = vec![
+            lifecycle_job(
+                HostWorkflowKind::SettingsChange,
+                HostActionState::Failed,
+                100,
+            ),
+            lifecycle_job(
+                HostWorkflowKind::SystemUpdateProposal,
+                HostActionState::ProposalRequested,
+                200,
+            ),
+        ];
+        let legacy = most_relevant_host_action(&jobs, "hsb8").expect("live proposal");
+        assert_eq!(
+            legacy.workflow_kind(),
+            HostWorkflowKind::SystemUpdateProposal
+        );
+        assert_eq!(legacy.id, jobs[1].id);
+
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::RequestPending, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::SettingsChange);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[0].id.as_str()));
+        assert_ne!(lifecycle.run_id.as_deref(), Some(legacy.id.as_str()));
     }
 
     #[test]
