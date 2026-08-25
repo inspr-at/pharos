@@ -1522,8 +1522,8 @@ test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", asyn
 
 test("saved update-restart stays read-only until the exact job renders", async ({
   page,
-}) => {
-  const host = "bl-saved-restart-loading";
+}, testInfo) => {
+  const host = `bl-saved-restart-loading-${testInfo.project.name}`;
   await reportRuntimeHost(page, host, {
     is_nix: true,
     kernel: {

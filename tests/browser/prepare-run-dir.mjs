@@ -85,6 +85,7 @@ const currentPath = path.join(operatorRoot, "current");
 fs.writeFileSync(currentPath, `${generation}\n`, { mode: 0o600 });
 
 const KERNEL_VS_RESTART_PROJECTS = ["chromium-mobile"];
+const SAVED_RESTART_LOADING_PROJECTS = ["chromium-desktop", "chromium-mobile"];
 const PREFS_DECLARED_DRIFT_HOST = "bl-prefs-declared-drift";
 
 function janusReadyHostManifest(hostName) {
@@ -138,8 +139,13 @@ function declaredDriftHostManifest(hostName) {
 
 const manifestDir = path.join(runDir, "manifests");
 fs.mkdirSync(manifestDir, { recursive: true, mode: 0o700 });
-const manifestPaths = KERNEL_VS_RESTART_PROJECTS.map((project) => {
-  const hostName = `bl-kernel-vs-restart-${project}`;
+const janusReadyHostNames = [
+  ...KERNEL_VS_RESTART_PROJECTS.map((project) => `bl-kernel-vs-restart-${project}`),
+  ...SAVED_RESTART_LOADING_PROJECTS.map(
+    (project) => `bl-saved-restart-loading-${project}`,
+  ),
+];
+const manifestPaths = janusReadyHostNames.map((hostName) => {
   const manifestPath = path.join(manifestDir, `${hostName}.json`);
   fs.writeFileSync(
     manifestPath,
