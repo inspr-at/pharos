@@ -7163,6 +7163,24 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )));
         assert!(!run_card.contains("Change requested"));
 
+        let read_only_html = render_home(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: Some(&declarations),
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("viewer", true),
+            false,
+        );
+        let read_only_run = rendered_card(&read_only_html, "run-target");
+        assert!(read_only_run.contains("data-host-action-note hidden"));
+        assert!(!read_only_run.contains("data-host-actions"));
+
         let kernel_card = rendered_card(&html, "kernel-target");
         assert!(kernel_card.contains(
             r#"<div class="kernel-slot" data-kernel-slot><details class="kernel-posture" data-kernel-posture data-lifecycle-slot="kernel_drift" data-lifecycle-level="warning" data-lifecycle-invoke="kernel_details">"#

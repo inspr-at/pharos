@@ -3805,11 +3805,11 @@ pub(super) fn settings_note_markup(
     )
 }
 
-pub(super) fn host_action_note_markup(lifecycle: &HostLifecycle) -> String {
+pub(super) fn host_action_note_markup(lifecycle: &HostLifecycle, interactive: bool) -> String {
     let shown = matches!(
         lifecycle.invoke,
         HostLifecycleInvoke::Workflow | HostLifecycleInvoke::UpdateRestart
-    );
+    ) && interactive;
     let hidden = if shown { "" } else { " hidden" };
     let label = if shown { lifecycle.label.as_str() } else { "" };
     format!(
@@ -6311,7 +6311,7 @@ pub(super) fn render_home_with_capabilities(
             &settings_title,
             false,
         );
-        let card_action_note = host_action_note_markup(&lifecycle);
+        let card_action_note = host_action_note_markup(&lifecycle, can_onboard);
         let row_action_note = card_action_note.clone();
         let drag_action = format!(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
