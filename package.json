@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:browser": "bash -euo pipefail -c 'node --test tests/browser/harness-path.test.mjs tests/browser/harness-auth.test.mjs tests/browser/harness-config.test.mjs tests/browser/harness-startup.test.mjs && node tests/browser/run-playwright.mjs'",
+    "test:browser": "bash -euo pipefail -c 'node --test tests/browser/harness-path.test.mjs tests/browser/harness-auth.test.mjs tests/browser/harness-config.test.mjs tests/browser/harness-startup.test.mjs && node tests/browser/pharosd-browser-server-selftest.mjs && node tests/browser/run-playwright.mjs'",
     "test:browser:update": "node tests/browser/run-playwright.mjs --update-snapshots"
   },
   "devDependencies": {

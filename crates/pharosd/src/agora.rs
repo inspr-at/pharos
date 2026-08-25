@@ -349,12 +349,36 @@ pub(crate) async fn request_host_preferences(
     {
         Ok(workflow) => workflow,
         Err(HostActionStoreError::ActiveJob) => {
+            let active = state
+                .host_actions
+                .latest_settings_change_for_host(canonical_host);
+            let summary = active.as_ref().map(|job| job.summary());
+            let workflow_html = summary
+                .as_ref()
+                .map(|summary| crate::host_workflow_markup(&summary.workflow));
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
-                    "error": "A settings change is already waiting for this host"
+                    "error": "A settings change is already waiting for this host",
+                    "message": "Review the saved settings workflow before sending another request.",
+                    "job": summary,
+                    "workflow_html": workflow_html,
                 })),
             );
+        }
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            match state
+                .host_actions
+                .latest_settings_change_for_host(canonical_host)
+            {
+                Some(workflow) => workflow,
+                None => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "The settings workflow could not be recorded" })),
+                    );
+                }
+            }
         }
         Err(_) => {
             return (
@@ -363,6 +387,35 @@ pub(crate) async fn request_host_preferences(
             );
         }
     };
+    let workflow = if runtime_host.is_nix {
+        match state.host_actions.record_settings_request(
+            &workflow.id,
+            &request.preferences,
+            crate::now_unix(),
+        ) {
+            Ok(job) => job,
+            Err(HostActionStoreError::PersistenceCommitted) => state
+                .host_actions
+                .get(&workflow.id)
+                .unwrap_or_else(|| workflow.clone()),
+            Err(_) => {
+                let failed = state
+                    .host_actions
+                    .fail_settings_change(&workflow.id, crate::now_unix())
+                    .unwrap_or(workflow);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "The settings request could not be saved before repository dispatch",
+                        "job": failed.summary(),
+                        "workflow_html": crate::host_workflow_markup(&failed.summary().workflow),
+                    })),
+                );
+            }
+        }
+    } else {
+        workflow
+    };
 
     let dispatch_request_id = if runtime_host.is_nix {
         match state
@@ -370,12 +423,42 @@ pub(crate) async fn request_host_preferences(
             .dispatch(canonical_host, &request.preferences)
             .await
         {
-            Ok(request_id) => Some(request_id),
-            Err(error) => {
-                let failed = state
+            Ok(request_id) => {
+                match state
                     .host_actions
-                    .fail_settings_change(&workflow.id, crate::now_unix())
-                    .ok();
+                    .mark_dispatch_submitted(&workflow.id, crate::now_unix())
+                {
+                    Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+                    Err(_) => {
+                        let current = state
+                            .host_actions
+                            .fail_settings_change_uncertain(&workflow.id, crate::now_unix())
+                            .ok()
+                            .or_else(|| state.host_actions.get(&workflow.id))
+                            .unwrap_or_else(|| workflow.clone());
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({
+                                "error": "nixcfg accepted the settings request, but Pharos could not save that handoff. Verify nixcfg before any retry.",
+                                "job": current.summary(),
+                                "workflow_html": crate::host_workflow_markup(&current.summary().workflow),
+                            })),
+                        );
+                    }
+                }
+                Some(request_id)
+            }
+            Err(error) => {
+                let failed = match error {
+                    NixcfgDispatchError::OutcomeUncertain => state
+                        .host_actions
+                        .fail_settings_change_uncertain(&workflow.id, crate::now_unix())
+                        .ok(),
+                    _ => state
+                        .host_actions
+                        .fail_settings_change(&workflow.id, crate::now_unix())
+                        .ok(),
+                };
                 let status = match &error {
                     NixcfgDispatchError::Disabled | NixcfgDispatchError::CredentialUnavailable => {
                         StatusCode::SERVICE_UNAVAILABLE
@@ -383,9 +466,8 @@ pub(crate) async fn request_host_preferences(
                     NixcfgDispatchError::InvalidHost
                     | NixcfgDispatchError::InvalidPreferences
                     | NixcfgDispatchError::InvalidRemovalIntent => StatusCode::BAD_REQUEST,
-                    NixcfgDispatchError::RequestFailed | NixcfgDispatchError::Rejected(_) => {
-                        StatusCode::BAD_GATEWAY
-                    }
+                    NixcfgDispatchError::OutcomeUncertain => StatusCode::CONFLICT,
+                    NixcfgDispatchError::Rejected(_) => StatusCode::BAD_GATEWAY,
                 };
                 return (
                     status,
@@ -413,6 +495,10 @@ pub(crate) async fn request_host_preferences(
                 .accept_settings_change(&workflow.id, crate::now_unix())
             {
                 Ok(workflow) => workflow,
+                Err(HostActionStoreError::PersistenceCommitted) => state
+                    .host_actions
+                    .get(&workflow.id)
+                    .unwrap_or(workflow.clone()),
                 Err(_) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -472,6 +558,20 @@ pub(crate) async fn request_host_preferences(
             unreachable!("runtime host checked before workflow dispatch")
         }
         Err(error) => {
+            if dispatch_request_id.is_some() {
+                let submitted = state
+                    .host_actions
+                    .get(&workflow.id)
+                    .unwrap_or_else(|| workflow.clone());
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "nixcfg accepted the settings request, but Pharos could not persist the local pending record; do not resend it",
+                        "job": submitted.summary(),
+                        "workflow_html": crate::host_workflow_markup(&submitted.summary().workflow),
+                    })),
+                );
+            }
             let failed = state
                 .host_actions
                 .fail_settings_change(&workflow.id, crate::now_unix())
@@ -644,6 +744,7 @@ function renderSettingsWorkflow(data){{
   const job=data?.job;
   if(!job)return;
   const workflow=job.workflow||{{}};
+  const primaryAction=workflow.primary_action||null;
   const overlay=document.querySelector('[data-host-action-overlay]');
   const dialog=overlay?.querySelector('[data-host-action-dialog]');
   if(!overlay||!dialog)return;
@@ -666,7 +767,12 @@ function renderSettingsWorkflow(data){{
   if(facts)facts.hidden=true;
   if(technical)technical.hidden=true;
   if(checklist){{checklist.hidden=false;checklist.innerHTML=data.workflow_html||''}}
-  if(primary)primary.hidden=true;
+  if(primary){{
+    primary.hidden=!['acknowledge','recover'].includes(primaryAction?.kind||'');
+    primary.disabled=false;
+    primary.dataset.workflowAction=primaryAction?.kind||'';
+    primary.textContent=primaryAction?.label||'Continue';
+  }}
   if(cancel)cancel.textContent='Close';
   if(status)status.textContent=data.message||'';
   if(safe)safe.textContent='Persisted and reviewable';
@@ -704,6 +810,27 @@ async function pollSettingsWorkflow(id){{
 }}
 document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
   if(event.target.closest('[data-host-action-close]')){{event.preventDefault();closeSettingsWorkflow()}}
+  const acknowledge=event.target.closest('[data-host-action-primary]');
+  if(acknowledge&&settingsWorkflow.id){{
+    event.preventDefault();
+    acknowledge.disabled=true;
+    const recover=acknowledge.dataset.workflowAction==='recover';
+    const endpoint=recover?'reconcile-accepted-dispatch':'acknowledge-dispatch-uncertainty';
+    fetch('/host-actions/jobs/'+encodeURIComponent(settingsWorkflow.id)+'/'+endpoint,{{
+      method:'POST',
+      credentials:'same-origin',
+      headers:{{'Content-Type':'application/json','X-Pharos-Action':'1'}},
+      body:'{{}}',
+    }}).then(async response=>{{
+      const data=await response.json().catch(()=>({{}}));
+      if(!response.ok)throw new Error(data.error||'Could not reconcile the saved workflow.');
+      renderSettingsWorkflow(data);
+    }}).catch(error=>{{
+      const status=document.querySelector('[data-host-action-status]');
+      if(status)status.textContent=error.message||'Could not reconcile the saved workflow.';
+      acknowledge.disabled=false;
+    }});
+  }}
 }});
 document.addEventListener('keydown',event=>{{if(event.key==='Escape'&&settingsWorkflow.id){{event.preventDefault();closeSettingsWorkflow()}}}});
 document.addEventListener('visibilitychange',()=>{{

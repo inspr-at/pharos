@@ -5329,7 +5329,7 @@ pub(super) fn activity_events(
                 ("info", "System update review requested")
             }
             (HostWorkflowKind::SystemUpdateProposal, HostActionState::Succeeded) => {
-                ("recovery", "System update review completed")
+                ("recovery", "System update review handed to nixcfg")
             }
             (HostWorkflowKind::SystemUpdateProposal, HostActionState::Failed) => {
                 ("warning", "System update review stopped")
