@@ -5268,6 +5268,9 @@ mod tests {
         ));
         assert!(html.contains(r#"data-host-action-cancel hidden"#));
         assert!(html.contains("openRequestedWorkflow()"));
+        assert!(html.contains(
+            "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'),workflowId)"
+        ));
     }
 
     #[test]

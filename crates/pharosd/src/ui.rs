@@ -227,6 +227,37 @@ mod module_tests {
     }
 
     #[test]
+    fn requested_workflow_passes_the_query_job_id_without_host_action_fallback() {
+        let opener = FOOT
+            .split("function openRequestedWorkflow()")
+            .nth(1)
+            .and_then(|rest| rest.split("function parseBeats").next())
+            .expect("openRequestedWorkflow");
+        assert!(opener.contains(
+            "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'),workflowId)"
+        ));
+        assert!(!opener.contains("host_action"));
+        assert!(!opener.contains("storedMatches"));
+    }
+
+    #[test]
+    fn lifecycle_sheet_hides_every_workflow_only_section() {
+        let sheet = FOOT
+            .split("function openHostLifecycleSheet")
+            .nth(1)
+            .and_then(|rest| rest.split("function updateSettingsLinkSurfaces").next())
+            .expect("openHostLifecycleSheet");
+        assert!(sheet.contains("if(confirm)confirm.hidden=true"));
+        assert!(sheet.contains("if(dispositionField)dispositionField.hidden=true"));
+        assert!(sheet.contains("if(successorField)successorField.hidden=true"));
+        assert!(sheet.contains("if(attendedConfirm)attendedConfirm.hidden=true"));
+        assert!(sheet.contains("[data-host-remove-confirm]"));
+        assert!(sheet.contains("[data-host-remove-disposition-field]"));
+        assert!(sheet.contains("[data-host-remove-successor]"));
+        assert!(sheet.contains("[data-host-attended-confirm]"));
+    }
+
+    #[test]
     fn preferences_summary_matches_safe_fleet_fact_format() {
         let prefs = HostPreferences {
             accent: Some("#48b8a8".to_string()),

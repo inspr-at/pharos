@@ -656,7 +656,7 @@ function openRequestedWorkflow(){
   const root=surface?.querySelector('[data-host-actions]');
   if(!root)return;
   root.dataset.actionJobId=workflowId;
-  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));
+  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'),workflowId);
 }
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
 function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
@@ -975,6 +975,14 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   const primary=dialog.querySelector('[data-host-action-primary]');
   const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
   const cancelRequest=dialog.querySelector('[data-host-action-cancel]');
+  const confirm=dialog.querySelector('[data-host-remove-confirm]');
+  const removeInput=dialog.querySelector('[data-host-remove-input]');
+  const dispositionField=dialog.querySelector('[data-host-remove-disposition-field]');
+  const disposition=dialog.querySelector('[data-host-remove-disposition]');
+  const successorField=dialog.querySelector('[data-host-remove-successor]');
+  const successorInput=dialog.querySelector('[data-host-remove-successor-input]');
+  const attendedConfirm=dialog.querySelector('[data-host-attended-confirm]');
+  const attendedInput=dialog.querySelector('[data-host-attended-input]');
   const status=dialog.querySelector('[data-host-action-status]');
   const facts=dialog.querySelector('[data-host-action-facts]');
   const workflow=dialog.querySelector('[data-host-workflow]');
@@ -983,6 +991,14 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   if(primary){primary.hidden=true;primary.disabled=false;primary.classList.remove('danger')}
   if(cancel)cancel.textContent='Close';
   if(cancelRequest){cancelRequest.hidden=true;cancelRequest.disabled=false}
+  if(confirm)confirm.hidden=true;
+  if(dispositionField)dispositionField.hidden=true;
+  if(successorField)successorField.hidden=true;
+  if(attendedConfirm)attendedConfirm.hidden=true;
+  if(removeInput)removeInput.value='';
+  if(disposition)disposition.value='';
+  if(successorInput)successorInput.value='';
+  if(attendedInput)attendedInput.checked=false;
   if(technical)technical.hidden=true;
   if(workflow){workflow.hidden=true;workflow.replaceChildren()}
   if(info)info.hidden=false;

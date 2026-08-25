@@ -1001,6 +1001,16 @@ async function applyServerFleetSnapshot(page) {
   return page.evaluate((body) => applyFleetSnapshot(body), payload);
 }
 
+async function expectInformationalWorkflowControlsHidden(dialog) {
+  await expect(dialog.locator("[data-host-remove-disposition-field]")).toBeHidden();
+  await expect(dialog.locator("[data-host-remove-successor]")).toBeHidden();
+  await expect(dialog.locator("[data-host-remove-confirm]")).toBeHidden();
+  await expect(dialog.locator("[data-host-attended-confirm]")).toBeHidden();
+  await expect(dialog.locator("[data-host-workflow]")).toBeHidden();
+  await expect(dialog.locator("[data-host-action-technical]")).toBeHidden();
+  await expect(dialog.locator("[data-host-action-primary]")).toBeHidden();
+}
+
 test("fleet refresh consumes server-emitted lifecycle for failed settings", async ({
   page,
 }) => {
@@ -2306,4 +2316,204 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
     { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
   );
   expect(reonboard.ok()).toBe(true);
+});
+
+test("activity workflow query polls the requested job id", async ({ page }, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "activity workflow fixture requires local harness manifest",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
+
+  const host = `bl-activity-workflow-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { is_nix: true });
+  const settings = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#48b8a8" } },
+  });
+  expect(settings.status()).toBe(409);
+  const requestedJobId = (await settings.json()).job.id;
+  expect(requestedJobId).toMatch(/^[A-Za-z0-9_-]{8,128}$/);
+
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
+  const proposal = await page.request.post("/host-actions/system-update", {
+    headers: { "x-pharos-action": "1" },
+    data: { host },
+  });
+  expect(proposal.status()).toBe(202);
+
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData?.lifecycle?.run_id).toBe(requestedJobId);
+  expect(hostData?.host_action?.id).toBeTruthy();
+  expect(hostData.lifecycle.run_id).not.toBe(hostData.host_action.id);
+  const legacyJobId = hostData.host_action.id;
+
+  const jobGets = [];
+  page.on("request", (request) => {
+    if (
+      request.url().includes("/host-actions/jobs/") &&
+      request.method() === "GET"
+    ) {
+      jobGets.push(request.url());
+    }
+  });
+  const pollResponsePromise = page.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .includes(`/host-actions/jobs/${encodeURIComponent(requestedJobId)}`) &&
+      response.request().method() === "GET",
+  );
+  await page.goto(`/?host=${host}&workflow=${encodeURIComponent(requestedJobId)}`);
+  const pollResponse = await pollResponsePromise;
+  expect(pollResponse.ok()).toBe(true);
+  const pollPayload = await pollResponse.json();
+  expect(pollPayload.job.id).toBe(requestedJobId);
+  expect(pollPayload.job.id).not.toBe(legacyJobId);
+  expect(
+    jobGets.some((url) =>
+      url.includes(`/host-actions/jobs/${encodeURIComponent(legacyJobId)}`),
+    ),
+  ).toBe(false);
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-workflow]")).not.toBeEmpty();
+  await expect(dialog.locator("[data-host-action-copy]")).not.toHaveText(
+    "Loading the saved execution checklist...",
+  );
+  await expect(page).toHaveURL(new RegExp(`[?&]host=${host}`));
+  await expect(page).not.toHaveURL(/\/agora/);
+
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
+  const cleanup = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(cleanup.status()).toBe(202);
+  const cleanupReonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(cleanupReonboard.ok()).toBe(true);
+});
+
+test("informational lifecycle sheets hide leftover workflow controls", async ({
+  page,
+}) => {
+  const quietHost = "bl-sheet-reuse-quiet";
+  const kernelHost = "bl-sheet-reuse-kernel";
+  await reportRuntimeHost(page, quietHost, { preferences: { accent: "#224466" } });
+  await reportRuntimeHost(page, kernelHost, {
+    kernel: {
+      state: "reboot_required",
+      running_version: "6.18.26",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  });
+  await page.goto("/");
+
+  const quietCard = page
+    .locator(`[data-host="${quietHost}"][data-host-surface="runtime"].card`)
+    .first();
+  await page.evaluate((hostName) => {
+    const surface = document.querySelector(
+      `article.card[data-host="${hostName}"][data-host-surface="runtime"]`,
+    );
+    const root = surface?.querySelector("[data-host-actions]");
+    if (!root) throw new Error("missing host actions root");
+    openHostActionDialog("remove", root);
+  }, quietHost);
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-remove-disposition-field]")).toBeVisible();
+  await expect(dialog.locator("[data-host-remove-confirm]")).toBeVisible();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  await page.evaluate(() => {
+    const overlay = document.querySelector("[data-host-action-overlay]");
+    overlay
+      ?.querySelector("[data-host-remove-disposition-field]")
+      ?.removeAttribute("hidden");
+    overlay?.querySelector("[data-host-remove-successor]")?.removeAttribute("hidden");
+    overlay?.querySelector("[data-host-remove-confirm]")?.removeAttribute("hidden");
+    overlay?.querySelector("[data-host-attended-confirm]")?.removeAttribute("hidden");
+  });
+
+  await quietCard.locator("[data-host-lifecycle-chip]").click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-info-title]")).toContainText("No drift");
+  await expectInformationalWorkflowControlsHidden(dialog);
+  await expect(dialog.locator("[data-host-action-close]").first()).toBeFocused();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  const kernelCard = page
+    .locator(`[data-host="${kernelHost}"][data-host-surface="runtime"].card`)
+    .first();
+  await kernelCard.locator("[data-host-lifecycle-chip]").click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-info-copy]")).toContainText(
+    "Pharos will not restart this host",
+  );
+  await expectInformationalWorkflowControlsHidden(dialog);
+  await expect(dialog.locator("[data-host-action-close]").first()).toBeFocused();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+
+  const prefsPayload = await page.request.get("/hosts.json").then((r) => r.json());
+  const prefsEntry = prefsPayload.hosts.find((entry) => entry.name === quietHost);
+  prefsEntry.preferences_state = "request_pending";
+  prefsEntry.requested_preferences = {
+    accent: "#48b8a8",
+    kind: "server",
+    alerts: {
+      suppress_down: false,
+      suppress_backup: false,
+      suppress_nix_freshness: false,
+    },
+  };
+  prefsEntry.lifecycle = {
+    schema: "inspr.pharos.host-lifecycle.v1",
+    version: 1,
+    slot: "prefs_drift",
+    label: "Change requested",
+    level: "warning",
+    invoke: "host_settings",
+    run_id: null,
+    detail: "Requested preferences have not yet been observed by the host.",
+    blocked_by: ["host_report"],
+  };
+  expect(await page.evaluate((body) => applyFleetSnapshot(body), prefsPayload)).toBe(
+    true,
+  );
+  await expect(quietCard.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "data-lifecycle-slot",
+    "prefs_drift",
+  );
+  await quietCard.locator("[data-host-lifecycle-chip]").click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-info-title]")).toContainText(
+    "Resolved when the host reports",
+  );
+  await expectInformationalWorkflowControlsHidden(dialog);
+  await expect(dialog.locator("[data-host-action-close]").first()).toBeFocused();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+
+  for (const host of [quietHost, kernelHost]) {
+    const removal = await page.request.post(`/host-actions/${host}/remove`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host, disposition: "unmanaged", successor: null },
+    });
+    expect(removal.status()).toBe(202);
+    const reonboard = await page.request.post(
+      `/host-actions/${host}/allow-reonboarding`,
+      { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+    );
+    expect(reonboard.ok()).toBe(true);
+  }
 });
