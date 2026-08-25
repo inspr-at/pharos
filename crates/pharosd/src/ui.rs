@@ -1498,11 +1498,9 @@ pub(super) fn host_actions_markup(
     });
     let reboot = kernel_reboot_required(host.kernel.as_ref());
     let update_pending = reboot.is_some() || host.freshness.has_proven_deployable_update();
-    let update_job_active = action.is_some_and(|job| {
-        job.workflow_kind() == HostWorkflowKind::UpdateRestart
-            && job.state != HostActionState::Succeeded
-            && job.state != HostActionState::Cancelled
-    });
+    let update_restart_active =
+        active_update_restart_for_host(context.action_jobs, &host.name).is_some();
+    let update_job_active = update_restart_active;
     let restart_hidden = if host.is_nix
         && capabilities.can_manage_fleet
         && janus_ready
@@ -1583,7 +1581,7 @@ pub(super) fn host_actions_markup(
         .unwrap_or("not reported");
 
     format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-update-restart-active="{update_restart_active}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
         is_nix = host.is_nix,
         declared = context.declared,
         credential_retirement = context.credential_retirement_required,
@@ -1592,6 +1590,7 @@ pub(super) fn host_actions_markup(
         system_update_available = capabilities.system_update_available,
         host_removal_available = capabilities.host_removal_available,
         update_pending = update_pending,
+        update_restart_active = update_restart_active,
         settings_state = context.settings_state.key(),
         backup_state = html_escape(context.backup.state),
         backup_label = html_escape(&context.backup.label),
@@ -2959,6 +2958,7 @@ pub(super) struct HostActionRenderContext<'a> {
     pub(super) backup: &'a BackupUiSummary,
     pub(super) surface: &'a str,
     pub(super) capabilities: FleetCapabilities,
+    pub(super) action_jobs: &'a [HostActionJob],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6363,6 +6363,7 @@ pub(super) fn render_home_with_capabilities(
                     backup: &backup,
                     surface: "card",
                     capabilities,
+                    action_jobs: runtime.action_jobs,
                 },
                 relevant_action,
                 &lifecycle,
@@ -6381,6 +6382,7 @@ pub(super) fn render_home_with_capabilities(
                     settings_href: &settings_href_raw,
                     backup: &backup,
                     surface: "row",
+                    action_jobs: runtime.action_jobs,
                     capabilities,
                 },
                 relevant_action,

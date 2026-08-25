@@ -94,11 +94,12 @@ use crate::alerting::*;
 use crate::alerts::{AlertEvent, AlertStore, AlertWorkerHealth};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 use crate::host_actions::{
-    host_lifecycle, host_preferences_state, most_relevant_host_action, AgentActionOutcome,
-    AgentActionResultRequest, HostActionEventSource, HostActionJob, HostActionState,
-    HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot, HostPreferencesState,
-    HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
-    RetiredHostStore, RetirementAgentResultRequest, SystemUpdateProposalBegin,
+    active_update_restart_for_host, host_lifecycle, host_preferences_state,
+    most_relevant_host_action, AgentActionOutcome, AgentActionResultRequest, HostActionEventSource,
+    HostActionJob, HostActionState, HostActionStore, HostActionStoreError, HostLifecycle,
+    HostLifecycleSlot, HostPreferencesState, HostRemovalPlan, HostRetirementDisposition,
+    HostWorkflowKind, HostWorkflowSummary, RetiredHost, RetiredHostStore,
+    RetirementAgentResultRequest, SystemUpdateProposalBegin,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -2737,6 +2738,7 @@ fn hosts_payload(
                 "backup_observations": h.backup_observations,
                 "backup_observations_summary": backup_observations_summary(&h.backup_observations),
                 "lifecycle": lifecycle,
+                "update_restart_active": active_update_restart_for_host(action_jobs, &h.name).is_some(),
                 "attention": {
                     "label": attention.label,
                     "level": attention.level,
@@ -5388,6 +5390,7 @@ mod tests {
                     system_update_available: true,
                     host_removal_available: true,
                 },
+                action_jobs: &[],
             },
             None,
             &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
@@ -5415,6 +5418,7 @@ mod tests {
                     system_update_available: false,
                     host_removal_available: false,
                 },
+                action_jobs: &[],
             },
             None,
             &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
@@ -5441,6 +5445,7 @@ mod tests {
                     system_update_available: false,
                     host_removal_available: false,
                 },
+                action_jobs: &[],
             },
             None,
             &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
@@ -5468,6 +5473,7 @@ mod tests {
                     system_update_available: false,
                     host_removal_available: true,
                 },
+                action_jobs: &[],
             },
             None,
             &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
@@ -5504,6 +5510,7 @@ mod tests {
                     system_update_available: true,
                     host_removal_available: true,
                 },
+                action_jobs: &[],
             },
             None,
             &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, false),
@@ -5515,6 +5522,7 @@ mod tests {
         let update_job = store
             .create_update_review("hsb8", "markus", 1_700_000_110)
             .expect("active update restart");
+        let action_jobs = store.list();
         let active_markup = host_actions_markup(
             &pending_update,
             HostActionRenderContext {
@@ -5531,18 +5539,97 @@ mod tests {
                     system_update_available: true,
                     host_removal_available: true,
                 },
+                action_jobs: &action_jobs,
             },
             Some(&update_job),
-            &host_lifecycle(
-                std::slice::from_ref(&update_job),
-                "hsb8",
-                HostPreferencesState::Applied,
-                false,
-            ),
+            &host_lifecycle(&action_jobs, "hsb8", HostPreferencesState::Applied, false),
         );
         assert!(active_markup.contains(r#"data-host-action="update-restart" hidden"#));
+        assert!(active_markup.contains(r#"data-update-restart-active="true""#));
         assert!(!active_markup.contains("Continue update workflow"));
         assert!(!FOOT.contains("Continue update workflow"));
+    }
+
+    #[test]
+    fn fleet_host_actions_hide_generic_restart_when_removal_masks_host_action() {
+        let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
+        pending_update.freshness = proven_freshness(
+            "nixos-unstable",
+            GitRevisionRelation::Behind,
+            Some(2),
+            NixpkgsRevisionRelation::Current,
+        );
+        pending_update.kernel = Some(KernelPosture::observed(
+            true,
+            Some("7.0.14".to_string()),
+            Some("7.0.14".to_string()),
+            1_700_000_100,
+        ));
+        let ready_manifest = test_manifest("hsb8", true);
+        let backup = backup_ui_summary(&pending_update.backup_observations, 1_700_000_120);
+        let store = HostActionStore::new(None);
+        let update_job = store
+            .create_update_review("hsb8", "markus", 1_700_000_110)
+            .expect("active update restart");
+        let removal_job = store
+            .begin_removal(
+                "hsb8",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Unmanaged,
+                    successor: None,
+                    declaration_pending: false,
+                    credential_retirement_required: false,
+                },
+                1_700_000_120,
+            )
+            .expect("active removal");
+        let action_jobs = store.list();
+        let masked_action = most_relevant_host_action(&action_jobs, "hsb8").expect("removal wins");
+        assert_eq!(masked_action.id, removal_job.id);
+        assert_ne!(masked_action.id, update_job.id);
+        let lifecycle = host_lifecycle(&action_jobs, "hsb8", HostPreferencesState::Applied, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::RemoveHost);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(removal_job.id.as_str()));
+        assert!(active_update_restart_for_host(&action_jobs, "hsb8").is_some());
+
+        let markup = host_actions_markup(
+            &pending_update,
+            HostActionRenderContext {
+                manifest: Some(&ready_manifest),
+                declared: true,
+                credential_retirement_required: false,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: true,
+                    host_removal_available: true,
+                },
+                action_jobs: &action_jobs,
+            },
+            Some(masked_action),
+            &lifecycle,
+        );
+        assert!(markup.contains(r#"data-update-restart-active="true""#));
+        assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
+        assert!(!markup.contains("Continue update workflow"));
+
+        let payload = hosts_payload(
+            vec![pending_update],
+            &[ready_manifest],
+            &BTreeMap::new(),
+            &action_jobs,
+            1_700_000_130,
+        );
+        let emitted = payload["hosts"][0].as_object().expect("host object");
+        assert_eq!(emitted["update_restart_active"], true);
+        assert_eq!(emitted["lifecycle"]["slot"], "remove_host");
+        assert_eq!(emitted["host_action"]["workflow"]["kind"], "remove_host");
+        assert_eq!(emitted["lifecycle"]["run_id"], removal_job.id);
     }
 
     #[test]

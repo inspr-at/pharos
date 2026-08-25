@@ -2232,6 +2232,18 @@ pub(crate) fn most_relevant_host_action<'a>(
     most_relevant_action(jobs, host)
 }
 
+pub(crate) fn active_update_restart_for_host<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    dedupe_latest_workflow_jobs(jobs, host)
+        .into_iter()
+        .find(|job| job.workflow_kind() == HostWorkflowKind::UpdateRestart)
+        .filter(|job| {
+            job.state != HostActionState::Succeeded && job.state != HostActionState::Cancelled
+        })
+}
+
 fn most_relevant_lifecycle_run<'a>(
     jobs: &'a [HostActionJob],
     host: &str,

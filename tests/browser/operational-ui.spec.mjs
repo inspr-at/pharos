@@ -1001,6 +1001,65 @@ async function applyServerFleetSnapshot(page) {
   return page.evaluate((body) => applyFleetSnapshot(body), payload);
 }
 
+async function cancelUpdateRestartJob(page, jobId) {
+  if (!jobId) return;
+  try {
+    await page.request.post(`/host-actions/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      headers: { "x-pharos-action": "1" },
+      data: {},
+    });
+  } catch {
+    /* best effort */
+  }
+}
+
+async function clearRetirementIfPending(page, host) {
+  try {
+    await page.request.post(`/host-actions/${host}/allow-reonboarding`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host },
+    });
+  } catch {
+    /* best effort */
+  }
+}
+
+function resetDispatchAcceptFlag(acceptFlagPath) {
+  if (!acceptFlagPath) return;
+  try {
+    fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+  } catch {
+    /* best effort */
+  }
+}
+
+async function cancelVisibleFleetUpdateRestarts(page) {
+  const payload = await page.request.get("/hosts.json").then((response) => {
+    return response.ok() ? response.json() : null;
+  });
+  if (!payload?.hosts) return;
+  const cancelIds = new Set();
+  for (const entry of payload.hosts) {
+    if (entry.lifecycle?.slot === "update_restart" && entry.lifecycle.run_id) {
+      cancelIds.add(entry.lifecycle.run_id);
+    }
+    if (entry.host_action?.workflow?.kind === "update_restart" && entry.host_action?.id) {
+      cancelIds.add(entry.host_action.id);
+    }
+  }
+  for (const id of cancelIds) {
+    await cancelUpdateRestartJob(page, id);
+  }
+}
+
+async function cleanupRemovalRestartFixture(page, host, options = {}) {
+  const { acceptFlagPath, updateRunId } = options;
+  await cancelUpdateRestartJob(page, updateRunId);
+  await cancelVisibleFleetUpdateRestarts(page);
+  await clearRetirementIfPending(page, host);
+  resetDispatchAcceptFlag(acceptFlagPath);
+}
+
 async function expectInformationalWorkflowControlsHidden(dialog) {
   await expect(dialog.locator("[data-host-remove-disposition-field]")).toBeHidden();
   await expect(dialog.locator("[data-host-remove-successor]")).toBeHidden();
@@ -1620,6 +1679,89 @@ test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", asyn
     { headers: { "x-pharos-action": "1" }, data: {} },
   );
   expect(cancel.status()).toBe(200);
+});
+
+test("fleet refresh hides generic update-restart when removal masks host_action", async ({
+  page,
+}, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "declared host removal fixture requires local harness manifest",
+  );
+  if (!manifest) return;
+
+  const host = `bl-removal-vs-restart-${testInfo.project.name}`;
+  let updateRunId;
+  try {
+    await cleanupRemovalRestartFixture(page, host, {
+      acceptFlagPath: manifest.acceptFlagPath,
+    });
+    fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
+
+    await reportRuntimeHost(page, host, {
+      is_nix: true,
+      kernel: {
+        state: "reboot_required",
+        running_version: "6.18.26",
+        expected_version: "7.0.14",
+        observed_at: 1_700_000_000,
+      },
+    });
+
+    const removal = await page.request.post(`/host-actions/${host}/remove`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host, disposition: "unmanaged", successor: null },
+    });
+    expect(removal.status()).toBe(202);
+
+    const review = await page.request.post(`/host-actions/${host}/update-restart/review`, {
+      headers: { "x-pharos-action": "1" },
+      data: {},
+    });
+    expect(review.status()).toBe(202);
+    const reviewBody = await review.json();
+    updateRunId = reviewBody.job?.id;
+    expect(updateRunId).toBeTruthy();
+
+    const payload = await page.request.get("/hosts.json").then((response) => {
+      expect(response.ok()).toBe(true);
+      return response.json();
+    });
+    const hostData = payload.hosts.find((entry) => entry.name === host);
+    expect(hostData?.host_action?.workflow?.kind).toBe("remove_host");
+    expect(hostData?.lifecycle?.slot).toBe("remove_host");
+    expect(hostData?.update_restart_active).toBe(true);
+    const removalRunId = hostData?.lifecycle?.run_id;
+    expect(removalRunId).toBeTruthy();
+    expect(removalRunId).not.toBe(updateRunId);
+
+    await page.goto("/");
+    const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+    const actionsRoot = card.locator("[data-host-actions]").first();
+    await expect(actionsRoot).toHaveAttribute("data-update-restart-active", "true");
+    await expect(actionsRoot.locator("[data-host-action='update-restart'][hidden]")).toHaveCount(1);
+    await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+      "data-lifecycle-invoke",
+      "workflow",
+    );
+    await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+      "data-lifecycle-run-id",
+      removalRunId,
+    );
+
+    expect(await applyServerFleetSnapshot(page)).toBe(true);
+    await expect(actionsRoot).toHaveAttribute("data-update-restart-active", "true");
+    await expect(actionsRoot.locator("[data-host-action='update-restart'][hidden]")).toHaveCount(1);
+    await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+      "data-lifecycle-run-id",
+      removalRunId,
+    );
+  } finally {
+    await cleanupRemovalRestartFixture(page, host, {
+      acceptFlagPath: manifest.acceptFlagPath,
+      updateRunId,
+    });
+  }
 });
 
 test("saved update-restart stays read-only until the exact job renders", async ({

@@ -530,9 +530,10 @@ function updateHostActionState(surface,host,backup){
   const remove=root.querySelector('[data-host-action="remove"]');
   const primarySeparator=root.querySelector('[data-primary-separator]');
   const removeSeparator=root.querySelector('[data-remove-separator]');
-  const updateJobActive=workflow?.kind==='update_restart'&&!['succeeded','cancelled'].includes(job.state);
+  const updateJobActive=host.update_restart_active===true;
   const updatePending=kernelState==='reboot_required'||provenGitUpdate||provenNixpkgsUpdate;
   root.dataset.updatePending=updatePending?'true':'false';
+  root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
   const retired=retirement?.pending===true;
   // PHAROS-197: mirrors the server gate — a removal that must record a nixcfg
   // declaration change or a retirement intent needs the proposal available.

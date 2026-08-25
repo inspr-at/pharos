@@ -86,6 +86,7 @@ fs.writeFileSync(currentPath, `${generation}\n`, { mode: 0o600 });
 
 const KERNEL_VS_RESTART_PROJECTS = ["chromium-mobile"];
 const SAVED_RESTART_LOADING_PROJECTS = ["chromium-desktop", "chromium-mobile"];
+const REMOVAL_VS_RESTART_PROJECTS = ["chromium-desktop", "chromium-mobile"];
 const PREFS_DECLARED_DRIFT_HOST = "bl-prefs-declared-drift";
 
 function janusReadyHostManifest(hostName) {
@@ -144,6 +145,7 @@ const janusReadyHostNames = [
   ...SAVED_RESTART_LOADING_PROJECTS.map(
     (project) => `bl-saved-restart-loading-${project}`,
   ),
+  ...REMOVAL_VS_RESTART_PROJECTS.map((project) => `bl-removal-vs-restart-${project}`),
 ];
 const manifestPaths = janusReadyHostNames.map((hostName) => {
   const manifestPath = path.join(manifestDir, `${hostName}.json`);

@@ -8,6 +8,7 @@ const test = base;
 const PERSISTENT_DECLARED_FIXTURES = [
   "bl-prefs-declared-drift",
   "bl-saved-restart-loading-chromium-desktop",
+  "bl-removal-vs-restart-chromium-desktop",
 ];
 
 async function listRuntimeHosts(page) {
