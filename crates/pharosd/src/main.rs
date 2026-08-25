@@ -96,10 +96,9 @@ use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 use crate::host_actions::{
     host_lifecycle, host_preferences_state, most_relevant_host_action, AgentActionOutcome,
     AgentActionResultRequest, HostActionEventSource, HostActionJob, HostActionState,
-    HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleInvoke, HostLifecycleSlot,
-    HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind,
-    HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
-    SystemUpdateProposalBegin,
+    HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot, HostPreferencesState,
+    HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
+    RetiredHostStore, RetirementAgentResultRequest, SystemUpdateProposalBegin,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -5206,7 +5205,8 @@ mod tests {
         assert!(html.contains(r#"id="host-actions-hsb8-card" role="menu""#));
         assert!(html.contains(r#"id="host-actions-hsb8-row" role="menu""#));
         assert_eq!(
-            html.matches(r#"data-host-action="host-settings""#).count(),
+            html.matches(r#"data-host-action="host-settings" data-settings-state="#)
+                .count(),
             1
         );
         assert!(!html.contains(r#"data-host-action="review-pending""#));
@@ -7516,7 +7516,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .count(),
             1
         );
-        assert!(html.contains(r#"data-host-action="host-settings" href="/agora?host=poseidon""#));
+        assert!(html.contains(
+            r#"data-host-action="host-settings" data-settings-state="declared_not_applied" href="/agora?host=poseidon""#
+        ));
         assert!(html.contains(
             r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
         ));

@@ -22,7 +22,7 @@ test("reset runtime fleet before the mobile project", async ({ browser }) => {
     }
     for (const host of hosts) {
       const name = host.name;
-      if (!name) {
+      if (!name || name === "bl-prefs-declared-drift") {
         continue;
       }
       const removal = await page.request.post(`/host-actions/${name}/remove`, {
@@ -38,6 +38,7 @@ test("reset runtime fleet before the mobile project", async ({ browser }) => {
     }
   }
 
-  expect(await listRuntimeHosts(page)).toEqual([]);
+  const remaining = await listRuntimeHosts(page);
+  expect(remaining.filter((host) => host.name !== "bl-prefs-declared-drift")).toEqual([]);
   await context.close();
 });

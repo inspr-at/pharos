@@ -101,6 +101,7 @@ pub(super) const SETUP_ASSISTANT_TEMPLATE: &str = include_str!("../assets/ui/set
 #[cfg(test)]
 mod module_tests {
     use super::*;
+    use crate::host_actions::{HostLifecycle, HostLifecycleInvoke, HostLifecycleSlot};
 
     fn proven_current(channel: &str) -> NixFreshness {
         let source_revision = "1".repeat(40);
@@ -1445,9 +1446,11 @@ pub(super) fn host_actions_markup(
     let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
     let title = html_escape(&format!("Actions for {}", host.name));
     let settings_href = html_escape(context.settings_href);
+    let settings_link_title = html_escape(&format!("Open host settings for {}", host.name));
+    let settings_state_key = context.settings_state.key();
     let settings_menu_item = if context.surface == "card" {
         format!(
-            r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="host-settings" href="{settings_href}">{icon}<span><strong>Host settings</strong><span>Color, alerts, and host type</span></span></a>"#,
+            r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="host-settings" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_link_title}" aria-label="{settings_link_title}">{icon}<span><strong>Host settings</strong><span>Color, alerts, and host type</span></span></a>"#,
             icon = icons::SLIDERS,
         )
     } else {
