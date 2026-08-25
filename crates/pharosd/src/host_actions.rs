@@ -245,6 +245,8 @@ pub(crate) enum HostActionEventKind {
     StateRecovered,
     DispatchAccepted,
     DispatchSubmitted,
+    DispatchOutcomeUncertain,
+    DispatchUncertaintyAcknowledged,
     DispatchFailed,
     ReviewClaimed,
     ReviewPassed,
@@ -1200,14 +1202,17 @@ impl HostActionJob {
             .events
             .iter()
             .any(|event| event.kind == HostActionEventKind::DispatchAccepted);
-        let dispatch_uncertain = failed && !accepted && !submitted;
+        let outcome_uncertain = self.has_event(HostActionEventKind::DispatchOutcomeUncertain);
+        let known_rejected =
+            failed && self.has_event(HostActionEventKind::DispatchFailed) && !outcome_uncertain;
+        let dispatch_handoff = accepted || submitted || succeeded;
         let (guidance, status_label, status_level) = match self.state {
             HostActionState::Succeeded => (
                 "The update review was handed to nixcfg. Pharos did not deploy or verify any host change.",
                 "review handed to nixcfg",
                 "clear",
             ),
-            HostActionState::Failed if dispatch_uncertain => (
+            HostActionState::Failed if outcome_uncertain => (
                 "Pharos could not confirm whether nixcfg received this review request. Verify nixcfg before starting another fleet-wide proposal. No host change was deployed or verified from Pharos.",
                 "dispatch outcome uncertain",
                 "warning",
@@ -1223,19 +1228,46 @@ impl HostActionJob {
                 "warning",
             ),
         };
-        let request_state = if failed && !accepted && !submitted {
+        let request_state = if outcome_uncertain || known_rejected {
             WorkflowStepState::Failed
-        } else if accepted || succeeded || submitted {
+        } else if dispatch_handoff {
             WorkflowStepState::Passed
         } else {
             WorkflowStepState::Running
         };
         let downstream_state = if failed || succeeded {
             WorkflowStepState::Skipped
-        } else if accepted || submitted {
+        } else if dispatch_handoff {
             WorkflowStepState::Waiting
         } else {
             WorkflowStepState::Queued
+        };
+        let request_detail = if dispatch_handoff && !outcome_uncertain {
+            "The review request was handed to nixcfg."
+        } else if outcome_uncertain {
+            "Pharos could not confirm whether the repository dispatch completed."
+        } else if known_rejected {
+            "The repository dispatch did not accept the review request."
+        } else {
+            "Pharos is recording the review request."
+        };
+        let downstream_detail = if dispatch_handoff && !failed {
+            "Repository checks continue in nixcfg outside Pharos."
+        } else if outcome_uncertain {
+            "Pharos could not confirm whether repository checks were requested."
+        } else if known_rejected {
+            "Repository checks were not started from Pharos."
+        } else {
+            "Completion is reported by the repository workflow."
+        };
+        let review_detail = if dispatch_handoff && !failed {
+            "Review continues in nixcfg outside Pharos."
+        } else if outcome_uncertain {
+            "Pharos could not confirm whether repository review was requested."
+        } else if known_rejected {
+            "Repository review was not started from Pharos."
+        } else {
+            "A separate reviewed workflow is required before deployment."
         };
         (
             "Review system updates".to_string(),
@@ -1249,15 +1281,7 @@ impl HostActionJob {
                     "PREPARE",
                     "Create an isolated update proposal",
                     request_state,
-                    if succeeded {
-                        "The review request was handed to nixcfg."
-                    } else if failed {
-                        "The repository dispatch did not accept the review request."
-                    } else if accepted {
-                        "The durable dispatch workflow accepted the review request."
-                    } else {
-                        "Pharos is recording the review request."
-                    },
+                    request_detail,
                 )
                 .at(HostWorkflowExecutionLocation::Github),
                 workflow_step(
@@ -1265,11 +1289,7 @@ impl HostActionJob {
                     "VALIDATE",
                     "Run repository and all-host checks",
                     downstream_state,
-                    if succeeded {
-                        "Repository checks continue in nixcfg outside Pharos."
-                    } else {
-                        "Completion is reported by the repository workflow."
-                    },
+                    downstream_detail,
                 )
                 .at(HostWorkflowExecutionLocation::Github),
                 workflow_step(
@@ -1277,11 +1297,7 @@ impl HostActionJob {
                     "APPROVE",
                     "Review the proposal",
                     downstream_state,
-                    if succeeded {
-                        "Review continues in nixcfg outside Pharos."
-                    } else {
-                        "A separate reviewed workflow is required before deployment."
-                    },
+                    review_detail,
                 )
                 .at(HostWorkflowExecutionLocation::Github),
                 workflow_step(
@@ -1914,6 +1930,10 @@ fn event_label(event: &HostActionEvent) -> String {
         HostActionEventKind::StateRecovered => "Existing workflow state loaded",
         HostActionEventKind::DispatchAccepted => "Guarded dispatch accepted",
         HostActionEventKind::DispatchSubmitted => "Repository dispatch submitted",
+        HostActionEventKind::DispatchOutcomeUncertain => "Repository dispatch outcome uncertain",
+        HostActionEventKind::DispatchUncertaintyAcknowledged => {
+            "Dispatch uncertainty acknowledged by operator"
+        }
         HostActionEventKind::DispatchFailed => "Guarded dispatch stopped",
         HostActionEventKind::ReviewClaimed => "Host started the safe review",
         HostActionEventKind::ReviewPassed => "Safe review passed",
@@ -2299,6 +2319,8 @@ impl RetirementAgentResultRequest {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HostActionStoreError {
     ActiveJob,
+    ActiveSystemUpdateProposal(Box<HostActionJob>),
+    UncertaintyRequiresAcknowledgement(Box<HostActionJob>),
     FailedJobRequiresRetry,
     InvalidJob,
     NotFound,
@@ -2476,14 +2498,32 @@ impl HostActionStore {
         host: &str,
         actor: &str,
         now: i64,
+        acknowledge_uncertainty_id: Option<&str>,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
         let migrated = reconcile_stalled_system_update_proposals_locked(&mut jobs, now);
         if migrated {
             self.persist_jobs(&jobs)?;
         }
-        if Self::has_active_system_update_proposal(&jobs) {
-            return Err(HostActionStoreError::ActiveJob);
+        if let Some(id) = acknowledge_uncertainty_id {
+            if let Some(job) = jobs.get(id) {
+                if system_update_uncertainty_requires_acknowledgement(job) {
+                    self.acknowledge_system_update_proposal_uncertainty_locked(
+                        &mut jobs, id, actor, now,
+                    )?;
+                    self.persist_jobs(&jobs)?;
+                }
+            }
+        }
+        if let Some(job) = unacknowledged_uncertain_system_update_proposal(&jobs) {
+            return Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(
+                Box::new(job),
+            ));
+        }
+        if let Some(job) = active_system_update_proposal_locked(&jobs) {
+            return Err(HostActionStoreError::ActiveSystemUpdateProposal(Box::new(
+                job,
+            )));
         }
         let mut job = HostActionJob {
             schema: ACTION_SCHEMA.to_string(),
@@ -2522,7 +2562,7 @@ impl HostActionStore {
         id: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        self.update_system_update_proposal(id, now, false)
+        self.update_system_update_proposal(id, now, HostActionEventKind::DispatchAccepted)
     }
 
     pub(crate) fn fail_system_update_proposal(
@@ -2530,7 +2570,83 @@ impl HostActionStore {
         id: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        self.update_system_update_proposal(id, now, true)
+        self.update_system_update_proposal(id, now, HostActionEventKind::DispatchFailed)
+    }
+
+    pub(crate) fn fail_system_update_proposal_uncertain(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.update_system_update_proposal(id, now, HostActionEventKind::DispatchOutcomeUncertain)
+    }
+
+    fn acknowledge_system_update_proposal_uncertainty_locked(
+        &self,
+        jobs: &mut BTreeMap<String, HostActionJob>,
+        id: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if !system_update_uncertainty_requires_acknowledgement(job) {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            let at = job.updated_at.max(now);
+            job.updated_at = at;
+            if !job.has_event(HostActionEventKind::DispatchUncertaintyAcknowledged) {
+                job.record_event(
+                    at,
+                    HostActionEventSource::Operator,
+                    HostActionEventKind::DispatchUncertaintyAcknowledged,
+                    Some(actor),
+                );
+            }
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        Ok(updated)
+    }
+
+    fn update_system_update_proposal(
+        &self,
+        id: &str,
+        now: i64,
+        failure_kind: HostActionEventKind,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.workflow_kind() != HostWorkflowKind::SystemUpdateProposal
+                || job.state != HostActionState::ProposalRequested
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            let at = job.updated_at.max(now);
+            job.state = if failure_kind == HostActionEventKind::DispatchAccepted {
+                HostActionState::Succeeded
+            } else {
+                HostActionState::Failed
+            };
+            job.updated_at = at;
+            job.record_event(at, HostActionEventSource::Pharos, failure_kind, None);
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
     }
 
     pub(crate) fn mark_system_update_dispatch_submitted(
@@ -2548,69 +2664,15 @@ impl HostActionStore {
             }
             let previous = job.clone();
             if !job.has_event(HostActionEventKind::DispatchSubmitted) {
-                job.updated_at = now;
+                let at = job.updated_at.max(now);
+                job.updated_at = at;
                 job.record_event(
-                    now,
+                    at,
                     HostActionEventSource::Pharos,
                     HostActionEventKind::DispatchSubmitted,
                     None,
                 );
             }
-            (previous, job.clone())
-        };
-        if !updated.validate() {
-            jobs.insert(id.to_string(), previous);
-            return Err(HostActionStoreError::InvalidJob);
-        }
-        if let Err(error) = self.persist_jobs(&jobs) {
-            jobs.insert(id.to_string(), previous);
-            return Err(error);
-        }
-        Ok(updated)
-    }
-
-    pub(crate) fn active_system_update_proposal(&self) -> Option<HostActionJob> {
-        let jobs = self.jobs.read().expect("host action store lock");
-        jobs.values()
-            .filter(|job| {
-                job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
-                    && !job.state.is_terminal()
-            })
-            .max_by_key(|job| (job.updated_at, job.created_at, &job.id))
-            .cloned()
-    }
-
-    fn update_system_update_proposal(
-        &self,
-        id: &str,
-        now: i64,
-        failed: bool,
-    ) -> Result<HostActionJob, HostActionStoreError> {
-        let mut jobs = self.jobs.write().expect("host action store lock");
-        let (previous, updated) = {
-            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
-            if job.workflow_kind() != HostWorkflowKind::SystemUpdateProposal
-                || job.state != HostActionState::ProposalRequested
-            {
-                return Err(HostActionStoreError::InvalidTransition);
-            }
-            let previous = job.clone();
-            job.state = if failed {
-                HostActionState::Failed
-            } else {
-                HostActionState::Succeeded
-            };
-            job.updated_at = now;
-            job.record_event(
-                now,
-                HostActionEventSource::Pharos,
-                if failed {
-                    HostActionEventKind::DispatchFailed
-                } else {
-                    HostActionEventKind::DispatchAccepted
-                },
-                None,
-            );
             (previous, job.clone())
         };
         if !updated.validate() {
@@ -3583,13 +3645,6 @@ impl HostActionStore {
             .any(|job| job.host == host && job.kind == kind && !job.state.is_terminal())
     }
 
-    fn has_active_system_update_proposal(jobs: &BTreeMap<String, HostActionJob>) -> bool {
-        jobs.values().any(|job| {
-            job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
-                && !job.state.is_terminal()
-        })
-    }
-
     fn latest_update_for<'a>(
         jobs: &'a BTreeMap<String, HostActionJob>,
         host: &str,
@@ -3885,12 +3940,14 @@ fn normalize_system_update_proposal(job: &mut HostActionJob, now: i64) -> bool {
     }
     let accepted = job.has_event(HostActionEventKind::DispatchAccepted);
     let submitted = job.has_event(HostActionEventKind::DispatchSubmitted);
+    let wall_now = system_time_unix();
     if accepted || submitted {
+        let at = job.updated_at.max(now);
         job.state = HostActionState::Succeeded;
-        job.updated_at = now;
+        job.updated_at = at;
         if !accepted {
             job.record_event(
-                now,
+                at,
                 HostActionEventSource::Pharos,
                 HostActionEventKind::DispatchAccepted,
                 None,
@@ -3898,24 +3955,53 @@ fn normalize_system_update_proposal(job: &mut HostActionJob, now: i64) -> bool {
         }
         return true;
     }
-    if now
+    if wall_now
         > job
             .updated_at
             .saturating_add(SYSTEM_UPDATE_DISPATCH_STALL_SECS)
     {
+        let at = job.updated_at.max(now);
         job.state = HostActionState::Failed;
-        job.updated_at = now;
-        if !job.has_event(HostActionEventKind::DispatchFailed) {
+        job.updated_at = at;
+        if !job.has_event(HostActionEventKind::DispatchOutcomeUncertain) {
             job.record_event(
-                now,
+                at,
                 HostActionEventSource::Pharos,
-                HostActionEventKind::DispatchFailed,
+                HostActionEventKind::DispatchOutcomeUncertain,
                 None,
             );
         }
         return true;
     }
     false
+}
+
+fn system_update_uncertainty_requires_acknowledgement(job: &HostActionJob) -> bool {
+    job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
+        && job.state == HostActionState::Failed
+        && job.has_event(HostActionEventKind::DispatchOutcomeUncertain)
+        && !job.has_event(HostActionEventKind::DispatchUncertaintyAcknowledged)
+}
+
+fn unacknowledged_uncertain_system_update_proposal(
+    jobs: &BTreeMap<String, HostActionJob>,
+) -> Option<HostActionJob> {
+    jobs.values()
+        .filter(|job| system_update_uncertainty_requires_acknowledgement(job))
+        .max_by_key(|job| (job.updated_at, job.created_at, &job.id))
+        .cloned()
+}
+
+fn active_system_update_proposal_locked(
+    jobs: &BTreeMap<String, HostActionJob>,
+) -> Option<HostActionJob> {
+    jobs.values()
+        .filter(|job| {
+            job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
+                && !job.state.is_terminal()
+        })
+        .max_by_key(|job| (job.updated_at, job.created_at, &job.id))
+        .cloned()
 }
 
 fn reconcile_stalled_system_update_proposals_locked(
@@ -5167,7 +5253,7 @@ mod tests {
     fn system_update_proposal_uses_the_shared_read_only_workflow() {
         let store = HostActionStore::new(None);
         let job = store
-            .begin_system_update_proposal("hsb8", "markus", 450)
+            .begin_system_update_proposal("hsb8", "markus", 450, None)
             .expect("proposal workflow created");
         let preparing = job.summary().workflow;
 
@@ -5225,13 +5311,14 @@ mod tests {
     #[test]
     fn system_update_proposal_rejects_a_second_fleet_wide_invoke() {
         let store = HostActionStore::new(None);
+        let now = system_time_unix();
         let first = store
-            .begin_system_update_proposal("hsb8", "markus", 460)
+            .begin_system_update_proposal("hsb8", "markus", now, None)
             .expect("first proposal workflow created");
-        assert_eq!(
-            store.begin_system_update_proposal("gpc0", "markus", 461),
-            Err(HostActionStoreError::ActiveJob)
-        );
+        assert!(matches!(
+            store.begin_system_update_proposal("gpc0", "markus", now + 1, None),
+            Err(HostActionStoreError::ActiveSystemUpdateProposal(_))
+        ));
         assert_eq!(
             store
                 .list()
@@ -5247,7 +5334,7 @@ mod tests {
     fn system_update_proposal_leaves_host_chip_after_dispatch_acceptance() {
         let store = HostActionStore::new(None);
         let job = store
-            .begin_system_update_proposal("hsb8", "markus", 470)
+            .begin_system_update_proposal("hsb8", "markus", 470, None)
             .expect("proposal workflow created");
         let accepted = store
             .accept_system_update_proposal(&job.id, 471)
@@ -5267,13 +5354,13 @@ mod tests {
     fn system_update_proposal_allows_a_new_invoke_after_terminal_success() {
         let store = HostActionStore::new(None);
         let first = store
-            .begin_system_update_proposal("hsb8", "markus", 480)
+            .begin_system_update_proposal("hsb8", "markus", 480, None)
             .expect("first proposal workflow created");
         store
             .accept_system_update_proposal(&first.id, 481)
             .expect("first proposal completed");
         let second = store
-            .begin_system_update_proposal("gpc0", "markus", 482)
+            .begin_system_update_proposal("gpc0", "markus", 482, None)
             .expect("second proposal workflow created");
         assert_ne!(first.id, second.id);
         assert_eq!(second.state, HostActionState::ProposalRequested);
@@ -5388,12 +5475,97 @@ mod tests {
             reconciled.summary().workflow.status_label,
             "dispatch outcome uncertain"
         );
+        assert!(matches!(
+            store.begin_system_update_proposal("hsb8", "markus", stale_at + 1, None),
+            Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(_))
+        ));
         assert!(
             store
-                .begin_system_update_proposal("hsb8", "markus", stale_at + 1)
+                .begin_system_update_proposal(
+                    "hsb8",
+                    "markus",
+                    stale_at + 2,
+                    Some("action-system-update-gpc0-200-1"),
+                )
                 .is_ok(),
-            "fleet-wide gate clears after uncertain terminalization"
+            "acknowledged uncertainty clears the fleet-wide gate"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_system_update_proposal_surfaces_uncertainty_without_redispatching() {
+        let store = HostActionStore::new(None);
+        let stale_at = system_time_unix() - SYSTEM_UPDATE_DISPATCH_STALL_SECS - 30;
+        let stalled = store
+            .create_system_update_proposal(
+                "action-system-update-gpc0-900-1".to_string(),
+                "gpc0",
+                "markus",
+                stale_at,
+            )
+            .expect("stalled proposal recorded");
+        assert!(matches!(
+            store.begin_system_update_proposal("hsb8", "markus", stale_at + 1, None),
+            Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(job)) if job.id == stalled.id
+        ));
+        assert_eq!(
+            store
+                .list()
+                .into_iter()
+                .filter(|job| job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal)
+                .count(),
+            1
+        );
+        store
+            .begin_system_update_proposal("hsb8", "markus", stale_at + 2, Some(&stalled.id))
+            .expect("replacement proposal after acknowledgement");
+    }
+
+    #[test]
+    fn future_dated_system_update_proposal_loads_and_validates() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-future-system-update-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let future_at = system_time_unix() + 3600;
+        let document = serde_json::json!([{
+            "schema": ACTION_SCHEMA,
+            "version": ACTION_VERSION,
+            "id": "action-system-update-hsb8-future-1",
+            "host": "hsb8",
+            "kind": "system_update_proposal",
+            "state": "proposal_requested",
+            "requested_by": "markus",
+            "ticket": "PHAROS-125",
+            "created_at": future_at,
+            "updated_at": future_at,
+            "confirmed_at": null,
+            "plan": null,
+            "result": null,
+            "lease_phase": null,
+            "lease_until": null,
+            "events": [{
+                "at": future_at,
+                "state": "proposal_requested",
+                "source": "operator",
+                "kind": "requested",
+                "actor": "markus"
+            }]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("future system update JSON"),
+        )
+        .expect("future system update state written");
+
+        let store = HostActionStore::new(Some(path.clone()));
+        let job = store
+            .get("action-system-update-hsb8-future-1")
+            .expect("future-dated proposal loaded");
+        assert_eq!(job.state, HostActionState::ProposalRequested);
+        assert_eq!(job.updated_at, future_at);
         let _ = std::fs::remove_file(path);
     }
 
@@ -5463,7 +5635,7 @@ mod tests {
         ));
         let store = HostActionStore::new(Some(path.clone()));
         let job = store
-            .begin_system_update_proposal("hsb8", "markus", 510)
+            .begin_system_update_proposal("hsb8", "markus", 510, None)
             .expect("proposal workflow created");
         store
             .mark_system_update_dispatch_submitted(&job.id, 511)

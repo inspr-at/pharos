@@ -107,7 +107,7 @@ use crate::managed_service_operations::{
 };
 use crate::managed_setup_intents::*;
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
-use crate::nixcfg_dispatch::NixcfgDispatch;
+use crate::nixcfg_dispatch::{NixcfgDispatch, NixcfgDispatchError};
 use crate::provider_connections::{
     compare_gross_prices, evidence_is_fresh, safe_hcloud_api_base, test_hetzner_connection,
     HetznerConnectionAttempt, HetznerConnectionCode, HetznerConnectionPreferences,
@@ -549,6 +549,14 @@ fn action_request_header(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value == "1")
 }
 
+fn system_update_uncertainty_acknowledgement(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("X-Pharos-Acknowledge-Uncertainty")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) fn action_actor(auth: &AuthState, headers: &HeaderMap) -> String {
     let raw = sidebar_user_label(auth, headers);
     let actor: String = raw
@@ -577,18 +585,15 @@ fn action_message(job: &HostActionJob) -> Cow<'static, str> {
         });
     }
     if job.workflow_kind() == host_actions::HostWorkflowKind::SystemUpdateProposal {
-        let dispatch_confirmed = job.events.iter().any(|event| {
-            matches!(
-                event.kind,
-                host_actions::HostActionEventKind::DispatchAccepted
-                    | host_actions::HostActionEventKind::DispatchSubmitted
-            )
-        });
+        let outcome_uncertain = job
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain);
         return Cow::Borrowed(match job.state {
             HostActionState::Succeeded => {
                 "Pharos handed the update review request to nixcfg. Repository checks and review continue outside Pharos. No host was deployed or verified from Pharos."
             }
-            HostActionState::Failed if !dispatch_confirmed => {
+            HostActionState::Failed if outcome_uncertain => {
                 "Pharos could not confirm whether nixcfg received this review request. Verify nixcfg before starting another fleet-wide proposal. No host change was deployed or verified from Pharos."
             }
             HostActionState::Failed => {
@@ -827,9 +832,22 @@ fn workflow_step_presentation_label(
     if workflow.kind == host_actions::HostWorkflowKind::SystemUpdateProposal
         && step.state.key() == "skipped"
     {
-        match step.key.as_str() {
-            "validate" | "review" => "continues in nixcfg",
-            "deploy" => "not deployed",
+        match workflow.status_label.as_str() {
+            "review handed to nixcfg" => match step.key.as_str() {
+                "validate" | "review" => "continues in nixcfg",
+                "deploy" => "not deployed",
+                _ => workflow_step_state_label(step.state.key()),
+            },
+            "dispatch outcome uncertain" => match step.key.as_str() {
+                "validate" | "review" => "not confirmed",
+                "deploy" => "not deployed",
+                _ => workflow_step_state_label(step.state.key()),
+            },
+            "update review stopped" => match step.key.as_str() {
+                "validate" | "review" => "not attempted",
+                "deploy" => "not deployed",
+                _ => workflow_step_state_label(step.state.key()),
+            },
             _ => workflow_step_state_label(step.state.key()),
         }
     } else {
@@ -909,19 +927,26 @@ async fn request_system_update(
     }
     let actor = action_actor(&state.auth, &headers);
     let now = now_unix();
-    let workflow = match state
-        .host_actions
-        .begin_system_update_proposal(host, &actor, now)
-    {
+    let acknowledge_uncertainty =
+        system_update_uncertainty_acknowledgement(&headers).map(str::to_string);
+    let workflow = match state.host_actions.begin_system_update_proposal(
+        host,
+        &actor,
+        now,
+        acknowledge_uncertainty.as_deref(),
+    ) {
         Ok(workflow) => workflow,
-        Err(HostActionStoreError::ActiveJob) => {
-            let active = state
-                .host_actions
-                .active_system_update_proposal()
-                .expect("fleet-wide system update proposal lock without an active job");
+        Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(job)) => {
             return action_response_with_message(
                 StatusCode::CONFLICT,
-                &active,
+                &job,
+                "Pharos could not confirm the prior repository dispatch. Review the saved workflow, verify nixcfg, then acknowledge the uncertainty before starting another fleet-wide request.",
+            );
+        }
+        Err(HostActionStoreError::ActiveSystemUpdateProposal(job)) => {
+            return action_response_with_message(
+                StatusCode::CONFLICT,
+                &job,
                 "A fleet-wide system update review is already open. Open the saved workflow before starting another request.",
             );
         }
@@ -933,14 +958,24 @@ async fn request_system_update(
         }
     };
     if let Err(error) = state.nixcfg_dispatch.dispatch_system_update(host).await {
-        let failed = state
-            .host_actions
-            .fail_system_update_proposal(&workflow.id, now_unix())
-            .unwrap_or(workflow);
+        let failed = match error {
+            NixcfgDispatchError::RequestFailed => state
+                .host_actions
+                .fail_system_update_proposal_uncertain(&workflow.id, now_unix())
+                .unwrap_or(workflow),
+            _ => state
+                .host_actions
+                .fail_system_update_proposal(&workflow.id, now_unix())
+                .unwrap_or(workflow),
+        };
         return action_response_with_message(
-            StatusCode::BAD_GATEWAY,
+            if error.is_outcome_uncertain() {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
             &failed,
-            error.safe_message(),
+            error.system_update_message(),
         );
     }
     let submitted = match state
@@ -13638,7 +13673,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("test report persists");
         state
             .host_actions
-            .begin_system_update_proposal("gpc0", "markus", now_unix())
+            .begin_system_update_proposal("gpc0", "markus", now_unix(), None)
             .expect("active system update proposal recorded");
 
         let (status, Json(payload)) = request_system_update(
@@ -13669,10 +13704,95 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn system_update_presentation_distinguishes_handoff_rejection_and_uncertainty() {
+        let store = HostActionStore::new(None);
+        let handoff = store
+            .create_system_update_proposal(
+                "action-system-update-hsb8-800-1".to_string(),
+                "hsb8",
+                "markus",
+                800,
+            )
+            .expect("handoff proposal created");
+        let completed = store
+            .accept_system_update_proposal(&handoff.id, 801)
+            .expect("handoff completed");
+        let handoff_workflow = completed.summary().workflow;
+        assert_eq!(handoff_workflow.status_label, "review handed to nixcfg");
+        let handoff_html = host_workflow_markup(&handoff_workflow);
+        assert!(handoff_html.contains("continues in nixcfg"));
+        assert!(!handoff_html.contains("not attempted"));
+
+        let rejected = store
+            .create_system_update_proposal(
+                "action-system-update-gpc0-802-1".to_string(),
+                "gpc0",
+                "markus",
+                802,
+            )
+            .expect("rejected proposal created");
+        let failed = store
+            .fail_system_update_proposal(&rejected.id, 803)
+            .expect("known rejection recorded");
+        let rejected_workflow = failed.summary().workflow;
+        assert_eq!(rejected_workflow.status_label, "update review stopped");
+        let rejected_html = host_workflow_markup(&rejected_workflow);
+        assert!(rejected_html.contains("not attempted"));
+        assert!(!rejected_html.contains("continues in nixcfg"));
+
+        let uncertain = store
+            .create_system_update_proposal(
+                "action-system-update-athena-804-1".to_string(),
+                "athena",
+                "markus",
+                804,
+            )
+            .expect("uncertain proposal created");
+        let uncertain_failed = store
+            .fail_system_update_proposal_uncertain(&uncertain.id, 805)
+            .expect("uncertain failure recorded");
+        let uncertain_workflow = uncertain_failed.summary().workflow;
+        assert_eq!(
+            uncertain_workflow.status_label,
+            "dispatch outcome uncertain"
+        );
+        let uncertain_html = host_workflow_markup(&uncertain_workflow);
+        assert!(uncertain_html.contains("not confirmed"));
+        assert!(!uncertain_html.contains("did not accept"));
+        assert!(!uncertain_html.contains("continues in nixcfg"));
+    }
+
+    #[tokio::test]
+    async fn system_update_active_job_conflict_never_panics_without_a_lookup_job() {
+        let state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
+        state
+            .host_actions
+            .begin_system_update_proposal("gpc0", "markus", now_unix(), None)
+            .expect("active system update proposal recorded");
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers(),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(payload["job"]["state"], "proposal_requested");
+    }
+
+    #[test]
     fn system_update_success_copy_honestly_describes_nixcfg_handoff() {
         let store = HostActionStore::new(None);
         let job = store
-            .begin_system_update_proposal("hsb8", "markus", 700)
+            .begin_system_update_proposal("hsb8", "markus", 700, None)
             .expect("proposal workflow created");
         let completed = store
             .accept_system_update_proposal(&job.id, 701)
@@ -13694,7 +13814,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     fn system_update_activity_title_describes_nixcfg_handoff() {
         let store = HostActionStore::new(None);
         let job = store
-            .begin_system_update_proposal("athena", "markus", 710)
+            .begin_system_update_proposal("athena", "markus", 710, None)
             .expect("proposal workflow created");
         let completed = store
             .accept_system_update_proposal(&job.id, 711)

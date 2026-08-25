@@ -257,6 +257,29 @@ impl NixcfgDispatchError {
             }
         }
     }
+
+    pub(crate) fn is_outcome_uncertain(&self) -> bool {
+        matches!(self, Self::RequestFailed)
+    }
+
+    pub(crate) fn system_update_message(&self) -> &'static str {
+        match self {
+            Self::Disabled => {
+                "System update review dispatch is not enabled on this Pharos server"
+            }
+            Self::CredentialUnavailable => {
+                "The repository dispatch credential is unavailable; no review request was sent"
+            }
+            Self::InvalidHost => "This host name cannot be used for a system update review",
+            Self::RequestFailed => {
+                "Pharos could not confirm whether nixcfg received the review request. Verify nixcfg before retrying."
+            }
+            Self::Rejected(_) => {
+                "The repository workflow rejected the review request; no host change was authorized"
+            }
+            Self::InvalidPreferences | Self::InvalidRemovalIntent => self.safe_message(),
+        }
+    }
 }
 
 #[derive(Serialize)]
