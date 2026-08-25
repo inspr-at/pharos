@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pharos_core::HostPreferences;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Serialize;
-use url::Url;
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const DISPATCH_PATH: &str =
@@ -304,24 +303,9 @@ impl NixcfgDispatchError {
     }
 }
 
-fn dispatch_api_base_from_env() -> String {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var("PHAROS_NIXCFG_DISPATCH_API_BASE")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .and_then(|value| safe_loopback_dispatch_api_base(&value))
-            .unwrap_or_else(|| GITHUB_API_BASE.to_string())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        GITHUB_API_BASE.to_string()
-    }
-}
-
+#[cfg(test)]
 fn safe_loopback_dispatch_api_base(value: &str) -> Option<String> {
-    let url = Url::parse(value).ok()?;
+    let url = url::Url::parse(value).ok()?;
     if url.scheme() != "http" {
         return None;
     }
@@ -877,6 +861,18 @@ mod tests {
         let evil_url = format!("http://{evil_address}/steal");
         std::thread::spawn(move || {
             let (mut stream, _) = redirect_listener.accept().expect("redirect accept");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read redirect request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if complete_http_request(&request) {
+                    break;
+                }
+            }
             let response = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {evil_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
@@ -887,10 +883,7 @@ mod tests {
 
         let client = NixcfgDispatch::for_test(Some(token_path.clone()), redirect_base);
         let result = client.dispatch("gpc0", &preferences()).await;
-        assert!(matches!(
-            result,
-            Err(NixcfgDispatchError::RequestFailed) | Err(NixcfgDispatchError::Rejected(302))
-        ));
+        assert_eq!(result, Err(NixcfgDispatchError::Rejected(302)));
 
         let evil_connected = evil_rx
             .recv_timeout(Duration::from_secs(3))

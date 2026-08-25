@@ -5,11 +5,11 @@
 //! store never carries credentials, permits, commands, Nix paths, or command
 //! output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use pharos_core::HostPreferences;
 use serde::{Deserialize, Serialize};
@@ -2507,6 +2507,7 @@ impl HostActionStoreError {
 pub(crate) struct HostActionStore {
     path: Option<PathBuf>,
     jobs: RwLock<BTreeMap<String, HostActionJob>>,
+    pending_durable_repair: Mutex<BTreeSet<String>>,
 }
 
 struct NewHostAction<'a> {
@@ -2555,7 +2556,7 @@ impl HostActionStore {
                     if normalize_system_update_proposal(job, now) {
                         migrated = true;
                     }
-                    if normalize_orphaned_host_dispatch(job, now) {
+                    if reconcile_orphaned_host_dispatch(job, now) {
                         migrated = true;
                     }
                 }
@@ -2571,6 +2572,7 @@ impl HostActionStore {
         let store = Self {
             path,
             jobs: RwLock::new(jobs),
+            pending_durable_repair: Mutex::new(BTreeSet::new()),
         };
         if migrated {
             let jobs = store.jobs.read().expect("host action store lock");
@@ -2597,11 +2599,98 @@ impl HostActionStore {
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<HostActionJob> {
+        let _ = self.reconcile_orphaned_host_dispatches_for(id, system_time_unix());
         self.jobs
             .read()
             .expect("host action store lock")
             .get(id)
             .cloned()
+    }
+
+    fn note_durable_repair_pending(&self, id: &str) {
+        if self.path.is_some() {
+            self.pending_durable_repair
+                .lock()
+                .expect("host action durable repair lock")
+                .insert(id.to_string());
+        }
+    }
+
+    fn remove_durable_repair_pending(&self, id: &str) {
+        if self.path.is_some() {
+            self.pending_durable_repair
+                .lock()
+                .expect("host action durable repair lock")
+                .remove(id);
+        }
+    }
+
+    fn pending_durable_repair_snapshot(&self) -> BTreeSet<String> {
+        self.pending_durable_repair
+            .lock()
+            .expect("host action durable repair lock")
+            .clone()
+    }
+
+    fn clear_durable_repair_for_snapshot(
+        &self,
+        snapshot_ids: &BTreeSet<String>,
+        jobs: &BTreeMap<String, HostActionJob>,
+    ) {
+        if self.path.is_none() {
+            return;
+        }
+        self.pending_durable_repair
+            .lock()
+            .expect("host action durable repair lock")
+            .retain(|id| {
+                !snapshot_ids.contains(id)
+                    || jobs
+                        .get(id)
+                        .is_none_or(|job| !durable_repair_state_is_snapshot_durable(job))
+            });
+    }
+
+    #[cfg(test)]
+    fn pending_durable_repair_ids(&self) -> BTreeSet<String> {
+        self.pending_durable_repair_snapshot()
+    }
+
+    pub(crate) fn reconcile_orphaned_host_dispatches(
+        &self,
+        now: i64,
+    ) -> Result<bool, HostActionStoreError> {
+        self.reconcile_orphaned_host_dispatches_for_ids(self.pending_durable_repair_snapshot(), now)
+    }
+
+    fn reconcile_orphaned_host_dispatches_for(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<bool, HostActionStoreError> {
+        if self.path.is_none() || !self.pending_durable_repair_snapshot().contains(id) {
+            return Ok(false);
+        }
+        let mut ids = BTreeSet::new();
+        ids.insert(id.to_string());
+        self.reconcile_orphaned_host_dispatches_for_ids(ids, now)
+    }
+
+    fn reconcile_orphaned_host_dispatches_for_ids(
+        &self,
+        pending_ids: BTreeSet<String>,
+        now: i64,
+    ) -> Result<bool, HostActionStoreError> {
+        if self.path.is_none() || pending_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let normalized = reconcile_orphaned_host_dispatches_locked(&mut jobs, &pending_ids, now);
+        match self.persist_jobs(&jobs) {
+            Ok(()) => Ok(normalized || !pending_ids.is_empty()),
+            Err(error) if error.persistence_committed() => Ok(true),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(test)]
@@ -2615,6 +2704,7 @@ impl HostActionStore {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn most_relevant_for_host(&self, host: &str) -> Option<HostActionJob> {
         let jobs = self.jobs.read().expect("host action store lock");
         jobs.values()
@@ -2655,6 +2745,16 @@ impl HostActionStore {
             .filter(|job| {
                 job.host == host && job.workflow_kind() == HostWorkflowKind::SettingsChange
             })
+            .max_by_key(|job| (job.created_at, job.updated_at, &job.id))
+            .cloned()
+    }
+
+    pub(crate) fn latest_removal_for_host(&self, host: &str) -> Option<HostActionJob> {
+        self.jobs
+            .read()
+            .expect("host action store lock")
+            .values()
+            .filter(|job| job.host == host && job.kind == HostActionKind::RemoveHost)
             .max_by_key(|job| (job.created_at, job.updated_at, &job.id))
             .cloned()
     }
@@ -2855,23 +2955,30 @@ impl HostActionStore {
                 return Err(error);
             }
             if let Err(error) = self.persist_jobs(&jobs) {
-                if !error.persistence_committed() {
-                    jobs.remove(&job.id);
-                    if let Some((ack_id, previous)) = pending_ack_rollback {
-                        jobs.insert(ack_id, previous);
-                    }
+                if error.persistence_committed() {
+                    return Ok(SystemUpdateProposalBegin::New(job));
+                }
+                jobs.remove(&job.id);
+                if let Some((ack_id, previous)) = pending_ack_rollback {
+                    jobs.insert(ack_id, previous);
                 }
                 return Err(error);
             }
             Ok(SystemUpdateProposalBegin::New(job))
         } else {
-            match self.insert_locked(&mut jobs, job) {
-                Ok(created) => Ok(SystemUpdateProposalBegin::New(created)),
-                Err(error) => Err(error),
+            self.prepare_insert_locked(&mut jobs, &job)?;
+            if let Err(error) = self.persist_jobs(&jobs) {
+                if error.persistence_committed() {
+                    return Ok(SystemUpdateProposalBegin::New(job));
+                }
+                jobs.remove(&job.id);
+                return Err(error);
             }
+            Ok(SystemUpdateProposalBegin::New(job))
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn accept_system_update_proposal(
         &self,
         id: &str,
@@ -2934,6 +3041,8 @@ impl HostActionStore {
         now: i64,
         failure_kind: HostActionEventKind,
     ) -> Result<HostActionJob, HostActionStoreError> {
+        let sticky_on_persist_failure =
+            failure_kind == HostActionEventKind::DispatchOutcomeUncertain;
         let mut jobs = self.jobs.write().expect("host action store lock");
         let (previous, updated) = {
             let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
@@ -2958,8 +3067,11 @@ impl HostActionStore {
             return Err(HostActionStoreError::InvalidJob);
         }
         if let Err(error) = self.persist_jobs(&jobs) {
-            if !error.persistence_committed() {
+            if !error.persistence_committed() && !sticky_on_persist_failure {
                 jobs.insert(id.to_string(), previous);
+                self.remove_durable_repair_pending(id);
+            } else if sticky_on_persist_failure && !error.persistence_committed() {
+                self.note_durable_repair_pending(id);
             }
             return Err(error);
         }
@@ -3022,6 +3134,9 @@ impl HostActionStore {
             let previous = job.clone();
             if !job.has_event(HostActionEventKind::DispatchSubmitted) {
                 let at = job.updated_at.max(now);
+                if job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal {
+                    job.state = HostActionState::Succeeded;
+                }
                 job.updated_at = at;
                 job.record_event(
                     at,
@@ -3039,6 +3154,7 @@ impl HostActionStore {
         if let Err(error) = self.persist_jobs(&jobs) {
             if !error.persistence_committed() {
                 jobs.insert(id.to_string(), previous);
+                self.note_durable_repair_pending(id);
             }
             return Err(error);
         }
@@ -3180,6 +3296,7 @@ impl HostActionStore {
         removal_plan: HostRemovalPlan,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
+        let _ = self.reconcile_orphaned_host_dispatches(now);
         let mut jobs = self.jobs.write().expect("host action store lock");
         if jobs.values().any(|job| {
             job.host == host
@@ -3309,6 +3426,8 @@ impl HostActionStore {
         now: i64,
         failure_kind: HostActionEventKind,
     ) -> Result<HostActionJob, HostActionStoreError> {
+        let sticky_on_persist_failure =
+            failure_kind == HostActionEventKind::DispatchOutcomeUncertain;
         let mut jobs = self.jobs.write().expect("host action store lock");
         let (previous, updated) = {
             let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
@@ -3329,8 +3448,11 @@ impl HostActionStore {
             return Err(HostActionStoreError::InvalidJob);
         }
         if let Err(error) = self.persist_jobs(&jobs) {
-            if !error.persistence_committed() {
+            if !error.persistence_committed() && !sticky_on_persist_failure {
                 jobs.insert(id.to_string(), previous);
+                self.remove_durable_repair_pending(id);
+            } else if sticky_on_persist_failure && !error.persistence_committed() {
+                self.note_durable_repair_pending(id);
             }
             return Err(error);
         }
@@ -3343,6 +3465,7 @@ impl HostActionStore {
         actor: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
+        let _ = self.reconcile_orphaned_host_dispatches(now);
         let mut jobs = self.jobs.write().expect("host action store lock");
         if jobs.values().any(|job| {
             job.host == host
@@ -3443,7 +3566,7 @@ impl HostActionStore {
         id: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        self.update_settings_change(id, now, |job, event_at| {
+        self.update_settings_change(id, now, false, |job, event_at| {
             job.record_event(
                 event_at,
                 HostActionEventSource::Pharos,
@@ -3458,7 +3581,7 @@ impl HostActionStore {
         id: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        self.update_settings_change(id, now, |job, event_at| {
+        self.update_settings_change(id, now, false, |job, event_at| {
             job.state = HostActionState::Failed;
             job.record_event(
                 event_at,
@@ -3474,7 +3597,7 @@ impl HostActionStore {
         id: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
-        self.update_settings_change(id, now, |job, event_at| {
+        self.update_settings_change(id, now, true, |job, event_at| {
             job.state = HostActionState::Failed;
             job.record_event(
                 event_at,
@@ -3530,6 +3653,7 @@ impl HostActionStore {
         &self,
         id: &str,
         now: i64,
+        sticky_on_persist_failure: bool,
         update: impl FnOnce(&mut HostActionJob, i64),
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
@@ -3551,8 +3675,11 @@ impl HostActionStore {
             return Err(HostActionStoreError::InvalidJob);
         }
         if let Err(error) = self.persist_jobs(&jobs) {
-            if !error.persistence_committed() {
+            if !error.persistence_committed() && !sticky_on_persist_failure {
                 jobs.insert(id.to_string(), previous);
+                self.remove_durable_repair_pending(id);
+            } else if sticky_on_persist_failure && !error.persistence_committed() {
+                self.note_durable_repair_pending(id);
             }
             return Err(error);
         }
@@ -4227,8 +4354,16 @@ impl HostActionStore {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        let snapshot_ids: BTreeSet<String> = jobs.keys().cloned().collect();
         let snapshot: Vec<_> = jobs.values().cloned().collect();
-        persist_json(path, &snapshot)
+        let result = persist_json(path, &snapshot);
+        if matches!(
+            result,
+            Ok(()) | Err(HostActionStoreError::PersistenceCommitted)
+        ) {
+            self.clear_durable_repair_for_snapshot(&snapshot_ids, jobs);
+        }
+        result
     }
 }
 
@@ -4490,16 +4625,25 @@ fn normalize_system_update_proposal(job: &mut HostActionJob, now: i64) -> bool {
     false
 }
 
-fn normalize_orphaned_host_dispatch(job: &mut HostActionJob, now: i64) -> bool {
+fn reconcile_orphaned_host_dispatch(job: &mut HostActionJob, now: i64) -> bool {
     if !matches!(
         job.workflow_kind(),
         HostWorkflowKind::SettingsChange | HostWorkflowKind::RemoveHost
     ) || job.state != HostActionState::ProposalRequested
         || job.has_event(HostActionEventKind::DispatchSubmitted)
-        || (job.workflow_kind() == HostWorkflowKind::SettingsChange
-            && job.has_event(HostActionEventKind::SettingsRequestAccepted))
     {
         return false;
+    }
+    match job.workflow_kind() {
+        HostWorkflowKind::SettingsChange => {
+            if job.has_event(HostActionEventKind::SettingsRequestAccepted)
+                || job.requested_preferences.is_none()
+            {
+                return false;
+            }
+        }
+        HostWorkflowKind::RemoveHost => {}
+        _ => return false,
     }
     let at = job.updated_at.max(now);
     job.state = HostActionState::Failed;
@@ -4513,6 +4657,30 @@ fn normalize_orphaned_host_dispatch(job: &mut HostActionJob, now: i64) -> bool {
         );
     }
     true
+}
+
+fn durable_repair_state_is_snapshot_durable(job: &HostActionJob) -> bool {
+    job.has_event(HostActionEventKind::DispatchSubmitted)
+        || (job.state == HostActionState::Failed
+            && job.has_event(HostActionEventKind::DispatchOutcomeUncertain))
+        || (job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
+            && job.state == HostActionState::Succeeded)
+}
+
+fn reconcile_orphaned_host_dispatches_locked(
+    jobs: &mut BTreeMap<String, HostActionJob>,
+    pending_ids: &BTreeSet<String>,
+    now: i64,
+) -> bool {
+    let mut migrated = false;
+    for id in pending_ids {
+        if let Some(job) = jobs.get_mut(id) {
+            if reconcile_orphaned_host_dispatch(job, now) {
+                migrated = true;
+            }
+        }
+    }
+    migrated
 }
 
 fn system_update_uncertainty_requires_acknowledgement(job: &HostActionJob) -> bool {
@@ -4770,6 +4938,7 @@ mod tests {
             lease_phase: None,
             lease_until: None,
             retirement_lease_until: None,
+            requested_preferences: None,
         }
     }
 
@@ -5772,6 +5941,30 @@ mod tests {
         assert_eq!(reloaded.get(&retained.id), Some(retained));
         std::fs::remove_file(path).expect("post-commit fixture removed");
 
+        let system_path = std::env::temp_dir().join(format!(
+            "pharos-post-commit-sync-failure-system-update-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let system_store = HostActionStore::new(Some(system_path.clone()));
+        let system_job = system_store
+            .begin_system_update_proposal("athena", "markus", 902, None)
+            .expect("final insert survives post-commit rename")
+            .into_job();
+        assert_eq!(
+            system_store.mark_dispatch_submitted(&system_job.id, 903),
+            Err(HostActionStoreError::PersistenceCommitted)
+        );
+        let system_retained = system_store
+            .get(&system_job.id)
+            .expect("committed system update handoff retained");
+        assert_eq!(system_retained.state, HostActionState::Succeeded);
+        assert_eq!(
+            HostActionStore::new(Some(system_path.clone())).get(&system_job.id),
+            Some(system_retained)
+        );
+        std::fs::remove_file(system_path).expect("system update post-commit fixture removed");
+
         let retired_path = std::env::temp_dir().join(format!(
             "pharos-post-commit-sync-failure-retired-{}-{}.json",
             std::process::id(),
@@ -6427,6 +6620,97 @@ mod tests {
                 )
                 .is_ok(),
             "acknowledged uncertainty clears the fleet-wide gate"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn begin_system_update_migration_persistence_committed_stays_err_with_failed_ack_replacement() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-post-commit-sync-failure-system-update-migrate-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let stale_at = system_time_unix() - SYSTEM_UPDATE_DISPATCH_STALL_SECS - 30;
+        let uncertain_id = format!(
+            "action-system-update-gpc0-migrate-rollback-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        match store.create_system_update_proposal(
+            uncertain_id.clone(),
+            "gpc0",
+            "markus",
+            stale_at.saturating_sub(200),
+        ) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain proposal seeded: {error:?}"),
+        }
+        match store
+            .fail_system_update_proposal_uncertain(&uncertain_id, stale_at.saturating_sub(199))
+        {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain failure seeded: {error:?}"),
+        }
+        let replacement_created_at = stale_at.saturating_sub(50);
+        let replacement = store
+            .begin_system_update_proposal(
+                "gpc0",
+                "markus",
+                replacement_created_at,
+                Some(&uncertain_id),
+            )
+            .expect("ack replacement seeded")
+            .into_job();
+        assert_eq!(replacement.retry_of.as_deref(), Some(uncertain_id.as_str()));
+        match store.fail_system_update_proposal(&replacement.id, replacement_created_at + 1) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("replacement terminalized: {error:?}"),
+        }
+        let stalled_id = format!(
+            "action-system-update-gpc0-stalled-migrate-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        match store.create_system_update_proposal(stalled_id.clone(), "gpc0", "markus", stale_at) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("stalled proposal seeded: {error:?}"),
+        }
+        let stalled = store
+            .get(&stalled_id)
+            .expect("stalled proposal retained in memory");
+        assert_eq!(stalled.state, HostActionState::ProposalRequested);
+        let rolled_back_now = replacement_created_at.saturating_sub(10);
+        assert!(
+            rolled_back_now < replacement.created_at,
+            "test models wall-clock rollback below the prior replacement timestamp"
+        );
+        assert_eq!(
+            store.begin_system_update_proposal(
+                "gpc0",
+                "markus",
+                rolled_back_now,
+                Some(&uncertain_id),
+            ),
+            Err(HostActionStoreError::PersistenceCommitted)
+        );
+        let retained = store
+            .get(&replacement.id)
+            .expect("failed replacement retained");
+        assert_eq!(retained.state, HostActionState::Failed);
+        assert!(!system_update_dispatch_handed_off(&retained));
+        assert!(
+            store
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
+                        && job.state == HostActionState::ProposalRequested
+                })
+                .count()
+                <= 1,
+            "migration stays in memory without authorizing a fresh proposal"
         );
         let _ = std::fs::remove_file(path);
     }
@@ -7384,7 +7668,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_dispatch_submitted_records_recovery_before_terminalization() {
+    fn mark_dispatch_submitted_terminalizes_system_update_atomically() {
         let path = std::env::temp_dir().join(format!(
             "pharos-submitted-recovery-{}-{}.json",
             std::process::id(),
@@ -7395,9 +7679,10 @@ mod tests {
             .begin_system_update_proposal("hsb8", "markus", 510, None)
             .expect("proposal workflow created")
             .into_job();
-        store
+        let submitted = store
             .mark_dispatch_submitted(&job.id, 511)
             .expect("dispatch submission recorded");
+        assert_eq!(submitted.state, HostActionState::Succeeded);
 
         let recovered = HostActionStore::new(Some(path.clone()));
         let migrated = recovered
@@ -7582,6 +7867,680 @@ mod tests {
         reloaded
             .begin_removal("gpc0", "markus", removal_plan, system_time_unix())
             .expect("new removal workflow allowed after verification");
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn dispatch_submitted_event_count(job: &HostActionJob) -> usize {
+        job.events
+            .iter()
+            .filter(|event| event.kind == HostActionEventKind::DispatchSubmitted)
+            .count()
+    }
+
+    fn uncertainty_acknowledgement_action(job: &HostActionJob) -> bool {
+        job.summary()
+            .workflow
+            .primary_action
+            .as_ref()
+            .is_some_and(|action| action.kind == HostWorkflowActionKind::Acknowledge)
+    }
+
+    #[cfg(unix)]
+    fn set_dir_read_only(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+            .expect("directory made read-only");
+    }
+
+    #[cfg(unix)]
+    fn set_dir_writable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+            .expect("directory restored writable");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn accepted_settings_dispatch_checkpoint_failure_recovers_in_process_without_redispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-settings-checkpoint-recovery-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("checkpoint recovery directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 600)
+            .expect("settings workflow created");
+        store
+            .record_settings_request(
+                &settings.id,
+                &HostPreferences {
+                    accent: Some("#48b8a8".to_string()),
+                    ..HostPreferences::default()
+                },
+                601,
+            )
+            .expect("settings payload persisted before dispatch");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&settings.id, 602),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_settings_change_uncertain(&settings.id, 603),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        let recovered = store
+            .get(&settings.id)
+            .expect("settings workflow reconciled after storage recovery");
+        assert!(uncertainty_acknowledgement_action(&recovered));
+        assert_eq!(dispatch_submitted_event_count(&recovered), 0);
+        assert_eq!(
+            store.begin_settings_change("hsb8", "markus", 604),
+            Err(HostActionStoreError::ActiveJob)
+        );
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        let durable = reloaded
+            .get(&settings.id)
+            .expect("uncertain settings workflow durable after recovery");
+        assert!(uncertainty_acknowledgement_action(&durable));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn accepted_removal_dispatch_checkpoint_failure_recovers_in_process_without_redispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-removal-checkpoint-recovery-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("checkpoint recovery directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let removal_plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: false,
+        };
+        let removal = store
+            .begin_removal("gpc0", "markus", removal_plan.clone(), 610)
+            .expect("removal workflow created");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&removal.id, 611),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_removal_uncertain(&removal.id, 612),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        let recovered = store
+            .get(&removal.id)
+            .expect("removal workflow reconciled after storage recovery");
+        assert!(uncertainty_acknowledgement_action(&recovered));
+        assert_eq!(dispatch_submitted_event_count(&recovered), 0);
+        assert_eq!(
+            store.begin_removal("gpc0", "markus", removal_plan, 613),
+            Err(HostActionStoreError::ActiveJob)
+        );
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        let durable = reloaded
+            .get(&removal.id)
+            .expect("uncertain removal workflow durable after recovery");
+        assert!(uncertainty_acknowledgement_action(&durable));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_begin_persistence_committed_retains_host_lookup_for_handler_recovery() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-post-commit-sync-failure-settings-begin-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        assert_eq!(
+            store.begin_settings_change("hsb8", "markus", 620),
+            Err(HostActionStoreError::PersistenceCommitted)
+        );
+        let active = store
+            .latest_settings_change_for_host("hsb8")
+            .expect("committed settings workflow retained in memory");
+        assert_eq!(active.state, HostActionState::ProposalRequested);
+        assert_eq!(
+            store.begin_settings_change("hsb8", "markus", 621),
+            Err(HostActionStoreError::ActiveJob)
+        );
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        assert_eq!(
+            reloaded.latest_settings_change_for_host("hsb8"),
+            Some(active)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatch_checkpoint_reconciliation_is_idempotent_without_redispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-dispatch-reconcile-idempotent-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("reconciliation directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 630)
+            .expect("settings workflow created");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&settings.id, 631),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_settings_change_uncertain(&settings.id, 632),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        let store = std::sync::Arc::new(store);
+        let settings_id = settings.id.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let settings_id = settings_id.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.get(&settings_id).expect("concurrent get succeeded")
+                })
+            })
+            .collect();
+        barrier.wait();
+        for round in 0..5 {
+            assert!(
+                store
+                    .reconcile_orphaned_host_dispatches(633 + round)
+                    .is_ok(),
+                "repeated reconciliation remains successful"
+            );
+        }
+        for handle in handles {
+            let job = handle.join().expect("concurrent get joined");
+            assert!(uncertainty_acknowledgement_action(&job));
+            assert_eq!(dispatch_submitted_event_count(&job), 0);
+        }
+        let final_job = store
+            .get(&settings.id)
+            .expect("settings workflow remains actionable");
+        assert_eq!(dispatch_submitted_event_count(&final_job), 0);
+        assert_eq!(
+            final_job
+                .events
+                .iter()
+                .filter(|event| { event.kind == HostActionEventKind::DispatchOutcomeUncertain })
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn checkpoint_preferences() -> HostPreferences {
+        HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..HostPreferences::default()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_repair_does_not_normalize_unrelated_in_flight_settings_workflow() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-scoped-repair-settings-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scoped repair directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let preferences = checkpoint_preferences();
+        let unrelated = store
+            .begin_settings_change("athena", "markus", 700)
+            .expect("unrelated settings workflow created");
+        store
+            .record_settings_request(&unrelated.id, &preferences, 701)
+            .expect("unrelated settings payload recorded");
+        let failed = store
+            .begin_settings_change("hsb8", "markus", 702)
+            .expect("failed settings workflow created");
+        store
+            .record_settings_request(&failed.id, &preferences, 703)
+            .expect("failed settings payload recorded");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&failed.id, 704),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_settings_change_uncertain(&failed.id, 705),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        assert_eq!(
+            store.pending_durable_repair_ids(),
+            [failed.id.clone()].into()
+        );
+        let repaired = store
+            .get(&failed.id)
+            .expect("failed settings workflow reconciled");
+        assert!(uncertainty_acknowledgement_action(&repaired));
+        assert!(store.pending_durable_repair_ids().is_empty());
+        let untouched = store
+            .get(&unrelated.id)
+            .expect("unrelated settings workflow readable");
+        assert_eq!(untouched.state, HostActionState::ProposalRequested);
+        assert!(!untouched.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        store
+            .accept_settings_change(&unrelated.id, 706)
+            .expect("unrelated settings workflow completes normally");
+        assert_eq!(
+            store
+                .get(&unrelated.id)
+                .expect("unrelated settings workflow retained")
+                .summary()
+                .workflow
+                .status_label,
+            "change waiting"
+        );
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        let durable_failed = reloaded
+            .get(&failed.id)
+            .expect("failed settings uncertainty durable");
+        assert!(uncertainty_acknowledgement_action(&durable_failed));
+        let durable_unrelated = reloaded
+            .get(&unrelated.id)
+            .expect("unrelated accepted settings durable");
+        assert_eq!(durable_unrelated.state, HostActionState::ProposalRequested);
+        assert!(!durable_unrelated.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_repair_does_not_normalize_unrelated_in_flight_removal_workflow() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-scoped-repair-removal-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scoped repair directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let removal_plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: false,
+        };
+        let unrelated = store
+            .begin_removal("gpc0", "markus", removal_plan.clone(), 710)
+            .expect("unrelated removal workflow created");
+        let failed = store
+            .begin_removal("hsb8", "markus", removal_plan, 711)
+            .expect("failed removal workflow created");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&failed.id, 712),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_removal_uncertain(&failed.id, 713),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        assert_eq!(
+            store.pending_durable_repair_ids(),
+            [failed.id.clone()].into()
+        );
+        let repaired = store
+            .get(&failed.id)
+            .expect("failed removal workflow reconciled");
+        assert!(uncertainty_acknowledgement_action(&repaired));
+        let untouched = store
+            .get(&unrelated.id)
+            .expect("unrelated removal readable");
+        assert_eq!(untouched.state, HostActionState::ProposalRequested);
+        assert!(!untouched.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        store
+            .fail_removal(&unrelated.id, 714)
+            .expect("unrelated removal records a terminal rejection");
+        assert_eq!(
+            store
+                .get(&unrelated.id)
+                .expect("unrelated removal retained")
+                .state,
+            HostActionState::Failed
+        );
+        assert_eq!(dispatch_submitted_event_count(&repaired), 0);
+        assert_eq!(dispatch_submitted_event_count(&untouched), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_repair_supports_multiple_pending_workflow_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-scoped-repair-multi-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scoped repair directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let preferences = checkpoint_preferences();
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 720)
+            .expect("settings workflow created");
+        store
+            .record_settings_request(&settings.id, &preferences, 721)
+            .expect("settings payload recorded");
+        let removal_plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: false,
+        };
+        let removal = store
+            .begin_removal("gpc0", "markus", removal_plan, 722)
+            .expect("removal workflow created");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&settings.id, 723),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_settings_change_uncertain(&settings.id, 724),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.mark_dispatch_submitted(&removal.id, 725),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_removal_uncertain(&removal.id, 726),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        let pending = store.pending_durable_repair_ids();
+        assert!(pending.contains(&settings.id));
+        assert!(pending.contains(&removal.id));
+        assert!(store
+            .reconcile_orphaned_host_dispatches(727)
+            .expect("multi-job reconciliation succeeds"));
+        assert!(store.pending_durable_repair_ids().is_empty());
+        for id in [&settings.id, &removal.id] {
+            let job = store.get(id).expect("pending workflow reconciled");
+            assert!(uncertainty_acknowledgement_action(&job));
+            assert_eq!(dispatch_submitted_event_count(&job), 0);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_repair_clearing_preserves_ids_registered_after_snapshot_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-scoped-repair-boundary-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scoped repair directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let preferences = checkpoint_preferences();
+        let first = store
+            .begin_settings_change("hsb8", "markus", 730)
+            .expect("first settings workflow created");
+        store
+            .record_settings_request(&first.id, &preferences, 731)
+            .expect("first settings payload recorded");
+        let second = store
+            .begin_settings_change("athena", "markus", 732)
+            .expect("second settings workflow created");
+        store
+            .record_settings_request(&second.id, &preferences, 733)
+            .expect("second settings payload recorded");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&first.id, 734),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.mark_dispatch_submitted(&second.id, 735),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        let pending = store.pending_durable_repair_ids();
+        assert!(pending.contains(&first.id));
+        assert!(pending.contains(&second.id));
+
+        store
+            .get(&first.id)
+            .expect("first workflow reconciliation persists snapshot");
+        assert!(
+            store.pending_durable_repair_ids().contains(&second.id),
+            "later pending id must survive an earlier snapshot flush"
+        );
+        assert_eq!(
+            store
+                .latest_settings_change_for_host("athena")
+                .expect("second workflow retained in memory")
+                .state,
+            HostActionState::ProposalRequested
+        );
+        store
+            .get(&second.id)
+            .expect("second workflow reconciliation persists snapshot");
+        assert!(store.pending_durable_repair_ids().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn system_update_checkpoint_failure_uses_scoped_repair_tracking() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-scoped-repair-system-update-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scoped repair directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path.clone()));
+        let preferences = checkpoint_preferences();
+        let unrelated = store
+            .begin_settings_change("athena", "markus", 740)
+            .expect("unrelated settings workflow created");
+        store
+            .record_settings_request(&unrelated.id, &preferences, 741)
+            .expect("unrelated settings payload recorded");
+        let update = store
+            .begin_system_update_proposal("gpc0", "markus", 742, None)
+            .expect("system update workflow created")
+            .into_job();
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&update.id, 743),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_system_update_proposal_uncertain(&update.id, 744),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        assert_eq!(
+            store.pending_durable_repair_ids(),
+            [update.id.clone()].into()
+        );
+        let repaired = store
+            .get(&update.id)
+            .expect("system update uncertainty reconciled");
+        assert!(repaired.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        assert!(store.pending_durable_repair_ids().is_empty());
+        let untouched = store
+            .get(&unrelated.id)
+            .expect("unrelated settings readable");
+        assert_eq!(untouched.state, HostActionState::ProposalRequested);
+        assert!(!untouched.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn system_update_non_sticky_failure_clears_scoped_repair_tracking() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-scoped-repair-system-update-rollback-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scoped repair directory created");
+        let path = dir.join("actions.json");
+        let store = HostActionStore::new(Some(path));
+        let rolled_back = store
+            .begin_system_update_proposal("hsb8", "markus", 745, None)
+            .expect("system update workflow created")
+            .into_job();
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&rolled_back.id, 746),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_system_update_proposal(&rolled_back.id, 747),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+        assert!(!store.pending_durable_repair_ids().contains(&rolled_back.id));
+        assert_eq!(
+            store
+                .get(&rolled_back.id)
+                .expect("rolled-back system update readable")
+                .state,
+            HostActionState::ProposalRequested
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_scoped_repair_leaves_unrelated_workflow_completable() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-scoped-repair-concurrent-{}-{}",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scoped repair directory created");
+        let path = dir.join("actions.json");
+        let store = std::sync::Arc::new(HostActionStore::new(Some(path.clone())));
+        let preferences = checkpoint_preferences();
+        let unrelated = store
+            .begin_settings_change("athena", "markus", 750)
+            .expect("unrelated settings workflow created");
+        store
+            .record_settings_request(&unrelated.id, &preferences, 751)
+            .expect("unrelated settings payload recorded");
+        let failed = store
+            .begin_settings_change("hsb8", "markus", 752)
+            .expect("failed settings workflow created");
+        store
+            .record_settings_request(&failed.id, &preferences, 753)
+            .expect("failed settings payload recorded");
+        set_dir_read_only(&dir);
+        assert_eq!(
+            store.mark_dispatch_submitted(&failed.id, 754),
+            Err(HostActionStoreError::Persistence)
+        );
+        assert_eq!(
+            store.fail_settings_change_uncertain(&failed.id, 755),
+            Err(HostActionStoreError::Persistence)
+        );
+        set_dir_writable(&dir);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let failed_id = failed.id.clone();
+        let unrelated_id = unrelated.id.clone();
+        let repair_store = std::sync::Arc::clone(&store);
+        let repair_barrier = std::sync::Arc::clone(&barrier);
+        let repair_handle = std::thread::spawn(move || {
+            repair_barrier.wait();
+            repair_store
+                .get(&failed_id)
+                .expect("failed workflow repaired concurrently")
+        });
+        let complete_store = std::sync::Arc::clone(&store);
+        let complete_barrier = std::sync::Arc::clone(&barrier);
+        let complete_handle = std::thread::spawn(move || {
+            complete_barrier.wait();
+            complete_store
+                .accept_settings_change(&unrelated_id, 756)
+                .expect("unrelated workflow completes during scoped repair");
+        });
+        barrier.wait();
+        let repaired = repair_handle.join().expect("repair thread joined");
+        complete_handle.join().expect("completion thread joined");
+        assert!(uncertainty_acknowledgement_action(&repaired));
+        let unrelated_job = store
+            .get(&unrelated.id)
+            .expect("unrelated workflow retained");
+        assert_eq!(unrelated_job.state, HostActionState::ProposalRequested);
+        assert!(!unrelated_job.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        assert_eq!(dispatch_submitted_event_count(&repaired), 0);
+        assert_eq!(dispatch_submitted_event_count(&unrelated_job), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn post_rename_persistence_committed_on_settings_dispatch_does_not_duplicate() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-post-commit-sync-failure-settings-dispatch-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        assert_eq!(
+            store.begin_settings_change("hsb8", "markus", 640),
+            Err(HostActionStoreError::PersistenceCommitted)
+        );
+        let settings = store
+            .latest_settings_change_for_host("hsb8")
+            .expect("settings workflow retained after begin");
+        assert_eq!(
+            store.mark_dispatch_submitted(&settings.id, 641),
+            Err(HostActionStoreError::PersistenceCommitted)
+        );
+        let handed_off = store
+            .get(&settings.id)
+            .expect("settings dispatch handoff retained");
+        assert_eq!(dispatch_submitted_event_count(&handed_off), 1);
+        assert_eq!(
+            store.mark_dispatch_submitted(&settings.id, 642),
+            Err(HostActionStoreError::PersistenceCommitted)
+        );
+        let idempotent = store
+            .get(&settings.id)
+            .expect("settings dispatch handoff still singular");
+        assert_eq!(dispatch_submitted_event_count(&idempotent), 1);
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        let durable = reloaded
+            .get(&settings.id)
+            .expect("settings dispatch handoff durable");
+        assert_eq!(dispatch_submitted_event_count(&durable), 1);
         let _ = std::fs::remove_file(path);
     }
 

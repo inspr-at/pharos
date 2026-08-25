@@ -1015,7 +1015,7 @@ test("fleet refresh consumes server-emitted lifecycle for failed settings", asyn
   const agora = await page.request.post("/agora/requests/host-preferences.json", {
     data: { host, preferences: { accent: "#48b8a8" } },
   });
-  expect(agora.status()).toBe(502);
+  expect(agora.status()).toBe(409);
 
   const snapshot = await page.request.get("/hosts.json");
   const payload = await snapshot.json();
@@ -1058,7 +1058,14 @@ test("fleet refresh applies server lifecycle when run_id differs from host_actio
   const agora = await page.request.post("/agora/requests/host-preferences.json", {
     data: { host, preferences: { accent: "#48b8a8" } },
   });
-  expect(agora.status()).toBe(502);
+  expect(agora.status()).toBe(409);
+
+  const manifest = requireFixtureManifest(
+    test,
+    "system update proposal fixture requires local harness manifest",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
 
   const proposal = await page.request.post("/host-actions/system-update", {
     headers: { "x-pharos-action": "1" },
@@ -1109,6 +1116,7 @@ test("fleet refresh applies server lifecycle when run_id differs from host_actio
     { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
   );
   expect(reonboard.ok()).toBe(true);
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
 });
 
 test("fleet refresh kernel slot follows server lifecycle transitions", async ({ page }) => {
@@ -1164,7 +1172,7 @@ test("fleet refresh keeps workflow note inert without host actions root", async 
   const agora = await writePage.request.post("/agora/requests/host-preferences.json", {
     data: { host, preferences: { accent: "#9868d0" } },
   });
-  expect(agora.status()).toBe(502);
+  expect(agora.status()).toBe(409);
   await writeContext.close();
 
   const readContext = await newAuthedContext(browser, "read");
@@ -1615,7 +1623,12 @@ test("settings dispatch uncertainty stays recoverable after page reload", async 
   );
   if (!manifest) return;
   const { acceptFlagPath } = manifest;
+  const settingsUncertainFlagPath = acceptFlagPath.replace(
+    /dispatch-accept$/,
+    "dispatch-settings-uncertain",
+  );
   fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+  fs.writeFileSync(settingsUncertainFlagPath, "true", { mode: 0o600 });
 
   const host = `browser-settings-uncertain-${testInfo.project.name}`;
   const report = await page.request.post("/report", {

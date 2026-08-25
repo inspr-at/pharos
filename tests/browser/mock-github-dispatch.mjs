@@ -25,8 +25,12 @@ if (!Number.isInteger(pharosPort) || pharosPort < 1 || pharosPort > 65535) {
 }
 
 const acceptFlagPath = path.join(runDir, "dispatch-accept");
+const settingsUncertainFlagPath = path.join(runDir, "dispatch-settings-uncertain");
 if (!fs.existsSync(acceptFlagPath)) {
   fs.writeFileSync(acceptFlagPath, "false\n", { mode: 0o600 });
+}
+if (!fs.existsSync(settingsUncertainFlagPath)) {
+  fs.writeFileSync(settingsUncertainFlagPath, "false\n", { mode: 0o600 });
 }
 
 const dispatchMockBase = `http://127.0.0.1:${dispatchPort}`;

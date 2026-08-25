@@ -52,6 +52,7 @@ writeSecretFile("read-token", readToken);
 writeSecretFile("write-token", writeToken);
 writeSecretFile("dispatch-token", dispatchToken);
 writeSecretFile("dispatch-accept", "false");
+writeSecretFile("dispatch-settings-uncertain", "false");
 
 const operators = [
   {

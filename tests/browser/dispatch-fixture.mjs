@@ -13,6 +13,14 @@ const DISPATCH_PATHS = new Set([
   HOST_REMOVAL_DISPATCH_PATH,
 ]);
 
+function settingsOutcomeUncertain(acceptFlagPath) {
+  const uncertainFlagPath = acceptFlagPath.replace(/dispatch-accept$/, "dispatch-settings-uncertain");
+  return (
+    fs.existsSync(uncertainFlagPath) &&
+    fs.readFileSync(uncertainFlagPath, "utf8").trim() === "true"
+  );
+}
+
 export function createDispatchMock(port, acceptFlagPath) {
   let attemptCount = 0;
   let acceptedCount = 0;
@@ -44,7 +52,21 @@ export function createDispatchMock(port, acceptFlagPath) {
           res.end();
           return;
         }
-        req.socket.destroy();
+        if (req.url === HOST_SETTINGS_DISPATCH_PATH) {
+          if (settingsOutcomeUncertain(acceptFlagPath)) {
+            req.socket.destroy();
+            return;
+          }
+          res.writeHead(503);
+          res.end();
+          return;
+        }
+        if (req.url === SYSTEM_UPDATE_DISPATCH_PATH) {
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(503);
+        res.end();
       });
       return;
     }

@@ -1039,8 +1039,8 @@ async fn request_system_update(
             );
         }
     };
-    if let SystemUpdateProposalBegin::Existing(workflow) = begin {
-        return system_update_action_response_for_existing_replacement(&workflow);
+    if let SystemUpdateProposalBegin::Existing(workflow) = &begin {
+        return system_update_action_response_for_existing_replacement(workflow);
     }
     let workflow = match begin {
         SystemUpdateProposalBegin::New(job) => job,
@@ -1074,6 +1074,10 @@ async fn request_system_update(
         .mark_dispatch_submitted(&workflow.id, now_unix())
     {
         Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => state
+            .host_actions
+            .get(&workflow.id)
+            .unwrap_or_else(|| workflow.clone()),
         Err(_) => {
             let uncertain = state
                 .host_actions
@@ -1088,21 +1092,8 @@ async fn request_system_update(
             );
         }
     };
-    let job = match state
-        .host_actions
-        .accept_system_update_proposal(&submitted.id, now_unix())
-    {
-        Ok(job) => job,
-        Err(_) => {
-            return action_response_with_message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &submitted,
-                "The update request was sent, but its saved checklist could not be updated",
-            );
-        }
-    };
     tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-125", "system update review handed to nixcfg");
-    action_response(StatusCode::ACCEPTED, &job)
+    action_response(StatusCode::ACCEPTED, &submitted)
 }
 
 async fn request_update_restart_review(
@@ -1685,10 +1676,28 @@ async fn request_host_removal(
         {
             Ok(job) => job,
             Err(HostActionStoreError::ActiveJob) => {
+                if let Some(current) = state.host_actions.latest_removal_for_host(&host) {
+                    return action_response_with_message(
+                        StatusCode::CONFLICT,
+                        &current,
+                        "A removal workflow is already active for this host",
+                    );
+                }
                 return action_error(
                     StatusCode::CONFLICT,
                     "A removal workflow is already active for this host",
                 );
+            }
+            Err(HostActionStoreError::PersistenceCommitted) => {
+                match state.host_actions.latest_removal_for_host(&host) {
+                    Some(job) => job,
+                    None => {
+                        return action_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "The removal workflow could not be recorded",
+                        );
+                    }
+                }
             }
             Err(_) => {
                 return action_error(
@@ -1793,6 +1802,9 @@ async fn request_host_removal(
         .mark_removal_access_revoked(&workflow.id, now_unix())
     {
         Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            state.host_actions.get(&workflow.id).unwrap_or(workflow)
+        }
         Err(_) => {
             let current = state.host_actions.get(&workflow.id).unwrap_or(workflow);
             return action_response_with_message(
@@ -5756,8 +5768,10 @@ mod tests {
         cancelled_settings.state = HostActionState::Cancelled;
         cancelled_settings.updated_at = 101;
         let proposal = store
-            .begin_system_update_proposal("diverge-host", "markus", 200)
-            .expect("system update proposal created");
+            .begin_system_update_proposal("diverge-host", "markus", 200, None)
+            .expect("system update proposal created")
+            .job()
+            .clone();
         let action_jobs = vec![cancelled_settings, proposal];
         let host = host_with_backups("diverge-host", 970, vec![]);
         let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &action_jobs, 1000);
@@ -14598,6 +14612,383 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .as_str()
             .expect("safe reconciliation error")
             .contains("Only a saved"));
+    }
+
+    fn post_commit_host_actions_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pharos-post-commit-sync-failure-handler-{}-{}.json",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[tokio::test]
+    async fn settings_begin_persistence_committed_continues_same_request_through_dispatch() {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+        let settings_request = || {
+            serde_json::from_value(serde_json::json!({
+                "host": "hsb8",
+                "preferences": {
+                    "accent": "#48b8a8"
+                }
+            }))
+            .expect("settings request parses")
+        };
+        let (status, Json(payload)) = agora::request_host_preferences(
+            State(state.clone()),
+            action_headers(),
+            Json(settings_request()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["status"], "dispatch_accepted");
+        assert_eq!(payload["job"]["workflow"]["status_label"], "change waiting");
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.host == "hsb8"
+                        && job.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange
+                })
+                .count(),
+            1
+        );
+
+        let (second_status, Json(second_payload)) = agora::request_host_preferences(
+            State(state.clone()),
+            action_headers(),
+            Json(settings_request()),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert_eq!(
+            second_payload["error"],
+            "A settings change is already waiting for this host"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn removal_begin_persistence_committed_continues_same_request_through_dispatch() {
+        let (generation_root, mut state) = janus_managed_undeclared_state();
+        let actions_path = post_commit_host_actions_path();
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+        let request = RemoveHostActionRequest {
+            confirmation: "dsc0".to_string(),
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+        };
+
+        let (status, Json(payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(request.clone()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "removal_pending");
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.host == "dsc0" && job.kind == host_actions::HostActionKind::RemoveHost
+                })
+                .count(),
+            1
+        );
+
+        let (second_status, Json(second_payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(request),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert_eq!(
+            second_payload["error"],
+            "This host is already being removed"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(generation_root);
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_begin_persistence_committed_continues_same_request_through_dispatch() {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("system update host recorded");
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers(),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "succeeded");
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "review handed to nixcfg"
+        );
+        assert!(host_actions::system_update_dispatch_handed_off(
+            &state
+                .host_actions
+                .get(payload["job"]["id"].as_str().expect("job id"))
+                .expect("handed-off workflow retained")
+        ));
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.workflow_kind() == host_actions::HostWorkflowKind::SystemUpdateProposal
+                })
+                .count(),
+            1
+        );
+
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_ack_replacement_begin_persistence_committed_continues_through_dispatch()
+    {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("system update host recorded");
+        let uncertain_id = format!(
+            "action-system-update-gpc0-post-commit-{}-{}",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        match state.host_actions.create_system_update_proposal(
+            uncertain_id.clone(),
+            "gpc0",
+            "markus",
+            850,
+        ) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update created: {error:?}"),
+        }
+        match state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_id, 851)
+        {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update recorded: {error:?}"),
+        }
+        assert!(state.host_actions.get(&uncertain_id).is_some());
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "succeeded");
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "review handed to nixcfg"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        let prior = state
+            .host_actions
+            .get(&uncertain_id)
+            .expect("acknowledged prior retained");
+        assert!(prior.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        }));
+        let replacement = state
+            .host_actions
+            .get(payload["job"]["id"].as_str().expect("replacement id"))
+            .expect("replacement workflow retained");
+        assert_eq!(replacement.retry_of.as_deref(), Some(uncertain_id.as_str()));
+        assert!(host_actions::system_update_dispatch_handed_off(
+            &replacement
+        ));
+
+        let (second_status, _) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::ACCEPTED);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_migration_persistence_committed_blocks_dispatch_with_failed_ack_replacement(
+    ) {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("system update host recorded");
+        let stale_at = now_unix() - 150;
+        let uncertain_id = format!(
+            "action-system-update-gpc0-migrate-handler-{}-{}",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        match state.host_actions.create_system_update_proposal(
+            uncertain_id.clone(),
+            "gpc0",
+            "markus",
+            stale_at.saturating_sub(200),
+        ) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update created: {error:?}"),
+        }
+        match state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_id, stale_at.saturating_sub(199))
+        {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update recorded: {error:?}"),
+        }
+        let replacement_created_at = stale_at.saturating_sub(50);
+        let replacement = match state.host_actions.begin_system_update_proposal(
+            "gpc0",
+            "markus",
+            replacement_created_at,
+            Some(&uncertain_id),
+        ) {
+            Ok(begin) => begin.into_job(),
+            Err(error) => panic!("ack replacement seeded: {error:?}"),
+        };
+        match state
+            .host_actions
+            .fail_system_update_proposal(&replacement.id, replacement_created_at + 1)
+        {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("failed replacement recorded: {error:?}"),
+        }
+        let stalled_id = format!(
+            "action-system-update-gpc0-stalled-handler-{}-{}",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        match state.host_actions.create_system_update_proposal(
+            stalled_id.clone(),
+            "gpc0",
+            "markus",
+            stale_at,
+        ) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("stalled proposal seeded: {error:?}"),
+        }
+        let stalled = state
+            .host_actions
+            .get(&stalled_id)
+            .expect("stalled proposal retained in memory");
+        assert_eq!(
+            stalled.state,
+            host_actions::HostActionState::ProposalRequested
+        );
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            payload["error"],
+            "The update review checklist could not be recorded"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        let retained = state
+            .host_actions
+            .get(&replacement.id)
+            .expect("failed replacement retained");
+        assert_eq!(retained.state, host_actions::HostActionState::Failed);
+        assert!(!host_actions::system_update_dispatch_handed_off(&retained));
+
+        let (second_status, _) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+        assert_ne!(second_status, StatusCode::ACCEPTED);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_file(actions_path);
     }
 
     #[tokio::test]

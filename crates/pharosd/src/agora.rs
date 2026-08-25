@@ -366,6 +366,20 @@ pub(crate) async fn request_host_preferences(
                 })),
             );
         }
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            match state
+                .host_actions
+                .latest_settings_change_for_host(canonical_host)
+            {
+                Some(workflow) => workflow,
+                None => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "The settings workflow could not be recorded" })),
+                    );
+                }
+            }
+        }
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -481,6 +495,10 @@ pub(crate) async fn request_host_preferences(
                 .accept_settings_change(&workflow.id, crate::now_unix())
             {
                 Ok(workflow) => workflow,
+                Err(HostActionStoreError::PersistenceCommitted) => state
+                    .host_actions
+                    .get(&workflow.id)
+                    .unwrap_or(workflow.clone()),
                 Err(_) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
