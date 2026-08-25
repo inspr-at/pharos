@@ -2405,6 +2405,7 @@ test("informational lifecycle sheets hide leftover workflow controls", async ({
 }) => {
   const quietHost = "bl-sheet-reuse-quiet";
   const kernelHost = "bl-sheet-reuse-kernel";
+  const prefsHost = "bl-prefs-declared-drift";
   await reportRuntimeHost(page, quietHost, { preferences: { accent: "#224466" } });
   await reportRuntimeHost(page, kernelHost, {
     kernel: {
@@ -2414,6 +2415,7 @@ test("informational lifecycle sheets hide leftover workflow controls", async ({
       observed_at: 1_700_000_000,
     },
   });
+  await reportRuntimeHost(page, prefsHost, { preferences: { accent: "#111111" } });
   await page.goto("/");
 
   const quietCard = page
@@ -2466,40 +2468,15 @@ test("informational lifecycle sheets hide leftover workflow controls", async ({
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
   await expect(dialog).toBeHidden();
 
-  const prefsPayload = await page.request.get("/hosts.json").then((r) => r.json());
-  const prefsEntry = prefsPayload.hosts.find((entry) => entry.name === quietHost);
-  prefsEntry.preferences_state = "request_pending";
-  prefsEntry.requested_preferences = {
-    accent: "#48b8a8",
-    kind: "server",
-    alerts: {
-      suppress_down: false,
-      suppress_backup: false,
-      suppress_nix_freshness: false,
-    },
-  };
-  prefsEntry.lifecycle = {
-    schema: "inspr.pharos.host-lifecycle.v1",
-    version: 1,
-    slot: "prefs_drift",
-    label: "Change requested",
-    level: "warning",
-    invoke: "host_settings",
-    run_id: null,
-    detail: "Requested preferences have not yet been observed by the host.",
-    blocked_by: ["host_report"],
-  };
-  expect(await page.evaluate((body) => applyFleetSnapshot(body), prefsPayload)).toBe(
-    true,
-  );
-  await expect(quietCard.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
-    "data-lifecycle-slot",
-    "prefs_drift",
-  );
-  await quietCard.locator("[data-host-lifecycle-chip]").click();
+  const prefsCard = page
+    .locator(`[data-host="${prefsHost}"][data-host-surface="runtime"].card`)
+    .first();
+  const prefsChip = prefsCard.locator("[data-host-lifecycle-chip]");
+  await expect(prefsChip).toHaveAttribute("data-lifecycle-slot", "prefs_drift");
+  await prefsChip.click();
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-action-info-title]")).toContainText(
-    "Resolved when the host reports",
+    "Resolved in host settings",
   );
   await expectInformationalWorkflowControlsHidden(dialog);
   await expect(dialog.locator("[data-host-action-close]").first()).toBeFocused();
