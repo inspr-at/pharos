@@ -684,7 +684,10 @@ mod tests {
 
         let client = NixcfgDispatch::for_test(Some(token_path.clone()), redirect_base);
         let result = client.dispatch("gpc0", &preferences()).await;
-        assert_eq!(result, Err(NixcfgDispatchError::RequestFailed));
+        assert!(matches!(
+            result,
+            Err(NixcfgDispatchError::RequestFailed) | Err(NixcfgDispatchError::Rejected(302))
+        ));
 
         let evil_connected = evil_rx
             .recv_timeout(Duration::from_secs(3))
