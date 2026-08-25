@@ -1647,51 +1647,78 @@ test("saved update-restart stays read-only until the exact job renders", async (
   expect(hostData?.lifecycle?.slot).toBe("update_restart");
   expect(runId).toBeTruthy();
 
+  const pauseFleetRefresh = async () => {
+    await page.evaluate(() => {
+      clearRefreshTimer();
+      abandonRefresh();
+    });
+  };
+
   await page.goto("/");
   await page.locator("[data-view-button='grid']").click();
   await expect(page.locator("main")).toHaveAttribute("data-view", "grid");
+  await pauseFleetRefresh();
+
+  const renderedPayload = await page.request.get("/hosts.json").then((response) => {
+    expect(response.ok()).toBe(true);
+    return response.json();
+  });
+  const renderedHostData = renderedPayload.hosts.find((entry) => entry.name === host);
+  expect(renderedHostData?.lifecycle?.run_id).toBe(runId);
+  expect(renderedHostData?.lifecycle?.primary_action).toBeFalsy();
+
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
   const chip = card.locator("[data-host-lifecycle-chip]");
   await expect(chip).toHaveAttribute("data-lifecycle-invoke", "update_restart");
   await expect(chip).toHaveAttribute("data-lifecycle-run-id", runId);
-  expect(hostData?.lifecycle?.primary_action).toBeFalsy();
 
   const actionsRoot = card.locator("[data-host-actions]").first();
   const restartItem = actionsRoot.locator("[data-host-action='update-restart']");
   const continueItem = actionsRoot.locator("[data-host-action='lifecycle-continue']");
-  await card.scrollIntoViewIfNeeded();
-  await card.locator("[data-host-actions-trigger]").click();
-  await expect(card.locator("[data-host-actions-menu]:not([hidden])")).toBeVisible();
-  await expect(restartItem).toBeHidden();
-  await expect(continueItem).toBeHidden();
-  await page.keyboard.press("Escape");
-  await expect(card.locator("[data-host-actions-menu]")).toBeHidden();
+  await expect(actionsRoot.locator("[data-host-action='update-restart'][hidden]")).toHaveCount(
+    1,
+  );
+  await expect(actionsRoot.locator("[data-host-action='lifecycle-continue'][hidden]")).toHaveCount(
+    1,
+  );
 
-  const continueSnapshot = structuredClone(payload);
+  const continueSnapshot = structuredClone(renderedPayload);
   const continueHost = continueSnapshot.hosts.find((entry) => entry.name === host);
   continueHost.lifecycle.primary_action = {
     kind: "recover",
     label: "Resume guarded update",
   };
+  await pauseFleetRefresh();
   expect(
     await page.evaluate((body) => applyFleetSnapshot(body), continueSnapshot),
   ).toBe(true);
+  await expect(actionsRoot.locator("[data-host-action='update-restart'][hidden]")).toHaveCount(
+    1,
+  );
+  await expect(
+    actionsRoot.locator("[data-host-action='lifecycle-continue']:not([hidden])"),
+  ).toHaveCount(1);
+  await expect(actionsRoot.locator("[data-host-action='lifecycle-continue'] strong")).toHaveText(
+    "Continue: Resume guarded update",
+  );
+  await expect(actionsRoot.locator("[data-host-action='lifecycle-continue']")).toHaveAttribute(
+    "data-lifecycle-run-id",
+    runId,
+  );
+  await expect(
+    actionsRoot.locator(".host-action-item:not([hidden])").filter({ hasText: /^Continue:/ }),
+  ).toHaveCount(1);
+
+  await card.scrollIntoViewIfNeeded();
   await card.locator("[data-host-actions-trigger]").click();
   await expect(card.locator("[data-host-actions-menu]:not([hidden])")).toBeVisible();
   await expect(restartItem).toBeHidden();
   await expect(continueItem).toBeVisible();
-  await expect(continueItem.locator("strong")).toHaveText(
-    "Continue: Resume guarded update",
-  );
-  await expect(continueItem).toHaveAttribute("data-lifecycle-run-id", runId);
-  const openMenu = actionsRoot.locator("[data-host-actions-menu]:not([hidden])");
-  await expect(openMenu.locator("[data-host-action='update-restart']")).toBeHidden();
-  await expect(openMenu.locator("[data-host-action='lifecycle-continue']")).toHaveCount(1);
   await page.keyboard.press("Escape");
   await expect(card.locator("[data-host-actions-menu]")).toBeHidden();
-  expect(await page.evaluate((body) => applyFleetSnapshot(body), payload)).toBe(
-    true,
-  );
+
+  await pauseFleetRefresh();
+  expect(await page.evaluate((body) => applyFleetSnapshot(body), renderedPayload)).toBe(true);
 
   const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
   const isExactJobGet = (url, method) => {
