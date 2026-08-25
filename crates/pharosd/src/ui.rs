@@ -231,10 +231,9 @@ mod module_tests {
         let prefs = HostPreferences {
             accent: Some("#48b8a8".to_string()),
             kind: HostKind::Workstation,
-            alerts: {
-                let mut alerts = pharos_core::HostAlertPreferences::default();
-                alerts.suppress_backup = true;
-                alerts
+            alerts: pharos_core::HostAlertPreferences {
+                suppress_backup: true,
+                ..Default::default()
             },
         };
         assert_eq!(
