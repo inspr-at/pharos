@@ -18,6 +18,7 @@ function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-h
 let openHostActionsRoot=null;
 let hostActionContext=null;
 let hostActionReturnFocus=null;
+let fleetHostsByName=new Map();
 const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:''};
 function setHostActionPollSuspended(suspended){
   const overlay=document.querySelector('[data-host-action-overlay]');
@@ -170,6 +171,8 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
   if(facts)facts.hidden=false;
   setHostActionFact('host',root.dataset.host,true);
   setHostActionFact('state',(root.closest('[data-host-surface="runtime"]')?.dataset.live||'unknown').replaceAll('_',' '),true);
+  setHostActionFact('declared','',false);
+  setHostActionFact('observed','',false);
   setHostActionFact('backup',root.dataset.backupLabel,true);
   setHostActionFact('kernel',root.dataset.kernelState==='reboot_required'?root.dataset.kernelRunning+' → '+root.dataset.kernelExpected:root.dataset.kernelState.replaceAll('_',' '),true);
   if(action==='system-update'){
@@ -249,16 +252,20 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
     if(primary){primary.textContent='Remove host';primary.classList.add('danger');primary.disabled=true}
     }
   }
+  const savedRunLoading=!!lifecycleRunId&&(action==='workflow'||action==='update-restart');
+  if(savedRunLoading){
+    hostActionContext.jobId=lifecycleRunId;
+    hostActionContext.stage='loading';
+    if(primary){primary.hidden=true;primary.disabled=true}
+    if(cancel)cancel.textContent='Close';
+    if(copy)copy.textContent='Loading the saved execution checklist...';
+  }
   overlay.hidden=false;
   document.body.dataset.hostActionDialogOpen='true';
   stopBeatClock();
   scheduleRefresh(DIALOG_REFRESH_MS);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
-  const invoke=root.querySelector('[data-host-action-note]')?.dataset.lifecycleInvoke||'';
-  const storedKind=invoke==='update_restart'?'update_restart':root.dataset.actionKind;
-  const storedMatches=action==='workflow'||(action==='update-restart'&&storedKind==='update_restart');
-  const jobId=lifecycleRunId||(storedMatches?root.dataset.actionJobId:null);
-  if(action!=='technical'&&jobId&&storedMatches)pollHostActionJob(jobId,true);
+  if(savedRunLoading)pollHostActionJob(lifecycleRunId,true);
 }
 async function requestHostAction(path,body,extraHeaders={}){
   const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1',...extraHeaders},body:JSON.stringify(body||{})});
@@ -430,6 +437,7 @@ async function pollHostActionJob(id,immediate=false){
 }
 async function submitHostAction(){
   if(!hostActionContext)return;
+  if(hostActionContext.stage==='loading')return;
   const {action,root,host,workflowHost}=hostActionContext;
   const workflowHostName=workflowHost||host;
   const overlay=document.querySelector('[data-host-action-overlay]');
@@ -517,16 +525,15 @@ function updateHostActionState(surface,host,backup){
   if(job){root.dataset.actionJobId=String(job.id||'');root.dataset.actionKind=String(workflow?.kind||job.kind||'');root.dataset.actionState=String(job.state||'')}
   else{delete root.dataset.actionJobId;delete root.dataset.actionKind;delete root.dataset.actionState}
   if(backup){root.dataset.backupState=String(backup.state||'unknown');root.dataset.backupLabel=String(backup.label||'Not observed')}
-  const review=root.querySelector('[data-host-action="review-pending"]');
   const update=root.querySelector('[data-host-action="system-update"]');
   const restart=root.querySelector('[data-host-action="update-restart"]');
   const remove=root.querySelector('[data-host-action="remove"]');
   const primarySeparator=root.querySelector('[data-primary-separator]');
   const removeSeparator=root.querySelector('[data-remove-separator]');
-  if(review)review.hidden=state==='applied';
-  const updateJobActive=workflow?.kind==='update_restart'&&!['succeeded','cancelled'].includes(job.state);
+  const updateJobActive=host.update_restart_active===true;
   const updatePending=kernelState==='reboot_required'||provenGitUpdate||provenNixpkgsUpdate;
   root.dataset.updatePending=updatePending?'true':'false';
+  root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
   const retired=retirement?.pending===true;
   // PHAROS-197: mirrors the server gate — a removal that must record a nixcfg
   // declaration change or a retirement intent needs the proposal available.
@@ -534,12 +541,26 @@ function updateHostActionState(surface,host,backup){
   const removalReady=!needsRemovalProposal||hostRemovalAvailable;
   if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
   if(restart){
-    restart.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&(updatePending||updateJobActive));
+    restart.hidden=retired||updateJobActive||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&updatePending);
     const strong=restart.querySelector('strong');
-    if(strong)strong.textContent=updateJobActive?'Continue update workflow':'Apply update and restart';
+    if(strong)strong.textContent='Apply update and restart';
   }
   if(remove)remove.hidden=!removalReady||!canManage||retired;
-  if(primarySeparator)primarySeparator.hidden=[review,update,restart].every(item=>!item||item.hidden);
+  const continueBtn=root.querySelector('[data-host-action="lifecycle-continue"]');
+  const lifecycle=host.lifecycle||{};
+  const lifecycleAction=lifecycle.primary_action;
+  const lifecycleRunId=lifecycle.run_id?String(lifecycle.run_id):'';
+  if(continueBtn){
+    const show=lifecycleAction?.label&&lifecycleRunId;
+    continueBtn.hidden=!show;
+    if(show){
+      continueBtn.dataset.lifecycleRunId=lifecycleRunId;
+      continueBtn.dataset.lifecycleInvoke=String(lifecycle.invoke||'workflow');
+      const strong=continueBtn.querySelector('strong');
+      if(strong)strong.textContent='Continue: '+String(lifecycleAction.label);
+    }
+  }
+  if(primarySeparator)primarySeparator.hidden=[continueBtn,update,restart].every(item=>!item||item.hidden);
   if(removeSeparator)removeSeparator.hidden=!removalReady||!canManage||retired;
   if(openHostActionsRoot===root)positionHostActions(root);
 }
@@ -547,22 +568,29 @@ function initHostActions(){
   document.addEventListener('click',event=>{
     const trigger=event.target.closest('[data-host-actions-trigger]');
     if(trigger){event.preventDefault();openHostActions(trigger.closest('[data-host-actions]'));return}
-    const actionNote=event.target.closest('[data-host-action-note]');
-    if(actionNote){
+    const chip=event.target.closest('[data-host-lifecycle-chip]');
+    if(chip){
+      if(chip.disabled||chip.getAttribute('aria-disabled')==='true')return;
       event.preventDefault();
-      const surface=actionNote.closest('[data-host-surface="runtime"]');
+      const surface=chip.closest('[data-host-surface="runtime"]');
       const root=surface?.querySelector('[data-host-actions]');
-      if(root){
-        const invoke=actionNote.dataset.lifecycleInvoke||'';
-        const action=invoke==='update_restart'?'update-restart':'workflow';
-        openHostActionDialog(action,root,actionNote,actionNote.dataset.lifecycleRunId||'');
-      }
+      if(!root)return;
+      const lifecycle=lifecycleFromChip(chip);
+      const host=fleetHostsByName.get(root.dataset.host)||{};
+      openHostLifecycleSheet(chip,root,lifecycle,host);
       return;
     }
     const actionItem=event.target.closest('[data-host-action]');
     if(actionItem&&actionItem.closest('[data-host-actions-menu]')&&!actionItem.matches('a')){
       event.preventDefault();
       const root=actionItem.closest('[data-host-actions]');
+      if(actionItem.dataset.hostAction==='lifecycle-continue'){
+        const runId=actionItem.dataset.lifecycleRunId||'';
+        const invoke=actionItem.dataset.lifecycleInvoke||'workflow';
+        const action=invoke==='update_restart'?'update-restart':'workflow';
+        openHostActionDialog(action,root,actionItem,runId);
+        return;
+      }
       openHostActionDialog(actionItem.dataset.hostAction,root,actionItem);
       return;
     }
@@ -638,7 +666,7 @@ function openRequestedWorkflow(){
   const root=surface?.querySelector('[data-host-actions]');
   if(!root)return;
   root.dataset.actionJobId=workflowId;
-  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));
+  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'),workflowId);
 }
 function parseBeats(v){return String(v||'').split(',').map(Number).filter(Number.isFinite).filter(n=>n>0)}
 function signalWindowByKey(key){return SIGNAL_WINDOWS.find(w=>w.key===key)||SIGNAL_WINDOWS[0]}
@@ -767,43 +795,6 @@ function kernelSearch(kernel){
 function kernelLifecycleActive(lifecycle){
   return String(lifecycle?.slot||'')==='kernel_drift';
 }
-function updateKernel(surface,host){
-  const lifecycle=host.lifecycle||null;
-  const kernelSelected=kernelLifecycleActive(lifecycle);
-  const slot=surface.querySelector('[data-kernel-slot]');
-  if(!slot)return;
-  slot.hidden=!kernelSelected;
-  const details=slot.querySelector('[data-kernel-posture]');
-  if(!kernelSelected){
-    if(details?.open)details.open=false;
-    if(details){
-      delete details.dataset.lifecycleSlot;
-      delete details.dataset.lifecycleLevel;
-      delete details.dataset.lifecycleInvoke;
-    }
-    return;
-  }
-  const kernel=host.kernel||{};
-  const level=String(lifecycle?.level||'warning');
-  const invoke=String(lifecycle?.invoke||'kernel_details');
-  if(details){
-    details.dataset.lifecycleSlot='kernel_drift';
-    details.dataset.lifecycleLevel=level;
-    details.dataset.lifecycleInvoke=invoke;
-    const summaryLabel=details.querySelector('summary span');
-    if(summaryLabel)summaryLabel.textContent=String(lifecycle?.label||'Restart required');
-  }
-  const healthy=host.liveness==='live';
-  const explanation=healthy
-    ? String(host.name||'This host')+' is healthy. A newer system kernel is ready for its next planned restart.'
-    : String(host.name||'This host')+' has a newer system kernel ready for its next planned restart.';
-  const explanationNode=slot.querySelector('[data-kernel-explanation]');
-  const running=slot.querySelector('[data-kernel-running]');
-  const expected=slot.querySelector('[data-kernel-expected]');
-  if(explanationNode)explanationNode.textContent=explanation;
-  if(running)running.textContent=kernel.running_version||'not reported';
-  if(expected)expected.textContent=kernel.expected_version||'not reported';
-}
 function freshnessAttention(f,now){
   if(!f||f.applicable===false)return null;
   const evidence=f.deployment_evidence;
@@ -914,72 +905,218 @@ function updateMuted(surface,info){
   const text=el.querySelector('span');
   if(text)text.textContent=info.label;
 }
-function lifecycleSettingsLabel(lifecycle,surface){
-  const invoke=String(lifecycle?.invoke||'');
-  const slot=String(lifecycle?.slot||'');
-  if(invoke!=='host_settings')return '';
-  if(slot==='quiet')return surface.matches('.card')?'Up to date':'';
-  return String(lifecycle?.label||'');
+function formatPreferencesSummary(prefs){
+  if(!prefs||typeof prefs!=='object')return 'not reported';
+  const parts=[];
+  if(typeof prefs.accent==='string'&&prefs.accent)parts.push('accent '+prefs.accent);
+  if(typeof prefs.kind==='string'&&prefs.kind&&prefs.kind!=='server')parts.push(String(prefs.kind));
+  const alerts=prefs.alerts;
+  if(alerts&&typeof alerts==='object'){
+    const muted=[];
+    if(alerts.suppress_down)muted.push('down');
+    if(alerts.suppress_backup)muted.push('backup');
+    if(alerts.suppress_nix_freshness)muted.push('nix freshness');
+    if(muted.length)parts.push('mute '+muted.join(', '));
+  }
+  return parts.length?parts.join(' · '):'defaults';
 }
-function lifecycleWorkflowShown(lifecycle){
-  return lifecycle&&(lifecycle.invoke==='workflow'||lifecycle.invoke==='update_restart');
+function lifecycleDriftSlot(slot){
+  return slot==='prefs_drift'||slot==='kernel_drift';
 }
-function updateSettingsStateSurfaces(surface,host,lifecycle){
+function lifecycleFromChip(chip){
+  const blockedRaw=String(chip.dataset.lifecycleBlockedBy||'');
+  return {
+    slot:String(chip.dataset.lifecycleSlot||'quiet'),
+    invoke:String(chip.dataset.lifecycleInvoke||'host_settings'),
+    label:chip.querySelector('[data-host-lifecycle-chip-copy]')?.textContent||'',
+    level:String(chip.dataset.lifecycleLevel||'clear'),
+    run_id:chip.dataset.lifecycleRunId||null,
+    detail:String(chip.dataset.lifecycleDetail||''),
+    blocked_by:blockedRaw?blockedRaw.split(','):[],
+  };
+}
+function lifecycleDriftResolver(slot,blockedBy){
+  if(slot==='prefs_drift'){
+    if(blockedBy.includes('host_report')){
+      return {
+        title:'Resolved when the host reports',
+        copy:'Requested preferences have not yet been observed by the host. Pharos clears this drift after the host reports the requested values.',
+      };
+    }
+    return {
+      title:'Resolved in host settings',
+      copy:'Declared preferences differ from what the host reports. Apply or withdraw the change in host settings.',
+    };
+  }
+  if(slot==='kernel_drift'){
+    return {
+      title:'Resolved at a planned restart',
+      copy:'Pharos will not restart this host. The newer kernel becomes active after the next planned restart.',
+    };
+  }
+  return {title:'Resolved by observation',copy:''};
+}
+function openHostLifecycleSheet(chip,root,lifecycle,host){
+  const overlay=document.querySelector('[data-host-action-overlay]');
+  const dialog=overlay?.querySelector('[data-host-action-dialog]');
+  if(!overlay||!dialog||!root)return;
+  const slot=String(lifecycle?.slot||'quiet');
+  const isDrift=lifecycleDriftSlot(slot);
+  const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
+  const isRun=runId&&(lifecycle.invoke==='workflow'||lifecycle.invoke==='update_restart');
+  if(isRun){
+    const action=lifecycle.invoke==='update_restart'?'update-restart':'workflow';
+    openHostActionDialog(action,root,chip,runId);
+    return;
+  }
+  stopHostActionPoll();
+  closeHostActions(root);
+  hostActionContext={action:'lifecycle',root,host:root.dataset.host,lifecycle};
+  hostActionReturnFocus=chip;
+  dialog.dataset.workflow='false';
+  dialog.dataset.drift=isDrift?'true':'false';
+  dialog.dataset.action='lifecycle';
+  dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{icon.hidden=true});
+  const title=dialog.querySelector('[data-host-action-title]');
+  const copy=dialog.querySelector('[data-host-action-copy]');
+  const info=dialog.querySelector('[data-host-action-info]');
+  const infoTitle=dialog.querySelector('[data-host-action-info-title]');
+  const infoCopy=dialog.querySelector('[data-host-action-info-copy]');
+  const primary=dialog.querySelector('[data-host-action-primary]');
+  const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
+  const cancelRequest=dialog.querySelector('[data-host-action-cancel]');
+  const confirm=dialog.querySelector('[data-host-remove-confirm]');
+  const removeInput=dialog.querySelector('[data-host-remove-input]');
+  const dispositionField=dialog.querySelector('[data-host-remove-disposition-field]');
+  const disposition=dialog.querySelector('[data-host-remove-disposition]');
+  const successorField=dialog.querySelector('[data-host-remove-successor]');
+  const successorInput=dialog.querySelector('[data-host-remove-successor-input]');
+  const attendedConfirm=dialog.querySelector('[data-host-attended-confirm]');
+  const attendedInput=dialog.querySelector('[data-host-attended-input]');
+  const status=dialog.querySelector('[data-host-action-status]');
+  const facts=dialog.querySelector('[data-host-action-facts]');
+  const workflow=dialog.querySelector('[data-host-workflow]');
+  const technical=dialog.querySelector('[data-host-action-technical]');
+  if(status)status.textContent='';
+  if(primary){primary.hidden=true;primary.disabled=false;primary.classList.remove('danger')}
+  if(cancel)cancel.textContent='Close';
+  if(cancelRequest){cancelRequest.hidden=true;cancelRequest.disabled=false}
+  if(confirm)confirm.hidden=true;
+  if(dispositionField)dispositionField.hidden=true;
+  if(successorField)successorField.hidden=true;
+  if(attendedConfirm)attendedConfirm.hidden=true;
+  if(removeInput)removeInput.value='';
+  if(disposition)disposition.value='';
+  if(successorInput)successorInput.value='';
+  if(attendedInput)attendedInput.checked=false;
+  if(technical)technical.hidden=true;
+  if(workflow){workflow.hidden=true;workflow.replaceChildren()}
+  if(info)info.hidden=false;
+  if(facts)facts.hidden=false;
+  setHostActionFact('host',root.dataset.host,true);
+  setHostActionFact('state','',false);
+  setHostActionFact('backup','',false);
+  setHostActionFact('kernel','',false);
+  setHostActionFact('scope','',false);
+  setHostActionFact('declared','',false);
+  setHostActionFact('observed','',false);
+  if(isDrift){
+    const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
+    const resolver=lifecycleDriftResolver(slot,blockedBy);
+    if(title)title.textContent=String(lifecycle.label||'');
+    if(copy)copy.textContent=String(lifecycle.detail||'');
+    if(infoTitle)infoTitle.textContent=resolver.title;
+    if(infoCopy)infoCopy.textContent=resolver.copy;
+    if(slot==='prefs_drift'){
+      const declaredSummary=chip.dataset.lifecycleDeclaredSummary
+        ||formatPreferencesSummary(host.declared_preferences||host.requested_preferences||host.preferences||{});
+      const observedSummary=chip.dataset.lifecycleObservedSummary
+        ||formatPreferencesSummary(host.preferences||{});
+      setHostActionFact('declared',declaredSummary,true);
+      setHostActionFact('observed',observedSummary,true);
+      setHostActionFact('scope',resolver.title,true);
+    }else if(slot==='kernel_drift'){
+      const kernel=host.kernel||{};
+      const running=String(kernel.running_version||root.dataset.kernelRunning||'not reported');
+      const expected=String(kernel.expected_version||root.dataset.kernelExpected||'not reported');
+      setHostActionFact('kernel',running+' → '+expected,true);
+      setHostActionFact('scope',resolver.title,true);
+    }
+  }else{
+    if(title)title.textContent=String(lifecycle.label||'Up to date');
+    if(copy)copy.textContent=String(lifecycle.detail||'No host lifecycle work is waiting.');
+    if(infoTitle)infoTitle.textContent='No drift';
+    if(infoCopy)infoCopy.textContent='Pharos has no saved workflow or drift waiting on this host.';
+    setHostActionFact('scope','No lifecycle work',true);
+  }
+  overlay.hidden=false;
+  document.body.dataset.hostActionDialogOpen='true';
+  stopBeatClock();
+  scheduleRefresh(DIALOG_REFRESH_MS);
+  requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
+}
+function updateSettingsLinkSurfaces(surface,host){
   const state=String(host.preferences_state||'applied');
-  const settingsLabel=lifecycleSettingsLabel(lifecycle,surface);
-  const name=surface.dataset.host||'host';
-  const settingsTitle=(lifecycle?.invoke==='host_settings'&&String(lifecycle?.slot||'quiet')!=='quiet'&&settingsLabel)
-    ? (settingsLabel+' for '+name)
-    : ('Open host settings for '+name);
-  surface.querySelectorAll('[data-settings-state]').forEach(node=>{
-    node.dataset.settingsState=state;
+  const title='Open host settings for '+(surface.dataset.host||'host');
+  surface.querySelectorAll('a[data-settings-state],a[data-host-action="host-settings"]').forEach(link=>{
+    link.dataset.settingsState=state;
+    link.title=title;
+    link.setAttribute('aria-label',title);
   });
-  surface.querySelectorAll('a[data-settings-state], [data-settings-note]').forEach(link=>{
-    link.title=settingsTitle;
-    link.setAttribute('aria-label',settingsTitle);
-  });
-  const settingsNote=surface.querySelector('[data-settings-note]');
-  if(settingsNote){
-    settingsNote.hidden=!settingsLabel;
-    settingsNote.dataset.settingsState=state;
+  const hostActions=surface.querySelector('[data-host-actions]');
+  if(hostActions)hostActions.dataset.settingsState=state;
+}
+function updateHostLifecycle(surface,host){
+  const lifecycle=host.lifecycle||null;
+  const actionsRoot=surface.querySelector('[data-host-actions]');
+  const interactive=Boolean(actionsRoot);
+  updateSettingsLinkSurfaces(surface,host);
+  const chip=surface.querySelector('[data-host-lifecycle-chip]');
+  if(chip){
+    const label=String(lifecycle?.label||'');
     const slot=String(lifecycle?.slot||'quiet');
     const invoke=String(lifecycle?.invoke||'host_settings');
     const level=String(lifecycle?.level||'clear');
     const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
-    settingsNote.dataset.lifecycleSlot=slot;
-    settingsNote.dataset.lifecycleLevel=level;
-    settingsNote.dataset.lifecycleInvoke=invoke;
-    if(runId)settingsNote.dataset.lifecycleRunId=runId;
-    else delete settingsNote.dataset.lifecycleRunId;
-    const copy=settingsNote.querySelector('[data-settings-note-copy]');
-    if(copy)copy.textContent=settingsLabel;
-  }
-}
-function updateHostLifecycle(surface,host){
-  const lifecycle=host.lifecycle||null;
-  const slot=String(lifecycle?.slot||'quiet');
-  const invoke=String(lifecycle?.invoke||'host_settings');
-  const label=String(lifecycle?.label||'');
-  const level=String(lifecycle?.level||'clear');
-  const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
-  const actionsRoot=surface.querySelector('[data-host-actions]');
-  const workflowInteractive=Boolean(actionsRoot);
-  updateSettingsStateSurfaces(surface,host,lifecycle);
-  const actionNote=surface.querySelector('[data-host-action-note]');
-  const workflowShown=lifecycleWorkflowShown(lifecycle)&&workflowInteractive;
-  if(actionNote){
-    actionNote.hidden=!workflowShown;
-    actionNote.dataset.actionLevel=level;
-    actionNote.dataset.lifecycleSlot=slot;
-    actionNote.dataset.lifecycleLevel=level;
-    actionNote.dataset.lifecycleInvoke=invoke;
-    if(runId)actionNote.dataset.lifecycleRunId=runId;
-    else delete actionNote.dataset.lifecycleRunId;
-    const copy=actionNote.querySelector('[data-host-action-note-copy]');
-    if(copy)copy.textContent=workflowShown?label:'';
+    const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
+    chip.hidden=false;
+    chip.dataset.settingsState=String(host.preferences_state||'applied');
+    chip.dataset.lifecycleSlot=slot;
+    chip.dataset.lifecycleLevel=level;
+    chip.dataset.lifecycleInvoke=invoke;
+    chip.dataset.lifecycleDetail=String(lifecycle?.detail||'');
+    if(runId)chip.dataset.lifecycleRunId=runId;
+    else delete chip.dataset.lifecycleRunId;
+    if(blockedBy.length)chip.dataset.lifecycleBlockedBy=blockedBy.join(',');
+    else delete chip.dataset.lifecycleBlockedBy;
+    if(slot==='prefs_drift'){
+      const declared=host.declared_preferences||null;
+      const observed=host.preferences||{};
+      const requested=host.requested_preferences||null;
+      const state=String(host.preferences_state||'applied');
+      const declaredSource=state==='request_pending'?requested:(declared||requested);
+      chip.dataset.lifecycleDeclaredSummary=formatPreferencesSummary(declaredSource||observed);
+      chip.dataset.lifecycleObservedSummary=formatPreferencesSummary(observed);
+    }else{
+      delete chip.dataset.lifecycleDeclaredSummary;
+      delete chip.dataset.lifecycleObservedSummary;
+    }
+    chip.title=label;
+    chip.setAttribute('aria-label',label);
+    const copy=chip.querySelector('[data-host-lifecycle-chip-copy]');
+    if(copy)copy.textContent=label;
+    if(interactive){
+      chip.disabled=false;
+      chip.removeAttribute('aria-disabled');
+      chip.tabIndex=0;
+    }else{
+      chip.disabled=true;
+      chip.setAttribute('aria-disabled','true');
+      chip.tabIndex=-1;
+    }
   }
   const dot=actionsRoot?.querySelector('[data-host-action-dot]');
-  if(dot)dot.hidden=slot==='quiet';
+  if(dot)dot.hidden=String(lifecycle?.slot||'quiet')==='quiet';
   if(actionsRoot&&openHostActionsRoot===actionsRoot)positionHostActions(actionsRoot);
 }
 function updatePreferenceState(surface,host){
@@ -1007,7 +1144,7 @@ function markHtml(beats,interval,windowDef=signalWindow){
     const x=((item.stamp-view.start)/view.span)*newestX;
     const info=historyInfo(kept,item.index,cadence);
     const title=info.label+' · '+info.detail;
-    return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
+    return '<span class="beat-mark" role="img" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
 }
 function syncHistoryStart(beat){
@@ -3342,6 +3479,7 @@ function fleetMembershipMatches(hosts){
 function applyFleetSnapshot(data){
   if(!validFleetSnapshot(data))return false;
   const hosts=data.hosts;
+  fleetHostsByName=new Map(hosts.map(host=>[host.name,host]));
   if(!fleetMembershipMatches(hosts)){
     window.location.reload();
     return false;
@@ -3364,7 +3502,6 @@ function applyFleetSnapshot(data){
       updatePreferenceState(card,h);
       updateHostActionState(card,h,backup);
       updateHostLifecycle(card,h);
-      updateKernel(card,h);
       updateReasonVisibility(card,attention,h.freshness,h.kernel,now,h.lifecycle);
       updateMuted(card,muted);
       updateFreshness(card,h.freshness,now);
