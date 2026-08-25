@@ -740,6 +740,16 @@ impl HostActionJob {
         self.requested_preferences.as_ref()
     }
 
+    pub(crate) fn accepted_dispatch_reconciled(&self) -> bool {
+        match self.workflow_kind() {
+            HostWorkflowKind::SettingsChange => {
+                self.has_event(HostActionEventKind::SettingsRequestAccepted)
+            }
+            HostWorkflowKind::RemoveHost => self.removal_access_revoked(),
+            _ => false,
+        }
+    }
+
     fn removal_access_revoked(&self) -> bool {
         self.has_event(HostActionEventKind::RemovalAccessRevoked)
     }

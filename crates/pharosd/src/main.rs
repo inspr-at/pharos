@@ -1412,7 +1412,10 @@ async fn reconcile_accepted_dispatch(
             "Accepted dispatch reconciliation access is not granted",
         );
     }
-    if existing.state != HostActionState::ProposalRequested || !existing.dispatch_submitted() {
+    if existing.state != HostActionState::ProposalRequested
+        || !existing.dispatch_submitted()
+        || existing.accepted_dispatch_reconciled()
+    {
         return action_error(
             StatusCode::CONFLICT,
             "Only a saved, accepted repository handoff can be reconciled locally",
@@ -14554,6 +14557,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 .and_then(|host| host.requested_preferences),
             Some(requested)
         );
+        let (second_status, _) = reconcile_accepted_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
 
         let plan = HostRemovalPlan {
             disposition: HostRetirementDisposition::Destroyed,
