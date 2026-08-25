@@ -1134,7 +1134,7 @@ function markHtml(beats,interval,windowDef=signalWindow){
     const x=((item.stamp-view.start)/view.span)*newestX;
     const info=historyInfo(kept,item.index,cadence);
     const title=info.label+' · '+info.detail;
-    return '<span class="beat-mark" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
+    return '<span class="beat-mark" role="img" tabindex="0" data-history-level="'+esc(info.level)+'" data-history-label="'+esc(info.label)+'" data-history-detail="'+esc(info.detail)+'" title="'+esc(title)+'" aria-label="'+esc(title)+'" style="--mark-x:'+x.toFixed(1)+'%"></span>';
   }).join('');
 }
 function syncHistoryStart(beat){

@@ -5999,7 +5999,7 @@ pub(super) fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (
         let (level, label, detail) = heartbeat_history(log, idx, interval);
         let title = format!("{label} · {detail}");
         marks.push_str(&format!(
-            r#"<span class="beat-mark" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
+            r#"<span class="beat-mark" role="img" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
             level = html_escape(level),
             label = html_escape(&label),
             detail = html_escape(&detail),

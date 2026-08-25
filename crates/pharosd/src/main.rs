@@ -7379,6 +7379,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(marks.contains(r#"--mark-x:29.3%""#));
         assert!(marks.contains(r#"--mark-x:58.7%""#));
         assert!(!marks.contains(r#"--mark-x:64.0%""#));
+        assert!(marks.contains(r#"class="beat-mark" role="img" tabindex="0""#));
+        assert!(FOOT.contains(r#"class="beat-mark" role="img" tabindex="0""#));
     }
 
     #[test]
