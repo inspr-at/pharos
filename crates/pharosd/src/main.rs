@@ -5510,6 +5510,39 @@ mod tests {
         );
         assert!(pending_markup.contains(r#"data-update-pending="true""#));
         assert!(pending_markup.contains(r#"data-host-action="update-restart"><svg"#));
+
+        let store = HostActionStore::new(None);
+        let update_job = store
+            .create_update_review("hsb8", "markus", 1_700_000_110)
+            .expect("active update restart");
+        let active_markup = host_actions_markup(
+            &pending_update,
+            HostActionRenderContext {
+                manifest: Some(&ready_manifest),
+                declared: true,
+                credential_retirement_required: false,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: true,
+                    host_removal_available: true,
+                },
+            },
+            Some(&update_job),
+            &host_lifecycle(
+                std::slice::from_ref(&update_job),
+                "hsb8",
+                HostPreferencesState::Applied,
+                false,
+            ),
+        );
+        assert!(active_markup.contains(r#"data-host-action="update-restart" hidden"#));
+        assert!(!active_markup.contains("Continue update workflow"));
+        assert!(!FOOT.contains("Continue update workflow"));
     }
 
     #[test]

@@ -1400,12 +1400,17 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
     chipCopy: "change waiting",
     requestedIconVisible: false,
   });
+  await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "data-lifecycle-level",
+    "warning",
+  );
   const cardChipChrome = await card.evaluate((surface) => {
     const chip = surface.querySelector(".host-lifecycle-chip");
     const chipStyle = getComputedStyle(chip);
     return {
       fontFamily: chipStyle.fontFamily,
       surfaceFontFamily: getComputedStyle(surface).fontFamily,
+      color: chipStyle.color,
       borderTopWidth: chipStyle.borderTopWidth,
       borderRightWidth: chipStyle.borderRightWidth,
       borderBottomWidth: chipStyle.borderBottomWidth,
@@ -1433,11 +1438,16 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
     chipCopy: "change waiting",
     requestedIconVisible: false,
   });
+  await expect(row.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "data-lifecycle-level",
+    "warning",
+  );
   const listChipChrome = await row.evaluate((surface) => {
     const chip = surface.querySelector(".host-lifecycle-chip");
     const attention = surface.querySelector(".list-attention") ?? surface;
     const chipStyle = getComputedStyle(chip);
     return {
+      color: chipStyle.color,
       borderTopWidth: chipStyle.borderTopWidth,
       borderRightWidth: chipStyle.borderRightWidth,
       borderBottomWidth: chipStyle.borderBottomWidth,
@@ -1473,6 +1483,8 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
     listChipChrome.attentionFontFamily,
     listChipChrome.rowFontFamily,
   ]).toContain(listChipChrome.fontFamily);
+  expect(cardChipChrome.color).toBe(listChipChrome.color);
+  expect(cardChipChrome.color).toBe("rgb(139, 87, 0)");
   await page.locator("[data-view-button='grid']").click();
 
   await reportRuntimeHost(page, host, {
@@ -1484,12 +1496,28 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
     title: settingsTitle,
     chipCopy: "Up to date",
   });
+  await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "data-lifecycle-level",
+    "clear",
+  );
   await page.locator("[data-view-button='list']").click();
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
     chipCopy: "Up to date",
   });
+  await expect(row.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "data-lifecycle-level",
+    "clear",
+  );
+  const cardQuietColor = await card.evaluate((surface) =>
+    getComputedStyle(surface.querySelector(".host-lifecycle-chip")).color,
+  );
+  const listQuietColor = await row.evaluate((surface) =>
+    getComputedStyle(surface.querySelector(".host-lifecycle-chip")).color,
+  );
+  expect(cardQuietColor).toBe(listQuietColor);
+  expect(cardQuietColor).toBe("rgb(124, 142, 160)");
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -1624,6 +1652,44 @@ test("saved update-restart stays read-only until the exact job renders", async (
   const chip = card.locator("[data-host-lifecycle-chip]");
   await expect(chip).toHaveAttribute("data-lifecycle-invoke", "update_restart");
   await expect(chip).toHaveAttribute("data-lifecycle-run-id", runId);
+  expect(hostData?.lifecycle?.primary_action).toBeFalsy();
+
+  const actionsRoot = card.locator("[data-host-actions]").first();
+  const restartItem = actionsRoot.locator("[data-host-action='update-restart']");
+  const continueItem = actionsRoot.locator("[data-host-action='lifecycle-continue']");
+  await card.scrollIntoViewIfNeeded();
+  await card.locator("[data-host-actions-trigger]").click();
+  await expect(card.locator("[data-host-actions-menu]:not([hidden])")).toBeVisible();
+  await expect(restartItem).toBeHidden();
+  await expect(continueItem).toBeHidden();
+  await page.keyboard.press("Escape");
+  await expect(card.locator("[data-host-actions-menu]")).toBeHidden();
+
+  const continueSnapshot = structuredClone(payload);
+  const continueHost = continueSnapshot.hosts.find((entry) => entry.name === host);
+  continueHost.lifecycle.primary_action = {
+    kind: "recover",
+    label: "Resume guarded update",
+  };
+  expect(
+    await page.evaluate((body) => applyFleetSnapshot(body), continueSnapshot),
+  ).toBe(true);
+  await card.locator("[data-host-actions-trigger]").click();
+  await expect(card.locator("[data-host-actions-menu]:not([hidden])")).toBeVisible();
+  await expect(restartItem).toBeHidden();
+  await expect(continueItem).toBeVisible();
+  await expect(continueItem.locator("strong")).toHaveText(
+    "Continue: Resume guarded update",
+  );
+  await expect(continueItem).toHaveAttribute("data-lifecycle-run-id", runId);
+  await expect(
+    card.getByRole("menuitem").filter({ hasText: /^Continue/ }),
+  ).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(card.locator("[data-host-actions-menu]")).toBeHidden();
+  expect(await page.evaluate((body) => applyFleetSnapshot(body), payload)).toBe(
+    true,
+  );
 
   const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
   const isExactJobGet = (url, method) => {
@@ -2282,6 +2348,23 @@ test("preference drift declared_not_applied sheet resolves in host settings", as
   await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(
     "Ready to apply",
   );
+  await expect(chip).toHaveAttribute("data-lifecycle-level", "info");
+  const cardInfoColor = await card.evaluate((surface) =>
+    getComputedStyle(surface.querySelector(".host-lifecycle-chip")).color,
+  );
+  await page.locator("[data-view-button='list']").click();
+  await expect(page.locator("main")).toHaveAttribute("data-view", "list");
+  const row = page.locator(`tr[data-host="${host}"][data-host-surface="runtime"]`).first();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "data-lifecycle-level",
+    "info",
+  );
+  const listInfoColor = await row.evaluate((surface) =>
+    getComputedStyle(surface.querySelector(".host-lifecycle-chip")).color,
+  );
+  expect(cardInfoColor).toBe(listInfoColor);
+  expect(cardInfoColor).toBe("rgb(23, 106, 152)");
+  await page.locator("[data-view-button='grid']").click();
 
   await chip.click();
   const dialog = page.getByRole("dialog");

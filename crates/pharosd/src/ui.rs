@@ -1498,12 +1498,21 @@ pub(super) fn host_actions_markup(
     });
     let reboot = kernel_reboot_required(host.kernel.as_ref());
     let update_pending = reboot.is_some() || host.freshness.has_proven_deployable_update();
-    let restart_hidden =
-        if host.is_nix && capabilities.can_manage_fleet && janus_ready && update_pending {
-            ""
-        } else {
-            " hidden"
-        };
+    let update_job_active = action.is_some_and(|job| {
+        job.workflow_kind() == HostWorkflowKind::UpdateRestart
+            && job.state != HostActionState::Succeeded
+            && job.state != HostActionState::Cancelled
+    });
+    let restart_hidden = if host.is_nix
+        && capabilities.can_manage_fleet
+        && janus_ready
+        && update_pending
+        && !update_job_active
+    {
+        ""
+    } else {
+        " hidden"
+    };
     // PHAROS-197: a removal needs the nixcfg proposal whenever it must remove a
     // declaration or record a retirement intent. Offering it without a working
     // dispatch would only produce a refusal.

@@ -540,9 +540,9 @@ function updateHostActionState(surface,host,backup){
   const removalReady=!needsRemovalProposal||hostRemovalAvailable;
   if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
   if(restart){
-    restart.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&(updatePending||updateJobActive));
+    restart.hidden=retired||updateJobActive||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&updatePending);
     const strong=restart.querySelector('strong');
-    if(strong)strong.textContent=updateJobActive?'Continue update workflow':'Apply update and restart';
+    if(strong)strong.textContent='Apply update and restart';
   }
   if(remove)remove.hidden=!removalReady||!canManage||retired;
   const continueBtn=root.querySelector('[data-host-action="lifecycle-continue"]');
