@@ -1648,6 +1648,8 @@ test("saved update-restart stays read-only until the exact job renders", async (
   expect(runId).toBeTruthy();
 
   await page.goto("/");
+  await page.locator("[data-view-button='grid']").click();
+  await expect(page.locator("main")).toHaveAttribute("data-view", "grid");
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
   const chip = card.locator("[data-host-lifecycle-chip]");
   await expect(chip).toHaveAttribute("data-lifecycle-invoke", "update_restart");
@@ -1682,9 +1684,9 @@ test("saved update-restart stays read-only until the exact job renders", async (
     "Continue: Resume guarded update",
   );
   await expect(continueItem).toHaveAttribute("data-lifecycle-run-id", runId);
-  await expect(
-    card.getByRole("menuitem").filter({ hasText: /^Continue/ }),
-  ).toHaveCount(1);
+  const openMenu = actionsRoot.locator("[data-host-actions-menu]:not([hidden])");
+  await expect(openMenu.locator("[data-host-action='update-restart']")).toBeHidden();
+  await expect(openMenu.locator("[data-host-action='lifecycle-continue']")).toHaveCount(1);
   await page.keyboard.press("Escape");
   await expect(card.locator("[data-host-actions-menu]")).toBeHidden();
   expect(await page.evaluate((body) => applyFleetSnapshot(body), payload)).toBe(
