@@ -1523,11 +1523,6 @@ test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", asyn
 test("saved update-restart stays read-only until the exact job renders", async ({
   page,
 }, testInfo) => {
-  const manifest = requireFixtureManifest(
-    test,
-    "saved restart fixture requires local harness manifest",
-  );
-  if (!manifest) return;
   const host = `bl-saved-restart-loading-${testInfo.project.name}`;
   await reportRuntimeHost(page, host, {
     is_nix: true,
@@ -1635,18 +1630,6 @@ test("saved update-restart stays read-only until the exact job renders", async (
     { headers: { "x-pharos-action": "1" }, data: {} },
   );
   expect(cancel.status()).toBe(200);
-  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
-  const removal = await page.request.post(`/host-actions/${host}/remove`, {
-    headers: { "x-pharos-action": "1" },
-    data: { confirmation: host, disposition: "unmanaged", successor: null },
-  });
-  expect(removal.status()).toBe(202);
-  const reonboard = await page.request.post(
-    `/host-actions/${host}/allow-reonboarding`,
-    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
-  );
-  expect(reonboard.ok()).toBe(true);
-  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
 });
 
 test("system update uncertainty dialog acknowledges and retries once", async ({

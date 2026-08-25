@@ -3,6 +3,13 @@ import { newAuthedContext, waitForHarnessTokens } from "./harness.mjs";
 
 const test = base;
 
+// Janus-declared fixtures stay across projects. Runtime remove is not
+// declarative cleanup, so the reset must not claim they were retired.
+const PERSISTENT_DECLARED_FIXTURES = [
+  "bl-prefs-declared-drift",
+  "bl-saved-restart-loading-chromium-desktop",
+];
+
 async function listRuntimeHosts(page) {
   const snapshot = await page.request.get("/hosts.json");
   expect(snapshot.ok()).toBe(true);
@@ -22,7 +29,7 @@ test("reset runtime fleet before the mobile project", async ({ browser }) => {
     }
     for (const host of hosts) {
       const name = host.name;
-      if (!name || name === "bl-prefs-declared-drift") {
+      if (!name || PERSISTENT_DECLARED_FIXTURES.includes(name)) {
         continue;
       }
       const removal = await page.request.post(`/host-actions/${name}/remove`, {
@@ -39,6 +46,8 @@ test("reset runtime fleet before the mobile project", async ({ browser }) => {
   }
 
   const remaining = await listRuntimeHosts(page);
-  expect(remaining.filter((host) => host.name !== "bl-prefs-declared-drift")).toEqual([]);
+  expect(
+    remaining.filter((host) => !PERSISTENT_DECLARED_FIXTURES.includes(host.name)),
+  ).toEqual([]);
   await context.close();
 });
