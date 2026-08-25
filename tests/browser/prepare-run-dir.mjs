@@ -85,6 +85,7 @@ const currentPath = path.join(operatorRoot, "current");
 fs.writeFileSync(currentPath, `${generation}\n`, { mode: 0o600 });
 
 const KERNEL_VS_RESTART_PROJECTS = ["chromium-mobile"];
+const PREFS_DECLARED_DRIFT_HOST = "bl-prefs-declared-drift";
 
 function janusReadyHostManifest(hostName) {
   return {
@@ -92,6 +93,36 @@ function janusReadyHostManifest(hostName) {
     version: 1,
     slug: hostName,
     host: { name: hostName },
+    wings: [],
+    services: [],
+    policy: {
+      declaredOnly: true,
+      runtimeStateOwner: "pharos",
+      privilegedActions: {
+        mode: "janus",
+        janusRequired: true,
+      },
+    },
+  };
+}
+
+function declaredDriftHostManifest(hostName) {
+  return {
+    schema: "inspr.hostdash.config.v1",
+    version: 1,
+    slug: hostName,
+    host: {
+      name: hostName,
+      preferences: {
+        accent: "#48b8a8",
+        kind: "server",
+        alerts: {
+          suppress_down: false,
+          suppress_backup: false,
+          suppress_nix_freshness: false,
+        },
+      },
+    },
     wings: [],
     services: [],
     policy: {
@@ -117,6 +148,13 @@ const manifestPaths = KERNEL_VS_RESTART_PROJECTS.map((project) => {
   );
   return manifestPath;
 });
+const prefsDeclaredManifestPath = path.join(manifestDir, `${PREFS_DECLARED_DRIFT_HOST}.json`);
+fs.writeFileSync(
+  prefsDeclaredManifestPath,
+  `${JSON.stringify(declaredDriftHostManifest(PREFS_DECLARED_DRIFT_HOST), null, 2)}\n`,
+  { mode: 0o600 },
+);
+manifestPaths.push(prefsDeclaredManifestPath);
 fs.writeFileSync(path.join(runDir, "manifest-paths"), manifestPaths.join(":"), {
   mode: 0o600,
 });

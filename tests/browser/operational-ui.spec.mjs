@@ -1148,7 +1148,18 @@ test("lifecycle chip opens drift sheet without agora navigation or workflow step
   await expect(chip).toHaveAttribute("type", "button");
   await expect(chip).not.toHaveAttribute("href", /.*/);
 
+  const jobPolls = [];
+  page.on("request", (request) => {
+    if (
+      request.url().includes("/host-actions/jobs/") &&
+      request.method() === "GET"
+    ) {
+      jobPolls.push(request.url());
+    }
+  });
   await chip.click();
+  expect(jobPolls).toHaveLength(0);
+
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await expect(page).toHaveURL("/");
@@ -1353,13 +1364,11 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipVisible: true,
     chipCopy: "Up to date",
   });
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipVisible: true,
     chipCopy: "Up to date",
   });
 
@@ -1371,14 +1380,12 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "request_pending",
     title: settingsTitle,
-    chipVisible: true,
     chipCopy: "Change requested",
     requestedIconVisible: true,
   });
   await expectSettingsSurfaces(row, {
     state: "request_pending",
     title: settingsTitle,
-    chipVisible: true,
     chipCopy: "Change requested",
     requestedIconVisible: true,
   });
@@ -1390,13 +1397,11 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipVisible: true,
     chipCopy: "Up to date",
   });
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipVisible: true,
     chipCopy: "Up to date",
   });
 
@@ -1970,4 +1975,301 @@ test("cross-host system update uncertainty recovery posts workflow host", async 
   expect(retryPayload.job.id).not.toBe(priorJobId);
 
   fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+});
+
+test("preference drift request_pending sheet shows SSR facts before fleet refresh", async ({
+  page,
+}) => {
+  const host = "bl-prefs-request-drift";
+  await reportRuntimeHost(page, host, { preferences: { accent: "#111111" } });
+  const agora = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#48b8a8" } },
+  });
+  expect(agora.status()).toBe(200);
+  await page.goto("/");
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toHaveCount(1);
+  await expect(chip).toHaveAttribute("data-lifecycle-slot", "prefs_drift");
+  await expect(chip).toHaveAttribute("data-lifecycle-blocked-by", "host_report");
+  await expect(chip).toHaveAttribute("data-lifecycle-declared-summary", /48b8a8/);
+  await expect(chip).toHaveAttribute("data-lifecycle-observed-summary", /111111/);
+
+  const jobPolls = [];
+  page.on("request", (request) => {
+    if (
+      request.url().includes("/host-actions/jobs/") &&
+      request.method() === "GET"
+    ) {
+      jobPolls.push(request.url());
+    }
+  });
+  await chip.click();
+  expect(jobPolls).toHaveLength(0);
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(page).toHaveURL("/");
+  await expect(dialog.locator("[data-host-workflow]")).toBeHidden();
+  await expect(dialog.locator("[data-host-action-info-title]")).toContainText(
+    "Resolved when the host reports",
+  );
+  await expect(dialog.locator("[data-host-action-fact='declared']")).toContainText(
+    "#48b8a8",
+  );
+  await expect(dialog.locator("[data-host-action-fact='observed']")).toContainText(
+    "#111111",
+  );
+  await expect(dialog.locator("[data-host-action-fact='declared']")).not.toHaveText(
+    "defaults",
+  );
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("preference drift declared_not_applied sheet resolves in host settings", async ({
+  page,
+}) => {
+  const host = "bl-prefs-declared-drift";
+  await reportRuntimeHost(page, host, { preferences: { accent: "#111111" } });
+  await page.goto("/");
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toHaveCount(1);
+  await expect(chip).toHaveAttribute("data-lifecycle-slot", "prefs_drift");
+  await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(
+    "Ready to apply",
+  );
+
+  await chip.click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-info-title]")).toContainText(
+    "Resolved in host settings",
+  );
+  await expect(dialog.locator("[data-host-action-fact='declared']")).toContainText(
+    "#48b8a8",
+  );
+  await expect(dialog.locator("[data-host-action-fact='observed']")).toContainText(
+    "#111111",
+  );
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("quiet lifecycle chip opens sheet without job polling or workflow steps", async ({
+  page,
+}) => {
+  const host = "bl-quiet-lifecycle-sheet";
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  await page.goto("/");
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toHaveCount(1);
+  await expect(chip).toHaveAttribute("data-lifecycle-slot", "quiet");
+
+  const jobPolls = [];
+  page.on("request", (request) => {
+    if (
+      request.url().includes("/host-actions/jobs/") &&
+      request.method() === "GET"
+    ) {
+      jobPolls.push(request.url());
+    }
+  });
+  await chip.click();
+  expect(jobPolls).toHaveLength(0);
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-workflow]")).toBeHidden();
+  await expect(dialog.locator("[data-host-action-info-title]")).toContainText("No drift");
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
+  page,
+}, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "lifecycle continue fixture requires local harness manifest",
+  );
+  if (!manifest) return;
+  const { acceptFlagPath } = manifest;
+  const settingsUncertainFlagPath = acceptFlagPath.replace(
+    /dispatch-accept$/,
+    "dispatch-settings-uncertain",
+  );
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+  fs.writeFileSync(settingsUncertainFlagPath, "true", { mode: 0o600 });
+
+  const host = `bl-lifecycle-continue-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { is_nix: true });
+  const uncertain = await page.request.post("/agora/requests/host-preferences.json", {
+    data: {
+      host,
+      preferences: {
+        accent: "#48b8a8",
+        kind: "server",
+        alerts: {
+          suppress_down: false,
+          suppress_backup: false,
+          suppress_nix_freshness: false,
+        },
+      },
+    },
+  });
+  expect(uncertain.status()).toBe(409);
+  const uncertainPayload = await uncertain.json();
+  const lifecycleRunId = uncertainPayload.job.id;
+
+  fs.writeFileSync(acceptFlagPath, "true", { mode: 0o600 });
+  const proposal = await page.request.post("/host-actions/system-update", {
+    headers: { "x-pharos-action": "1" },
+    data: { host },
+  });
+  expect(proposal.status()).toBe(202);
+
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData?.lifecycle?.run_id).toBe(lifecycleRunId);
+  expect(hostData?.host_action?.id).toBeTruthy();
+  expect(hostData.lifecycle.run_id).not.toBe(hostData.host_action.id);
+  expect(hostData?.lifecycle?.primary_action?.label).toBe(
+    "I verified nixcfg — allow a new request",
+  );
+
+  await page.goto("/");
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const continueBtn = card
+    .locator("[data-host-actions]")
+    .first()
+    .locator("[data-host-action='lifecycle-continue']");
+  expect(await applyServerFleetSnapshot(page)).toBe(true);
+  await card.locator("[data-host-actions-trigger]").click();
+  await expect(continueBtn).toBeVisible();
+  await expect(continueBtn).toContainText(
+    "Continue: I verified nixcfg — allow a new request",
+  );
+  await expect(continueBtn).toHaveAttribute(
+    "data-lifecycle-run-id",
+    lifecycleRunId,
+  );
+
+  const pollResponsePromise = page.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .includes(`/host-actions/jobs/${encodeURIComponent(lifecycleRunId)}`) &&
+      response.request().method() === "GET",
+  );
+  await continueBtn.click();
+  const pollResponse = await pollResponsePromise;
+  expect(pollResponse.ok()).toBe(true);
+  const pollPayload = await pollResponse.json();
+  expect(pollPayload.job.id).toBe(lifecycleRunId);
+  expect(pollPayload.job.id).not.toBe(hostData.host_action.id);
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(page).toHaveURL("/");
+  await expect(dialog.locator("[data-host-workflow]")).not.toBeEmpty();
+  await expect(
+    dialog.getByRole("button", { name: "I verified nixcfg — allow a new request" }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+
+  const failedHost = `bl-lifecycle-continue-hidden-${testInfo.project.name}`;
+  await reportRuntimeHost(page, failedHost, { is_nix: true });
+  const failed = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host: failedHost, preferences: { accent: "#9868d0" } },
+  });
+  expect(failed.status()).toBe(409);
+  const failedPayload = await failed.json();
+  const failedRunId = failedPayload.job.id;
+  expect(failedPayload.job.workflow.primary_action).toBeNull();
+
+  await page.goto("/");
+  const failedCard = page
+    .locator(`[data-host="${failedHost}"][data-host-surface="runtime"].card`)
+    .first();
+  const failedContinue = failedCard
+    .locator("[data-host-actions]")
+    .first()
+    .locator("[data-host-action='lifecycle-continue']");
+  await failedCard.locator("[data-host-actions-trigger]").click();
+  await expect(failedContinue).toBeHidden();
+
+  const refreshPayload = await page.request.get("/hosts.json").then((r) => r.json());
+  const failedEntry = refreshPayload.hosts.find((entry) => entry.name === failedHost);
+  failedEntry.lifecycle.primary_action = {
+    kind: "recover",
+    label: "Run recovery checks",
+  };
+  expect(await page.evaluate((body) => applyFleetSnapshot(body), refreshPayload)).toBe(
+    true,
+  );
+  await failedCard.locator("[data-host-actions-trigger]").click();
+  await expect(failedContinue).toBeVisible();
+  await expect(failedContinue).toContainText("Continue: Run recovery checks");
+  await expect(failedContinue).toHaveAttribute("data-lifecycle-run-id", failedRunId);
+
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+  fs.writeFileSync(settingsUncertainFlagPath, "false", { mode: 0o600 });
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+  const failedRemoval = await page.request.post(`/host-actions/${failedHost}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: failedHost, disposition: "unmanaged", successor: null },
+  });
+  expect(failedRemoval.status()).toBe(202);
+  const failedReonboard = await page.request.post(
+    `/host-actions/${failedHost}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: failedHost } },
+  );
+  expect(failedReonboard.ok()).toBe(true);
 });

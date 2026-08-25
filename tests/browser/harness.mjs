@@ -189,8 +189,7 @@ export async function expectSettingsSurfaces(
   {
     state,
     title,
-    chipVisible = false,
-    chipCopy = "",
+    chipCopy,
     requestedIconVisible = false,
     readyIconVisible = false,
   },
@@ -220,25 +219,22 @@ export async function expectSettingsSurfaces(
   }
 
   const chip = surface.locator("[data-host-lifecycle-chip]");
-  if (chipVisible) {
-    await expect(chip).toBeVisible();
-    await expect(chip).toHaveAttribute("data-settings-state", state);
-    await expect(chip).toHaveAttribute("title", chipCopy);
-    await expect(chip).toHaveAttribute("aria-label", chipCopy);
-    await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(chipCopy);
-    const requestedIcon = chip.locator(".settings-state-icon.requested");
-    if (requestedIconVisible) {
-      await expect(requestedIcon).toBeVisible();
-    } else {
-      await expect(requestedIcon).toBeHidden();
-    }
-    const readyIcon = chip.locator(".settings-state-icon.ready");
-    if (readyIconVisible) {
-      await expect(readyIcon).toBeVisible();
-    } else {
-      await expect(readyIcon).toBeHidden();
-    }
+  await expect(chip).toHaveCount(1);
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveAttribute("data-settings-state", state);
+  await expect(chip).toHaveAttribute("title", chipCopy);
+  await expect(chip).toHaveAttribute("aria-label", chipCopy);
+  await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(chipCopy);
+  const requestedIcon = chip.locator(".settings-state-icon.requested");
+  if (requestedIconVisible) {
+    await expect(requestedIcon).toBeVisible();
   } else {
-    await expect(chip).toBeHidden();
+    await expect(requestedIcon).toBeHidden();
+  }
+  const readyIcon = chip.locator(".settings-state-icon.ready");
+  if (readyIconVisible) {
+    await expect(readyIcon).toBeVisible();
+  } else {
+    await expect(readyIcon).toBeHidden();
   }
 }

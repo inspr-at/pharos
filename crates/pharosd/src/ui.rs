@@ -194,7 +194,7 @@ mod module_tests {
             blocked_by: Vec::new(),
             primary_action: None,
         };
-        let chip = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, true);
+        let chip = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, true, None);
         assert!(chip.contains("data-host-lifecycle-chip"));
         assert!(chip.contains("<button"));
         assert!(!chip.contains("/agora"));
@@ -213,15 +213,34 @@ mod module_tests {
             primary_action: None,
         };
         let drift_chip =
-            host_lifecycle_chip_markup(&drift, HostPreferencesState::RequestPending, true);
+            host_lifecycle_chip_markup(&drift, HostPreferencesState::RequestPending, true, None);
         assert!(drift_chip.contains("Change requested"));
         assert!(!drift_chip.contains("Continue:"));
+        assert!(drift_chip.contains("data-lifecycle-blocked-by=\"host_report\""));
 
-        let inert = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, false);
+        let inert = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, false, None);
         assert!(inert.contains("disabled"));
         assert!(inert.contains("aria-disabled=\"true\""));
         assert!(inert.contains("tabindex=\"-1\""));
         assert!(!inert.contains(" hidden"));
+    }
+
+    #[test]
+    fn preferences_summary_matches_safe_fleet_fact_format() {
+        let prefs = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            kind: HostKind::Workstation,
+            alerts: {
+                let mut alerts = pharos_core::HostAlertPreferences::default();
+                alerts.suppress_backup = true;
+                alerts
+            },
+        };
+        assert_eq!(
+            preferences_summary(&prefs),
+            "accent #48b8a8 · workstation · mute backup"
+        );
+        assert_eq!(preferences_summary(&HostPreferences::default()), "defaults");
     }
 
     #[test]
@@ -3778,10 +3797,39 @@ pub(super) fn manifest_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &Ho
     by_host
 }
 
+pub(super) fn preferences_summary(prefs: &HostPreferences) -> String {
+    let mut parts = Vec::new();
+    if let Some(accent) = prefs.accent.as_deref() {
+        parts.push(format!("accent {}", accent));
+    }
+    if prefs.kind != HostKind::default() {
+        parts.push(prefs.kind.label().to_string());
+    }
+    let mut muted = Vec::new();
+    if prefs.alerts.suppress_down {
+        muted.push("down");
+    }
+    if prefs.alerts.suppress_backup {
+        muted.push("backup");
+    }
+    if prefs.alerts.suppress_nix_freshness {
+        muted.push("nix freshness");
+    }
+    if !muted.is_empty() {
+        parts.push(format!("mute {}", muted.join(", ")));
+    }
+    if parts.is_empty() {
+        "defaults".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 pub(super) fn host_lifecycle_chip_markup(
     lifecycle: &HostLifecycle,
     settings_state: HostPreferencesState,
     interactive: bool,
+    prefs_facts: Option<(String, String)>,
 ) -> String {
     let label = lifecycle.label.clone();
     let inert = if interactive {
@@ -3794,15 +3842,32 @@ pub(super) fn host_lifecycle_chip_markup(
         .as_ref()
         .map(|id| format!(r#" data-lifecycle-run-id="{}""#, html_escape(id)))
         .unwrap_or_default();
+    let blocked_by_attr = if lifecycle.blocked_by.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#" data-lifecycle-blocked-by="{}""#,
+            html_escape(&lifecycle.blocked_by.join(","))
+        )
+    };
+    let fact_attrs = prefs_facts.map_or(String::new(), |(declared, observed)| {
+        format!(
+            r#" data-lifecycle-declared-summary="{declared}" data-lifecycle-observed-summary="{observed}""#,
+            declared = html_escape(&declared),
+            observed = html_escape(&observed),
+        )
+    });
     let title = html_escape(&label);
     format!(
-        r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="{state}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}" data-lifecycle-detail="{detail}"{run_id_attr}{inert} title="{title}" aria-label="{title}"><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span class="settings-state-icon workflow" aria-hidden="true">{workflow_icon}</span><span data-host-lifecycle-chip-copy>{label}</span></button>"#,
+        r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="{state}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}" data-lifecycle-detail="{detail}"{run_id_attr}{blocked_by_attr}{fact_attrs}{inert} title="{title}" aria-label="{title}"><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span class="settings-state-icon workflow" aria-hidden="true">{workflow_icon}</span><span data-host-lifecycle-chip-copy>{label}</span></button>"#,
         state = settings_state.key(),
         slot = lifecycle.slot.key(),
         level = lifecycle.level,
         invoke = lifecycle.invoke.key(),
         detail = html_escape(&lifecycle.detail),
         run_id_attr = run_id_attr,
+        blocked_by_attr = blocked_by_attr,
+        fact_attrs = fact_attrs,
         inert = inert,
         title = title,
         label = html_escape(&label),
@@ -6282,7 +6347,28 @@ pub(super) fn render_home_with_capabilities(
         } else {
             String::new()
         };
-        let chip = host_lifecycle_chip_markup(&lifecycle, settings_state, can_onboard);
+        let chip = host_lifecycle_chip_markup(
+            &lifecycle,
+            settings_state,
+            can_onboard,
+            if lifecycle.slot == HostLifecycleSlot::PrefsDrift {
+                let declared_source = match settings_state {
+                    HostPreferencesState::RequestPending => {
+                        h.requested_preferences.as_ref().or(declared_preferences)
+                    }
+                    HostPreferencesState::DeclaredNotApplied => {
+                        declared_preferences.or(h.requested_preferences.as_ref())
+                    }
+                    HostPreferencesState::Applied => None,
+                };
+                let observed_summary = preferences_summary(&h.preferences);
+                let declared_summary =
+                    preferences_summary(declared_source.unwrap_or(&h.preferences));
+                Some((declared_summary, observed_summary))
+            } else {
+                None
+            },
+        );
         let card_lifecycle_chip = chip.clone();
         let row_lifecycle_chip = chip;
         let drag_action = format!(

@@ -914,6 +914,7 @@ function lifecycleDriftSlot(slot){
   return slot==='prefs_drift'||slot==='kernel_drift';
 }
 function lifecycleFromChip(chip){
+  const blockedRaw=String(chip.dataset.lifecycleBlockedBy||'');
   return {
     slot:String(chip.dataset.lifecycleSlot||'quiet'),
     invoke:String(chip.dataset.lifecycleInvoke||'host_settings'),
@@ -921,10 +922,17 @@ function lifecycleFromChip(chip){
     level:String(chip.dataset.lifecycleLevel||'clear'),
     run_id:chip.dataset.lifecycleRunId||null,
     detail:String(chip.dataset.lifecycleDetail||''),
+    blocked_by:blockedRaw?blockedRaw.split(','):[],
   };
 }
-function lifecycleDriftResolver(slot){
+function lifecycleDriftResolver(slot,blockedBy){
   if(slot==='prefs_drift'){
+    if(blockedBy.includes('host_report')){
+      return {
+        title:'Resolved when the host reports',
+        copy:'Requested preferences have not yet been observed by the host. Pharos clears this drift after the host reports the requested values.',
+      };
+    }
     return {
       title:'Resolved in host settings',
       copy:'Declared preferences differ from what the host reports. Apply or withdraw the change in host settings.',
@@ -987,17 +995,17 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   setHostActionFact('declared','',false);
   setHostActionFact('observed','',false);
   if(isDrift){
-    const resolver=lifecycleDriftResolver(slot);
+    const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
+    const resolver=lifecycleDriftResolver(slot,blockedBy);
     if(title)title.textContent=String(lifecycle.label||'');
     if(copy)copy.textContent=String(lifecycle.detail||'');
     if(infoTitle)infoTitle.textContent=resolver.title;
     if(infoCopy)infoCopy.textContent=resolver.copy;
     if(slot==='prefs_drift'){
-      const declared=host.declared_preferences||null;
-      const observed=host.preferences||{};
-      const requested=host.requested_preferences||null;
-      const observedSummary=formatPreferencesSummary(observed);
-      const declaredSummary=formatPreferencesSummary(declared||requested||observed);
+      const declaredSummary=chip.dataset.lifecycleDeclaredSummary
+        ||formatPreferencesSummary(host.declared_preferences||host.requested_preferences||host.preferences||{});
+      const observedSummary=chip.dataset.lifecycleObservedSummary
+        ||formatPreferencesSummary(host.preferences||{});
       setHostActionFact('declared',declaredSummary,true);
       setHostActionFact('observed',observedSummary,true);
       setHostActionFact('scope',resolver.title,true);
@@ -1044,6 +1052,7 @@ function updateHostLifecycle(surface,host){
     const invoke=String(lifecycle?.invoke||'host_settings');
     const level=String(lifecycle?.level||'clear');
     const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
+    const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
     chip.hidden=false;
     chip.dataset.settingsState=String(host.preferences_state||'applied');
     chip.dataset.lifecycleSlot=slot;
@@ -1052,6 +1061,20 @@ function updateHostLifecycle(surface,host){
     chip.dataset.lifecycleDetail=String(lifecycle?.detail||'');
     if(runId)chip.dataset.lifecycleRunId=runId;
     else delete chip.dataset.lifecycleRunId;
+    if(blockedBy.length)chip.dataset.lifecycleBlockedBy=blockedBy.join(',');
+    else delete chip.dataset.lifecycleBlockedBy;
+    if(slot==='prefs_drift'){
+      const declared=host.declared_preferences||null;
+      const observed=host.preferences||{};
+      const requested=host.requested_preferences||null;
+      const state=String(host.preferences_state||'applied');
+      const declaredSource=state==='request_pending'?requested:(declared||requested);
+      chip.dataset.lifecycleDeclaredSummary=formatPreferencesSummary(declaredSource||observed);
+      chip.dataset.lifecycleObservedSummary=formatPreferencesSummary(observed);
+    }else{
+      delete chip.dataset.lifecycleDeclaredSummary;
+      delete chip.dataset.lifecycleObservedSummary;
+    }
     chip.title=label;
     chip.setAttribute('aria-label',label);
     const copy=chip.querySelector('[data-host-lifecycle-chip-copy]');
