@@ -2464,6 +2464,7 @@ test("informational lifecycle sheets hide leftover workflow controls", async ({
   await expectInformationalWorkflowControlsHidden(dialog);
   await expect(dialog.locator("[data-host-action-close]").first()).toBeFocused();
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).toBeHidden();
 
   const prefsPayload = await page.request.get("/hosts.json").then((r) => r.json());
   const prefsEntry = prefsPayload.hosts.find((entry) => entry.name === quietHost);
