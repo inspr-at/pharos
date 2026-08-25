@@ -1400,6 +1400,32 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
     chipCopy: "change waiting",
     requestedIconVisible: false,
   });
+  const cardChipChrome = await card.evaluate((surface) => {
+    const chip = surface.querySelector(".host-lifecycle-chip");
+    const chipStyle = getComputedStyle(chip);
+    return {
+      fontFamily: chipStyle.fontFamily,
+      surfaceFontFamily: getComputedStyle(surface).fontFamily,
+      borderTopWidth: chipStyle.borderTopWidth,
+      borderRightWidth: chipStyle.borderRightWidth,
+      borderBottomWidth: chipStyle.borderBottomWidth,
+      borderLeftWidth: chipStyle.borderLeftWidth,
+      backgroundColor: chipStyle.backgroundColor,
+      paddingTop: chipStyle.paddingTop,
+      paddingRight: chipStyle.paddingRight,
+      paddingBottom: chipStyle.paddingBottom,
+      paddingLeft: chipStyle.paddingLeft,
+    };
+  });
+  expect(cardChipChrome.fontFamily).toBe(cardChipChrome.surfaceFontFamily);
+  expect(parseFloat(cardChipChrome.borderTopWidth)).toBeGreaterThan(0);
+  expect(parseFloat(cardChipChrome.borderRightWidth)).toBeGreaterThan(0);
+  expect(parseFloat(cardChipChrome.borderBottomWidth)).toBeGreaterThan(0);
+  expect(parseFloat(cardChipChrome.borderLeftWidth)).toBeGreaterThan(0);
+  expect(cardChipChrome.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(cardChipChrome.backgroundColor).not.toBe("transparent");
+  expect(parseFloat(cardChipChrome.paddingRight)).toBeGreaterThan(0);
+  expect(parseFloat(cardChipChrome.paddingLeft)).toBeGreaterThan(0);
   await page.locator("[data-view-button='list']").click();
   await expectSettingsSurfaces(row, {
     state: "request_pending",
@@ -1407,6 +1433,46 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
     chipCopy: "change waiting",
     requestedIconVisible: false,
   });
+  const listChipChrome = await row.evaluate((surface) => {
+    const chip = surface.querySelector(".host-lifecycle-chip");
+    const attention = surface.querySelector(".list-attention") ?? surface;
+    const chipStyle = getComputedStyle(chip);
+    return {
+      borderTopWidth: chipStyle.borderTopWidth,
+      borderRightWidth: chipStyle.borderRightWidth,
+      borderBottomWidth: chipStyle.borderBottomWidth,
+      borderLeftWidth: chipStyle.borderLeftWidth,
+      borderTopStyle: chipStyle.borderTopStyle,
+      borderRightStyle: chipStyle.borderRightStyle,
+      borderBottomStyle: chipStyle.borderBottomStyle,
+      borderLeftStyle: chipStyle.borderLeftStyle,
+      backgroundColor: chipStyle.backgroundColor,
+      paddingTop: chipStyle.paddingTop,
+      paddingRight: chipStyle.paddingRight,
+      paddingBottom: chipStyle.paddingBottom,
+      paddingLeft: chipStyle.paddingLeft,
+      fontFamily: chipStyle.fontFamily,
+      attentionFontFamily: getComputedStyle(attention).fontFamily,
+      rowFontFamily: getComputedStyle(surface).fontFamily,
+    };
+  });
+  expect(listChipChrome.borderTopWidth).toBe("0px");
+  expect(listChipChrome.borderRightWidth).toBe("0px");
+  expect(listChipChrome.borderBottomWidth).toBe("0px");
+  expect(listChipChrome.borderLeftWidth).toBe("0px");
+  expect(listChipChrome.borderTopStyle).toBe("none");
+  expect(listChipChrome.borderRightStyle).toBe("none");
+  expect(listChipChrome.borderBottomStyle).toBe("none");
+  expect(listChipChrome.borderLeftStyle).toBe("none");
+  expect(listChipChrome.backgroundColor).toBe("rgba(0, 0, 0, 0)");
+  expect(listChipChrome.paddingTop).toBe("0px");
+  expect(listChipChrome.paddingRight).toBe("0px");
+  expect(listChipChrome.paddingBottom).toBe("0px");
+  expect(listChipChrome.paddingLeft).toBe("0px");
+  expect([
+    listChipChrome.attentionFontFamily,
+    listChipChrome.rowFontFamily,
+  ]).toContain(listChipChrome.fontFamily);
   await page.locator("[data-view-button='grid']").click();
 
   await reportRuntimeHost(page, host, {
