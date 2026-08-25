@@ -1523,6 +1523,11 @@ test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", asyn
 test("saved update-restart stays read-only until the exact job renders", async ({
   page,
 }, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "saved restart fixture requires local harness manifest",
+  );
+  if (!manifest) return;
   const host = `bl-saved-restart-loading-${testInfo.project.name}`;
   await reportRuntimeHost(page, host, {
     is_nix: true,
@@ -1551,7 +1556,20 @@ test("saved update-restart stays read-only until the exact job renders", async (
   await expect(chip).toHaveAttribute("data-lifecycle-invoke", "update_restart");
   await expect(chip).toHaveAttribute("data-lifecycle-run-id", runId);
 
+  const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  const isExactJobGet = (url, method) => {
+    if (method !== "GET") return false;
+    try {
+      return new URL(url).pathname === jobPath;
+    } catch {
+      return false;
+    }
+  };
+  const prefetchedJob = await page.request.get(jobPath);
+  expect(prefetchedJob.ok()).toBe(true);
+  const prefetchedPayload = await prefetchedJob.json();
   const reviewPosts = [];
+  const jobGets = [];
   page.on("request", (request) => {
     if (
       request.method() === "POST" &&
@@ -1559,22 +1577,26 @@ test("saved update-restart stays read-only until the exact job renders", async (
     ) {
       reviewPosts.push(request.url());
     }
+    if (isExactJobGet(request.url(), request.method())) {
+      jobGets.push(request.url());
+    }
   });
   let releaseJobGet = () => {};
   const holdJobGet = new Promise((resolve) => {
     releaseJobGet = resolve;
   });
   await page.route("**/host-actions/jobs/**", async (route) => {
-    const url = route.request().url();
-    if (
-      route.request().method() !== "GET" ||
-      !url.includes(`/host-actions/jobs/${encodeURIComponent(runId)}`)
-    ) {
+    const request = route.request();
+    if (!isExactJobGet(request.url(), request.method())) {
       await route.continue();
       return;
     }
     await holdJobGet;
-    await route.continue();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(prefetchedPayload),
+    });
   });
 
   await chip.click();
@@ -1589,15 +1611,14 @@ test("saved update-restart stays read-only until the exact job renders", async (
   await expect(
     dialog.getByRole("button", { name: "Prepare guarded review" }),
   ).toHaveCount(0);
+  await expect.poll(() => jobGets.length).toBeGreaterThan(0);
   await page.evaluate(() => submitHostAction());
   expect(reviewPosts).toEqual([]);
 
   const pollResponsePromise = page.waitForResponse(
     (response) =>
-      response
-        .url()
-        .includes(`/host-actions/jobs/${encodeURIComponent(runId)}`) &&
-      response.request().method() === "GET",
+      isExactJobGet(response.url(), response.request().method()) &&
+      response.ok(),
   );
   releaseJobGet();
   const pollResponse = await pollResponsePromise;
@@ -1609,6 +1630,12 @@ test("saved update-restart stays read-only until the exact job renders", async (
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
 
+  const cancel = await page.request.post(
+    `/host-actions/jobs/${encodeURIComponent(runId)}/cancel`,
+    { headers: { "x-pharos-action": "1" }, data: {} },
+  );
+  expect(cancel.status()).toBe(200);
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
     data: { confirmation: host, disposition: "unmanaged", successor: null },
@@ -1619,6 +1646,7 @@ test("saved update-restart stays read-only until the exact job renders", async (
     { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
   );
   expect(reonboard.ok()).toBe(true);
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
 });
 
 test("system update uncertainty dialog acknowledges and retries once", async ({
