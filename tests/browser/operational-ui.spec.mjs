@@ -1524,7 +1524,15 @@ test("saved update-restart stays read-only until the exact job renders", async (
   page,
 }) => {
   const host = "bl-saved-restart-loading";
-  await reportRuntimeHost(page, host, { is_nix: true });
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    kernel: {
+      state: "reboot_required",
+      running_version: "6.18.26",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  });
   const review = await page.request.post(`/host-actions/${host}/update-restart/review`, {
     headers: { "x-pharos-action": "1" },
     data: {},
