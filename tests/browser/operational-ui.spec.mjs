@@ -1025,12 +1025,13 @@ test("fleet refresh consumes server-emitted lifecycle for failed settings", asyn
 
   expect(await applyServerFleetSnapshot(page)).toBe(true);
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
-  await expect(card.locator("[data-settings-note]")).toBeHidden();
-  await expect(card.locator("[data-host-action-note-copy]")).not.toContainText(
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toBeVisible();
+  await expect(chip.locator("[data-host-lifecycle-chip-copy]")).not.toContainText(
     "Change requested",
   );
   if (hostData.lifecycle?.run_id) {
-    await expect(card.locator("[data-host-action-note]")).toHaveAttribute(
+    await expect(chip).toHaveAttribute(
       "data-lifecycle-run-id",
       hostData.lifecycle.run_id,
     );
@@ -1083,7 +1084,7 @@ test("fleet refresh applies server lifecycle when run_id differs from host_actio
 
   expect(await applyServerFleetSnapshot(page)).toBe(true);
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
-  await expect(card.locator("[data-host-action-note]")).toHaveAttribute(
+  await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
     "data-lifecycle-run-id",
     hostData.lifecycle.run_id,
   );
@@ -1096,7 +1097,7 @@ test("fleet refresh applies server lifecycle when run_id differs from host_actio
         `/host-actions/jobs/${encodeURIComponent(lifecycleRunId)}`,
       ) && response.request().method() === "GET",
   );
-  await card.locator("[data-host-action-note]").click();
+  await card.locator("[data-host-lifecycle-chip]").click();
   const pollResponse = await pollResponsePromise;
   expect(pollResponse.ok()).toBe(true);
   const pollPayload = await pollResponse.json();
@@ -1119,7 +1120,102 @@ test("fleet refresh applies server lifecycle when run_id differs from host_actio
   fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
 });
 
-test("fleet refresh kernel slot follows server lifecycle transitions", async ({ page }) => {
+test("lifecycle chip opens drift sheet without agora navigation or workflow steps", async ({
+  page,
+}) => {
+  const host = "bl-lifecycle-drift-sheet";
+  await reportRuntimeHost(page, host, {
+    kernel: {
+      state: "reboot_required",
+      running_version: "6.18.26",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  });
+  await page.goto("/");
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveAttribute("type", "button");
+  await expect(chip).not.toHaveAttribute("href", /.*/);
+
+  await chip.click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(page).toHaveURL("/");
+  await expect(dialog.locator("[data-host-workflow]")).toBeHidden();
+  await expect(dialog.locator("[data-host-action-fact-row='kernel']")).toBeVisible();
+  await expect(dialog.locator("[data-host-action-fact='kernel']")).toContainText("6.18.26");
+  await expect(dialog.locator("[data-host-action-fact='kernel']")).toContainText("7.0.14");
+  await expect(dialog.locator("[data-host-action-info-copy]")).toContainText(
+    "Pharos will not restart this host",
+  );
+
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("lifecycle chip opens persisted run sheet without agora navigation", async ({
+  page,
+}) => {
+  const host = "bl-lifecycle-run-sheet";
+  await reportRuntimeHost(page, host, { is_nix: true });
+  await page.goto("/");
+
+  const agora = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#48b8a8" } },
+  });
+  expect(agora.status()).toBe(409);
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveAttribute("data-lifecycle-invoke", "workflow");
+
+  const pollResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes("/host-actions/jobs/") &&
+      response.request().method() === "GET",
+  );
+  await chip.click();
+  const pollResponse = await pollResponsePromise;
+  expect(pollResponse.ok()).toBe(true);
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(page).toHaveURL("/");
+  await expect(dialog.locator("[data-host-workflow]")).not.toBeEmpty();
+  await expect(dialog.locator("[data-host-action-fact-row='declared']")).toBeHidden();
+  await expect(dialog.locator("[data-host-action-fact-row='observed']")).toBeHidden();
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
+test("fleet refresh kernel chip follows server lifecycle transitions", async ({ page }) => {
   const host = "bl-kernel-lifecycle";
   await reportRuntimeHost(page, host, {
     kernel: {
@@ -1133,9 +1229,13 @@ test("fleet refresh kernel slot follows server lifecycle transitions", async ({ 
 
   expect(await applyServerFleetSnapshot(page)).toBe(true);
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
-  await expect(card.locator("[data-kernel-slot]")).toBeVisible();
-  await expect(card.locator("[data-kernel-slot] [data-kernel-running]")).toHaveText("6.18.26");
-  await expect(card.locator("[data-kernel-slot] [data-kernel-expected]")).toHaveText("7.0.14");
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveAttribute("data-lifecycle-slot", "kernel_drift");
+  await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toContainText(
+    "Continue: planned restart",
+  );
+  await expect(card.locator("[data-kernel-slot]")).toHaveCount(0);
 
   await reportRuntimeHost(page, host, {
     kernel: {
@@ -1146,8 +1246,7 @@ test("fleet refresh kernel slot follows server lifecycle transitions", async ({ 
     },
   });
   expect(await applyServerFleetSnapshot(page)).toBe(true);
-  await expect(card.locator("[data-kernel-slot]")).toBeHidden();
-  await expect(card.locator("[data-settings-note-copy]")).toContainText("Up to date");
+  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText("Up to date");
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -1188,13 +1287,13 @@ test("fleet refresh keeps workflow note inert without host actions root", async 
   const row = page.locator(`tr[data-host="${host}"][data-host-surface="runtime"]`).first();
   await expect(card.locator("[data-host-actions]")).toHaveCount(0);
   await expect(row.locator("[data-host-actions]")).toHaveCount(0);
-  await expect(card.locator("[data-host-action-note]")).toBeHidden();
-  await expect(row.locator("[data-host-action-note]")).toBeHidden();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeHidden();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toBeHidden();
 
   expect(await applyServerFleetSnapshot(page)).toBe(true);
-  await expect(card.locator("[data-host-action-note]")).toBeHidden();
-  await expect(row.locator("[data-host-action-note]")).toBeHidden();
-  await expect(card.locator("[data-host-action-note]")).not.toBeFocused();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeHidden();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toBeHidden();
+  await expect(card.locator("[data-host-lifecycle-chip]")).not.toBeFocused();
   await readContext.close();
 
   const cleanupContext = await newAuthedContext(browser, "write");
@@ -1229,13 +1328,13 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    noteVisible: true,
-    noteCopy: "Up to date",
+    chipVisible: true,
+    chipCopy: "Up to date",
   });
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    noteVisible: false,
+    chipVisible: false,
   });
 
   const agora = await page.request.post("/agora/requests/host-preferences.json", {
@@ -1246,15 +1345,17 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "request_pending",
     title: settingsTitle,
-    noteVisible: false,
+    chipVisible: false,
     requestedIconVisible: false,
   });
   await expectSettingsSurfaces(row, {
     state: "request_pending",
     title: settingsTitle,
-    noteVisible: false,
+    chipVisible: false,
   });
-  await expect(card.locator("[data-host-action-note-copy]")).not.toBeEmpty();
+  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText(
+    "Continue: host report",
+  );
 
   await reportRuntimeHost(page, host, {
     preferences: { accent: "#48b8a8" },
@@ -1263,16 +1364,16 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    noteVisible: true,
-    noteCopy: "Up to date",
+    chipVisible: true,
+    chipCopy: "Up to date",
   });
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    noteVisible: false,
+    chipVisible: false,
   });
-  await expect(card.locator("[data-host-action-note]")).toBeHidden();
-  await expect(row.locator("[data-host-action-note]")).toBeHidden();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeHidden();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toBeHidden();
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -1324,7 +1425,7 @@ test("settings naming applies only to settings surfaces, not generic host action
   expect(reonboard.ok()).toBe(true);
 });
 
-test("fleet refresh hides kernel slot when UpdateRestart lifecycle wins", async ({
+test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", async ({
   page,
 }, testInfo) => {
   test.skip(
@@ -1356,17 +1457,17 @@ test("fleet refresh hides kernel slot when UpdateRestart lifecycle wins", async 
 
   await page.goto("/");
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
-  const kernelDetails = card.locator("[data-kernel-posture]");
-  const expectDormantKernelMetadataAbsent = async () => {
-    await expect(card.locator("[data-kernel-slot]")).toBeHidden();
-    await expect(kernelDetails).not.toHaveAttribute("data-lifecycle-slot");
-    await expect(kernelDetails).not.toHaveAttribute("data-lifecycle-level");
-    await expect(kernelDetails).not.toHaveAttribute("data-lifecycle-invoke");
+  const expectKernelDriftChipAbsent = async () => {
+    await expect(card.locator("[data-kernel-slot]")).toHaveCount(0);
+    await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+      "data-lifecycle-invoke",
+      "update_restart",
+    );
   };
-  await expectDormantKernelMetadataAbsent();
+  await expectKernelDriftChipAbsent();
   expect(await applyServerFleetSnapshot(page)).toBe(true);
-  await expectDormantKernelMetadataAbsent();
-  await expect(card.locator("[data-host-action-note]")).toBeVisible();
+  await expectKernelDriftChipAbsent();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeVisible();
 });
 
 test("system update uncertainty dialog acknowledges and retries once", async ({
@@ -1487,7 +1588,7 @@ test("system update uncertainty dialog acknowledges and retries once", async ({
         response.url().includes("/host-actions/jobs/") &&
         response.request().method() === "GET",
     );
-    await card.locator("[data-host-action-note]").click();
+    await card.locator("[data-host-lifecycle-chip]").click();
     await jobPoll;
   };
 
@@ -1699,7 +1800,7 @@ test("settings dispatch uncertainty stays recoverable after page reload", async 
       response.url().includes(`/host-actions/jobs/${uncertainJobId}`) &&
       response.request().method() === "GET",
   );
-  await card.locator("[data-host-action-note]").click();
+  await card.locator("[data-host-lifecycle-chip]").click();
   await jobPoll;
   await expect(dialog).toBeVisible();
   await expect(acknowledge).toBeVisible();

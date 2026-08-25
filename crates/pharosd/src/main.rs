@@ -5209,13 +5209,7 @@ mod tests {
             html.matches(r#"data-host-action="host-settings""#).count(),
             1
         );
-        assert_eq!(
-            html.matches(
-                r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending""#
-            )
-            .count(),
-            2
-        );
+        assert!(!html.contains(r#"data-host-action="review-pending""#));
         assert_eq!(
             html.matches(
                 r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update""#
@@ -5256,8 +5250,8 @@ mod tests {
         assert!(html.contains("document.addEventListener('visibilitychange'"));
         assert!(html.contains("const storedMatches=action==='workflow'"));
         assert!(!html.contains("action==='system-update'&&storedKind"));
-        assert!(html.contains("actionNote.dataset.lifecycleInvoke"));
-        assert!(html.contains("actionNote.dataset.lifecycleRunId"));
+        assert!(html.contains("chip.dataset.lifecycleInvoke"));
+        assert!(html.contains("chip.dataset.lifecycleRunId"));
         assert!(html.contains(r#"data-host-remove-disposition"#));
         assert!(html.contains("It no longer exists"));
         assert!(html.contains("It still exists; stop managing it"));
@@ -5817,7 +5811,7 @@ mod tests {
         );
         assert!(html.contains("review queued"));
         assert!(html.contains(r#"data-lifecycle-invoke="update_restart""#));
-        assert!(html.contains(r#"data-kernel-slot hidden"#));
+        assert!(!html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
     }
 
     #[test]
@@ -5840,11 +5834,9 @@ mod tests {
             shell("markus", true),
             true,
         );
-        assert!(html.contains(r#"<div class="kernel-slot" data-kernel-slot><details"#));
-        assert!(html.contains("Restart required"));
-        assert!(html.contains("csb0 is healthy"));
-        assert!(html.contains("Ready after restart"));
-        assert!(html.contains("Pharos will not restart this host."));
+        assert!(html.contains(r#"data-host-lifecycle-chip"#));
+        assert!(html.contains(r#"data-lifecycle-slot="kernel_drift""#));
+        assert!(html.contains("Continue: planned restart"));
         assert!(html.contains("restart required restart needed kernel reboot required"));
 
         let mut current = host_with_backups("hsb0", 970, vec![]);
@@ -5862,7 +5854,8 @@ mod tests {
             shell("markus", true),
             true,
         );
-        assert!(current_html.contains(r#"data-kernel-slot hidden"#));
+        assert!(current_html.contains(r#"data-host-lifecycle-chip-copy>Up to date</span>"#));
+        assert!(!current_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
     }
 
     #[test]
@@ -7510,7 +7503,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains(r#"class="card has-settings""#));
         assert!(html.contains(r#"data-settings-state="declared_not_applied""#));
-        assert!(html.contains(r#"aria-label="ready to apply for poseidon""#));
+        assert!(html.contains(r#"aria-label="Ready to apply""#));
         assert!(html.contains(r#"style="--pending-color:#48b8a8""#));
         assert_eq!(
             html.matches(
@@ -7524,12 +7517,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
         ));
         assert!(html.contains(
-            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings" href="/agora?host=poseidon" title="ready to apply for poseidon" aria-label="ready to apply for poseidon"><span class="settings-state-icon requested""#
+            r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings""#
         ));
-        assert!(html.contains(r#"<span data-settings-note-copy>Ready to apply</span></a>"#));
-        assert!(!html.contains(
-            r#"<span data-settings-note-copy>Ready to apply</span><span class="settings-swatch""#
-        ));
+        assert!(
+            html.contains(r#"<span data-host-lifecycle-chip-copy>Ready to apply</span></button>"#)
+        );
         assert!(!html.contains(r#"class="settings-wait-icon""#));
         assert!(!html.contains(r#"--host-color:#48b8a8""#));
         assert!(html.contains(r#"<div class="card-actions"><button class="drag-handle" type="button" data-drag-handle title="Move poseidon" aria-label="Move poseidon""#));
@@ -7550,11 +7542,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert!(applied.contains(r#"class="card has-settings""#));
         assert!(applied.contains(
-            r#"data-settings-state="applied" data-lifecycle-slot="quiet" data-lifecycle-level="clear" data-lifecycle-invoke="host_settings" href="/agora?host=poseidon" title="Open host settings for poseidon" aria-label="Open host settings for poseidon"><span class="settings-state-icon requested""#
+            r#"data-settings-state="applied" data-lifecycle-slot="quiet" data-lifecycle-level="clear" data-lifecycle-invoke="host_settings""#
         ));
-        assert!(applied.contains(r#"<span data-settings-note-copy>Up to date</span></a>"#));
+        assert!(
+            applied.contains(r#"<span data-host-lifecycle-chip-copy>Up to date</span></button>"#)
+        );
         assert!(applied.contains(r#"style="--host-color:#48b8a8""#));
-        assert!(!applied.contains(r#"aria-label="ready to apply for poseidon""#));
+        assert!(!applied.contains(r#"aria-label="Ready to apply""#));
     }
 
     #[test]
@@ -7596,14 +7590,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             true,
         );
         assert!(lifecycle_html.contains(r#"<div class="card-maintenance">"#));
-        assert!(
-            lifecycle_html.contains(r#"<span data-settings-note-copy>Change requested</span></a>"#)
-        );
-        assert!(lifecycle_html.contains("Restart required"));
-        assert!(HEAD.contains(
-            "--lifecycle-width:calc(var(--fresh-cell-width) + var(--fresh-cell-width) + var(--indicator-gap))"
+        assert!(lifecycle_html.contains(
+            r#"<span data-host-lifecycle-chip-copy>Continue: host report</span></button>"#
         ));
-        assert!(HEAD.contains(".card-maintenance .settings-wait-note{width:var(--lifecycle-width)"));
+        assert!(!lifecycle_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
+        assert!(
+            HEAD.contains(".card-maintenance .host-lifecycle-chip{width:var(--lifecycle-width)")
+        );
         assert!(HEAD.contains(".card .fresh-row-compact{position:relative;display:flex"));
         assert!(HEAD.contains("width:var(--fresh-cell-width)"));
 
@@ -7666,23 +7659,26 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         let prefs_card = rendered_card(&html, "prefs-target");
         assert!(prefs_card.contains(
-            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings" href="/agora?host=prefs-target""#
+            r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings""#
         ));
-        assert!(prefs_card.contains(r#"<span data-settings-note-copy>Ready to apply</span></a>"#));
+        assert!(prefs_card
+            .contains(r#"<span data-host-lifecycle-chip-copy>Ready to apply</span></button>"#));
+        assert!(!prefs_card.contains("data-settings-note"));
 
         let run_card = rendered_card(&html, "run-target");
-        assert!(run_card.contains(
-            r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note data-action-level="warning" data-lifecycle-slot="settings_change" data-lifecycle-level="warning" data-lifecycle-invoke="workflow" data-lifecycle-run-id=""#
-        ));
+        assert!(run_card.contains("data-host-lifecycle-chip"));
+        assert!(run_card.contains(r#"data-lifecycle-slot="settings_change""#));
+        assert!(run_card.contains(r#"data-lifecycle-invoke="workflow""#));
         assert!(run_card.contains(&format!(r#"data-lifecycle-run-id="{}"#, settings_run.id)));
         assert!(run_card.contains(
-            r#"<span data-host-action-note-copy>settings request stopped</span></button>"#
+            r#"<span data-host-lifecycle-chip-copy>settings request stopped</span></button>"#
         ));
         assert!(run_card.contains(&format!(
             r#"data-action-job-id="{}" data-action-kind="settings_change" data-action-state="failed""#,
             settings_run.id
         )));
         assert!(!run_card.contains("Change requested"));
+        assert!(run_card.contains(r#"type="button" data-host-lifecycle-chip"#));
 
         let read_only_html = render_home(
             RuntimeSnapshot {
@@ -7699,22 +7695,23 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             false,
         );
         let read_only_run = rendered_card(&read_only_html, "run-target");
-        assert!(read_only_run.contains("data-host-action-note hidden"));
+        assert!(read_only_run.contains("data-host-lifecycle-chip hidden"));
         assert!(!read_only_run.contains("data-host-actions"));
 
         let kernel_card = rendered_card(&html, "kernel-target");
         assert!(kernel_card.contains(
-            r#"<div class="kernel-slot" data-kernel-slot><details class="kernel-posture" data-kernel-posture data-lifecycle-slot="kernel_drift" data-lifecycle-level="warning" data-lifecycle-invoke="kernel_details">"#
+            r#"data-lifecycle-slot="kernel_drift" data-lifecycle-level="warning" data-lifecycle-invoke="kernel_details""#
         ));
-        assert!(kernel_card.contains("<summary>"));
-        assert!(kernel_card.contains("Restart required"));
+        assert!(kernel_card.contains(
+            r#"<span data-host-lifecycle-chip-copy>Continue: planned restart</span></button>"#
+        ));
+        assert!(!kernel_card.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
 
-        // These are the existing handlers: this ticket changes no destinations.
-        assert!(FOOT.contains("event.target.closest('[data-host-action-note]')"));
-        assert!(FOOT.contains("actionNote.dataset.lifecycleInvoke"));
-        assert!(FOOT.contains("actionNote.dataset.lifecycleRunId"));
-        assert!(FOOT.contains("workflowInteractive"));
-        assert!(FOOT.contains("const details=slot.querySelector('[data-kernel-posture]');"));
+        assert!(FOOT.contains("event.target.closest('[data-host-lifecycle-chip]')"));
+        assert!(FOOT.contains("chip.dataset.lifecycleInvoke"));
+        assert!(FOOT.contains("chip.dataset.lifecycleRunId"));
+        assert!(FOOT.contains("openHostLifecycleSheet"));
+        assert!(FOOT.contains("dialog.dataset.drift"));
     }
 
     #[test]

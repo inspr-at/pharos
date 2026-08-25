@@ -189,15 +189,13 @@ export async function expectSettingsSurfaces(
   {
     state,
     title,
-    noteVisible = false,
-    noteCopy = "",
+    chipVisible = false,
+    chipCopy = "",
     requestedIconVisible = false,
     readyIconVisible = false,
   },
 ) {
-  const namedSurfaces = surface.locator(
-    "a[data-settings-state], [data-settings-note]",
-  );
+  const namedSurfaces = surface.locator("a[data-settings-state]");
   const namedCount = await namedSurfaces.count();
   expect(namedCount).toBeGreaterThan(0);
   for (let index = 0; index < namedCount; index += 1) {
@@ -221,26 +219,26 @@ export async function expectSettingsSurfaces(
     await expect(hostActions).not.toHaveAttribute("aria-label", title);
   }
 
-  const note = surface.locator("[data-settings-note]");
-  if (noteVisible) {
-    await expect(note).toBeVisible();
-    await expect(note).toHaveAttribute("data-settings-state", state);
-    await expect(note).toHaveAttribute("title", title);
-    await expect(note).toHaveAttribute("aria-label", title);
-    await expect(note.locator("[data-settings-note-copy]")).toHaveText(noteCopy);
-    const requestedIcon = note.locator(".settings-state-icon.requested");
+  const chip = surface.locator("[data-host-lifecycle-chip]");
+  if (chipVisible) {
+    await expect(chip).toBeVisible();
+    await expect(chip).toHaveAttribute("data-settings-state", state);
+    await expect(chip).toHaveAttribute("title", chipCopy);
+    await expect(chip).toHaveAttribute("aria-label", chipCopy);
+    await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(chipCopy);
+    const requestedIcon = chip.locator(".settings-state-icon.requested");
     if (requestedIconVisible) {
       await expect(requestedIcon).toBeVisible();
     } else {
       await expect(requestedIcon).toBeHidden();
     }
-    const readyIcon = note.locator(".settings-state-icon.ready");
+    const readyIcon = chip.locator(".settings-state-icon.ready");
     if (readyIconVisible) {
       await expect(readyIcon).toBeVisible();
     } else {
       await expect(readyIcon).toBeHidden();
     }
   } else {
-    await expect(note).toBeHidden();
+    await expect(chip).toBeHidden();
   }
 }
