@@ -5249,8 +5249,13 @@ mod tests {
         assert!(html.contains("if(!response.ok&&!payload.job)"));
         assert!(html.contains("document.addEventListener('visibilitychange'"));
         assert!(html.contains(
-            "if(lifecycleRunId&&(action==='workflow'||action==='update-restart'))pollHostActionJob(lifecycleRunId,true)"
+            "const savedRunLoading=!!lifecycleRunId&&(action==='workflow'||action==='update-restart')"
         ));
+        assert!(html.contains("hostActionContext.jobId=lifecycleRunId"));
+        assert!(html.contains("hostActionContext.stage='loading'"));
+        assert!(html.contains("if(primary){primary.hidden=true;primary.disabled=true}"));
+        assert!(html.contains("if(savedRunLoading)pollHostActionJob(lifecycleRunId,true)"));
+        assert!(html.contains("if(hostActionContext.stage==='loading')return"));
         assert!(!html.contains("const storedMatches=action==='workflow'"));
         assert!(html.contains("chip.dataset.lifecycleInvoke"));
         assert!(html.contains("chip.dataset.lifecycleRunId"));

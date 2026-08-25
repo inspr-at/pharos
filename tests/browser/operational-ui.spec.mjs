@@ -1520,6 +1520,99 @@ test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", asyn
   await expect(card.locator("[data-host-lifecycle-chip]")).toBeVisible();
 });
 
+test("saved update-restart stays read-only until the exact job renders", async ({
+  page,
+}) => {
+  const host = "bl-saved-restart-loading";
+  await reportRuntimeHost(page, host, { is_nix: true });
+  const review = await page.request.post(`/host-actions/${host}/update-restart/review`, {
+    headers: { "x-pharos-action": "1" },
+    data: {},
+  });
+  expect(review.status()).toBe(202);
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  const runId = hostData?.lifecycle?.run_id;
+  expect(hostData?.lifecycle?.slot).toBe("update_restart");
+  expect(runId).toBeTruthy();
+
+  await page.goto("/");
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toHaveAttribute("data-lifecycle-invoke", "update_restart");
+  await expect(chip).toHaveAttribute("data-lifecycle-run-id", runId);
+
+  const reviewPosts = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().includes(`/host-actions/${host}/update-restart/review`)
+    ) {
+      reviewPosts.push(request.url());
+    }
+  });
+  let releaseJobGet = () => {};
+  const holdJobGet = new Promise((resolve) => {
+    releaseJobGet = resolve;
+  });
+  await page.route("**/host-actions/jobs/**", async (route) => {
+    const url = route.request().url();
+    if (
+      route.request().method() !== "GET" ||
+      !url.includes(`/host-actions/jobs/${encodeURIComponent(runId)}`)
+    ) {
+      await route.continue();
+      return;
+    }
+    await holdJobGet;
+    await route.continue();
+  });
+
+  await chip.click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  const primary = dialog.locator("[data-host-action-primary]");
+  await expect(primary).toBeHidden();
+  await expect(primary).toBeDisabled();
+  await expect(dialog.locator("[data-host-action-copy]")).toContainText(
+    "Loading the saved execution checklist",
+  );
+  await expect(
+    dialog.getByRole("button", { name: "Prepare guarded review" }),
+  ).toHaveCount(0);
+  await page.evaluate(() => submitHostAction());
+  expect(reviewPosts).toEqual([]);
+
+  const pollResponsePromise = page.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .includes(`/host-actions/jobs/${encodeURIComponent(runId)}`) &&
+      response.request().method() === "GET",
+  );
+  releaseJobGet();
+  const pollResponse = await pollResponsePromise;
+  expect(pollResponse.ok()).toBe(true);
+  await expect(dialog.locator("[data-host-workflow]")).not.toBeEmpty();
+  await expect(primary).toBeHidden();
+  expect(reviewPosts).toEqual([]);
+  await page.unroute("**/host-actions/jobs/**");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
 test("system update uncertainty dialog acknowledges and retries once", async ({
   page,
 }, testInfo) => {

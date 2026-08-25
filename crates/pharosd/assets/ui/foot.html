@@ -252,12 +252,20 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
     if(primary){primary.textContent='Remove host';primary.classList.add('danger');primary.disabled=true}
     }
   }
+  const savedRunLoading=!!lifecycleRunId&&(action==='workflow'||action==='update-restart');
+  if(savedRunLoading){
+    hostActionContext.jobId=lifecycleRunId;
+    hostActionContext.stage='loading';
+    if(primary){primary.hidden=true;primary.disabled=true}
+    if(cancel)cancel.textContent='Close';
+    if(copy)copy.textContent='Loading the saved execution checklist...';
+  }
   overlay.hidden=false;
   document.body.dataset.hostActionDialogOpen='true';
   stopBeatClock();
   scheduleRefresh(DIALOG_REFRESH_MS);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
-  if(lifecycleRunId&&(action==='workflow'||action==='update-restart'))pollHostActionJob(lifecycleRunId,true);
+  if(savedRunLoading)pollHostActionJob(lifecycleRunId,true);
 }
 async function requestHostAction(path,body,extraHeaders={}){
   const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pharos-Action':'1',...extraHeaders},body:JSON.stringify(body||{})});
@@ -429,6 +437,7 @@ async function pollHostActionJob(id,immediate=false){
 }
 async function submitHostAction(){
   if(!hostActionContext)return;
+  if(hostActionContext.stage==='loading')return;
   const {action,root,host,workflowHost}=hostActionContext;
   const workflowHostName=workflowHost||host;
   const overlay=document.querySelector('[data-host-action-overlay]');
