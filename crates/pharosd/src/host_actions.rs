@@ -24,6 +24,7 @@ const LEASE_SECS: i64 = 180;
 const RETIREMENT_LEASE_SECS: i64 = 1800;
 const WORKFLOW_SCHEMA: &str = "inspr.pharos.host-workflow.v1";
 const WORKFLOW_VERSION: u16 = 2;
+const SYSTEM_UPDATE_DISPATCH_STALL_SECS: i64 = 120;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -243,6 +244,7 @@ pub(crate) enum HostActionEventKind {
     Requested,
     StateRecovered,
     DispatchAccepted,
+    DispatchSubmitted,
     DispatchFailed,
     ReviewClaimed,
     ReviewPassed,
@@ -1193,15 +1195,22 @@ impl HostActionJob {
     ) {
         let failed = self.state == HostActionState::Failed;
         let succeeded = self.state == HostActionState::Succeeded;
+        let submitted = self.has_event(HostActionEventKind::DispatchSubmitted);
         let accepted = self
             .events
             .iter()
             .any(|event| event.kind == HostActionEventKind::DispatchAccepted);
+        let dispatch_uncertain = failed && !accepted && !submitted;
         let (guidance, status_label, status_level) = match self.state {
             HostActionState::Succeeded => (
                 "The update review was handed to nixcfg. Pharos did not deploy or verify any host change.",
                 "review handed to nixcfg",
                 "clear",
+            ),
+            HostActionState::Failed if dispatch_uncertain => (
+                "Pharos could not confirm whether nixcfg received this review request. Verify nixcfg before starting another fleet-wide proposal. No host change was deployed or verified from Pharos.",
+                "dispatch outcome uncertain",
+                "warning",
             ),
             HostActionState::Failed => (
                 "The repository review request stopped. No host change was authorized.",
@@ -1214,16 +1223,16 @@ impl HostActionJob {
                 "warning",
             ),
         };
-        let request_state = if failed && !accepted {
+        let request_state = if failed && !accepted && !submitted {
             WorkflowStepState::Failed
-        } else if accepted || succeeded {
+        } else if accepted || succeeded || submitted {
             WorkflowStepState::Passed
         } else {
             WorkflowStepState::Running
         };
         let downstream_state = if failed || succeeded {
             WorkflowStepState::Skipped
-        } else if accepted {
+        } else if accepted || submitted {
             WorkflowStepState::Waiting
         } else {
             WorkflowStepState::Queued
@@ -1904,6 +1913,7 @@ fn event_label(event: &HostActionEvent) -> String {
         HostActionEventKind::Requested => "Workflow requested",
         HostActionEventKind::StateRecovered => "Existing workflow state loaded",
         HostActionEventKind::DispatchAccepted => "Guarded dispatch accepted",
+        HostActionEventKind::DispatchSubmitted => "Repository dispatch submitted",
         HostActionEventKind::DispatchFailed => "Guarded dispatch stopped",
         HostActionEventKind::ReviewClaimed => "Host started the safe review",
         HostActionEventKind::ReviewPassed => "Safe review passed",
@@ -2317,12 +2327,14 @@ struct NewHostAction<'a> {
 
 impl HostActionStore {
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
-        let jobs = path
+        let now = system_time_unix();
+        let (jobs, migrated) = path
             .as_ref()
             .and_then(|path| read_persisted_state(path, "guarded host action"))
             .map(|jobs| {
                 let mut jobs: Vec<HostActionJob> = serde_json::from_slice(&jobs)
                     .unwrap_or_else(|_| panic!("guarded host action state is malformed"));
+                let mut migrated = false;
                 for job in &mut jobs {
                     if job.kind == HostActionKind::RemoveHost && job.removal_plan.is_none() {
                         job.removal_plan = Some(HostRemovalPlan {
@@ -2345,6 +2357,9 @@ impl HostActionStore {
                             retirement_failure: None,
                         });
                     }
+                    if normalize_system_update_proposal(job, now) {
+                        migrated = true;
+                    }
                 }
                 let jobs: BTreeMap<_, _> =
                     jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
@@ -2352,13 +2367,20 @@ impl HostActionStore {
                     valid_action_jobs(&jobs),
                     "guarded host action state failed validation"
                 );
-                jobs
+                (jobs, migrated)
             })
-            .unwrap_or_default();
-        Self {
+            .unwrap_or((BTreeMap::new(), false));
+        let store = Self {
             path,
             jobs: RwLock::new(jobs),
+        };
+        if migrated {
+            let jobs = store.jobs.read().expect("host action store lock");
+            if let Err(error) = store.persist_jobs(&jobs) {
+                panic!("migrated host action state failed to persist: {:?}", error);
+            }
         }
+        store
     }
 
     pub(crate) fn path_for(host_store_path: Option<&Path>) -> Option<PathBuf> {
@@ -2456,6 +2478,10 @@ impl HostActionStore {
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
+        let migrated = reconcile_stalled_system_update_proposals_locked(&mut jobs, now);
+        if migrated {
+            self.persist_jobs(&jobs)?;
+        }
         if Self::has_active_system_update_proposal(&jobs) {
             return Err(HostActionStoreError::ActiveJob);
         }
@@ -2505,6 +2531,53 @@ impl HostActionStore {
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         self.update_system_update_proposal(id, now, true)
+    }
+
+    pub(crate) fn mark_system_update_dispatch_submitted(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.workflow_kind() != HostWorkflowKind::SystemUpdateProposal
+                || job.state != HostActionState::ProposalRequested
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            if !job.has_event(HostActionEventKind::DispatchSubmitted) {
+                job.updated_at = now;
+                job.record_event(
+                    now,
+                    HostActionEventSource::Pharos,
+                    HostActionEventKind::DispatchSubmitted,
+                    None,
+                );
+            }
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            jobs.insert(id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn active_system_update_proposal(&self) -> Option<HostActionJob> {
+        let jobs = self.jobs.read().expect("host action store lock");
+        jobs.values()
+            .filter(|job| {
+                job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal
+                    && !job.state.is_terminal()
+            })
+            .max_by_key(|job| (job.updated_at, job.created_at, &job.id))
+            .cloned()
     }
 
     fn update_system_update_proposal(
@@ -3607,7 +3680,7 @@ fn legacy_state_event_kind(job: &HostActionJob) -> HostActionEventKind {
             HostActionEventKind::DispatchAccepted
         }
         (HostWorkflowKind::SystemUpdateProposal, HostActionState::ProposalRequested) => {
-            HostActionEventKind::DispatchAccepted
+            HostActionEventKind::Requested
         }
         (HostWorkflowKind::SystemUpdateProposal, HostActionState::Failed) => {
             HostActionEventKind::DispatchFailed
@@ -3794,6 +3867,68 @@ impl RetiredHostStore {
 fn action_id(action: &str, host: &str, now: i64) -> String {
     let counter = ACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("action-{action}-{host}-{now}-{counter}")
+}
+
+fn system_time_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn normalize_system_update_proposal(job: &mut HostActionJob, now: i64) -> bool {
+    if job.workflow_kind() != HostWorkflowKind::SystemUpdateProposal
+        || job.state != HostActionState::ProposalRequested
+    {
+        return false;
+    }
+    let accepted = job.has_event(HostActionEventKind::DispatchAccepted);
+    let submitted = job.has_event(HostActionEventKind::DispatchSubmitted);
+    if accepted || submitted {
+        job.state = HostActionState::Succeeded;
+        job.updated_at = now;
+        if !accepted {
+            job.record_event(
+                now,
+                HostActionEventSource::Pharos,
+                HostActionEventKind::DispatchAccepted,
+                None,
+            );
+        }
+        return true;
+    }
+    if now
+        > job
+            .updated_at
+            .saturating_add(SYSTEM_UPDATE_DISPATCH_STALL_SECS)
+    {
+        job.state = HostActionState::Failed;
+        job.updated_at = now;
+        if !job.has_event(HostActionEventKind::DispatchFailed) {
+            job.record_event(
+                now,
+                HostActionEventSource::Pharos,
+                HostActionEventKind::DispatchFailed,
+                None,
+            );
+        }
+        return true;
+    }
+    false
+}
+
+fn reconcile_stalled_system_update_proposals_locked(
+    jobs: &mut BTreeMap<String, HostActionJob>,
+    now: i64,
+) -> bool {
+    let mut migrated = false;
+    for job in jobs.values_mut() {
+        if normalize_system_update_proposal(job, now) {
+            migrated = true;
+        }
+    }
+    migrated
 }
 
 fn derived_path(host_store_path: Option<&Path>, suffix: &str) -> Option<PathBuf> {
@@ -5142,6 +5277,204 @@ mod tests {
             .expect("second proposal workflow created");
         assert_ne!(first.id, second.id);
         assert_eq!(second.state, HostActionState::ProposalRequested);
+    }
+
+    #[test]
+    fn legacy_system_update_proposal_with_dispatch_accepted_migrates_to_succeeded() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-legacy-system-update-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let document = serde_json::json!([{
+            "schema": ACTION_SCHEMA,
+            "version": ACTION_VERSION,
+            "id": "action-system-update-hsb8-100-1",
+            "host": "hsb8",
+            "kind": "system_update_proposal",
+            "state": "proposal_requested",
+            "requested_by": "markus",
+            "ticket": "PHAROS-125",
+            "created_at": 100,
+            "updated_at": 101,
+            "confirmed_at": null,
+            "plan": null,
+            "result": null,
+            "lease_phase": null,
+            "lease_until": null,
+            "events": [
+                {
+                    "at": 100,
+                    "state": "proposal_requested",
+                    "source": "operator",
+                    "kind": "requested",
+                    "actor": "markus"
+                },
+                {
+                    "at": 101,
+                    "state": "proposal_requested",
+                    "source": "pharos",
+                    "kind": "dispatch_accepted"
+                }
+            ]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("legacy system update JSON"),
+        )
+        .expect("legacy system update state written");
+
+        let store = HostActionStore::new(Some(path.clone()));
+        let migrated = store
+            .get("action-system-update-hsb8-100-1")
+            .expect("legacy system update proposal loaded");
+        assert_eq!(migrated.state, HostActionState::Succeeded);
+        assert_eq!(
+            migrated.summary().workflow.status_label,
+            "review handed to nixcfg"
+        );
+
+        let persisted: Vec<HostActionJob> =
+            serde_json::from_slice(&std::fs::read(&path).expect("migrated state readable"))
+                .expect("migrated state parses");
+        assert_eq!(persisted[0].state, HostActionState::Succeeded);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stalled_system_update_proposal_without_dispatch_confirmation_terminalizes_as_uncertain() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-stalled-system-update-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let stale_at = system_time_unix() - SYSTEM_UPDATE_DISPATCH_STALL_SECS - 30;
+        let document = serde_json::json!([{
+            "schema": ACTION_SCHEMA,
+            "version": ACTION_VERSION,
+            "id": "action-system-update-gpc0-200-1",
+            "host": "gpc0",
+            "kind": "system_update_proposal",
+            "state": "proposal_requested",
+            "requested_by": "markus",
+            "ticket": "PHAROS-125",
+            "created_at": stale_at,
+            "updated_at": stale_at,
+            "confirmed_at": null,
+            "plan": null,
+            "result": null,
+            "lease_phase": null,
+            "lease_until": null,
+            "events": [{
+                "at": stale_at,
+                "state": "proposal_requested",
+                "source": "operator",
+                "kind": "requested",
+                "actor": "markus"
+            }]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("stalled system update JSON"),
+        )
+        .expect("stalled system update state written");
+
+        let store = HostActionStore::new(Some(path.clone()));
+        let reconciled = store
+            .get("action-system-update-gpc0-200-1")
+            .expect("stalled system update proposal loaded");
+        assert_eq!(reconciled.state, HostActionState::Failed);
+        assert_eq!(
+            reconciled.summary().workflow.status_label,
+            "dispatch outcome uncertain"
+        );
+        assert!(
+            store
+                .begin_system_update_proposal("hsb8", "markus", stale_at + 1)
+                .is_ok(),
+            "fleet-wide gate clears after uncertain terminalization"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn submitted_system_update_proposal_without_accept_migrates_to_succeeded() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-submitted-system-update-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let document = serde_json::json!([{
+            "schema": ACTION_SCHEMA,
+            "version": ACTION_VERSION,
+            "id": "action-system-update-hsb8-300-1",
+            "host": "hsb8",
+            "kind": "system_update_proposal",
+            "state": "proposal_requested",
+            "requested_by": "markus",
+            "ticket": "PHAROS-125",
+            "created_at": 300,
+            "updated_at": 301,
+            "confirmed_at": null,
+            "plan": null,
+            "result": null,
+            "lease_phase": null,
+            "lease_until": null,
+            "events": [
+                {
+                    "at": 300,
+                    "state": "proposal_requested",
+                    "source": "operator",
+                    "kind": "requested",
+                    "actor": "markus"
+                },
+                {
+                    "at": 301,
+                    "state": "proposal_requested",
+                    "source": "pharos",
+                    "kind": "dispatch_submitted"
+                }
+            ]
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("submitted system update JSON"),
+        )
+        .expect("submitted system update state written");
+
+        let store = HostActionStore::new(Some(path.clone()));
+        let migrated = store
+            .get("action-system-update-hsb8-300-1")
+            .expect("submitted system update proposal loaded");
+        assert_eq!(migrated.state, HostActionState::Succeeded);
+        assert!(migrated
+            .events
+            .iter()
+            .any(|event| event.kind == HostActionEventKind::DispatchAccepted));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mark_system_update_dispatch_submitted_records_recovery_before_terminalization() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-submitted-recovery-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let job = store
+            .begin_system_update_proposal("hsb8", "markus", 510)
+            .expect("proposal workflow created");
+        store
+            .mark_system_update_dispatch_submitted(&job.id, 511)
+            .expect("dispatch submission recorded");
+
+        let recovered = HostActionStore::new(Some(path.clone()));
+        let migrated = recovered
+            .get(&job.id)
+            .expect("submitted proposal recovered");
+        assert_eq!(migrated.state, HostActionState::Succeeded);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

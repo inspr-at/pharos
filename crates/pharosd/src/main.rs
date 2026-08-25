@@ -576,6 +576,30 @@ fn action_message(job: &HostActionJob) -> Cow<'static, str> {
             _ => "The settings request is saved and waiting for the host.",
         });
     }
+    if job.workflow_kind() == host_actions::HostWorkflowKind::SystemUpdateProposal {
+        let dispatch_confirmed = job.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                host_actions::HostActionEventKind::DispatchAccepted
+                    | host_actions::HostActionEventKind::DispatchSubmitted
+            )
+        });
+        return Cow::Borrowed(match job.state {
+            HostActionState::Succeeded => {
+                "Pharos handed the update review request to nixcfg. Repository checks and review continue outside Pharos. No host was deployed or verified from Pharos."
+            }
+            HostActionState::Failed if !dispatch_confirmed => {
+                "Pharos could not confirm whether nixcfg received this review request. Verify nixcfg before starting another fleet-wide proposal. No host change was deployed or verified from Pharos."
+            }
+            HostActionState::Failed => {
+                "The system update review request stopped and was recorded. No host change was authorized from Pharos."
+            }
+            HostActionState::ProposalRequested => {
+                "Pharos is recording the fleet-wide update review request. No host has changed."
+            }
+            _ => "The system update review workflow is recorded.",
+        });
+    }
     if job.workflow_kind() == host_actions::HostWorkflowKind::RemoveHost {
         return match job.state {
             HostActionState::ProposalRequested => Cow::Borrowed(
@@ -662,7 +686,7 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
     let mut current_group = "";
     for (index, step) in workflow.steps.iter().enumerate() {
         let current = workflow.current_step.as_deref() == Some(step.key.as_str());
-        let state_label = workflow_step_state_label(step.state.key());
+        let state_label = workflow_step_presentation_label(workflow, step);
         let location_label = step.location.label(&workflow.host);
         let current_attribute = if current {
             r#" aria-current="step""#
@@ -796,6 +820,23 @@ fn workflow_step_state_label(state: &str) -> &'static str {
     }
 }
 
+fn workflow_step_presentation_label(
+    workflow: &host_actions::HostWorkflowSummary,
+    step: &host_actions::HostWorkflowStep,
+) -> &'static str {
+    if workflow.kind == host_actions::HostWorkflowKind::SystemUpdateProposal
+        && step.state.key() == "skipped"
+    {
+        match step.key.as_str() {
+            "validate" | "review" => "continues in nixcfg",
+            "deploy" => "not deployed",
+            _ => workflow_step_state_label(step.state.key()),
+        }
+    } else {
+        workflow_step_state_label(step.state.key())
+    }
+}
+
 fn host_is_declared(state: &AppState, host: &str) -> bool {
     state
         .manifests
@@ -873,6 +914,17 @@ async fn request_system_update(
         .begin_system_update_proposal(host, &actor, now)
     {
         Ok(workflow) => workflow,
+        Err(HostActionStoreError::ActiveJob) => {
+            let active = state
+                .host_actions
+                .active_system_update_proposal()
+                .expect("fleet-wide system update proposal lock without an active job");
+            return action_response_with_message(
+                StatusCode::CONFLICT,
+                &active,
+                "A fleet-wide system update review is already open. Open the saved workflow before starting another request.",
+            );
+        }
         Err(_) => {
             return action_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -891,20 +943,33 @@ async fn request_system_update(
             error.safe_message(),
         );
     }
-    let job = match state
+    let submitted = match state
         .host_actions
-        .accept_system_update_proposal(&workflow.id, now_unix())
+        .mark_system_update_dispatch_submitted(&workflow.id, now_unix())
     {
         Ok(job) => job,
         Err(_) => {
             return action_response_with_message(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &workflow,
+                "The update request was sent, but Pharos could not record the repository dispatch",
+            );
+        }
+    };
+    let job = match state
+        .host_actions
+        .accept_system_update_proposal(&submitted.id, now_unix())
+    {
+        Ok(job) => job,
+        Err(_) => {
+            return action_response_with_message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &submitted,
                 "The update request was sent, but its saved checklist could not be updated",
             );
         }
     };
-    tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-125", "system update review requested");
+    tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-125", "system update review handed to nixcfg");
     action_response(StatusCode::ACCEPTED, &job)
 }
 
@@ -13561,6 +13626,94 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(failed.state, HostActionState::Failed);
         assert_eq!(payload["job"]["workflow"]["kind"], "system_update_proposal");
         assert_eq!(payload["job"]["workflow"]["current_step"], "request");
+    }
+
+    #[tokio::test]
+    async fn system_update_duplicate_invoke_returns_conflict_with_active_job() {
+        let state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
+        state
+            .host_actions
+            .begin_system_update_proposal("gpc0", "markus", now_unix())
+            .expect("active system update proposal recorded");
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers(),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(payload["job"]["state"], "proposal_requested");
+        assert!(payload["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already open")));
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.workflow_kind() == host_actions::HostWorkflowKind::SystemUpdateProposal
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn system_update_success_copy_honestly_describes_nixcfg_handoff() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_system_update_proposal("hsb8", "markus", 700)
+            .expect("proposal workflow created");
+        let completed = store
+            .accept_system_update_proposal(&job.id, 701)
+            .expect("proposal dispatch accepted");
+        let message = action_message(&completed);
+        assert!(message.contains("handed"));
+        assert!(message.contains("nixcfg"));
+        assert!(message.contains("No host was deployed or verified from Pharos."));
+        assert!(!message.contains("guarded action completed"));
+
+        let workflow = completed.summary().workflow;
+        let html = host_workflow_markup(&workflow);
+        assert!(html.contains("continues in nixcfg"));
+        assert!(!html.contains("not required"));
+        assert!(html.contains("not deployed"));
+    }
+
+    #[test]
+    fn system_update_activity_title_describes_nixcfg_handoff() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_system_update_proposal("athena", "markus", 710)
+            .expect("proposal workflow created");
+        let completed = store
+            .accept_system_update_proposal(&job.id, 711)
+            .expect("proposal dispatch accepted");
+        let html = render_activity_with_actions(
+            runtime(&[], &[]),
+            "csb1",
+            720,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[completed],
+            },
+            shell("markus", true),
+        );
+        assert!(html.contains("System update review handed to nixcfg"));
+        assert!(!html.contains("System update review completed"));
+        assert!(html.contains("handed the update review request to nixcfg"));
     }
 
     #[tokio::test]
