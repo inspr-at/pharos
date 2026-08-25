@@ -51,6 +51,7 @@ const dispatchToken = crypto.randomBytes(32).toString("hex");
 writeSecretFile("read-token", readToken);
 writeSecretFile("write-token", writeToken);
 writeSecretFile("dispatch-token", dispatchToken);
+writeSecretFile("dispatch-accept", "false");
 
 const operators = [
   {

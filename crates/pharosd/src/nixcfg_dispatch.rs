@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pharos_core::HostPreferences;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Serialize;
+use url::Url;
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const DISPATCH_PATH: &str =
@@ -195,9 +196,13 @@ impl NixcfgDispatch {
             .json(request)
             .send()
             .await
-            .map_err(|_| NixcfgDispatchError::RequestFailed)?;
+            .map_err(|_| NixcfgDispatchError::OutcomeUncertain)?;
         if response.status() != reqwest::StatusCode::NO_CONTENT {
-            return Err(NixcfgDispatchError::Rejected(response.status().as_u16()));
+            let status = response.status();
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
+                return Err(NixcfgDispatchError::OutcomeUncertain);
+            }
+            return Err(NixcfgDispatchError::Rejected(status.as_u16()));
         }
         Ok(())
     }
@@ -235,7 +240,7 @@ pub(crate) enum NixcfgDispatchError {
     InvalidHost,
     InvalidPreferences,
     InvalidRemovalIntent,
-    RequestFailed,
+    OutcomeUncertain,
     Rejected(u16),
 }
 
@@ -249,8 +254,8 @@ impl NixcfgDispatchError {
             Self::InvalidHost => "This host name cannot be used for declarative settings",
             Self::InvalidPreferences => "Host settings do not match the supported schema",
             Self::InvalidRemovalIntent => "The host retirement details are invalid",
-            Self::RequestFailed => {
-                "The declarative settings workflow could not be reached; no change was requested"
+            Self::OutcomeUncertain => {
+                "Pharos could not confirm whether the declarative settings workflow received this request"
             }
             Self::Rejected(_) => {
                 "The declarative settings workflow rejected the request; no change was requested"
@@ -259,7 +264,7 @@ impl NixcfgDispatchError {
     }
 
     pub(crate) fn is_outcome_uncertain(&self) -> bool {
-        matches!(self, Self::RequestFailed)
+        matches!(self, Self::OutcomeUncertain)
     }
 
     pub(crate) fn system_update_message(&self) -> &'static str {
@@ -271,7 +276,7 @@ impl NixcfgDispatchError {
                 "The repository dispatch credential is unavailable; no review request was sent"
             }
             Self::InvalidHost => "This host name cannot be used for a system update review",
-            Self::RequestFailed => {
+            Self::OutcomeUncertain => {
                 "Pharos could not confirm whether nixcfg received the review request. Verify nixcfg before retrying."
             }
             Self::Rejected(_) => {
@@ -280,6 +285,59 @@ impl NixcfgDispatchError {
             Self::InvalidPreferences | Self::InvalidRemovalIntent => self.safe_message(),
         }
     }
+
+    pub(crate) fn host_removal_message(&self) -> &'static str {
+        match self {
+            Self::Disabled => "Declarative host removal dispatch is not enabled on this Pharos server",
+            Self::CredentialUnavailable => {
+                "The declarative removal credential is unavailable; no removal request was sent"
+            }
+            Self::InvalidHost => "This host name cannot be used for declarative removal",
+            Self::OutcomeUncertain => {
+                "Pharos could not confirm whether the declarative removal workflow received this request"
+            }
+            Self::Rejected(_) => {
+                "The declarative removal workflow rejected the request; no retirement change was requested"
+            }
+            Self::InvalidPreferences | Self::InvalidRemovalIntent => self.safe_message(),
+        }
+    }
+}
+
+fn dispatch_api_base_from_env() -> String {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("PHAROS_NIXCFG_DISPATCH_API_BASE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| safe_loopback_dispatch_api_base(&value))
+            .unwrap_or_else(|| GITHUB_API_BASE.to_string())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        GITHUB_API_BASE.to_string()
+    }
+}
+
+fn safe_loopback_dispatch_api_base(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host != "127.0.0.1" {
+        return None;
+    }
+    let path = url.path();
+    if !path.is_empty() && path != "/" {
+        return None;
+    }
+    let port = url.port().unwrap_or(80);
+    Some(format!("http://127.0.0.1:{port}"))
 }
 
 #[derive(Serialize)]
@@ -422,6 +480,126 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn loopback_dispatch_api_base_override_is_narrow() {
+        assert_eq!(
+            safe_loopback_dispatch_api_base("http://127.0.0.1:18981"),
+            Some("http://127.0.0.1:18981".to_string())
+        );
+        assert!(safe_loopback_dispatch_api_base("http://localhost:9").is_none());
+        assert!(safe_loopback_dispatch_api_base("https://127.0.0.1:9").is_none());
+        assert!(safe_loopback_dispatch_api_base("http://evil.example").is_none());
+        assert!(safe_loopback_dispatch_api_base("http://user@127.0.0.1:9").is_none());
+        assert!(safe_loopback_dispatch_api_base("http://127.0.0.1:9/extra").is_none());
+    }
+
+    #[tokio::test]
+    async fn system_update_dispatch_http_statuses_classify_honestly() {
+        let token_path = token_file();
+
+        let (base, request) = mock_github(204);
+        let accepted = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch_system_update("hsb8")
+            .await
+            .expect("204 accepted");
+        request.recv().expect("accepted request captured");
+        assert!(accepted.starts_with("pharos-system-update-hsb8-"));
+
+        let (base, request) = mock_github(302);
+        let redirect = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch_system_update("hsb8")
+            .await
+            .expect_err("302 rejected");
+        assert_eq!(redirect, NixcfgDispatchError::Rejected(302));
+        assert!(!redirect.is_outcome_uncertain());
+        request.recv().expect("redirect request captured");
+
+        let (base, request) = mock_github(401);
+        let rejected = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch_system_update("hsb8")
+            .await
+            .expect_err("401 rejected");
+        assert_eq!(rejected, NixcfgDispatchError::Rejected(401));
+        assert!(!rejected.is_outcome_uncertain());
+        request.recv().expect("rejected request captured");
+
+        let (base, request) = mock_github(408);
+        let timeout = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch_system_update("hsb8")
+            .await
+            .expect_err("408 uncertain");
+        assert_eq!(timeout, NixcfgDispatchError::OutcomeUncertain);
+        assert!(timeout.is_outcome_uncertain());
+        request.recv().expect("timeout request captured");
+
+        let (base, request) = mock_github(500);
+        let server_error = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch_system_update("hsb8")
+            .await
+            .expect_err("500 uncertain");
+        assert_eq!(server_error, NixcfgDispatchError::OutcomeUncertain);
+        assert!(server_error.is_outcome_uncertain());
+        request.recv().expect("server error request captured");
+
+        let transport =
+            NixcfgDispatch::for_test(Some(token_path.clone()), "http://127.0.0.1:1".to_string())
+                .dispatch_system_update("hsb8")
+                .await
+                .expect_err("transport uncertain");
+        assert_eq!(transport, NixcfgDispatchError::OutcomeUncertain);
+        assert!(transport.is_outcome_uncertain());
+
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn settings_dispatch_http_statuses_classify_honestly() {
+        let token_path = token_file();
+        let (base, request) = mock_github(408);
+        let timeout = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch("gpc0", &preferences())
+            .await
+            .expect_err("408 uncertain");
+        assert_eq!(timeout, NixcfgDispatchError::OutcomeUncertain);
+        assert!(timeout.is_outcome_uncertain());
+        request.recv().expect("timeout request captured");
+
+        let (base, request) = mock_github(500);
+        let server_error = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch("gpc0", &preferences())
+            .await
+            .expect_err("500 uncertain");
+        assert_eq!(server_error, NixcfgDispatchError::OutcomeUncertain);
+        assert!(server_error.is_outcome_uncertain());
+        request.recv().expect("server error request captured");
+
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn host_removal_dispatch_http_statuses_classify_honestly() {
+        let token_path = token_file();
+        let (base, request) = mock_github(408);
+        let timeout = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch_host_removal("hsb8", "rebuilt", Some("stm2607"), false)
+            .await
+            .expect_err("408 uncertain");
+        assert_eq!(timeout, NixcfgDispatchError::OutcomeUncertain);
+        assert!(timeout.is_outcome_uncertain());
+        request.recv().expect("timeout request captured");
+
+        let (base, request) = mock_github(500);
+        let server_error = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+            .dispatch_host_removal("hsb8", "rebuilt", Some("stm2607"), false)
+            .await
+            .expect_err("500 uncertain");
+        assert_eq!(server_error, NixcfgDispatchError::OutcomeUncertain);
+        assert!(server_error.is_outcome_uncertain());
+        request.recv().expect("server error request captured");
+
+        let _ = std::fs::remove_file(token_path);
+    }
+
     fn token_file() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "pharos-nixcfg-dispatch-token-{}-{}",
@@ -465,10 +643,12 @@ mod tests {
             sender
                 .send(String::from_utf8(request).expect("request is UTF-8"))
                 .expect("record request");
-            let reason = if status == 204 {
-                "No Content"
-            } else {
-                "Unauthorized"
+            let reason = match status {
+                204 => "No Content",
+                302 => "Found",
+                408 => "Request Timeout",
+                500 => "Internal Server Error",
+                _ => "Unauthorized",
             };
             write!(
                 stream,

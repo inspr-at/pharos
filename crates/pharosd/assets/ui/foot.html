@@ -117,6 +117,7 @@ function closeHostActionDialog(restore=true){
   if(successor)successor.value='';
   const attended=overlay.querySelector('[data-host-attended-input]');
   if(attended)attended.checked=false;
+  hostActionPoll.lastRevision=null;
   hostActionContext=null;
   if(restore)hostActionReturnFocus?.focus();
   hostActionReturnFocus=null;
@@ -196,6 +197,7 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
     if(primary)primary.hidden=true;
     if(cancel)cancel.textContent='Close';
   }else if(action==='workflow'){
+    hostActionContext.action=hostActionFromWorkflowKind(root.dataset.actionKind||'');
     title.textContent=root.dataset.host+' workflow';
     copy.textContent='Loading the saved execution checklist...';
     if(infoTitle)infoTitle.textContent='Saved workflow';
@@ -263,6 +265,13 @@ async function requestHostAction(path,body,extraHeaders={}){
   const payload=await response.json().catch(()=>({}));
   if(!response.ok&&!payload.job)throw new Error(payload.error||payload.message||'The guarded action could not be requested.');
   return payload;
+}
+function hostActionFromWorkflowKind(kind){
+  if(kind==='update_restart')return 'update-restart';
+  if(kind==='remove_host')return 'remove';
+  if(kind==='settings_change')return 'settings';
+  if(kind==='system_update_proposal')return 'system-update';
+  return 'workflow';
 }
 function hostWorkflowUncertaintyAcknowledged(workflow){
   return Array.isArray(workflow?.events)&&workflow.events.some(event=>String(event.label||'').toLowerCase().includes('uncertainty acknowledged'));
@@ -348,7 +357,8 @@ function renderHostActionJob(job,message,workflowHtml){
   const workflowKind=String(workflow.kind||job.kind||'');
   const primaryAction=workflow.primary_action||null;
   hostActionContext.jobId=job.id;
-  hostActionContext.action=workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':workflowKind==='system_update_proposal'?'system-update':'workflow';
+  hostActionContext.workflowHost=job.host||hostActionContext.host;
+  hostActionContext.action=hostActionFromWorkflowKind(workflowKind);
   hostActionContext.root.dataset.actionJobId=job.id;
   hostActionContext.root.dataset.actionKind=workflowKind;
   hostActionContext.root.dataset.actionState=job.state;
@@ -420,13 +430,16 @@ async function pollHostActionJob(id,immediate=false){
 }
 async function submitHostAction(){
   if(!hostActionContext)return;
-  const {action,root,host}=hostActionContext;
+  const {action,root,host,workflowHost}=hostActionContext;
+  const workflowHostName=workflowHost||host;
   const overlay=document.querySelector('[data-host-action-overlay]');
   const primary=overlay?.querySelector('[data-host-action-primary]');
   const status=overlay?.querySelector('[data-host-action-status]');
   if(!primary||!status)return;
   primary.disabled=true;
-  status.textContent=action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
+  status.textContent=(action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge'?'Recording the nixcfg verification…'
+    :(action==='settings'||action==='remove')&&hostActionContext.stage==='recover'?'Retrying the local save without another repository dispatch…'
+    :action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
     :action==='remove'?'Recording retirement and revoking reports…'
     :action==='system-update'&&hostActionContext.stage==='acknowledge-uncertainty'?'Recording nixcfg verification and requesting again…'
     :hostActionContext.stage==='recover'?'Queueing target-local recovery checks…'
@@ -435,14 +448,16 @@ async function submitHostAction(){
   try{
     let result;
     if(action==='system-update'&&hostActionContext.stage==='acknowledge-uncertainty'){
-      result=await requestHostAction('/host-actions/system-update',{host},{
+      result=await requestHostAction('/host-actions/system-update',{host:workflowHostName},{
         'X-Pharos-Acknowledge-Uncertainty':hostActionContext.uncertaintyJobId||''
       });
-    }else if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host});
+    }else if(action==='system-update')result=await requestHostAction('/host-actions/system-update',{host:workflowHostName});
     else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
     else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
+    else if((action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/acknowledge-dispatch-uncertainty',{});
+    else if((action==='settings'||action==='remove')&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/reconcile-accepted-dispatch',{});
     else if(action==='remove'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry-retirement',{});
     else if(action==='remove'){
       const disposition=overlay.querySelector('[data-host-remove-disposition]')?.value||'';
@@ -551,6 +566,12 @@ function initHostActions(){
       openHostActionDialog(actionItem.dataset.hostAction,root,actionItem);
       return;
     }
+    const primary=event.target.closest('[data-host-action-primary]');
+    if(primary&&!primary.hidden&&!primary.disabled){
+      event.preventDefault();
+      submitHostAction();
+      return;
+    }
     if(event.target.closest('[data-host-action-close]')){event.preventDefault();closeHostActionDialog();return}
     if(openHostActionsRoot&&!event.target.closest('[data-host-actions]'))closeHostActions(openHostActionsRoot);
   });
@@ -588,7 +609,6 @@ function initHostActions(){
     if(primary&&hostActionContext?.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
   });
   document.querySelector('[data-host-action-cancel]')?.addEventListener('click',submitHostActionCancellation);
-  document.querySelector('[data-host-action-primary]')?.addEventListener('click',submitHostAction);
   document.addEventListener('visibilitychange',()=>{
     if(document.hidden){pauseHostActionPoll();return}
     if(hostActionContext?.jobId)scheduleHostActionPoll(hostActionContext.jobId,0);

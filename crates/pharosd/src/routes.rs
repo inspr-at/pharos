@@ -104,6 +104,14 @@ fn human_routes() -> Router<AppState> {
         )
         .route("/host-actions/jobs/{id}", get(host_action_job_json))
         .route(
+            "/host-actions/jobs/{id}/acknowledge-dispatch-uncertainty",
+            post(acknowledge_dispatch_uncertainty),
+        )
+        .route(
+            "/host-actions/jobs/{id}/reconcile-accepted-dispatch",
+            post(reconcile_accepted_dispatch),
+        )
+        .route(
             "/host-actions/jobs/{id}/retry",
             post(retry_update_restart_review),
         )

@@ -1,13 +1,12 @@
 import AxeBuilder from "@axe-core/playwright";
 import { test as base, expect } from "@playwright/test";
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   expectSettingsSurfaces,
   newAuthedContext,
   waitForHarnessTokens,
 } from "./harness.mjs";
+import { requireFixtureManifest } from "./harness-fixture.mjs";
 
 const test = base.extend({
   page: async ({ browser }, use) => {
@@ -22,11 +21,6 @@ const test = base.extend({
 function openHostSettingsTitle(host) {
   return `Open host settings for ${host}`;
 }
-
-const browserDir = path.dirname(fileURLToPath(import.meta.url));
-const dispatchAcceptFlag = path.join(browserDir, ".dispatch-accept");
-const dispatchMockBase =
-  process.env.PHAROS_BROWSER_DISPATCH_BASE ?? "http://127.0.0.1:18981";
 
 test("fleet has no serious accessibility violations and serves hardened headers", async ({
   page,
@@ -1371,7 +1365,13 @@ test("system update uncertainty dialog acknowledges and retries once", async ({
   page,
 }, testInfo) => {
   test.setTimeout(60_000);
-  fs.writeFileSync(dispatchAcceptFlag, "false");
+  const manifest = requireFixtureManifest(
+    test,
+    "system update uncertainty fixture requires local harness manifest",
+  );
+  if (!manifest) return;
+  const { acceptFlagPath, dispatchMockBase } = manifest;
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
 
   const host = `browser-uncertain-${testInfo.project.name}`;
   const report = await page.request.post("/report", {
@@ -1387,9 +1387,22 @@ test("system update uncertainty dialog acknowledges and retries once", async ({
   });
   expect(report.status()).toBe(204);
 
-  const readDispatchCount = async () =>
-    Number((await fetch(`${dispatchMockBase}/test/dispatch-count`)).text());
-  const dispatchAtStart = await readDispatchCount();
+  const readDispatchAttempts = async () => {
+    const response = await fetch(`${dispatchMockBase}/test/dispatch-attempts`);
+    expect(response.ok).toBe(true);
+    const text = await response.text();
+    return Number(text);
+  };
+  const readDispatchAccepted = async () => {
+    const response = await fetch(`${dispatchMockBase}/test/dispatch-accepted`);
+    expect(response.ok).toBe(true);
+    const text = await response.text();
+    return Number(text);
+  };
+  const attemptsAtStart = await readDispatchAttempts();
+  const acceptedAtStart = await readDispatchAccepted();
+  expect(Number.isNaN(attemptsAtStart)).toBe(false);
+  expect(Number.isNaN(acceptedAtStart)).toBe(false);
 
   const uncertain = await page.request.post("/host-actions/system-update", {
     headers: { "X-Pharos-Action": "1" },
@@ -1412,14 +1425,16 @@ test("system update uncertainty dialog acknowledges and retries once", async ({
   expect(uncertainPayload.workflow_html).toContain("outcome uncertain");
   expect(uncertainPayload.workflow_html).toContain("not confirmed");
   const priorJobId = uncertainPayload.job.id;
-  expect(await readDispatchCount()).toBe(dispatchAtStart);
+  expect(await readDispatchAttempts()).toBe(attemptsAtStart + 1);
+  expect(await readDispatchAccepted()).toBe(acceptedAtStart);
 
   const blocked = await page.request.post("/host-actions/system-update", {
     headers: { "X-Pharos-Action": "1" },
     data: { host },
   });
   expect(blocked.status()).toBe(409);
-  expect(await readDispatchCount()).toBe(dispatchAtStart);
+  expect(await readDispatchAttempts()).toBe(attemptsAtStart + 1);
+  expect(await readDispatchAccepted()).toBe(acceptedAtStart);
 
   const invalidAck = await page.request.post("/host-actions/system-update", {
     headers: {
@@ -1429,49 +1444,116 @@ test("system update uncertainty dialog acknowledges and retries once", async ({
     data: { host },
   });
   expect(invalidAck.status()).toBe(400);
+  expect(await readDispatchAttempts()).toBe(attemptsAtStart + 1);
+  expect(await readDispatchAccepted()).toBe(acceptedAtStart);
 
   await page.goto("/");
   const card = page.locator(`article.card[data-host="${host}"]`);
   await expect(card).toBeVisible();
 
-  const overlay = page.locator("[data-host-action-overlay]");
-  await card.locator("[data-host-action-note]").click();
-  await expect(overlay).toBeVisible();
+  const useKeyboard = testInfo.project.name.includes("mobile");
 
-  const primary = overlay.locator("[data-host-action-primary]");
-  await expect(primary).toBeVisible();
-  await expect(primary).toHaveText("I verified nixcfg — request again");
-  await expect(overlay.locator("[data-host-workflow]")).toContainText(
-    "not confirmed",
-  );
-  await expect(overlay.locator("[data-host-action-copy]")).toContainText(
+  if (useKeyboard) {
+    const widths = await page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    }));
+    expect(widths.innerWidth).toBe(412);
+    expect(widths.clientWidth).toBe(412);
+    expect(widths.scrollWidth).toBe(412);
+  }
+
+  const dialog = () =>
+    page.getByRole("dialog", { name: "Review system updates" });
+  const retryButton = () =>
+    dialog().getByRole("button", {
+      name: "I verified nixcfg — request again",
+    });
+  const closeButton = () =>
+    dialog().getByRole("button", { name: "Close", exact: true });
+
+  const openDialog = async () => {
+    const jobPoll = page.waitForResponse(
+      (response) =>
+        response.url().includes("/host-actions/jobs/") &&
+        response.request().method() === "GET",
+    );
+    await card.locator("[data-host-action-note]").click();
+    await jobPoll;
+  };
+
+  await openDialog();
+  await expect(dialog()).toBeVisible();
+  await expect(retryButton()).toBeVisible();
+  await expect(retryButton()).toBeEnabled();
+  await expect(dialog().locator("[data-host-action-copy]")).toContainText(
     "Verify nixcfg",
   );
+  const statusLine = dialog().locator("[data-host-action-status]");
+  await expect(statusLine).toBeVisible();
+  await expect(statusLine).toHaveAttribute("aria-live", "polite");
+  await expect(statusLine).not.toBeEmpty();
 
-  await page.keyboard.press("Escape");
-  await expect(overlay).toBeHidden();
-  await card.locator("[data-host-action-note]").click();
-  await expect(primary).toBeVisible();
-
-  fs.writeFileSync(dispatchAcceptFlag, "true");
-
-  const [retryResponse] = await Promise.all([
-    page.waitForResponse(
-      (response) =>
-        response.url().includes("/host-actions/system-update") &&
-        response.request().method() === "POST",
+  const axeWithDialog = await new AxeBuilder({ page }).analyze();
+  expect(
+    axeWithDialog.violations.filter(({ impact }) =>
+      ["serious", "critical"].includes(impact),
     ),
-    primary.scrollIntoViewIfNeeded().then(() => primary.click({ force: true })),
-  ]);
+  ).toEqual([]);
+
+  await closeButton().click();
+  await expect(dialog()).toBeHidden();
+
+  await openDialog();
+  await expect(dialog()).toBeVisible();
+  await expect(retryButton()).toBeVisible();
+  await expect(retryButton()).toBeEnabled();
+
+  fs.writeFileSync(acceptFlagPath, "true", { mode: 0o600 });
+
+  const retryPost = page.waitForResponse(
+    (response) =>
+      response.url().includes("/host-actions/system-update") &&
+      response.request().method() === "POST",
+  );
+  if (useKeyboard) {
+    await retryButton().focus();
+    await page.keyboard.press("Enter");
+  } else {
+    await retryButton().click();
+  }
+  const retryResponse = await retryPost;
   expect(retryResponse.status()).toBe(202);
   const replacementPayload = await retryResponse.json();
-  expect(replacementPayload.job.id).not.toBe(priorJobId);
+  const replacementJobId = replacementPayload.job.id;
+  expect(replacementJobId).not.toBe(priorJobId);
   expect(replacementPayload.job.state).toBe("succeeded");
-  await expect(overlay.locator("[data-host-workflow]")).toContainText(
+  await expect(dialog().locator("[data-host-workflow]")).toContainText(
     "continues in nixcfg",
   );
-  await expect(primary).toBeHidden();
-  expect(await readDispatchCount()).toBe(dispatchAtStart + 1);
+  await expect(retryButton()).toBeHidden();
+  const axeAfterHandoff = await new AxeBuilder({ page }).analyze();
+  expect(
+    axeAfterHandoff.violations.filter(({ impact }) =>
+      ["serious", "critical"].includes(impact),
+    ),
+  ).toEqual([]);
+  expect(await readDispatchAttempts()).toBe(attemptsAtStart + 2);
+  expect(await readDispatchAccepted()).toBe(acceptedAtStart + 1);
+
+  const replay = await page.request.post("/host-actions/system-update", {
+    headers: {
+      "X-Pharos-Action": "1",
+      "X-Pharos-Acknowledge-Uncertainty": priorJobId,
+    },
+    data: { host },
+  });
+  expect(replay.status()).toBe(202);
+  const replayPayload = await replay.json();
+  expect(replayPayload.job.id).toBe(replacementJobId);
+  expect(await readDispatchAttempts()).toBe(attemptsAtStart + 2);
+  expect(await readDispatchAccepted()).toBe(acceptedAtStart + 1);
 
   const priorJob = await page.request.get(
     `/host-actions/jobs/${encodeURIComponent(priorJobId)}`,
@@ -1520,5 +1602,233 @@ test("system update uncertainty dialog acknowledges and retries once", async ({
     { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
   );
   expect(reonboard.ok()).toBe(true);
-  fs.writeFileSync(dispatchAcceptFlag, "false");
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+});
+
+test("settings dispatch uncertainty stays recoverable after page reload", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(60_000);
+  const manifest = requireFixtureManifest(
+    test,
+    "settings uncertainty fixture requires local harness manifest",
+  );
+  if (!manifest) return;
+  const { acceptFlagPath } = manifest;
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+
+  const host = `browser-settings-uncertain-${testInfo.project.name}`;
+  const report = await page.request.post("/report", {
+    data: {
+      schema: "inspr.pharos.host-report.v4",
+      version: 4,
+      name: host,
+      role: "server",
+      is_nix: true,
+      heartbeat_interval_secs: 60,
+      freshness: { applicable: true },
+    },
+  });
+  expect(report.status()).toBe(204);
+
+  const preferences = {
+    accent: "#48b8a8",
+    kind: "server",
+    alerts: {
+      suppress_down: false,
+      suppress_backup: false,
+      suppress_nix_freshness: false,
+    },
+  };
+  const uncertain = await page.request.post(
+    "/agora/requests/host-preferences.json",
+    { data: { host, preferences } },
+  );
+  expect(uncertain.status()).toBe(409);
+  const uncertainPayload = await uncertain.json();
+  expect(uncertainPayload.job.workflow.status_label).toBe(
+    "dispatch outcome uncertain",
+  );
+  const uncertainJobId = uncertainPayload.job.id;
+
+  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  const save = page.locator("[data-save-color]");
+  await expect(save).toBeVisible();
+  const activeConflict = page.waitForResponse(
+    (response) =>
+      response.url().includes("/agora/requests/host-preferences.json") &&
+      response.request().method() === "POST",
+  );
+  await save.click();
+  const conflictResponse = await activeConflict;
+  expect(conflictResponse.status()).toBe(409);
+  const conflictPayload = await conflictResponse.json();
+  expect(conflictPayload.job.id).toBe(uncertainJobId);
+  expect(conflictPayload.workflow_html).toContain("outcome uncertain");
+
+  const dialog = page.getByRole("dialog", {
+    name: `Change ${host} settings`,
+  });
+  const acknowledge = dialog.getByRole("button", {
+    name: "I verified nixcfg — allow a new request",
+  });
+  await expect(dialog).toBeVisible();
+  await expect(acknowledge).toBeVisible();
+  await expect(acknowledge).toBeEnabled();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  await page.goto("/");
+  const card = page.locator(`article.card[data-host="${host}"]`);
+  await expect(card).toBeVisible();
+  const jobPoll = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/host-actions/jobs/${uncertainJobId}`) &&
+      response.request().method() === "GET",
+  );
+  await card.locator("[data-host-action-note]").click();
+  await jobPoll;
+  await expect(dialog).toBeVisible();
+  await expect(acknowledge).toBeVisible();
+  await expect(acknowledge).toBeEnabled();
+
+  const acknowledgePost = page.waitForResponse(
+    (response) =>
+      response.url().includes(
+        `/host-actions/jobs/${uncertainJobId}/acknowledge-dispatch-uncertainty`,
+      ) && response.request().method() === "POST",
+  );
+  await acknowledge.click();
+  const acknowledgeResponse = await acknowledgePost;
+  expect(acknowledgeResponse.status()).toBe(200);
+  const acknowledgedPayload = await acknowledgeResponse.json();
+  expect(acknowledgedPayload.job.workflow.status_label).toBe(
+    "uncertainty acknowledged",
+  );
+  await expect(acknowledge).toBeHidden();
+
+  fs.writeFileSync(acceptFlagPath, "true", { mode: 0o600 });
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+});
+
+test("cross-host system update uncertainty recovery posts workflow host", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(60_000);
+  const manifest = requireFixtureManifest(
+    test,
+    "cross-host uncertainty fixture requires local harness manifest",
+  );
+  if (!manifest) return;
+  const { acceptFlagPath } = manifest;
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
+
+  const hostA = `browser-cross-a-${testInfo.project.name}`;
+  const hostB = `browser-cross-b-${testInfo.project.name}`;
+
+  for (const host of [hostA, hostB]) {
+    const report = await page.request.post("/report", {
+      data: {
+        schema: "inspr.pharos.host-report.v4",
+        version: 4,
+        name: host,
+        role: "server",
+        is_nix: true,
+        heartbeat_interval_secs: 60,
+        freshness: { applicable: true },
+      },
+    });
+    expect(report.status()).toBe(204);
+  }
+
+  const uncertain = await page.request.post("/host-actions/system-update", {
+    headers: { "X-Pharos-Action": "1" },
+    data: { host: hostA },
+  });
+  expect(uncertain.status()).toBe(409);
+  const uncertainPayload = await uncertain.json();
+  const priorJobId = uncertainPayload.job.id;
+  expect(uncertainPayload.job.host).toBe(hostA);
+
+  await page.goto("/");
+  const cardB = page.locator(`article.card[data-host="${hostB}"]`);
+  await expect(cardB).toBeVisible();
+
+  // Model the stale-card race explicitly: B rendered the action before A's
+  // uncertain workflow reached the next fleet refresh. The server must return
+  // A's persisted conflict and the client must bind all recovery to A.
+  await page.evaluate((host) => {
+    const card = document.querySelector(`article.card[data-host="${host}"]`);
+    const root = card?.querySelector("[data-host-actions]");
+    const item = root?.querySelector("[data-host-action='system-update']");
+    if (!root || !item) throw new Error("system update action fixture missing");
+    item.hidden = false;
+    openHostActionDialog("system-update", root, item);
+  }, hostB);
+
+  // The accessible name changes from the action prompt to the persisted
+  // workflow title after the 409 payload is rendered, so anchor on the stable
+  // dialog element across that transition.
+  const dialog = page.locator("[data-host-action-dialog]");
+  await expect(dialog).toBeVisible();
+
+  const createReview = dialog.getByRole("button", {
+    name: "Create update review",
+  });
+  await expect(createReview).toBeVisible();
+  const conflictPost = page.waitForResponse(
+    (response) =>
+      response.url().includes("/host-actions/system-update") &&
+      response.request().method() === "POST",
+  );
+  await createReview.click();
+  const conflictResponse = await conflictPost;
+  expect(conflictResponse.status()).toBe(409);
+  const conflictPayload = await conflictResponse.json();
+  expect(conflictPayload.job.host).toBe(hostA);
+
+  const retryButton = dialog.getByRole("button", {
+    name: "I verified nixcfg — request again",
+  });
+  await expect(retryButton).toBeVisible();
+  await expect(retryButton).toBeEnabled();
+
+  fs.writeFileSync(acceptFlagPath, "true", { mode: 0o600 });
+
+  const retryPost = page.waitForRequest(
+    (request) =>
+      request.url().includes("/host-actions/system-update") &&
+      request.method() === "POST",
+  );
+  const retryResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes("/host-actions/system-update") &&
+      response.request().method() === "POST" &&
+      response !== conflictResponse,
+  );
+  await retryButton.click();
+  const retryRequest = await retryPost;
+  const retryBody = JSON.parse(retryRequest.postData() || "{}");
+  expect(retryBody.host).toBe(hostA);
+  expect(retryRequest.headers()["x-pharos-acknowledge-uncertainty"]).toBe(
+    priorJobId,
+  );
+
+  const retryResponse = await retryResponsePromise;
+  expect(retryResponse.status()).toBe(202);
+  const retryPayload = await retryResponse.json();
+  expect(retryPayload.job.host).toBe(hostA);
+  expect(retryPayload.job.id).not.toBe(priorJobId);
+
+  fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
 });

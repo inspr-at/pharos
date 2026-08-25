@@ -99,6 +99,7 @@ use crate::host_actions::{
     HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleInvoke, HostLifecycleSlot,
     HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind,
     HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
+    SystemUpdateProposalBegin,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -515,7 +516,7 @@ struct ConfirmHostActionRequest {
     attended: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoveHostActionRequest {
     confirmation: String,
@@ -578,8 +579,21 @@ fn action_error(status: StatusCode, message: &str) -> (StatusCode, Json<serde_js
 
 fn action_message(job: &HostActionJob) -> Cow<'static, str> {
     if job.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange {
+        let outcome_uncertain = job
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain);
+        let uncertainty_acknowledged = job.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        });
         return Cow::Borrowed(match job.state {
             HostActionState::Succeeded => "The host reported the requested settings.",
+            HostActionState::Failed if outcome_uncertain && uncertainty_acknowledged => {
+                "The operator recorded that nixcfg was checked. A fresh settings request may now be submitted deliberately."
+            }
+            HostActionState::Failed if outcome_uncertain => {
+                "Pharos could not confirm whether nixcfg received the settings request. Verify nixcfg before allowing another request."
+            }
             HostActionState::Failed => "The settings request stopped and was recorded.",
             _ => "The settings request is saved and waiting for the host.",
         });
@@ -606,6 +620,13 @@ fn action_message(job: &HostActionJob) -> Cow<'static, str> {
         });
     }
     if job.workflow_kind() == host_actions::HostWorkflowKind::RemoveHost {
+        let outcome_uncertain = job
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain);
+        let uncertainty_acknowledged = job.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        });
         return match job.state {
             HostActionState::ProposalRequested => Cow::Borrowed(
                 "The retirement intent is saved while Pharos finishes the guarded handoff.",
@@ -614,6 +635,14 @@ fn action_message(job: &HostActionJob) -> Cow<'static, str> {
             HostActionState::Succeeded => {
                 Cow::Borrowed("The host retirement completed and was recorded.")
             }
+            HostActionState::Failed if outcome_uncertain && uncertainty_acknowledged => {
+                Cow::Borrowed(
+                    "The operator recorded that nixcfg was checked. Reporting remains active, and a fresh removal request may now be started deliberately.",
+                )
+            }
+            HostActionState::Failed if outcome_uncertain => Cow::Borrowed(
+                "Pharos could not confirm whether nixcfg received the removal request. Reporting access remains active; verify nixcfg before allowing another request.",
+            ),
             HostActionState::Failed => {
                 Cow::Borrowed("The removal request stopped safely and remains recorded.")
             }
@@ -903,6 +932,33 @@ fn update_restart_target_error(state: &AppState, host: &str) -> Option<(StatusCo
     None
 }
 
+fn system_update_action_response_for_existing_replacement(
+    workflow: &HostActionJob,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if host_actions::system_update_dispatch_handed_off(workflow) {
+        return action_response(StatusCode::ACCEPTED, workflow);
+    }
+    if workflow.state == HostActionState::Failed {
+        if workflow
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain)
+        {
+            return action_response_with_message(
+                StatusCode::CONFLICT,
+                workflow,
+                "Pharos could not confirm whether nixcfg received the review request. Verify nixcfg before retrying.",
+            );
+        }
+        return action_response_with_message(
+            StatusCode::BAD_GATEWAY,
+            workflow,
+            "The repository workflow rejected the review request; no host change was authorized",
+        );
+    }
+    action_response(StatusCode::ACCEPTED, workflow)
+}
+
 async fn request_system_update(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -937,17 +993,29 @@ async fn request_system_update(
             );
         }
     }
-    let workflow = match state.host_actions.begin_system_update_proposal(
+    let begin = match state.host_actions.begin_system_update_proposal(
         host,
         &actor,
         now,
         acknowledge_uncertainty.as_deref(),
     ) {
-        Ok(workflow) => workflow,
+        Ok(begin) => begin,
         Err(HostActionStoreError::InvalidJob) => {
             return action_error(
                 StatusCode::BAD_REQUEST,
                 "The uncertainty acknowledgement reference is invalid",
+            );
+        }
+        Err(HostActionStoreError::NotFound) => {
+            return action_error(
+                StatusCode::BAD_REQUEST,
+                "The uncertainty acknowledgement reference was not found",
+            );
+        }
+        Err(HostActionStoreError::WrongHost) => {
+            return action_error(
+                StatusCode::FORBIDDEN,
+                "The uncertainty acknowledgement does not belong to this host",
             );
         }
         Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(job)) => {
@@ -971,9 +1039,18 @@ async fn request_system_update(
             );
         }
     };
+    if let SystemUpdateProposalBegin::Existing(workflow) = begin {
+        return system_update_action_response_for_existing_replacement(&workflow);
+    }
+    let workflow = match begin {
+        SystemUpdateProposalBegin::New(job) => job,
+        SystemUpdateProposalBegin::Existing(_) => {
+            unreachable!("existing replacements handled above")
+        }
+    };
     if let Err(error) = state.nixcfg_dispatch.dispatch_system_update(host).await {
         let failed = match error {
-            NixcfgDispatchError::RequestFailed => state
+            NixcfgDispatchError::OutcomeUncertain => state
                 .host_actions
                 .fail_system_update_proposal_uncertain(&workflow.id, now_unix())
                 .unwrap_or(workflow),
@@ -994,14 +1071,20 @@ async fn request_system_update(
     }
     let submitted = match state
         .host_actions
-        .mark_system_update_dispatch_submitted(&workflow.id, now_unix())
+        .mark_dispatch_submitted(&workflow.id, now_unix())
     {
         Ok(job) => job,
         Err(_) => {
+            let uncertain = state
+                .host_actions
+                .fail_system_update_proposal_uncertain(&workflow.id, now_unix())
+                .ok()
+                .or_else(|| state.host_actions.get(&workflow.id))
+                .unwrap_or_else(|| workflow.clone());
             return action_response_with_message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &workflow,
-                "The update request was sent, but Pharos could not record the repository dispatch",
+                StatusCode::CONFLICT,
+                &uncertain,
+                "The update request was sent, but Pharos could not record the repository handoff. Verify nixcfg before any retry.",
             );
         }
     };
@@ -1263,6 +1346,203 @@ async fn host_action_job_json(
     action_response(StatusCode::OK, &job)
 }
 
+async fn acknowledge_dispatch_uncertainty(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    let workflow_allowed = match existing.workflow_kind() {
+        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
+        _ => false,
+    };
+    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&existing.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Dispatch uncertainty acknowledgement access is not granted",
+        );
+    }
+    let actor = action_actor(&state.auth, &headers);
+    match state
+        .host_actions
+        .acknowledge_dispatch_uncertainty(&id, &actor, now_unix())
+    {
+        Ok(job) => action_response_with_message(
+            StatusCode::OK,
+            &job,
+            "The nixcfg verification was recorded. A fresh request may now be started deliberately.",
+        ),
+        Err(HostActionStoreError::InvalidTransition) => action_error(
+            StatusCode::CONFLICT,
+            "Only an uncertain settings or removal dispatch can be acknowledged",
+        ),
+        Err(HostActionStoreError::NotFound) => {
+            action_error(StatusCode::NOT_FOUND, "Guarded action was not found")
+        }
+        Err(_) => action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The dispatch uncertainty acknowledgement could not be recorded",
+        ),
+    }
+}
+
+async fn reconcile_accepted_dispatch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    let workflow_allowed = match existing.workflow_kind() {
+        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
+        _ => false,
+    };
+    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&existing.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Accepted dispatch reconciliation access is not granted",
+        );
+    }
+    if existing.state != HostActionState::ProposalRequested || !existing.dispatch_submitted() {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Only a saved, accepted repository handoff can be reconciled locally",
+        );
+    }
+
+    match existing.workflow_kind() {
+        host_actions::HostWorkflowKind::SettingsChange => {
+            let Some(preferences) = existing.requested_preferences().cloned() else {
+                return action_error(
+                    StatusCode::CONFLICT,
+                    "The accepted settings handoff has no saved local recovery payload",
+                );
+            };
+            let host = match state.store.request_preferences(&existing.host, preferences) {
+                Ok(host) => host,
+                Err(error) => {
+                    return action_response_with_message(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &existing,
+                        &format!(
+                            "The repository handoff remains accepted, but the local settings save still failed: {}",
+                            error.safe_message()
+                        ),
+                    );
+                }
+            };
+            let accepted = match state
+                .host_actions
+                .accept_settings_change(&existing.id, now_unix())
+            {
+                Ok(job) => job,
+                Err(HostActionStoreError::PersistenceCommitted) => state
+                    .host_actions
+                    .get(&existing.id)
+                    .unwrap_or_else(|| existing.clone()),
+                Err(_) => {
+                    return action_response_with_message(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &existing,
+                        "The local settings save succeeded, but its checklist still needs reconciliation",
+                    );
+                }
+            };
+            let job = if host.requested_preferences.is_none() {
+                match state
+                    .host_actions
+                    .complete_settings_change(&host.name, now_unix())
+                {
+                    Ok(Some(job)) => job,
+                    Ok(None) => accepted,
+                    Err(HostActionStoreError::PersistenceCommitted) => {
+                        state.host_actions.get(&existing.id).unwrap_or(accepted)
+                    }
+                    Err(_) => {
+                        return action_response_with_message(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &accepted,
+                            "The local settings save succeeded, but completion still needs reconciliation",
+                        );
+                    }
+                }
+            } else {
+                accepted
+            };
+            action_response_with_message(
+                StatusCode::OK,
+                &job,
+                "The accepted repository handoff was reconciled locally without a second dispatch.",
+            )
+        }
+        host_actions::HostWorkflowKind::RemoveHost => {
+            let Some(plan) = existing.removal_plan.clone() else {
+                return action_error(StatusCode::CONFLICT, "The removal plan is unavailable");
+            };
+            if !plan.declaration_pending && !plan.credential_retirement_required {
+                return action_error(
+                    StatusCode::CONFLICT,
+                    "This removal did not require a repository handoff",
+                );
+            }
+            if !state.retired_hosts.is_retired(&existing.host) {
+                match state.retired_hosts.retire(RetiredHost {
+                    host: existing.host.clone(),
+                    requested_by: existing.requested_by.clone(),
+                    removal_job_id: existing.id.clone(),
+                    disposition: plan.disposition,
+                    successor: plan.successor.clone(),
+                    declaration_pending: plan.declaration_pending,
+                    retired_at: now_unix(),
+                }) {
+                    Ok(()) | Err(HostActionStoreError::PersistenceCommitted) => {}
+                    Err(_) => {
+                        return action_response_with_message(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &existing,
+                            "The repository handoff remains accepted, but the local retirement save still failed",
+                        );
+                    }
+                }
+            }
+            let job = match state
+                .host_actions
+                .mark_removal_access_revoked(&existing.id, now_unix())
+            {
+                Ok(job) => job,
+                Err(HostActionStoreError::PersistenceCommitted) => {
+                    state.host_actions.get(&existing.id).unwrap_or(existing)
+                }
+                Err(_) => {
+                    return action_response_with_message(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &existing,
+                        "The retirement save succeeded, but its checklist still needs reconciliation",
+                    );
+                }
+            };
+            action_response_with_message(
+                StatusCode::ACCEPTED,
+                &job,
+                "The accepted repository handoff was reconciled locally without a second dispatch.",
+            )
+        }
+        _ => action_error(
+            StatusCode::CONFLICT,
+            "This workflow has no accepted local handoff to reconcile",
+        ),
+    }
+}
+
 async fn confirm_update_restart(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1395,30 +1675,32 @@ async fn request_host_removal(
     }
     let actor = action_actor(&state.auth, &headers);
     let now = now_unix();
-    let workflow = match state
-        .host_actions
-        .begin_removal(&host, &actor, removal_plan.clone(), now)
-    {
-        Ok(job) => job,
-        Err(HostActionStoreError::ActiveJob) => {
-            return action_error(
-                StatusCode::CONFLICT,
-                "A removal workflow is already active for this host",
-            );
-        }
-        Err(_) => {
-            return action_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The removal workflow could not be recorded",
-            );
-        }
-    };
+    let mut workflow =
+        match state
+            .host_actions
+            .begin_removal(&host, &actor, removal_plan.clone(), now)
+        {
+            Ok(job) => job,
+            Err(HostActionStoreError::ActiveJob) => {
+                return action_error(
+                    StatusCode::CONFLICT,
+                    "A removal workflow is already active for this host",
+                );
+            }
+            Err(_) => {
+                return action_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The removal workflow could not be recorded",
+                );
+            }
+        };
     // PHAROS-197: the proposal is what records the retirement intent the
     // retirement agent reads, so it is needed whenever a credential must be
     // retired, not only when a declaration must be removed. Without it an
     // undeclared Janus-managed host revokes reporting and then strands, failing
     // credential retirement on every attempt with its credential still live.
-    if declaration_pending || credential_retirement_required {
+    let repository_dispatch_required = declaration_pending || credential_retirement_required;
+    if repository_dispatch_required {
         if let Err(error) = state
             .nixcfg_dispatch
             .dispatch_host_removal(
@@ -1429,30 +1711,70 @@ async fn request_host_removal(
             )
             .await
         {
-            let failed = state
-                .host_actions
-                .fail_removal(&workflow.id, now_unix())
-                .unwrap_or(workflow);
+            let failed = match error {
+                NixcfgDispatchError::OutcomeUncertain => state
+                    .host_actions
+                    .fail_removal_uncertain(&workflow.id, now_unix())
+                    .unwrap_or(workflow),
+                _ => state
+                    .host_actions
+                    .fail_removal(&workflow.id, now_unix())
+                    .unwrap_or(workflow),
+            };
             return action_response_with_message(
-                StatusCode::BAD_GATEWAY,
+                if error.is_outcome_uncertain() {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
                 &failed,
-                error.safe_message(),
+                error.host_removal_message(),
             );
         }
+        workflow = match state
+            .host_actions
+            .mark_dispatch_submitted(&workflow.id, now_unix())
+        {
+            Ok(job) => job,
+            Err(HostActionStoreError::PersistenceCommitted) => state
+                .host_actions
+                .get(&workflow.id)
+                .unwrap_or_else(|| workflow.clone()),
+            Err(_) => {
+                let uncertain = state
+                    .host_actions
+                    .fail_removal_uncertain(&workflow.id, now_unix())
+                    .ok()
+                    .or_else(|| state.host_actions.get(&workflow.id))
+                    .unwrap_or_else(|| workflow.clone());
+                return action_response_with_message(
+                    StatusCode::CONFLICT,
+                    &uncertain,
+                    "nixcfg accepted the removal request, but Pharos could not save that handoff. Verify nixcfg before any retry.",
+                );
+            }
+        };
     }
-    if state
-        .retired_hosts
-        .retire(RetiredHost {
-            host: host.clone(),
-            requested_by: actor.clone(),
-            removal_job_id: workflow.id.clone(),
-            disposition: removal_plan.disposition,
-            successor: removal_plan.successor.clone(),
-            declaration_pending,
-            retired_at: now,
-        })
-        .is_err()
-    {
+    let retirement_record = state.retired_hosts.retire(RetiredHost {
+        host: host.clone(),
+        requested_by: actor.clone(),
+        removal_job_id: workflow.id.clone(),
+        disposition: removal_plan.disposition,
+        successor: removal_plan.successor.clone(),
+        declaration_pending,
+        retired_at: now,
+    });
+    if !matches!(
+        retirement_record,
+        Ok(()) | Err(HostActionStoreError::PersistenceCommitted)
+    ) {
+        if repository_dispatch_required {
+            return action_response_with_message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &workflow,
+                "nixcfg accepted the removal request, but the local retirement record could not be persisted. Reporting access remains active; do not resend the request.",
+            );
+        }
         let failed = state
             .host_actions
             .fail_removal(&workflow.id, now_unix())
@@ -1556,7 +1878,7 @@ async fn allow_host_reonboarding(
         );
     }
     match state.retired_hosts.clear(&host) {
-        Ok(true) => {}
+        Ok(true) | Err(HostActionStoreError::PersistenceCommitted) => {}
         Ok(false) => return action_error(StatusCode::NOT_FOUND, "Host is not retired"),
         Err(_) => {
             return action_error(
@@ -12735,6 +13057,15 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         headers
     }
 
+    fn action_headers_with_ack(job_id: &str) -> HeaderMap {
+        let mut headers = action_headers();
+        headers.insert(
+            "X-Pharos-Acknowledge-Uncertainty",
+            axum::http::HeaderValue::from_str(job_id).expect("valid uncertainty acknowledgement"),
+        );
+        headers
+    }
+
     #[tokio::test]
     async fn host_action_job_reads_require_agora_and_host_access() {
         let mut state = report_test_state(false);
@@ -13280,14 +13611,74 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         (format!("http://{address}"), receiver)
     }
 
-    fn dispatch_token_file() -> PathBuf {
+    fn mock_counting_dispatch_endpoint() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock dispatch");
+        let address = listener.local_addr().expect("mock address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .or_else(|| line.strip_prefix("Content-Length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            count_clone.fetch_add(1, Ordering::SeqCst);
+                            let _ = stream
+                                .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+                            let _ = stream.flush();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (format!("http://{address}"), count)
+    }
+
+    struct DispatchTokenFixture {
+        path: PathBuf,
+    }
+
+    impl Drop for DispatchTokenFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn dispatch_token_file() -> DispatchTokenFixture {
         let path = std::env::temp_dir().join(format!(
             "pharos-197-dispatch-token-{}-{}",
             std::process::id(),
             JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&path, "test-dispatch-token\n").expect("write dispatch token fixture");
-        path
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write as _;
+        let mut file = options.open(&path).expect("create dispatch token fixture");
+        file.write_all(b"test-dispatch-token\n")
+            .expect("write dispatch token fixture");
+        DispatchTokenFixture { path }
     }
 
     fn janus_managed_undeclared_state() -> (PathBuf, AppState) {
@@ -13354,7 +13745,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         // PHAROS-197: a reachable proposal endpoint, so the retirement intent
         // this removal depends on is actually requested.
         let (api_base, dispatched) = mock_dispatch_endpoint();
-        state.nixcfg_dispatch = NixcfgDispatch::for_test(Some(dispatch_token_file()), api_base);
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
 
         let (status, Json(payload)) = request_host_removal(
             State(state.clone()),
@@ -13439,6 +13832,52 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert!(state.store.get("dsc0").is_none());
 
+        let _ = std::fs::remove_dir_all(generation_root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_removal_requests_send_exactly_one_dispatch() {
+        let (generation_root, mut state) = janus_managed_undeclared_state();
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+        let request = RemoveHostActionRequest {
+            confirmation: "dsc0".to_string(),
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+        };
+
+        let (left, right) = tokio::join!(
+            request_host_removal(
+                State(state.clone()),
+                action_headers(),
+                AxumPath("dsc0".to_string()),
+                Json(request.clone()),
+            ),
+            request_host_removal(
+                State(state.clone()),
+                action_headers(),
+                AxumPath("dsc0".to_string()),
+                Json(request),
+            ),
+        );
+        let statuses = [left.0, right.0];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::ACCEPTED)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(generation_root);
     }
 
@@ -13717,6 +14156,225 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
     }
 
+    #[tokio::test]
+    async fn concurrent_system_update_ack_sends_one_dispatch() {
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
+
+        let uncertain_id = "action-system-update-gpc0-concurrent-1".to_string();
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_id.clone(), "gpc0", "markus", 820)
+            .expect("uncertain job created");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_id, 821)
+            .expect("uncertain failure recorded");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let headers = action_headers_with_ack(&uncertain_id);
+        let (left, right) = tokio::join!(
+            request_system_update(
+                State(state.clone()),
+                headers.clone(),
+                Json(SystemUpdateActionRequest {
+                    host: "gpc0".to_string(),
+                }),
+            ),
+            request_system_update(
+                State(state.clone()),
+                headers,
+                Json(SystemUpdateActionRequest {
+                    host: "gpc0".to_string(),
+                }),
+            ),
+        );
+        assert_eq!(left.0, StatusCode::ACCEPTED);
+        assert_eq!(right.0, StatusCode::ACCEPTED);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn system_update_cross_host_ack_forbidden_without_foreign_job_or_dispatch() {
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        register_test_token(&state, "hsb8", "update-token-hsb8");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("gpc0 report persists");
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("hsb8 report persists");
+
+        let uncertain_gpc0 = "action-system-update-gpc0-cross-handler-1".to_string();
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_gpc0.clone(), "gpc0", "markus", 830)
+            .expect("gpc0 uncertain job created");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_gpc0, 831)
+            .expect("gpc0 uncertain failure recorded");
+        let replacement = state
+            .host_actions
+            .begin_system_update_proposal("gpc0", "markus", 832, Some(&uncertain_gpc0))
+            .expect("gpc0 replacement created")
+            .into_job();
+        state
+            .host_actions
+            .accept_system_update_proposal(&replacement.id, 833)
+            .expect("gpc0 replacement accepted");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_gpc0),
+            Json(SystemUpdateActionRequest {
+                host: "hsb8".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(payload.get("job").is_none());
+        assert!(payload.get("workflow_html").is_none());
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        let gpc0_prior = state
+            .host_actions
+            .get(&uncertain_gpc0)
+            .expect("gpc0 prior retained");
+        assert!(gpc0_prior.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        }));
+        let gpc0_replacement = state
+            .host_actions
+            .get(&replacement.id)
+            .expect("gpc0 replacement retained");
+        assert_eq!(gpc0_replacement.host, "gpc0");
+        assert_eq!(gpc0_replacement.state, HostActionState::Succeeded);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.host == "hsb8"
+                        && job.kind == host_actions::HostActionKind::SystemUpdateProposal
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_ack_replay_after_other_replacement_sends_no_dispatch() {
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token-gpc0");
+        register_test_token(&state, "hsb8", "update-token-hsb8");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("gpc0 report persists");
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("hsb8 report persists");
+
+        let uncertain_gpc0 = "action-system-update-gpc0-partial-handler-1".to_string();
+        let uncertain_hsb8 = "action-system-update-hsb8-partial-handler-1".to_string();
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_gpc0.clone(), "gpc0", "markus", 840)
+            .expect("gpc0 uncertain job created");
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_hsb8.clone(), "hsb8", "markus", 841)
+            .expect("hsb8 uncertain job created");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_gpc0, 842)
+            .expect("gpc0 uncertain failure recorded");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_hsb8, 843)
+            .expect("hsb8 uncertain failure recorded");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        assert!(matches!(
+            state
+                .host_actions
+                .begin_system_update_proposal("gpc0", "markus", 844, Some(&uncertain_gpc0)),
+            Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(job))
+                if job.id == uncertain_hsb8
+        ));
+
+        let (lost_response_replay_status, Json(lost_response_replay_payload)) =
+            request_system_update(
+                State(state.clone()),
+                action_headers_with_ack(&uncertain_gpc0),
+                Json(SystemUpdateActionRequest {
+                    host: "gpc0".to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(lost_response_replay_status, StatusCode::CONFLICT);
+        assert_eq!(lost_response_replay_payload["job"]["id"], uncertain_hsb8);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+
+        let replacement = state
+            .host_actions
+            .begin_system_update_proposal("hsb8", "markus", 845, Some(&uncertain_hsb8))
+            .expect("hsb8 replacement created")
+            .into_job();
+        state
+            .host_actions
+            .accept_system_update_proposal(&replacement.id, 846)
+            .expect("hsb8 replacement accepted");
+
+        let headers = action_headers_with_ack(&uncertain_gpc0);
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            headers,
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(payload["job"]["id"], uncertain_gpc0);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.kind == host_actions::HostActionKind::SystemUpdateProposal
+                        && job.retry_of.as_deref() == Some(uncertain_gpc0.as_str())
+                })
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn system_update_presentation_distinguishes_handoff_rejection_and_uncertainty() {
         let store = HostActionStore::new(None);
@@ -13799,6 +14457,140 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn settings_and_removal_uncertainty_ack_endpoint_reopens_each_workflow() {
+        let state = report_test_state(true);
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 900)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .fail_settings_change_uncertain(&settings.id, 901)
+            .expect("settings uncertainty recorded");
+        let (status, Json(payload)) = acknowledge_dispatch_uncertainty(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "uncertainty acknowledged"
+        );
+        state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 902)
+            .expect("fresh settings request allowed");
+
+        let plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: false,
+        };
+        let removal = state
+            .host_actions
+            .begin_removal("gpc0", "markus", plan.clone(), 903)
+            .expect("removal workflow created");
+        state
+            .host_actions
+            .fail_removal_uncertain(&removal.id, 904)
+            .expect("removal uncertainty recorded");
+        let (status, Json(payload)) = acknowledge_dispatch_uncertainty(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(removal.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "uncertainty acknowledged"
+        );
+        state
+            .host_actions
+            .begin_removal("gpc0", "markus", plan, 905)
+            .expect("fresh removal request allowed");
+    }
+
+    #[tokio::test]
+    async fn accepted_settings_and_removal_dispatches_reconcile_locally_without_redispatch() {
+        let state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 910)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 911)
+            .expect("settings recovery payload recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, 912)
+            .expect("settings dispatch accepted");
+        let (status, Json(payload)) = reconcile_accepted_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["job"]["workflow"]["status_label"], "change waiting");
+        assert!(payload["job"]["workflow"]["primary_action"].is_null());
+        assert_eq!(
+            state
+                .store
+                .get("hsb8")
+                .and_then(|host| host.requested_preferences),
+            Some(requested)
+        );
+
+        let plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Destroyed,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: true,
+        };
+        let removal = state
+            .host_actions
+            .begin_removal("gpc0", "markus", plan, 913)
+            .expect("removal workflow created");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&removal.id, 914)
+            .expect("removal dispatch accepted");
+        let (status, Json(payload)) = reconcile_accepted_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(removal.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "removal_pending");
+        assert!(payload["job"]["workflow"]["primary_action"].is_null());
+        assert!(state.retired_hosts.is_retired("gpc0"));
+        assert!(state.store.get("gpc0").is_none());
+
+        let (second_status, Json(second_payload)) =
+            reconcile_accepted_dispatch(State(state), action_headers(), AxumPath(removal.id)).await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert!(second_payload["error"]
+            .as_str()
+            .expect("safe reconciliation error")
+            .contains("Only a saved"));
+    }
+
+    #[tokio::test]
     async fn system_update_active_job_conflict_never_panics_without_a_lookup_job() {
         let state = report_test_state(true);
         register_test_token(&state, "gpc0", "update-token");
@@ -13829,7 +14621,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let store = HostActionStore::new(None);
         let job = store
             .begin_system_update_proposal("hsb8", "markus", 700, None)
-            .expect("proposal workflow created");
+            .expect("proposal workflow created")
+            .into_job();
         let completed = store
             .accept_system_update_proposal(&job.id, 701)
             .expect("proposal dispatch accepted");
@@ -13851,7 +14644,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let store = HostActionStore::new(None);
         let job = store
             .begin_system_update_proposal("athena", "markus", 710, None)
-            .expect("proposal workflow created");
+            .expect("proposal workflow created")
+            .into_job();
         let completed = store
             .accept_system_update_proposal(&job.id, 711)
             .expect("proposal dispatch accepted");
