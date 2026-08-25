@@ -226,6 +226,8 @@ pub(crate) struct HostLifecycle {
     pub(crate) run_id: Option<String>,
     pub(crate) detail: String,
     pub(crate) blocked_by: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) primary_action: Option<HostWorkflowAction>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2275,6 +2277,13 @@ fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle 
         run_id: Some(job.id.clone()),
         detail,
         blocked_by,
+        primary_action: if job.workflow_kind() == HostWorkflowKind::SettingsChange
+            && job.state == HostActionState::Cancelled
+        {
+            None
+        } else {
+            workflow.primary_action.clone()
+        },
     }
 }
 
@@ -2304,6 +2313,7 @@ pub(crate) fn host_lifecycle(
                 run_id: None,
                 detail: "Requested preferences have not yet been observed by the host.".to_string(),
                 blocked_by: vec!["host_report".to_string()],
+                primary_action: None,
             };
         }
         HostPreferencesState::DeclaredNotApplied => {
@@ -2318,6 +2328,7 @@ pub(crate) fn host_lifecycle(
                 detail: "Declared preferences differ from the host's observed preferences."
                     .to_string(),
                 blocked_by: Vec::new(),
+                primary_action: None,
             };
         }
         HostPreferencesState::Applied => {}
@@ -2334,6 +2345,7 @@ pub(crate) fn host_lifecycle(
             run_id: None,
             detail: "The running kernel differs from the kernel ready after restart.".to_string(),
             blocked_by: vec!["planned_restart".to_string()],
+            primary_action: None,
         };
     }
 
@@ -2353,6 +2365,7 @@ pub(crate) fn host_lifecycle(
         run_id: None,
         detail: "No host lifecycle work is waiting.".to_string(),
         blocked_by: Vec::new(),
+        primary_action: None,
     }
 }
 

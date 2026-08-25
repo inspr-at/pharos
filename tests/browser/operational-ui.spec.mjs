@@ -1027,6 +1027,9 @@ test("fleet refresh consumes server-emitted lifecycle for failed settings", asyn
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
   const chip = card.locator("[data-host-lifecycle-chip]");
   await expect(chip).toBeVisible();
+  await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toHaveText(
+    hostData.lifecycle.label,
+  );
   await expect(chip.locator("[data-host-lifecycle-chip-copy]")).not.toContainText(
     "Change requested",
   );
@@ -1036,6 +1039,11 @@ test("fleet refresh consumes server-emitted lifecycle for failed settings", asyn
       hostData.lifecycle.run_id,
     );
   }
+  const continueBtn = card
+    .locator("[data-host-actions]")
+    .first()
+    .locator("[data-host-action='lifecycle-continue']");
+  await expect(continueBtn).toBeHidden();
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -1233,9 +1241,14 @@ test("fleet refresh kernel chip follows server lifecycle transitions", async ({ 
   await expect(chip).toBeVisible();
   await expect(chip).toHaveAttribute("data-lifecycle-slot", "kernel_drift");
   await expect(chip.locator("[data-host-lifecycle-chip-copy]")).toContainText(
-    "Continue: planned restart",
+    "Restart required",
   );
   await expect(card.locator("[data-kernel-slot]")).toHaveCount(0);
+  const continueBtn = card
+    .locator("[data-host-actions]")
+    .first()
+    .locator("[data-host-action='lifecycle-continue']");
+  await expect(continueBtn).toBeHidden();
 
   await reportRuntimeHost(page, host, {
     kernel: {
@@ -1287,12 +1300,24 @@ test("fleet refresh keeps workflow note inert without host actions root", async 
   const row = page.locator(`tr[data-host="${host}"][data-host-surface="runtime"]`).first();
   await expect(card.locator("[data-host-actions]")).toHaveCount(0);
   await expect(row.locator("[data-host-actions]")).toHaveCount(0);
-  await expect(card.locator("[data-host-lifecycle-chip]")).toBeHidden();
-  await expect(row.locator("[data-host-lifecycle-chip]")).toBeHidden();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeVisible();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toBeVisible();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeDisabled();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toBeDisabled();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await expect(row.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
 
   expect(await applyServerFleetSnapshot(page)).toBe(true);
-  await expect(card.locator("[data-host-lifecycle-chip]")).toBeHidden();
-  await expect(row.locator("[data-host-lifecycle-chip]")).toBeHidden();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeVisible();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toBeVisible();
+  await expect(card.locator("[data-host-lifecycle-chip]")).toBeDisabled();
+  await expect(row.locator("[data-host-lifecycle-chip]")).toBeDisabled();
   await expect(card.locator("[data-host-lifecycle-chip]")).not.toBeFocused();
   await readContext.close();
 
@@ -1334,7 +1359,8 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipVisible: false,
+    chipVisible: true,
+    chipCopy: "Up to date",
   });
 
   const agora = await page.request.post("/agora/requests/host-preferences.json", {
@@ -1345,17 +1371,17 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "request_pending",
     title: settingsTitle,
-    chipVisible: false,
-    requestedIconVisible: false,
+    chipVisible: true,
+    chipCopy: "Change requested",
+    requestedIconVisible: true,
   });
   await expectSettingsSurfaces(row, {
     state: "request_pending",
     title: settingsTitle,
-    chipVisible: false,
+    chipVisible: true,
+    chipCopy: "Change requested",
+    requestedIconVisible: true,
   });
-  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText(
-    "Continue: host report",
-  );
 
   await reportRuntimeHost(page, host, {
     preferences: { accent: "#48b8a8" },
@@ -1370,10 +1396,9 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipVisible: false,
+    chipVisible: true,
+    chipCopy: "Up to date",
   });
-  await expect(card.locator("[data-host-lifecycle-chip]")).toBeHidden();
-  await expect(row.locator("[data-host-lifecycle-chip]")).toBeHidden();
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },

@@ -192,8 +192,9 @@ mod module_tests {
             run_id: None,
             detail: "No host lifecycle work is waiting.".to_string(),
             blocked_by: Vec::new(),
+            primary_action: None,
         };
-        let chip = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, true, true);
+        let chip = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, true);
         assert!(chip.contains("data-host-lifecycle-chip"));
         assert!(chip.contains("<button"));
         assert!(!chip.contains("/agora"));
@@ -209,11 +210,18 @@ mod module_tests {
             run_id: None,
             detail: "Requested preferences have not yet been observed by the host.".to_string(),
             blocked_by: vec!["host_report".to_string()],
+            primary_action: None,
         };
         let drift_chip =
-            host_lifecycle_chip_markup(&drift, HostPreferencesState::RequestPending, true, true);
-        assert!(drift_chip.contains("Continue: host report"));
-        assert_eq!(lifecycle_chip_label(&drift, true), "Continue: host report");
+            host_lifecycle_chip_markup(&drift, HostPreferencesState::RequestPending, true);
+        assert!(drift_chip.contains("Change requested"));
+        assert!(!drift_chip.contains("Continue:"));
+
+        let inert = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, false);
+        assert!(inert.contains("disabled"));
+        assert!(inert.contains("aria-disabled=\"true\""));
+        assert!(inert.contains("tabindex=\"-1\""));
+        assert!(!inert.contains(" hidden"));
     }
 
     #[test]
@@ -1455,7 +1463,23 @@ pub(super) fn host_actions_markup(
     } else {
         " hidden"
     };
+    let lifecycle_continue = if let Some((action, run_id)) = lifecycle
+        .primary_action
+        .as_ref()
+        .zip(lifecycle.run_id.as_ref())
+    {
+        format!(
+            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" data-lifecycle-run-id="{run_id}" data-lifecycle-invoke="{invoke}">{history}<span><strong>Continue: {label}</strong><span>Open the saved workflow at this step</span></span></button>"#,
+            run_id = html_escape(run_id),
+            invoke = lifecycle.invoke.key(),
+            label = html_escape(&action.label),
+            history = icons::HISTORY,
+        )
+    } else {
+        r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" hidden><span><strong>Continue</strong><span>Open the saved workflow at this step</span></span></button>"#.to_string()
+    };
     let primary_separator_hidden = if !settings_menu_item.is_empty()
+        || lifecycle.primary_action.is_some() && lifecycle.run_id.is_some()
         || update_hidden.is_empty()
         || restart_hidden.is_empty()
     {
@@ -1498,7 +1522,7 @@ pub(super) fn host_actions_markup(
         .unwrap_or("not reported");
 
     format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
         is_nix = host.is_nix,
         declared = context.declared,
         credential_retirement = context.credential_retirement_required,
@@ -3754,69 +3778,32 @@ pub(super) fn manifest_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &Ho
     by_host
 }
 
-pub(super) fn lifecycle_blocked_by_label(key: &str) -> String {
-    match key {
-        "host_report" => "host report".to_string(),
-        "planned_restart" => "planned restart".to_string(),
-        other => other.replace('_', " "),
-    }
-}
-
-pub(super) fn lifecycle_chip_label(lifecycle: &HostLifecycle, card: bool) -> String {
-    if lifecycle.slot == HostLifecycleSlot::Quiet {
-        return if card {
-            lifecycle.label.clone()
-        } else {
-            String::new()
-        };
-    }
-    if matches!(
-        lifecycle.invoke,
-        HostLifecycleInvoke::Workflow | HostLifecycleInvoke::UpdateRestart
-    ) {
-        return lifecycle.label.clone();
-    }
-    if let Some(blocker) = lifecycle.blocked_by.first() {
-        return format!("Continue: {}", lifecycle_blocked_by_label(blocker));
-    }
-    lifecycle.label.clone()
-}
-
 pub(super) fn host_lifecycle_chip_markup(
     lifecycle: &HostLifecycle,
     settings_state: HostPreferencesState,
-    card: bool,
     interactive: bool,
 ) -> String {
-    let label = lifecycle_chip_label(lifecycle, card);
-    let hidden = if !interactive || label.is_empty() {
-        " hidden"
-    } else {
+    let label = lifecycle.label.clone();
+    let inert = if interactive {
         ""
+    } else {
+        " disabled aria-disabled=\"true\" tabindex=\"-1\""
     };
     let run_id_attr = lifecycle
         .run_id
         .as_ref()
         .map(|id| format!(r#" data-lifecycle-run-id="{}""#, html_escape(id)))
         .unwrap_or_default();
-    let blocked_attr = if lifecycle.blocked_by.is_empty() {
-        String::new()
-    } else {
-        format!(
-            r#" data-lifecycle-blocked="{}""#,
-            html_escape(&lifecycle.blocked_by.join(","))
-        )
-    };
     let title = html_escape(&label);
     format!(
-        r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip{hidden} data-settings-state="{state}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}" data-lifecycle-detail="{detail}"{blocked_attr}{run_id_attr} title="{title}" aria-label="{title}"><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span class="settings-state-icon workflow" aria-hidden="true">{workflow_icon}</span><span data-host-lifecycle-chip-copy>{label}</span></button>"#,
+        r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="{state}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}" data-lifecycle-detail="{detail}"{run_id_attr}{inert} title="{title}" aria-label="{title}"><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span class="settings-state-icon workflow" aria-hidden="true">{workflow_icon}</span><span data-host-lifecycle-chip-copy>{label}</span></button>"#,
         state = settings_state.key(),
         slot = lifecycle.slot.key(),
         level = lifecycle.level,
         invoke = lifecycle.invoke.key(),
         detail = html_escape(&lifecycle.detail),
-        blocked_attr = blocked_attr,
         run_id_attr = run_id_attr,
+        inert = inert,
         title = title,
         label = html_escape(&label),
         requested_icon = icons::CLOCK_3,
@@ -6295,10 +6282,9 @@ pub(super) fn render_home_with_capabilities(
         } else {
             String::new()
         };
-        let card_lifecycle_chip =
-            host_lifecycle_chip_markup(&lifecycle, settings_state, true, can_onboard);
-        let row_lifecycle_chip =
-            host_lifecycle_chip_markup(&lifecycle, settings_state, false, can_onboard);
+        let chip = host_lifecycle_chip_markup(&lifecycle, settings_state, can_onboard);
+        let card_lifecycle_chip = chip.clone();
+        let row_lifecycle_chip = chip;
         let drag_action = format!(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP

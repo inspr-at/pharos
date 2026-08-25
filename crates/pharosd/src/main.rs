@@ -5248,8 +5248,10 @@ mod tests {
         assert!(html.contains("new AbortController()"));
         assert!(html.contains("if(!response.ok&&!payload.job)"));
         assert!(html.contains("document.addEventListener('visibilitychange'"));
-        assert!(html.contains("const storedMatches=action==='workflow'"));
-        assert!(!html.contains("action==='system-update'&&storedKind"));
+        assert!(html.contains(
+            "if(lifecycleRunId&&(action==='workflow'||action==='update-restart'))pollHostActionJob(lifecycleRunId,true)"
+        ));
+        assert!(!html.contains("const storedMatches=action==='workflow'"));
         assert!(html.contains("chip.dataset.lifecycleInvoke"));
         assert!(html.contains("chip.dataset.lifecycleRunId"));
         assert!(html.contains(r#"data-host-remove-disposition"#));
@@ -5750,6 +5752,7 @@ mod tests {
         assert_eq!(failed["lifecycle"]["slot"], "settings_change");
         assert_eq!(failed["lifecycle"]["run_id"], settings_run.id);
         assert_ne!(failed["lifecycle"]["label"], "Change requested");
+        assert!(failed["lifecycle"]["primary_action"].is_null());
         assert_eq!(failed["host_action"]["workflow"]["kind"], "settings_change");
     }
 
@@ -5836,7 +5839,8 @@ mod tests {
         );
         assert!(html.contains(r#"data-host-lifecycle-chip"#));
         assert!(html.contains(r#"data-lifecycle-slot="kernel_drift""#));
-        assert!(html.contains("Continue: planned restart"));
+        assert!(html.contains(r#"<span data-host-lifecycle-chip-copy>Restart required</span>"#));
+        assert!(!html.contains("Continue: planned restart"));
         assert!(html.contains("restart required restart needed kernel reboot required"));
 
         let mut current = host_with_backups("hsb0", 970, vec![]);
@@ -7590,9 +7594,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             true,
         );
         assert!(lifecycle_html.contains(r#"<div class="card-maintenance">"#));
-        assert!(lifecycle_html.contains(
-            r#"<span data-host-lifecycle-chip-copy>Continue: host report</span></button>"#
-        ));
+        assert!(lifecycle_html
+            .contains(r#"<span data-host-lifecycle-chip-copy>Change requested</span></button>"#));
+        assert!(!lifecycle_html.contains(r#"<span data-host-lifecycle-chip-copy>Continue:"#));
         assert!(!lifecycle_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
         assert!(
             HEAD.contains(".card-maintenance .host-lifecycle-chip{width:var(--lifecycle-width)")
@@ -7673,6 +7677,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(run_card.contains(
             r#"<span data-host-lifecycle-chip-copy>settings request stopped</span></button>"#
         ));
+        assert!(run_card.contains(r#"data-host-action="lifecycle-continue""#));
+        assert!(!run_card.contains("Continue: Run recovery checks"));
         assert!(run_card.contains(&format!(
             r#"data-action-job-id="{}" data-action-kind="settings_change" data-action-state="failed""#,
             settings_run.id
@@ -7695,16 +7701,21 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             false,
         );
         let read_only_run = rendered_card(&read_only_html, "run-target");
-        assert!(read_only_run.contains("data-host-lifecycle-chip hidden"));
+        assert!(read_only_run.contains("data-host-lifecycle-chip"));
+        assert!(read_only_run.contains("disabled"));
+        assert!(read_only_run.contains("aria-disabled=\"true\""));
         assert!(!read_only_run.contains("data-host-actions"));
+        let read_only_prefs = rendered_card(&read_only_html, "prefs-target");
+        assert!(read_only_prefs.contains("data-host-lifecycle-chip"));
+        assert!(read_only_prefs.contains("disabled"));
 
         let kernel_card = rendered_card(&html, "kernel-target");
         assert!(kernel_card.contains(
             r#"data-lifecycle-slot="kernel_drift" data-lifecycle-level="warning" data-lifecycle-invoke="kernel_details""#
         ));
-        assert!(kernel_card.contains(
-            r#"<span data-host-lifecycle-chip-copy>Continue: planned restart</span></button>"#
-        ));
+        assert!(kernel_card
+            .contains(r#"<span data-host-lifecycle-chip-copy>Restart required</span></button>"#));
+        assert!(!kernel_card.contains(r#"<span data-host-lifecycle-chip-copy>Continue:"#));
         assert!(!kernel_card.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
 
         assert!(FOOT.contains("event.target.closest('[data-host-lifecycle-chip]')"));
