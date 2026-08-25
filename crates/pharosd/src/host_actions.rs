@@ -11,10 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+use pharos_core::HostPreferences;
 use serde::{Deserialize, Serialize};
 
 const ACTION_SCHEMA: &str = "inspr.pharos.host-action.v1";
 const ACTION_VERSION: u16 = 1;
+const HOST_LIFECYCLE_SCHEMA: &str = "inspr.pharos.host-lifecycle.v1";
+const HOST_LIFECYCLE_VERSION: u16 = 1;
 const RETIRED_SCHEMA: &str = "inspr.pharos.retired-hosts.v1";
 const RETIRED_VERSION: u16 = 2;
 const LEASE_SECS: i64 = 180;
@@ -39,6 +42,17 @@ pub(crate) enum HostWorkflowKind {
     SystemUpdateProposal,
     UpdateRestart,
     RemoveHost,
+}
+
+impl HostWorkflowKind {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::SettingsChange => "settings_change",
+            Self::SystemUpdateProposal => "system_update_proposal",
+            Self::UpdateRestart => "update_restart",
+            Self::RemoveHost => "remove_host",
+        }
+    }
 }
 
 impl From<HostActionKind> for HostWorkflowKind {
@@ -93,6 +107,124 @@ pub(crate) enum HostActionState {
     Succeeded,
     Failed,
     Cancelled,
+}
+
+impl HostActionState {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ProposalRequested => "proposal_requested",
+            Self::QueuedReview => "queued_review",
+            Self::Reviewing => "reviewing",
+            Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::QueuedApply => "queued_apply",
+            Self::Applying => "applying",
+            Self::Rebooting => "rebooting",
+            Self::RemovalPending => "removal_pending",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostPreferencesState {
+    Applied,
+    RequestPending,
+    DeclaredNotApplied,
+}
+
+impl HostPreferencesState {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::RequestPending => "request_pending",
+            Self::DeclaredNotApplied => "declared_not_applied",
+        }
+    }
+}
+
+pub(crate) fn host_preferences_state(
+    observed: &HostPreferences,
+    declared: Option<&HostPreferences>,
+    requested: Option<&HostPreferences>,
+) -> HostPreferencesState {
+    if let Some(requested) = requested {
+        if declared.is_some_and(|declared| declared == requested && declared != observed) {
+            return HostPreferencesState::DeclaredNotApplied;
+        }
+        if requested != observed {
+            return HostPreferencesState::RequestPending;
+        }
+    }
+    if declared.is_some_and(|declared| declared != observed) {
+        HostPreferencesState::DeclaredNotApplied
+    } else {
+        HostPreferencesState::Applied
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostLifecycleSlot {
+    RemoveHost,
+    UpdateRestart,
+    SettingsChange,
+    PrefsDrift,
+    KernelDrift,
+    SystemUpdateProposal,
+    Quiet,
+}
+
+impl HostLifecycleSlot {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::RemoveHost => "remove_host",
+            Self::UpdateRestart => "update_restart",
+            Self::SettingsChange => "settings_change",
+            Self::PrefsDrift => "prefs_drift",
+            Self::KernelDrift => "kernel_drift",
+            Self::SystemUpdateProposal => "system_update_proposal",
+            Self::Quiet => "quiet",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostLifecycleInvoke {
+    HostSettings,
+    Workflow,
+    UpdateRestart,
+    KernelDetails,
+}
+
+impl HostLifecycleInvoke {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::HostSettings => "host_settings",
+            Self::Workflow => "workflow",
+            Self::UpdateRestart => "update_restart",
+            Self::KernelDetails => "kernel_details",
+        }
+    }
+}
+
+/// One server-selected lifecycle signal for a host.
+///
+/// `blocked_by` contains stable workflow or observation step keys that must
+/// complete before this lifecycle can become verified and quiet.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostLifecycle {
+    pub(crate) schema: &'static str,
+    pub(crate) version: u16,
+    pub(crate) slot: HostLifecycleSlot,
+    pub(crate) label: String,
+    pub(crate) level: &'static str,
+    pub(crate) invoke: HostLifecycleInvoke,
+    pub(crate) run_id: Option<String>,
+    pub(crate) detail: String,
+    pub(crate) blocked_by: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1814,6 +1946,236 @@ pub(crate) struct HostActionSummary {
     pub(crate) workflow: HostWorkflowSummary,
 }
 
+fn host_action_priority(job: &HostActionJob) -> u8 {
+    match (job.workflow_kind(), job.state) {
+        (HostWorkflowKind::RemoveHost, HostActionState::Succeeded | HostActionState::Cancelled) => {
+            0
+        }
+        (HostWorkflowKind::RemoveHost, _) => 4,
+        (
+            HostWorkflowKind::UpdateRestart,
+            HostActionState::Succeeded | HostActionState::Cancelled,
+        ) => 0,
+        (HostWorkflowKind::UpdateRestart, _) => 3,
+        (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => 0,
+        (
+            HostWorkflowKind::SettingsChange,
+            HostActionState::Cancelled | HostActionState::Failed,
+        ) => 0,
+        (HostWorkflowKind::SettingsChange, _) => 2,
+        (
+            HostWorkflowKind::SystemUpdateProposal,
+            HostActionState::Succeeded | HostActionState::Cancelled | HostActionState::Failed,
+        ) => 0,
+        (HostWorkflowKind::SystemUpdateProposal, _) => 1,
+    }
+}
+
+fn lifecycle_run_slot(job: &HostActionJob) -> Option<HostLifecycleSlot> {
+    match (job.workflow_kind(), job.state) {
+        (HostWorkflowKind::RemoveHost, HostActionState::Succeeded | HostActionState::Cancelled) => {
+            None
+        }
+        (HostWorkflowKind::RemoveHost, _) => Some(HostLifecycleSlot::RemoveHost),
+        (
+            HostWorkflowKind::UpdateRestart,
+            HostActionState::Succeeded | HostActionState::Cancelled,
+        ) => None,
+        (HostWorkflowKind::UpdateRestart, _) => Some(HostLifecycleSlot::UpdateRestart),
+        (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => None,
+        (HostWorkflowKind::SettingsChange, _) => Some(HostLifecycleSlot::SettingsChange),
+        (
+            HostWorkflowKind::SystemUpdateProposal,
+            HostActionState::Succeeded | HostActionState::Cancelled,
+        ) => None,
+        (HostWorkflowKind::SystemUpdateProposal, _) => {
+            Some(HostLifecycleSlot::SystemUpdateProposal)
+        }
+    }
+}
+
+fn lifecycle_run_priority(job: &HostActionJob) -> u8 {
+    match lifecycle_run_slot(job) {
+        Some(HostLifecycleSlot::RemoveHost) => 4,
+        Some(HostLifecycleSlot::UpdateRestart) => 3,
+        Some(HostLifecycleSlot::SettingsChange) => 2,
+        Some(HostLifecycleSlot::SystemUpdateProposal) => 1,
+        Some(
+            HostLifecycleSlot::PrefsDrift
+            | HostLifecycleSlot::KernelDrift
+            | HostLifecycleSlot::Quiet,
+        )
+        | None => 0,
+    }
+}
+
+fn dedupe_latest_workflow_jobs<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Vec<&'a HostActionJob> {
+    jobs.iter()
+        .filter(|job| {
+            job.host == host
+                && !jobs.iter().any(|other| {
+                    other.host == host
+                        && other.workflow_kind() == job.workflow_kind()
+                        && (other.created_at, other.updated_at, &other.id)
+                            > (job.created_at, job.updated_at, &job.id)
+                })
+        })
+        .collect()
+}
+
+fn most_relevant_action_with_priority<'a, F>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+    priority: F,
+) -> Option<&'a HostActionJob>
+where
+    F: Fn(&HostActionJob) -> u8,
+{
+    dedupe_latest_workflow_jobs(jobs, host)
+        .into_iter()
+        .max_by_key(|job| (priority(job), job.updated_at, job.created_at))
+}
+
+fn most_relevant_action<'a>(jobs: &'a [HostActionJob], host: &str) -> Option<&'a HostActionJob> {
+    most_relevant_action_with_priority(jobs, host, host_action_priority)
+}
+
+pub(crate) fn most_relevant_host_action<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    most_relevant_action(jobs, host)
+}
+
+fn most_relevant_lifecycle_run<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    dedupe_latest_workflow_jobs(jobs, host)
+        .into_iter()
+        .filter(|job| lifecycle_run_slot(job).is_some())
+        .max_by_key(|job| (lifecycle_run_priority(job), job.updated_at, job.created_at))
+}
+
+fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle {
+    let workflow = job.workflow();
+    let (label, level, detail, blocked_by) = if job.workflow_kind()
+        == HostWorkflowKind::SettingsChange
+        && job.state == HostActionState::Cancelled
+    {
+        (
+            "settings change cancelled".to_string(),
+            "clear",
+            "The settings request was cancelled before the host reported the requested values."
+                .to_string(),
+            Vec::new(),
+        )
+    } else {
+        (
+            workflow.status_label,
+            workflow.status_level,
+            workflow.guidance,
+            workflow.current_step.into_iter().collect(),
+        )
+    };
+    HostLifecycle {
+        schema: HOST_LIFECYCLE_SCHEMA,
+        version: HOST_LIFECYCLE_VERSION,
+        slot,
+        label,
+        level,
+        invoke: if slot == HostLifecycleSlot::UpdateRestart {
+            HostLifecycleInvoke::UpdateRestart
+        } else {
+            HostLifecycleInvoke::Workflow
+        },
+        run_id: Some(job.id.clone()),
+        detail,
+        blocked_by,
+    }
+}
+
+pub(crate) fn host_lifecycle(
+    jobs: &[HostActionJob],
+    host: &str,
+    preferences: HostPreferencesState,
+    kernel_drift: bool,
+) -> HostLifecycle {
+    let action = most_relevant_lifecycle_run(jobs, host);
+    if let Some((job, slot)) = action
+        .and_then(|job| lifecycle_run_slot(job).map(|slot| (job, slot)))
+        .filter(|(_, slot)| *slot != HostLifecycleSlot::SystemUpdateProposal)
+    {
+        return run_lifecycle(job, slot);
+    }
+
+    match preferences {
+        HostPreferencesState::RequestPending => {
+            return HostLifecycle {
+                schema: HOST_LIFECYCLE_SCHEMA,
+                version: HOST_LIFECYCLE_VERSION,
+                slot: HostLifecycleSlot::PrefsDrift,
+                label: "Change requested".to_string(),
+                level: "warning",
+                invoke: HostLifecycleInvoke::HostSettings,
+                run_id: None,
+                detail: "Requested preferences have not yet been observed by the host.".to_string(),
+                blocked_by: vec!["host_report".to_string()],
+            };
+        }
+        HostPreferencesState::DeclaredNotApplied => {
+            return HostLifecycle {
+                schema: HOST_LIFECYCLE_SCHEMA,
+                version: HOST_LIFECYCLE_VERSION,
+                slot: HostLifecycleSlot::PrefsDrift,
+                label: "Ready to apply".to_string(),
+                level: "info",
+                invoke: HostLifecycleInvoke::HostSettings,
+                run_id: None,
+                detail: "Declared preferences differ from the host's observed preferences."
+                    .to_string(),
+                blocked_by: Vec::new(),
+            };
+        }
+        HostPreferencesState::Applied => {}
+    }
+
+    if kernel_drift {
+        return HostLifecycle {
+            schema: HOST_LIFECYCLE_SCHEMA,
+            version: HOST_LIFECYCLE_VERSION,
+            slot: HostLifecycleSlot::KernelDrift,
+            label: "Restart required".to_string(),
+            level: "warning",
+            invoke: HostLifecycleInvoke::KernelDetails,
+            run_id: None,
+            detail: "The running kernel differs from the kernel ready after restart.".to_string(),
+            blocked_by: vec!["planned_restart".to_string()],
+        };
+    }
+
+    if let Some((job, HostLifecycleSlot::SystemUpdateProposal)) =
+        action.and_then(|job| lifecycle_run_slot(job).map(|slot| (job, slot)))
+    {
+        return run_lifecycle(job, HostLifecycleSlot::SystemUpdateProposal);
+    }
+
+    HostLifecycle {
+        schema: HOST_LIFECYCLE_SCHEMA,
+        version: HOST_LIFECYCLE_VERSION,
+        slot: HostLifecycleSlot::Quiet,
+        label: "Up to date".to_string(),
+        level: "clear",
+        invoke: HostLifecycleInvoke::HostSettings,
+        run_id: None,
+        detail: "No host lifecycle work is waiting.".to_string(),
+        blocked_by: Vec::new(),
+    }
+}
+
 fn valid_action_jobs(jobs: &BTreeMap<String, HostActionJob>) -> bool {
     jobs.values().all(|job| {
         job.validate()
@@ -2006,38 +2368,6 @@ impl HostActionStore {
             .values()
             .filter(|job| job.host == host)
             .max_by_key(|job| job.updated_at)
-            .cloned()
-    }
-
-    pub(crate) fn most_relevant_for_host(&self, host: &str) -> Option<HostActionJob> {
-        let jobs = self.jobs.read().expect("host action store lock");
-        jobs.values()
-            .filter(|job| job.host == host)
-            .filter(|job| {
-                !jobs.values().any(|other| {
-                    other.host == host
-                        && other.workflow_kind() == job.workflow_kind()
-                        && (other.created_at, other.updated_at, &other.id)
-                            > (job.created_at, job.updated_at, &job.id)
-                })
-            })
-            .max_by_key(|job| {
-                let priority = match (job.workflow_kind(), job.state) {
-                    (HostWorkflowKind::RemoveHost, HostActionState::Succeeded) => 0,
-                    (HostWorkflowKind::RemoveHost, HostActionState::Cancelled) => 0,
-                    (HostWorkflowKind::RemoveHost, _) => 4,
-                    (HostWorkflowKind::UpdateRestart, HostActionState::Succeeded) => 0,
-                    (HostWorkflowKind::UpdateRestart, HostActionState::Cancelled) => 0,
-                    (HostWorkflowKind::UpdateRestart, _) => 3,
-                    (HostWorkflowKind::SettingsChange, HostActionState::Succeeded) => 0,
-                    (HostWorkflowKind::SettingsChange, HostActionState::Cancelled) => 0,
-                    (HostWorkflowKind::SettingsChange, _) => 2,
-                    (HostWorkflowKind::SystemUpdateProposal, HostActionState::Succeeded) => 0,
-                    (HostWorkflowKind::SystemUpdateProposal, HostActionState::Cancelled) => 0,
-                    (HostWorkflowKind::SystemUpdateProposal, _) => 1,
-                };
-                (priority, job.updated_at, job.created_at)
-            })
             .cloned()
     }
 
@@ -3521,6 +3851,48 @@ mod tests {
         }
     }
 
+    fn lifecycle_job(
+        kind: HostWorkflowKind,
+        state: HostActionState,
+        created_at: i64,
+    ) -> HostActionJob {
+        let action_kind = match kind {
+            HostWorkflowKind::SettingsChange | HostWorkflowKind::SystemUpdateProposal => {
+                HostActionKind::SystemUpdateProposal
+            }
+            HostWorkflowKind::UpdateRestart => HostActionKind::UpdateRestart,
+            HostWorkflowKind::RemoveHost => HostActionKind::RemoveHost,
+        };
+        HostActionJob {
+            schema: ACTION_SCHEMA.to_string(),
+            version: ACTION_VERSION,
+            id: format!("action-lifecycle-{}-{created_at}", kind.key()),
+            host: "hsb8".to_string(),
+            kind: action_kind,
+            workflow_kind: (kind == HostWorkflowKind::SettingsChange).then_some(kind),
+            state,
+            requested_by: "markus".to_string(),
+            ticket: "PHAROS-214".to_string(),
+            retry_of: None,
+            created_at,
+            updated_at: created_at,
+            confirmed_at: None,
+            plan: None,
+            removal_plan: (kind == HostWorkflowKind::RemoveHost).then_some(HostRemovalPlan {
+                disposition: HostRetirementDisposition::Unmanaged,
+                successor: None,
+                declaration_pending: true,
+                credential_retirement_required: false,
+            }),
+            result: None,
+            recovery_started_at: None,
+            events: Vec::new(),
+            lease_phase: None,
+            lease_until: None,
+            retirement_lease_until: None,
+        }
+    }
+
     fn rebooting_update(store: &HostActionStore, started_at: i64) -> HostActionJob {
         let job = store
             .create_update_review("hsb8", "markus", started_at)
@@ -4330,11 +4702,262 @@ mod tests {
             .expect("replacement settings workflow persisted")
             .expect("replacement settings workflow completed");
 
-        let relevant = store
-            .most_relevant_for_host("hsb8")
-            .expect("relevant settings workflow");
+        let jobs = store.list();
+        let relevant =
+            most_relevant_host_action(&jobs, "hsb8").expect("relevant settings workflow");
         assert_eq!(relevant.id, retry.id);
         assert_eq!(relevant.state, HostActionState::Succeeded);
+    }
+
+    /// PHAROS-214: exhaust every set of simultaneously true lifecycle facts.
+    /// Reversing each job set also proves insertion order cannot alter the winner.
+    #[test]
+    fn lifecycle_precedence_property_holds_for_every_candidate_set() {
+        const REMOVE: u8 = 1 << 0;
+        const UPDATE: u8 = 1 << 1;
+        const SETTINGS: u8 = 1 << 2;
+        const PREFS: u8 = 1 << 3;
+        const KERNEL: u8 = 1 << 4;
+        const PROPOSAL: u8 = 1 << 5;
+
+        for facts in 0..=(REMOVE | UPDATE | SETTINGS | PREFS | KERNEL | PROPOSAL) {
+            let mut jobs = Vec::new();
+            if facts & REMOVE != 0 {
+                jobs.push(lifecycle_job(
+                    HostWorkflowKind::RemoveHost,
+                    HostActionState::RemovalPending,
+                    100,
+                ));
+            }
+            if facts & UPDATE != 0 {
+                jobs.push(lifecycle_job(
+                    HostWorkflowKind::UpdateRestart,
+                    HostActionState::QueuedReview,
+                    101,
+                ));
+            }
+            if facts & SETTINGS != 0 {
+                jobs.push(lifecycle_job(
+                    HostWorkflowKind::SettingsChange,
+                    HostActionState::ProposalRequested,
+                    102,
+                ));
+            }
+            if facts & PROPOSAL != 0 {
+                jobs.push(lifecycle_job(
+                    HostWorkflowKind::SystemUpdateProposal,
+                    HostActionState::ProposalRequested,
+                    103,
+                ));
+            }
+            let preferences = if facts & PREFS != 0 {
+                HostPreferencesState::DeclaredNotApplied
+            } else {
+                HostPreferencesState::Applied
+            };
+            let expected = if facts & REMOVE != 0 {
+                HostLifecycleSlot::RemoveHost
+            } else if facts & UPDATE != 0 {
+                HostLifecycleSlot::UpdateRestart
+            } else if facts & SETTINGS != 0 {
+                HostLifecycleSlot::SettingsChange
+            } else if facts & PREFS != 0 {
+                HostLifecycleSlot::PrefsDrift
+            } else if facts & KERNEL != 0 {
+                HostLifecycleSlot::KernelDrift
+            } else if facts & PROPOSAL != 0 {
+                HostLifecycleSlot::SystemUpdateProposal
+            } else {
+                HostLifecycleSlot::Quiet
+            };
+
+            for reverse in [false, true] {
+                if reverse {
+                    jobs.reverse();
+                }
+                let lifecycle = host_lifecycle(&jobs, "hsb8", preferences, facts & KERNEL != 0);
+                assert_eq!(
+                    lifecycle.slot, expected,
+                    "candidate facts {facts:06b}, reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_removal_does_not_mask_live_update_restart_in_host_action_selector() {
+        let jobs = vec![
+            lifecycle_job(
+                HostWorkflowKind::RemoveHost,
+                HostActionState::Succeeded,
+                100,
+            ),
+            lifecycle_job(
+                HostWorkflowKind::UpdateRestart,
+                HostActionState::QueuedReview,
+                200,
+            ),
+        ];
+        let legacy = most_relevant_host_action(&jobs, "hsb8").expect("live update restart");
+        assert_eq!(legacy.workflow_kind(), HostWorkflowKind::UpdateRestart);
+        assert_eq!(legacy.state, HostActionState::QueuedReview);
+
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::Applied, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::UpdateRestart);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[1].id.as_str()));
+    }
+
+    #[test]
+    fn cancelled_settings_wins_lifecycle_but_live_proposal_wins_host_action_selector() {
+        let jobs = vec![
+            lifecycle_job(
+                HostWorkflowKind::SettingsChange,
+                HostActionState::Cancelled,
+                100,
+            ),
+            lifecycle_job(
+                HostWorkflowKind::SystemUpdateProposal,
+                HostActionState::ProposalRequested,
+                200,
+            ),
+        ];
+        let legacy = most_relevant_host_action(&jobs, "hsb8").expect("live proposal");
+        assert_eq!(
+            legacy.workflow_kind(),
+            HostWorkflowKind::SystemUpdateProposal
+        );
+        assert_eq!(legacy.id, jobs[1].id);
+
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::RequestPending, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::SettingsChange);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[0].id.as_str()));
+        assert_ne!(lifecycle.label, "Change requested");
+    }
+
+    #[test]
+    fn failed_settings_wins_lifecycle_but_live_proposal_wins_host_action_selector() {
+        let jobs = vec![
+            lifecycle_job(
+                HostWorkflowKind::SettingsChange,
+                HostActionState::Failed,
+                100,
+            ),
+            lifecycle_job(
+                HostWorkflowKind::SystemUpdateProposal,
+                HostActionState::ProposalRequested,
+                200,
+            ),
+        ];
+        let legacy = most_relevant_host_action(&jobs, "hsb8").expect("live proposal");
+        assert_eq!(
+            legacy.workflow_kind(),
+            HostWorkflowKind::SystemUpdateProposal
+        );
+        assert_eq!(legacy.id, jobs[1].id);
+
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::RequestPending, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::SettingsChange);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[0].id.as_str()));
+        assert_ne!(lifecycle.run_id.as_deref(), Some(legacy.id.as_str()));
+    }
+
+    #[test]
+    fn completed_removal_does_not_hold_lifecycle_forever() {
+        let jobs = vec![lifecycle_job(
+            HostWorkflowKind::RemoveHost,
+            HostActionState::Succeeded,
+            100,
+        )];
+        let lifecycle = host_lifecycle(&jobs, "hsb8", HostPreferencesState::Applied, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::Quiet);
+        assert_eq!(lifecycle.run_id, None);
+    }
+
+    #[test]
+    fn failed_and_cancelled_settings_runs_outrank_requested_preferences() {
+        for state in [HostActionState::Failed, HostActionState::Cancelled] {
+            let jobs = vec![lifecycle_job(HostWorkflowKind::SettingsChange, state, 200)];
+            let lifecycle =
+                host_lifecycle(&jobs, "hsb8", HostPreferencesState::RequestPending, true);
+
+            assert_eq!(lifecycle.slot, HostLifecycleSlot::SettingsChange);
+            assert_eq!(lifecycle.run_id.as_deref(), Some(jobs[0].id.as_str()));
+            assert_ne!(lifecycle.label, "Change requested");
+            assert_ne!(lifecycle.label, "Ready to apply");
+        }
+    }
+
+    #[test]
+    fn ready_to_apply_requires_declared_observed_drift_and_no_higher_run() {
+        let observed = HostPreferences::default();
+        let declared = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let requested = HostPreferences {
+            accent: Some("#9868d0".to_string()),
+            ..Default::default()
+        };
+
+        let declared_state = host_preferences_state(&observed, Some(&declared), None);
+        let ready = host_lifecycle(&[], "hsb8", declared_state, true);
+        assert_eq!(ready.slot, HostLifecycleSlot::PrefsDrift);
+        assert_eq!(ready.label, "Ready to apply");
+
+        let requested_state = host_preferences_state(&observed, None, Some(&requested));
+        let requested_lifecycle = host_lifecycle(&[], "hsb8", requested_state, false);
+        assert_eq!(requested_lifecycle.label, "Change requested");
+
+        let applied_state = host_preferences_state(&observed, Some(&observed), None);
+        let quiet = host_lifecycle(&[], "hsb8", applied_state, false);
+        assert_eq!(quiet.slot, HostLifecycleSlot::Quiet);
+        assert_ne!(quiet.label, "Ready to apply");
+
+        for kind in [
+            HostWorkflowKind::RemoveHost,
+            HostWorkflowKind::UpdateRestart,
+            HostWorkflowKind::SettingsChange,
+        ] {
+            let state = match kind {
+                HostWorkflowKind::RemoveHost => HostActionState::RemovalPending,
+                HostWorkflowKind::UpdateRestart => HostActionState::QueuedReview,
+                HostWorkflowKind::SettingsChange => HostActionState::ProposalRequested,
+                HostWorkflowKind::SystemUpdateProposal => unreachable!(),
+            };
+            let lifecycle = host_lifecycle(
+                &[lifecycle_job(kind, state, 300)],
+                "hsb8",
+                declared_state,
+                true,
+            );
+            assert_ne!(lifecycle.label, "Ready to apply", "{kind:?} must win");
+        }
+    }
+
+    #[test]
+    fn lifecycle_contract_serializes_all_projection_fields() {
+        let lifecycle = host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, false);
+        let value = serde_json::to_value(lifecycle).expect("lifecycle serializes");
+
+        for field in [
+            "schema",
+            "version",
+            "slot",
+            "label",
+            "level",
+            "invoke",
+            "run_id",
+            "detail",
+            "blocked_by",
+        ] {
+            assert!(
+                value.get(field).is_some(),
+                "missing lifecycle field {field}"
+            );
+        }
+        assert_eq!(value["slot"], "quiet");
+        assert_eq!(value["invoke"], "host_settings");
+        assert!(value["run_id"].is_null());
     }
 
     #[test]

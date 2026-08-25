@@ -94,10 +94,11 @@ use crate::alerting::*;
 use crate::alerts::{AlertEvent, AlertStore, AlertWorkerHealth};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 use crate::host_actions::{
-    AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
-    HostActionState, HostActionStore, HostActionStoreError, HostRemovalPlan,
-    HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
-    RetiredHostStore, RetirementAgentResultRequest,
+    host_lifecycle, host_preferences_state, most_relevant_host_action, AgentActionOutcome,
+    AgentActionResultRequest, HostActionEventSource, HostActionJob, HostActionState,
+    HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleInvoke, HostLifecycleSlot,
+    HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind,
+    HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -2167,7 +2168,19 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    let mut payload = hosts_payload(runtime_hosts, &manifests, &declared_preferences, now);
+    let action_jobs: Vec<_> = state
+        .host_actions
+        .list()
+        .into_iter()
+        .filter(|job| access.allows_host(&job.host))
+        .collect();
+    let mut payload = hosts_payload(
+        runtime_hosts,
+        &manifests,
+        &declared_preferences,
+        &action_jobs,
+        now,
+    );
     if let Some(hosts) = payload
         .get_mut("hosts")
         .and_then(|hosts| hosts.as_array_mut())
@@ -2180,9 +2193,6 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
             else {
                 continue;
             };
-            if let Some(action) = state.host_actions.most_relevant_for_host(&name) {
-                host["host_action"] = serde_json::to_value(action.summary()).unwrap_or_default();
-            }
             if let Some(retired) = state.retired_hosts.get(&name) {
                 // PHAROS-194: a pending removal can be waiting on declarative
                 // cleanup, credential retirement, or both. Name which one.
@@ -2214,6 +2224,7 @@ fn hosts_payload(
     runtime_hosts: Vec<Host>,
     manifests: &[HostManifest],
     declared_preferences: &BTreeMap<String, HostPreferences>,
+    action_jobs: &[HostActionJob],
     now: i64,
 ) -> serde_json::Value {
     let manifests = manifest_by_host(manifests);
@@ -2230,6 +2241,14 @@ fn hosts_payload(
                 declared_preferences.as_ref(),
                 h.requested_preferences.as_ref(),
             );
+            let action = most_relevant_host_action(action_jobs, &h.name);
+            let lifecycle = host_lifecycle(
+                action_jobs,
+                &h.name,
+                preferences_state,
+                kernel_reboot_required(h.kernel.as_ref()).is_some(),
+            );
+            let action_summary = action.map(HostActionJob::summary);
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
             let freshness_tldr = h.freshness.tldr();
             let attention = attention_reason(
@@ -2245,7 +2264,7 @@ fn hosts_payload(
                 &h.name,
                 now,
             );
-            json!({
+            let mut host = json!({
                 "name": h.name,
                 "role": h.role,
                 "is_nix": h.is_nix,
@@ -2267,12 +2286,18 @@ fn hosts_payload(
                 "service_observations_summary": service_observations_summary(&h.service_observations),
                 "backup_observations": h.backup_observations,
                 "backup_observations_summary": backup_observations_summary(&h.backup_observations),
+                "lifecycle": lifecycle,
                 "attention": {
                     "label": attention.label,
                     "level": attention.level,
                     "rank": attention.rank,
                 },
-            })
+            });
+            if let Some(action_summary) = action_summary {
+                host["host_action"] =
+                    serde_json::to_value(action_summary).expect("host action summary serializes");
+            }
+            host
         })
         .collect();
     json!({ "as_of": now, "hosts": hosts })
@@ -4020,9 +4045,23 @@ mod tests {
         RuntimeSnapshot {
             hosts,
             jobs,
+            action_jobs: &[],
             declared_preferences: None,
             janus_managed_hosts: None,
         }
+    }
+
+    fn rendered_card<'a>(html: &'a str, host: &str) -> &'a str {
+        let host_marker = format!(r#"data-host="{host}""#);
+        let host_at = html.find(&host_marker).expect("host card rendered");
+        let start = html[..host_at]
+            .rfind(r#"<article class="card"#)
+            .expect("host card starts");
+        let end = html[host_at..]
+            .find("</article>")
+            .map(|end| host_at + end + "</article>".len())
+            .expect("host card closes");
+        &html[start..end]
     }
 
     fn shell(user_label: &str, logout_enabled: bool) -> ShellContext<'_> {
@@ -4766,7 +4805,8 @@ mod tests {
         assert!(html.contains("document.addEventListener('visibilitychange'"));
         assert!(html.contains("const storedMatches=action==='workflow'"));
         assert!(!html.contains("action==='system-update'&&storedKind"));
-        assert!(html.contains("const action=kind==='update_restart'?'update-restart':'workflow'"));
+        assert!(html.contains("actionNote.dataset.lifecycleInvoke"));
+        assert!(html.contains("actionNote.dataset.lifecycleRunId"));
         assert!(html.contains(r#"data-host-remove-disposition"#));
         assert!(html.contains("It no longer exists"));
         assert!(html.contains("It still exists; stop managing it"));
@@ -4894,6 +4934,8 @@ mod tests {
                     host_removal_available: true,
                 },
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
 
         assert!(markup.contains(r#"data-can-manage="false""#));
@@ -4919,6 +4961,8 @@ mod tests {
                     host_removal_available: false,
                 },
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(runtime_only_markup.contains(r#"data-host-action="remove"><svg"#));
         assert!(runtime_only_markup.contains(r#"data-declared="false""#));
@@ -4943,6 +4987,8 @@ mod tests {
                     host_removal_available: false,
                 },
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(janus_managed_markup.contains(r#"data-declared="false""#));
         assert!(janus_managed_markup.contains(r#"data-credential-retirement="true""#));
@@ -4968,6 +5014,8 @@ mod tests {
                     host_removal_available: true,
                 },
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(janus_managed_ready.contains(r#"data-host-action="remove"><svg"#));
 
@@ -5002,6 +5050,8 @@ mod tests {
                     host_removal_available: true,
                 },
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, false),
         );
         assert!(pending_markup.contains(r#"data-update-pending="true""#));
         assert!(pending_markup.contains(r#"data-host-action="update-restart"><svg"#));
@@ -5157,7 +5207,7 @@ mod tests {
             requested_preferences: None,
         };
 
-        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), 1000);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], 1000);
 
         assert_eq!(payload["as_of"], 1000);
         assert_eq!(
@@ -5184,11 +5234,145 @@ mod tests {
     }
 
     #[test]
+    fn hosts_json_payload_emits_one_complete_lifecycle_for_every_host() {
+        let quiet = host_with_backups("quiet", 970, vec![]);
+        let ready = host_with_backups("ready", 970, vec![]);
+        let mut failed = host_with_backups("failed-settings", 970, vec![]);
+        failed.requested_preferences = Some(HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        });
+        let mut kernel = host_with_backups("kernel-drift", 970, vec![]);
+        kernel.kernel = Some(reboot_required_kernel(965));
+
+        let actions = HostActionStore::new(None);
+        let settings_run = actions
+            .begin_settings_change("failed-settings", "markus", 900)
+            .expect("settings run created");
+        actions
+            .fail_settings_change(&settings_run.id, 901)
+            .expect("settings run failed");
+        let action_jobs = actions.list();
+        let declarations = BTreeMap::from([(
+            "ready".to_string(),
+            HostPreferences {
+                accent: Some("#9868d0".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        let payload = hosts_payload(
+            vec![quiet, ready, failed, kernel],
+            &[],
+            &declarations,
+            &action_jobs,
+            1000,
+        );
+        let hosts = payload["hosts"].as_array().expect("hosts array");
+        assert_eq!(hosts.len(), 4);
+        for host in hosts {
+            let lifecycle = host
+                .get("lifecycle")
+                .and_then(serde_json::Value::as_object)
+                .expect("every host has a lifecycle object");
+            for field in [
+                "slot",
+                "label",
+                "level",
+                "invoke",
+                "run_id",
+                "detail",
+                "blocked_by",
+            ] {
+                assert!(
+                    lifecycle.contains_key(field),
+                    "{} lifecycle misses {field}",
+                    host["name"]
+                );
+            }
+        }
+
+        let by_name = |name: &str| {
+            hosts
+                .iter()
+                .find(|host| host["name"] == name)
+                .expect("named host")
+        };
+        assert_eq!(by_name("quiet")["lifecycle"]["slot"], "quiet");
+        assert_eq!(by_name("ready")["lifecycle"]["label"], "Ready to apply");
+        assert_eq!(by_name("kernel-drift")["lifecycle"]["slot"], "kernel_drift");
+        let failed = by_name("failed-settings");
+        assert_eq!(failed["lifecycle"]["slot"], "settings_change");
+        assert_eq!(failed["lifecycle"]["run_id"], settings_run.id);
+        assert_ne!(failed["lifecycle"]["label"], "Change requested");
+        assert_eq!(failed["host_action"]["workflow"]["kind"], "settings_change");
+    }
+
+    #[test]
+    fn hosts_payload_lifecycle_run_id_differs_from_legacy_host_action() {
+        let store = HostActionStore::new(None);
+        let mut cancelled_settings = store
+            .begin_settings_change("diverge-host", "markus", 100)
+            .expect("settings workflow created");
+        cancelled_settings.state = HostActionState::Cancelled;
+        cancelled_settings.updated_at = 101;
+        let proposal = store
+            .begin_system_update_proposal("diverge-host", "markus", 200)
+            .expect("system update proposal created");
+        let action_jobs = vec![cancelled_settings, proposal];
+        let host = host_with_backups("diverge-host", 970, vec![]);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &action_jobs, 1000);
+        let emitted = payload["hosts"][0].as_object().expect("host object");
+        let lifecycle = emitted["lifecycle"].as_object().expect("lifecycle object");
+        let host_action = emitted["host_action"]
+            .as_object()
+            .expect("host_action object");
+        assert_eq!(lifecycle["slot"], "settings_change");
+        assert_eq!(lifecycle["run_id"], action_jobs[0].id);
+        assert_eq!(host_action["id"], action_jobs[1].id);
+        assert_ne!(lifecycle["run_id"], host_action["id"]);
+    }
+
+    #[test]
+    fn fleet_render_hides_kernel_drift_when_update_restart_wins_lifecycle() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 100)
+            .expect("settings workflow created");
+        store
+            .fail_settings_change(&settings.id, 101)
+            .expect("settings workflow failed");
+        store
+            .create_update_review("hsb8", "markus", 200)
+            .expect("update restart review created");
+        let mut host = host_with_backups("hsb8", 970, vec![]);
+        host.kernel = Some(reboot_required_kernel(965));
+        let action_jobs = store.list();
+        let html = render_home(
+            RuntimeSnapshot {
+                hosts: std::slice::from_ref(&host),
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: None,
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(html.contains("review queued"));
+        assert!(html.contains(r#"data-lifecycle-invoke="update_restart""#));
+        assert!(html.contains(r#"data-kernel-slot hidden"#));
+    }
+
+    #[test]
     fn hosts_payload_and_fleet_expose_only_actionable_kernel_posture() {
         let mut staged = host_with_backups("csb0", 970, vec![]);
         staged.kernel = Some(reboot_required_kernel(965));
 
-        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), 1000);
+        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(payload["hosts"][0]["kernel"]["state"], "reboot_required");
         assert_eq!(payload["hosts"][0]["kernel"]["running_version"], "6.18.26");
         assert_eq!(payload["hosts"][0]["kernel"]["expected_version"], "7.0.14");
@@ -5826,7 +6010,7 @@ mod tests {
         );
         assert!(fleet.contains("down, backup, Nix freshness muted"));
         assert!(fleet.contains(r#"class="mute-note""#));
-        let applied_payload = hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), 1000);
+        let applied_payload = hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(
             applied_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             true
@@ -5864,7 +6048,7 @@ mod tests {
         );
         assert!(pending_fleet.contains(r#"class="mute-note" data-mute-note title="" hidden"#));
         assert!(!pending_fleet.contains("down, backup, Nix freshness muted"));
-        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), 1000);
+        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(
             pending_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             false
@@ -5910,7 +6094,7 @@ mod tests {
             .iter()
             .any(|event| event.title == "No heartbeat received"));
 
-        let payload = hosts_payload(vec![workstation.clone()], &[], &BTreeMap::new(), 1000);
+        let payload = hosts_payload(vec![workstation.clone()], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(payload["hosts"][0]["liveness"], "down");
         assert_eq!(
             payload["hosts"][0]["attention"]["label"],
@@ -6887,7 +7071,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
         ));
         assert!(html.contains(
-            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" href="/agora?host=poseidon" title="ready to apply for poseidon" aria-label="ready to apply for poseidon"><span class="settings-state-icon requested""#
+            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings" href="/agora?host=poseidon" title="ready to apply for poseidon" aria-label="ready to apply for poseidon"><span class="settings-state-icon requested""#
         ));
         assert!(html.contains(r#"<span data-settings-note-copy>Ready to apply</span></a>"#));
         assert!(!html.contains(
@@ -6913,7 +7097,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert!(applied.contains(r#"class="card has-settings""#));
         assert!(applied.contains(
-            r#"data-settings-state="applied" href="/agora?host=poseidon" title="Open host settings for poseidon" aria-label="Open host settings for poseidon"><span class="settings-state-icon requested""#
+            r#"data-settings-state="applied" data-lifecycle-slot="quiet" data-lifecycle-level="clear" data-lifecycle-invoke="host_settings" href="/agora?host=poseidon" title="Open host settings for poseidon" aria-label="Open host settings for poseidon"><span class="settings-state-icon requested""#
         ));
         assert!(applied.contains(r#"<span data-settings-note-copy>Up to date</span></a>"#));
         assert!(applied.contains(r#"style="--host-color:#48b8a8""#));
@@ -6986,6 +7170,101 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn server_rendered_lifecycle_preserves_existing_click_targets() {
+        let prefs = host_with_backups("prefs-target", 970, vec![]);
+        let mut run = host_with_backups("run-target", 970, vec![]);
+        run.requested_preferences = Some(HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        });
+        let mut kernel = host_with_backups("kernel-target", 970, vec![]);
+        kernel.kernel = Some(reboot_required_kernel(965));
+        let hosts = [prefs, run, kernel];
+        let declarations = BTreeMap::from([(
+            "prefs-target".to_string(),
+            HostPreferences {
+                accent: Some("#9868d0".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let actions = HostActionStore::new(None);
+        let settings_run = actions
+            .begin_settings_change("run-target", "markus", 900)
+            .expect("settings run created");
+        actions
+            .fail_settings_change(&settings_run.id, 901)
+            .expect("settings run failed");
+        let action_jobs = actions.list();
+
+        let html = render_home(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: Some(&declarations),
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+
+        let prefs_card = rendered_card(&html, "prefs-target");
+        assert!(prefs_card.contains(
+            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings" href="/agora?host=prefs-target""#
+        ));
+        assert!(prefs_card.contains(r#"<span data-settings-note-copy>Ready to apply</span></a>"#));
+
+        let run_card = rendered_card(&html, "run-target");
+        assert!(run_card.contains(
+            r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note data-action-level="warning" data-lifecycle-slot="settings_change" data-lifecycle-level="warning" data-lifecycle-invoke="workflow" data-lifecycle-run-id=""#
+        ));
+        assert!(run_card.contains(&format!(r#"data-lifecycle-run-id="{}"#, settings_run.id)));
+        assert!(run_card.contains(
+            r#"<span data-host-action-note-copy>settings request stopped</span></button>"#
+        ));
+        assert!(run_card.contains(&format!(
+            r#"data-action-job-id="{}" data-action-kind="settings_change" data-action-state="failed""#,
+            settings_run.id
+        )));
+        assert!(!run_card.contains("Change requested"));
+
+        let read_only_html = render_home(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: Some(&declarations),
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("viewer", true),
+            false,
+        );
+        let read_only_run = rendered_card(&read_only_html, "run-target");
+        assert!(read_only_run.contains("data-host-action-note hidden"));
+        assert!(!read_only_run.contains("data-host-actions"));
+
+        let kernel_card = rendered_card(&html, "kernel-target");
+        assert!(kernel_card.contains(
+            r#"<div class="kernel-slot" data-kernel-slot><details class="kernel-posture" data-kernel-posture data-lifecycle-slot="kernel_drift" data-lifecycle-level="warning" data-lifecycle-invoke="kernel_details">"#
+        ));
+        assert!(kernel_card.contains("<summary>"));
+        assert!(kernel_card.contains("Restart required"));
+
+        // These are the existing handlers: this ticket changes no destinations.
+        assert!(FOOT.contains("event.target.closest('[data-host-action-note]')"));
+        assert!(FOOT.contains("actionNote.dataset.lifecycleInvoke"));
+        assert!(FOOT.contains("actionNote.dataset.lifecycleRunId"));
+        assert!(FOOT.contains("workflowInteractive"));
+        assert!(FOOT.contains("const details=slot.querySelector('[data-kernel-posture]');"));
+    }
+
+    #[test]
     fn registry_only_declaration_is_not_rendered_as_applied() {
         let host = host_with_backups("gpc0", 970, vec![]);
         let declared = HostPreferences {
@@ -6999,6 +7278,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             RuntimeSnapshot {
                 hosts: &hosts,
                 jobs: &[],
+                action_jobs: &[],
                 declared_preferences: Some(&declarations),
                 janus_managed_hosts: None,
             },
@@ -7013,7 +7293,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"style="--pending-color:#9868d0""#));
         assert!(!html.contains(r#"--host-color:#9868d0""#));
 
-        let payload = hosts_payload(vec![host], &[], &declarations, 1000);
+        let payload = hosts_payload(vec![host], &[], &declarations, &[], 1000);
         assert_eq!(payload["hosts"][0]["declared_preferences"], json!(declared));
         assert_eq!(
             payload["hosts"][0]["preferences_state"],
