@@ -723,6 +723,113 @@ test("fleet host cards do not overlap in grid or list view", async ({ page }) =>
   }
 });
 
+test("fleet host actions menu opens adjacent to its trigger", async ({ page }) => {
+  const hosts = [
+    "browser-actions-a",
+    "browser-actions-b",
+    "browser-actions-c",
+    "browser-actions-d",
+  ];
+  for (const host of hosts) {
+    const report = await page.request.post("/report", {
+      data: {
+        schema: "inspr.pharos.host-report.v5",
+        version: 5,
+        name: host,
+        role: "server",
+        is_nix: true,
+        heartbeat_interval_secs: 60,
+        freshness: {
+          applicable: true,
+          flake_lock_age_days: 1,
+          commits_behind: 0,
+          nixpkgs_age_days: 2,
+          nixpkgs_channel: "nixos-unstable",
+          secondary_nixpkgs: null,
+          deployment_evidence: {
+            schema: "inspr.pharos.nix-deployment-evidence.v1",
+            version: 1,
+            source_revision: "a".repeat(40),
+            flake_lock_sha256: "b".repeat(64),
+            nixpkgs_revision: "c".repeat(40),
+            nixpkgs_last_modified: 1700000000,
+            nixpkgs_channel: "nixos-unstable",
+          },
+          nixcfg_comparison: {
+            upstream_revision: "a".repeat(40),
+            relation: "current",
+            commits_behind: 0,
+          },
+          nixpkgs_comparison: {
+            upstream_revision: "c".repeat(40),
+            relation: "current",
+          },
+        },
+      },
+    });
+    expect(report.status()).toBe(204);
+  }
+
+  await page.goto("/");
+  await page.setViewportSize({ width: 1280, height: 1024 });
+
+  const host = "browser-actions-b";
+  const trigger = page.locator(
+    `[data-grid] article[data-host="${host}"] [data-host-actions-trigger]`,
+  );
+  await trigger.click();
+
+  const placement = await page.evaluate((hostName) => {
+    const pad = 16;
+    const card = document.querySelector(
+      `[data-grid] article[data-host="${hostName}"]`,
+    );
+    const menuTrigger = card?.querySelector("[data-host-actions-trigger]");
+    const menu = card?.querySelector("[data-host-actions-menu]");
+    if (!menuTrigger || !menu || menu.hidden) {
+      return { intersects: false, hostTitle: "", itemCount: 0 };
+    }
+    const triggerRect = menuTrigger.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const intersects =
+      triggerRect.left - pad < menuRect.right &&
+      triggerRect.right + pad > menuRect.left &&
+      triggerRect.top - pad < menuRect.bottom &&
+      triggerRect.bottom + pad > menuRect.top;
+    return {
+      intersects,
+      hostTitle: menu.querySelector(".host-actions-title")?.textContent?.trim(),
+      itemCount: menu.querySelectorAll('[role="menuitem"]:not([hidden])').length,
+    };
+  }, host);
+
+  expect(placement.intersects).toBe(true);
+  expect(placement.hostTitle).toBe(host);
+  expect(placement.itemCount).toBeGreaterThan(0);
+  await expect(
+    page.locator(`[data-host-actions-menu]:not([hidden]) .host-action-item`, {
+      hasText: "View technical details",
+    }),
+  ).toBeVisible();
+
+  for (const cleanupHost of hosts) {
+    const removal = await page.request.post(`/host-actions/${cleanupHost}/remove`, {
+      headers: { "x-pharos-action": "1" },
+      data: {
+        confirmation: cleanupHost,
+        disposition: "unmanaged",
+        successor: null,
+      },
+    });
+    expect(removal.status()).toBe(202);
+    const reonboard = await page.request.post(
+      `/host-actions/${cleanupHost}/allow-reonboarding`,
+      { headers: { "x-pharos-action": "1" }, data: { confirmation: cleanupHost } },
+    );
+    expect(reonboard.ok()).toBe(true);
+  }
+});
+
 test("chip row does not overflow card boundary or paint into neighbors", async ({ page }) => {
   const host = "browser-chip-overflow";
   const report = await page.request.post("/report", {
