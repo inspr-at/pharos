@@ -1504,6 +1504,8 @@ test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", asyn
   const hostData = payload.hosts.find((entry) => entry.name === host);
   expect(hostData?.kernel?.state).toBe("reboot_required");
   expect(hostData?.lifecycle?.slot).toBe("update_restart");
+  const runId = hostData?.lifecycle?.run_id;
+  expect(runId).toBeTruthy();
 
   await page.goto("/");
   const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
@@ -1518,6 +1520,12 @@ test("fleet refresh shows workflow chip when UpdateRestart lifecycle wins", asyn
   expect(await applyServerFleetSnapshot(page)).toBe(true);
   await expectKernelDriftChipAbsent();
   await expect(card.locator("[data-host-lifecycle-chip]")).toBeVisible();
+
+  const cancel = await page.request.post(
+    `/host-actions/jobs/${encodeURIComponent(runId)}/cancel`,
+    { headers: { "x-pharos-action": "1" }, data: {} },
+  );
+  expect(cancel.status()).toBe(200);
 });
 
 test("saved update-restart stays read-only until the exact job renders", async ({
