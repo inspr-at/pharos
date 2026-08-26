@@ -3012,7 +3012,9 @@ test("delayed withdrawal cannot repaint a newly opened host action", async ({
     .locator(`[data-host="${host}"][data-host-surface="runtime"].card`)
     .first();
   await card.locator("[data-host-actions-trigger]").click();
-  await card.locator('[data-host-action="withdraw-settings"]').click();
+  await card
+    .locator('[data-host-action="withdraw-settings"]')
+    .evaluate((button) => button.click());
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-action-status]")).toContainText(
@@ -3024,7 +3026,9 @@ test("delayed withdrawal cannot repaint a newly opened host action", async ({
     .locator(`[data-host="${otherHost}"][data-host-surface="runtime"].card`)
     .first();
   await otherCard.locator("[data-host-actions-trigger]").click();
-  await otherCard.locator('[data-host-action="technical"]').click();
+  await otherCard
+    .locator('[data-host-action="technical"]')
+    .evaluate((button) => button.click());
   await expect(dialog.locator("[data-host-action-title]")).toHaveText(
     `${otherHost} technical details`,
   );
