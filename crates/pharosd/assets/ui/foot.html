@@ -46,6 +46,7 @@ function closeHostActions(root=openHostActionsRoot,restore=false){
   if(trigger)trigger.setAttribute('aria-expanded','false');
   if(openHostActionsRoot===root)openHostActionsRoot=null;
   if(restore)trigger?.focus();
+  flushFleetSortAfterInteraction();
 }
 function positionHostActions(root){
   const trigger=root.querySelector('[data-host-actions-trigger]');
@@ -1412,10 +1413,58 @@ function sortByFreeformOrder(items,order){
     return ai-bi||a.dataset.sortName.localeCompare(b.dataset.sortName);
   });
 }
+function reorderChildrenIfNeeded(parent,ordered){
+  if(!parent)return;
+  const orderedSet=new Set(ordered);
+  const current=Array.from(parent.children).filter(child=>orderedSet.has(child));
+  if(current.length===ordered.length&&current.every((child,index)=>child===ordered[index]))return;
+  ordered.forEach(child=>parent.appendChild(child));
+}
+let fleetPointerActive=false;
+let fleetKeyboardActive=false;
+let pendingFleetSort=null;
+function flushFleetSortAfterInteraction(){
+  if(fleetPointerActive||fleetKeyboardActive||!pendingFleetSort)return;
+  const pending=pendingFleetSort;
+  pendingFleetSort=null;
+  setTimeout(()=>applySort(pending.mode,pending.write),0);
+}
+function finishFleetPointerInteraction(){
+  if(!fleetPointerActive)return;
+  fleetPointerActive=false;
+  flushFleetSortAfterInteraction();
+}
+function beginFleetPointerInteraction(event){
+  if(event.button===0&&event.target.closest('[data-host-surface="runtime"]'))fleetPointerActive=true;
+}
+function fleetActivationKey(event){return event.key===' '||event.key==='Spacebar'||event.key==='Enter'}
+function beginFleetKeyboardInteraction(event){
+  if(fleetActivationKey(event)&&event.target.closest('[data-host-surface="runtime"]')&&event.target.closest('button,a,[role="button"],[role="menuitem"]'))fleetKeyboardActive=true;
+}
+function finishFleetKeyboardInteraction(event){
+  if(!fleetKeyboardActive||!fleetActivationKey(event))return;
+  fleetKeyboardActive=false;
+  flushFleetSortAfterInteraction();
+}
+document.addEventListener('pointerdown',beginFleetPointerInteraction,true);
+document.addEventListener('mousedown',beginFleetPointerInteraction,true);
+document.addEventListener('keydown',beginFleetKeyboardInteraction,true);
+window.addEventListener('pointerup',finishFleetPointerInteraction,true);
+window.addEventListener('pointercancel',finishFleetPointerInteraction,true);
+window.addEventListener('mouseup',finishFleetPointerInteraction,true);
+window.addEventListener('keyup',finishFleetKeyboardInteraction,true);
+function resetFleetInteraction(){
+  fleetPointerActive=false;
+  fleetKeyboardActive=false;
+  pendingFleetSort=null;
+}
+window.addEventListener('blur',resetFleetInteraction);
+document.addEventListener('contextmenu',resetFleetInteraction,true);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)resetFleetInteraction()},true);
 function keepOnboardAffordanceLast(){
   const grid=document.querySelector('[data-grid]');
   const tile=document.querySelector('[data-onboard-tile]');
-  if(grid&&tile)grid.appendChild(tile);
+  if(grid&&tile&&(tile.parentElement!==grid||tile.nextElementSibling))grid.appendChild(tile);
 }
 function applyFreeformOrder(){
   const grid=document.querySelector('[data-grid]');
@@ -1426,8 +1475,8 @@ function applyFreeformOrder(){
     keepOnboardAffordanceLast();
     return;
   }
-  if(grid)sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order).forEach(el=>grid.appendChild(el));
-  if(body)sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order).forEach(el=>body.appendChild(el));
+  if(grid)reorderChildrenIfNeeded(grid,sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order));
+  if(body)reorderChildrenIfNeeded(body,sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order));
   keepOnboardAffordanceLast();
 }
 function setArrangeMode(mode){
@@ -1438,15 +1487,21 @@ function applySort(mode,write=true){
   mode=['attention','name','last','freeform'].includes(mode)?mode:'attention';
   const grid=document.querySelector('[data-grid]');
   const body=document.querySelector('[data-list-body]');
+  const focusedHostControl=document.activeElement?.closest?.('[data-host-surface="runtime"]')?document.activeElement:null;
   setArrangeMode(mode);
+  if(fleetPointerActive||fleetKeyboardActive||openHostActionsRoot){
+    pendingFleetSort={mode,write:write||(pendingFleetSort?.write===true)};
+    return;
+  }
   if(mode==='freeform'){
     applyFreeformOrder();
   }else{
     if(write)clearFreeformOrder();
-    if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
-    if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
+    if(grid)reorderChildrenIfNeeded(grid,Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)));
+    if(body)reorderChildrenIfNeeded(body,Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)));
   }
   keepOnboardAffordanceLast();
+  if(focusedHostControl?.isConnected&&document.activeElement!==focusedHostControl)focusedHostControl.focus();
   const select=document.querySelector('[data-sort]');
   if(select)select.value=mode;
   if(write)setCookie('pharos_sort',mode);

@@ -2940,9 +2940,138 @@ test("settings run shows five-state truth and withdraw clears only the Pharos re
   await expect(dialog).toBeHidden();
   expect(withdrawPosts).toBe(0);
 
-  await card.locator("[data-host-actions-trigger]").click();
+  const stableSnapshotResponse = await page.request.get("/hosts.json");
+  expect(stableSnapshotResponse.ok()).toBe(true);
+  const stableSnapshot = await stableSnapshotResponse.json();
+  const pointerReorderedSnapshot = structuredClone(stableSnapshot);
+  const pointerReorderedHost = pointerReorderedSnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(pointerReorderedHost).toBeTruthy();
+  pointerReorderedHost.attention = {
+    ...(pointerReorderedHost.attention ?? {}),
+    label: pointerReorderedHost.attention?.label ?? "settings change waiting",
+    level: pointerReorderedHost.attention?.level ?? "warn",
+    rank: -1,
+  };
+  const actionsTrigger = card.locator("[data-host-actions-trigger]");
+  await actionsTrigger.hover();
+  await page.mouse.down();
+  const stableRefreshMoves = await card.evaluate((surface, snapshot) => {
+    const grid = surface.parentElement;
+    if (!grid) return -1;
+    const observer = new MutationObserver(() => {});
+    observer.observe(grid, { childList: true });
+    window.applyFleetSnapshot(snapshot);
+    const moves = observer
+      .takeRecords()
+      .filter(
+        (record) =>
+          [...record.addedNodes, ...record.removedNodes].includes(surface),
+      ).length;
+    observer.disconnect();
+    return moves;
+  }, pointerReorderedSnapshot);
+  expect(stableRefreshMoves).toBe(0);
+  await page.mouse.up();
+
   const withdraw = card.locator('[data-host-action="withdraw-settings"]');
   await expect(withdraw).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(withdraw).toBeHidden();
+  await expect(actionsTrigger).toBeFocused();
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').first(),
+  ).toHaveAttribute("data-host", host);
+
+  const blurResetSnapshot = structuredClone(stableSnapshot);
+  const blurResetHost = blurResetSnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(blurResetHost).toBeTruthy();
+  blurResetHost.attention = {
+    ...(blurResetHost.attention ?? {}),
+    label: blurResetHost.attention?.label ?? "settings change waiting",
+    level: blurResetHost.attention?.level ?? "warn",
+    rank: 99,
+  };
+  await actionsTrigger.hover();
+  await page.mouse.down();
+  await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+  await card.evaluate((_, snapshot) => {
+    window.applyFleetSnapshot(snapshot);
+  }, blurResetSnapshot);
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').last(),
+  ).toHaveAttribute("data-host", host);
+  await page.mouse.move(0, 0);
+  await page.mouse.up();
+
+  await actionsTrigger.hover();
+  await page.mouse.down({ button: "middle" });
+  const nonPrimarySnapshot = structuredClone(stableSnapshot);
+  const nonPrimaryHost = nonPrimarySnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(nonPrimaryHost).toBeTruthy();
+  nonPrimaryHost.attention = {
+    ...(nonPrimaryHost.attention ?? {}),
+    label: nonPrimaryHost.attention?.label ?? "settings change waiting",
+    level: nonPrimaryHost.attention?.level ?? "warn",
+    rank: -1,
+  };
+  await card.evaluate((_, snapshot) => {
+    window.applyFleetSnapshot(snapshot);
+  }, nonPrimarySnapshot);
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').first(),
+  ).toHaveAttribute("data-host", host);
+  await page.mouse.up({ button: "middle" });
+
+  const reorderedSnapshot = structuredClone(stableSnapshot);
+  const reorderedHost = reorderedSnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(reorderedHost).toBeTruthy();
+  reorderedHost.attention = {
+    ...(reorderedHost.attention ?? {}),
+    label: reorderedHost.attention?.label ?? "settings change waiting",
+    level: reorderedHost.attention?.level ?? "warn",
+    rank: 99,
+  };
+  await page.keyboard.down("Space");
+  const keyboardRefreshMoves = await card.evaluate((surface, snapshot) => {
+    const grid = surface.parentElement;
+    if (!grid) return -1;
+    const observer = new MutationObserver(() => {});
+    observer.observe(grid, { childList: true });
+    window.applyFleetSnapshot(snapshot);
+    const moves = observer
+      .takeRecords()
+      .filter(
+        (record) =>
+          [...record.addedNodes, ...record.removedNodes].includes(surface),
+      ).length;
+    observer.disconnect();
+    return moves;
+  }, reorderedSnapshot);
+  expect(keyboardRefreshMoves).toBe(0);
+  await page.keyboard.up("Space");
+  await expect(withdraw).toBeVisible();
+  const focusedMenuItem = card
+    .locator('[data-host-actions-menu] [role="menuitem"]:visible')
+    .first();
+  await expect(focusedMenuItem).toBeFocused();
+  const menuBox = await card
+    .locator("[data-host-actions-menu]")
+    .boundingBox();
+  const viewport = page.viewportSize();
+  expect(menuBox).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  expect(menuBox.x).toBeGreaterThanOrEqual(0);
+  expect(menuBox.y).toBeGreaterThanOrEqual(0);
+  expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(viewport.width);
+  expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(viewport.height);
   await expect(withdraw).toContainText("Withdraw change request");
   await expect(withdraw).toContainText(
     "Clears the pending request. An open nixcfg proposal stays open there.",
@@ -2956,6 +3085,9 @@ test("settings run shows five-state truth and withdraw clears only the Pharos re
   withdrawalResponseSeen = false;
   await withdraw.evaluate((button) => button.click());
   expect((await withdrawalResponse).status()).toBe(200);
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').last(),
+  ).toHaveAttribute("data-host", host);
   expect(withdrawPosts).toBe(1);
   expect(staleWithdrawalJobGets).toBe(0);
   await expect(dialog).toBeVisible();
