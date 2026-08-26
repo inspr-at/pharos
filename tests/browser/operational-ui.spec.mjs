@@ -1453,6 +1453,9 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   });
   expect(agora.status()).toBe(200);
   expect(await applyServerFleetSnapshot(page)).toBe(true);
+  const cardWithdraw = card.locator('[data-host-action="withdraw-settings"]');
+  await expect(cardWithdraw).not.toHaveAttribute("hidden", "");
+  await expect(cardWithdraw.locator("svg")).toHaveCount(1);
   await expectSettingsSurfaces(card, {
     state: "request_pending",
     title: settingsTitle,
@@ -1491,6 +1494,9 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   expect(parseFloat(cardChipChrome.paddingRight)).toBeGreaterThan(0);
   expect(parseFloat(cardChipChrome.paddingLeft)).toBeGreaterThan(0);
   await page.locator("[data-view-button='list']").click();
+  const rowWithdraw = row.locator('[data-host-action="withdraw-settings"]');
+  await expect(rowWithdraw).not.toHaveAttribute("hidden", "");
+  await expect(rowWithdraw.locator("svg")).toHaveCount(1);
   await expectSettingsSurfaces(row, {
     state: "request_pending",
     title: settingsTitle,
@@ -2860,6 +2866,328 @@ test("activity workflow query polls the requested job id", async ({ page }, test
   expect(cleanupReonboard.ok()).toBe(true);
 });
 
+test("settings run shows five-state truth and withdraw clears only the Pharos request", async ({
+  page,
+}, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "settings withdrawal requires local dispatch fixture",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
+
+  const host = `bl-settings-withdraw-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    preferences: { accent: "#224466" },
+  });
+  const request = await page.request.post(
+    "/agora/requests/host-preferences.json",
+    { data: { host, preferences: { accent: "#48b8a8" } } },
+  );
+  expect(request.ok()).toBe(true);
+  const requested = await request.json();
+  const runId = requested.job.id;
+
+  await page.goto("/");
+  const card = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"].card`)
+    .first();
+  await card.locator("[data-host-lifecycle-chip]").click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  const ladder = dialog.locator(".host-workflow-ladder li");
+  await expect(ladder).toHaveCount(5);
+  await expect(ladder.locator("strong")).toHaveText([
+    "Observed",
+    "Declared",
+    "Requested",
+    "Executed",
+    "Verified",
+  ]);
+  await expect(dialog.locator(".host-workflow-next")).toContainText("Next");
+  await expect(dialog.locator(".host-workflow-next")).toContainText("Where");
+  await expect(dialog.locator(".host-workflow-next")).toContainText("Will not");
+  await expect(dialog.locator("[data-host-action-cancel]")).toBeHidden();
+
+  let withdrawPosts = 0;
+  let withdrawalResponseSeen = false;
+  let staleWithdrawalJobGets = 0;
+  page.on("request", (outgoing) => {
+    if (
+      outgoing.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      outgoing.method() === "POST"
+    ) {
+      withdrawPosts += 1;
+    }
+    if (
+      outgoing.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}`) &&
+      outgoing.method() === "GET" &&
+      !withdrawalResponseSeen
+    ) {
+      staleWithdrawalJobGets += 1;
+    }
+  });
+  page.on("response", (incoming) => {
+    if (
+      incoming.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      incoming.request().method() === "POST"
+    ) {
+      withdrawalResponseSeen = true;
+    }
+  });
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  expect(withdrawPosts).toBe(0);
+
+  const stableSnapshotResponse = await page.request.get("/hosts.json");
+  expect(stableSnapshotResponse.ok()).toBe(true);
+  const stableSnapshot = await stableSnapshotResponse.json();
+  const pointerReorderedSnapshot = structuredClone(stableSnapshot);
+  const pointerReorderedHost = pointerReorderedSnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(pointerReorderedHost).toBeTruthy();
+  pointerReorderedHost.attention = {
+    ...(pointerReorderedHost.attention ?? {}),
+    label: pointerReorderedHost.attention?.label ?? "settings change waiting",
+    level: pointerReorderedHost.attention?.level ?? "warn",
+    rank: -1,
+  };
+  const actionsTrigger = card.locator("[data-host-actions-trigger]");
+  await actionsTrigger.hover();
+  await page.mouse.down();
+  const stableRefreshMoves = await card.evaluate((surface, snapshot) => {
+    const grid = surface.parentElement;
+    if (!grid) return -1;
+    const observer = new MutationObserver(() => {});
+    observer.observe(grid, { childList: true });
+    window.applyFleetSnapshot(snapshot);
+    const moves = observer
+      .takeRecords()
+      .filter(
+        (record) =>
+          [...record.addedNodes, ...record.removedNodes].includes(surface),
+      ).length;
+    observer.disconnect();
+    return moves;
+  }, pointerReorderedSnapshot);
+  expect(stableRefreshMoves).toBe(0);
+  await page.mouse.up();
+
+  const withdraw = card.locator('[data-host-action="withdraw-settings"]');
+  await expect(withdraw).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(withdraw).toBeHidden();
+  await expect(actionsTrigger).toBeFocused();
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').first(),
+  ).toHaveAttribute("data-host", host);
+
+  const blurResetSnapshot = structuredClone(stableSnapshot);
+  const blurResetHost = blurResetSnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(blurResetHost).toBeTruthy();
+  blurResetHost.attention = {
+    ...(blurResetHost.attention ?? {}),
+    label: blurResetHost.attention?.label ?? "settings change waiting",
+    level: blurResetHost.attention?.level ?? "warn",
+    rank: 99,
+  };
+  await actionsTrigger.hover();
+  await page.mouse.down();
+  await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+  await card.evaluate((_, snapshot) => {
+    window.applyFleetSnapshot(snapshot);
+  }, blurResetSnapshot);
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').last(),
+  ).toHaveAttribute("data-host", host);
+  await page.mouse.move(0, 0);
+  await page.mouse.up();
+
+  await actionsTrigger.hover();
+  await page.mouse.down({ button: "middle" });
+  const nonPrimarySnapshot = structuredClone(stableSnapshot);
+  const nonPrimaryHost = nonPrimarySnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(nonPrimaryHost).toBeTruthy();
+  nonPrimaryHost.attention = {
+    ...(nonPrimaryHost.attention ?? {}),
+    label: nonPrimaryHost.attention?.label ?? "settings change waiting",
+    level: nonPrimaryHost.attention?.level ?? "warn",
+    rank: -1,
+  };
+  await card.evaluate((_, snapshot) => {
+    window.applyFleetSnapshot(snapshot);
+  }, nonPrimarySnapshot);
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').first(),
+  ).toHaveAttribute("data-host", host);
+  await page.mouse.up({ button: "middle" });
+
+  const reorderedSnapshot = structuredClone(stableSnapshot);
+  const reorderedHost = reorderedSnapshot.hosts.find(
+    (entry) => entry.name === host,
+  );
+  expect(reorderedHost).toBeTruthy();
+  reorderedHost.attention = {
+    ...(reorderedHost.attention ?? {}),
+    label: reorderedHost.attention?.label ?? "settings change waiting",
+    level: reorderedHost.attention?.level ?? "warn",
+    rank: 99,
+  };
+  await page.keyboard.down("Space");
+  const keyboardRefreshMoves = await card.evaluate((surface, snapshot) => {
+    const grid = surface.parentElement;
+    if (!grid) return -1;
+    const observer = new MutationObserver(() => {});
+    observer.observe(grid, { childList: true });
+    window.applyFleetSnapshot(snapshot);
+    const moves = observer
+      .takeRecords()
+      .filter(
+        (record) =>
+          [...record.addedNodes, ...record.removedNodes].includes(surface),
+      ).length;
+    observer.disconnect();
+    return moves;
+  }, reorderedSnapshot);
+  expect(keyboardRefreshMoves).toBe(0);
+  await page.keyboard.up("Space");
+  await expect(withdraw).toBeVisible();
+  const focusedMenuItem = card
+    .locator('[data-host-actions-menu] [role="menuitem"]:visible')
+    .first();
+  await expect(focusedMenuItem).toBeFocused();
+  const menuBox = await card
+    .locator("[data-host-actions-menu]")
+    .boundingBox();
+  const viewport = page.viewportSize();
+  expect(menuBox).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  expect(menuBox.x).toBeGreaterThanOrEqual(0);
+  expect(menuBox.y).toBeGreaterThanOrEqual(0);
+  expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(viewport.width);
+  expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(viewport.height);
+  await expect(withdraw).toContainText("Withdraw change request");
+  await expect(withdraw).toContainText(
+    "Clears the pending request. An open nixcfg proposal stays open there.",
+  );
+  const withdrawalResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      response.request().method() === "POST",
+  );
+  staleWithdrawalJobGets = 0;
+  withdrawalResponseSeen = false;
+  await withdraw.evaluate((button) => button.click());
+  expect((await withdrawalResponse).status()).toBe(200);
+  await expect(
+    page.locator('[data-grid] > .card[data-host-surface="runtime"]').last(),
+  ).toHaveAttribute("data-host", host);
+  expect(withdrawPosts).toBe(1);
+  expect(staleWithdrawalJobGets).toBe(0);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-copy]")).toContainText(
+    "pending request was cleared",
+  );
+  await expect(dialog.locator(".host-workflow-next")).toContainText(
+    "An open nixcfg proposal stays open there.",
+  );
+
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData.requested_preferences).toBeNull();
+  expect(hostData.lifecycle.label).toBe("settings change cancelled");
+  expect(hostData.lifecycle.label).not.toBe("Change requested");
+
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(card.locator("[data-host-actions-trigger]")).toBeFocused();
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
+});
+
+test("delayed withdrawal cannot repaint a newly opened host action", async ({
+  page,
+}, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "delayed settings withdrawal requires local dispatch fixture",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
+
+  const host = `bl-withdraw-delay-${testInfo.project.name}`;
+  const otherHost = `bl-withdraw-other-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { is_nix: true });
+  await reportRuntimeHost(page, otherHost);
+  const request = await page.request.post(
+    "/agora/requests/host-preferences.json",
+    { data: { host, preferences: { accent: "#48b8a8" } } },
+  );
+  expect(request.ok()).toBe(true);
+  const runId = (await request.json()).job.id;
+
+  await page.goto("/");
+  await page.evaluate((withdrawRunId) => {
+    const originalFetch = window.fetch.bind(window);
+    window.__releaseWithdrawal = () => {};
+    window.fetch = (input, init) => {
+      const url = String(input);
+      if (url.endsWith(`/host-actions/jobs/${withdrawRunId}/withdraw`)) {
+        return new Promise((resolve, reject) => {
+          window.__releaseWithdrawal = () => {
+            originalFetch(input, init).then(resolve, reject);
+          };
+        });
+      }
+      return originalFetch(input, init);
+    };
+  }, runId);
+  const card = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"].card`)
+    .first();
+  await card.locator("[data-host-actions-trigger]").click();
+  await card
+    .locator('[data-host-action="withdraw-settings"]')
+    .evaluate((button) => button.click());
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-status]")).toContainText(
+    "Clearing the pending request",
+  );
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+
+  const otherCard = page
+    .locator(`[data-host="${otherHost}"][data-host-surface="runtime"].card`)
+    .first();
+  await otherCard.locator("[data-host-actions-trigger]").click();
+  await otherCard
+    .locator('[data-host-action="technical"]')
+    .evaluate((button) => button.click());
+  await expect(dialog.locator("[data-host-action-title]")).toHaveText(
+    `${otherHost} technical details`,
+  );
+
+  const delayedResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      response.request().method() === "POST",
+  );
+  await page.evaluate(() => window.__releaseWithdrawal());
+  expect((await delayedResponse).status()).toBe(200);
+  await expect(dialog.locator("[data-host-action-title]")).toHaveText(
+    `${otherHost} technical details`,
+  );
+  await expect(dialog.locator("[data-host-action-technical]")).toContainText(
+    `Host: ${otherHost}`,
+  );
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
+});
+
 test("informational lifecycle sheets hide leftover workflow controls", async ({
   page,
 }) => {
@@ -2894,7 +3222,7 @@ test("informational lifecycle sheets hide leftover workflow controls", async ({
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-remove-disposition-field]")).toBeVisible();
   await expect(dialog.locator("[data-host-remove-confirm]")).toBeVisible();
-  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
   await expect(dialog).toBeHidden();
 
   await page.evaluate(() => {

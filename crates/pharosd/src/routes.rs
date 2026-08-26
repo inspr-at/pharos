@@ -120,6 +120,10 @@ fn human_routes() -> Router<AppState> {
             post(cancel_update_restart_review),
         )
         .route(
+            "/host-actions/jobs/{id}/withdraw",
+            post(withdraw_settings_change),
+        )
+        .route(
             "/host-actions/jobs/{id}/confirm",
             post(confirm_update_restart),
         )

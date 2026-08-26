@@ -95,11 +95,11 @@ use crate::alerts::{AlertEvent, AlertStore, AlertWorkerHealth};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 use crate::host_actions::{
     active_update_restart_for_host, host_lifecycle, host_preferences_state,
-    most_relevant_host_action, AgentActionOutcome, AgentActionResultRequest, HostActionEventSource,
-    HostActionJob, HostActionState, HostActionStore, HostActionStoreError, HostLifecycle,
-    HostLifecycleSlot, HostPreferencesState, HostRemovalPlan, HostRetirementDisposition,
-    HostWorkflowKind, HostWorkflowSummary, RetiredHost, RetiredHostStore,
-    RetirementAgentResultRequest, SystemUpdateProposalBegin,
+    most_relevant_host_action, withdrawable_settings_change_for_host, AgentActionOutcome,
+    AgentActionResultRequest, HostActionEventSource, HostActionJob, HostActionState,
+    HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot, HostPreferencesState,
+    HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
+    RetiredHostStore, RetirementAgentResultRequest, SystemUpdateProposalBegin,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -140,6 +140,7 @@ struct AppState {
     provider_runtime: ProviderRuntimeConfig,
     provider_connections: Arc<ProviderConnectionStore>,
     paid_create_lock: Arc<tokio::sync::Mutex<()>>,
+    settings_change_lock: Arc<tokio::sync::Mutex<()>>,
     nixcfg_dispatch: NixcfgDispatch,
     retirement_owner: RetirementOwnerAuth,
     host_actions: Arc<HostActionStore>,
@@ -588,6 +589,9 @@ fn action_message(job: &HostActionJob) -> Cow<'static, str> {
         });
         return Cow::Borrowed(match job.state {
             HostActionState::Succeeded => "The host reported the requested settings.",
+            HostActionState::Cancelled => {
+                "The pending settings request was withdrawn. An open nixcfg proposal was not changed."
+            }
             HostActionState::Failed if outcome_uncertain && uncertainty_acknowledged => {
                 "The operator recorded that nixcfg was checked. A fresh settings request may now be submitted deliberately."
             }
@@ -716,6 +720,31 @@ fn action_response_with_message(
 }
 
 pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
+    let ladder = workflow
+        .ladder
+        .iter()
+        .map(|fact| {
+            let at = fact
+                .at
+                .map(|at| format!(" <time>{}</time>", html_escape(&clock_label(at))))
+                .unwrap_or_default();
+            format!(
+                r#"<li data-ladder-key="{key}" data-ladder-state="{state}"><span class="host-workflow-ladder-marker" aria-hidden="true"></span><span><strong>{label}</strong><small>{fact}{at}</small></span></li>"#,
+                key = html_escape(fact.key),
+                state = html_escape(fact.state),
+                label = html_escape(fact.label),
+                fact = html_escape(&fact.fact),
+                at = at,
+            )
+        })
+        .collect::<String>();
+    let next = format!(
+        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p><dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>"#,
+        title = html_escape(&workflow.next.title),
+        consequence = html_escape(&workflow.next.consequence),
+        location = html_escape(&workflow.next.location),
+        boundary = html_escape(&workflow.next.boundary),
+    );
     let mut groups = String::new();
     let mut current_group = "";
     for (index, step) in workflow.steps.iter().enumerate() {
@@ -821,11 +850,13 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
         .map(|location| format!(" on {}", html_escape(&location)))
         .unwrap_or_default();
     format!(
-        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}"><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
+        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}"><ol class="host-workflow-ladder" aria-label="Run truth: observed, declared, requested, executed, verified">{ladder}</ol><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{next}{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
         kind = workflow_kind_key(workflow.kind),
         status = html_escape(&workflow.status_label),
+        ladder = ladder,
         created = html_escape(&clock_label(workflow.created_at)),
         current_status = html_escape(current_status),
+        next = next,
     )
 }
 
@@ -1243,6 +1274,111 @@ async fn cancel_update_restart_review(
     }
 }
 
+async fn withdraw_settings_change(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(preview) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers) || !access.can_agora() || !access.allows_host(&preview.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Settings change access is not granted",
+        );
+    }
+    // A withdrawal must run wholly before a settings submission begins or
+    // after its handoff and pending write have both completed.
+    let _settings_change_guard = state.settings_change_lock.lock().await;
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
+    };
+    if !existing.can_withdraw() {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Only a non-terminal settings change can be withdrawn",
+        );
+    }
+    let Some(host_before) = state.store.get(&existing.host) else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The settings change host is not in the fleet store",
+        );
+    };
+    let previous_preferences = host_before.requested_preferences.clone();
+    if let Err(error) = state.store.clear_requested_preferences(&existing.host) {
+        tracing::error!(host = %existing.host, error = %error, "pending host settings could not be cleared for withdrawal");
+        return action_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The pending settings request could not be cleared",
+        );
+    }
+
+    let actor = action_actor(&state.auth, &headers);
+    let withdrawn = match state.host_actions.withdraw_settings_change(
+        &id,
+        &existing.host,
+        &actor,
+        now_unix(),
+    ) {
+        Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            let Some(job) = state
+                .host_actions
+                .get(&id)
+                .filter(|job| job.state == HostActionState::Cancelled)
+            else {
+                return action_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The withdrawal was persisted but could not be reloaded",
+                );
+            };
+            job
+        }
+        Err(error) => {
+            let workflow_still_withdrawable = state
+                .host_actions
+                .get(&id)
+                .is_some_and(|job| job.can_withdraw());
+            if let Some(preferences) = previous_preferences.filter(|_| workflow_still_withdrawable)
+            {
+                if let Err(restore_error) =
+                    state.store.request_preferences(&existing.host, preferences)
+                {
+                    tracing::error!(host = %existing.host, error = %restore_error, "pending settings request could not be restored after withdrawal failure");
+                }
+            }
+            let (status, message) = match error {
+                HostActionStoreError::InvalidTransition => (
+                    StatusCode::CONFLICT,
+                    "Only a non-terminal settings change can be withdrawn",
+                ),
+                HostActionStoreError::WrongHost => (
+                    StatusCode::FORBIDDEN,
+                    "Settings change does not belong to this host",
+                ),
+                HostActionStoreError::NotFound => {
+                    (StatusCode::NOT_FOUND, "Settings change was not found")
+                }
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The settings change withdrawal could not be recorded",
+                ),
+            };
+            return action_error(status, message);
+        }
+    };
+    tracing::info!(host = %withdrawn.host, actor = %actor, ticket = "PHAROS-215", "pending settings request withdrawn without changing nixcfg");
+    action_response_with_message(
+        StatusCode::OK,
+        &withdrawn,
+        "Clears the pending request. An open nixcfg proposal stays open there.",
+    )
+}
+
 async fn recover_update_restart(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1387,22 +1523,33 @@ async fn reconcile_accepted_dispatch(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(existing) = state.host_actions.get(&id) else {
+    let Some(preview) = state.host_actions.get(&id) else {
         return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
     };
     let access = access_for_headers(&state.auth, &headers);
-    let workflow_allowed = match existing.workflow_kind() {
+    let workflow_allowed = match preview.workflow_kind() {
         host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
         host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
         _ => false,
     };
-    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&existing.host)
-    {
+    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&preview.host) {
         return action_error(
             StatusCode::FORBIDDEN,
             "Accepted dispatch reconciliation access is not granted",
         );
     }
+    // Settings reconciliation writes the same pending preference slot as a
+    // fresh submission. Order it with withdrawal, then reload the workflow so
+    // a queued reconciliation cannot act on a run that was just cancelled.
+    let _settings_change_guard =
+        if preview.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange {
+            Some(state.settings_change_lock.lock().await)
+        } else {
+            None
+        };
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
     if existing.state != HostActionState::ProposalRequested
         || !existing.dispatch_submitted()
         || existing.accepted_dispatch_reconciled()
@@ -2700,6 +2847,8 @@ fn hosts_payload(
                 kernel_reboot_required(h.kernel.as_ref()).is_some(),
             );
             let action_summary = action.map(HostActionJob::summary);
+            let withdrawable_settings_change =
+                withdrawable_settings_change_for_host(action_jobs, &h.name);
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
             let freshness_tldr = h.freshness.tldr();
             let attention = attention_reason(
@@ -2739,6 +2888,7 @@ fn hosts_payload(
                 "backup_observations_summary": backup_observations_summary(&h.backup_observations),
                 "lifecycle": lifecycle,
                 "update_restart_active": active_update_restart_for_host(action_jobs, &h.name).is_some(),
+                "settings_change_withdraw_run_id": withdrawable_settings_change.map(|job| &job.id),
                 "attention": {
                     "label": attention.label,
                     "level": attention.level,
@@ -4046,6 +4196,7 @@ async fn main() {
         provider_runtime,
         provider_connections,
         paid_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+        settings_change_lock: Arc::new(tokio::sync::Mutex::new(())),
         nixcfg_dispatch,
         retirement_owner,
         host_actions,
@@ -5273,7 +5424,19 @@ mod tests {
         assert!(html.contains(
             "'/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/cancel'"
         ));
+        assert!(html.contains("'/host-actions/jobs/'+encodeURIComponent(runId)+'/withdraw'"));
+        assert!(html.contains(
+            "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));"
+        ));
+        assert!(!html.contains("openHostActionDialog('workflow',root,actionItem,runId)"));
+        assert!(html.contains("Withdraw change request"));
+        assert!(
+            html.contains("Clears the pending request. An open nixcfg proposal stays open there.")
+        );
         assert!(html.contains(r#"data-host-action-cancel hidden"#));
+        assert!(html.contains(
+            r#"data-host-action-primary>Continue</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button>"#
+        ));
         assert!(html.contains("openRequestedWorkflow()"));
         assert!(html.contains(
             "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'),workflowId)"
@@ -5325,6 +5488,15 @@ mod tests {
         assert!(running_html.contains(r#"aria-current="step""#));
         assert!(running_html.contains("<small>on hsb8</small>"));
         assert!(running_html.contains(r#"role="listitem""#));
+        assert!(running_html.contains(
+            r#"aria-label="Run truth: observed, declared, requested, executed, verified""#
+        ));
+        for label in ["Observed", "Declared", "Requested", "Executed", "Verified"] {
+            assert!(running_html.contains(&format!("<strong>{label}</strong>")));
+        }
+        assert!(running_html.contains(r#"class="host-workflow-next""#));
+        assert!(running_html.contains("<dt>Where</dt>"));
+        assert!(running_html.contains("<dt>Will not</dt>"));
         assert_eq!(running_html.matches(r#"aria-busy="true""#).count(), 1);
         assert!(HEAD.contains("@keyframes host-workflow-spin"));
         assert!(HEAD.contains(
@@ -5551,7 +5723,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_host_actions_hide_generic_restart_when_removal_masks_host_action() {
+    fn fleet_host_actions_keep_independent_controls_when_removal_masks_host_action() {
         let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
         pending_update.freshness = proven_freshness(
             "nixos-unstable",
@@ -5571,6 +5743,9 @@ mod tests {
         let update_job = store
             .create_update_review("hsb8", "markus", 1_700_000_110)
             .expect("active update restart");
+        let settings_job = store
+            .begin_settings_change("hsb8", "markus", 1_700_000_115)
+            .expect("active settings change");
         let removal_job = store
             .begin_removal(
                 "hsb8",
@@ -5616,6 +5791,8 @@ mod tests {
         );
         assert!(markup.contains(r#"data-update-restart-active="true""#));
         assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
+        assert!(markup.contains(&format!(r#"data-lifecycle-run-id="{}""#, settings_job.id)));
+        assert!(markup.contains("Withdraw change request"));
         assert!(!markup.contains("Continue update workflow"));
 
         let payload = hosts_payload(
@@ -5627,6 +5804,7 @@ mod tests {
         );
         let emitted = payload["hosts"][0].as_object().expect("host object");
         assert_eq!(emitted["update_restart_active"], true);
+        assert_eq!(emitted["settings_change_withdraw_run_id"], settings_job.id);
         assert_eq!(emitted["lifecycle"]["slot"], "remove_host");
         assert_eq!(emitted["host_action"]["workflow"]["kind"], "remove_host");
         assert_eq!(emitted["lifecycle"]["run_id"], removal_job.id);
@@ -13067,6 +13245,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ProviderConnectionStore::new(None).expect("in-memory provider store starts"),
             ),
             paid_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings_change_lock: Arc::new(tokio::sync::Mutex::new(())),
             nixcfg_dispatch: NixcfgDispatch::disabled(),
             retirement_owner: RetirementOwnerAuth::default(),
             host_actions: Arc::new(HostActionStore::new(None)),
@@ -13806,6 +13985,51 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             }
         });
         (format!("http://{address}"), count)
+    }
+
+    fn mock_blocking_dispatch_endpoint() -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock dispatch");
+        let address = listener.local_addr().expect("mock address");
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    return;
+                }
+                raw.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .or_else(|| line.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if body.len() >= length {
+                    break;
+                }
+            }
+            let _ = arrived_tx.send(());
+            let _ = release_rx.recv();
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+            let _ = stream.flush();
+        });
+        (format!("http://{address}"), arrived_rx, release_tx)
     }
 
     struct DispatchTokenFixture {
@@ -14752,6 +14976,220 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .as_str()
             .expect("safe reconciliation error")
             .contains("Only a saved"));
+    }
+
+    #[tokio::test]
+    async fn withdrawn_settings_cannot_be_resurrected_by_queued_dispatch_reconciliation() {
+        let state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 916)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 917)
+            .expect("settings recovery payload recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, 918)
+            .expect("settings dispatch accepted");
+
+        let held = state.settings_change_lock.lock().await;
+        let withdraw_state = state.clone();
+        let withdraw_id = settings.id.clone();
+        let withdrawal = tokio::spawn(async move {
+            withdraw_settings_change(
+                State(withdraw_state),
+                action_headers(),
+                AxumPath(withdraw_id),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let reconcile_state = state.clone();
+        let reconcile_id = settings.id.clone();
+        let reconciliation = tokio::spawn(async move {
+            reconcile_accepted_dispatch(
+                State(reconcile_state),
+                action_headers(),
+                AxumPath(reconcile_id),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+
+        let (withdraw_status, Json(withdraw_payload)) = withdrawal.await.expect("withdrawal joins");
+        assert_eq!(withdraw_status, StatusCode::OK);
+        assert_eq!(withdraw_payload["job"]["state"], "cancelled");
+        let (reconcile_status, _) = reconciliation.await.expect("reconciliation joins");
+        assert_eq!(reconcile_status, StatusCode::CONFLICT);
+        assert!(state
+            .store
+            .get("hsb8")
+            .expect("host retained")
+            .requested_preferences
+            .is_none());
+        assert_eq!(
+            state
+                .host_actions
+                .get(&settings.id)
+                .expect("workflow retained")
+                .state,
+            HostActionState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_withdrawal_clears_pending_preferences_without_repository_dispatch() {
+        let mut state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        state
+            .store
+            .request_preferences("hsb8", requested.clone())
+            .expect("pending preferences recorded");
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 920)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 921)
+            .expect("settings request audit recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, 922)
+            .expect("repository handoff recorded");
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = withdraw_settings_change(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["job"]["state"], "cancelled");
+        assert_eq!(
+            payload["message"],
+            "Clears the pending request. An open nixcfg proposal stays open there."
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        let host = state.store.get("hsb8").expect("host remains recorded");
+        assert!(host.requested_preferences.is_none());
+        let payload = hosts_payload(
+            vec![host],
+            &[],
+            &BTreeMap::new(),
+            &state.host_actions.list(),
+            923,
+        );
+        assert_eq!(
+            payload["hosts"][0]["lifecycle"]["label"],
+            "settings change cancelled"
+        );
+        assert!(!payload.to_string().contains("Change requested"));
+
+        let (second_status, _) =
+            withdraw_settings_change(State(state), action_headers(), AxumPath(settings.id)).await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn settings_withdrawal_waits_for_in_flight_submission_then_clears_it() {
+        let mut state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let (api_base, dispatch_arrived, release_dispatch) = mock_blocking_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let submit_state = state.clone();
+        let submission = tokio::spawn(async move {
+            agora::request_host_preferences(
+                State(submit_state),
+                action_headers(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "host": "hsb8",
+                        "preferences": { "accent": "#48b8a8" }
+                    }))
+                    .expect("settings request parses"),
+                ),
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            dispatch_arrived
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("dispatch reached blocking endpoint")
+        })
+        .await
+        .expect("dispatch waiter joins");
+
+        let settings = state
+            .host_actions
+            .latest_settings_change_for_host("hsb8")
+            .expect("in-flight settings workflow exists");
+        let withdraw_state = state.clone();
+        let settings_id = settings.id.clone();
+        let mut withdrawal = tokio::spawn(async move {
+            withdraw_settings_change(
+                State(withdraw_state),
+                action_headers(),
+                AxumPath(settings_id),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut withdrawal)
+                .await
+                .is_err(),
+            "withdrawal must wait for the in-flight submission transaction"
+        );
+
+        release_dispatch.send(()).expect("dispatch released");
+        let (submit_status, _) = submission.await.expect("submission joins");
+        assert_eq!(submit_status, StatusCode::OK);
+        let (withdraw_status, Json(withdraw_payload)) = withdrawal.await.expect("withdrawal joins");
+        assert_eq!(withdraw_status, StatusCode::OK);
+        assert_eq!(withdraw_payload["job"]["state"], "cancelled");
+        assert!(state
+            .store
+            .get("hsb8")
+            .expect("host retained")
+            .requested_preferences
+            .is_none());
+        assert_eq!(
+            state
+                .host_actions
+                .get(&settings.id)
+                .expect("workflow retained")
+                .state,
+            HostActionState::Cancelled
+        );
     }
 
     fn post_commit_host_actions_path() -> PathBuf {
