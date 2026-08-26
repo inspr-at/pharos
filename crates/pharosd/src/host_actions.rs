@@ -1013,9 +1013,12 @@ impl HostActionJob {
         };
         match self.workflow_kind() {
             HostWorkflowKind::SettingsChange => {
-                let accepted = self.latest_event(&[
-                    HostActionEventKind::SettingsRequestAccepted,
-                    HostActionEventKind::DispatchSubmitted,
+                let accepted = self.latest_event(&[HostActionEventKind::SettingsRequestAccepted]);
+                let submitted = self.latest_event(&[HostActionEventKind::DispatchSubmitted]);
+                let uncertain = self.latest_event(&[HostActionEventKind::DispatchOutcomeUncertain]);
+                let rejected = self.latest_event(&[
+                    HostActionEventKind::DispatchFailed,
+                    HostActionEventKind::SettingsFailed,
                 ]);
                 let applied = self.latest_event(&[HostActionEventKind::SettingsApplied]);
                 vec![
@@ -1038,27 +1041,37 @@ impl HostActionJob {
                         "declared",
                         "Declared",
                         "not_observed",
-                        "A nixcfg merge is not observed by this run",
+                        "No declaration merge is observed by this run",
                         None,
                     ),
                     Self::ladder_fact(
                         "requested",
                         "Requested",
-                        if accepted.is_some() {
+                        if submitted.is_some() || accepted.is_some() {
                             "complete"
-                        } else if cancelled {
+                        } else if cancelled || self.state == HostActionState::Failed {
                             "stopped"
                         } else {
                             "current"
                         },
-                        if accepted.is_some() {
+                        if submitted.is_some() {
                             "Repository handoff accepted"
+                        } else if accepted.is_some() {
+                            "Pending request saved for host delivery"
+                        } else if uncertain.is_some() {
+                            "Repository receipt is unconfirmed"
+                        } else if rejected.is_some() || self.state == HostActionState::Failed {
+                            "Request delivery stopped"
                         } else if cancelled {
                             "Pending request withdrawn"
                         } else {
                             "Operator request recorded"
                         },
-                        accepted.or(requested),
+                        submitted
+                            .or(accepted)
+                            .or(uncertain)
+                            .or(rejected)
+                            .or(requested),
                     ),
                     Self::ladder_fact(
                         "executed",
@@ -1625,6 +1638,9 @@ impl HostActionJob {
             .iter()
             .any(|event| event.kind == HostActionEventKind::SettingsRequestAccepted);
         let submitted = self.has_event(HostActionEventKind::DispatchSubmitted);
+        let repository_delivery = submitted
+            || self.has_event(HostActionEventKind::DispatchOutcomeUncertain)
+            || self.has_event(HostActionEventKind::DispatchFailed);
         let handoff_needs_reconciliation = submitted && !accepted;
         let outcome_uncertain = self.has_event(HostActionEventKind::DispatchOutcomeUncertain);
         let uncertainty_acknowledged =
@@ -1731,13 +1747,19 @@ impl HostActionJob {
                         "Pharos cannot prove whether the repository accepted this request."
                     } else if self.state == HostActionState::Failed {
                         "The delivery workflow did not accept the request."
-                    } else if accepted || submitted {
+                    } else if submitted {
                         "The durable delivery workflow accepted the request."
+                    } else if accepted {
+                        "Pharos saved the request for host delivery."
                     } else {
                         "Pharos is recording the delivery request."
                     },
                 )
-                .at(HostWorkflowExecutionLocation::Github),
+                .at(if repository_delivery {
+                    HostWorkflowExecutionLocation::Github
+                } else {
+                    HostWorkflowExecutionLocation::Pharos
+                }),
                 workflow_step(
                     "host",
                     "APPLY",
@@ -6264,14 +6286,26 @@ mod tests {
         let accepted = store
             .accept_settings_change(&job.id, 402)
             .expect("request accepted");
-        let wait = accepted
-            .summary()
-            .workflow
+        let workflow = accepted.summary().workflow;
+        let wait = workflow
             .steps
-            .into_iter()
+            .iter()
             .find(|step| step.key == "host")
             .expect("host wait step");
         assert_eq!(wait.state, WorkflowStepState::Waiting);
+        let request = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "requested")
+            .expect("requested ladder fact");
+        assert_eq!(request.fact, "Pending request saved for host delivery");
+        assert_eq!(request.state, "complete");
+        let send = workflow
+            .steps
+            .iter()
+            .find(|step| step.key == "request")
+            .expect("request step");
+        assert_eq!(send.location, HostWorkflowExecutionLocation::Pharos);
 
         let completed = store
             .complete_settings_change("hsb8", 403)
@@ -6283,6 +6317,26 @@ mod tests {
             "settings applied"
         );
         assert_eq!(WorkflowStepState::Cancelled.key(), "cancelled");
+    }
+
+    #[test]
+    fn failed_settings_ladder_stops_the_request_instead_of_claiming_current_work() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("hsb8", "markus", 404)
+            .expect("settings workflow created");
+        let failed = store
+            .fail_settings_change(&job.id, 405)
+            .expect("settings request stopped");
+        let workflow = failed.summary().workflow;
+        let requested = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "requested")
+            .expect("requested ladder fact");
+        assert_eq!(requested.state, "stopped");
+        assert_eq!(requested.fact, "Request delivery stopped");
+        assert!(workflow.primary_action.is_none());
     }
 
     #[test]

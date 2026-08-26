@@ -1523,22 +1523,33 @@ async fn reconcile_accepted_dispatch(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(existing) = state.host_actions.get(&id) else {
+    let Some(preview) = state.host_actions.get(&id) else {
         return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
     };
     let access = access_for_headers(&state.auth, &headers);
-    let workflow_allowed = match existing.workflow_kind() {
+    let workflow_allowed = match preview.workflow_kind() {
         host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
         host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
         _ => false,
     };
-    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&existing.host)
-    {
+    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&preview.host) {
         return action_error(
             StatusCode::FORBIDDEN,
             "Accepted dispatch reconciliation access is not granted",
         );
     }
+    // Settings reconciliation writes the same pending preference slot as a
+    // fresh submission. Order it with withdrawal, then reload the workflow so
+    // a queued reconciliation cannot act on a run that was just cancelled.
+    let _settings_change_guard =
+        if preview.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange {
+            Some(state.settings_change_lock.lock().await)
+        } else {
+            None
+        };
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
     if existing.state != HostActionState::ProposalRequested
         || !existing.dispatch_submitted()
         || existing.accepted_dispatch_reconciled()
@@ -14963,6 +14974,76 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .as_str()
             .expect("safe reconciliation error")
             .contains("Only a saved"));
+    }
+
+    #[tokio::test]
+    async fn withdrawn_settings_cannot_be_resurrected_by_queued_dispatch_reconciliation() {
+        let state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 916)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 917)
+            .expect("settings recovery payload recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, 918)
+            .expect("settings dispatch accepted");
+
+        let held = state.settings_change_lock.lock().await;
+        let withdraw_state = state.clone();
+        let withdraw_id = settings.id.clone();
+        let withdrawal = tokio::spawn(async move {
+            withdraw_settings_change(
+                State(withdraw_state),
+                action_headers(),
+                AxumPath(withdraw_id),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let reconcile_state = state.clone();
+        let reconcile_id = settings.id.clone();
+        let reconciliation = tokio::spawn(async move {
+            reconcile_accepted_dispatch(
+                State(reconcile_state),
+                action_headers(),
+                AxumPath(reconcile_id),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+
+        let (withdraw_status, Json(withdraw_payload)) = withdrawal.await.expect("withdrawal joins");
+        assert_eq!(withdraw_status, StatusCode::OK);
+        assert_eq!(withdraw_payload["job"]["state"], "cancelled");
+        let (reconcile_status, _) = reconciliation.await.expect("reconciliation joins");
+        assert_eq!(reconcile_status, StatusCode::CONFLICT);
+        assert!(state
+            .store
+            .get("hsb8")
+            .expect("host retained")
+            .requested_preferences
+            .is_none());
+        assert_eq!(
+            state
+                .host_actions
+                .get(&settings.id)
+                .expect("workflow retained")
+                .state,
+            HostActionState::Cancelled
+        );
     }
 
     #[tokio::test]

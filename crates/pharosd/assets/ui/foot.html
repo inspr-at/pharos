@@ -507,15 +507,20 @@ async function withdrawSettingsChange(actionItem,root){
   // The withdrawal POST is the sole source of truth for this repaint. Opening
   // without a run id avoids a stale GET racing the transition response.
   openHostActionDialog('workflow',root,actionItem);
+  const withdrawalContext=hostActionContext;
   const status=document.querySelector('[data-host-action-status]');
   if(status)status.textContent='Clearing the pending request in Pharos…';
   try{
     const result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(runId)+'/withdraw',{});
-    renderHostActionJob(result.job,result.message,result.workflow_html);
     const menuItem=root.querySelector('[data-host-action="withdraw-settings"]');
-    if(menuItem)menuItem.hidden=true;
+    if(menuItem?.dataset.lifecycleRunId===runId)menuItem.hidden=true;
+    if(hostActionContext===withdrawalContext){
+      renderHostActionJob(result.job,result.message,result.workflow_html);
+    }
   }catch(error){
-    if(status)status.textContent=error instanceof Error?error.message:'The settings change could not be withdrawn.';
+    if(hostActionContext===withdrawalContext&&status){
+      status.textContent=error instanceof Error?error.message:'The settings change could not be withdrawn.';
+    }
   }
 }
 function updateHostActionState(surface,host,backup){

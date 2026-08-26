@@ -2971,6 +2971,80 @@ test("settings run shows five-state truth and withdraw clears only the Pharos re
   fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
 });
 
+test("delayed withdrawal cannot repaint a newly opened host action", async ({
+  page,
+}, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "delayed settings withdrawal requires local dispatch fixture",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
+
+  const host = `bl-withdraw-delay-${testInfo.project.name}`;
+  const otherHost = `bl-withdraw-other-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { is_nix: true });
+  await reportRuntimeHost(page, otherHost);
+  const request = await page.request.post(
+    "/agora/requests/host-preferences.json",
+    { data: { host, preferences: { accent: "#48b8a8" } } },
+  );
+  expect(request.ok()).toBe(true);
+  const runId = (await request.json()).job.id;
+
+  await page.goto("/");
+  await page.evaluate((withdrawRunId) => {
+    const originalFetch = window.fetch.bind(window);
+    window.__releaseWithdrawal = () => {};
+    window.fetch = (input, init) => {
+      const url = String(input);
+      if (url.endsWith(`/host-actions/jobs/${withdrawRunId}/withdraw`)) {
+        return new Promise((resolve, reject) => {
+          window.__releaseWithdrawal = () => {
+            originalFetch(input, init).then(resolve, reject);
+          };
+        });
+      }
+      return originalFetch(input, init);
+    };
+  }, runId);
+  const card = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"].card`)
+    .first();
+  await card.locator("[data-host-actions-trigger]").click();
+  await card.locator('[data-host-action="withdraw-settings"]').click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-status]")).toContainText(
+    "Clearing the pending request",
+  );
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+
+  const otherCard = page
+    .locator(`[data-host="${otherHost}"][data-host-surface="runtime"].card`)
+    .first();
+  await otherCard.locator("[data-host-actions-trigger]").click();
+  await otherCard.locator('[data-host-action="technical"]').click();
+  await expect(dialog.locator("[data-host-action-title]")).toHaveText(
+    `${otherHost} technical details`,
+  );
+
+  const delayedResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      response.request().method() === "POST",
+  );
+  await page.evaluate(() => window.__releaseWithdrawal());
+  expect((await delayedResponse).status()).toBe(200);
+  await expect(dialog.locator("[data-host-action-title]")).toHaveText(
+    `${otherHost} technical details`,
+  );
+  await expect(dialog.locator("[data-host-action-technical]")).toContainText(
+    `Host: ${otherHost}`,
+  );
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
+});
+
 test("informational lifecycle sheets hide leftover workflow controls", async ({
   page,
 }) => {
