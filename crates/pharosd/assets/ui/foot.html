@@ -156,7 +156,7 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
   dialog.dataset.workflow='false';
   if(status)status.textContent='';
   if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
-  if(cancel)cancel.textContent='Cancel';
+  if(cancel)cancel.textContent='Close';
   if(cancelRequest){cancelRequest.hidden=true;cancelRequest.disabled=false}
   if(confirm)confirm.hidden=true;
   if(dispositionField)dispositionField.hidden=true;
@@ -383,7 +383,11 @@ function renderHostActionJob(job,message,workflowHtml){
   if(safeNote)safeNote.textContent='Persisted and reviewable';
   if(status)status.textContent=message||'';
   if(cancel)cancel.textContent='Close';
-  if(cancelRequest){cancelRequest.hidden=workflow.can_cancel!==true;cancelRequest.disabled=false}
+  if(cancelRequest){
+    cancelRequest.hidden=workflow.can_cancel!==true;
+    cancelRequest.disabled=false;
+    cancelRequest.textContent='Cancel review — no live change was authorised';
+  }
   if(confirm)confirm.hidden=primaryAction?.kind!=='confirm';
   if(attended)attended.hidden=primaryAction?.kind!=='confirm';
   if(removeName)removeName.textContent=hostActionContext.host;
@@ -497,6 +501,21 @@ async function submitHostActionCancellation(){
     button.disabled=false;
   }
 }
+async function withdrawSettingsChange(actionItem,root){
+  const runId=actionItem.dataset.lifecycleRunId||root.dataset.actionJobId||'';
+  if(!runId)return;
+  openHostActionDialog('workflow',root,actionItem,runId);
+  const status=document.querySelector('[data-host-action-status]');
+  if(status)status.textContent='Clearing the pending request in Pharos…';
+  try{
+    const result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(runId)+'/withdraw',{});
+    renderHostActionJob(result.job,result.message,result.workflow_html);
+    const menuItem=root.querySelector('[data-host-action="withdraw-settings"]');
+    if(menuItem)menuItem.hidden=true;
+  }catch(error){
+    if(status)status.textContent=error instanceof Error?error.message:'The settings change could not be withdrawn.';
+  }
+}
 function updateHostActionState(surface,host,backup){
   const root=surface.querySelector('[data-host-actions]');
   if(!root)return;
@@ -528,6 +547,7 @@ function updateHostActionState(surface,host,backup){
   const update=root.querySelector('[data-host-action="system-update"]');
   const restart=root.querySelector('[data-host-action="update-restart"]');
   const remove=root.querySelector('[data-host-action="remove"]');
+  const withdraw=root.querySelector('[data-host-action="withdraw-settings"]');
   const primarySeparator=root.querySelector('[data-primary-separator]');
   const removeSeparator=root.querySelector('[data-remove-separator]');
   const updateJobActive=host.update_restart_active===true;
@@ -535,6 +555,11 @@ function updateHostActionState(surface,host,backup){
   root.dataset.updatePending=updatePending?'true':'false';
   root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
   const retired=retirement?.pending===true;
+  const settingsWithdrawable=workflow?.kind==='settings_change'&&!['succeeded','failed','cancelled'].includes(String(job?.state||''));
+  if(withdraw){
+    withdraw.hidden=!settingsWithdrawable;
+    if(settingsWithdrawable)withdraw.dataset.lifecycleRunId=String(job.id||'');
+  }
   // PHAROS-197: mirrors the server gate — a removal that must record a nixcfg
   // declaration change or a retirement intent needs the proposal available.
   const needsRemovalProposal=root.dataset.declared==='true'||root.dataset.credentialRetirement==='true';
@@ -560,7 +585,7 @@ function updateHostActionState(surface,host,backup){
       if(strong)strong.textContent='Continue: '+String(lifecycleAction.label);
     }
   }
-  if(primarySeparator)primarySeparator.hidden=[continueBtn,update,restart].every(item=>!item||item.hidden);
+  if(primarySeparator)primarySeparator.hidden=[continueBtn,withdraw,update,restart].every(item=>!item||item.hidden);
   if(removeSeparator)removeSeparator.hidden=!removalReady||!canManage||retired;
   if(openHostActionsRoot===root)positionHostActions(root);
 }
@@ -584,6 +609,10 @@ function initHostActions(){
     if(actionItem&&actionItem.closest('[data-host-actions-menu]')&&!actionItem.matches('a')){
       event.preventDefault();
       const root=actionItem.closest('[data-host-actions]');
+      if(actionItem.dataset.hostAction==='withdraw-settings'){
+        withdrawSettingsChange(actionItem,root);
+        return;
+      }
       if(actionItem.dataset.hostAction==='lifecycle-continue'){
         const runId=actionItem.dataset.lifecycleRunId||'';
         const invoke=actionItem.dataset.lifecycleInvoke||'workflow';

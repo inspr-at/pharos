@@ -224,6 +224,22 @@ impl Store {
         Ok(host)
     }
 
+    pub(crate) fn clear_requested_preferences(&self, host_name: &str) -> Result<Host, StoreError> {
+        let mut map = self.hosts.write().expect("store lock");
+        let host = map.get_mut(host_name).ok_or(StoreError::HostNotFound)?;
+        let previous = host.requested_preferences.take();
+        let host = host.clone();
+        if let Err(error) = self.persist(&map) {
+            if !store_error_replaced_final_file(&error) {
+                map.get_mut(host_name)
+                    .expect("mutated host remains present")
+                    .requested_preferences = previous;
+            }
+            return Err(error);
+        }
+        Ok(host)
+    }
+
     /// Upsert from a beacon report. `now` is the **server** receive time — the
     /// agent never asserts its own liveness (PHAROS-9).
     pub(crate) fn record(

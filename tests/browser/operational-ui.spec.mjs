@@ -2860,6 +2860,97 @@ test("activity workflow query polls the requested job id", async ({ page }, test
   expect(cleanupReonboard.ok()).toBe(true);
 });
 
+test("settings run shows five-state truth and withdraw clears only the Pharos request", async ({
+  page,
+}, testInfo) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "settings withdrawal requires local dispatch fixture",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
+
+  const host = `bl-settings-withdraw-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    preferences: { accent: "#224466" },
+  });
+  const request = await page.request.post(
+    "/agora/requests/host-preferences.json",
+    { data: { host, preferences: { accent: "#48b8a8" } } },
+  );
+  expect(request.ok()).toBe(true);
+  const requested = await request.json();
+  const runId = requested.job.id;
+
+  await page.goto("/");
+  const card = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"].card`)
+    .first();
+  await card.locator("[data-host-lifecycle-chip]").click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  const ladder = dialog.locator(".host-workflow-ladder li");
+  await expect(ladder).toHaveCount(5);
+  await expect(ladder.locator("strong")).toHaveText([
+    "Observed",
+    "Declared",
+    "Requested",
+    "Executed",
+    "Verified",
+  ]);
+  await expect(dialog.locator(".host-workflow-next")).toContainText("Next");
+  await expect(dialog.locator(".host-workflow-next")).toContainText("Where");
+  await expect(dialog.locator(".host-workflow-next")).toContainText("Will not");
+  await expect(dialog.locator("[data-host-action-cancel]")).toBeHidden();
+
+  let withdrawPosts = 0;
+  page.on("request", (outgoing) => {
+    if (
+      outgoing.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      outgoing.method() === "POST"
+    ) {
+      withdrawPosts += 1;
+    }
+  });
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  expect(withdrawPosts).toBe(0);
+
+  await card.locator("[data-host-actions-trigger]").click();
+  const withdraw = card.locator('[data-host-action="withdraw-settings"]');
+  await expect(withdraw).toBeVisible();
+  await expect(withdraw).toContainText("Withdraw change request");
+  await expect(withdraw).toContainText(
+    "Clears the pending request. An open nixcfg proposal stays open there.",
+  );
+  const withdrawalResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      response.request().method() === "POST",
+  );
+  await withdraw.evaluate((button) => button.click());
+  expect((await withdrawalResponse).status()).toBe(200);
+  expect(withdrawPosts).toBe(1);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-copy]")).toContainText(
+    "pending request was cleared",
+  );
+  await expect(dialog.locator(".host-workflow-next")).toContainText(
+    "An open nixcfg proposal stays open there.",
+  );
+
+  const snapshot = await page.request.get("/hosts.json");
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData.requested_preferences).toBeNull();
+  expect(hostData.lifecycle.label).toBe("settings change cancelled");
+  expect(hostData.lifecycle.label).not.toBe("Change requested");
+
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
+});
+
 test("informational lifecycle sheets hide leftover workflow controls", async ({
   page,
 }) => {
@@ -2894,7 +2985,7 @@ test("informational lifecycle sheets hide leftover workflow controls", async ({
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-remove-disposition-field]")).toBeVisible();
   await expect(dialog.locator("[data-host-remove-confirm]")).toBeVisible();
-  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
   await expect(dialog).toBeHidden();
 
   await page.evaluate(() => {
