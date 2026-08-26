@@ -2905,12 +2905,29 @@ test("settings run shows five-state truth and withdraw clears only the Pharos re
   await expect(dialog.locator("[data-host-action-cancel]")).toBeHidden();
 
   let withdrawPosts = 0;
+  let withdrawalResponseSeen = false;
+  let staleWithdrawalJobGets = 0;
   page.on("request", (outgoing) => {
     if (
       outgoing.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
       outgoing.method() === "POST"
     ) {
       withdrawPosts += 1;
+    }
+    if (
+      outgoing.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}`) &&
+      outgoing.method() === "GET" &&
+      !withdrawalResponseSeen
+    ) {
+      staleWithdrawalJobGets += 1;
+    }
+  });
+  page.on("response", (incoming) => {
+    if (
+      incoming.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
+      incoming.request().method() === "POST"
+    ) {
+      withdrawalResponseSeen = true;
     }
   });
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
@@ -2929,9 +2946,12 @@ test("settings run shows five-state truth and withdraw clears only the Pharos re
       response.url().includes(`/host-actions/jobs/${encodeURIComponent(runId)}/withdraw`) &&
       response.request().method() === "POST",
   );
+  staleWithdrawalJobGets = 0;
+  withdrawalResponseSeen = false;
   await withdraw.evaluate((button) => button.click());
   expect((await withdrawalResponse).status()).toBe(200);
   expect(withdrawPosts).toBe(1);
+  expect(staleWithdrawalJobGets).toBe(0);
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-action-copy]")).toContainText(
     "pending request was cleared",

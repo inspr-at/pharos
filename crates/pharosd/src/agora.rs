@@ -341,6 +341,9 @@ pub(crate) async fn request_host_preferences(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
     }
 
+    // PHAROS-215: keep repository dispatch, the local pending write, and any
+    // concurrent withdrawal in one total order.
+    let _settings_change_guard = state.settings_change_lock.lock().await;
     let now = crate::now_unix();
     let actor = crate::action_actor(&state.auth, &headers);
     let workflow = match state

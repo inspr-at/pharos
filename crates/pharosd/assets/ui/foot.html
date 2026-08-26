@@ -504,7 +504,9 @@ async function submitHostActionCancellation(){
 async function withdrawSettingsChange(actionItem,root){
   const runId=actionItem.dataset.lifecycleRunId||root.dataset.actionJobId||'';
   if(!runId)return;
-  openHostActionDialog('workflow',root,actionItem,runId);
+  // The withdrawal POST is the sole source of truth for this repaint. Opening
+  // without a run id avoids a stale GET racing the transition response.
+  openHostActionDialog('workflow',root,actionItem);
   const status=document.querySelector('[data-host-action-status]');
   if(status)status.textContent='Clearing the pending request in Pharos…';
   try{
@@ -555,10 +557,12 @@ function updateHostActionState(surface,host,backup){
   root.dataset.updatePending=updatePending?'true':'false';
   root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
   const retired=retirement?.pending===true;
-  const settingsWithdrawable=workflow?.kind==='settings_change'&&!['succeeded','failed','cancelled'].includes(String(job?.state||''));
+  const settingsWithdrawRunId=String(host.settings_change_withdraw_run_id||'');
+  const settingsWithdrawable=settingsWithdrawRunId.length>0;
   if(withdraw){
     withdraw.hidden=!settingsWithdrawable;
-    if(settingsWithdrawable)withdraw.dataset.lifecycleRunId=String(job.id||'');
+    if(settingsWithdrawable)withdraw.dataset.lifecycleRunId=settingsWithdrawRunId;
+    else delete withdraw.dataset.lifecycleRunId;
   }
   // PHAROS-197: mirrors the server gate — a removal that must record a nixcfg
   // declaration change or a retirement intent needs the proposal available.

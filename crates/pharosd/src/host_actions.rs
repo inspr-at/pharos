@@ -1097,6 +1097,9 @@ impl HostActionJob {
                     HostActionEventKind::DispatchAccepted,
                     HostActionEventKind::DispatchSubmitted,
                 ]);
+                let uncertain = self.latest_event(&[HostActionEventKind::DispatchOutcomeUncertain]);
+                let rejected = self.latest_event(&[HostActionEventKind::DispatchFailed]);
+                let handoff_event = accepted.or(uncertain).or(rejected);
                 vec![
                     Self::ladder_fact(
                         "observed",
@@ -1109,23 +1112,43 @@ impl HostActionJob {
                         "declared",
                         "Declared",
                         "not_observed",
-                        "Repository review continues outside Pharos",
-                        accepted,
+                        if accepted.is_some() {
+                            "Repository review continues outside Pharos"
+                        } else if uncertain.is_some() {
+                            "Repository receipt is unconfirmed"
+                        } else if rejected.is_some() {
+                            "Repository handoff was rejected"
+                        } else {
+                            "No repository handoff was accepted"
+                        },
+                        handoff_event,
                     ),
                     Self::ladder_fact(
                         "requested",
                         "Requested",
                         if accepted.is_some() {
                             "complete"
+                        } else if uncertain.is_some()
+                            || rejected.is_some()
+                            || cancelled
+                            || self.state == HostActionState::Failed
+                        {
+                            "stopped"
                         } else {
-                            stopped_state
+                            "current"
                         },
                         if accepted.is_some() {
                             "nixcfg accepted the review handoff"
+                        } else if uncertain.is_some() {
+                            "nixcfg receipt could not be confirmed"
+                        } else if rejected.is_some() {
+                            "nixcfg rejected the review handoff"
+                        } else if cancelled {
+                            "Operator request was cancelled"
                         } else {
                             "Operator request recorded"
                         },
-                        accepted.or(requested),
+                        handoff_event.or(requested),
                     ),
                     Self::ladder_fact(
                         "executed",
@@ -1148,10 +1171,15 @@ impl HostActionJob {
                     HostActionEventKind::ReviewPassed,
                     HostActionEventKind::RecoveryPassed,
                 ]);
-                let executed = self.latest_event(&[
+                let execution_completed = self.latest_event(&[
                     HostActionEventKind::ApplyPassed,
+                    HostActionEventKind::RecoveryPassed,
+                ]);
+                let execution_started = self.latest_event(&[
                     HostActionEventKind::ApplyRebooting,
                     HostActionEventKind::ApplyClaimed,
+                    HostActionEventKind::RecoveryRebooting,
+                    HostActionEventKind::RecoveryClaimed,
                 ]);
                 let verified = self.latest_event(&[
                     HostActionEventKind::ApplyPassed,
@@ -1190,17 +1218,21 @@ impl HostActionJob {
                     Self::ladder_fact(
                         "executed",
                         "Executed",
-                        if executed.is_some() {
+                        if execution_completed.is_some() {
                             "complete"
+                        } else if execution_started.is_some() {
+                            "current"
                         } else {
                             stopped_state
                         },
-                        if executed.is_some() {
-                            "Target-local execution evidence recorded"
+                        if execution_completed.is_some() {
+                            "Target-local execution completed"
+                        } else if execution_started.is_some() {
+                            "Target-local execution started; completion is not recorded"
                         } else {
                             "No live execution recorded"
                         },
-                        executed,
+                        execution_completed.or(execution_started),
                     ),
                     Self::ladder_fact(
                         "verified",
@@ -2687,6 +2719,16 @@ pub(crate) fn active_update_restart_for_host<'a>(
         .filter(|job| {
             job.state != HostActionState::Succeeded && job.state != HostActionState::Cancelled
         })
+}
+
+pub(crate) fn withdrawable_settings_change_for_host<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    dedupe_latest_workflow_jobs(jobs, host)
+        .into_iter()
+        .find(|job| job.workflow_kind() == HostWorkflowKind::SettingsChange)
+        .filter(|job| job.can_withdraw())
 }
 
 fn most_relevant_lifecycle_run<'a>(
@@ -6992,6 +7034,76 @@ mod tests {
                 .expect("deployment boundary")
                 .detail,
             "This proposal workflow never deploys hosts."
+        );
+    }
+
+    #[test]
+    fn proposal_ladder_does_not_claim_repository_review_after_failed_handoff() {
+        for (uncertain, expected) in [
+            (true, "Repository receipt is unconfirmed"),
+            (false, "Repository handoff was rejected"),
+        ] {
+            let store = HostActionStore::new(None);
+            let job = store
+                .begin_system_update_proposal("hsb8", "markus", 460, None)
+                .expect("proposal workflow created")
+                .into_job();
+            let failed = if uncertain {
+                store
+                    .fail_system_update_proposal_uncertain(&job.id, 461)
+                    .expect("uncertain handoff recorded")
+            } else {
+                store
+                    .fail_system_update_proposal(&job.id, 461)
+                    .expect("rejected handoff recorded")
+            };
+            let workflow = failed.summary().workflow;
+            let declared = workflow
+                .ladder
+                .iter()
+                .find(|fact| fact.key == "declared")
+                .expect("declared ladder fact");
+            assert_eq!(declared.fact, expected);
+            assert_ne!(declared.fact, "Repository review continues outside Pharos");
+        }
+    }
+
+    #[test]
+    fn apply_claim_is_current_execution_not_completed_evidence() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "markus", 470)
+            .expect("job created");
+        store.claim("hsb8", 471).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                472,
+            )
+            .expect("review stored");
+        store
+            .confirm_update(&job.id, "hsb8", "markus", 473)
+            .expect("confirmed");
+        store.claim("hsb8", 474).expect("claim").expect("lease");
+
+        let workflow = store.get(&job.id).expect("job retained").summary().workflow;
+        let executed = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "executed")
+            .expect("executed ladder fact");
+        assert_eq!(executed.state, "current");
+        assert_eq!(
+            executed.fact,
+            "Target-local execution started; completion is not recorded"
         );
     }
 

@@ -1486,9 +1486,10 @@ pub(super) fn host_actions_markup(
     } else {
         String::new()
     };
-    let withdraw_settings_visible = action.is_some_and(HostActionJob::can_withdraw);
-    let withdraw_settings_item = action
-        .filter(|job| job.can_withdraw())
+    let withdrawable_settings =
+        withdrawable_settings_change_for_host(context.action_jobs, &host.name);
+    let withdraw_settings_visible = withdrawable_settings.is_some();
+    let withdraw_settings_item = withdrawable_settings
         .map_or_else(
             || {
                 r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" hidden><span><strong>Withdraw change request</strong><span>Clears the pending request. An open nixcfg proposal stays open there.</span></span></button>"#.to_string()
