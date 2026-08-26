@@ -5425,7 +5425,9 @@ mod tests {
             "'/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/cancel'"
         ));
         assert!(html.contains("'/host-actions/jobs/'+encodeURIComponent(runId)+'/withdraw'"));
-        assert!(html.contains("openHostActionDialog('workflow',root,actionItem);"));
+        assert!(html.contains(
+            "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));"
+        ));
         assert!(!html.contains("openHostActionDialog('workflow',root,actionItem,runId)"));
         assert!(html.contains("Withdraw change request"));
         assert!(
