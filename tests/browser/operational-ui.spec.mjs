@@ -1453,6 +1453,9 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   });
   expect(agora.status()).toBe(200);
   expect(await applyServerFleetSnapshot(page)).toBe(true);
+  const cardWithdraw = card.locator('[data-host-action="withdraw-settings"]');
+  await expect(cardWithdraw).not.toHaveAttribute("hidden", "");
+  await expect(cardWithdraw.locator("svg")).toHaveCount(1);
   await expectSettingsSurfaces(card, {
     state: "request_pending",
     title: settingsTitle,
@@ -1491,6 +1494,9 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   expect(parseFloat(cardChipChrome.paddingRight)).toBeGreaterThan(0);
   expect(parseFloat(cardChipChrome.paddingLeft)).toBeGreaterThan(0);
   await page.locator("[data-view-button='list']").click();
+  const rowWithdraw = row.locator('[data-host-action="withdraw-settings"]');
+  await expect(rowWithdraw).not.toHaveAttribute("hidden", "");
+  await expect(rowWithdraw.locator("svg")).toHaveCount(1);
   await expectSettingsSurfaces(row, {
     state: "request_pending",
     title: settingsTitle,
@@ -2968,6 +2974,7 @@ test("settings run shows five-state truth and withdraw clears only the Pharos re
   expect(hostData.lifecycle.label).not.toBe("Change requested");
 
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(card.locator("[data-host-actions-trigger]")).toBeFocused();
   fs.writeFileSync(manifest.acceptFlagPath, "false", { mode: 0o600 });
 });
 

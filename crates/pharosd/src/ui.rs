@@ -1492,7 +1492,10 @@ pub(super) fn host_actions_markup(
     let withdraw_settings_item = withdrawable_settings
         .map_or_else(
             || {
-                r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" hidden><span><strong>Withdraw change request</strong><span>Clears the pending request. An open nixcfg proposal stays open there.</span></span></button>"#.to_string()
+                format!(
+                    r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" hidden>{history}<span><strong>Withdraw change request</strong><span>Clears the pending request. An open nixcfg proposal stays open there.</span></span></button>"#,
+                    history = icons::HISTORY,
+                )
             },
             |job| {
                 format!(

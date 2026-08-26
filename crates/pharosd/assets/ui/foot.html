@@ -506,7 +506,7 @@ async function withdrawSettingsChange(actionItem,root){
   if(!runId)return;
   // The withdrawal POST is the sole source of truth for this repaint. Opening
   // without a run id avoids a stale GET racing the transition response.
-  openHostActionDialog('workflow',root,actionItem);
+  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));
   const withdrawalContext=hostActionContext;
   const status=document.querySelector('[data-host-action-status]');
   if(status)status.textContent='Clearing the pending request in Pharos…';
