@@ -847,6 +847,133 @@ test("fleet host actions menu opens adjacent to its trigger", async ({ page }) =
   }
 });
 
+function healthyBackupObservation() {
+  return {
+    id: "restic-main",
+    label: "Restic main",
+    engine: "restic",
+    state: "healthy",
+    configured: "enabled",
+    summary: "last backup succeeded",
+    target_label: "off-box repository",
+    last_success_at: 1_700_000_000,
+    last_attempt_at: 1_700_000_000,
+    last_attempt_state: "succeeded",
+  };
+}
+
+function failedBackupObservation() {
+  return {
+    id: "restic-main",
+    label: "Restic main",
+    engine: "restic",
+    state: "failed",
+    configured: "enabled",
+    summary: "last backup failed",
+    target_label: "off-box repository",
+    last_attempt_at: 1_700_000_000,
+    last_attempt_state: "failed",
+  };
+}
+
+test("fleet card header keeps actions visible and backup shield only when not ok", async ({
+  page,
+}) => {
+  const healthyHost = "header-actions-healthy";
+  const failedHost = "header-actions-failed";
+  const hosts = [healthyHost, failedHost];
+
+  for (const host of hosts) {
+    const report = await page.request.post("/report", {
+      data: {
+        schema: "inspr.pharos.host-report.v5",
+        version: 5,
+        name: host,
+        role: "server",
+        is_nix: true,
+        heartbeat_interval_secs: 60,
+        freshness: {
+          applicable: true,
+          flake_lock_age_days: 1,
+          commits_behind: 0,
+          nixpkgs_age_days: 2,
+          nixpkgs_channel: "nixos-unstable",
+          deployment_evidence: {
+            schema: "inspr.pharos.nix-deployment-evidence.v1",
+            version: 1,
+            source_revision: "a".repeat(40),
+            flake_lock_sha256: "b".repeat(64),
+            nixpkgs_revision: "c".repeat(40),
+            nixpkgs_last_modified: 1_700_000_000,
+            nixpkgs_channel: "nixos-unstable",
+          },
+          nixcfg_comparison: {
+            upstream_revision: "a".repeat(40),
+            relation: "current",
+            commits_behind: 0,
+          },
+          nixpkgs_comparison: {
+            upstream_revision: "c".repeat(40),
+            relation: "current",
+          },
+        },
+        backup_observations:
+          host === healthyHost
+            ? [healthyBackupObservation()]
+            : [failedBackupObservation()],
+      },
+    });
+    expect(report.status()).toBe(204);
+  }
+
+  await page.goto("/");
+  await page.setViewportSize({ width: 1280, height: 1024 });
+
+  const healthyCard = page.locator(
+    `[data-grid] article[data-host="${healthyHost}"]`,
+  );
+  const healthyRow = page.locator(`tr[data-host="${healthyHost}"]`);
+  const failedCard = page.locator(`[data-grid] article[data-host="${failedHost}"]`);
+  const failedRow = page.locator(`tr[data-host="${failedHost}"]`);
+
+  await expect(healthyCard.locator("[data-host-actions-trigger]")).toBeVisible();
+  await expect(healthyCard.locator(".backup-chip")).toBeHidden();
+  await expect(failedCard.locator("[data-host-actions-trigger]")).toBeVisible();
+  await expect(failedCard.locator(".backup-chip")).toBeVisible();
+
+  const failedBackupChrome = await failedCard
+    .locator(".backup-chip")
+    .evaluate((el) => {
+      const style = getComputedStyle(el);
+      return {
+        borderColor: style.borderColor,
+        backgroundColor: style.backgroundColor,
+      };
+    });
+  expect(failedBackupChrome.borderColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(failedBackupChrome.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+
+  await page.locator("[data-view-button='list']").click();
+  await expect(page.locator("main")).toHaveAttribute("data-view", "list");
+  await expect(healthyRow.locator("[data-host-actions-trigger]")).toBeVisible();
+  await expect(healthyRow.locator(".backup-chip")).toBeHidden();
+  await expect(failedRow.locator("[data-host-actions-trigger]")).toBeVisible();
+  await expect(failedRow.locator(".backup-chip")).toBeVisible();
+
+  for (const host of hosts) {
+    const removal = await page.request.post(`/host-actions/${host}/remove`, {
+      headers: { "x-pharos-action": "1" },
+      data: { confirmation: host, disposition: "unmanaged", successor: null },
+    });
+    expect(removal.status()).toBe(202);
+    const reonboard = await page.request.post(
+      `/host-actions/${host}/allow-reonboarding`,
+      { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+    );
+    expect(reonboard.ok()).toBe(true);
+  }
+});
+
 test("chip row does not overflow card boundary or paint into neighbors", async ({ page }) => {
   const host = "browser-chip-overflow";
   const report = await page.request.post("/report", {

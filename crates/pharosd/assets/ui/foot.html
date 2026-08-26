@@ -849,6 +849,11 @@ function updateBackup(surface,info){
   const el=surface.querySelector('[data-backup-state]');
   if(!el)return;
   if(el.classList.contains('backup-chip')){
+    if(info.state==='healthy'){
+      el.hidden=true;
+      return;
+    }
+    el.hidden=false;
     const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
     const host=surface.dataset.host||'';
     el.classList.remove('clear','watch','warning','critical');
