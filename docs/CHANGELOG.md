@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.88 - 2026-08-27
+
+- Show one truthful lifecycle control for each host, backed by a server-computed priority projection that keeps simultaneous and recovered workflows visible (PHAROS-214, PHAROS-219).
+- Anchor the Fleet host Actions menu to the invoking card across desktop and mobile refreshes (PHAROS-220).
+- Terminalize successful system-update proposals, deduplicate dispatch, and make uncertain guarded handoffs explicitly recoverable (PHAROS-217).
+- Add a fact-based Observed / Declared / Requested / Executed / Verified ladder, explicit next-action consequences, and SettingsChange withdrawal that preserves any open nixcfg proposal (PHAROS-215).
+
 ## 0.1.87 - 2026-08-24
 
 - Fleet freshness chip row clips inside the card and fades at the right edge (PHAROS-211).
