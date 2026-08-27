@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make the shared container healthcheck role-aware: `pharosd` keeps its readiness probe while `pharos-beacon` becomes healthy after a successful report and unhealthy when reporting goes stale (PHAROS-204).
+
 ## 0.1.88 - 2026-08-27
 
 - Show one truthful lifecycle control for each host, backed by a server-computed priority projection that keeps simultaneous and recovered workflows visible (PHAROS-214, PHAROS-219).

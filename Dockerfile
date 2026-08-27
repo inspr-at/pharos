@@ -52,5 +52,10 @@ USER pharos
 ENV PHAROS_ADDR=0.0.0.0:8080 \
     RUST_LOG=info
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 CMD ["/usr/local/bin/pharosd", "healthcheck"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+    CMD if [ -n "${PHAROS_URL:-}" ]; then \
+        exec /usr/local/bin/pharos-beacon healthcheck; \
+    else \
+        exec /usr/local/bin/pharosd healthcheck; \
+    fi
 ENTRYPOINT ["/usr/local/bin/pharosd"]
