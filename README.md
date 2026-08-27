@@ -177,7 +177,9 @@ Then open:
 
 The local Compose topology binds only to loopback, stores data in a Docker
 volume and intentionally leaves OIDC and strict beacon authentication off. It
-is a smoke environment, not a production template.
+is a smoke environment, not a production template. The shared image checks
+`pharosd` through `/readyz`; for the beacon role it instead requires a
+successful report within three configured heartbeat intervals.
 
 ### Native development
 

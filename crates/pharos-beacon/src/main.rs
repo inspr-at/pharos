@@ -48,6 +48,8 @@ const DEFAULT_NIXPKGS_CHANNEL_BASE_URL: &str = "https://channels.nixos.org/";
 const OFFICIAL_NIXPKGS_GIT_REMOTE: &str = "https://github.com/NixOS/nixpkgs.git";
 const MAX_DEPLOYMENT_EVIDENCE_BYTES: u64 = 4 * 1024;
 const MAX_FLAKE_LOCK_BYTES: u64 = 8 * 1024 * 1024;
+const BEACON_HEALTH_PATH: &str = "/tmp/pharos-beacon-health-v1";
+const BEACON_HEALTH_STALE_INTERVALS: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportEndpoint {
@@ -195,6 +197,78 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+fn write_beacon_health(path: &Path, last_success_at: i64) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "health path has no parent",
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "health path has no file name",
+            )
+        })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
+        writeln!(file, "v1 {last_success_at}")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn beacon_health_is_fresh(path: &Path, cadence_secs: u64, now: i64) -> bool {
+    if RequestDeadlines::for_cadence(cadence_secs).is_err() {
+        return false;
+    }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 64 {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut fields = raw.split_ascii_whitespace();
+    if fields.next() != Some("v1") || fields.clone().count() != 1 {
+        return false;
+    }
+    let Some(last_success_at) = fields.next().and_then(|value| value.parse::<i64>().ok()) else {
+        return false;
+    };
+    let Some(age_secs) = now.checked_sub(last_success_at) else {
+        return false;
+    };
+    age_secs >= 0
+        && u64::try_from(age_secs)
+            .is_ok_and(|age| age <= cadence_secs.saturating_mul(BEACON_HEALTH_STALE_INTERVALS))
+}
+
+fn beacon_container_healthcheck() -> bool {
+    reporting_interval().ok().flatten().is_some_and(|cadence| {
+        beacon_health_is_fresh(Path::new(BEACON_HEALTH_PATH), cadence, now_unix())
+    })
 }
 
 fn report_rtt_millis(duration: Duration) -> u64 {
@@ -1910,6 +1984,10 @@ fn reporting_interval() -> Result<Option<u64>, &'static str> {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
+        std::process::exit(if beacon_container_healthcheck() { 0 } else { 1 });
+    }
+
     let base = env_value("PHAROS_URL").unwrap_or_else(|| {
         eprintln!("pharos-beacon: PHAROS_URL is required");
         std::process::exit(2);
@@ -1944,6 +2022,9 @@ fn main() {
     let agent = deadlines.agent();
     let mut last_report_rtt_ms: Option<u64> = None;
     let mut consecutive_failures = 0_u32;
+    if interval.is_some() && write_beacon_health(Path::new(BEACON_HEALTH_PATH), 0).is_err() {
+        eprintln!("pharos-beacon: could not initialize container health state");
+    }
     systemd_notify("READY=1\nSTATUS=Waiting for first successful report");
 
     loop {
@@ -2037,6 +2118,9 @@ fn main() {
                 let status = resp.status().as_u16();
                 last_report_rtt_ms = Some(report_rtt_millis(started.elapsed()));
                 consecutive_failures = 0;
+                if write_beacon_health(Path::new(BEACON_HEALTH_PATH), now_unix()).is_err() {
+                    eprintln!("pharos-beacon: could not refresh container health state");
+                }
                 systemd_notify("WATCHDOG=1\nSTATUS=Last report succeeded");
                 println!(
                     "{}",
@@ -2852,6 +2936,46 @@ mod tests {
         assert!(RequestDeadlines::for_cadence(MAX_HEARTBEAT_INTERVAL_SECS + 1).is_err());
         assert!(retry_delay(60, 2, 0) > retry_delay(60, 1, 0));
         assert_ne!(retry_delay(60, 1, 0), retry_delay(60, 1, 499));
+    }
+
+    #[test]
+    fn beacon_health_tracks_recent_success_and_stalled_reporting() {
+        let path = kernel_fixture("container-health");
+        write_beacon_health(&path, 1_000).expect("write successful report health");
+
+        assert!(beacon_health_is_fresh(&path, 60, 1_180));
+        assert!(!beacon_health_is_fresh(&path, 60, 1_181));
+
+        std::fs::remove_file(path).expect("remove health fixture");
+    }
+
+    #[test]
+    fn beacon_health_fails_closed_before_success_or_for_invalid_state() {
+        let path = kernel_fixture("invalid-container-health");
+        assert!(!beacon_health_is_fresh(&path, 60, 1_000));
+
+        write_beacon_health(&path, 0).expect("write startup health state");
+        assert!(!beacon_health_is_fresh(&path, 60, 1_000));
+        assert!(!beacon_health_is_fresh(&path, 60, -1));
+
+        std::fs::write(&path, "not-health\n").expect("write invalid health state");
+        assert!(!beacon_health_is_fresh(&path, 60, 1_000));
+        assert!(!beacon_health_is_fresh(
+            &path,
+            MIN_HEARTBEAT_INTERVAL_SECS - 1,
+            1_000
+        ));
+
+        std::fs::remove_file(path).expect("remove health fixture");
+    }
+
+    #[test]
+    fn shared_image_healthcheck_dispatches_beacon_and_server_roles() {
+        let dockerfile = include_str!("../../../Dockerfile");
+
+        assert!(dockerfile.contains(r#"if [ -n "${PHAROS_URL:-}" ]; then"#));
+        assert!(dockerfile.contains("exec /usr/local/bin/pharos-beacon healthcheck"));
+        assert!(dockerfile.contains("exec /usr/local/bin/pharosd healthcheck"));
     }
 
     #[test]
