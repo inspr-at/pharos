@@ -4116,7 +4116,18 @@ async fn disconnect_hetzner_provider(
 #[tokio::main]
 async fn main() {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
-        std::process::exit(if container_healthcheck().await { 0 } else { 1 });
+        // Container probe (PHAROS-203): every verdict carries its reason so
+        // `docker inspect --format '{{json .State.Health}}'` is diagnosable.
+        match container_healthcheck().await {
+            Ok(detail) => {
+                println!("pharosd healthcheck: {detail}");
+                std::process::exit(0);
+            }
+            Err(reason) => {
+                eprintln!("pharosd healthcheck: {reason}");
+                std::process::exit(1);
+            }
+        }
     }
 
     tracing_subscriber::fmt()
