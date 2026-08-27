@@ -19,7 +19,7 @@ let openHostActionsRoot=null;
 let hostActionContext=null;
 let hostActionReturnFocus=null;
 let fleetHostsByName=new Map();
-const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:''};
+const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:'',terminal:false};
 function setHostActionPollSuspended(suspended){
   const overlay=document.querySelector('[data-host-action-overlay]');
   if(overlay)overlay.dataset.suspended=suspended?'true':'false';
@@ -36,6 +36,7 @@ function stopHostActionPoll(){
   hostActionPoll.id=null;
   hostActionPoll.failures=0;
   hostActionPoll.lastRevision='';
+  hostActionPoll.terminal=false;
 }
 function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
 function closeHostActions(root=openHostActionsRoot,restore=false){
@@ -154,8 +155,10 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
   const facts=dialog.querySelector('[data-host-action-facts]');
   const workflow=dialog.querySelector('[data-host-workflow]');
   const status=dialog.querySelector('[data-host-action-status]');
+  const safeNote=dialog.querySelector('[data-host-action-safe-note]');
   dialog.dataset.workflow='false';
   if(status)status.textContent='';
+  if(safeNote){safeNote.dataset.workflowLive='false';safeNote.textContent='Reviewable and recorded'}
   if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
   if(cancel)cancel.textContent='Close';
   if(cancelRequest){cancelRequest.hidden=true;cancelRequest.disabled=false}
@@ -328,6 +331,7 @@ function hostActionConfirmationReady(){
   return input?.value===hostActionContext?.host&&attended?.checked===true;
 }
 function scheduleHostActionPoll(id,delay=2000){
+  if(hostActionPoll.terminal)return;
   if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
   hostActionPoll.timer=null;
   hostActionPoll.id=id;
@@ -341,7 +345,8 @@ function scheduleHostActionPoll(id,delay=2000){
 }
 function hostActionPollDelay(job){
   const kind=job?.workflow?.kind;
-  if(kind==='settings_change'||kind==='remove_host')return 10000;
+  if(kind==='settings_change')return 2000;
+  if(kind==='remove_host')return 10000;
   return job?.state==='rebooting'?5000:2000;
 }
 function renderHostActionJob(job,message,workflowHtml){
@@ -381,7 +386,15 @@ function renderHostActionJob(job,message,workflowHtml){
   if(info)info.hidden=true;
   if(facts)facts.hidden=true;
   if(workflowRoot){workflowRoot.hidden=false;workflowRoot.innerHTML=workflowHtml||''}
-  if(safeNote)safeNote.textContent='Persisted and reviewable';
+  const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
+    ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
+    ||(workflowKind==='remove_host'&&job.state==='removal_pending');
+  hostActionPoll.terminal=!active;
+  if(safeNote){
+    const liveSettings=workflowKind==='settings_change'&&active;
+    safeNote.dataset.workflowLive=liveSettings?'true':'false';
+    safeNote.textContent=liveSettings?'Watching for recorded host evidence':active?'Persisted and reviewable':'Run complete and saved';
+  }
   if(status)status.textContent=message||'';
   if(cancel)cancel.textContent='Close';
   if(cancelRequest){
@@ -409,14 +422,17 @@ function renderHostActionJob(job,message,workflowHtml){
   }else if(primary){
     primary.hidden=true;
   }
-  const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
-    ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
-    ||(workflowKind==='remove_host'&&job.state==='removal_pending');
   if(active)scheduleHostActionPoll(job.id,hostActionPollDelay(job));
+  else{
+    if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+    hostActionPoll.timer=null;
+    setHostActionPollSuspended(false);
+  }
 }
 async function pollHostActionJob(id,immediate=false){
   if(!hostActionContext||hostActionContext.jobId&&hostActionContext.jobId!==id)return;
   hostActionPoll.timer=null;
+  if(hostActionPoll.terminal)return;
   if(document.hidden||!navigator.onLine){hostActionPoll.id=id;setHostActionPollSuspended(true);return}
   setHostActionPollSuspended(false);
   hostActionPoll.controller?.abort();

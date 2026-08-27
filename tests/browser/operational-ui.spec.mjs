@@ -2193,6 +2193,204 @@ test("system update uncertainty dialog acknowledges and retries once", async ({
   fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
 });
 
+test("settings no-run-on-single-field keeps color and host type as drafts", async ({
+  page,
+}, testInfo) => {
+  const host = `settings-draft-field-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  let requestPosts = 0;
+  page.on("request", (request) => {
+    if (
+      request.url().includes("/agora/requests/host-preferences.json") &&
+      request.method() === "POST"
+    ) {
+      requestPosts += 1;
+    }
+  });
+
+  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.locator("[data-color]").evaluate((input) => {
+    input.value = "#48b8a8";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.locator("[data-settings-status]")).toHaveText(
+    "Draft only — no request sent.",
+  );
+  await expect(page.locator("[data-review-settings]")).toBeEnabled();
+  let snapshot = await page.request.get("/hosts.json").then((response) => response.json());
+  let hostData = snapshot.hosts.find((entry) => entry.name === host);
+  expect(hostData.requested_preferences).toBeNull();
+  expect(hostData.lifecycle.run_id).toBeNull();
+  expect(requestPosts).toBe(0);
+
+  await page.locator("[data-discard-settings]").click();
+  await page.locator("[data-advanced]").evaluate((details) => {
+    details.open = true;
+  });
+  await page.locator("[data-host-kind]").selectOption("workstation");
+  await expect(page.locator("[data-settings-status]")).toHaveText(
+    "Draft only — no request sent.",
+  );
+  snapshot = await page.request.get("/hosts.json").then((response) => response.json());
+  hostData = snapshot.hosts.find((entry) => entry.name === host);
+  expect(hostData.requested_preferences).toBeNull();
+  expect(hostData.lifecycle.run_id).toBeNull();
+  expect(requestPosts).toBe(0);
+});
+
+test("settings discard-is-clean closes review without a request", async ({
+  page,
+}, testInfo) => {
+  const host = `settings-draft-discard-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  let requestPosts = 0;
+  page.on("request", (request) => {
+    if (
+      request.url().includes("/agora/requests/host-preferences.json") &&
+      request.method() === "POST"
+    ) {
+      requestPosts += 1;
+    }
+  });
+
+  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.locator("[data-color]").evaluate((input) => {
+    input.value = "#48b8a8";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.locator("[data-review-settings]").click();
+  const dialog = page.getByRole("dialog", { name: `Confirm changes for ${host}` });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Discard draft" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.locator("[data-color]")).toHaveValue("#224466");
+  await expect(page.locator("[data-review-settings]")).toBeDisabled();
+  const snapshot = await page.request.get("/hosts.json").then((response) => response.json());
+  const hostData = snapshot.hosts.find((entry) => entry.name === host);
+  expect(hostData.requested_preferences).toBeNull();
+  expect(hostData.lifecycle.run_id).toBeNull();
+  expect(requestPosts).toBe(0);
+});
+
+test("settings confirm-creates-one-run and opens the workflow sheet", async ({
+  page,
+}, testInfo) => {
+  const host = `settings-draft-confirm-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  const settingsResponses = [];
+  page.on("response", async (response) => {
+    if (
+      response.url().includes("/agora/requests/host-preferences.json") &&
+      response.request().method() === "POST"
+    ) {
+      settingsResponses.push(response);
+    }
+  });
+
+  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.locator("[data-color]").evaluate((input) => {
+    input.value = "#48b8a8";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.locator("[data-review-settings]").click();
+  const dialog = page.getByRole("dialog", { name: `Confirm changes for ${host}` });
+  await expect(dialog).toContainText("Host color: #224466 → #48b8a8");
+  await expect(dialog).toContainText(`Pharos pending preferences for ${host}`);
+  await expect(dialog).toContainText(
+    "Pharos will not close or merge a nixcfg proposal.",
+  );
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes("/agora/requests/host-preferences.json") &&
+      response.request().method() === "POST",
+  );
+  await dialog.getByRole("button", { name: "Confirm change request" }).click();
+  const response = await responsePromise;
+  expect(response.ok()).toBe(true);
+  const payload = await response.json();
+  await expect(page.getByRole("dialog", { name: `Change ${host} settings` })).toBeVisible();
+  await expect(page.locator("[data-host-workflow]")).toContainText("Wait for the host");
+  expect(settingsResponses).toHaveLength(1);
+  const snapshot = await page.request.get("/hosts.json").then((result) => result.json());
+  const hostData = snapshot.hosts.find((entry) => entry.name === host);
+  expect(hostData.requested_preferences.accent).toBe("#48b8a8");
+  expect(hostData.lifecycle.run_id).toBe(payload.job.id);
+});
+
+test("settings sheet live wait advances only from host evidence and stops terminal polling", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(30_000);
+  const host = `settings-live-wait-${testInfo.project.name}`;
+  const desired = {
+    accent: "#48b8a8",
+    kind: "server",
+    alerts: {
+      suppress_down: false,
+      suppress_backup: false,
+      suppress_nix_freshness: false,
+    },
+  };
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  const requestedUrls = [];
+  page.on("request", (request) => requestedUrls.push(request.url()));
+
+  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.locator("[data-color]").evaluate((input) => {
+    input.value = "#48b8a8";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.locator("[data-review-settings]").click();
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes("/agora/requests/host-preferences.json") &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Confirm change request" }).click();
+  const requestPayload = await (await responsePromise).json();
+  const runId = requestPayload.job.id;
+  const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  await expect(dialog.locator("[data-host-action-safe-note]")).toHaveAttribute(
+    "data-workflow-live",
+    "true",
+  );
+  await expect(dialog.locator('[data-step-state="waiting"]')).toHaveAttribute(
+    "data-waiting-for-evidence",
+    "true",
+  );
+  await expect(dialog.locator('[data-step-state="waiting"]')).toHaveAttribute(
+    "aria-busy",
+    "true",
+  );
+  await expect(dialog.locator('[data-ladder-key="verified"]')).not.toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+  );
+
+  await reportRuntimeHost(page, host, { preferences: desired });
+  await expect(dialog.locator('[data-ladder-key="executed"]')).toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+    { timeout: 8_000 },
+  );
+  await expect(dialog.locator('[data-ladder-key="verified"]')).toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+  );
+  await expect(dialog.locator("[data-host-action-safe-note]")).toHaveAttribute(
+    "data-workflow-live",
+    "false",
+  );
+  const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  const terminalPollCount = requestedUrls.filter((url) => url.includes(jobPath)).length;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(2_500);
+  expect(requestedUrls.filter((url) => url.includes(jobPath))).toHaveLength(
+    terminalPollCount,
+  );
+  expect(requestedUrls.some((url) => url.includes("fleet.barta.cm"))).toBe(false);
+});
+
 test("settings dispatch uncertainty stays recoverable after page reload", async ({
   page,
 }, testInfo) => {
@@ -2245,14 +2443,21 @@ test("settings dispatch uncertainty stays recoverable after page reload", async 
   const uncertainJobId = uncertainPayload.job.id;
 
   await page.goto(`/agora?host=${encodeURIComponent(host)}`);
-  const save = page.locator("[data-save-color]");
-  await expect(save).toBeVisible();
+  await page.locator("[data-color]").evaluate((input) => {
+    input.value = "#d45d5d";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const review = page.locator("[data-review-settings]");
+  await expect(review).toBeEnabled();
+  await review.click();
+  const confirm = page.getByRole("button", { name: "Confirm change request" });
+  await expect(confirm).toBeVisible();
   const activeConflict = page.waitForResponse(
     (response) =>
       response.url().includes("/agora/requests/host-preferences.json") &&
       response.request().method() === "POST",
   );
-  await save.click();
+  await confirm.click();
   const conflictResponse = await activeConflict;
   expect(conflictResponse.status()).toBe(409);
   const conflictPayload = await conflictResponse.json();

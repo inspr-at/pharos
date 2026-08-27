@@ -749,6 +749,9 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
     let mut current_group = "";
     for (index, step) in workflow.steps.iter().enumerate() {
         let current = workflow.current_step.as_deref() == Some(step.key.as_str());
+        let waiting_for_evidence = workflow.kind == host_actions::HostWorkflowKind::SettingsChange
+            && current
+            && step.state.key() == "waiting";
         let state_label = workflow_step_presentation_label(workflow, step);
         let location_label = step.location.label(&workflow.host);
         let current_attribute = if current {
@@ -777,10 +780,11 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
             ));
         }
         groups.push_str(&format!(
-            r#"<div class="host-workflow-step" role="listitem" data-step-state="{state}" data-current="{current}" aria-busy="{busy}"{current_attribute}><span class="host-workflow-marker" aria-hidden="true"></span><span class="host-workflow-step-copy"><strong>{number}. {label}</strong><span>{detail}</span></span><span class="host-workflow-step-state" aria-label="{state_aria}"><span>{state_label}</span>{location}</span></div>"#,
+            r#"<div class="host-workflow-step" role="listitem" data-step-state="{state}" data-current="{current}" data-waiting-for-evidence="{waiting_for_evidence}" aria-busy="{busy}"{current_attribute}><span class="host-workflow-marker" aria-hidden="true"></span><span class="host-workflow-step-copy"><strong>{number}. {label}</strong><span>{detail}</span></span><span class="host-workflow-step-state" aria-label="{state_aria}"><span>{state_label}</span>{location}</span></div>"#,
             state = step.state.key(),
             current = current,
-            busy = step.state.key() == "running",
+            waiting_for_evidence = waiting_for_evidence,
+            busy = step.state.key() == "running" || waiting_for_evidence,
             current_attribute = current_attribute,
             number = index + 1,
             label = html_escape(&step.label),
@@ -5447,6 +5451,9 @@ mod tests {
     fn host_action_dialog_uses_one_suspendable_poll_lifecycle() {
         assert!(FOOT.contains("function pauseHostActionPoll()"));
         assert!(FOOT.contains("function stopHostActionPoll()"));
+        assert!(FOOT.contains("if(hostActionPoll.terminal)return;"));
+        assert!(FOOT.contains("hostActionPoll.terminal=!active;"));
+        assert!(FOOT.contains("Watching for recorded host evidence"));
         assert!(FOOT.contains("function scheduleHostActionPoll(id,delay=2000)"));
         assert!(FOOT.contains("hostActionPoll.timer=null;\n    pollHostActionJob(id,false);"));
         assert!(FOOT.contains("if(document.hidden){pauseHostActionPoll();return}"));
@@ -5461,9 +5468,8 @@ mod tests {
         assert!(FOOT.contains("stopHostActionPoll();\n  if(overlay.hidden)return;"));
         assert!(!FOOT.contains("setInterval("));
         assert!(HEAD.contains("animation-duration:3.2s;animation-timing-function:steps(4,end)"));
-        assert!(HEAD.contains(
-            ".host-action-overlay[data-suspended=\"true\"] .host-workflow-step[data-step-state=\"running\"] .host-workflow-marker:before{animation-play-state:paused}"
-        ));
+        assert!(HEAD.contains(r#"data-waiting-for-evidence="true""#));
+        assert!(HEAD.contains(r#"data-workflow-live="true""#));
     }
 
     #[test]
@@ -5483,8 +5489,9 @@ mod tests {
                 .summary()
                 .workflow,
         );
-        assert!(running_html
-            .contains(r#"data-step-state="running" data-current="true" aria-busy="true""#));
+        assert!(running_html.contains(
+            r#"data-step-state="running" data-current="true" data-waiting-for-evidence="false" aria-busy="true""#
+        ));
         assert!(running_html.contains(r#"aria-current="step""#));
         assert!(running_html.contains("<small>on hsb8</small>"));
         assert!(running_html.contains(r#"role="listitem""#));
@@ -5500,7 +5507,7 @@ mod tests {
         assert_eq!(running_html.matches(r#"aria-busy="true""#).count(), 1);
         assert!(HEAD.contains("@keyframes host-workflow-spin"));
         assert!(HEAD.contains(
-            ".host-workflow-step[data-step-state=\"running\"] .host-workflow-marker:before,.asof[data-refresh-state=\"syncing\"]:before{animation:none}"
+            ".host-workflow-step[data-waiting-for-evidence=\"true\"] .host-workflow-marker:before"
         ));
         let reviewed = store
             .record_agent_result(
@@ -5538,6 +5545,32 @@ mod tests {
         assert!(html.contains(&job.id));
         assert!(html.contains("Recorded span"));
         assert!(!html.contains("/nix/store/"));
+    }
+
+    #[test]
+    fn settings_workflow_markup_marks_only_the_evidence_wait_as_live() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("hsb8", "markus", 1_700_000_200)
+            .expect("settings workflow created");
+        let waiting = store
+            .accept_settings_change(&job.id, 1_700_000_201)
+            .expect("settings request accepted");
+        let waiting_html = host_workflow_markup(&waiting.summary().workflow);
+        assert!(waiting_html.contains(
+            r#"data-step-state="waiting" data-current="true" data-waiting-for-evidence="true" aria-busy="true""#
+        ));
+        assert!(waiting_html.contains(r#"data-ladder-key="verified" data-ladder-state="pending""#));
+
+        let completed = store
+            .complete_settings_change("hsb8", 1_700_000_202)
+            .expect("settings completion persisted")
+            .expect("settings workflow completed");
+        let completed_html = host_workflow_markup(&completed.summary().workflow);
+        assert!(!completed_html.contains(r#"data-waiting-for-evidence="true""#));
+        assert!(
+            completed_html.contains(r#"data-ladder-key="verified" data-ladder-state="complete""#)
+        );
     }
 
     #[test]
