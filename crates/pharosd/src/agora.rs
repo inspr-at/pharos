@@ -56,16 +56,17 @@ const AGORA_CSS: &str = r#"<style>
 .host-color-task{padding:28px 14px 30px}.host-color-task h3{margin:0;font-size:16px}.host-color-task>p{margin:5px 0 0;color:var(--muted);font-size:13px}
 .host-color-choice{display:flex;align-items:center;flex-wrap:wrap;gap:15px;margin-top:20px}.host-color-well{width:48px;height:48px;flex:0 0 auto;padding:0;border:0;border-radius:50%;background:var(--picked-color);box-shadow:0 0 0 6px color-mix(in srgb,var(--picked-color) 12%,transparent),0 9px 22px color-mix(in srgb,var(--picked-color) 18%,transparent);cursor:pointer}.host-color-well::-webkit-color-swatch-wrapper{padding:0}.host-color-well::-webkit-color-swatch{border:0;border-radius:50%}
 .host-color-choice .preset-row{gap:13px}.host-color-choice .preset{width:31px;height:31px;box-shadow:0 0 0 3px color-mix(in srgb,var(--preset-color) 9%,transparent)}.host-color-choice .preset[aria-pressed="true"]{box-shadow:0 0 0 3px #fff,0 0 0 5px color-mix(in srgb,var(--preset-color) 58%,transparent)}
-.host-color-actions{display:flex;align-items:center;gap:12px;margin-top:22px}.host-color-actions .primary-action{min-width:126px}.settings-status{min-width:0;color:var(--muted);font-size:12px}.settings-status[data-state="pending"]{color:#9a5b00}.settings-status[data-state="applied"]{color:var(--live)}.settings-status[data-state="error"]{color:var(--down)}
+.host-color-actions{display:flex;align-items:center;gap:12px;margin-top:22px}.settings-status{min-width:0;color:var(--muted);font-size:12px}.settings-status[data-state="draft"]{color:#9a5b00}.settings-status[data-state="pending"]{color:#9a5b00}.settings-status[data-state="applied"]{color:var(--live)}.settings-status[data-state="error"]{color:var(--down)}
 .host-setup-note{margin-top:18px;padding:10px 12px;border-left:3px solid var(--sun);background:rgba(255,248,234,.62);color:var(--muted);font-size:12px}.host-setup-note strong{display:block;margin-bottom:2px;color:var(--ink)}
 .settings-disclosures{border-top:1px solid rgba(210,226,234,.86);border-bottom:1px solid rgba(210,226,234,.86)}.settings-disclosure+.settings-disclosure{border-top:1px solid rgba(210,226,234,.86)}
 .settings-disclosure>summary{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;min-height:58px;padding:0 14px;list-style:none;cursor:pointer}.settings-disclosure>summary::-webkit-details-marker{display:none}.settings-disclosure-title,.settings-disclosure-meta{display:flex;align-items:center;gap:10px;min-width:0}.settings-disclosure-title>.ico{width:17px;height:17px;color:#315d7c}.settings-disclosure-title strong{font-size:13px}.settings-disclosure-meta{color:var(--muted);font-size:12px}.settings-disclosure-meta>.ico{width:15px;height:15px;transition:transform .16s ease}.settings-disclosure[open] .settings-disclosure-meta>.ico{transform:rotate(180deg)}
 .settings-disclosure-body{padding:0 14px 20px}.preference-list{display:grid}.preference-row{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:54px;border-top:1px solid rgba(214,226,234,.62)}.preference-row:first-child{border-top:0}.preference-row strong{display:block;font-size:13px}.preference-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px}.preference-switch{position:relative;flex:0 0 auto;width:38px;height:22px}.preference-switch input{position:absolute;opacity:0;pointer-events:none}.preference-switch i{position:absolute;inset:0;border:1px solid rgba(137,151,163,.38);border-radius:999px;background:#edf2f4;transition:.16s}.preference-switch i:after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(45,75,95,.18);transition:.16s}.preference-switch input:checked+i{border-color:rgba(37,132,95,.36);background:rgba(37,132,95,.78)}.preference-switch input:checked+i:after{transform:translateX(16px)}.preference-switch input:focus-visible+i{outline:2px solid rgba(31,127,181,.42);outline-offset:2px}.preference-switch input:disabled+i{opacity:.52;cursor:not-allowed}
-.preference-actions{display:flex;align-items:center;gap:12px;margin-top:14px}.preference-actions .primary-action{min-height:38px;background:#fff;color:var(--ink)}.preference-actions .primary-action:hover{background:#f4fafb}
 .host-advanced{display:grid;gap:12px}.host-advanced-note{margin:0;color:var(--muted);font-size:12px}.host-advanced-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.host-advanced-meta div{min-width:0;padding:9px 10px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,252,253,.72)}.host-advanced-meta span,.host-advanced-meta strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.host-advanced-meta span{color:var(--muted);font-size:10px}.host-advanced-meta strong{margin-top:2px;font-size:11px}.host-advanced .review-output{min-height:120px;max-height:260px}
-.host-kind-row{display:grid;grid-template-columns:minmax(0,1fr) 180px auto;align-items:center;gap:12px;padding:11px 0;border-top:1px solid rgba(214,226,234,.62);border-bottom:1px solid rgba(214,226,234,.62)}.host-kind-copy strong,.host-kind-copy span{display:block}.host-kind-copy strong{font-size:13px}.host-kind-copy span{margin-top:2px;color:var(--muted);font-size:11px}.host-kind-row select{height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px;padding:0 10px}.host-kind-row .primary-action{min-height:38px;background:#fff;color:var(--ink)}
+.host-kind-row{display:grid;grid-template-columns:minmax(0,1fr) 180px;align-items:center;gap:12px;padding:11px 0;border-top:1px solid rgba(214,226,234,.62);border-bottom:1px solid rgba(214,226,234,.62)}.host-kind-copy strong,.host-kind-copy span{display:block}.host-kind-copy strong{font-size:13px}.host-kind-copy span{margin-top:2px;color:var(--muted);font-size:11px}.host-kind-row select{height:38px;border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:12px;padding:0 10px}
+.settings-draft-actions{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px 14px}.settings-draft-copy strong,.settings-draft-copy span{display:block}.settings-draft-copy strong{font-size:13px}.settings-draft-copy span{margin-top:2px;color:var(--muted);font-size:11px}.settings-draft-buttons{display:flex;align-items:center;gap:9px}.settings-draft-buttons button{min-height:38px}.settings-draft-buttons .secondary-action{border:1px solid rgba(210,226,234,.92);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:680;padding:0 13px;cursor:pointer}.settings-draft-buttons .secondary-action:disabled{opacity:.48;cursor:not-allowed}
+.settings-draft-review{display:grid;gap:12px;padding:13px 0;border-top:1px solid rgba(214,226,234,.72);border-bottom:1px solid rgba(214,226,234,.72)}.settings-draft-review h3,.settings-draft-review p{margin:0}.settings-draft-review h3{font-size:13px}.settings-draft-review p{color:var(--muted);font-size:11px;line-height:1.45}.settings-draft-review ul{display:grid;gap:7px;margin:0;padding:0;list-style:none}.settings-draft-review li{padding:8px 10px;border:1px solid rgba(210,226,234,.76);border-radius:7px;background:rgba(247,252,253,.72);font-size:11px}.settings-draft-review dl{display:grid;grid-template-columns:54px minmax(0,1fr);gap:5px 9px;margin:0;font-size:10px}.settings-draft-review dt{color:var(--muted)}.settings-draft-review dd{margin:0;color:#294761}
 .empty-settings{width:min(840px,100%);margin:26px auto 0;box-shadow:none}
-@media (max-width:640px){.host-picker{grid-template-columns:1fr;gap:6px}.host-settings-surface{margin-top:18px}.host-settings-identity,.host-color-task,.settings-disclosure>summary,.settings-disclosure-body{padding-left:4px;padding-right:4px}.host-color-choice{gap:13px}.host-color-actions,.preference-actions{align-items:stretch;flex-direction:column}.host-color-actions .primary-action,.preference-actions .primary-action{width:100%}.host-advanced-meta,.host-kind-row{grid-template-columns:1fr}.host-kind-row .primary-action{width:100%}}
+@media (max-width:640px){.host-picker{grid-template-columns:1fr;gap:6px}.host-settings-surface{margin-top:18px}.host-settings-identity,.host-color-task,.settings-disclosure>summary,.settings-disclosure-body,.settings-draft-actions{padding-left:4px;padding-right:4px}.host-color-choice{gap:13px}.host-advanced-meta,.host-kind-row{grid-template-columns:1fr}.settings-draft-actions,.settings-draft-buttons{align-items:stretch;flex-direction:column}.settings-draft-buttons{width:100%}.settings-draft-buttons button{width:100%}}
 </style>"#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -707,7 +708,7 @@ document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{
   window.location.assign('/agora?host='+encodeURIComponent(event.target.value));
 }});
 const root=document.querySelector('[data-color-root]');
-const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:'',failures:0}};
+const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:'',failures:0,terminal:false,mode:null,confirming:false}};
 function setSettingsWorkflowSuspended(suspended){{
   const overlay=document.querySelector('[data-host-action-overlay]');
   if(overlay)overlay.dataset.suspended=suspended?'true':'false';
@@ -727,11 +728,15 @@ function closeSettingsWorkflow(){{
   stopSettingsWorkflowPoll();
   settingsWorkflow.id=null;
   settingsWorkflow.lastRevision='';
+  settingsWorkflow.terminal=false;
+  settingsWorkflow.mode=null;
+  settingsWorkflow.confirming=false;
   const overlay=document.querySelector('[data-host-action-overlay]');
   if(overlay)overlay.hidden=true;
   document.body.removeAttribute('data-host-action-dialog-open');
 }}
-function scheduleSettingsWorkflowPoll(id,delay=10000){{
+function scheduleSettingsWorkflowPoll(id,delay=2000){{
+  if(settingsWorkflow.terminal)return;
   if(settingsWorkflow.timer!=null)clearTimeout(settingsWorkflow.timer);
   settingsWorkflow.timer=null;
   settingsWorkflow.id=id;
@@ -763,9 +768,14 @@ function renderSettingsWorkflow(data){{
   const technical=dialog.querySelector('[data-host-action-technical]');
   const checklist=dialog.querySelector('[data-host-workflow]');
   const primary=dialog.querySelector('[data-host-action-primary]');
+  const cancelRequest=dialog.querySelector('[data-host-action-cancel]');
   const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
   const status=dialog.querySelector('[data-host-action-status]');
   const safe=dialog.querySelector('[data-host-action-safe-note]');
+  const terminal=['succeeded','failed','cancelled'].includes(job.state);
+  settingsWorkflow.mode='workflow';
+  settingsWorkflow.confirming=false;
+  settingsWorkflow.terminal=terminal;
   if(info)info.hidden=true;
   if(facts)facts.hidden=true;
   if(technical)technical.hidden=true;
@@ -776,19 +786,27 @@ function renderSettingsWorkflow(data){{
     primary.dataset.workflowAction=primaryAction?.kind||'';
     primary.textContent=primaryAction?.label||'Continue';
   }}
+  if(cancelRequest){{cancelRequest.hidden=true;cancelRequest.disabled=false}}
   if(cancel)cancel.textContent='Close';
   if(status)status.textContent=data.message||'';
-  if(safe)safe.textContent='Persisted and reviewable';
+  if(safe){{
+    safe.dataset.workflowLive=terminal?'false':'true';
+    safe.textContent=terminal?'Run complete and saved':'Watching for recorded host evidence';
+  }}
   overlay.hidden=false;
   document.body.dataset.hostActionDialogOpen='true';
   settingsWorkflow.id=job.id;
   settingsWorkflow.lastRevision=[job.id,job.state,job.updated_at].join(':');
-  if(!['succeeded','failed','cancelled'].includes(job.state))scheduleSettingsWorkflowPoll(job.id);
+  if(terminal){{
+    if(settingsWorkflow.timer!=null)clearTimeout(settingsWorkflow.timer);
+    settingsWorkflow.timer=null;
+    setSettingsWorkflowSuspended(false);
+  }}else scheduleSettingsWorkflowPoll(job.id);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
 }}
 async function pollSettingsWorkflow(id){{
   settingsWorkflow.timer=null;
-  if(settingsWorkflow.id!==id)return;
+  if(settingsWorkflow.id!==id||settingsWorkflow.terminal)return;
   if(document.hidden||!navigator.onLine){{setSettingsWorkflowSuspended(true);return}}
   setSettingsWorkflowSuspended(false);
   settingsWorkflow.controller?.abort();
@@ -814,7 +832,7 @@ async function pollSettingsWorkflow(id){{
 document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
   if(event.target.closest('[data-host-action-close]')){{event.preventDefault();closeSettingsWorkflow()}}
   const acknowledge=event.target.closest('[data-host-action-primary]');
-  if(acknowledge&&settingsWorkflow.id){{
+  if(acknowledge&&settingsWorkflow.id&&settingsWorkflow.mode==='workflow'){{
     event.preventDefault();
     acknowledge.disabled=true;
     const recover=acknowledge.dataset.workflowAction==='recover';
@@ -835,13 +853,13 @@ document.querySelector('[data-host-action-overlay]')?.addEventListener('click',e
     }});
   }}
 }});
-document.addEventListener('keydown',event=>{{if(event.key==='Escape'&&settingsWorkflow.id){{event.preventDefault();closeSettingsWorkflow()}}}});
+document.addEventListener('keydown',event=>{{if(event.key==='Escape'&&(settingsWorkflow.id||settingsWorkflow.mode==='confirm')){{event.preventDefault();closeSettingsWorkflow()}}}});
 document.addEventListener('visibilitychange',()=>{{
   if(document.hidden){{pauseSettingsWorkflowPoll();return}}
-  if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0);
+  if(settingsWorkflow.id&&!settingsWorkflow.terminal)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0);
 }});
-window.addEventListener('focus',()=>{{if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)}});
-window.addEventListener('online',()=>{{if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)}});
+window.addEventListener('focus',()=>{{if(settingsWorkflow.id&&!settingsWorkflow.terminal)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)}});
+window.addEventListener('online',()=>{{if(settingsWorkflow.id&&!settingsWorkflow.terminal)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)}});
 window.addEventListener('offline',()=>{{pauseSettingsWorkflowPoll()}});
 window.addEventListener('pagehide',stopSettingsWorkflowPoll);
 if(root){{
@@ -855,6 +873,9 @@ if(root){{
   const kind=root.querySelector('[data-host-kind]');
   const downCopy=root.querySelector('[data-alert-down-copy]');
   let manualDownSuppressed=root.dataset.manualDownSuppressed==='true';
+  let savedPreferences=null;
+  let persistedStatusText=status?.textContent||'';
+  let persistedStatusState=status?.dataset.state||'idle';
   function setStatus(state,text){{if(!status)return;status.dataset.state=state;status.textContent=text}}
   function setPressed(value){{root.querySelectorAll('[data-preset]').forEach(button=>button.setAttribute('aria-pressed',String((button.dataset.preset||'').toLowerCase()===value.toLowerCase())))}}
   function setPicked(value){{
@@ -879,7 +900,7 @@ if(root){{
     if(downCopy)downCopy.textContent=workstation?'Off automatically for workstations.':'Warn when this host stops reporting.';
     updateAlertSummary();
   }}
-  function requestedPreferences(){{
+  function draftPreferences(){{
     return {{
       accent:color?.value||null,
       kind:kind?.value||root.dataset.kind||'server',
@@ -890,6 +911,105 @@ if(root){{
       }},
     }};
   }}
+  function preferenceChanges(before,after){{
+    const changes=[];
+    if(before.accent!==after.accent)changes.push('Host color: '+(before.accent||'default')+' → '+(after.accent||'default'));
+    if(before.kind!==after.kind)changes.push('Host type: '+before.kind+' → '+after.kind);
+    const alertLabels={{suppress_down:'Down alerts',suppress_backup:'Backup warnings',suppress_nix_freshness:'Nix freshness warnings'}};
+    Object.entries(alertLabels).forEach(([key,label])=>{{
+      if(before.alerts[key]!==after.alerts[key])changes.push(label+': '+(after.alerts[key]?'off':'on'));
+    }});
+    return changes;
+  }}
+  function updateDraftState(){{
+    if(!savedPreferences)return;
+    const changes=preferenceChanges(savedPreferences,draftPreferences());
+    const dirty=changes.length>0;
+    const summary=root.querySelector('[data-draft-summary]');
+    const review=root.querySelector('[data-review-settings]');
+    const discard=root.querySelector('[data-discard-settings]');
+    if(summary)summary.textContent=dirty?(changes.length+' unsent '+(changes.length===1?'change':'changes')):'Change a setting to prepare a review.';
+    if(review)review.disabled=!dirty||settingsWorkflow.confirming;
+    if(discard)discard.disabled=!dirty||settingsWorkflow.confirming;
+    if(dirty)setStatus('draft','Draft only — no request sent.');
+    else setStatus(persistedStatusState,persistedStatusText);
+  }}
+  function applyPreferences(preferences){{
+    setPicked(preferences.accent||'{accent}');
+    if(kind)kind.value=preferences.kind||'server';
+    manualDownSuppressed=preferences.alerts?.suppress_down===true;
+    if(backup)backup.checked=preferences.alerts?.suppress_backup!==true;
+    if(nix)nix.checked=preferences.alerts?.suppress_nix_freshness!==true;
+    syncDownAlertPolicy();
+    updateAlertSummary();
+  }}
+  function draftReviewSection(changes){{
+    const section=document.createElement('section');
+    section.className='settings-draft-review';
+    section.dataset.settingsDraftReview='true';
+    const heading=document.createElement('h3');
+    heading.textContent='What will be requested';
+    const list=document.createElement('ul');
+    changes.forEach(change=>{{const item=document.createElement('li');item.textContent=change;list.append(item)}});
+    const details=document.createElement('dl');
+    const addDetail=(label,value)=>{{const term=document.createElement('dt');term.textContent=label;const detail=document.createElement('dd');detail.textContent=value;details.append(term,detail)}};
+    const where=root.dataset.isNix==='true'
+      ? 'nixcfg · '+root.dataset.targetPath+' · '+root.dataset.targetAttribute
+      : 'Pharos pending preferences for '+root.dataset.host;
+    addDetail('Where',where);
+    addDetail('Will not','Pharos will not close or merge a nixcfg proposal.');
+    const note=document.createElement('p');
+    note.textContent='Confirmation creates one saved SettingsChange run. Applied state changes only after matching host evidence.';
+    section.append(heading,list,details,note);
+    return section;
+  }}
+  function openDraftConfirmation(){{
+    const changes=preferenceChanges(savedPreferences,draftPreferences());
+    if(!changes.length)return;
+    stopSettingsWorkflowPoll();
+    settingsWorkflow.id=null;
+    settingsWorkflow.lastRevision='';
+    settingsWorkflow.terminal=false;
+    settingsWorkflow.mode='confirm';
+    settingsWorkflow.confirming=false;
+    const overlay=document.querySelector('[data-host-action-overlay]');
+    const dialog=overlay?.querySelector('[data-host-action-dialog]');
+    if(!overlay||!dialog)return;
+    dialog.dataset.workflow='true';
+    dialog.dataset.action='settings-change';
+    dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{{icon.hidden=icon.dataset.actionIcon!=='settings-change'}});
+    const title=dialog.querySelector('[data-host-action-title]');
+    const copy=dialog.querySelector('[data-host-action-copy]');
+    const info=dialog.querySelector('[data-host-action-info]');
+    const facts=dialog.querySelector('[data-host-action-facts]');
+    const technical=dialog.querySelector('[data-host-action-technical]');
+    const checklist=dialog.querySelector('[data-host-workflow]');
+    const primary=dialog.querySelector('[data-host-action-primary]');
+    const discard=dialog.querySelector('[data-host-action-cancel]');
+    const close=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
+    const sheetStatus=dialog.querySelector('[data-host-action-status]');
+    const safe=dialog.querySelector('[data-host-action-safe-note]');
+    if(title)title.textContent='Confirm changes for '+root.dataset.host;
+    if(copy)copy.textContent='Review the draft before Pharos creates a saved settings workflow.';
+    if(info)info.hidden=true;
+    if(facts)facts.hidden=true;
+    if(technical)technical.hidden=true;
+    if(checklist){{checklist.hidden=false;checklist.replaceChildren(draftReviewSection(changes))}}
+    if(primary){{primary.hidden=false;primary.disabled=false;primary.dataset.workflowAction='confirm-settings';primary.textContent='Confirm change request'}}
+    if(discard){{discard.hidden=false;discard.disabled=false;discard.textContent='Discard draft'}}
+    if(close)close.textContent='Keep editing';
+    if(sheetStatus)sheetStatus.textContent='No request has been sent.';
+    if(safe){{safe.dataset.workflowLive='false';safe.textContent='Draft only — confirmation required'}}
+    overlay.hidden=false;
+    document.body.dataset.hostActionDialogOpen='true';
+    requestAnimationFrame(()=>primary?.focus());
+  }}
+  function discardDraft(){{
+    if(!savedPreferences)return;
+    applyPreferences(savedPreferences);
+    updateDraftState();
+    closeSettingsWorkflow();
+  }}
   async function loadReview(){{
     if(!output||root.dataset.ready!=='true')return;
     output.textContent='Preparing declarative details...';
@@ -899,35 +1019,64 @@ if(root){{
       output.textContent=res.ok?data.patch.value:(data.error||'Details unavailable');
     }}catch(_){{output.textContent='Details unavailable'}}
   }}
-  async function savePreferences(button){{
+  async function confirmSettingsDraft(button){{
+    if(settingsWorkflow.mode!=='confirm'||settingsWorkflow.confirming)return;
+    settingsWorkflow.confirming=true;
     button.disabled=true;
-    setStatus('pending','Saving request...');
+    root.querySelector('[data-discard-settings]')?.setAttribute('disabled','');
+    const discard=document.querySelector('[data-host-action-cancel]');
+    if(discard)discard.disabled=true;
+    const sheetStatus=document.querySelector('[data-host-action-status]');
+    if(sheetStatus)sheetStatus.textContent='Creating one saved settings request…';
     try{{
       const res=await fetch('/agora/requests/host-preferences.json',{{
         method:'POST',
         headers:{{Accept:'application/json','Content-Type':'application/json'}},
-        body:JSON.stringify({{host:root.dataset.host,preferences:requestedPreferences()}}),
+        body:JSON.stringify({{host:root.dataset.host,preferences:draftPreferences()}}),
       }});
       const data=await res.json();
       if(data.job)renderSettingsWorkflow(data);
-      if(!res.ok)throw new Error(data.error||'Request failed');
-      if(data.status==='applied')setStatus('applied','Already active on this host.');
-      else if(data.status==='dispatch_accepted')setStatus('pending','Change requested. Validation is running.');
-      else setStatus('pending','Saved. Waiting for the host.');
+      if(!res.ok){{
+        if(data.job){{setStatus('error',data.error||'Request already exists.');return}}
+        throw new Error(data.error||'Request failed');
+      }}
+      savedPreferences=draftPreferences();
+      if(data.status==='applied')persistedStatusText='Already active on this host.';
+      else if(data.status==='dispatch_accepted')persistedStatusText='Change requested. Validation is running.';
+      else persistedStatusText='Saved. Waiting for the host.';
+      persistedStatusState=data.status==='applied'?'applied':'pending';
+      setStatus(persistedStatusState,persistedStatusText);
+      const summary=root.querySelector('[data-draft-summary]');
+      if(summary)summary.textContent='Request confirmed. Continue in the workflow sheet.';
+      root.querySelector('[data-review-settings]')?.setAttribute('disabled','');
+      root.querySelector('[data-discard-settings]')?.setAttribute('disabled','');
       await loadReview();
-    }}catch(error){{setStatus('error',error.message||'Request failed')}}
-    finally{{button.disabled=false}}
+    }}catch(error){{
+      settingsWorkflow.confirming=false;
+      setStatus('error',error.message||'Request failed');
+      if(sheetStatus)sheetStatus.textContent=error.message||'Request failed';
+      button.disabled=false;
+      if(discard)discard.disabled=false;
+      updateDraftState();
+    }}
   }}
-  color?.addEventListener('input',event=>setPicked(event.target.value));
-  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>setPicked(button.dataset.preset)));
-  root.querySelector('[data-save-color]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
-  root.querySelector('[data-save-alerts]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
-  root.querySelector('[data-save-kind]')?.addEventListener('click',event=>savePreferences(event.currentTarget));
-  down?.addEventListener('change',()=>{{manualDownSuppressed=!down.checked;updateAlertSummary()}});
-  [backup,nix].forEach(input=>input?.addEventListener('change',updateAlertSummary));
-  kind?.addEventListener('change',syncDownAlertPolicy);
+  color?.addEventListener('input',event=>{{setPicked(event.target.value);updateDraftState()}});
+  root.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>{{setPicked(button.dataset.preset);updateDraftState()}}));
+  root.querySelector('[data-review-settings]')?.addEventListener('click',openDraftConfirmation);
+  root.querySelector('[data-discard-settings]')?.addEventListener('click',discardDraft);
+  down?.addEventListener('change',()=>{{manualDownSuppressed=!down.checked;updateAlertSummary();updateDraftState()}});
+  [backup,nix].forEach(input=>input?.addEventListener('change',()=>{{updateAlertSummary();updateDraftState()}}));
+  kind?.addEventListener('change',()=>{{syncDownAlertPolicy();updateDraftState()}});
+  document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
+    const primary=event.target.closest('[data-host-action-primary]');
+    if(primary&&settingsWorkflow.mode==='confirm'){{event.preventDefault();confirmSettingsDraft(primary);return}}
+    const discard=event.target.closest('[data-host-action-cancel]');
+    if(discard&&settingsWorkflow.mode==='confirm'){{event.preventDefault();discardDraft()}}
+  }});
   setPicked(color?.value||'{accent}');
   syncDownAlertPolicy();
+  savedPreferences=draftPreferences();
+  updateDraftState();
 }}
 </script></div></body></html>"##,
         header = crate::page_header(
@@ -1003,7 +1152,7 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         String::new()
     } else if host.has_reported {
         format!(
-            r#"<div class="host-setup-note"><strong>Prepare host settings</strong>Saving creates a pending request for {name}. It becomes active only after the host applies and reports it.</div>"#,
+            r#"<div class="host-setup-note"><strong>Prepare host settings</strong>Editing creates a local draft for {name}. Only the confirmation sheet sends a request, and it becomes active only after the host applies and reports it.</div>"#,
             name = html_escape(&host.name)
         )
     } else {
@@ -1076,10 +1225,11 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         ""
     };
     format!(
-        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-kind="{kind}" data-manual-down-suppressed="{manual_down_suppressed}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><button class="primary-action" type="button" data-save-color{disabled}>{color_action}</button><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span data-alert-down-copy>{down_copy}</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{down_disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div><div class="preference-actions"><button class="primary-action" type="button" data-save-alerts{disabled}>Save alert preferences</button></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select><button class="primary-action" type="button" data-save-kind{disabled}>Save host type</button></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section></section>"##,
+        r##"<section class="host-settings-surface" data-color-root data-host="{host_name}" data-ready="{ready}" data-host-reported="{has_reported}" data-is-nix="{is_nix}" data-kind="{kind}" data-manual-down-suppressed="{manual_down_suppressed}" data-target-path="{target_path}" data-target-attribute="{target_attribute}" style="--picked-color:{accent}"><header class="host-settings-identity"><span class="host-settings-badge">{badge}</span><div><h2>{host_name}</h2><p>{role}</p></div></header><section class="host-color-task"><h3>Host color</h3><p>Used to identify this host across Pharos.</p>{setup_note}<div class="host-color-choice"><input class="host-color-well" data-color type="color" value="{accent}" aria-label="Choose a custom host color"{disabled}><div class="preset-row" aria-label="Preset host colors">{presets}</div></div><div class="host-color-actions"><span class="settings-status" data-settings-status data-state="{status_state}" role="status" aria-live="polite">{pending_copy}</span></div></section><section class="settings-disclosures"><details class="settings-disclosure"><summary><span class="settings-disclosure-title">{bell}<strong>Alert preferences</strong></span><span class="settings-disclosure-meta"><span data-alert-summary>{enabled_alerts} on</span>{chevron}</span></summary><div class="settings-disclosure-body"><div class="preference-list"><label class="preference-row"><span><strong>Down alerts</strong><span data-alert-down-copy>{down_copy}</span></span><span class="preference-switch"><input data-alert-down type="checkbox"{down_checked}{down_disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Backup warnings</strong><span>Warn when backup evidence needs attention.</span></span><span class="preference-switch"><input data-alert-backup type="checkbox"{backup_checked}{disabled}><i aria-hidden="true"></i></span></label><label class="preference-row"><span><strong>Nix freshness warnings</strong><span>Warn when this host falls behind nixcfg.</span></span><span class="preference-switch"><input data-alert-nix type="checkbox"{nix_checked}{disabled}><i aria-hidden="true"></i></span></label></div></div></details><details class="settings-disclosure" data-advanced><summary><span class="settings-disclosure-title">{sliders}<strong>Advanced</strong></span><span class="settings-disclosure-meta"><span>Declarative details</span>{chevron}</span></summary><div class="settings-disclosure-body host-advanced"><p class="host-advanced-note">{advanced_note}</p><div class="host-kind-row"><span class="host-kind-copy"><strong>Host type</strong><span>Controls whether continuous availability is expected.</span></span><select data-host-kind aria-label="Host type"{disabled}><option value="server"{server_selected}>Server</option><option value="workstation"{workstation_selected}>Workstation</option></select></div><div class="host-advanced-meta"><div><span>nixcfg target</span><strong>{target_path}</strong></div><div><span>Attribute</span><strong>{target_attribute}</strong></div></div><pre class="review-output" data-review-output>{initial_output}</pre></div></details></section><footer class="settings-draft-actions"><span class="settings-draft-copy"><strong>Draft changes</strong><span data-draft-summary>Change a setting to prepare a review.</span></span><span class="settings-draft-buttons"><button class="secondary-action" type="button" data-discard-settings disabled>Discard draft</button><button class="primary-action" type="button" data-review-settings disabled{disabled}>Review changes</button></span></footer></section>"##,
         host_name = html_escape(&host.name),
         ready = if ready { "true" } else { "false" },
         has_reported = if host.has_reported { "true" } else { "false" },
+        is_nix = if host.is_nix { "true" } else { "false" },
         disabled = if host.has_reported { "" } else { " disabled" },
         kind = shown_preferences.kind.label(),
         manual_down_suppressed = shown_preferences.alerts.suppress_down,
@@ -1088,13 +1238,6 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         badge = badge,
         setup_note = setup_note,
         presets = presets,
-        color_action = if ready {
-            "Save color"
-        } else if host.has_reported {
-            "Prepare host settings"
-        } else {
-            "Waiting for host"
-        },
         status_state = status_state,
         pending_copy = html_escape(pending_copy),
         bell = crate::icons::BELL,
@@ -1830,7 +1973,9 @@ mod tests {
         assert!(html.contains(r#"<select data-host-picker aria-label="Choose host">"#));
         assert!(html.contains(r#"<option value="hsb8" selected>"#));
         assert_eq!(html.matches(r#"type="color""#).count(), 1);
-        assert!(html.contains("Save color"));
+        assert!(html.contains("Review changes"));
+        assert!(html.contains("Discard draft"));
+        assert!(html.contains("Draft only — no request sent."));
         assert!(html.contains("Alert preferences"));
         assert!(html.contains("Down alerts"));
         assert!(html.contains("Backup warnings"));
@@ -1840,7 +1985,12 @@ mod tests {
         assert!(!html.contains(r#"<details class="settings-disclosure" open"#));
         assert!(html.contains("hosts.hsb8"));
         assert!(html.contains(r#"<select data-host-kind aria-label="Host type""#));
-        assert!(html.contains(r#"data-save-kind"#));
+        assert!(html.contains(r#"data-review-settings"#));
+        assert!(html.contains(r#"data-discard-settings"#));
+        assert!(!html.contains(r#"data-save-color"#));
+        assert!(!html.contains(r#"data-save-alerts"#));
+        assert!(!html.contains(r#"data-save-kind"#));
+        assert!(html.contains("Pharos will not close or merge a nixcfg proposal."));
         assert!(!html.contains(r#"class="settings-ia""#));
         assert!(!html.contains(r#"class="settings-workspace""#));
         assert!(!html.contains(r#"class="settings-host-table""#));
@@ -1879,7 +2029,9 @@ mod tests {
             html.contains("let manualDownSuppressed=root.dataset.manualDownSuppressed==='true'")
         );
         assert!(html.contains("suppress_down:manualDownSuppressed"));
-        assert!(html.contains("kind?.addEventListener('change',syncDownAlertPolicy)"));
+        assert!(html.contains(
+            "kind?.addEventListener('change',()=>{syncDownAlertPolicy();updateDraftState()})"
+        ));
 
         let server_html = render_page(
             &[manifest()],
@@ -1907,11 +2059,12 @@ mod tests {
 
         assert!(html.contains("function pauseSettingsWorkflowPoll()"));
         assert!(html.contains("function stopSettingsWorkflowPoll()"));
-        assert!(html.contains("function scheduleSettingsWorkflowPoll(id,delay=10000)"));
+        assert!(html.contains("function scheduleSettingsWorkflowPoll(id,delay=2000)"));
+        assert!(html.contains("if(settingsWorkflow.terminal)return"));
         assert!(html.contains("settingsWorkflow.timer=null;\n    pollSettingsWorkflow(id);"));
         assert!(html.contains("if(document.hidden){pauseSettingsWorkflowPoll();return}"));
         assert!(html.contains(
-            "window.addEventListener('focus',()=>{if(settingsWorkflow.id)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)})"
+            "window.addEventListener('focus',()=>{if(settingsWorkflow.id&&!settingsWorkflow.terminal)scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)})"
         ));
         assert!(
             html.contains("window.addEventListener('offline',()=>{pauseSettingsWorkflowPoll()})")
@@ -1975,13 +2128,13 @@ mod tests {
         );
 
         assert!(html.contains("Prepare host settings"));
-        assert!(html.contains("Saving creates a pending request for csb0"));
+        assert!(html.contains("Editing creates a local draft for csb0"));
         assert!(html.contains(r#"<option value="csb0" selected>"#));
         assert!(html.contains(r#"data-ready="false""#));
         assert!(html.contains(r#"data-host-reported="true""#));
         assert!(html.contains(r#"data-host="csb0""#));
         assert!(!html.contains("must report once"));
-        assert!(!html.contains(r#"data-save-color disabled"#));
+        assert!(html.contains(r#"data-review-settings disabled"#));
     }
 
     #[test]
@@ -2024,8 +2177,7 @@ mod tests {
         assert!(html.contains("csb0 must report once before settings can be requested"));
         assert!(html.contains(r#"<option value="csb0" selected>"#));
         assert!(html.contains(r#"data-host-reported="false""#));
-        assert!(html.contains(r#"data-save-color disabled"#));
-        assert!(html.contains("Waiting for host"));
+        assert!(html.contains(r#"data-review-settings disabled"#));
     }
 
     #[test]
