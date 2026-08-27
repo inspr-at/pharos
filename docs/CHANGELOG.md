@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.89 - 2026-08-27
+
+- Keep host setting edits local until an explicit review and confirmation creates exactly one saved SettingsChange request, with clean draft discard and clear requested consequences (PHAROS-225).
+- Follow a confirmed SettingsChange live through recorded host evidence, advancing the truth ladder only from matching reports and stopping polling once the workflow is terminal (PHAROS-226).
 - Make the shared container healthcheck role-aware: `pharosd` keeps its readiness probe while `pharos-beacon` becomes healthy after a successful report and unhealthy when reporting goes stale (PHAROS-204).
 
 ## 0.1.88 - 2026-08-27
