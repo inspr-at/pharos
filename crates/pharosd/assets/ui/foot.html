@@ -901,7 +901,7 @@ function backupInfo(host,now){
   return {state,level:BACKUP_LEVEL[state]||'watch',label,detail,total:observations.length,search:[label,detail,last,schedule,target].join(' ')};
 }
 function updateBackup(surface,info){
-  const el=surface.querySelector('[data-backup-state]');
+  const el=surface.querySelector('.backup-chip[data-backup-state]');
   if(!el)return;
   if(el.classList.contains('backup-chip')){
     const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
@@ -914,6 +914,9 @@ function updateBackup(surface,info){
     el.href='/backups?host='+encodeURIComponent(host);
     el.title='Backup: '+info.label+' - '+info.detail;
     el.setAttribute('aria-label','Backup for '+host+': '+info.label+', '+info.detail);
+    const shouldHide=info.state==='healthy';
+    if(shouldHide&&document.activeElement===el)surface.querySelector('[data-host-actions-trigger]')?.focus();
+    el.hidden=shouldHide;
   }
 }
 function setReason(surface,reason){

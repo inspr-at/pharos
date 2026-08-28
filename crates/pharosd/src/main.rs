@@ -5387,10 +5387,13 @@ mod tests {
 
         assert!(html.contains(r#"data-backup-state="healthy""#));
         assert_eq!(
-            html.matches(r#"class="header-chip backup-chip clear""#)
+            html.matches(r#"data-backup-state="healthy" data-backup-level="clear""#)
                 .count(),
             2
         );
+        assert!(html.contains(
+            r#"aria-label="Backup for athena: Protected, last success 2m 00s ago" hidden>"#
+        ));
         assert!(html.contains(r#"href="/backups?host=athena""#));
         assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
         assert!(
@@ -5423,6 +5426,23 @@ mod tests {
                 r#"<span class="header-chip-label" aria-hidden="true">Backup</span></a>"#
             ));
         }
+        let healthy_html = backup_chip_markup(
+            &backup_ui_summary(
+                &[backup_observation(BackupPostureState::Healthy)],
+                1_700_000_120,
+            ),
+            "athena",
+        );
+        assert!(healthy_html.contains(r#"data-backup-state="healthy""#));
+        assert!(healthy_html.contains(" hidden>"));
+        let failed_html = backup_chip_markup(
+            &backup_ui_summary(
+                &[backup_observation(BackupPostureState::Failed)],
+                1_700_000_120,
+            ),
+            "athena",
+        );
+        assert!(!failed_html.contains(" hidden>"));
     }
 
     #[test]
@@ -5431,14 +5451,81 @@ mod tests {
         assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
         assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
         assert!(HEAD.contains(".header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1"));
-        assert!(HEAD.contains(
+        assert!(HEAD.contains(".backup-chip[hidden]{display:none}"));
+        assert!(!HEAD.contains(
             ".card .backup-chip:not(:hover):not(:focus-visible){border-color:transparent;background:transparent;box-shadow:none}"
+        ));
+        assert!(HEAD.contains(
+            ".host-actions-trigger{color:#4c6780;border-color:rgba(188,211,222,.92);background:rgba(255,255,255,.88)"
         ));
         assert!(HEAD.contains(
             ".card .fresh-row-compact{position:relative;display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width);min-height:28px;padding:0 8px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,251,252,.82);outline:0;overflow:hidden}"
         ));
         assert!(HEAD.contains(".card .fresh-row-label{display:none}"));
         assert!(HEAD.contains(".card .fresh-row-label,.card .fresh-row strong{transition:none}"));
+    }
+
+    #[test]
+    fn fleet_card_header_actions_visible_backup_omitted_when_healthy() {
+        let healthy = {
+            let mut host = host_with_backups("healthy-header", 970, vec![]);
+            host.backup_observations = vec![backup_observation(BackupPostureState::Healthy)];
+            host
+        };
+        let failed = {
+            let mut host = host_with_backups("failed-header", 970, vec![]);
+            host.backup_observations = vec![backup_observation(BackupPostureState::Failed)];
+            host.requested_preferences = Some(HostPreferences {
+                accent: Some("#48b8a8".to_string()),
+                ..Default::default()
+            });
+            host
+        };
+        let html = render_home_with_capabilities(
+            runtime(&[healthy, failed], &[]),
+            "csb1",
+            1_700_000_120,
+            &[],
+            shell("markus", true),
+            FleetCapabilities {
+                can_onboard: true,
+                can_manage_fleet: true,
+                system_update_available: true,
+                host_removal_available: true,
+            },
+        );
+
+        assert_eq!(
+            html.matches(r#"class="header-chip host-actions-trigger""#)
+                .count(),
+            4
+        );
+        assert_eq!(
+            html.matches(r#"class="header-chip backup-chip clear""#)
+                .count(),
+            2
+        );
+        assert_eq!(
+            html.matches(r#"class="header-chip backup-chip critical""#)
+                .count(),
+            2
+        );
+        assert!(html.contains(
+            r#"aria-label="Backup for healthy-header: Protected, last success 2m 00s ago" hidden>"#
+        ));
+        let failed_card = rendered_card(&html, "failed-header");
+        let failed_chip = failed_card
+            .split_once(r#"class="header-chip backup-chip critical""#)
+            .map(|(_, tail)| tail.split_once('>').map_or(tail, |(tag, _)| tag))
+            .expect("failed backup chip rendered");
+        assert!(!failed_chip.contains(" hidden"));
+        assert_eq!(
+            html.matches(
+                r#"class="host-action-dot" data-host-action-dot aria-hidden="true"></span>"#
+            )
+            .count(),
+            2
+        );
     }
 
     #[test]
