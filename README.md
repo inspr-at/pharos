@@ -195,9 +195,13 @@ Each verdict prints its reason, visible with
 The beacon records its last successful report in
 `/tmp/pharos-beacon-health-v1` (`PHAROS_BEACON_HEALTH_FILE` overrides the
 path); a read-only container needs a writable tmpfs there. Every probe first
-proves it can perform the same atomic write the beacon uses (a temporary file
-created and removed next to the marker), so a leftover marker in a location
-the beacon cannot write is never trusted. The state is reset at startup, and a
+proves it can perform the same atomic write the beacon uses: it creates a
+temporary file next to the marker, hard-links the existing marker to a
+sibling name and renames the temporary over that link, so immutable flags,
+deny-delete ACLs or sticky-directory ownership that would refuse replacing the
+marker refuse the probe too, while the marker itself is never written or
+moved. A marker the beacon cannot replace is never trusted, however recent it
+reads. The state is reset at startup, and a
 reset that cannot write destroys any previous marker it can reach, so a
 restarted beacon stays unhealthy until it reports again and nothing outside
 the beacon can make it look healthy. Deployments that disabled

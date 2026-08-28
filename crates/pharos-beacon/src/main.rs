@@ -200,9 +200,9 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Unique sibling path used for the atomic temp+rename write of the health
-/// marker (and for probing that such a write is possible at all).
-fn beacon_health_temp_path(path: &Path, tag: &str) -> std::io::Result<PathBuf> {
+/// A hidden sibling of the marker, `.<marker>.<suffix>`, in the marker's own
+/// directory so that renaming it over the marker stays on one filesystem.
+fn beacon_health_sibling_path(path: &Path, suffix: &str) -> std::io::Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -218,11 +218,17 @@ fn beacon_health_temp_path(path: &Path, tag: &str) -> std::io::Result<PathBuf> {
                 "health path has no file name",
             )
         })?;
+    Ok(parent.join(format!(".{file_name}.{suffix}")))
+}
+
+/// Unique sibling path used for the atomic temp+rename write of the health
+/// marker (and for probing that such a write is possible at all).
+fn beacon_health_temp_path(path: &Path, tag: &str) -> std::io::Result<PathBuf> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    Ok(parent.join(format!(".{file_name}.{}.{nonce}.{tag}", std::process::id())))
+    beacon_health_sibling_path(path, &format!("{}.{nonce}.{tag}", std::process::id()))
 }
 
 fn create_beacon_health_temp(temporary: &Path) -> std::io::Result<File> {
@@ -248,52 +254,81 @@ fn write_beacon_health(path: &Path, last_success_at: i64) -> std::io::Result<()>
     write_result
 }
 
-/// Whether a marker can be replaced by rename: a sticky directory (such as
-/// `/tmp`) only lets the owner or root rename over an existing file.
-fn beacon_health_marker_replaceable(parent_sticky: bool, marker_uid: u32, own_uid: u32) -> bool {
-    !parent_sticky || own_uid == 0 || marker_uid == own_uid
+/// Fixed sibling name used to hard-link the existing marker while probing
+/// that it can be replaced. Fixed so a probe that could not clean up leaves
+/// at most one leftover, which the next probe removes or reports.
+fn beacon_health_probe_link_path(path: &Path) -> std::io::Result<PathBuf> {
+    beacon_health_sibling_path(path, "probe-link")
 }
 
-/// Proves that this process can perform the marker's atomic temp+rename write
-/// right now, by doing a real create+write+sync+remove next to the marker. A
-/// marker that cannot be reset or refreshed says nothing about the running
-/// beacon, however recent it reads (PHAROS-203).
+/// Proves that this process can perform the marker's atomic temp+rename
+/// write right now, without ever writing, moving or racing the marker's own
+/// name (PHAROS-203):
+///
+/// 1. create+write+sync a sibling temp file, exactly what the beacon writes;
+/// 2. when a marker exists, hard-link it to a sibling name and rename the temp
+///    over that link. The link shares the marker's inode, owner, flags and
+///    ACLs, so the kernel applies the checks `rename(temp, marker)` would
+///    face: immutable or append-only flags (`chflags uchg`, `chattr +i`),
+///    deny-delete ACLs or policies, and the sticky-directory rule (target
+///    owner, directory owner, or root). A marker that survives the beacon's
+///    reset and refresh says nothing about the running beacon, however
+///    recent it reads.
+///
+/// Both sibling names are removed afterwards; whatever remains is reported.
 fn probe_beacon_health_location(path: &Path) -> Result<(), String> {
     let temporary = beacon_health_temp_path(path, "probe").map_err(|err| err.to_string())?;
-    let probe = (|| -> std::io::Result<Option<u32>> {
-        let mut file = create_beacon_health_temp(&temporary)?;
-        file.write_all(b"probe\n")?;
-        file.sync_all()?;
-        #[cfg(unix)]
-        let own_uid = {
-            use std::os::unix::fs::MetadataExt;
-            Some(file.metadata()?.uid())
-        };
-        #[cfg(not(unix))]
-        let own_uid = None;
-        Ok(own_uid)
-    })();
-    let removed = std::fs::remove_file(&temporary);
-    let own_uid = probe.map_err(|err| err.to_string())?;
-    removed.map_err(|err| format!("could not remove probe file: {err}"))?;
-    #[cfg(unix)]
-    if let (Some(own_uid), Some(parent), Ok(marker)) =
-        (own_uid, path.parent(), std::fs::symlink_metadata(path))
-    {
-        use std::os::unix::fs::MetadataExt;
-        let parent_sticky = std::fs::metadata(parent)
-            .map(|metadata| metadata.mode() & 0o1000 != 0)
-            .unwrap_or(false);
-        if !beacon_health_marker_replaceable(parent_sticky, marker.uid(), own_uid) {
-            return Err(
-                "existing marker is owned by another user in a sticky directory, so it cannot be replaced"
-                    .to_string(),
-            );
+    let result = probe_beacon_health_location_with(path, &temporary);
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
+fn probe_beacon_health_location_with(path: &Path, temporary: &Path) -> Result<(), String> {
+    let mut file = create_beacon_health_temp(temporary)
+        .map_err(|err| format!("cannot create a temporary file next to the marker: {err}"))?;
+    file.write_all(b"probe\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|err| format!("cannot write a temporary file next to the marker: {err}"))?;
+    drop(file);
+
+    match std::fs::symlink_metadata(path) {
+        // No marker: the rename would create the name, and creating a file
+        // here was just proven. The read reports the missing state.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("cannot inspect the marker: {err}")),
+        // Not a file: cannot be a marker, and the read reports it as invalid.
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {}
+    }
+
+    let link = beacon_health_probe_link_path(path).map_err(|err| err.to_string())?;
+    if let Err(err) = std::fs::remove_file(&link) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!(
+                "a previous probe link {} cannot be removed: {err}",
+                link.display()
+            ));
         }
     }
-    #[cfg(not(unix))]
-    let _ = own_uid;
-    Ok(())
+    std::fs::hard_link(path, &link).map_err(|err| {
+        format!("the existing marker cannot be replaced (linking it was refused): {err}")
+    })?;
+    let replaced = std::fs::rename(temporary, &link).map_err(|err| {
+        format!("the existing marker cannot be replaced (renaming over a link to it was refused): {err}")
+    });
+    // On success the link name now holds the probe file; on failure it is
+    // still a second name for the marker. Remove it either way; a concurrent
+    // probe (a manual `healthcheck` next to the container's own) may already
+    // have removed it, which is fine.
+    let removed = match std::fs::remove_file(&link) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(format!(
+            "could not remove probe file {}: {err}",
+            link.display()
+        )),
+        _ => Ok(()),
+    };
+    replaced?;
+    removed
 }
 
 /// Best-effort destruction of a marker this beacon could not reset: truncate
@@ -3415,12 +3450,177 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("remove location");
     }
 
+    /// Applies the platform's file-level no-change protection to `path`
+    /// (`chflags uchg` on Darwin/BSD, `chattr +i` on Linux, which needs
+    /// CAP_LINUX_IMMUTABLE and an extN/XFS/Btrfs file). Returns whether the
+    /// protection is really in force, verified by a refused atomic replace.
+    #[cfg(unix)]
+    fn protect_marker(path: &Path) -> bool {
+        let applied = if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+            Command::new("chflags").arg("uchg").arg(path).status()
+        } else {
+            Command::new("chattr").arg("+i").arg(path).status()
+        };
+        if !applied.map(|status| status.success()).unwrap_or(false) {
+            return false;
+        }
+        if write_beacon_health(path, 1_005).is_ok() {
+            unprotect_marker(path);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn unprotect_marker(path: &Path) {
+        let _ = if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+            Command::new("chflags").arg("nouchg").arg(path).status()
+        } else {
+            Command::new("chattr").arg("-i").arg(path).status()
+        };
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list location")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
-    fn sticky_directory_markers_are_only_replaceable_by_owner_or_root() {
-        assert!(beacon_health_marker_replaceable(false, 1, 2));
-        assert!(beacon_health_marker_replaceable(true, 7, 7));
-        assert!(beacon_health_marker_replaceable(true, 7, 0));
-        assert!(!beacon_health_marker_replaceable(true, 7, 8));
+    fn beacon_health_rejects_readable_recent_marker_that_cannot_be_replaced() {
+        // Real regression: the directory is writable and the marker reads
+        // fine, yet a file-level no-change flag refuses replacement,
+        // truncation and removal alike. Root is subject to the flag too.
+        let dir = kernel_fixture("immutable-marker");
+        std::fs::create_dir(&dir).expect("create location");
+        let path = dir.join("pharos-beacon-health-v1");
+        write_beacon_health(&path, 1_000).expect("write recent marker");
+
+        #[cfg(unix)]
+        if protect_marker(&path) {
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("marker readable"),
+                "v1 1000\n"
+            );
+            let sibling = dir.join("sibling");
+            assert!(
+                std::fs::File::create(&sibling).is_ok(),
+                "location is writable"
+            );
+            std::fs::remove_file(&sibling).expect("remove sibling");
+            assert!(invalidate_beacon_health(&path).is_err());
+
+            let error = probe_beacon_health_location(&path).unwrap_err();
+            assert!(error.contains("cannot be replaced"), "{error}");
+            let verdict = beacon_health_verdict(&path, 60, 1_010).unwrap_err();
+            assert!(
+                matches!(verdict, BeaconHealthProblem::LocationUnwritable { .. }),
+                "{verdict:?}"
+            );
+            assert!(verdict.to_string().contains(&path.display().to_string()));
+            let reason = initialize_beacon_health(&path).unwrap_err();
+            assert!(
+                reason.contains("could not be invalidated either"),
+                "{reason}"
+            );
+
+            // The marker was neither damaged nor moved, and nothing was left
+            // behind next to it.
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("marker readable"),
+                "v1 1000\n"
+            );
+            assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
+
+            unprotect_marker(&path);
+            assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
+            assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
+        } else {
+            eprintln!(
+                "note: no file-level immutability available for this user/filesystem; \
+                 the injected-probe test carries the fail-closed proof here"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("remove location");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn beacon_health_rejects_marker_protected_by_a_deny_delete_acl() {
+        // ACL/policy analogue: linking the marker is allowed, replacing any
+        // name of it is not. The probe must fail closed, leave the marker
+        // intact, and clean up its own leftover once the policy is lifted.
+        let dir = kernel_fixture("acl-marker");
+        std::fs::create_dir(&dir).expect("create location");
+        let path = dir.join("pharos-beacon-health-v1");
+        write_beacon_health(&path, 1_000).expect("write recent marker");
+        let user = std::env::var("USER").unwrap_or_default();
+        let applied = Command::new("chmod")
+            .args(["+a", &format!("{user} deny delete")])
+            .arg(&path)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if applied && write_beacon_health(&path, 1_005).is_err() {
+            let error = probe_beacon_health_location(&path).unwrap_err();
+            assert!(error.contains("renaming over a link"), "{error}");
+            assert!(matches!(
+                beacon_health_verdict(&path, 60, 1_010),
+                Err(BeaconHealthProblem::LocationUnwritable { .. })
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("marker readable"),
+                "v1 1000\n"
+            );
+            // The deny-delete ACL also pins the probe link; a repeated probe
+            // reports the leftover instead of piling up more.
+            let error = probe_beacon_health_location(&path).unwrap_err();
+            assert!(
+                error.contains("cannot be replaced") || error.contains("previous probe link"),
+                "{error}"
+            );
+            assert!(entries(&dir).len() <= 2, "{:?}", entries(&dir));
+
+            let lifted = Command::new("chmod")
+                .args(["-a", &format!("{user} deny delete")])
+                .arg(&path)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            assert!(lifted, "lift deny-delete ACL");
+            assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
+            assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
+        } else {
+            eprintln!("note: deny-delete ACL could not be applied; skipping the ACL analogue");
+        }
+        std::fs::remove_dir_all(&dir).expect("remove location");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn beacon_health_probe_passes_in_a_sticky_directory_the_beacon_owns() {
+        // /tmp-style sticky directory: rename over an own marker is allowed
+        // for the marker owner, the directory owner and root, so the kernel
+        // rule the probe relies on must not reject the normal case.
+        let dir = kernel_fixture("sticky-location");
+        std::fs::create_dir(&dir).expect("create location");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1700))
+            .expect("sticky location");
+        let path = dir.join("pharos-beacon-health-v1");
+        write_beacon_health(&path, 1_000).expect("write recent marker");
+        assert_eq!(probe_beacon_health_location(&path), Ok(()));
+        assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
+        assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
+        std::fs::remove_dir_all(&dir).expect("remove location");
     }
 
     #[test]
