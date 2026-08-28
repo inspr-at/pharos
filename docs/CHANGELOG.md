@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.1.91 - 2026-08-28
+
+- Turn Ready to apply into a guarded `apply_declared` host workflow with the same fresh-backup and confirmation gates as an update, skip restart only when the reviewed plan says it is unnecessary, preserve the deployed v1 target-agent lease, and show the fleet-lock owner before an operator can issue a request that would be rejected (PHAROS-216).
+- Populate bounded service observations from local Compose discovery: aggregate replicas without exposing raw Docker data, leave services without healthchecks unknown, distinguish probe failure from service failure, cache on a separate cadence, and report overflow explicitly (PHAROS-188).
+- Detect de-converged appliance-tier hosts with fixed, debounced ICMP and SSH probes while keeping powered-off workstations quiet; optionally read one size-bounded convergence marker through the existing pinned SSH boundary, without installing an agent, storing a credential, or attempting remediation (PHAROS-180).
+- Fail closed on beacon container health when the report marker cannot be replaced: `pharos-beacon healthcheck` proves the beacon's atomic temp+rename write is possible (directory writable and the existing marker replaceable despite immutable flags, ACLs or sticky ownership, probed through a hard link so the marker is never touched, with fixed-name artifacts that every run recovers) before trusting a recent marker, names the path and reason otherwise, never follows a symlink at the marker path, a failed startup reset only unlinks the previous marker, never writing into it, writes and probes share a marker lock so a blocked write temporary is detected instead of raced, the startup reset runs in one lock scope and unlinks only the marker it observed, and the marker names the beacon process that wrote it (with the canonical kernel boot id on Linux) so state from a previous run never becomes healthy again merely because its obstacle clears (PHAROS-203, PHAROS-230).
+- Move every pinned GitHub Action off Node 20 to reviewed Node 24 or non-JavaScript releases, and enforce the exact immutable action/runtime inventory with a mutation-tested, fail-closed CI check (PHAROS-177).
+- QA only: adopt the orphaned history-dot hover/focus regression into the synthetic browser harness and document that Cargo `target/` is disposable build cache, not a home for tests or captured infrastructure fixtures; runtime behavior is unchanged (PHAROS-205).
+
+## 0.1.90 - 2026-08-28
+
+- Make container health diagnosable and truthful for both image roles: `pharosd healthcheck` refuses to guess the bind address when `PHAROS_ADDR` is unset and reports the failing target or HTTP status, `pharos-beacon healthcheck` states why the beacon is unhealthy (one-shot mode, missing or invalid report state, no successful report yet, clock skew, stale age against the interval), and `PHAROS_BEACON_HEALTH_FILE` relocates the beacon's report state; deployments can drop `--no-healthcheck` workarounds (PHAROS-203).
+
+## 0.1.89 - 2026-08-27
+
+- Keep host setting edits local until an explicit review and confirmation creates exactly one saved SettingsChange request, with clean draft discard and clear requested consequences (PHAROS-225).
+- Follow a confirmed SettingsChange live through recorded host evidence, advancing the truth ladder only from matching reports and stopping polling once the workflow is terminal (PHAROS-226).
+- Make the shared container healthcheck role-aware: `pharosd` keeps its readiness probe while `pharos-beacon` becomes healthy after a successful report and unhealthy when reporting goes stale (PHAROS-204).
+
+## 0.1.88 - 2026-08-27
+
+- Show one truthful lifecycle control for each host, backed by a server-computed priority projection that keeps simultaneous and recovered workflows visible (PHAROS-214, PHAROS-219).
+- Anchor the Fleet host Actions menu to the invoking card across desktop and mobile refreshes (PHAROS-220).
+- Terminalize successful system-update proposals, deduplicate dispatch, and make uncertain guarded handoffs explicitly recoverable (PHAROS-217).
+- Add a fact-based Observed / Declared / Requested / Executed / Verified ladder, explicit next-action consequences, and SettingsChange withdrawal that preserves any open nixcfg proposal (PHAROS-215).
+
 ## 0.1.87 - 2026-08-24
 
 - Fleet freshness chip row clips inside the card and fades at the right edge (PHAROS-211).

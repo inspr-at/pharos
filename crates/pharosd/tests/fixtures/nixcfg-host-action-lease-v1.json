@@ -1,0 +1,8 @@
+{
+  "schema": "inspr.pharos.host-action-lease.v1",
+  "version": 1,
+  "id": "action-update-restart-hsb8-120-1",
+  "host": "hsb8",
+  "ticket": "PHAROS-126",
+  "phase": "review"
+}

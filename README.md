@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.87-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.91-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -46,7 +46,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v0.1.53
+## What ships in v0.1.91
 
 | Area | Current capability |
 | --- | --- |
@@ -178,6 +178,50 @@ Then open:
 The local Compose topology binds only to loopback, stores data in a Docker
 volume and intentionally leaves OIDC and strict beacon authentication off. It
 is a smoke environment, not a production template.
+
+### Container health
+
+`pharosd` and `pharos-beacon` ship in one image, so the image `HEALTHCHECK`
+is role-aware: a container with `PHAROS_URL` set is a beacon and runs
+`pharos-beacon healthcheck`; any other container runs `pharosd healthcheck`.
+Each verdict prints its reason, visible with
+`docker inspect --format '{{json .State.Health}}' <container>`.
+
+| Role | Healthy means | Unhealthy reasons |
+| --- | --- | --- |
+| `pharosd` | `GET /readyz` on the loopback side of `PHAROS_ADDR` answered 200 | `PHAROS_ADDR` unset or not a socket address (the probe never guesses `127.0.0.1:8080`), unreachable, non-200 status |
+| `pharos-beacon` | The beacon can write its report state where it is configured and the last successful report is at most three `PHAROS_INTERVAL`s old | `PHAROS_INTERVAL` unset (one-shot beacon), report state location not writable, report state missing, unreadable or invalid, no successful report yet, clock skew, report stale |
+
+The beacon records its last successful report in
+`/tmp/pharos-beacon-health-v1` (`PHAROS_BEACON_HEALTH_FILE` overrides the
+path); a read-only container needs a writable tmpfs there. Every probe first
+proves it can perform the same atomic write the beacon uses: it creates a
+temporary file next to the marker, hard-links the existing marker to a
+sibling name and renames the temporary over that link, so immutable flags,
+deny-delete ACLs, sticky-directory ownership or a filesystem without hard
+links that would refuse replacing the marker refuse the probe too, while the
+marker itself is never written or moved. The marker is only ever opened
+without following symlinks; a symlink, directory or device at that path is
+invalid state and is never followed. Writes and probes take a shared lock
+(`.<marker>.lock`, the one artifact that stays), so a probe never recovers or
+replaces anything while a refresh is in flight; under it, probe and write
+artifacts use fixed sibling names (`.<marker>.tmp`, `.<marker>.probe-tmp`,
+`.<marker>.probe-link`) that each run removes first, so a run killed by the
+healthcheck timeout leaves at most one file per name, and a write temporary
+that cannot be removed makes the probe unhealthy because no refresh could
+land. A marker the beacon cannot replace is never trusted, however recent it
+reads. The marker also records which beacon process wrote it (pid and kernel
+process start time) and is trusted only while that exact process is running:
+state left by a previous run never becomes healthy merely because an obstacle
+to resetting it clears, a crashed beacon is unhealthy at the next probe, and
+only a successful report by the current process restores health (on Linux
+the token includes the kernel boot id, which must be the canonical lowercase
+UUID the kernel writes; anything else, or an unreadable boot id, is refused). The state is reset at startup under the same lock: the beacon takes
+it, notes which file the marker name points at, attempts the reset, and if
+that fails unlinks only that exact file (it never writes into an existing
+file); if the lock cannot be taken, nothing is touched. Deployments that disabled
+the inherited check (`--no-healthcheck`, Compose `healthcheck: disable: true`)
+as a workaround can remove that override.
 
 ### Native development
 
@@ -455,6 +499,9 @@ Collectors are explicit and bounded:
 - host identity, role and heartbeat interval;
 - Nix `flake.lock` age and commits behind the configured checkout;
 - running versus current kernel posture;
+- Compose services discovered through a fixed, local Docker query. Replica
+  failures are warnings, missing healthchecks stay unknown, and probe failure
+  is reported separately from service failure;
 - optional backup observations from Restic, a status file or a configured
   bounded command;
 - optional location from static configuration, a bounded command or an
@@ -465,13 +512,77 @@ Collectors are explicit and bounded:
 Unknown or malformed contract fields fail validation. A missing observation is
 shown as unknown rather than guessed.
 
+Service observation deliberately uses discovery, not the declared-host
+manifest: the useful signal is what Compose actually has, including stopped
+replicas. It groups containers by Compose project and service, ignores one-off
+jobs, sorts groups deterministically, and reserves the final available report
+slot for an overflow warning. The probe asks Docker only for Compose
+project/service/one-off labels, lifecycle state and bounded status. It derives
+only the fixed healthy, unhealthy, starting, or no-healthcheck states; raw
+status, inspect documents, environment, mounts, ports and probe payloads are
+never reported. The local beacon user still needs permission to connect
+to the Docker socket;
+granting Docker-group access is root-equivalent and therefore remains an
+explicit host-operator decision. The collector interface is runtime-specific,
+so a future systemd collector can add fixed unit-state discovery without
+changing the report contract or creating a general inspection channel.
+
+### Appliance convergence observations
+
+Appliance-tier hosts deliberately run no beacon and hold no Pharos secret.
+When `PHAROS_APPLIANCE_PROBES_PATH` names a reviewed registry using
+`inspr.pharos.appliance-probes.v1`, `pharosd` makes only two fixed network
+checks: one ICMP presence probe and one TCP connection to the declared SSH
+port. Targets are used for those calls only and are never returned in the API,
+logs, observations or durable debounce state.
+
+Every registry host must already have a Pharos host record and be declared
+`kind: workstation` through the existing PHAROS-109 preference contract;
+startup rejects missing records or server-kind declarations. Record creation
+and real-host acceptance remain owned by OPS-19. Once validated, an ICMP-down
+appliance is recorded as `powered off as expected` and creates no heartbeat
+alert. ICMP-up with SSH closed remains non-alerting boot grace until the
+declared 2–10 consecutive-sample threshold is reached; it then becomes the
+distinct warning
+`un-converged: online but SSH is unavailable`. SSH recovery resets the durable
+counter. Pharos only detects and reports this state—it never tries to enable
+SSH, run a bootstrap, install an agent or otherwise remediate the appliance.
+
+If the existing-host strict SSH boundary has both an owner-controlled identity
+file and a pinned `known_hosts` file, Pharos also runs one fixed read-only
+marker command after SSH becomes reachable. The marker is at the registry's
+validated absolute path and contains exactly:
+
+```text
+<build-id> <RFC3339 timestamp>
+```
+
+The response is limited to 256 ASCII bytes; only a 1–64 byte
+`[A-Za-z0-9._-]` build identifier and a valid RFC3339 timestamp are surfaced.
+Missing, malformed, oversized or unavailable markers are named coarsely, and
+raw SSH output is never logged or stored. The registry contains no credential;
+the committed `contracts/appliance-probes-v1.json` is a synthetic shape
+fixture. `PHAROS_DB` is required so the debounce counter survives restarts.
+
 ## Guarded operations
 
 Pharos can coordinate changes without becoming a free-form command bus.
 
 ### Host update and restart
 
-The current workflow persists:
+The current workflow persists a typed `update`, `apply_declared`, or
+`restart_only` intent. Existing records without an intent remain `update`;
+`restart_only` is reserved and is not offered in the first UI. A declared
+preference or kernel drift can start `apply_declared` only for a reporting Nix
+host whose manifest requires Janus. It uses the same fresh-backup and attended
+confirmation gates as an update, and skips the restart step when the reviewed
+plan says no restart is required. One update/restart workflow holds the fleet
+lock at a time; other eligible hosts name the blocking host instead of issuing
+a request that would be rejected. The target-agent lease deliberately remains
+the deployed v1 six-field `PHAROS-126` envelope; intent and `PHAROS-216`
+provenance stay in Pharos's durable job, events and summary.
+
+Each workflow persists:
 
 1. operator intent;
 2. target-local review and preflight;
@@ -585,6 +696,9 @@ promised third-party API. The important boundaries are:
 | `PHAROS_BEACON_TOKEN_HASH_DIR` | Private Janus v2 token-generation root containing `current` and immutable generation files |
 | `PHAROS_MANIFEST_PATHS` | Read-only declared-host manifests |
 | `PHAROS_HOST_PREFERENCES_PATH` | Read-only declared preference registry |
+| `PHAROS_APPLIANCE_PROBES_PATH` | Optional owner-controlled `inspr.pharos.appliance-probes.v1` registry for fixed ICMP/SSH convergence observations; requires `PHAROS_DB` |
+| `PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE` | Owner-controlled pinned SSH host-key file used by existing-host and optional appliance marker reads |
+| `PHAROS_EXISTING_HOST_IDENTITY_FILE` | Owner-controlled SSH identity path; required with the pinned host-key file before appliance marker reads are attempted |
 | `PHAROS_ALERT_WEBHOOK_URL` | Optional HTTP(S) or Telegram alert target; enables durable host-down and backup Stale/Failed incidents, escalation and recovery delivery with redirects disabled |
 | `PHAROS_ALERT_DB` | Optional explicit durable incident/outbox path; derived beside `PHAROS_DB` when unset and required when alert delivery is configured |
 | `PHAROS_ALERT_CHECK_SECS` | Durable alert sweep interval, minimum 5 seconds |
@@ -606,6 +720,9 @@ promised third-party API. The important boundaries are:
 | `PHAROS_NIXPKGS_CHANNEL_BASE_URL` | Optional credential-free HTTPS base for bounded `<channel>/git-revision` documents; overrides the automatic official channel base |
 | `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
 | `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
+| `PHAROS_SERVICE_OBSERVATION_MODE` | `auto` (default), `off` or `compose`; auto stays silent when the local Docker socket is absent, while an indicated but inaccessible or failed local probe reports unknown |
+| `PHAROS_SERVICE_OBSERVATION_INTERVAL_SECS` | Compose discovery cadence, 60–3600 seconds (default 300); cached coarse observations are carried on faster heartbeats and failed probes retry after at most 60 seconds |
+| `PHAROS_DOCKER_SOCKET` | Absolute local Docker Unix socket path (default `/var/run/docker.sock`); remote Docker endpoints are never used |
 | `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
 
 ### Read-only CLI
@@ -653,7 +770,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.72**. It is already used as a real
+Pharos is an active early release at **v0.1.91**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
@@ -693,6 +810,13 @@ cargo deny check
 
 Additional checks cover the NixOS module, native systemd installer,
 `nixos-anywhere` handoff and self-host Compose contract.
+
+Browser QA runs with `npm run test:browser`. Playwright keeps transient traces,
+failure screenshots and videos under `test-results/`, while reviewed visual
+baselines live under `tests/browser/__screenshots__/`. Use the harness output
+paths for ad-hoc evidence and synthetic fixture data only. Cargo's ignored
+`target/` directory is disposable build cache: never park tests or fleet
+captures there, and never commit captured infrastructure data as a fixture.
 
 The visible version in [`VERSION`](VERSION), the Cargo workspace version and
 the latest entry in [`docs/CHANGELOG.md`](docs/CHANGELOG.md) must stay aligned.

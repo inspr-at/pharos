@@ -19,7 +19,7 @@ let openHostActionsRoot=null;
 let hostActionContext=null;
 let hostActionReturnFocus=null;
 let fleetHostsByName=new Map();
-const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:''};
+const hostActionPoll={timer:null,controller:null,id:null,failures:0,lastRevision:'',terminal:false};
 function setHostActionPollSuspended(suspended){
   const overlay=document.querySelector('[data-host-action-overlay]');
   if(overlay)overlay.dataset.suspended=suspended?'true':'false';
@@ -36,6 +36,7 @@ function stopHostActionPoll(){
   hostActionPoll.id=null;
   hostActionPoll.failures=0;
   hostActionPoll.lastRevision='';
+  hostActionPoll.terminal=false;
 }
 function visibleHostActionItems(menu){return Array.from(menu?.querySelectorAll('[role="menuitem"]')||[]).filter(item=>!item.hidden)}
 function closeHostActions(root=openHostActionsRoot,restore=false){
@@ -46,6 +47,7 @@ function closeHostActions(root=openHostActionsRoot,restore=false){
   if(trigger)trigger.setAttribute('aria-expanded','false');
   if(openHostActionsRoot===root)openHostActionsRoot=null;
   if(restore)trigger?.focus();
+  flushFleetSortAfterInteraction();
 }
 function positionHostActions(root){
   const trigger=root.querySelector('[data-host-actions-trigger]');
@@ -153,10 +155,12 @@ function openHostActionDialog(action,root,returnFocus,lifecycleRunId){
   const facts=dialog.querySelector('[data-host-action-facts]');
   const workflow=dialog.querySelector('[data-host-workflow]');
   const status=dialog.querySelector('[data-host-action-status]');
+  const safeNote=dialog.querySelector('[data-host-action-safe-note]');
   dialog.dataset.workflow='false';
   if(status)status.textContent='';
+  if(safeNote){safeNote.dataset.workflowLive='false';safeNote.textContent='Reviewable and recorded'}
   if(primary){primary.hidden=false;primary.disabled=false;primary.classList.remove('danger')}
-  if(cancel)cancel.textContent='Cancel';
+  if(cancel)cancel.textContent='Close';
   if(cancelRequest){cancelRequest.hidden=true;cancelRequest.disabled=false}
   if(confirm)confirm.hidden=true;
   if(dispositionField)dispositionField.hidden=true;
@@ -327,6 +331,7 @@ function hostActionConfirmationReady(){
   return input?.value===hostActionContext?.host&&attended?.checked===true;
 }
 function scheduleHostActionPoll(id,delay=2000){
+  if(hostActionPoll.terminal)return;
   if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
   hostActionPoll.timer=null;
   hostActionPoll.id=id;
@@ -340,7 +345,8 @@ function scheduleHostActionPoll(id,delay=2000){
 }
 function hostActionPollDelay(job){
   const kind=job?.workflow?.kind;
-  if(kind==='settings_change'||kind==='remove_host')return 10000;
+  if(kind==='settings_change')return 2000;
+  if(kind==='remove_host')return 10000;
   return job?.state==='rebooting'?5000:2000;
 }
 function renderHostActionJob(job,message,workflowHtml){
@@ -380,10 +386,22 @@ function renderHostActionJob(job,message,workflowHtml){
   if(info)info.hidden=true;
   if(facts)facts.hidden=true;
   if(workflowRoot){workflowRoot.hidden=false;workflowRoot.innerHTML=workflowHtml||''}
-  if(safeNote)safeNote.textContent='Persisted and reviewable';
+  const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
+    ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
+    ||(workflowKind==='remove_host'&&job.state==='removal_pending');
+  hostActionPoll.terminal=!active;
+  if(safeNote){
+    const liveSettings=workflowKind==='settings_change'&&active;
+    safeNote.dataset.workflowLive=liveSettings?'true':'false';
+    safeNote.textContent=liveSettings?'Watching for recorded host evidence':active?'Persisted and reviewable':'Run complete and saved';
+  }
   if(status)status.textContent=message||'';
   if(cancel)cancel.textContent='Close';
-  if(cancelRequest){cancelRequest.hidden=workflow.can_cancel!==true;cancelRequest.disabled=false}
+  if(cancelRequest){
+    cancelRequest.hidden=workflow.can_cancel!==true;
+    cancelRequest.disabled=false;
+    cancelRequest.textContent='Cancel review — no live change was authorised';
+  }
   if(confirm)confirm.hidden=primaryAction?.kind!=='confirm';
   if(attended)attended.hidden=primaryAction?.kind!=='confirm';
   if(removeName)removeName.textContent=hostActionContext.host;
@@ -404,14 +422,17 @@ function renderHostActionJob(job,message,workflowHtml){
   }else if(primary){
     primary.hidden=true;
   }
-  const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
-    ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
-    ||(workflowKind==='remove_host'&&job.state==='removal_pending');
   if(active)scheduleHostActionPoll(job.id,hostActionPollDelay(job));
+  else{
+    if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+    hostActionPoll.timer=null;
+    setHostActionPollSuspended(false);
+  }
 }
 async function pollHostActionJob(id,immediate=false){
   if(!hostActionContext||hostActionContext.jobId&&hostActionContext.jobId!==id)return;
   hostActionPoll.timer=null;
+  if(hostActionPoll.terminal)return;
   if(document.hidden||!navigator.onLine){hostActionPoll.id=id;setHostActionPollSuspended(true);return}
   setHostActionPollSuspended(false);
   hostActionPoll.controller?.abort();
@@ -463,7 +484,7 @@ async function submitHostAction(){
     else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
-    else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
+    else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{intent:hostActionContext.intent||'update'});
     else if((action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/acknowledge-dispatch-uncertainty',{});
     else if((action==='settings'||action==='remove')&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/reconcile-accepted-dispatch',{});
     else if(action==='remove'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry-retirement',{});
@@ -497,6 +518,28 @@ async function submitHostActionCancellation(){
     button.disabled=false;
   }
 }
+async function withdrawSettingsChange(actionItem,root){
+  const runId=actionItem.dataset.lifecycleRunId||root.dataset.actionJobId||'';
+  if(!runId)return;
+  // The withdrawal POST is the sole source of truth for this repaint. Opening
+  // without a run id avoids a stale GET racing the transition response.
+  openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));
+  const withdrawalContext=hostActionContext;
+  const status=document.querySelector('[data-host-action-status]');
+  if(status)status.textContent='Clearing the pending request in Pharos…';
+  try{
+    const result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(runId)+'/withdraw',{});
+    const menuItem=root.querySelector('[data-host-action="withdraw-settings"]');
+    if(menuItem?.dataset.lifecycleRunId===runId)menuItem.hidden=true;
+    if(hostActionContext===withdrawalContext){
+      renderHostActionJob(result.job,result.message,result.workflow_html);
+    }
+  }catch(error){
+    if(hostActionContext===withdrawalContext&&status){
+      status.textContent=error instanceof Error?error.message:'The settings change could not be withdrawn.';
+    }
+  }
+}
 function updateHostActionState(surface,host,backup){
   const root=surface.querySelector('[data-host-actions]');
   if(!root)return;
@@ -528,26 +571,34 @@ function updateHostActionState(surface,host,backup){
   const update=root.querySelector('[data-host-action="system-update"]');
   const restart=root.querySelector('[data-host-action="update-restart"]');
   const remove=root.querySelector('[data-host-action="remove"]');
+  const withdraw=root.querySelector('[data-host-action="withdraw-settings"]');
   const primarySeparator=root.querySelector('[data-primary-separator]');
   const removeSeparator=root.querySelector('[data-remove-separator]');
   const updateJobActive=host.update_restart_active===true;
   const updatePending=kernelState==='reboot_required'||provenGitUpdate||provenNixpkgsUpdate;
+  const lifecycle=host.lifecycle||{};
   root.dataset.updatePending=updatePending?'true':'false';
   root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
   const retired=retirement?.pending===true;
+  const settingsWithdrawRunId=String(host.settings_change_withdraw_run_id||'');
+  const settingsWithdrawable=settingsWithdrawRunId.length>0;
+  if(withdraw){
+    withdraw.hidden=!settingsWithdrawable;
+    if(settingsWithdrawable)withdraw.dataset.lifecycleRunId=settingsWithdrawRunId;
+    else delete withdraw.dataset.lifecycleRunId;
+  }
   // PHAROS-197: mirrors the server gate — a removal that must record a nixcfg
   // declaration change or a retirement intent needs the proposal available.
   const needsRemovalProposal=root.dataset.declared==='true'||root.dataset.credentialRetirement==='true';
   const removalReady=!needsRemovalProposal||hostRemovalAvailable;
   if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
   if(restart){
-    restart.hidden=retired||updateJobActive||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&updatePending);
+    restart.hidden=retired||updateJobActive||lifecycle.slot==='blocked'||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&updatePending);
     const strong=restart.querySelector('strong');
     if(strong)strong.textContent='Apply update and restart';
   }
   if(remove)remove.hidden=!removalReady||!canManage||retired;
   const continueBtn=root.querySelector('[data-host-action="lifecycle-continue"]');
-  const lifecycle=host.lifecycle||{};
   const lifecycleAction=lifecycle.primary_action;
   const lifecycleRunId=lifecycle.run_id?String(lifecycle.run_id):'';
   if(continueBtn){
@@ -560,7 +611,7 @@ function updateHostActionState(surface,host,backup){
       if(strong)strong.textContent='Continue: '+String(lifecycleAction.label);
     }
   }
-  if(primarySeparator)primarySeparator.hidden=[continueBtn,update,restart].every(item=>!item||item.hidden);
+  if(primarySeparator)primarySeparator.hidden=[continueBtn,withdraw,update,restart].every(item=>!item||item.hidden);
   if(removeSeparator)removeSeparator.hidden=!removalReady||!canManage||retired;
   if(openHostActionsRoot===root)positionHostActions(root);
 }
@@ -584,6 +635,10 @@ function initHostActions(){
     if(actionItem&&actionItem.closest('[data-host-actions-menu]')&&!actionItem.matches('a')){
       event.preventDefault();
       const root=actionItem.closest('[data-host-actions]');
+      if(actionItem.dataset.hostAction==='withdraw-settings'){
+        withdrawSettingsChange(actionItem,root);
+        return;
+      }
       if(actionItem.dataset.hostAction==='lifecycle-continue'){
         const runId=actionItem.dataset.lifecycleRunId||'';
         const invoke=actionItem.dataset.lifecycleInvoke||'workflow';
@@ -926,13 +981,14 @@ function formatPreferencesSummary(prefs){
   return parts.length?parts.join(' · '):'defaults';
 }
 function lifecycleDriftSlot(slot){
-  return slot==='prefs_drift'||slot==='kernel_drift';
+  return slot==='blocked'||slot==='prefs_drift'||slot==='kernel_drift';
 }
 function lifecycleFromChip(chip){
   const blockedRaw=String(chip.dataset.lifecycleBlockedBy||'');
   return {
     slot:String(chip.dataset.lifecycleSlot||'quiet'),
     invoke:String(chip.dataset.lifecycleInvoke||'host_settings'),
+    update_restart_intent:chip.dataset.lifecycleUpdateRestartIntent||null,
     label:chip.querySelector('[data-host-lifecycle-chip-copy]')?.textContent||'',
     level:String(chip.dataset.lifecycleLevel||'clear'),
     run_id:chip.dataset.lifecycleRunId||null,
@@ -941,6 +997,13 @@ function lifecycleFromChip(chip){
   };
 }
 function lifecycleDriftResolver(slot,blockedBy){
+  if(slot==='blocked'){
+    const blocker=blockedBy.find(value=>value.startsWith('fleet_update:'))?.slice('fleet_update:'.length)||'another host';
+    return {
+      title:'Wait for '+blocker,
+      copy:'Only one guarded host update may run at a time. Finish or resolve that recorded workflow before starting this host.',
+    };
+  }
   if(slot==='prefs_drift'){
     if(blockedBy.includes('host_report')){
       return {
@@ -967,6 +1030,10 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   if(!overlay||!dialog||!root)return;
   const slot=String(lifecycle?.slot||'quiet');
   const isDrift=lifecycleDriftSlot(slot);
+  const applyDeclared=slot!=='blocked'
+    &&lifecycle?.invoke==='update_restart'
+    &&lifecycle?.update_restart_intent==='apply_declared'
+    &&root.dataset.canManage==='true';
   const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
   const isRun=runId&&(lifecycle.invoke==='workflow'||lifecycle.invoke==='update_restart');
   if(isRun){
@@ -976,7 +1043,7 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   }
   stopHostActionPoll();
   closeHostActions(root);
-  hostActionContext={action:'lifecycle',root,host:root.dataset.host,lifecycle};
+  hostActionContext={action:applyDeclared?'update-restart':'lifecycle',root,host:root.dataset.host,lifecycle,intent:applyDeclared?'apply_declared':null};
   hostActionReturnFocus=chip;
   dialog.dataset.workflow='false';
   dialog.dataset.drift=isDrift?'true':'false';
@@ -1027,11 +1094,19 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   setHostActionFact('observed','',false);
   if(isDrift){
     const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
-    const resolver=lifecycleDriftResolver(slot,blockedBy);
+    const resolver=applyDeclared?{
+      title:'Guarded apply',
+      copy:'This starts a read-only target review. Backup evidence and attended confirmation remain required before any live switch or restart.',
+    }:lifecycleDriftResolver(slot,blockedBy);
     if(title)title.textContent=String(lifecycle.label||'');
     if(copy)copy.textContent=String(lifecycle.detail||'');
     if(infoTitle)infoTitle.textContent=resolver.title;
     if(infoCopy)infoCopy.textContent=resolver.copy;
+    if(applyDeclared&&primary){
+      primary.hidden=false;
+      primary.textContent='Prepare guarded apply';
+      setHostActionFact('scope',root.dataset.host+' only · backup required',true);
+    }
     if(slot==='prefs_drift'){
       const declaredSummary=chip.dataset.lifecycleDeclaredSummary
         ||formatPreferencesSummary(host.declared_preferences||host.requested_preferences||host.preferences||{});
@@ -1083,6 +1158,7 @@ function updateHostLifecycle(surface,host){
     const invoke=String(lifecycle?.invoke||'host_settings');
     const level=String(lifecycle?.level||'clear');
     const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
+    const intent=lifecycle?.update_restart_intent?String(lifecycle.update_restart_intent):'';
     const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
     chip.hidden=false;
     chip.dataset.settingsState=String(host.preferences_state||'applied');
@@ -1092,6 +1168,8 @@ function updateHostLifecycle(surface,host){
     chip.dataset.lifecycleDetail=String(lifecycle?.detail||'');
     if(runId)chip.dataset.lifecycleRunId=runId;
     else delete chip.dataset.lifecycleRunId;
+    if(intent)chip.dataset.lifecycleUpdateRestartIntent=intent;
+    else delete chip.dataset.lifecycleUpdateRestartIntent;
     if(blockedBy.length)chip.dataset.lifecycleBlockedBy=blockedBy.join(',');
     else delete chip.dataset.lifecycleBlockedBy;
     if(slot==='prefs_drift'){
@@ -1379,10 +1457,58 @@ function sortByFreeformOrder(items,order){
     return ai-bi||a.dataset.sortName.localeCompare(b.dataset.sortName);
   });
 }
+function reorderChildrenIfNeeded(parent,ordered){
+  if(!parent)return;
+  const orderedSet=new Set(ordered);
+  const current=Array.from(parent.children).filter(child=>orderedSet.has(child));
+  if(current.length===ordered.length&&current.every((child,index)=>child===ordered[index]))return;
+  ordered.forEach(child=>parent.appendChild(child));
+}
+let fleetPointerActive=false;
+let fleetKeyboardActive=false;
+let pendingFleetSort=null;
+function flushFleetSortAfterInteraction(){
+  if(fleetPointerActive||fleetKeyboardActive||!pendingFleetSort)return;
+  const pending=pendingFleetSort;
+  pendingFleetSort=null;
+  setTimeout(()=>applySort(pending.mode,pending.write),0);
+}
+function finishFleetPointerInteraction(){
+  if(!fleetPointerActive)return;
+  fleetPointerActive=false;
+  flushFleetSortAfterInteraction();
+}
+function beginFleetPointerInteraction(event){
+  if(event.button===0&&event.target.closest('[data-host-surface="runtime"]'))fleetPointerActive=true;
+}
+function fleetActivationKey(event){return event.key===' '||event.key==='Spacebar'||event.key==='Enter'}
+function beginFleetKeyboardInteraction(event){
+  if(fleetActivationKey(event)&&event.target.closest('[data-host-surface="runtime"]')&&event.target.closest('button,a,[role="button"],[role="menuitem"]'))fleetKeyboardActive=true;
+}
+function finishFleetKeyboardInteraction(event){
+  if(!fleetKeyboardActive||!fleetActivationKey(event))return;
+  fleetKeyboardActive=false;
+  flushFleetSortAfterInteraction();
+}
+document.addEventListener('pointerdown',beginFleetPointerInteraction,true);
+document.addEventListener('mousedown',beginFleetPointerInteraction,true);
+document.addEventListener('keydown',beginFleetKeyboardInteraction,true);
+window.addEventListener('pointerup',finishFleetPointerInteraction,true);
+window.addEventListener('pointercancel',finishFleetPointerInteraction,true);
+window.addEventListener('mouseup',finishFleetPointerInteraction,true);
+window.addEventListener('keyup',finishFleetKeyboardInteraction,true);
+function resetFleetInteraction(){
+  fleetPointerActive=false;
+  fleetKeyboardActive=false;
+  pendingFleetSort=null;
+}
+window.addEventListener('blur',resetFleetInteraction);
+document.addEventListener('contextmenu',resetFleetInteraction,true);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)resetFleetInteraction()},true);
 function keepOnboardAffordanceLast(){
   const grid=document.querySelector('[data-grid]');
   const tile=document.querySelector('[data-onboard-tile]');
-  if(grid&&tile)grid.appendChild(tile);
+  if(grid&&tile&&(tile.parentElement!==grid||tile.nextElementSibling))grid.appendChild(tile);
 }
 function applyFreeformOrder(){
   const grid=document.querySelector('[data-grid]');
@@ -1393,8 +1519,8 @@ function applyFreeformOrder(){
     keepOnboardAffordanceLast();
     return;
   }
-  if(grid)sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order).forEach(el=>grid.appendChild(el));
-  if(body)sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order).forEach(el=>body.appendChild(el));
+  if(grid)reorderChildrenIfNeeded(grid,sortByFreeformOrder(Array.from(grid.querySelectorAll('.card')),order));
+  if(body)reorderChildrenIfNeeded(body,sortByFreeformOrder(Array.from(body.querySelectorAll('tr')),order));
   keepOnboardAffordanceLast();
 }
 function setArrangeMode(mode){
@@ -1405,15 +1531,21 @@ function applySort(mode,write=true){
   mode=['attention','name','last','freeform'].includes(mode)?mode:'attention';
   const grid=document.querySelector('[data-grid]');
   const body=document.querySelector('[data-list-body]');
+  const focusedHostControl=document.activeElement?.closest?.('[data-host-surface="runtime"]')?document.activeElement:null;
   setArrangeMode(mode);
+  if(fleetPointerActive||fleetKeyboardActive||openHostActionsRoot){
+    pendingFleetSort={mode,write:write||(pendingFleetSort?.write===true)};
+    return;
+  }
   if(mode==='freeform'){
     applyFreeformOrder();
   }else{
     if(write)clearFreeformOrder();
-    if(grid)Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>grid.appendChild(el));
-    if(body)Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)).forEach(el=>body.appendChild(el));
+    if(grid)reorderChildrenIfNeeded(grid,Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)));
+    if(body)reorderChildrenIfNeeded(body,Array.from(body.querySelectorAll('tr')).sort((a,b)=>cmp(a,b,mode)));
   }
   keepOnboardAffordanceLast();
+  if(focusedHostControl?.isConnected&&document.activeElement!==focusedHostControl)focusedHostControl.focus();
   const select=document.querySelector('[data-sort]');
   if(select)select.value=mode;
   if(write)setCookie('pharos_sort',mode);

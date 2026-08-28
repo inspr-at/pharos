@@ -36,6 +36,29 @@ pub(crate) enum HostActionKind {
     RemoveHost,
 }
 
+/// The operator-selected purpose of an update/restart workflow.
+///
+/// Missing values on persisted v1 jobs deliberately mean `update`, preserving
+/// the contract of jobs written before PHAROS-216.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpdateRestartIntent {
+    #[default]
+    Update,
+    ApplyDeclared,
+    RestartOnly,
+}
+
+impl UpdateRestartIntent {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::ApplyDeclared => "apply_declared",
+            Self::RestartOnly => "restart_only",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HostWorkflowKind {
@@ -168,6 +191,7 @@ pub(crate) fn host_preferences_state(
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HostLifecycleSlot {
+    Blocked,
     RemoveHost,
     UpdateRestart,
     SettingsChange,
@@ -180,6 +204,7 @@ pub(crate) enum HostLifecycleSlot {
 impl HostLifecycleSlot {
     pub(crate) fn key(self) -> &'static str {
         match self {
+            Self::Blocked => "blocked",
             Self::RemoveHost => "remove_host",
             Self::UpdateRestart => "update_restart",
             Self::SettingsChange => "settings_change",
@@ -224,6 +249,8 @@ pub(crate) struct HostLifecycle {
     pub(crate) level: &'static str,
     pub(crate) invoke: HostLifecycleInvoke,
     pub(crate) run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) update_restart_intent: Option<UpdateRestartIntent>,
     pub(crate) detail: String,
     pub(crate) blocked_by: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -513,6 +540,23 @@ pub(crate) struct HostWorkflowEvidence {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowLadderFact {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) state: &'static str,
+    pub(crate) fact: String,
+    pub(crate) at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowNext {
+    pub(crate) title: String,
+    pub(crate) consequence: String,
+    pub(crate) location: String,
+    pub(crate) boundary: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct HostWorkflowSummary {
     pub(crate) schema: &'static str,
     pub(crate) version: u16,
@@ -529,8 +573,11 @@ pub(crate) struct HostWorkflowSummary {
     pub(crate) current_step: Option<String>,
     pub(crate) current_location: Option<HostWorkflowExecutionLocation>,
     pub(crate) can_cancel: bool,
+    pub(crate) can_withdraw: bool,
     pub(crate) persisted: bool,
     pub(crate) primary_action: Option<HostWorkflowAction>,
+    pub(crate) ladder: Vec<HostWorkflowLadderFact>,
+    pub(crate) next: HostWorkflowNext,
     pub(crate) steps: Vec<HostWorkflowStep>,
     pub(crate) evidence: Vec<HostWorkflowEvidence>,
     pub(crate) events: Vec<HostWorkflowEvent>,
@@ -615,6 +662,8 @@ pub(crate) struct HostActionJob {
     pub(crate) host: String,
     pub(crate) kind: HostActionKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<UpdateRestartIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_kind: Option<HostWorkflowKind>,
     pub(crate) state: HostActionState,
     pub(crate) requested_by: String,
@@ -644,6 +693,14 @@ pub(crate) struct HostActionJob {
 impl HostActionJob {
     pub(crate) fn workflow_kind(&self) -> HostWorkflowKind {
         self.workflow_kind.unwrap_or_else(|| self.kind.into())
+    }
+
+    pub(crate) fn update_restart_intent(&self) -> UpdateRestartIntent {
+        if self.kind == HostActionKind::UpdateRestart {
+            self.intent.unwrap_or_default()
+        } else {
+            UpdateRestartIntent::Update
+        }
     }
 
     fn validate(&self) -> bool {
@@ -678,14 +735,16 @@ impl HostActionJob {
                     && self.kind == HostActionKind::SystemUpdateProposal
                     && self.removal_plan.is_none()
             })
+            && (self.kind == HostActionKind::UpdateRestart || self.intent.is_none())
             && self.recovery_started_at.is_none_or(|_| {
                 self.kind == HostActionKind::UpdateRestart && self.confirmed_at.is_some()
             })
             && (self.state != HostActionState::Cancelled
-                || (self.kind == HostActionKind::UpdateRestart
-                    && self.confirmed_at.is_none()
-                    && self.recovery_started_at.is_none()
-                    && self.result.is_none()))
+                || (self.workflow_kind() == HostWorkflowKind::SettingsChange
+                    || (self.kind == HostActionKind::UpdateRestart
+                        && self.confirmed_at.is_none()
+                        && self.recovery_started_at.is_none()
+                        && self.result.is_none())))
             && self.lease_state_valid()
             && self.retirement_lease_state_valid()
             && match self.kind {
@@ -805,6 +864,8 @@ impl HostActionJob {
             id: self.id.clone(),
             host: self.host.clone(),
             kind: self.kind,
+            intent: (self.kind == HostActionKind::UpdateRestart)
+                .then_some(self.update_restart_intent()),
             state: self.state,
             ticket: self.ticket.clone(),
             retry_of: self.retry_of.clone(),
@@ -899,6 +960,10 @@ impl HostActionJob {
             )
     }
 
+    pub(crate) fn can_withdraw(&self) -> bool {
+        self.workflow_kind() == HostWorkflowKind::SettingsChange && !self.state.is_terminal()
+    }
+
     fn workflow(&self) -> HostWorkflowSummary {
         let kind = self.workflow_kind();
         let (title, guidance, status_label, status_level, primary_action, steps) = match kind {
@@ -915,6 +980,8 @@ impl HostActionJob {
                 .map(|step| step.location)
         });
         let evidence = self.workflow_evidence();
+        let ladder = self.workflow_ladder();
+        let next = self.workflow_next(primary_action.as_ref(), current_location);
         let events = self
             .events
             .iter()
@@ -942,11 +1009,459 @@ impl HostActionJob {
             current_step,
             current_location,
             can_cancel: self.can_cancel(),
+            can_withdraw: self.can_withdraw(),
             persisted: true,
             primary_action,
+            ladder,
+            next,
             steps,
             evidence,
             events,
+        }
+    }
+
+    fn latest_event(&self, kinds: &[HostActionEventKind]) -> Option<&HostActionEvent> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| kinds.contains(&event.kind))
+    }
+
+    fn ladder_fact(
+        key: &'static str,
+        label: &'static str,
+        state: &'static str,
+        fact: impl Into<String>,
+        event: Option<&HostActionEvent>,
+    ) -> HostWorkflowLadderFact {
+        HostWorkflowLadderFact {
+            key,
+            label,
+            state,
+            fact: fact.into(),
+            at: event.map(|event| event.at),
+        }
+    }
+
+    fn workflow_ladder(&self) -> Vec<HostWorkflowLadderFact> {
+        let requested = self.latest_event(&[HostActionEventKind::Requested]);
+        let cancelled = self.state == HostActionState::Cancelled;
+        let stopped_state = if cancelled || self.state == HostActionState::Failed {
+            "stopped"
+        } else {
+            "pending"
+        };
+        match self.workflow_kind() {
+            HostWorkflowKind::SettingsChange => {
+                let accepted = self.latest_event(&[HostActionEventKind::SettingsRequestAccepted]);
+                let submitted = self.latest_event(&[HostActionEventKind::DispatchSubmitted]);
+                let uncertain = self.latest_event(&[HostActionEventKind::DispatchOutcomeUncertain]);
+                let rejected = self.latest_event(&[
+                    HostActionEventKind::DispatchFailed,
+                    HostActionEventKind::SettingsFailed,
+                ]);
+                let applied = self.latest_event(&[HostActionEventKind::SettingsApplied]);
+                vec![
+                    Self::ladder_fact(
+                        "observed",
+                        "Observed",
+                        if applied.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if applied.is_some() {
+                            "Host reported the requested values"
+                        } else {
+                            "No matching host report recorded"
+                        },
+                        applied,
+                    ),
+                    Self::ladder_fact(
+                        "declared",
+                        "Declared",
+                        "not_observed",
+                        "No declaration merge is observed by this run",
+                        None,
+                    ),
+                    Self::ladder_fact(
+                        "requested",
+                        "Requested",
+                        if submitted.is_some() || accepted.is_some() {
+                            "complete"
+                        } else if cancelled || self.state == HostActionState::Failed {
+                            "stopped"
+                        } else {
+                            "current"
+                        },
+                        if submitted.is_some() {
+                            "Repository handoff accepted"
+                        } else if accepted.is_some() {
+                            "Pending request saved for host delivery"
+                        } else if uncertain.is_some() {
+                            "Repository receipt is unconfirmed"
+                        } else if rejected.is_some() || self.state == HostActionState::Failed {
+                            "Request delivery stopped"
+                        } else if cancelled {
+                            "Pending request withdrawn"
+                        } else {
+                            "Operator request recorded"
+                        },
+                        submitted
+                            .or(accepted)
+                            .or(uncertain)
+                            .or(rejected)
+                            .or(requested),
+                    ),
+                    Self::ladder_fact(
+                        "executed",
+                        "Executed",
+                        if applied.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if applied.is_some() {
+                            "Requested values reported by the host"
+                        } else {
+                            "No host execution reported"
+                        },
+                        applied,
+                    ),
+                    Self::ladder_fact(
+                        "verified",
+                        "Verified",
+                        if applied.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if applied.is_some() {
+                            "Matching host report completed the run"
+                        } else {
+                            "No matching host report recorded"
+                        },
+                        applied,
+                    ),
+                ]
+            }
+            HostWorkflowKind::SystemUpdateProposal => {
+                let accepted = self.latest_event(&[
+                    HostActionEventKind::DispatchAccepted,
+                    HostActionEventKind::DispatchSubmitted,
+                ]);
+                let uncertain = self.latest_event(&[HostActionEventKind::DispatchOutcomeUncertain]);
+                let rejected = self.latest_event(&[HostActionEventKind::DispatchFailed]);
+                let handoff_event = accepted.or(uncertain).or(rejected);
+                vec![
+                    Self::ladder_fact(
+                        "observed",
+                        "Observed",
+                        "not_applicable",
+                        "No host observation is part of this proposal",
+                        None,
+                    ),
+                    Self::ladder_fact(
+                        "declared",
+                        "Declared",
+                        "not_observed",
+                        if accepted.is_some() {
+                            "Repository review continues outside Pharos"
+                        } else if uncertain.is_some() {
+                            "Repository receipt is unconfirmed"
+                        } else if rejected.is_some() {
+                            "Repository handoff was rejected"
+                        } else {
+                            "No repository handoff was accepted"
+                        },
+                        handoff_event,
+                    ),
+                    Self::ladder_fact(
+                        "requested",
+                        "Requested",
+                        if accepted.is_some() {
+                            "complete"
+                        } else if uncertain.is_some()
+                            || rejected.is_some()
+                            || cancelled
+                            || self.state == HostActionState::Failed
+                        {
+                            "stopped"
+                        } else {
+                            "current"
+                        },
+                        if accepted.is_some() {
+                            "nixcfg accepted the review handoff"
+                        } else if uncertain.is_some() {
+                            "nixcfg receipt could not be confirmed"
+                        } else if rejected.is_some() {
+                            "nixcfg rejected the review handoff"
+                        } else if cancelled {
+                            "Operator request was cancelled"
+                        } else {
+                            "Operator request recorded"
+                        },
+                        handoff_event.or(requested),
+                    ),
+                    Self::ladder_fact(
+                        "executed",
+                        "Executed",
+                        "not_applicable",
+                        "No host execution was authorized",
+                        None,
+                    ),
+                    Self::ladder_fact(
+                        "verified",
+                        "Verified",
+                        "not_applicable",
+                        "No host verification is claimed",
+                        None,
+                    ),
+                ]
+            }
+            HostWorkflowKind::UpdateRestart => {
+                let observed = self.latest_event(&[
+                    HostActionEventKind::ReviewPassed,
+                    HostActionEventKind::RecoveryPassed,
+                ]);
+                let execution_completed = self.latest_event(&[
+                    HostActionEventKind::ApplyPassed,
+                    HostActionEventKind::RecoveryPassed,
+                ]);
+                let execution_started = self.latest_event(&[
+                    HostActionEventKind::ApplyRebooting,
+                    HostActionEventKind::ApplyClaimed,
+                    HostActionEventKind::RecoveryRebooting,
+                    HostActionEventKind::RecoveryClaimed,
+                ]);
+                let verified = self.latest_event(&[
+                    HostActionEventKind::ApplyPassed,
+                    HostActionEventKind::RecoveryPassed,
+                ]);
+                vec![
+                    Self::ladder_fact(
+                        "observed",
+                        "Observed",
+                        if observed.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if observed.is_some() {
+                            "Target-local review evidence recorded"
+                        } else {
+                            "No completed host review recorded"
+                        },
+                        observed,
+                    ),
+                    Self::ladder_fact(
+                        "declared",
+                        "Declared",
+                        "not_observed",
+                        "No declaration merge is claimed by this run",
+                        None,
+                    ),
+                    Self::ladder_fact(
+                        "requested",
+                        "Requested",
+                        "complete",
+                        "Operator request recorded",
+                        requested,
+                    ),
+                    Self::ladder_fact(
+                        "executed",
+                        "Executed",
+                        if execution_completed.is_some() {
+                            "complete"
+                        } else if execution_started.is_some() {
+                            "current"
+                        } else {
+                            stopped_state
+                        },
+                        if execution_completed.is_some() {
+                            "Target-local execution completed"
+                        } else if execution_started.is_some() {
+                            "Target-local execution started; completion is not recorded"
+                        } else {
+                            "No live execution recorded"
+                        },
+                        execution_completed.or(execution_started),
+                    ),
+                    Self::ladder_fact(
+                        "verified",
+                        "Verified",
+                        if verified.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if verified.is_some() {
+                            "Host verification evidence completed the run"
+                        } else {
+                            "No completed host verification recorded"
+                        },
+                        verified,
+                    ),
+                ]
+            }
+            HostWorkflowKind::RemoveHost => {
+                let declaration =
+                    self.latest_event(&[HostActionEventKind::RemovalDeclarationCompleted]);
+                let executed = self.latest_event(&[
+                    HostActionEventKind::RemovalAccessRevoked,
+                    HostActionEventKind::RemovalCredentialRetired,
+                ]);
+                let verified = self.latest_event(&[HostActionEventKind::RemovalCompleted]);
+                vec![
+                    Self::ladder_fact(
+                        "observed",
+                        "Observed",
+                        "not_applicable",
+                        "Retirement does not claim a new host observation",
+                        None,
+                    ),
+                    Self::ladder_fact(
+                        "declared",
+                        "Declared",
+                        if declaration.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if declaration.is_some() {
+                            "Host declaration removal recorded"
+                        } else {
+                            "No declaration removal recorded"
+                        },
+                        declaration,
+                    ),
+                    Self::ladder_fact(
+                        "requested",
+                        "Requested",
+                        "complete",
+                        "Operator retirement intent recorded",
+                        requested,
+                    ),
+                    Self::ladder_fact(
+                        "executed",
+                        "Executed",
+                        if executed.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if executed.is_some() {
+                            "Retirement gate execution recorded"
+                        } else {
+                            "No completed retirement gate recorded"
+                        },
+                        executed,
+                    ),
+                    Self::ladder_fact(
+                        "verified",
+                        "Verified",
+                        if verified.is_some() {
+                            "complete"
+                        } else {
+                            stopped_state
+                        },
+                        if verified.is_some() {
+                            "All retirement gates completed"
+                        } else {
+                            "Retirement is not complete"
+                        },
+                        verified,
+                    ),
+                ]
+            }
+        }
+    }
+
+    fn workflow_next(
+        &self,
+        primary: Option<&HostWorkflowAction>,
+        current_location: Option<HostWorkflowExecutionLocation>,
+    ) -> HostWorkflowNext {
+        let location = match primary.map(|action| action.kind) {
+            Some(HostWorkflowActionKind::Confirm) => HostWorkflowExecutionLocation::TargetHost,
+            Some(HostWorkflowActionKind::Retry)
+                if self.workflow_kind() == HostWorkflowKind::RemoveHost =>
+            {
+                HostWorkflowExecutionLocation::RetirementOwner
+            }
+            Some(HostWorkflowActionKind::Retry) => HostWorkflowExecutionLocation::TargetHost,
+            Some(HostWorkflowActionKind::Recover)
+                if self.workflow_kind() == HostWorkflowKind::UpdateRestart =>
+            {
+                HostWorkflowExecutionLocation::TargetHost
+            }
+            Some(HostWorkflowActionKind::Recover | HostWorkflowActionKind::Acknowledge) => {
+                HostWorkflowExecutionLocation::Pharos
+            }
+            None => current_location.unwrap_or(HostWorkflowExecutionLocation::Pharos),
+        }
+        .label(&self.host);
+        let (title, consequence) = match primary.map(|action| action.kind) {
+            Some(HostWorkflowActionKind::Confirm) => (
+                primary.expect("matched primary action").label.clone(),
+                "Queues the reviewed change for target-local execution, then waits for fresh host verification.".to_string(),
+            ),
+            Some(HostWorkflowActionKind::Retry) => (
+                primary.expect("matched primary action").label.clone(),
+                "Retries only the recorded failed step in this saved run.".to_string(),
+            ),
+            Some(HostWorkflowActionKind::Recover) => (
+                primary.expect("matched primary action").label.clone(),
+                if self.workflow_kind() == HostWorkflowKind::SettingsChange {
+                    "Saves the already accepted request locally without another repository dispatch."
+                } else {
+                    "Queues verification of the current host state without replaying the live change."
+                }
+                .to_string(),
+            ),
+            Some(HostWorkflowActionKind::Acknowledge) => (
+                primary.expect("matched primary action").label.clone(),
+                "Records that the repository outcome was checked and permits a deliberate new request."
+                    .to_string(),
+            ),
+            None if self.state == HostActionState::Cancelled => (
+                "No next action".to_string(),
+                if self.workflow_kind() == HostWorkflowKind::SettingsChange {
+                    "Clears the pending request. An open nixcfg proposal stays open there."
+                        .to_string()
+                } else {
+                    "The run remains recorded as cancelled.".to_string()
+                },
+            ),
+            None if self.state.is_terminal() => (
+                "No next action".to_string(),
+                "This run is terminal and remains available for review.".to_string(),
+            ),
+            None => (
+                "Wait for the current step".to_string(),
+                "Pharos keeps this run saved and updates it only from the recorded owner or host evidence."
+                    .to_string(),
+            ),
+        };
+        let boundary = match self.workflow_kind() {
+            HostWorkflowKind::SettingsChange => {
+                "Pharos will not close or merge a nixcfg proposal."
+            }
+            HostWorkflowKind::SystemUpdateProposal => {
+                "Pharos will not merge, deploy, or verify a host change."
+            }
+            HostWorkflowKind::UpdateRestart => {
+                "This step will not bypass backup, Janus, attended confirmation, or host verification."
+            }
+            HostWorkflowKind::RemoveHost => {
+                "Pharos will not delete the server, disks, services, or application data."
+            }
+        };
+        HostWorkflowNext {
+            title,
+            consequence,
+            location,
+            boundary: boundary.to_string(),
         }
     }
 
@@ -963,7 +1478,9 @@ impl HostActionJob {
                 let submitted = self.has_event(HostActionEventKind::DispatchSubmitted);
                 evidence.push(workflow_evidence(
                     "Delivery",
-                    if outcome_uncertain {
+                    if self.state == HostActionState::Cancelled {
+                        "withdrawn"
+                    } else if outcome_uncertain {
                         "outcome uncertain"
                     } else if self.state == HostActionState::Failed {
                         "stopped"
@@ -1051,7 +1568,17 @@ impl HostActionJob {
                         workflow_evidence("Reviewed switch", evidence_result(result.switch_passed)),
                         workflow_evidence(
                             "Restart observed",
-                            evidence_result(result.reboot_observed),
+                            if !result.reboot_observed
+                                && self.plan.as_ref().is_some_and(|plan| {
+                                    !plan.restart_required
+                                        && self.update_restart_intent()
+                                            != UpdateRestartIntent::RestartOnly
+                                })
+                            {
+                                "not required"
+                            } else {
+                                evidence_result(result.reboot_observed)
+                            },
                         ),
                         workflow_evidence(
                             "Kernel verification",
@@ -1161,6 +1688,9 @@ impl HostActionJob {
             .iter()
             .any(|event| event.kind == HostActionEventKind::SettingsRequestAccepted);
         let submitted = self.has_event(HostActionEventKind::DispatchSubmitted);
+        let repository_delivery = submitted
+            || self.has_event(HostActionEventKind::DispatchOutcomeUncertain)
+            || self.has_event(HostActionEventKind::DispatchFailed);
         let handoff_needs_reconciliation = submitted && !accepted;
         let outcome_uncertain = self.has_event(HostActionEventKind::DispatchOutcomeUncertain);
         let uncertainty_acknowledged =
@@ -1170,6 +1700,11 @@ impl HostActionJob {
             HostActionState::Succeeded => (
                 "The host reported the requested settings. The saved workflow is complete.",
                 "settings applied",
+                "clear",
+            ),
+            HostActionState::Cancelled => (
+                "The pending request was cleared. An open nixcfg proposal stays open there.",
+                "settings change withdrawn",
                 "clear",
             ),
             HostActionState::Failed if uncertainty_needs_ack => (
@@ -1205,6 +1740,7 @@ impl HostActionJob {
         };
         let request_state = match self.state {
             HostActionState::Succeeded => WorkflowStepState::Passed,
+            HostActionState::Cancelled => WorkflowStepState::Cancelled,
             HostActionState::Failed if outcome_uncertain => WorkflowStepState::ActionRequired,
             HostActionState::Failed => WorkflowStepState::Failed,
             _ if accepted || submitted => WorkflowStepState::Passed,
@@ -1212,13 +1748,16 @@ impl HostActionJob {
         };
         let wait_state = match self.state {
             HostActionState::Succeeded => WorkflowStepState::Passed,
+            HostActionState::Cancelled => WorkflowStepState::Skipped,
             HostActionState::Failed if outcome_uncertain => WorkflowStepState::Queued,
             HostActionState::Failed => WorkflowStepState::Skipped,
             _ if accepted => WorkflowStepState::Waiting,
             _ => WorkflowStepState::Queued,
         };
         let record_state = match self.state {
-            HostActionState::Succeeded | HostActionState::Failed => WorkflowStepState::Passed,
+            HostActionState::Succeeded | HostActionState::Failed | HostActionState::Cancelled => {
+                WorkflowStepState::Passed
+            }
             _ => WorkflowStepState::Queued,
         };
         (
@@ -1226,7 +1765,9 @@ impl HostActionJob {
             guidance.to_string(),
             status_label.to_string(),
             status_level,
-            if uncertainty_needs_ack {
+            if self.state.is_terminal() && self.state != HostActionState::Failed {
+                None
+            } else if uncertainty_needs_ack {
                 Some(HostWorkflowAction {
                     kind: HostWorkflowActionKind::Acknowledge,
                     label: "I verified nixcfg — allow a new request".to_string(),
@@ -1250,17 +1791,25 @@ impl HostActionJob {
                     "SEND",
                     "Send the change request",
                     request_state,
-                    if outcome_uncertain {
+                    if self.state == HostActionState::Cancelled {
+                        "The pending request was withdrawn; an external proposal is unchanged."
+                    } else if outcome_uncertain {
                         "Pharos cannot prove whether the repository accepted this request."
                     } else if self.state == HostActionState::Failed {
                         "The delivery workflow did not accept the request."
-                    } else if accepted || submitted {
+                    } else if submitted {
                         "The durable delivery workflow accepted the request."
+                    } else if accepted {
+                        "Pharos saved the request for host delivery."
                     } else {
                         "Pharos is recording the delivery request."
                     },
                 )
-                .at(HostWorkflowExecutionLocation::Github),
+                .at(if repository_delivery {
+                    HostWorkflowExecutionLocation::Github
+                } else {
+                    HostWorkflowExecutionLocation::Pharos
+                }),
                 workflow_step(
                     "host",
                     "APPLY",
@@ -1425,6 +1974,8 @@ impl HostActionJob {
         Vec<HostWorkflowStep>,
     ) {
         let plan = self.plan.as_ref();
+        let intent = self.update_restart_intent();
+        let applying_declared = intent == UpdateRestartIntent::ApplyDeclared;
         let confirmed = self.confirmed_at.is_some();
         let recovery = self.recovery_started_at.is_some();
         let recovered = recovery && self.state == HostActionState::Succeeded;
@@ -1435,7 +1986,12 @@ impl HostActionJob {
         let primary_action = match self.state {
             HostActionState::AwaitingConfirmation => Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Confirm,
-                label: "Confirm update".to_string(),
+                label: if applying_declared {
+                    "Confirm declared apply"
+                } else {
+                    "Confirm update"
+                }
+                .to_string(),
             }),
             HostActionState::Failed if self.review_retryable() => Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Retry,
@@ -1480,7 +2036,11 @@ impl HostActionJob {
             ),
             HostActionState::Applying => (
                 "The guarded live workflow is running on the target host.",
-                "applying update",
+                if applying_declared {
+                    "applying declared configuration"
+                } else {
+                    "applying update"
+                },
                 "warning",
             ),
             HostActionState::Rebooting if recovery => (
@@ -1499,8 +2059,16 @@ impl HostActionJob {
                 "clear",
             ),
             HostActionState::Succeeded => (
-                "The guarded update completed and all required evidence was recorded.",
-                "update completed",
+                if applying_declared {
+                    "The declared configuration was applied and all required evidence was recorded."
+                } else {
+                    "The guarded update completed and all required evidence was recorded."
+                },
+                if applying_declared {
+                    "declared configuration applied"
+                } else {
+                    "update completed"
+                },
                 "clear",
             ),
             HostActionState::Failed if preconfirm_failed => (
@@ -1587,7 +2155,9 @@ impl HostActionJob {
                 _ => WorkflowStepState::Queued,
             }
         };
-        let restart_state = if plan.is_some_and(|plan| !plan.restart_required) {
+        let restart_state = if plan.is_some_and(|plan| !plan.restart_required)
+            && intent != UpdateRestartIntent::RestartOnly
+        {
             WorkflowStepState::Skipped
         } else if recovered {
             WorkflowStepState::Recovered
@@ -1753,7 +2323,11 @@ impl HostActionJob {
             },
         ));
         (
-            format!("Update {}", self.host),
+            if applying_declared {
+                format!("Apply declared configuration to {}", self.host)
+            } else {
+                format!("Update {}", self.host)
+            },
             guidance,
             status_label.to_string(),
             status_level,
@@ -2116,6 +2690,7 @@ pub(crate) struct HostActionSummary {
     pub(crate) id: String,
     pub(crate) host: String,
     pub(crate) kind: HostActionKind,
+    pub(crate) intent: Option<UpdateRestartIntent>,
     pub(crate) state: HostActionState,
     pub(crate) ticket: String,
     pub(crate) retry_of: Option<String>,
@@ -2183,7 +2758,8 @@ fn lifecycle_run_priority(job: &HostActionJob) -> u8 {
         Some(HostLifecycleSlot::SettingsChange) => 2,
         Some(HostLifecycleSlot::SystemUpdateProposal) => 1,
         Some(
-            HostLifecycleSlot::PrefsDrift
+            HostLifecycleSlot::Blocked
+            | HostLifecycleSlot::PrefsDrift
             | HostLifecycleSlot::KernelDrift
             | HostLifecycleSlot::Quiet,
         )
@@ -2244,6 +2820,42 @@ pub(crate) fn active_update_restart_for_host<'a>(
         })
 }
 
+pub(crate) fn blocking_update_for_host<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    let mut latest_by_host: BTreeMap<&str, &HostActionJob> = BTreeMap::new();
+    for job in jobs
+        .iter()
+        .filter(|job| job.kind == HostActionKind::UpdateRestart)
+    {
+        let replace = latest_by_host.get(job.host.as_str()).is_none_or(|current| {
+            (job.created_at, job.updated_at, &job.id)
+                > (current.created_at, current.updated_at, &current.id)
+        });
+        if replace {
+            latest_by_host.insert(job.host.as_str(), job);
+        }
+    }
+    latest_by_host.into_values().find(|job| {
+        job.host != host
+            && !matches!(
+                job.state,
+                HostActionState::Succeeded | HostActionState::Cancelled
+            )
+    })
+}
+
+pub(crate) fn withdrawable_settings_change_for_host<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    dedupe_latest_workflow_jobs(jobs, host)
+        .into_iter()
+        .find(|job| job.workflow_kind() == HostWorkflowKind::SettingsChange)
+        .filter(|job| job.can_withdraw())
+}
+
 fn most_relevant_lifecycle_run<'a>(
     jobs: &'a [HostActionJob],
     host: &str,
@@ -2287,6 +2899,8 @@ fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle 
             HostLifecycleInvoke::Workflow
         },
         run_id: Some(job.id.clone()),
+        update_restart_intent: (job.kind == HostActionKind::UpdateRestart)
+            .then_some(job.update_restart_intent()),
         detail,
         blocked_by,
         primary_action: if job.workflow_kind() == HostWorkflowKind::SettingsChange
@@ -2299,11 +2913,23 @@ fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle 
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn host_lifecycle(
     jobs: &[HostActionJob],
     host: &str,
     preferences: HostPreferencesState,
     kernel_drift: bool,
+) -> HostLifecycle {
+    host_lifecycle_with_apply(jobs, host, preferences, kernel_drift, false, false)
+}
+
+pub(crate) fn host_lifecycle_with_apply(
+    jobs: &[HostActionJob],
+    host: &str,
+    preferences: HostPreferencesState,
+    kernel_drift: bool,
+    apply_declared_ready: bool,
+    normal_update_ready: bool,
 ) -> HostLifecycle {
     let action = most_relevant_lifecycle_run(jobs, host);
     if let Some((job, slot)) = action
@@ -2311,6 +2937,39 @@ pub(crate) fn host_lifecycle(
         .filter(|(_, slot)| *slot != HostLifecycleSlot::SystemUpdateProposal)
     {
         return run_lifecycle(job, slot);
+    }
+
+    let apply_declared_waiting = apply_declared_ready
+        && (preferences == HostPreferencesState::DeclaredNotApplied || kernel_drift);
+    if apply_declared_waiting || normal_update_ready {
+        if let Some(blocker) = blocking_update_for_host(jobs, host) {
+            let intent = if apply_declared_waiting {
+                UpdateRestartIntent::ApplyDeclared
+            } else {
+                UpdateRestartIntent::Update
+            };
+            return HostLifecycle {
+                schema: HOST_LIFECYCLE_SCHEMA,
+                version: HOST_LIFECYCLE_VERSION,
+                slot: HostLifecycleSlot::Blocked,
+                label: format!("Blocked by {}", blocker.host),
+                level: "warning",
+                invoke: HostLifecycleInvoke::UpdateRestart,
+                run_id: None,
+                update_restart_intent: Some(intent),
+                detail: format!(
+                    "{} holds the fleet update lock. Finish or resolve that workflow before starting this host's guarded {}.",
+                    blocker.host,
+                    if intent == UpdateRestartIntent::ApplyDeclared {
+                        "declared apply"
+                    } else {
+                        "update"
+                    }
+                ),
+                blocked_by: vec![format!("fleet_update:{}", blocker.host)],
+                primary_action: None,
+            };
+        }
     }
 
     match preferences {
@@ -2323,6 +2982,7 @@ pub(crate) fn host_lifecycle(
                 level: "warning",
                 invoke: HostLifecycleInvoke::HostSettings,
                 run_id: None,
+                update_restart_intent: None,
                 detail: "Requested preferences have not yet been observed by the host.".to_string(),
                 blocked_by: vec!["host_report".to_string()],
                 primary_action: None,
@@ -2335,10 +2995,20 @@ pub(crate) fn host_lifecycle(
                 slot: HostLifecycleSlot::PrefsDrift,
                 label: "Ready to apply".to_string(),
                 level: "info",
-                invoke: HostLifecycleInvoke::HostSettings,
+                invoke: if apply_declared_ready {
+                    HostLifecycleInvoke::UpdateRestart
+                } else {
+                    HostLifecycleInvoke::HostSettings
+                },
                 run_id: None,
-                detail: "Declared preferences differ from the host's observed preferences."
-                    .to_string(),
+                update_restart_intent: apply_declared_ready
+                    .then_some(UpdateRestartIntent::ApplyDeclared),
+                detail: if apply_declared_ready {
+                    "Declared preferences differ from the host. Start a guarded apply with the normal backup and confirmation gates."
+                } else {
+                    "Declared preferences differ from the host's observed preferences."
+                }
+                .to_string(),
                 blocked_by: Vec::new(),
                 primary_action: None,
             };
@@ -2353,9 +3023,20 @@ pub(crate) fn host_lifecycle(
             slot: HostLifecycleSlot::KernelDrift,
             label: "Restart required".to_string(),
             level: "warning",
-            invoke: HostLifecycleInvoke::KernelDetails,
+            invoke: if apply_declared_ready {
+                HostLifecycleInvoke::UpdateRestart
+            } else {
+                HostLifecycleInvoke::KernelDetails
+            },
             run_id: None,
-            detail: "The running kernel differs from the kernel ready after restart.".to_string(),
+            update_restart_intent: apply_declared_ready
+                .then_some(UpdateRestartIntent::ApplyDeclared),
+            detail: if apply_declared_ready {
+                "The running kernel differs from the declared kernel. Start a guarded apply with the normal backup and confirmation gates."
+            } else {
+                "The running kernel differs from the kernel ready after restart."
+            }
+            .to_string(),
             blocked_by: vec!["planned_restart".to_string()],
             primary_action: None,
         };
@@ -2375,6 +3056,7 @@ pub(crate) fn host_lifecycle(
         level: "clear",
         invoke: HostLifecycleInvoke::HostSettings,
         run_id: None,
+        update_restart_intent: None,
         detail: "No host lifecycle work is waiting.".to_string(),
         blocked_by: Vec::new(),
         primary_action: None,
@@ -2807,6 +3489,7 @@ impl HostActionStore {
             id: proposal.id,
             host: proposal.host.to_string(),
             kind: proposal.kind,
+            intent: None,
             workflow_kind: None,
             state: proposal.state,
             requested_by: proposal.actor.to_string(),
@@ -2948,6 +3631,7 @@ impl HostActionStore {
             id: action_id("system-update", host, now),
             host: host.to_string(),
             kind: HostActionKind::SystemUpdateProposal,
+            intent: None,
             workflow_kind: None,
             state: HostActionState::ProposalRequested,
             requested_by: actor.to_string(),
@@ -3186,10 +3870,21 @@ impl HostActionStore {
         Ok(updated)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_update_review(
         &self,
         host: &str,
         actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.create_update_review_with_intent(host, actor, UpdateRestartIntent::Update, now)
+    }
+
+    pub(crate) fn create_update_review_with_intent(
+        &self,
+        host: &str,
+        actor: &str,
+        intent: UpdateRestartIntent,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
@@ -3204,7 +3899,7 @@ impl HostActionStore {
         if Self::blocked_by_other_update(&jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
-        let job = Self::new_update_review(host, actor, now, None);
+        let job = Self::new_update_review(host, actor, intent, now, None);
         self.insert_locked(&mut jobs, job)
     }
 
@@ -3220,6 +3915,7 @@ impl HostActionStore {
         if existing.host != host {
             return Err(HostActionStoreError::WrongHost);
         }
+        let intent = existing.update_restart_intent();
         if !existing.review_retryable()
             || Self::latest_update_for(&jobs, host).is_none_or(|job| job.id != id)
         {
@@ -3231,7 +3927,7 @@ impl HostActionStore {
         if Self::blocked_by_other_update(&jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
-        let job = Self::new_update_review(host, actor, now, Some(id.to_string()));
+        let job = Self::new_update_review(host, actor, intent, now, Some(id.to_string()));
         self.insert_locked(&mut jobs, job)
     }
 
@@ -3261,6 +3957,49 @@ impl HostActionStore {
             job.lease_until = None;
             job.record_event(
                 now,
+                HostActionEventSource::Operator,
+                HostActionEventKind::Cancelled,
+                Some(actor),
+            );
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            if !error.persistence_committed() {
+                jobs.insert(id.to_string(), previous);
+            }
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn withdraw_settings_change(
+        &self,
+        id: &str,
+        host: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.host != host {
+                return Err(HostActionStoreError::WrongHost);
+            }
+            if !job.can_withdraw() {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            let event_at = now.max(job.updated_at);
+            job.state = HostActionState::Cancelled;
+            job.updated_at = event_at;
+            job.lease_phase = None;
+            job.lease_until = None;
+            job.record_event(
+                event_at,
                 HostActionEventSource::Operator,
                 HostActionEventKind::Cancelled,
                 Some(actor),
@@ -3340,6 +4079,7 @@ impl HostActionStore {
             id: action_id("remove-host", host, now),
             host: host.to_string(),
             kind: HostActionKind::RemoveHost,
+            intent: None,
             workflow_kind: None,
             state: HostActionState::ProposalRequested,
             requested_by: actor.to_string(),
@@ -3515,6 +4255,7 @@ impl HostActionStore {
             // Keep the persisted v1 action enum backward-readable. New clients
             // use workflow_kind for the precise user-facing workflow.
             kind: HostActionKind::SystemUpdateProposal,
+            intent: None,
             workflow_kind: Some(HostWorkflowKind::SettingsChange),
             state: HostActionState::ProposalRequested,
             requested_by: actor.to_string(),
@@ -3857,11 +4598,14 @@ impl HostActionStore {
             None,
         );
         let lease = AgentActionLease {
+            // The deployed nixcfg consumer requires this exact v1 six-field
+            // envelope and PHAROS-126 ticket. PHAROS-216 intent/provenance is
+            // control-plane state, not target-agent wire authority.
             schema: "inspr.pharos.host-action-lease.v1",
             version: 1,
             id: job.id.clone(),
             host: job.host.clone(),
-            ticket: job.ticket.clone(),
+            ticket: "PHAROS-126".to_string(),
             phase,
         };
         let id = job.id.clone();
@@ -3932,7 +4676,11 @@ impl HostActionStore {
                     AgentActionPhase::Apply | AgentActionPhase::Resume,
                     AgentActionOutcome::Rebooting,
                 ) => {
-                    if request.result.is_some() {
+                    let restart_expected = job.plan.as_ref().is_some_and(|plan| {
+                        plan.restart_required
+                            || job.update_restart_intent() == UpdateRestartIntent::RestartOnly
+                    });
+                    if request.result.is_some() || !restart_expected {
                         return Err(HostActionStoreError::InvalidJob);
                     }
                     job.state = HostActionState::Rebooting;
@@ -3947,9 +4695,13 @@ impl HostActionStore {
                     AgentActionOutcome::Succeeded,
                 ) => {
                     let result = request.result.ok_or(HostActionStoreError::InvalidJob)?;
+                    let restart_expected = job.plan.as_ref().is_some_and(|plan| {
+                        plan.restart_required
+                            || job.update_restart_intent() == UpdateRestartIntent::RestartOnly
+                    });
                     if !(result.backup_validated
                         && result.switch_passed
-                        && result.reboot_observed
+                        && (!restart_expected || result.reboot_observed)
                         && result.kernel_verified
                         && result.rollback_available)
                         || result.failure_gate.is_some()
@@ -4251,6 +5003,7 @@ impl HostActionStore {
     fn new_update_review(
         host: &str,
         actor: &str,
+        intent: UpdateRestartIntent,
         now: i64,
         retry_of: Option<String>,
     ) -> HostActionJob {
@@ -4260,10 +5013,17 @@ impl HostActionStore {
             id: action_id("update-restart", host, now),
             host: host.to_string(),
             kind: HostActionKind::UpdateRestart,
+            intent: Some(intent),
             workflow_kind: None,
             state: HostActionState::QueuedReview,
             requested_by: actor.to_string(),
-            ticket: "PHAROS-126".to_string(),
+            ticket: match intent {
+                UpdateRestartIntent::Update => "PHAROS-126",
+                UpdateRestartIntent::ApplyDeclared | UpdateRestartIntent::RestartOnly => {
+                    "PHAROS-216"
+                }
+            }
+            .to_string(),
             retry_of,
             created_at: now,
             updated_at: now,
@@ -4311,26 +5071,8 @@ impl HostActionStore {
     }
 
     fn blocked_by_other_update(jobs: &BTreeMap<String, HostActionJob>, host: &str) -> bool {
-        let mut latest_by_host: BTreeMap<&str, &HostActionJob> = BTreeMap::new();
-        for job in jobs
-            .values()
-            .filter(|job| job.kind == HostActionKind::UpdateRestart)
-        {
-            let replace = latest_by_host.get(job.host.as_str()).is_none_or(|current| {
-                (job.created_at, job.updated_at, &job.id)
-                    > (current.created_at, current.updated_at, &current.id)
-            });
-            if replace {
-                latest_by_host.insert(job.host.as_str(), job);
-            }
-        }
-        latest_by_host.values().any(|job| {
-            job.host != host
-                && !matches!(
-                    job.state,
-                    HostActionState::Succeeded | HostActionState::Cancelled
-                )
-        })
+        let snapshot = jobs.values().cloned().collect::<Vec<_>>();
+        blocking_update_for_host(&snapshot, host).is_some()
     }
 
     fn insert(&self, job: HostActionJob) -> Result<HostActionJob, HostActionStoreError> {
@@ -4942,6 +5684,8 @@ mod tests {
             id: format!("action-lifecycle-{}-{created_at}", kind.key()),
             host: "hsb8".to_string(),
             kind: action_kind,
+            intent: (action_kind == HostActionKind::UpdateRestart)
+                .then_some(UpdateRestartIntent::Update),
             workflow_kind: (kind == HostWorkflowKind::SettingsChange).then_some(kind),
             state,
             requested_by: "markus".to_string(),
@@ -5195,6 +5939,189 @@ mod tests {
         assert_eq!(
             store.claim("hsb8", 104).expect("claim").unwrap().phase,
             AgentActionPhase::Apply
+        );
+    }
+
+    #[test]
+    fn apply_declared_intent_stays_control_plane_only_and_skips_unneeded_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-apply-declared-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let job = store
+            .create_update_review_with_intent(
+                "hsb8",
+                "markus",
+                UpdateRestartIntent::ApplyDeclared,
+                120,
+            )
+            .expect("declared apply created");
+        assert_eq!(job.ticket, "PHAROS-216");
+        assert_eq!(
+            job.update_restart_intent(),
+            UpdateRestartIntent::ApplyDeclared
+        );
+        assert_eq!(
+            job.summary().intent,
+            Some(UpdateRestartIntent::ApplyDeclared)
+        );
+
+        let review = store.claim("hsb8", 121).expect("claim").expect("lease");
+        let actual = serde_json::to_value(&review).expect("lease serializes");
+        let mut expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/nixcfg-host-action-lease-v1.json"
+        ))
+        .expect("nixcfg contract fixture parses");
+        // Action IDs include a process-global counter. Normalize only that
+        // value; every authority-bearing declaration and the exact key set
+        // remain pinned to the deployed cross-repository consumer contract.
+        expected["id"] = actual["id"].clone();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.as_object().expect("lease object").len(), 6);
+        assert_eq!(review.id, job.id);
+        assert_eq!(review.ticket, "PHAROS-126");
+
+        let mut plan = ready_plan();
+        plan.restart_required = false;
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(plan),
+                    result: None,
+                },
+                122,
+            )
+            .expect("review stored");
+        let confirmed = store
+            .confirm_update(&job.id, "hsb8", "markus", 123)
+            .expect("confirmed");
+        let workflow = confirmed.summary().workflow;
+        assert_eq!(workflow.title, "Apply declared configuration to hsb8");
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "restart")
+                .expect("restart step")
+                .state,
+            WorkflowStepState::Skipped
+        );
+
+        let apply = store.claim("hsb8", 124).expect("claim").expect("lease");
+        assert_eq!(apply.schema, "inspr.pharos.host-action-lease.v1");
+        assert_eq!(apply.version, 1);
+        assert_eq!(apply.ticket, "PHAROS-126");
+        assert_eq!(
+            serde_json::to_value(&apply)
+                .expect("apply lease serializes")
+                .as_object()
+                .expect("apply lease object")
+                .len(),
+            6
+        );
+        assert_eq!(
+            store.record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Rebooting,
+                    plan: None,
+                    result: None,
+                },
+                125,
+            ),
+            Err(HostActionStoreError::InvalidJob)
+        );
+        let completed = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: false,
+                        kernel_verified: true,
+                        rollback_available: true,
+                        failure_gate: None,
+                        recovery_mode: None,
+                    }),
+                },
+                126,
+            )
+            .expect("non-restarting apply accepted");
+        assert_eq!(completed.state, HostActionState::Succeeded);
+        assert!(completed
+            .summary()
+            .workflow
+            .evidence
+            .iter()
+            .any(|fact| fact.label == "Restart observed" && fact.value == "not required"));
+
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        assert_eq!(
+            reloaded
+                .get(&job.id)
+                .expect("declared apply reloads")
+                .update_restart_intent(),
+            UpdateRestartIntent::ApplyDeclared
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_apply_lifecycle_names_the_host_holding_the_fleet_lock() {
+        let mut blocker = lifecycle_job(
+            HostWorkflowKind::UpdateRestart,
+            HostActionState::QueuedReview,
+            150,
+        );
+        blocker.host = "csb0".to_string();
+
+        let blocked = host_lifecycle_with_apply(
+            &[blocker],
+            "hsb8",
+            HostPreferencesState::DeclaredNotApplied,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(blocked.slot, HostLifecycleSlot::Blocked);
+        assert_eq!(blocked.label, "Blocked by csb0");
+        assert!(blocked.detail.contains("csb0 holds the fleet update lock"));
+        assert_eq!(blocked.blocked_by, vec!["fleet_update:csb0"]);
+        assert_eq!(
+            blocked.update_restart_intent,
+            Some(UpdateRestartIntent::ApplyDeclared)
+        );
+        assert!(blocked.primary_action.is_none());
+
+        let ready = host_lifecycle_with_apply(
+            &[],
+            "hsb8",
+            HostPreferencesState::DeclaredNotApplied,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(ready.slot, HostLifecycleSlot::PrefsDrift);
+        assert_eq!(ready.invoke, HostLifecycleInvoke::UpdateRestart);
+        assert_eq!(
+            ready.update_restart_intent,
+            Some(UpdateRestartIntent::ApplyDeclared)
         );
     }
 
@@ -5734,14 +6661,26 @@ mod tests {
         let accepted = store
             .accept_settings_change(&job.id, 402)
             .expect("request accepted");
-        let wait = accepted
-            .summary()
-            .workflow
+        let workflow = accepted.summary().workflow;
+        let wait = workflow
             .steps
-            .into_iter()
+            .iter()
             .find(|step| step.key == "host")
             .expect("host wait step");
         assert_eq!(wait.state, WorkflowStepState::Waiting);
+        let request = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "requested")
+            .expect("requested ladder fact");
+        assert_eq!(request.fact, "Pending request saved for host delivery");
+        assert_eq!(request.state, "complete");
+        let send = workflow
+            .steps
+            .iter()
+            .find(|step| step.key == "request")
+            .expect("request step");
+        assert_eq!(send.location, HostWorkflowExecutionLocation::Pharos);
 
         let completed = store
             .complete_settings_change("hsb8", 403)
@@ -5753,6 +6692,73 @@ mod tests {
             "settings applied"
         );
         assert_eq!(WorkflowStepState::Cancelled.key(), "cancelled");
+    }
+
+    #[test]
+    fn failed_settings_ladder_stops_the_request_instead_of_claiming_current_work() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("hsb8", "markus", 404)
+            .expect("settings workflow created");
+        let failed = store
+            .fail_settings_change(&job.id, 405)
+            .expect("settings request stopped");
+        let workflow = failed.summary().workflow;
+        let requested = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "requested")
+            .expect("requested ladder fact");
+        assert_eq!(requested.state, "stopped");
+        assert_eq!(requested.fact, "Request delivery stopped");
+        assert!(workflow.primary_action.is_none());
+    }
+
+    #[test]
+    fn nonterminal_settings_change_can_be_withdrawn_without_erasing_audit_facts() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("hsb8", "markus", 410)
+            .expect("settings workflow created");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..HostPreferences::default()
+        };
+        store
+            .record_settings_request(&job.id, &requested, 411)
+            .expect("settings request recorded");
+        store
+            .mark_dispatch_submitted(&job.id, 412)
+            .expect("repository handoff recorded");
+
+        let withdrawn = store
+            .withdraw_settings_change(&job.id, "hsb8", "markus", 413)
+            .expect("settings change withdrawn");
+        assert_eq!(withdrawn.state, HostActionState::Cancelled);
+        assert_eq!(withdrawn.requested_preferences(), Some(&requested));
+        assert!(!withdrawn.can_withdraw());
+        let workflow = withdrawn.summary().workflow;
+        assert_eq!(workflow.status_label, "settings change withdrawn");
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "request")
+                .expect("request step")
+                .state,
+            WorkflowStepState::Cancelled
+        );
+        assert_eq!(
+            workflow.next.consequence,
+            "Clears the pending request. An open nixcfg proposal stays open there."
+        );
+        assert!(matches!(
+            store.withdraw_settings_change(&job.id, "hsb8", "markus", 414),
+            Err(HostActionStoreError::InvalidTransition)
+        ));
+        store
+            .begin_settings_change("hsb8", "markus", 415)
+            .expect("a fresh settings change can start after withdrawal");
     }
 
     #[test]
@@ -6457,6 +7463,76 @@ mod tests {
                 .expect("deployment boundary")
                 .detail,
             "This proposal workflow never deploys hosts."
+        );
+    }
+
+    #[test]
+    fn proposal_ladder_does_not_claim_repository_review_after_failed_handoff() {
+        for (uncertain, expected) in [
+            (true, "Repository receipt is unconfirmed"),
+            (false, "Repository handoff was rejected"),
+        ] {
+            let store = HostActionStore::new(None);
+            let job = store
+                .begin_system_update_proposal("hsb8", "markus", 460, None)
+                .expect("proposal workflow created")
+                .into_job();
+            let failed = if uncertain {
+                store
+                    .fail_system_update_proposal_uncertain(&job.id, 461)
+                    .expect("uncertain handoff recorded")
+            } else {
+                store
+                    .fail_system_update_proposal(&job.id, 461)
+                    .expect("rejected handoff recorded")
+            };
+            let workflow = failed.summary().workflow;
+            let declared = workflow
+                .ladder
+                .iter()
+                .find(|fact| fact.key == "declared")
+                .expect("declared ladder fact");
+            assert_eq!(declared.fact, expected);
+            assert_ne!(declared.fact, "Repository review continues outside Pharos");
+        }
+    }
+
+    #[test]
+    fn apply_claim_is_current_execution_not_completed_evidence() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "markus", 470)
+            .expect("job created");
+        store.claim("hsb8", 471).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                472,
+            )
+            .expect("review stored");
+        store
+            .confirm_update(&job.id, "hsb8", "markus", 473)
+            .expect("confirmed");
+        store.claim("hsb8", 474).expect("claim").expect("lease");
+
+        let workflow = store.get(&job.id).expect("job retained").summary().workflow;
+        let executed = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "executed")
+            .expect("executed ladder fact");
+        assert_eq!(executed.state, "current");
+        assert_eq!(
+            executed.fact,
+            "Target-local execution started; completion is not recorded"
         );
     }
 
@@ -8849,6 +9925,7 @@ mod tests {
 
         let store = HostActionStore::new(Some(path.clone()));
         let job = store.latest_for_host("hsb8").expect("legacy update loaded");
+        assert_eq!(job.update_restart_intent(), UpdateRestartIntent::Update);
         assert_eq!(job.events[0].kind, HostActionEventKind::ApplyFailed);
         assert!(job
             .summary()
@@ -8864,6 +9941,7 @@ mod tests {
         let retry = HostActionStore::new_update_review(
             "hsb8",
             "markus",
+            UpdateRestartIntent::Update,
             300,
             Some("action-update-restart-csb0-200-1".to_string()),
         );
