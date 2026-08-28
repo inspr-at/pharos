@@ -49,6 +49,7 @@ const OFFICIAL_NIXPKGS_GIT_REMOTE: &str = "https://github.com/NixOS/nixpkgs.git"
 const MAX_DEPLOYMENT_EVIDENCE_BYTES: u64 = 4 * 1024;
 const MAX_FLAKE_LOCK_BYTES: u64 = 8 * 1024 * 1024;
 const BEACON_HEALTH_PATH: &str = "/tmp/pharos-beacon-health-v1";
+const BEACON_HEALTH_PATH_ENV: &str = "PHAROS_BEACON_HEALTH_FILE";
 const BEACON_HEALTH_STALE_INTERVALS: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,38 +238,168 @@ fn write_beacon_health(path: &Path, last_success_at: i64) -> std::io::Result<()>
     write_result
 }
 
-fn beacon_health_is_fresh(path: &Path, cadence_secs: u64, now: i64) -> bool {
-    if RequestDeadlines::for_cadence(cadence_secs).is_err() {
-        return false;
-    }
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() || metadata.len() > 64 {
-        return false;
-    }
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let mut fields = raw.split_ascii_whitespace();
-    if fields.next() != Some("v1") || fields.clone().count() != 1 {
-        return false;
-    }
-    let Some(last_success_at) = fields.next().and_then(|value| value.parse::<i64>().ok()) else {
-        return false;
-    };
-    let Some(age_secs) = now.checked_sub(last_success_at) else {
-        return false;
-    };
-    age_secs >= 0
-        && u64::try_from(age_secs)
-            .is_ok_and(|age| age <= cadence_secs.saturating_mul(BEACON_HEALTH_STALE_INTERVALS))
+/// Where the beacon records its last successful report for the container
+/// probe. Overridable so a deployment without a writable `/tmp` can still
+/// publish truthful health (PHAROS-203).
+fn beacon_health_path() -> PathBuf {
+    env_value(BEACON_HEALTH_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(BEACON_HEALTH_PATH))
 }
 
-fn beacon_container_healthcheck() -> bool {
-    reporting_interval().ok().flatten().is_some_and(|cadence| {
-        beacon_health_is_fresh(Path::new(BEACON_HEALTH_PATH), cadence, now_unix())
-    })
+/// Every way the beacon container can be unhealthy, each with a reason an
+/// operator can act on from `docker inspect` output alone (PHAROS-203).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BeaconHealthProblem {
+    OneShot,
+    InvalidInterval,
+    StateMissing(PathBuf),
+    StateUnreadable {
+        path: PathBuf,
+        error: String,
+    },
+    StateInvalid(PathBuf),
+    NoSuccessfulReportYet,
+    ClockSkew {
+        last_success_at: i64,
+        now: i64,
+    },
+    Stale {
+        age_secs: u64,
+        limit_secs: u64,
+        cadence_secs: u64,
+    },
+}
+
+impl std::fmt::Display for BeaconHealthProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OneShot => write!(
+                f,
+                "PHAROS_INTERVAL is not set, so this is a one-shot beacon that publishes no container health; \
+                 set PHAROS_INTERVAL for a recurring beacon or disable the container healthcheck"
+            ),
+            Self::InvalidInterval => write!(
+                f,
+                "PHAROS_INTERVAL must be between {MIN_HEARTBEAT_INTERVAL_SECS} and {MAX_HEARTBEAT_INTERVAL_SECS} seconds"
+            ),
+            Self::StateMissing(path) => write!(
+                f,
+                "no report state at {}; the beacon has not started, or cannot write there (mount a writable tmpfs or set {BEACON_HEALTH_PATH_ENV})",
+                path.display()
+            ),
+            Self::StateUnreadable { path, error } => write!(
+                f,
+                "report state at {} could not be read: {error}",
+                path.display()
+            ),
+            Self::StateInvalid(path) => write!(
+                f,
+                "report state at {} is not a pharos-beacon health record",
+                path.display()
+            ),
+            Self::NoSuccessfulReportYet => {
+                write!(f, "no successful report to the control plane yet")
+            }
+            Self::ClockSkew {
+                last_success_at,
+                now,
+            } => write!(
+                f,
+                "last successful report is stamped {last_success_at} but the clock reads {now}; refusing to trust a future report"
+            ),
+            Self::Stale {
+                age_secs,
+                limit_secs,
+                cadence_secs,
+            } => write!(
+                f,
+                "last successful report was {age_secs}s ago, beyond {limit_secs}s ({BEACON_HEALTH_STALE_INTERVALS} x PHAROS_INTERVAL={cadence_secs})"
+            ),
+        }
+    }
+}
+
+/// Reads the recorded last-success timestamp. `Ok(None)` is the startup
+/// marker: the beacon is running but has not reported successfully yet.
+fn read_beacon_health(path: &Path) -> Result<Option<i64>, BeaconHealthProblem> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BeaconHealthProblem::StateMissing(path.to_path_buf()));
+        }
+        Err(err) => {
+            return Err(BeaconHealthProblem::StateUnreadable {
+                path: path.to_path_buf(),
+                error: err.to_string(),
+            });
+        }
+    };
+    if !metadata.is_file() || metadata.len() > 64 {
+        return Err(BeaconHealthProblem::StateInvalid(path.to_path_buf()));
+    }
+    let raw =
+        std::fs::read_to_string(path).map_err(|err| BeaconHealthProblem::StateUnreadable {
+            path: path.to_path_buf(),
+            error: err.to_string(),
+        })?;
+    let mut fields = raw.split_ascii_whitespace();
+    if fields.next() != Some("v1") || fields.clone().count() != 1 {
+        return Err(BeaconHealthProblem::StateInvalid(path.to_path_buf()));
+    }
+    let last_success_at = fields
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| BeaconHealthProblem::StateInvalid(path.to_path_buf()))?;
+    match last_success_at {
+        0 => Ok(None),
+        stamp if stamp > 0 => Ok(Some(stamp)),
+        _ => Err(BeaconHealthProblem::StateInvalid(path.to_path_buf())),
+    }
+}
+
+/// Container health verdict for a recurring beacon: `Ok(age)` when the last
+/// successful report is within the staleness window, otherwise the reason.
+fn beacon_health_verdict(
+    path: &Path,
+    cadence_secs: u64,
+    now: i64,
+) -> Result<u64, BeaconHealthProblem> {
+    if RequestDeadlines::for_cadence(cadence_secs).is_err() {
+        return Err(BeaconHealthProblem::InvalidInterval);
+    }
+    let last_success_at =
+        read_beacon_health(path)?.ok_or(BeaconHealthProblem::NoSuccessfulReportYet)?;
+    let age_secs = now
+        .checked_sub(last_success_at)
+        .and_then(|age| u64::try_from(age).ok())
+        .ok_or(BeaconHealthProblem::ClockSkew {
+            last_success_at,
+            now,
+        })?;
+    let limit_secs = cadence_secs.saturating_mul(BEACON_HEALTH_STALE_INTERVALS);
+    if age_secs > limit_secs {
+        return Err(BeaconHealthProblem::Stale {
+            age_secs,
+            limit_secs,
+            cadence_secs,
+        });
+    }
+    Ok(age_secs)
+}
+
+fn beacon_container_healthcheck() -> Result<String, BeaconHealthProblem> {
+    let cadence = match reporting_interval() {
+        Ok(Some(cadence)) => cadence,
+        Ok(None) => return Err(BeaconHealthProblem::OneShot),
+        Err(_) => return Err(BeaconHealthProblem::InvalidInterval),
+    };
+    let path = beacon_health_path();
+    let age_secs = beacon_health_verdict(&path, cadence, now_unix())?;
+    Ok(format!(
+        "healthy: last successful report {age_secs}s ago (limit {}s)",
+        cadence.saturating_mul(BEACON_HEALTH_STALE_INTERVALS)
+    ))
 }
 
 fn report_rtt_millis(duration: Duration) -> u64 {
@@ -1985,7 +2116,19 @@ fn reporting_interval() -> Result<Option<u64>, &'static str> {
 
 fn main() {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
-        std::process::exit(if beacon_container_healthcheck() { 0 } else { 1 });
+        // Container probe (PHAROS-203/204): healthy only if this beacon
+        // reported successfully within the staleness window; every other
+        // verdict prints its reason for `docker inspect`.
+        match beacon_container_healthcheck() {
+            Ok(detail) => {
+                println!("pharos-beacon healthcheck: {detail}");
+                std::process::exit(0);
+            }
+            Err(problem) => {
+                eprintln!("pharos-beacon healthcheck: {problem}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let base = env_value("PHAROS_URL").unwrap_or_else(|| {
@@ -2022,8 +2165,12 @@ fn main() {
     let agent = deadlines.agent();
     let mut last_report_rtt_ms: Option<u64> = None;
     let mut consecutive_failures = 0_u32;
-    if interval.is_some() && write_beacon_health(Path::new(BEACON_HEALTH_PATH), 0).is_err() {
-        eprintln!("pharos-beacon: could not initialize container health state");
+    let health_path = beacon_health_path();
+    if interval.is_some() && write_beacon_health(&health_path, 0).is_err() {
+        eprintln!(
+            "pharos-beacon: could not initialize container health state at {}; the container healthcheck will stay unhealthy",
+            health_path.display()
+        );
     }
     systemd_notify("READY=1\nSTATUS=Waiting for first successful report");
 
@@ -2118,8 +2265,11 @@ fn main() {
                 let status = resp.status().as_u16();
                 last_report_rtt_ms = Some(report_rtt_millis(started.elapsed()));
                 consecutive_failures = 0;
-                if write_beacon_health(Path::new(BEACON_HEALTH_PATH), now_unix()).is_err() {
-                    eprintln!("pharos-beacon: could not refresh container health state");
+                if write_beacon_health(&health_path, now_unix()).is_err() {
+                    eprintln!(
+                        "pharos-beacon: could not refresh container health state at {}",
+                        health_path.display()
+                    );
                 }
                 systemd_notify("WATCHDOG=1\nSTATUS=Last report succeeded");
                 println!(
@@ -2943,8 +3093,21 @@ mod tests {
         let path = kernel_fixture("container-health");
         write_beacon_health(&path, 1_000).expect("write successful report health");
 
-        assert!(beacon_health_is_fresh(&path, 60, 1_180));
-        assert!(!beacon_health_is_fresh(&path, 60, 1_181));
+        assert_eq!(beacon_health_verdict(&path, 60, 1_000), Ok(0));
+        assert_eq!(beacon_health_verdict(&path, 60, 1_180), Ok(180));
+        let stale = beacon_health_verdict(&path, 60, 1_181).unwrap_err();
+        assert_eq!(
+            stale,
+            BeaconHealthProblem::Stale {
+                age_secs: 181,
+                limit_secs: 180,
+                cadence_secs: 60
+            }
+        );
+        let reason = stale.to_string();
+        assert!(reason.contains("181s ago"), "{reason}");
+        assert!(reason.contains("beyond 180s"), "{reason}");
+        assert!(reason.contains("PHAROS_INTERVAL=60"), "{reason}");
 
         std::fs::remove_file(path).expect("remove health fixture");
     }
@@ -2952,21 +3115,94 @@ mod tests {
     #[test]
     fn beacon_health_fails_closed_before_success_or_for_invalid_state() {
         let path = kernel_fixture("invalid-container-health");
-        assert!(!beacon_health_is_fresh(&path, 60, 1_000));
+        let missing = beacon_health_verdict(&path, 60, 1_000).unwrap_err();
+        assert_eq!(missing, BeaconHealthProblem::StateMissing(path.clone()));
+        let reason = missing.to_string();
+        assert!(reason.contains(&path.display().to_string()), "{reason}");
+        assert!(reason.contains(BEACON_HEALTH_PATH_ENV), "{reason}");
 
         write_beacon_health(&path, 0).expect("write startup health state");
-        assert!(!beacon_health_is_fresh(&path, 60, 1_000));
-        assert!(!beacon_health_is_fresh(&path, 60, -1));
+        assert_eq!(
+            beacon_health_verdict(&path, 60, 1_000),
+            Err(BeaconHealthProblem::NoSuccessfulReportYet)
+        );
+        assert_eq!(
+            beacon_health_verdict(&path, MIN_HEARTBEAT_INTERVAL_SECS - 1, 1_000),
+            Err(BeaconHealthProblem::InvalidInterval)
+        );
 
-        std::fs::write(&path, "not-health\n").expect("write invalid health state");
-        assert!(!beacon_health_is_fresh(&path, 60, 1_000));
-        assert!(!beacon_health_is_fresh(
-            &path,
-            MIN_HEARTBEAT_INTERVAL_SECS - 1,
-            1_000
-        ));
+        write_beacon_health(&path, 1_000).expect("write successful report health");
+        assert_eq!(
+            beacon_health_verdict(&path, 60, 999),
+            Err(BeaconHealthProblem::ClockSkew {
+                last_success_at: 1_000,
+                now: 999
+            })
+        );
+        assert_eq!(
+            beacon_health_verdict(&path, 60, -1),
+            Err(BeaconHealthProblem::ClockSkew {
+                last_success_at: 1_000,
+                now: -1
+            })
+        );
 
-        std::fs::remove_file(path).expect("remove health fixture");
+        for invalid in [
+            "not-health\n",
+            "v1\n",
+            "v1 12 34\n",
+            "v2 1000\n",
+            "v1 abc\n",
+            "v1 -5\n",
+        ] {
+            std::fs::write(&path, invalid).expect("write invalid health state");
+            assert_eq!(
+                beacon_health_verdict(&path, 60, 1_000),
+                Err(BeaconHealthProblem::StateInvalid(path.clone())),
+                "{invalid:?}"
+            );
+        }
+
+        std::fs::remove_file(&path).expect("remove health fixture");
+        std::fs::create_dir(&path).expect("create directory in place of health state");
+        assert_eq!(
+            beacon_health_verdict(&path, 60, 1_000),
+            Err(BeaconHealthProblem::StateInvalid(path.clone()))
+        );
+        std::fs::remove_dir(path).expect("remove directory fixture");
+    }
+
+    #[test]
+    fn beacon_health_problems_name_the_missing_configuration() {
+        let one_shot = BeaconHealthProblem::OneShot.to_string();
+        assert!(
+            one_shot.contains("PHAROS_INTERVAL is not set"),
+            "{one_shot}"
+        );
+        assert!(one_shot.contains("one-shot"), "{one_shot}");
+
+        let invalid = BeaconHealthProblem::InvalidInterval.to_string();
+        assert!(
+            invalid.contains("PHAROS_INTERVAL must be between"),
+            "{invalid}"
+        );
+
+        let never = BeaconHealthProblem::NoSuccessfulReportYet.to_string();
+        assert!(never.contains("no successful report"), "{never}");
+
+        let unreadable = BeaconHealthProblem::StateUnreadable {
+            path: PathBuf::from("/tmp/pharos-beacon-health-v1"),
+            error: "permission denied".to_string(),
+        }
+        .to_string();
+        assert!(
+            unreadable.contains("/tmp/pharos-beacon-health-v1"),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.contains("could not be read: permission denied"),
+            "{unreadable}"
+        );
     }
 
     #[test]

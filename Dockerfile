@@ -52,6 +52,11 @@ USER pharos
 ENV PHAROS_ADDR=0.0.0.0:8080 \
     RUST_LOG=info
 EXPOSE 8080
+# Role-aware container probe (PHAROS-203/204). The image is shared by two
+# roles: `pharosd` (default entrypoint) and `pharos-beacon`. A beacon always
+# carries PHAROS_URL, so that selects its own report-freshness check; anything
+# else gets the daemon readiness probe, which refuses to guess a bind address
+# and prints its reason. Both verdicts land in `docker inspect .State.Health`.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
     CMD if [ -n "${PHAROS_URL:-}" ]; then \
         exec /usr/local/bin/pharos-beacon healthcheck; \

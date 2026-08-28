@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make container health diagnosable and truthful for both image roles: `pharosd healthcheck` refuses to guess the bind address when `PHAROS_ADDR` is unset and reports the failing target or HTTP status, `pharos-beacon healthcheck` states why the beacon is unhealthy (one-shot mode, missing or invalid report state, no successful report yet, clock skew, stale age against the interval), and `PHAROS_BEACON_HEALTH_FILE` relocates the beacon's report state; deployments can drop `--no-healthcheck` workarounds (PHAROS-203).
+
 ## 0.1.89 - 2026-08-27
 
 - Keep host setting edits local until an explicit review and confirmation creates exactly one saved SettingsChange request, with clean draft discard and clear requested consequences (PHAROS-225).
