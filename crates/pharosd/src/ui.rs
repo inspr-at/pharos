@@ -1145,6 +1145,12 @@ pub(super) fn service_observation_attention_reason(
     let unknown = observations
         .iter()
         .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
+        .filter(|observation| {
+            !appliance_probes::is_appliance_observation(observation)
+                || !observation
+                    .summary
+                    .starts_with("online; allowing SSH startup")
+        })
         .filter(|obs| obs.state == ServiceObservationState::Unknown)
         .count();
     if unknown > 0 {
@@ -2208,6 +2214,12 @@ pub(super) fn attention_reason(
                     .is_some_and(|observation| observation.summary == "powered off as expected")
                 {
                     "offline as expected"
+                } else if appliance.is_some_and(|observation| {
+                    observation
+                        .summary
+                        .starts_with("online; allowing SSH startup")
+                }) {
+                    "starting normally"
                 } else if live == Liveness::Down {
                     if preferences.kind == HostKind::Workstation {
                         "offline as expected"

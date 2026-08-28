@@ -7129,6 +7129,15 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(grace_alerts.is_empty());
+        let grace_attention = attention_reason(
+            Liveness::AwaitingFirstHeartbeat,
+            &appliance.freshness,
+            None,
+            &appliance.service_observations,
+            &appliance.preferences,
+        );
+        assert_eq!(grace_attention.label, "starting normally");
+        assert_eq!(grace_attention.level, "ok");
         let grace_activity = activity_events(
             runtime(std::slice::from_ref(&appliance), &[]),
             "csb1",
