@@ -1270,6 +1270,8 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
       expected_version: "7.0.14",
       observed_at: 1_700_000_000,
     };
+    await faultCard.locator("[data-host-actions]").evaluate((root) => root.remove());
+    await expect(faultCard.locator("[data-host-actions]")).toHaveCount(0);
     await firstFault.focus();
     await expect(page.locator("[data-fresh-popover]")).toBeVisible();
     expect(await page.evaluate((body) => applyFleetSnapshot(body), healed)).toBe(true);

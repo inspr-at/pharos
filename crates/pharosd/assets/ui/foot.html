@@ -567,12 +567,6 @@ function updateHostActionState(surface,host,backup){
   root.dataset.deployedRevision=String(host.freshness?.deployment_evidence?.source_revision||'');
   root.dataset.nixcfgRevision=String(host.freshness?.nixcfg_comparison?.upstream_revision||'');
   root.dataset.nixpkgsRevision=String(host.freshness?.deployment_evidence?.nixpkgs_revision||'');
-  setFreshRow(surface,'kernel-restart',{
-    value:'restart required',
-    klass:'warn',
-    label:'Kernel',
-    visible:kernelState==='reboot_required'
-  });
   root.dataset.retired=retirement?.pending===true?'true':'false';
   root.dataset.retirementDisposition=String(retirement?.disposition||'');
   root.dataset.retirementSuccessor=String(retirement?.successor||'');
@@ -1200,6 +1194,14 @@ function updateSettingsLinkSurfaces(surface,host){
   });
   const hostActions=surface.querySelector('[data-host-actions]');
   if(hostActions)hostActions.dataset.settingsState=state;
+}
+function updateKernelFault(surface,host){
+  setFreshRow(surface,'kernel-restart',{
+    value:'restart required',
+    klass:'warn',
+    label:'Kernel',
+    visible:String(host?.kernel?.state||'unknown')==='reboot_required'
+  });
 }
 function updateHostLifecycle(surface,host){
   const lifecycle=host.lifecycle||null;
@@ -3696,6 +3698,7 @@ function applyFleetSnapshot(data){
       updateHostLifecycle(card,h);
       updateReasonVisibility(card,attention,h.freshness,h.kernel,now,h.lifecycle);
       updateMuted(card,muted);
+      updateKernelFault(card,h);
       updateFreshness(card,h.freshness,now);
       updateBackup(card,backup);
       setSeen(card,h.last_seen,now);
