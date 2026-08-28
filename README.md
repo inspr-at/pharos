@@ -214,9 +214,12 @@ reads. The marker also records which beacon process wrote it (pid and kernel
 process start time) and is trusted only while that exact process is running:
 state left by a previous run never becomes healthy merely because an obstacle
 to resetting it clears, a crashed beacon is unhealthy at the next probe, and
-only a successful report by the current process restores health. The state is
-reset at startup, and a reset that cannot write unlinks the previous marker
-if it can (it never writes into an existing file). Deployments that disabled
+only a successful report by the current process restores health (on Linux
+the token includes the kernel boot id and is refused when that cannot be
+read). The state is reset at startup under the same lock: the beacon takes
+it, notes which file the marker name points at, attempts the reset, and if
+that fails unlinks only that exact file (it never writes into an existing
+file); if the lock cannot be taken, nothing is touched. Deployments that disabled
 the inherited check (`--no-healthcheck`, Compose `healthcheck: disable: true`)
 as a workaround can remove that override.
 
