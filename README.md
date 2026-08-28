@@ -727,6 +727,13 @@ cargo deny check
 Additional checks cover the NixOS module, native systemd installer,
 `nixos-anywhere` handoff and self-host Compose contract.
 
+Browser QA runs with `npm run test:browser`. Playwright keeps transient traces,
+failure screenshots and videos under `test-results/`, while reviewed visual
+baselines live under `tests/browser/__screenshots__/`. Use the harness output
+paths for ad-hoc evidence and synthetic fixture data only. Cargo's ignored
+`target/` directory is disposable build cache: never park tests or fleet
+captures there, and never commit captured infrastructure data as a fixture.
+
 The visible version in [`VERSION`](VERSION), the Cargo workspace version and
 the latest entry in [`docs/CHANGELOG.md`](docs/CHANGELOG.md) must stay aligned.
 `pharosd` exposes the version and build commit at `/version`.
