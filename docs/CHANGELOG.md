@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Fail closed on beacon container health when the report marker cannot be replaced: `pharos-beacon healthcheck` proves the beacon's atomic temp+rename write is possible (directory writable and the existing marker replaceable despite immutable flags, ACLs or sticky ownership, probed through a hard link so the marker is never touched) before trusting a recent marker, names the path and reason otherwise, and a failed startup reset invalidates any previous marker it can reach (PHAROS-203).
+- Fail closed on beacon container health when the report marker cannot be replaced: `pharos-beacon healthcheck` proves the beacon's atomic temp+rename write is possible (directory writable and the existing marker replaceable despite immutable flags, ACLs or sticky ownership, probed through a hard link so the marker is never touched, with fixed-name artifacts that every run recovers) before trusting a recent marker, names the path and reason otherwise, never follows a symlink at the marker path, and a failed startup reset only unlinks the previous marker, never writing into it (PHAROS-203).
 
 ## 0.1.90 - 2026-08-28
 

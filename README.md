@@ -198,13 +198,18 @@ path); a read-only container needs a writable tmpfs there. Every probe first
 proves it can perform the same atomic write the beacon uses: it creates a
 temporary file next to the marker, hard-links the existing marker to a
 sibling name and renames the temporary over that link, so immutable flags,
-deny-delete ACLs or sticky-directory ownership that would refuse replacing the
-marker refuse the probe too, while the marker itself is never written or
-moved. A marker the beacon cannot replace is never trusted, however recent it
-reads. The state is reset at startup, and a
-reset that cannot write destroys any previous marker it can reach, so a
-restarted beacon stays unhealthy until it reports again and nothing outside
-the beacon can make it look healthy. Deployments that disabled
+deny-delete ACLs, sticky-directory ownership or a filesystem without hard
+links that would refuse replacing the marker refuse the probe too, while the
+marker itself is never written or moved. The marker is only ever opened
+without following symlinks; a symlink, directory or device at that path is
+invalid state and is never followed. Probe and write artifacts use fixed
+sibling names (`.<marker>.tmp`, `.<marker>.probe-tmp`, `.<marker>.probe-link`)
+that each run removes first, so a run killed by the healthcheck timeout leaves
+at most one file per name. A marker the beacon cannot replace is never
+trusted, however recent it reads. The state is reset at startup, and a reset
+that cannot write unlinks the previous marker if it can (it never writes into
+an existing file), so a restarted beacon stays unhealthy until it reports
+again and nothing outside the beacon can make it look healthy. Deployments that disabled
 the inherited check (`--no-healthcheck`, Compose `healthcheck: disable: true`)
 as a workaround can remove that override.
 
