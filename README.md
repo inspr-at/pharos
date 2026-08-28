@@ -513,12 +513,14 @@ checks: one ICMP presence probe and one TCP connection to the declared SSH
 port. Targets are used for those calls only and are never returned in the API,
 logs, observations or durable debounce state.
 
-For a host declared `kind: workstation` through the existing PHAROS-109
-preference contract, an ICMP-down appliance is recorded as
-`powered off as expected` and creates no heartbeat alert. The registry does not
-silence heartbeat policy for server-kind hosts. ICMP-up with SSH closed remains
-non-alerting boot grace until the declared 2–10 consecutive-sample threshold is
-reached; it then becomes the distinct warning
+Every registry host must already have a Pharos host record and be declared
+`kind: workstation` through the existing PHAROS-109 preference contract;
+startup rejects missing records or server-kind declarations. Record creation
+and real-host acceptance remain owned by OPS-19. Once validated, an ICMP-down
+appliance is recorded as `powered off as expected` and creates no heartbeat
+alert. ICMP-up with SSH closed remains non-alerting boot grace until the
+declared 2–10 consecutive-sample threshold is reached; it then becomes the
+distinct warning
 `un-converged: online but SSH is unavailable`. SSH recovery resets the durable
 counter. Pharos only detects and reports this state—it never tries to enable
 SSH, run a bootstrap, install an agent or otherwise remediate the appliance.

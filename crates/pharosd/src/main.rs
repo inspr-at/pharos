@@ -4275,8 +4275,13 @@ async fn main() {
         host_store_path.as_deref(),
         provider_runtime.existing_host.clone(),
     )
-    .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"))
-    .map(Arc::new);
+    .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
+    if let Some(runtime) = appliance_probes.as_ref() {
+        runtime
+            .validate_host_records(&store, &manifests)
+            .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
+    }
+    let appliance_probes = appliance_probes.map(Arc::new);
     store
         .replace_server_observations(appliance_probes::APPLIANCE_OBSERVATION_ID, &BTreeMap::new())
         .unwrap_or_else(|error| panic!("stale appliance observation cleanup failed: {error}"));
@@ -7064,8 +7069,12 @@ mod tests {
     fn appliance_probe_owns_liveness_without_false_boot_or_offline_alerts() {
         let mut appliance = host_with_backups("appliance-test", 500, vec![]);
         appliance.last_seen = None;
+        appliance.heartbeat_log.clear();
         appliance.heartbeat_interval_secs = None;
-        appliance.preferences.kind = HostKind::Workstation;
+        // Beacon-less records retain the runtime default. Startup separately
+        // proves that this server-owned observation is backed by a declared
+        // workstation preference before it can reach these projections.
+        assert_eq!(appliance.preferences.kind, HostKind::Server);
         appliance.service_observations = vec![ServiceObservation {
             id: appliance_probes::APPLIANCE_OBSERVATION_ID.to_string(),
             label: "Appliance convergence".to_string(),
@@ -7092,6 +7101,20 @@ mod tests {
         );
         assert_eq!(offline_attention.label, "offline as expected");
         assert_eq!(offline_attention.level, "ok");
+        let offline_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1000,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!offline_activity
+            .iter()
+            .any(|event| matches!(event.kind, "heartbeat" | "service")));
 
         appliance.service_observations[0].state = ServiceObservationState::Unknown;
         appliance.service_observations[0].summary =
@@ -7106,6 +7129,20 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(grace_alerts.is_empty());
+        let grace_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1001,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!grace_activity
+            .iter()
+            .any(|event| matches!(event.kind, "heartbeat" | "service")));
 
         appliance.service_observations[0].state = ServiceObservationState::Warning;
         appliance.service_observations[0].summary =
@@ -7128,30 +7165,25 @@ mod tests {
         assert!(!unconverged_alerts
             .iter()
             .any(|alert| alert.source == "heartbeat"));
-
-        appliance.preferences.kind = HostKind::Server;
-        appliance.service_observations[0].state = ServiceObservationState::Healthy;
-        appliance.service_observations[0].summary = "powered off as expected".to_string();
-        let misclassified_alerts = alert_items(
-            std::slice::from_ref(&appliance),
-            &[],
+        let unconverged_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
             "csb1",
-            1003,
-            &[],
-            &[],
-            &BTreeMap::new(),
+            1002,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
         );
-        assert!(misclassified_alerts
+        assert!(!unconverged_activity
             .iter()
-            .any(|alert| alert.source == "heartbeat"));
-        let misclassified_attention = attention_reason(
-            Liveness::AwaitingFirstHeartbeat,
-            &appliance.freshness,
-            None,
-            &appliance.service_observations,
-            &appliance.preferences,
-        );
-        assert_ne!(misclassified_attention.label, "offline as expected");
+            .any(|event| event.kind == "heartbeat"));
+        let unconverged_event = unconverged_activity
+            .iter()
+            .find(|event| event.kind == "service")
+            .expect("un-converged service activity is present");
+        assert!(unconverged_event.detail.starts_with("un-converged:"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pharos_core::{ServiceObservation, ServiceObservationState};
+use pharos_core::{HostKind, ServiceObservation, ServiceObservationState};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -19,7 +19,8 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
-use crate::durable_file::{atomic_write_json, load_optional_json};
+use crate::durable_file::{atomic_write_json, load_optional_json, DurableFileError};
+use crate::manifests::ManifestRegistry;
 use crate::provisioning::{
     open_trusted_runtime_file, read_trusted_runtime_file, run_child_with_deadline,
     valid_bootstrap_name, valid_ssh_endpoint, valid_ssh_user, ExistingHostRuntimeConfig,
@@ -240,15 +241,37 @@ impl ApplianceProbeRuntime {
         ssh: ExistingHostRuntimeConfig,
     ) -> Result<Self, String> {
         registry.validate()?;
-        let mut state = load_optional_json::<ApplianceProbeStateDocument>(&state_path)
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
+        let mut state = match load_optional_json::<ApplianceProbeStateDocument>(&state_path) {
+            Ok(Some(state))
+                if state.schema == APPLIANCE_STATE_SCHEMA
+                    && state.version == APPLIANCE_STATE_VERSION =>
+            {
+                state
+            }
+            Ok(Some(_)) | Err(DurableFileError::Decode(_)) => {
+                ApplianceProbeStateDocument::default()
+            }
+            Ok(None) => ApplianceProbeStateDocument::default(),
+            Err(error) => return Err(error.to_string()),
+        };
         state.hosts.retain(|host, _| {
             registry
                 .appliances
                 .iter()
                 .any(|declaration| declaration.host == *host)
         });
+        for (host, host_state) in &mut state.hosts {
+            let declaration = registry
+                .appliances
+                .iter()
+                .find(|declaration| declaration.host == *host)
+                .expect("undeclared probe state was retained");
+            if host_state.checked_at < 0
+                || host_state.consecutive_online_without_ssh > declaration.debounce_samples
+            {
+                *host_state = ApplianceHostProbeState::default();
+            }
+        }
         state.validate(&registry)?;
         Ok(Self {
             registry,
@@ -271,6 +294,27 @@ impl ApplianceProbeRuntime {
 
     fn interval(&self) -> Duration {
         Duration::from_secs(self.registry.probe_interval_secs)
+    }
+
+    pub(crate) fn validate_host_records(
+        &self,
+        store: &Store,
+        manifests: &ManifestRegistry,
+    ) -> Result<(), String> {
+        for declaration in &self.registry.appliances {
+            if store.get(&declaration.host).is_none()
+                || manifests
+                    .declared_preferences_for(&declaration.host)
+                    .map(|preferences| preferences.kind)
+                    != Some(HostKind::Workstation)
+            {
+                return Err(format!(
+                    "appliance probe host {} requires an existing host record and declared workstation kind",
+                    declaration.host
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn collect_samples(&self) -> Vec<(ApplianceProbeDeclaration, ApplianceProbeSample)> {
@@ -493,13 +537,16 @@ fn ping_present(target: &str) -> Result<bool, ()> {
 }
 
 fn classify_ping_exit(code: Option<i32>) -> Result<bool, ()> {
+    #[cfg(target_os = "macos")]
+    const NO_REPLY: i32 = 2;
+    #[cfg(not(target_os = "macos"))]
+    const NO_REPLY: i32 = 1;
     match code {
         Some(0) => Ok(true),
-        // iputils and macOS ping reserve exit 1 for a completed probe that
-        // received no reply. Invocation, permission, and network errors use a
-        // different status and must not be misreported as a safely powered-off
-        // appliance.
-        Some(1) => Ok(false),
+        // iputils reserves exit 1 and macOS ping reserves exit 2 for a
+        // completed probe that received no reply. Other statuses are errors
+        // and must not be misreported as a safely powered-off appliance.
+        Some(code) if code == NO_REPLY => Ok(false),
         Some(_) | None => Err(()),
     }
 }
@@ -658,6 +705,10 @@ fn parse_marker_response(output: &[u8]) -> MarkerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pharos_core::{
+        HostPreferences, HostPreferencesRegistry, HostRegistration, HOST_PREFERENCES_SCHEMA,
+        HOST_PREFERENCES_VERSION, HOST_REGISTRATION_SCHEMA, HOST_REGISTRATION_VERSION,
+    };
 
     fn registry() -> ApplianceProbeRegistry {
         serde_json::from_str(include_str!("../../../contracts/appliance-probes-v1.json")).unwrap()
@@ -708,6 +759,66 @@ mod tests {
         let mut unsafe_target = registry;
         unsafe_target.appliances[0].target = "host; cat /etc/passwd".to_string();
         assert!(unsafe_target.validate().is_err());
+    }
+
+    #[test]
+    fn appliance_membership_requires_existing_record_and_declared_workstation_kind() {
+        let state_path = temporary_path("host-policy-state");
+        let preferences_path = temporary_path("host-policy-preferences");
+        let runtime = ApplianceProbeRuntime::new(
+            registry(),
+            state_path.clone(),
+            ExistingHostRuntimeConfig::default(),
+        )
+        .unwrap();
+        let store = Store::new(None).unwrap();
+        store
+            .register(
+                HostRegistration {
+                    schema: HOST_REGISTRATION_SCHEMA.to_string(),
+                    version: HOST_REGISTRATION_VERSION,
+                    name: "appliance-test".to_string(),
+                    role: "appliance".to_string(),
+                    is_nix: false,
+                    heartbeat_interval_secs: 60,
+                },
+                "test-hash".to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.get("appliance-test").unwrap().preferences.kind,
+            HostKind::Server
+        );
+        assert!(runtime
+            .validate_host_records(&store, &ManifestRegistry::default())
+            .is_err());
+
+        atomic_write_json(
+            &preferences_path,
+            &HostPreferencesRegistry {
+                schema: HOST_PREFERENCES_SCHEMA.to_string(),
+                version: HOST_PREFERENCES_VERSION,
+                hosts: BTreeMap::from([(
+                    "appliance-test".to_string(),
+                    HostPreferences {
+                        accent: Some("#123456".to_string()),
+                        kind: HostKind::Workstation,
+                        ..Default::default()
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+        let manifests = ManifestRegistry::from_sources(Vec::new(), Some(preferences_path.clone()));
+        assert!(
+            runtime.validate_host_records(&store, &manifests).is_ok(),
+            "manifest issues: {:?}; declared: {:?}",
+            manifests.load_errors(),
+            manifests.declared_preferences()
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(preferences_path);
     }
 
     #[test]
@@ -837,6 +948,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_or_corrupt_debounce_cache_resets_without_blocking_startup() {
+        let state_path = temporary_path("stale-cache");
+        atomic_write_json(
+            &state_path,
+            &ApplianceProbeStateDocument {
+                schema: APPLIANCE_STATE_SCHEMA.to_string(),
+                version: APPLIANCE_STATE_VERSION,
+                hosts: BTreeMap::from([(
+                    "appliance-test".to_string(),
+                    ApplianceHostProbeState {
+                        consecutive_online_without_ssh: 4,
+                        checked_at: 100,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+        let after_threshold_lowering = ApplianceProbeRuntime::new(
+            registry(),
+            state_path.clone(),
+            ExistingHostRuntimeConfig::default(),
+        )
+        .unwrap()
+        .apply_samples(
+            vec![(declaration(), ApplianceProbeSample::OnlineWithoutSsh)],
+            101,
+        )
+        .unwrap();
+        assert_eq!(
+            after_threshold_lowering["appliance-test"].state,
+            ServiceObservationState::Unknown
+        );
+        assert!(after_threshold_lowering["appliance-test"]
+            .summary
+            .contains("1 of 3"));
+
+        std::fs::write(&state_path, b"{not-json").unwrap();
+        assert!(ApplianceProbeRuntime::new(
+            registry(),
+            state_path.clone(),
+            ExistingHostRuntimeConfig::default(),
+        )
+        .is_ok());
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
     fn marker_parser_accepts_only_two_sanitized_bounded_facts() {
         assert_eq!(
             parse_marker_response(b"present\n20260827.1 2026-08-27T20:15:00Z\n"),
@@ -915,8 +1073,13 @@ mod tests {
             "if test -r /home/operator/.appliance-converged; then printf 'present\\n'; head -c 257 -- /home/operator/.appliance-converged; else printf 'missing\\n'; fi"
         );
         assert_eq!(classify_ping_exit(Some(0)), Ok(true));
-        assert_eq!(classify_ping_exit(Some(1)), Ok(false));
-        assert_eq!(classify_ping_exit(Some(2)), Err(()));
+        if cfg!(target_os = "macos") {
+            assert_eq!(classify_ping_exit(Some(1)), Err(()));
+            assert_eq!(classify_ping_exit(Some(2)), Ok(false));
+        } else {
+            assert_eq!(classify_ping_exit(Some(1)), Ok(false));
+            assert_eq!(classify_ping_exit(Some(2)), Err(()));
+        }
         assert_eq!(classify_ping_exit(None), Err(()));
     }
 }
