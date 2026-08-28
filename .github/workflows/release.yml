@@ -26,7 +26,7 @@ jobs:
     # roughly a tenth of the minute consumption.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           fetch-depth: 0
       - name: fetch release tag object
@@ -36,15 +36,15 @@ jobs:
         run: scripts/check-release-consistency.sh
       - name: pinned Paimos delivery contract
         run: scripts/check-paimos-delivery-contract.sh
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0 (Node 24)
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0 (Node 24)
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: version
         run: echo "value=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0 (Node 24)
         id: meta
         with:
           images: ghcr.io/inspr-at/pharos/pharosd
@@ -67,7 +67,7 @@ jobs:
             echo "error: could not prove that the semantic image tag is unused" >&2
             exit 1
           fi
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0 (Node 24)
         id: build
         with:
           context: .
@@ -82,7 +82,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: scan published image
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (composite; Node 24 nested actions)
         with:
           image-ref: ghcr.io/inspr-at/pharos/pharosd@${{ steps.build.outputs.digest }}
           version: v0.72.0
@@ -93,7 +93,7 @@ jobs:
           severity: CRITICAL,HIGH
           scanners: vuln
       - name: generate SPDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0 (Node 24)
         with:
           image: ghcr.io/inspr-at/pharos/pharosd@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -120,7 +120,7 @@ jobs:
             and (.packages | type == "array" and length > 0)
           ' <<<"${sbom}" >/dev/null
       - name: install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1 (composite)
         with:
           cosign-release: v2.5.2
       - name: sign image digest with GitHub OIDC

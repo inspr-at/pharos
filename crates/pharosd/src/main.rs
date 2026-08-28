@@ -11,6 +11,7 @@
 mod agora;
 mod alerting;
 mod alerts;
+mod appliance_probes;
 mod auth;
 mod durable_file;
 mod host_actions;
@@ -92,12 +93,18 @@ use url::Url;
 
 use crate::alerting::*;
 use crate::alerts::{AlertEvent, AlertStore, AlertWorkerHealth};
+use crate::appliance_probes::{spawn_appliance_probe_loop, ApplianceProbeRuntime};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
+#[cfg(test)]
+use crate::host_actions::host_lifecycle;
 use crate::host_actions::{
+    active_update_restart_for_host, blocking_update_for_host, host_lifecycle_with_apply,
+    host_preferences_state, most_relevant_host_action, withdrawable_settings_change_for_host,
     AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
-    HostActionState, HostActionStore, HostActionStoreError, HostRemovalPlan,
-    HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
-    RetiredHostStore, RetirementAgentResultRequest,
+    HostActionState, HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot,
+    HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind,
+    HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
+    SystemUpdateProposalBegin, UpdateRestartIntent,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -106,7 +113,7 @@ use crate::managed_service_operations::{
 };
 use crate::managed_setup_intents::*;
 use crate::manifests::{ManifestLoadIssue, ManifestRegistry};
-use crate::nixcfg_dispatch::NixcfgDispatch;
+use crate::nixcfg_dispatch::{NixcfgDispatch, NixcfgDispatchError};
 use crate::provider_connections::{
     compare_gross_prices, evidence_is_fresh, safe_hcloud_api_base, test_hetzner_connection,
     HetznerConnectionAttempt, HetznerConnectionCode, HetznerConnectionPreferences,
@@ -138,6 +145,7 @@ struct AppState {
     provider_runtime: ProviderRuntimeConfig,
     provider_connections: Arc<ProviderConnectionStore>,
     paid_create_lock: Arc<tokio::sync::Mutex<()>>,
+    settings_change_lock: Arc<tokio::sync::Mutex<()>>,
     nixcfg_dispatch: NixcfgDispatch,
     retirement_owner: RetirementOwnerAuth,
     host_actions: Arc<HostActionStore>,
@@ -507,6 +515,13 @@ struct SystemUpdateActionRequest {
     host: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateRestartActionRequest {
+    #[serde(default)]
+    intent: UpdateRestartIntent,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfirmHostActionRequest {
@@ -514,7 +529,7 @@ struct ConfirmHostActionRequest {
     attended: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoveHostActionRequest {
     confirmation: String,
@@ -548,6 +563,14 @@ fn action_request_header(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value == "1")
 }
 
+fn system_update_uncertainty_acknowledgement(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("X-Pharos-Acknowledge-Uncertainty")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) fn action_actor(auth: &AuthState, headers: &HeaderMap) -> String {
     let raw = sidebar_user_label(auth, headers);
     let actor: String = raw
@@ -569,13 +592,57 @@ fn action_error(status: StatusCode, message: &str) -> (StatusCode, Json<serde_js
 
 fn action_message(job: &HostActionJob) -> Cow<'static, str> {
     if job.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange {
+        let outcome_uncertain = job
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain);
+        let uncertainty_acknowledged = job.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        });
         return Cow::Borrowed(match job.state {
             HostActionState::Succeeded => "The host reported the requested settings.",
+            HostActionState::Cancelled => {
+                "The pending settings request was withdrawn. An open nixcfg proposal was not changed."
+            }
+            HostActionState::Failed if outcome_uncertain && uncertainty_acknowledged => {
+                "The operator recorded that nixcfg was checked. A fresh settings request may now be submitted deliberately."
+            }
+            HostActionState::Failed if outcome_uncertain => {
+                "Pharos could not confirm whether nixcfg received the settings request. Verify nixcfg before allowing another request."
+            }
             HostActionState::Failed => "The settings request stopped and was recorded.",
             _ => "The settings request is saved and waiting for the host.",
         });
     }
+    if job.workflow_kind() == host_actions::HostWorkflowKind::SystemUpdateProposal {
+        let outcome_uncertain = job
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain);
+        return Cow::Borrowed(match job.state {
+            HostActionState::Succeeded => {
+                "Pharos handed the update review request to nixcfg. Repository checks and review continue outside Pharos. No host was deployed or verified from Pharos."
+            }
+            HostActionState::Failed if outcome_uncertain => {
+                "Pharos could not confirm whether nixcfg received this review request. Verify nixcfg before starting another fleet-wide proposal. No host change was deployed or verified from Pharos."
+            }
+            HostActionState::Failed => {
+                "The system update review request stopped and was recorded. No host change was authorized from Pharos."
+            }
+            HostActionState::ProposalRequested => {
+                "Pharos is recording the fleet-wide update review request. No host has changed."
+            }
+            _ => "The system update review workflow is recorded.",
+        });
+    }
     if job.workflow_kind() == host_actions::HostWorkflowKind::RemoveHost {
+        let outcome_uncertain = job
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain);
+        let uncertainty_acknowledged = job.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        });
         return match job.state {
             HostActionState::ProposalRequested => Cow::Borrowed(
                 "The retirement intent is saved while Pharos finishes the guarded handoff.",
@@ -584,6 +651,14 @@ fn action_message(job: &HostActionJob) -> Cow<'static, str> {
             HostActionState::Succeeded => {
                 Cow::Borrowed("The host retirement completed and was recorded.")
             }
+            HostActionState::Failed if outcome_uncertain && uncertainty_acknowledged => {
+                Cow::Borrowed(
+                    "The operator recorded that nixcfg was checked. Reporting remains active, and a fresh removal request may now be started deliberately.",
+                )
+            }
+            HostActionState::Failed if outcome_uncertain => Cow::Borrowed(
+                "Pharos could not confirm whether nixcfg received the removal request. Reporting access remains active; verify nixcfg before allowing another request.",
+            ),
             HostActionState::Failed => {
                 Cow::Borrowed("The removal request stopped safely and remains recorded.")
             }
@@ -657,11 +732,39 @@ fn action_response_with_message(
 }
 
 pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
+    let ladder = workflow
+        .ladder
+        .iter()
+        .map(|fact| {
+            let at = fact
+                .at
+                .map(|at| format!(" <time>{}</time>", html_escape(&clock_label(at))))
+                .unwrap_or_default();
+            format!(
+                r#"<li data-ladder-key="{key}" data-ladder-state="{state}"><span class="host-workflow-ladder-marker" aria-hidden="true"></span><span><strong>{label}</strong><small>{fact}{at}</small></span></li>"#,
+                key = html_escape(fact.key),
+                state = html_escape(fact.state),
+                label = html_escape(fact.label),
+                fact = html_escape(&fact.fact),
+                at = at,
+            )
+        })
+        .collect::<String>();
+    let next = format!(
+        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p><dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>"#,
+        title = html_escape(&workflow.next.title),
+        consequence = html_escape(&workflow.next.consequence),
+        location = html_escape(&workflow.next.location),
+        boundary = html_escape(&workflow.next.boundary),
+    );
     let mut groups = String::new();
     let mut current_group = "";
     for (index, step) in workflow.steps.iter().enumerate() {
         let current = workflow.current_step.as_deref() == Some(step.key.as_str());
-        let state_label = workflow_step_state_label(step.state.key());
+        let waiting_for_evidence = workflow.kind == host_actions::HostWorkflowKind::SettingsChange
+            && current
+            && step.state.key() == "waiting";
+        let state_label = workflow_step_presentation_label(workflow, step);
         let location_label = step.location.label(&workflow.host);
         let current_attribute = if current {
             r#" aria-current="step""#
@@ -689,10 +792,11 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
             ));
         }
         groups.push_str(&format!(
-            r#"<div class="host-workflow-step" role="listitem" data-step-state="{state}" data-current="{current}" aria-busy="{busy}"{current_attribute}><span class="host-workflow-marker" aria-hidden="true"></span><span class="host-workflow-step-copy"><strong>{number}. {label}</strong><span>{detail}</span></span><span class="host-workflow-step-state" aria-label="{state_aria}"><span>{state_label}</span>{location}</span></div>"#,
+            r#"<div class="host-workflow-step" role="listitem" data-step-state="{state}" data-current="{current}" data-waiting-for-evidence="{waiting_for_evidence}" aria-busy="{busy}"{current_attribute}><span class="host-workflow-marker" aria-hidden="true"></span><span class="host-workflow-step-copy"><strong>{number}. {label}</strong><span>{detail}</span></span><span class="host-workflow-step-state" aria-label="{state_aria}"><span>{state_label}</span>{location}</span></div>"#,
             state = step.state.key(),
             current = current,
-            busy = step.state.key() == "running",
+            waiting_for_evidence = waiting_for_evidence,
+            busy = step.state.key() == "running" || waiting_for_evidence,
             current_attribute = current_attribute,
             number = index + 1,
             label = html_escape(&step.label),
@@ -762,11 +866,13 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
         .map(|location| format!(" on {}", html_escape(&location)))
         .unwrap_or_default();
     format!(
-        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}"><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
+        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}"><ol class="host-workflow-ladder" aria-label="Run truth: observed, declared, requested, executed, verified">{ladder}</ol><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{next}{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
         kind = workflow_kind_key(workflow.kind),
         status = html_escape(&workflow.status_label),
+        ladder = ladder,
         created = html_escape(&clock_label(workflow.created_at)),
         current_status = html_escape(current_status),
+        next = next,
     )
 }
 
@@ -795,6 +901,36 @@ fn workflow_step_state_label(state: &str) -> &'static str {
     }
 }
 
+fn workflow_step_presentation_label(
+    workflow: &host_actions::HostWorkflowSummary,
+    step: &host_actions::HostWorkflowStep,
+) -> &'static str {
+    if workflow.kind == host_actions::HostWorkflowKind::SystemUpdateProposal
+        && step.state.key() == "skipped"
+    {
+        match workflow.status_label.as_str() {
+            "review handed to nixcfg" => match step.key.as_str() {
+                "validate" | "review" => "continues in nixcfg",
+                "deploy" => "not deployed",
+                _ => workflow_step_state_label(step.state.key()),
+            },
+            "dispatch outcome uncertain" => match step.key.as_str() {
+                "validate" | "review" => "not confirmed",
+                "deploy" => "not deployed",
+                _ => workflow_step_state_label(step.state.key()),
+            },
+            "update review stopped" => match step.key.as_str() {
+                "validate" | "review" => "not attempted",
+                "deploy" => "not deployed",
+                _ => workflow_step_state_label(step.state.key()),
+            },
+            _ => workflow_step_state_label(step.state.key()),
+        }
+    } else {
+        workflow_step_state_label(step.state.key())
+    }
+}
+
 fn host_is_declared(state: &AppState, host: &str) -> bool {
     state
         .manifests
@@ -816,7 +952,11 @@ fn host_janus_actions_ready(state: &AppState, host: &str) -> bool {
     })
 }
 
-fn update_restart_target_error(state: &AppState, host: &str) -> Option<(StatusCode, &'static str)> {
+fn update_restart_target_error(
+    state: &AppState,
+    host: &str,
+    intent: UpdateRestartIntent,
+) -> Option<(StatusCode, &'static str)> {
     let Some(runtime) = state.store.get(host) else {
         return Some((StatusCode::NOT_FOUND, "Host is not reporting to Pharos"));
     };
@@ -832,15 +972,67 @@ fn update_restart_target_error(state: &AppState, host: &str) -> Option<(StatusCo
             "This host is not prepared for target-local Janus actions yet",
         ));
     }
-    if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
-        && !runtime.freshness.has_proven_deployable_update()
-    {
-        return Some((
-            StatusCode::CONFLICT,
-            "No pending system update or restart is currently reported for this host",
-        ));
+    match intent {
+        UpdateRestartIntent::Update => {
+            if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
+                && !runtime.freshness.has_proven_deployable_update()
+            {
+                return Some((
+                    StatusCode::CONFLICT,
+                    "No pending system update or restart is currently reported for this host",
+                ));
+            }
+        }
+        UpdateRestartIntent::ApplyDeclared => {
+            let preferences = host_preferences_state(
+                &runtime.preferences,
+                state.manifests.declared_preferences_for(host),
+                runtime.requested_preferences.as_ref(),
+            );
+            if preferences != HostPreferencesState::DeclaredNotApplied
+                && kernel_reboot_required(runtime.kernel.as_ref()).is_none()
+            {
+                return Some((
+                    StatusCode::CONFLICT,
+                    "No declared preference or kernel drift is ready to apply for this host",
+                ));
+            }
+        }
+        UpdateRestartIntent::RestartOnly => {
+            return Some((
+                StatusCode::CONFLICT,
+                "Restart-only workflows are not available in this release",
+            ));
+        }
     }
     None
+}
+
+fn system_update_action_response_for_existing_replacement(
+    workflow: &HostActionJob,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if host_actions::system_update_dispatch_handed_off(workflow) {
+        return action_response(StatusCode::ACCEPTED, workflow);
+    }
+    if workflow.state == HostActionState::Failed {
+        if workflow
+            .events
+            .iter()
+            .any(|event| event.kind == host_actions::HostActionEventKind::DispatchOutcomeUncertain)
+        {
+            return action_response_with_message(
+                StatusCode::CONFLICT,
+                workflow,
+                "Pharos could not confirm whether nixcfg received the review request. Verify nixcfg before retrying.",
+            );
+        }
+        return action_response_with_message(
+            StatusCode::BAD_GATEWAY,
+            workflow,
+            "The repository workflow rejected the review request; no host change was authorized",
+        );
+    }
+    action_response(StatusCode::ACCEPTED, workflow)
 }
 
 async fn request_system_update(
@@ -867,11 +1059,55 @@ async fn request_system_update(
     }
     let actor = action_actor(&state.auth, &headers);
     let now = now_unix();
-    let workflow = match state
-        .host_actions
-        .begin_system_update_proposal(host, &actor, now)
-    {
-        Ok(workflow) => workflow,
+    let acknowledge_uncertainty =
+        system_update_uncertainty_acknowledgement(&headers).map(str::to_string);
+    if let Some(id) = acknowledge_uncertainty.as_deref() {
+        if !host_actions::system_update_uncertainty_acknowledgement_id_valid(id) {
+            return action_error(
+                StatusCode::BAD_REQUEST,
+                "The uncertainty acknowledgement reference is invalid",
+            );
+        }
+    }
+    let begin = match state.host_actions.begin_system_update_proposal(
+        host,
+        &actor,
+        now,
+        acknowledge_uncertainty.as_deref(),
+    ) {
+        Ok(begin) => begin,
+        Err(HostActionStoreError::InvalidJob) => {
+            return action_error(
+                StatusCode::BAD_REQUEST,
+                "The uncertainty acknowledgement reference is invalid",
+            );
+        }
+        Err(HostActionStoreError::NotFound) => {
+            return action_error(
+                StatusCode::BAD_REQUEST,
+                "The uncertainty acknowledgement reference was not found",
+            );
+        }
+        Err(HostActionStoreError::WrongHost) => {
+            return action_error(
+                StatusCode::FORBIDDEN,
+                "The uncertainty acknowledgement does not belong to this host",
+            );
+        }
+        Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(job)) => {
+            return action_response_with_message(
+                StatusCode::CONFLICT,
+                &job,
+                "Pharos could not confirm the prior repository dispatch. Review the saved workflow, verify nixcfg, then acknowledge the uncertainty before starting another fleet-wide request.",
+            );
+        }
+        Err(HostActionStoreError::ActiveSystemUpdateProposal(job)) => {
+            return action_response_with_message(
+                StatusCode::CONFLICT,
+                &job,
+                "A fleet-wide system update review is already open. Open the saved workflow before starting another request.",
+            );
+        }
         Err(_) => {
             return action_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -879,38 +1115,68 @@ async fn request_system_update(
             );
         }
     };
+    if let SystemUpdateProposalBegin::Existing(workflow) = &begin {
+        return system_update_action_response_for_existing_replacement(workflow);
+    }
+    let workflow = match begin {
+        SystemUpdateProposalBegin::New(job) => job,
+        SystemUpdateProposalBegin::Existing(_) => {
+            unreachable!("existing replacements handled above")
+        }
+    };
     if let Err(error) = state.nixcfg_dispatch.dispatch_system_update(host).await {
-        let failed = state
-            .host_actions
-            .fail_system_update_proposal(&workflow.id, now_unix())
-            .unwrap_or(workflow);
+        let failed = match error {
+            NixcfgDispatchError::OutcomeUncertain => state
+                .host_actions
+                .fail_system_update_proposal_uncertain(&workflow.id, now_unix())
+                .unwrap_or(workflow),
+            _ => state
+                .host_actions
+                .fail_system_update_proposal(&workflow.id, now_unix())
+                .unwrap_or(workflow),
+        };
         return action_response_with_message(
-            StatusCode::BAD_GATEWAY,
+            if error.is_outcome_uncertain() {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
             &failed,
-            error.safe_message(),
+            error.system_update_message(),
         );
     }
-    let job = match state
+    let submitted = match state
         .host_actions
-        .accept_system_update_proposal(&workflow.id, now_unix())
+        .mark_dispatch_submitted(&workflow.id, now_unix())
     {
         Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => state
+            .host_actions
+            .get(&workflow.id)
+            .unwrap_or_else(|| workflow.clone()),
         Err(_) => {
+            let uncertain = state
+                .host_actions
+                .fail_system_update_proposal_uncertain(&workflow.id, now_unix())
+                .ok()
+                .or_else(|| state.host_actions.get(&workflow.id))
+                .unwrap_or_else(|| workflow.clone());
             return action_response_with_message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &workflow,
-                "The update request was sent, but its saved checklist could not be updated",
+                StatusCode::CONFLICT,
+                &uncertain,
+                "The update request was sent, but Pharos could not record the repository handoff. Verify nixcfg before any retry.",
             );
         }
     };
-    tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-125", "system update review requested");
-    action_response(StatusCode::ACCEPTED, &job)
+    tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-125", "system update review handed to nixcfg");
+    action_response(StatusCode::ACCEPTED, &submitted)
 }
 
 async fn request_update_restart_review(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(host): AxumPath<String>,
+    Json(request): Json<UpdateRestartActionRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let access = access_for_headers(&state.auth, &headers);
     if !action_request_header(&headers) || !access.can_manage_fleet() || !access.allows_host(&host)
@@ -920,16 +1186,18 @@ async fn request_update_restart_review(
             "Guarded host action access is not granted",
         );
     }
-    if let Some((status, message)) = update_restart_target_error(&state, &host) {
+    if let Some((status, message)) = update_restart_target_error(&state, &host, request.intent) {
         return action_error(status, message);
     }
     let actor = action_actor(&state.auth, &headers);
-    match state
-        .host_actions
-        .create_update_review(&host, &actor, now_unix())
-    {
+    match state.host_actions.create_update_review_with_intent(
+        &host,
+        &actor,
+        request.intent,
+        now_unix(),
+    ) {
         Ok(job) => {
-            tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-126", "guarded host review queued");
+            tracing::info!(host = %host, actor = %actor, intent = request.intent.key(), ticket = %job.ticket, "guarded host review queued");
             action_response(StatusCode::ACCEPTED, &job)
         }
         Err(HostActionStoreError::ActiveJob) => action_error(
@@ -940,10 +1208,19 @@ async fn request_update_restart_review(
             StatusCode::CONFLICT,
             "The latest guarded review failed; retry that recorded attempt",
         ),
-        Err(HostActionStoreError::BlockedByFleetGate) => action_error(
-            StatusCode::CONFLICT,
-            "Another host update workflow must finish or be resolved first",
-        ),
+        Err(HostActionStoreError::BlockedByFleetGate) => {
+            let jobs = state.host_actions.list();
+            let message = blocking_update_for_host(&jobs, &host).map_or_else(
+                || "Another host update workflow must finish or be resolved first".to_string(),
+                |blocker| {
+                    format!(
+                        "{} holds the fleet update lock; finish or resolve that workflow first",
+                        blocker.host
+                    )
+                },
+            );
+            action_error(StatusCode::CONFLICT, &message)
+        }
         Err(_) => action_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "The guarded review could not be recorded",
@@ -969,7 +1246,9 @@ async fn retry_update_restart_review(
             "Guarded host action access is not granted",
         );
     }
-    if let Some((status, message)) = update_restart_target_error(&state, &existing.host) {
+    if let Some((status, message)) =
+        update_restart_target_error(&state, &existing.host, existing.update_restart_intent())
+    {
         return action_error(status, message);
     }
     let actor = action_actor(&state.auth, &headers);
@@ -989,10 +1268,19 @@ async fn retry_update_restart_review(
             StatusCode::CONFLICT,
             "A guarded update workflow is already active for this host",
         ),
-        Err(HostActionStoreError::BlockedByFleetGate) => action_error(
-            StatusCode::CONFLICT,
-            "Another host update workflow must finish or be resolved first",
-        ),
+        Err(HostActionStoreError::BlockedByFleetGate) => {
+            let jobs = state.host_actions.list();
+            let message = blocking_update_for_host(&jobs, &existing.host).map_or_else(
+                || "Another host update workflow must finish or be resolved first".to_string(),
+                |blocker| {
+                    format!(
+                        "{} holds the fleet update lock; finish or resolve that workflow first",
+                        blocker.host
+                    )
+                },
+            );
+            action_error(StatusCode::CONFLICT, &message)
+        }
         Err(HostActionStoreError::NotFound) => {
             action_error(StatusCode::NOT_FOUND, "Guarded action was not found")
         }
@@ -1052,6 +1340,111 @@ async fn cancel_update_restart_review(
             "The safe cancellation could not be recorded",
         ),
     }
+}
+
+async fn withdraw_settings_change(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(preview) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers) || !access.can_agora() || !access.allows_host(&preview.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Settings change access is not granted",
+        );
+    }
+    // A withdrawal must run wholly before a settings submission begins or
+    // after its handoff and pending write have both completed.
+    let _settings_change_guard = state.settings_change_lock.lock().await;
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
+    };
+    if !existing.can_withdraw() {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Only a non-terminal settings change can be withdrawn",
+        );
+    }
+    let Some(host_before) = state.store.get(&existing.host) else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The settings change host is not in the fleet store",
+        );
+    };
+    let previous_preferences = host_before.requested_preferences.clone();
+    if let Err(error) = state.store.clear_requested_preferences(&existing.host) {
+        tracing::error!(host = %existing.host, error = %error, "pending host settings could not be cleared for withdrawal");
+        return action_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The pending settings request could not be cleared",
+        );
+    }
+
+    let actor = action_actor(&state.auth, &headers);
+    let withdrawn = match state.host_actions.withdraw_settings_change(
+        &id,
+        &existing.host,
+        &actor,
+        now_unix(),
+    ) {
+        Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            let Some(job) = state
+                .host_actions
+                .get(&id)
+                .filter(|job| job.state == HostActionState::Cancelled)
+            else {
+                return action_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The withdrawal was persisted but could not be reloaded",
+                );
+            };
+            job
+        }
+        Err(error) => {
+            let workflow_still_withdrawable = state
+                .host_actions
+                .get(&id)
+                .is_some_and(|job| job.can_withdraw());
+            if let Some(preferences) = previous_preferences.filter(|_| workflow_still_withdrawable)
+            {
+                if let Err(restore_error) =
+                    state.store.request_preferences(&existing.host, preferences)
+                {
+                    tracing::error!(host = %existing.host, error = %restore_error, "pending settings request could not be restored after withdrawal failure");
+                }
+            }
+            let (status, message) = match error {
+                HostActionStoreError::InvalidTransition => (
+                    StatusCode::CONFLICT,
+                    "Only a non-terminal settings change can be withdrawn",
+                ),
+                HostActionStoreError::WrongHost => (
+                    StatusCode::FORBIDDEN,
+                    "Settings change does not belong to this host",
+                ),
+                HostActionStoreError::NotFound => {
+                    (StatusCode::NOT_FOUND, "Settings change was not found")
+                }
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The settings change withdrawal could not be recorded",
+                ),
+            };
+            return action_error(status, message);
+        }
+    };
+    tracing::info!(host = %withdrawn.host, actor = %actor, ticket = "PHAROS-215", "pending settings request withdrawn without changing nixcfg");
+    action_response_with_message(
+        StatusCode::OK,
+        &withdrawn,
+        "Clears the pending request. An open nixcfg proposal stays open there.",
+    )
 }
 
 async fn recover_update_restart(
@@ -1146,6 +1539,217 @@ async fn host_action_job_json(
         );
     }
     action_response(StatusCode::OK, &job)
+}
+
+async fn acknowledge_dispatch_uncertainty(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    let workflow_allowed = match existing.workflow_kind() {
+        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
+        _ => false,
+    };
+    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&existing.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Dispatch uncertainty acknowledgement access is not granted",
+        );
+    }
+    let actor = action_actor(&state.auth, &headers);
+    match state
+        .host_actions
+        .acknowledge_dispatch_uncertainty(&id, &actor, now_unix())
+    {
+        Ok(job) => action_response_with_message(
+            StatusCode::OK,
+            &job,
+            "The nixcfg verification was recorded. A fresh request may now be started deliberately.",
+        ),
+        Err(HostActionStoreError::InvalidTransition) => action_error(
+            StatusCode::CONFLICT,
+            "Only an uncertain settings or removal dispatch can be acknowledged",
+        ),
+        Err(HostActionStoreError::NotFound) => {
+            action_error(StatusCode::NOT_FOUND, "Guarded action was not found")
+        }
+        Err(_) => action_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The dispatch uncertainty acknowledgement could not be recorded",
+        ),
+    }
+}
+
+async fn reconcile_accepted_dispatch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(preview) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    let workflow_allowed = match preview.workflow_kind() {
+        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
+        _ => false,
+    };
+    if !action_request_header(&headers) || !workflow_allowed || !access.allows_host(&preview.host) {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Accepted dispatch reconciliation access is not granted",
+        );
+    }
+    // Settings reconciliation writes the same pending preference slot as a
+    // fresh submission. Order it with withdrawal, then reload the workflow so
+    // a queued reconciliation cannot act on a run that was just cancelled.
+    let _settings_change_guard =
+        if preview.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange {
+            Some(state.settings_change_lock.lock().await)
+        } else {
+            None
+        };
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Guarded action was not found");
+    };
+    if existing.state != HostActionState::ProposalRequested
+        || !existing.dispatch_submitted()
+        || existing.accepted_dispatch_reconciled()
+    {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Only a saved, accepted repository handoff can be reconciled locally",
+        );
+    }
+
+    match existing.workflow_kind() {
+        host_actions::HostWorkflowKind::SettingsChange => {
+            let Some(preferences) = existing.requested_preferences().cloned() else {
+                return action_error(
+                    StatusCode::CONFLICT,
+                    "The accepted settings handoff has no saved local recovery payload",
+                );
+            };
+            let host = match state.store.request_preferences(&existing.host, preferences) {
+                Ok(host) => host,
+                Err(error) => {
+                    return action_response_with_message(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &existing,
+                        &format!(
+                            "The repository handoff remains accepted, but the local settings save still failed: {}",
+                            error.safe_message()
+                        ),
+                    );
+                }
+            };
+            let accepted = match state
+                .host_actions
+                .accept_settings_change(&existing.id, now_unix())
+            {
+                Ok(job) => job,
+                Err(HostActionStoreError::PersistenceCommitted) => state
+                    .host_actions
+                    .get(&existing.id)
+                    .unwrap_or_else(|| existing.clone()),
+                Err(_) => {
+                    return action_response_with_message(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &existing,
+                        "The local settings save succeeded, but its checklist still needs reconciliation",
+                    );
+                }
+            };
+            let job = if host.requested_preferences.is_none() {
+                match state
+                    .host_actions
+                    .complete_settings_change(&host.name, now_unix())
+                {
+                    Ok(Some(job)) => job,
+                    Ok(None) => accepted,
+                    Err(HostActionStoreError::PersistenceCommitted) => {
+                        state.host_actions.get(&existing.id).unwrap_or(accepted)
+                    }
+                    Err(_) => {
+                        return action_response_with_message(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &accepted,
+                            "The local settings save succeeded, but completion still needs reconciliation",
+                        );
+                    }
+                }
+            } else {
+                accepted
+            };
+            action_response_with_message(
+                StatusCode::OK,
+                &job,
+                "The accepted repository handoff was reconciled locally without a second dispatch.",
+            )
+        }
+        host_actions::HostWorkflowKind::RemoveHost => {
+            let Some(plan) = existing.removal_plan.clone() else {
+                return action_error(StatusCode::CONFLICT, "The removal plan is unavailable");
+            };
+            if !plan.declaration_pending && !plan.credential_retirement_required {
+                return action_error(
+                    StatusCode::CONFLICT,
+                    "This removal did not require a repository handoff",
+                );
+            }
+            if !state.retired_hosts.is_retired(&existing.host) {
+                match state.retired_hosts.retire(RetiredHost {
+                    host: existing.host.clone(),
+                    requested_by: existing.requested_by.clone(),
+                    removal_job_id: existing.id.clone(),
+                    disposition: plan.disposition,
+                    successor: plan.successor.clone(),
+                    declaration_pending: plan.declaration_pending,
+                    retired_at: now_unix(),
+                }) {
+                    Ok(()) | Err(HostActionStoreError::PersistenceCommitted) => {}
+                    Err(_) => {
+                        return action_response_with_message(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &existing,
+                            "The repository handoff remains accepted, but the local retirement save still failed",
+                        );
+                    }
+                }
+            }
+            let job = match state
+                .host_actions
+                .mark_removal_access_revoked(&existing.id, now_unix())
+            {
+                Ok(job) => job,
+                Err(HostActionStoreError::PersistenceCommitted) => {
+                    state.host_actions.get(&existing.id).unwrap_or(existing)
+                }
+                Err(_) => {
+                    return action_response_with_message(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &existing,
+                        "The retirement save succeeded, but its checklist still needs reconciliation",
+                    );
+                }
+            };
+            action_response_with_message(
+                StatusCode::ACCEPTED,
+                &job,
+                "The accepted repository handoff was reconciled locally without a second dispatch.",
+            )
+        }
+        _ => action_error(
+            StatusCode::CONFLICT,
+            "This workflow has no accepted local handoff to reconcile",
+        ),
+    }
 }
 
 async fn confirm_update_restart(
@@ -1280,30 +1884,50 @@ async fn request_host_removal(
     }
     let actor = action_actor(&state.auth, &headers);
     let now = now_unix();
-    let workflow = match state
-        .host_actions
-        .begin_removal(&host, &actor, removal_plan.clone(), now)
-    {
-        Ok(job) => job,
-        Err(HostActionStoreError::ActiveJob) => {
-            return action_error(
-                StatusCode::CONFLICT,
-                "A removal workflow is already active for this host",
-            );
-        }
-        Err(_) => {
-            return action_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The removal workflow could not be recorded",
-            );
-        }
-    };
+    let mut workflow =
+        match state
+            .host_actions
+            .begin_removal(&host, &actor, removal_plan.clone(), now)
+        {
+            Ok(job) => job,
+            Err(HostActionStoreError::ActiveJob) => {
+                if let Some(current) = state.host_actions.latest_removal_for_host(&host) {
+                    return action_response_with_message(
+                        StatusCode::CONFLICT,
+                        &current,
+                        "A removal workflow is already active for this host",
+                    );
+                }
+                return action_error(
+                    StatusCode::CONFLICT,
+                    "A removal workflow is already active for this host",
+                );
+            }
+            Err(HostActionStoreError::PersistenceCommitted) => {
+                match state.host_actions.latest_removal_for_host(&host) {
+                    Some(job) => job,
+                    None => {
+                        return action_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "The removal workflow could not be recorded",
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                return action_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The removal workflow could not be recorded",
+                );
+            }
+        };
     // PHAROS-197: the proposal is what records the retirement intent the
     // retirement agent reads, so it is needed whenever a credential must be
     // retired, not only when a declaration must be removed. Without it an
     // undeclared Janus-managed host revokes reporting and then strands, failing
     // credential retirement on every attempt with its credential still live.
-    if declaration_pending || credential_retirement_required {
+    let repository_dispatch_required = declaration_pending || credential_retirement_required;
+    if repository_dispatch_required {
         if let Err(error) = state
             .nixcfg_dispatch
             .dispatch_host_removal(
@@ -1314,30 +1938,70 @@ async fn request_host_removal(
             )
             .await
         {
-            let failed = state
-                .host_actions
-                .fail_removal(&workflow.id, now_unix())
-                .unwrap_or(workflow);
+            let failed = match error {
+                NixcfgDispatchError::OutcomeUncertain => state
+                    .host_actions
+                    .fail_removal_uncertain(&workflow.id, now_unix())
+                    .unwrap_or(workflow),
+                _ => state
+                    .host_actions
+                    .fail_removal(&workflow.id, now_unix())
+                    .unwrap_or(workflow),
+            };
             return action_response_with_message(
-                StatusCode::BAD_GATEWAY,
+                if error.is_outcome_uncertain() {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
                 &failed,
-                error.safe_message(),
+                error.host_removal_message(),
             );
         }
+        workflow = match state
+            .host_actions
+            .mark_dispatch_submitted(&workflow.id, now_unix())
+        {
+            Ok(job) => job,
+            Err(HostActionStoreError::PersistenceCommitted) => state
+                .host_actions
+                .get(&workflow.id)
+                .unwrap_or_else(|| workflow.clone()),
+            Err(_) => {
+                let uncertain = state
+                    .host_actions
+                    .fail_removal_uncertain(&workflow.id, now_unix())
+                    .ok()
+                    .or_else(|| state.host_actions.get(&workflow.id))
+                    .unwrap_or_else(|| workflow.clone());
+                return action_response_with_message(
+                    StatusCode::CONFLICT,
+                    &uncertain,
+                    "nixcfg accepted the removal request, but Pharos could not save that handoff. Verify nixcfg before any retry.",
+                );
+            }
+        };
     }
-    if state
-        .retired_hosts
-        .retire(RetiredHost {
-            host: host.clone(),
-            requested_by: actor.clone(),
-            removal_job_id: workflow.id.clone(),
-            disposition: removal_plan.disposition,
-            successor: removal_plan.successor.clone(),
-            declaration_pending,
-            retired_at: now,
-        })
-        .is_err()
-    {
+    let retirement_record = state.retired_hosts.retire(RetiredHost {
+        host: host.clone(),
+        requested_by: actor.clone(),
+        removal_job_id: workflow.id.clone(),
+        disposition: removal_plan.disposition,
+        successor: removal_plan.successor.clone(),
+        declaration_pending,
+        retired_at: now,
+    });
+    if !matches!(
+        retirement_record,
+        Ok(()) | Err(HostActionStoreError::PersistenceCommitted)
+    ) {
+        if repository_dispatch_required {
+            return action_response_with_message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &workflow,
+                "nixcfg accepted the removal request, but the local retirement record could not be persisted. Reporting access remains active; do not resend the request.",
+            );
+        }
         let failed = state
             .host_actions
             .fail_removal(&workflow.id, now_unix())
@@ -1353,6 +2017,9 @@ async fn request_host_removal(
         .mark_removal_access_revoked(&workflow.id, now_unix())
     {
         Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            state.host_actions.get(&workflow.id).unwrap_or(workflow)
+        }
         Err(_) => {
             let current = state.host_actions.get(&workflow.id).unwrap_or(workflow);
             return action_response_with_message(
@@ -1441,7 +2108,7 @@ async fn allow_host_reonboarding(
         );
     }
     match state.retired_hosts.clear(&host) {
-        Ok(true) => {}
+        Ok(true) | Err(HostActionStoreError::PersistenceCommitted) => {}
         Ok(false) => return action_error(StatusCode::NOT_FOUND, "Host is not retired"),
         Err(_) => {
             return action_error(
@@ -1992,6 +2659,14 @@ async fn report(
         tracing::warn!(error = %error, "report rejected: invalid report contract");
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if rep
+        .service_observations
+        .iter()
+        .any(appliance_probes::is_appliance_observation)
+    {
+        tracing::warn!(host = %rep.name, "report rejected: reserved server observation");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if let Some(token) = bearer_token(&headers) {
         match state
             .beacon_auth
@@ -2167,7 +2842,19 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
-    let mut payload = hosts_payload(runtime_hosts, &manifests, &declared_preferences, now);
+    let action_jobs: Vec<_> = state
+        .host_actions
+        .list()
+        .into_iter()
+        .filter(|job| access.allows_host(&job.host))
+        .collect();
+    let mut payload = hosts_payload(
+        runtime_hosts,
+        &manifests,
+        &declared_preferences,
+        &action_jobs,
+        now,
+    );
     if let Some(hosts) = payload
         .get_mut("hosts")
         .and_then(|hosts| hosts.as_array_mut())
@@ -2180,9 +2867,6 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
             else {
                 continue;
             };
-            if let Some(action) = state.host_actions.most_relevant_for_host(&name) {
-                host["host_action"] = serde_json::to_value(action.summary()).unwrap_or_default();
-            }
             if let Some(retired) = state.retired_hosts.get(&name) {
                 // PHAROS-194: a pending removal can be waiting on declarative
                 // cleanup, credential retirement, or both. Name which one.
@@ -2214,6 +2898,7 @@ fn hosts_payload(
     runtime_hosts: Vec<Host>,
     manifests: &[HostManifest],
     declared_preferences: &BTreeMap<String, HostPreferences>,
+    action_jobs: &[HostActionJob],
     now: i64,
 ) -> serde_json::Value {
     let manifests = manifest_by_host(manifests);
@@ -2230,6 +2915,26 @@ fn hosts_payload(
                 declared_preferences.as_ref(),
                 h.requested_preferences.as_ref(),
             );
+            let action = most_relevant_host_action(action_jobs, &h.name);
+            let apply_declared_ready = h.is_nix
+                && manifest.is_some_and(|manifest| {
+                    manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
+                        && manifest.policy.privileged_actions.janus_required
+                });
+            let normal_update_ready = apply_declared_ready
+                && (kernel_reboot_required(h.kernel.as_ref()).is_some()
+                    || h.freshness.has_proven_deployable_update());
+            let lifecycle = host_lifecycle_with_apply(
+                action_jobs,
+                &h.name,
+                preferences_state,
+                kernel_reboot_required(h.kernel.as_ref()).is_some(),
+                apply_declared_ready,
+                normal_update_ready,
+            );
+            let action_summary = action.map(HostActionJob::summary);
+            let withdrawable_settings_change =
+                withdrawable_settings_change_for_host(action_jobs, &h.name);
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
             let freshness_tldr = h.freshness.tldr();
             let attention = attention_reason(
@@ -2245,7 +2950,7 @@ fn hosts_payload(
                 &h.name,
                 now,
             );
-            json!({
+            let mut host = json!({
                 "name": h.name,
                 "role": h.role,
                 "is_nix": h.is_nix,
@@ -2267,12 +2972,20 @@ fn hosts_payload(
                 "service_observations_summary": service_observations_summary(&h.service_observations),
                 "backup_observations": h.backup_observations,
                 "backup_observations_summary": backup_observations_summary(&h.backup_observations),
+                "lifecycle": lifecycle,
+                "update_restart_active": active_update_restart_for_host(action_jobs, &h.name).is_some(),
+                "settings_change_withdraw_run_id": withdrawable_settings_change.map(|job| &job.id),
                 "attention": {
                     "label": attention.label,
                     "level": attention.level,
                     "rank": attention.rank,
                 },
-            })
+            });
+            if let Some(action_summary) = action_summary {
+                host["host_action"] =
+                    serde_json::to_value(action_summary).expect("host action summary serializes");
+            }
+            host
         })
         .collect();
     json!({ "as_of": now, "hosts": hosts })
@@ -3485,7 +4198,18 @@ async fn disconnect_hetzner_provider(
 #[tokio::main]
 async fn main() {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
-        std::process::exit(if container_healthcheck().await { 0 } else { 1 });
+        // Container probe (PHAROS-203): every verdict carries its reason so
+        // `docker inspect --format '{{json .State.Health}}'` is diagnosable.
+        match container_healthcheck().await {
+            Ok(detail) => {
+                println!("pharosd healthcheck: {detail}");
+                std::process::exit(0);
+            }
+            Err(reason) => {
+                eprintln!("pharosd healthcheck: {reason}");
+                std::process::exit(1);
+            }
+        }
     }
 
     tracing_subscriber::fmt()
@@ -3547,6 +4271,20 @@ async fn main() {
         .unwrap_or_else(|err| panic!("Pharos authentication startup failed: {err}"));
     let beacon_auth = startup.beacon_auth;
     let provider_runtime = ProviderRuntimeConfig::from_env();
+    let appliance_probes = ApplianceProbeRuntime::from_env(
+        host_store_path.as_deref(),
+        provider_runtime.existing_host.clone(),
+    )
+    .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
+    if let Some(runtime) = appliance_probes.as_ref() {
+        runtime
+            .validate_host_records(&store, &manifests)
+            .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
+    }
+    let appliance_probes = appliance_probes.map(Arc::new);
+    store
+        .replace_server_observations(appliance_probes::APPLIANCE_OBSERVATION_ID, &BTreeMap::new())
+        .unwrap_or_else(|error| panic!("stale appliance observation cleanup failed: {error}"));
     let nixcfg_dispatch = NixcfgDispatch::from_env();
     let retirement_owner = RetirementOwnerAuth::from_env();
     let alert_notifier = AlertNotifier::from_env(alert_store)
@@ -3569,6 +4307,7 @@ async fn main() {
         provider_runtime,
         provider_connections,
         paid_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+        settings_change_lock: Arc::new(tokio::sync::Mutex::new(())),
         nixcfg_dispatch,
         retirement_owner,
         host_actions,
@@ -3577,6 +4316,9 @@ async fn main() {
     };
     let _ = reconcile_completed_removals(&state, now_unix());
     spawn_alert_loop(state.clone(), alert_notifier);
+    if let Some(runtime) = appliance_probes {
+        spawn_appliance_probe_loop(runtime, Arc::clone(&state.store));
+    }
     if let Some(adapter) = paimos_delivery {
         adapter.spawn();
     }
@@ -4020,9 +4762,23 @@ mod tests {
         RuntimeSnapshot {
             hosts,
             jobs,
+            action_jobs: &[],
             declared_preferences: None,
             janus_managed_hosts: None,
         }
+    }
+
+    fn rendered_card<'a>(html: &'a str, host: &str) -> &'a str {
+        let host_marker = format!(r#"data-host="{host}""#);
+        let host_at = html.find(&host_marker).expect("host card rendered");
+        let start = html[..host_at]
+            .rfind(r#"<article class="card"#)
+            .expect("host card starts");
+        let end = html[host_at..]
+            .find("</article>")
+            .map(|end| host_at + end + "</article>".len())
+            .expect("host card closes");
+        &html[start..end]
     }
 
     fn shell(user_label: &str, logout_enabled: bool) -> ShellContext<'_> {
@@ -4631,10 +5387,13 @@ mod tests {
 
         assert!(html.contains(r#"data-backup-state="healthy""#));
         assert_eq!(
-            html.matches(r#"class="header-chip backup-chip clear""#)
+            html.matches(r#"data-backup-state="healthy" data-backup-level="clear""#)
                 .count(),
             2
         );
+        assert!(html.contains(
+            r#"aria-label="Backup for athena: Protected, last success 2m 00s ago" hidden>"#
+        ));
         assert!(html.contains(r#"href="/backups?host=athena""#));
         assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
         assert!(
@@ -4667,6 +5426,23 @@ mod tests {
                 r#"<span class="header-chip-label" aria-hidden="true">Backup</span></a>"#
             ));
         }
+        let healthy_html = backup_chip_markup(
+            &backup_ui_summary(
+                &[backup_observation(BackupPostureState::Healthy)],
+                1_700_000_120,
+            ),
+            "athena",
+        );
+        assert!(healthy_html.contains(r#"data-backup-state="healthy""#));
+        assert!(healthy_html.contains(" hidden>"));
+        let failed_html = backup_chip_markup(
+            &backup_ui_summary(
+                &[backup_observation(BackupPostureState::Failed)],
+                1_700_000_120,
+            ),
+            "athena",
+        );
+        assert!(!failed_html.contains(" hidden>"));
     }
 
     #[test]
@@ -4675,14 +5451,81 @@ mod tests {
         assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
         assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
         assert!(HEAD.contains(".header-chip:hover .header-chip-label,.header-chip:focus-visible .header-chip-label{max-width:58px;opacity:1"));
-        assert!(HEAD.contains(
+        assert!(HEAD.contains(".backup-chip[hidden]{display:none}"));
+        assert!(!HEAD.contains(
             ".card .backup-chip:not(:hover):not(:focus-visible){border-color:transparent;background:transparent;box-shadow:none}"
+        ));
+        assert!(HEAD.contains(
+            ".host-actions-trigger{color:#4c6780;border-color:rgba(188,211,222,.92);background:rgba(255,255,255,.88)"
         ));
         assert!(HEAD.contains(
             ".card .fresh-row-compact{position:relative;display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width);min-height:28px;padding:0 8px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,251,252,.82);outline:0;overflow:hidden}"
         ));
         assert!(HEAD.contains(".card .fresh-row-label{display:none}"));
         assert!(HEAD.contains(".card .fresh-row-label,.card .fresh-row strong{transition:none}"));
+    }
+
+    #[test]
+    fn fleet_card_header_actions_visible_backup_omitted_when_healthy() {
+        let healthy = {
+            let mut host = host_with_backups("healthy-header", 970, vec![]);
+            host.backup_observations = vec![backup_observation(BackupPostureState::Healthy)];
+            host
+        };
+        let failed = {
+            let mut host = host_with_backups("failed-header", 970, vec![]);
+            host.backup_observations = vec![backup_observation(BackupPostureState::Failed)];
+            host.requested_preferences = Some(HostPreferences {
+                accent: Some("#48b8a8".to_string()),
+                ..Default::default()
+            });
+            host
+        };
+        let html = render_home_with_capabilities(
+            runtime(&[healthy, failed], &[]),
+            "csb1",
+            1_700_000_120,
+            &[],
+            shell("markus", true),
+            FleetCapabilities {
+                can_onboard: true,
+                can_manage_fleet: true,
+                system_update_available: true,
+                host_removal_available: true,
+            },
+        );
+
+        assert_eq!(
+            html.matches(r#"class="header-chip host-actions-trigger""#)
+                .count(),
+            4
+        );
+        assert_eq!(
+            html.matches(r#"class="header-chip backup-chip clear""#)
+                .count(),
+            2
+        );
+        assert_eq!(
+            html.matches(r#"class="header-chip backup-chip critical""#)
+                .count(),
+            2
+        );
+        assert!(html.contains(
+            r#"aria-label="Backup for healthy-header: Protected, last success 2m 00s ago" hidden>"#
+        ));
+        let failed_card = rendered_card(&html, "failed-header");
+        let failed_chip = failed_card
+            .split_once(r#"class="header-chip backup-chip critical""#)
+            .map(|(_, tail)| tail.split_once('>').map_or(tail, |(tag, _)| tag))
+            .expect("failed backup chip rendered");
+        assert!(!failed_chip.contains(" hidden"));
+        assert_eq!(
+            html.matches(
+                r#"class="host-action-dot" data-host-action-dot aria-hidden="true"></span>"#
+            )
+            .count(),
+            2
+        );
     }
 
     #[test]
@@ -4716,16 +5559,11 @@ mod tests {
         assert!(html.contains(r#"id="host-actions-hsb8-card" role="menu""#));
         assert!(html.contains(r#"id="host-actions-hsb8-row" role="menu""#));
         assert_eq!(
-            html.matches(r#"data-host-action="host-settings""#).count(),
+            html.matches(r#"data-host-action="host-settings" data-settings-state="#)
+                .count(),
             1
         );
-        assert_eq!(
-            html.matches(
-                r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending""#
-            )
-            .count(),
-            2
-        );
+        assert!(!html.contains(r#"data-host-action="review-pending""#));
         assert_eq!(
             html.matches(
                 r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update""#
@@ -4764,9 +5602,17 @@ mod tests {
         assert!(html.contains("new AbortController()"));
         assert!(html.contains("if(!response.ok&&!payload.job)"));
         assert!(html.contains("document.addEventListener('visibilitychange'"));
-        assert!(html.contains("const storedMatches=action==='workflow'"));
-        assert!(!html.contains("action==='system-update'&&storedKind"));
-        assert!(html.contains("const action=kind==='update_restart'?'update-restart':'workflow'"));
+        assert!(html.contains(
+            "const savedRunLoading=!!lifecycleRunId&&(action==='workflow'||action==='update-restart')"
+        ));
+        assert!(html.contains("hostActionContext.jobId=lifecycleRunId"));
+        assert!(html.contains("hostActionContext.stage='loading'"));
+        assert!(html.contains("if(primary){primary.hidden=true;primary.disabled=true}"));
+        assert!(html.contains("if(savedRunLoading)pollHostActionJob(lifecycleRunId,true)"));
+        assert!(html.contains("if(hostActionContext.stage==='loading')return"));
+        assert!(!html.contains("const storedMatches=action==='workflow'"));
+        assert!(html.contains("chip.dataset.lifecycleInvoke"));
+        assert!(html.contains("chip.dataset.lifecycleRunId"));
         assert!(html.contains(r#"data-host-remove-disposition"#));
         assert!(html.contains("It no longer exists"));
         assert!(html.contains("It still exists; stop managing it"));
@@ -4779,14 +5625,32 @@ mod tests {
         assert!(html.contains(
             "'/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/cancel'"
         ));
+        assert!(html.contains("'/host-actions/jobs/'+encodeURIComponent(runId)+'/withdraw'"));
+        assert!(html.contains(
+            "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));"
+        ));
+        assert!(!html.contains("openHostActionDialog('workflow',root,actionItem,runId)"));
+        assert!(html.contains("Withdraw change request"));
+        assert!(
+            html.contains("Clears the pending request. An open nixcfg proposal stays open there.")
+        );
         assert!(html.contains(r#"data-host-action-cancel hidden"#));
+        assert!(html.contains(
+            r#"data-host-action-primary>Continue</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button>"#
+        ));
         assert!(html.contains("openRequestedWorkflow()"));
+        assert!(html.contains(
+            "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'),workflowId)"
+        ));
     }
 
     #[test]
     fn host_action_dialog_uses_one_suspendable_poll_lifecycle() {
         assert!(FOOT.contains("function pauseHostActionPoll()"));
         assert!(FOOT.contains("function stopHostActionPoll()"));
+        assert!(FOOT.contains("if(hostActionPoll.terminal)return;"));
+        assert!(FOOT.contains("hostActionPoll.terminal=!active;"));
+        assert!(FOOT.contains("Watching for recorded host evidence"));
         assert!(FOOT.contains("function scheduleHostActionPoll(id,delay=2000)"));
         assert!(FOOT.contains("hostActionPoll.timer=null;\n    pollHostActionJob(id,false);"));
         assert!(FOOT.contains("if(document.hidden){pauseHostActionPoll();return}"));
@@ -4801,9 +5665,8 @@ mod tests {
         assert!(FOOT.contains("stopHostActionPoll();\n  if(overlay.hidden)return;"));
         assert!(!FOOT.contains("setInterval("));
         assert!(HEAD.contains("animation-duration:3.2s;animation-timing-function:steps(4,end)"));
-        assert!(HEAD.contains(
-            ".host-action-overlay[data-suspended=\"true\"] .host-workflow-step[data-step-state=\"running\"] .host-workflow-marker:before{animation-play-state:paused}"
-        ));
+        assert!(HEAD.contains(r#"data-waiting-for-evidence="true""#));
+        assert!(HEAD.contains(r#"data-workflow-live="true""#));
     }
 
     #[test]
@@ -4823,15 +5686,25 @@ mod tests {
                 .summary()
                 .workflow,
         );
-        assert!(running_html
-            .contains(r#"data-step-state="running" data-current="true" aria-busy="true""#));
+        assert!(running_html.contains(
+            r#"data-step-state="running" data-current="true" data-waiting-for-evidence="false" aria-busy="true""#
+        ));
         assert!(running_html.contains(r#"aria-current="step""#));
         assert!(running_html.contains("<small>on hsb8</small>"));
         assert!(running_html.contains(r#"role="listitem""#));
+        assert!(running_html.contains(
+            r#"aria-label="Run truth: observed, declared, requested, executed, verified""#
+        ));
+        for label in ["Observed", "Declared", "Requested", "Executed", "Verified"] {
+            assert!(running_html.contains(&format!("<strong>{label}</strong>")));
+        }
+        assert!(running_html.contains(r#"class="host-workflow-next""#));
+        assert!(running_html.contains("<dt>Where</dt>"));
+        assert!(running_html.contains("<dt>Will not</dt>"));
         assert_eq!(running_html.matches(r#"aria-busy="true""#).count(), 1);
         assert!(HEAD.contains("@keyframes host-workflow-spin"));
         assert!(HEAD.contains(
-            ".host-workflow-step[data-step-state=\"running\"] .host-workflow-marker:before,.asof[data-refresh-state=\"syncing\"]:before{animation:none}"
+            ".host-workflow-step[data-waiting-for-evidence=\"true\"] .host-workflow-marker:before"
         ));
         let reviewed = store
             .record_agent_result(
@@ -4872,6 +5745,32 @@ mod tests {
     }
 
     #[test]
+    fn settings_workflow_markup_marks_only_the_evidence_wait_as_live() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("hsb8", "markus", 1_700_000_200)
+            .expect("settings workflow created");
+        let waiting = store
+            .accept_settings_change(&job.id, 1_700_000_201)
+            .expect("settings request accepted");
+        let waiting_html = host_workflow_markup(&waiting.summary().workflow);
+        assert!(waiting_html.contains(
+            r#"data-step-state="waiting" data-current="true" data-waiting-for-evidence="true" aria-busy="true""#
+        ));
+        assert!(waiting_html.contains(r#"data-ladder-key="verified" data-ladder-state="pending""#));
+
+        let completed = store
+            .complete_settings_change("hsb8", 1_700_000_202)
+            .expect("settings completion persisted")
+            .expect("settings workflow completed");
+        let completed_html = host_workflow_markup(&completed.summary().workflow);
+        assert!(!completed_html.contains(r#"data-waiting-for-evidence="true""#));
+        assert!(
+            completed_html.contains(r#"data-ladder-key="verified" data-ladder-state="complete""#)
+        );
+    }
+
+    #[test]
     fn fleet_host_actions_fail_closed_without_fleet_or_janus_capability() {
         let mut host = host_with_backups("hsb8", 1_700_000_100, vec![]);
         host.kernel = Some(reboot_required_kernel(1_700_000_100));
@@ -4893,7 +5792,10 @@ mod tests {
                     system_update_available: true,
                     host_removal_available: true,
                 },
+                action_jobs: &[],
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
 
         assert!(markup.contains(r#"data-can-manage="false""#));
@@ -4918,7 +5820,10 @@ mod tests {
                     system_update_available: false,
                     host_removal_available: false,
                 },
+                action_jobs: &[],
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(runtime_only_markup.contains(r#"data-host-action="remove"><svg"#));
         assert!(runtime_only_markup.contains(r#"data-declared="false""#));
@@ -4942,7 +5847,10 @@ mod tests {
                     system_update_available: false,
                     host_removal_available: false,
                 },
+                action_jobs: &[],
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(janus_managed_markup.contains(r#"data-declared="false""#));
         assert!(janus_managed_markup.contains(r#"data-credential-retirement="true""#));
@@ -4967,7 +5875,10 @@ mod tests {
                     system_update_available: false,
                     host_removal_available: true,
                 },
+                action_jobs: &[],
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
         assert!(janus_managed_ready.contains(r#"data-host-action="remove"><svg"#));
 
@@ -5001,10 +5912,132 @@ mod tests {
                     system_update_available: true,
                     host_removal_available: true,
                 },
+                action_jobs: &[],
             },
+            None,
+            &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, false),
         );
         assert!(pending_markup.contains(r#"data-update-pending="true""#));
         assert!(pending_markup.contains(r#"data-host-action="update-restart"><svg"#));
+
+        let store = HostActionStore::new(None);
+        let update_job = store
+            .create_update_review("hsb8", "markus", 1_700_000_110)
+            .expect("active update restart");
+        let action_jobs = store.list();
+        let active_markup = host_actions_markup(
+            &pending_update,
+            HostActionRenderContext {
+                manifest: Some(&ready_manifest),
+                declared: true,
+                credential_retirement_required: false,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: true,
+                    host_removal_available: true,
+                },
+                action_jobs: &action_jobs,
+            },
+            Some(&update_job),
+            &host_lifecycle(&action_jobs, "hsb8", HostPreferencesState::Applied, false),
+        );
+        assert!(active_markup.contains(r#"data-host-action="update-restart" hidden"#));
+        assert!(active_markup.contains(r#"data-update-restart-active="true""#));
+        assert!(!active_markup.contains("Continue update workflow"));
+        assert!(!FOOT.contains("Continue update workflow"));
+    }
+
+    #[test]
+    fn fleet_host_actions_keep_independent_controls_when_removal_masks_host_action() {
+        let mut pending_update = host_with_backups("hsb8", 1_700_000_100, vec![]);
+        pending_update.freshness = proven_freshness(
+            "nixos-unstable",
+            GitRevisionRelation::Behind,
+            Some(2),
+            NixpkgsRevisionRelation::Current,
+        );
+        pending_update.kernel = Some(KernelPosture::observed(
+            true,
+            Some("7.0.14".to_string()),
+            Some("7.0.14".to_string()),
+            1_700_000_100,
+        ));
+        let ready_manifest = test_manifest("hsb8", true);
+        let backup = backup_ui_summary(&pending_update.backup_observations, 1_700_000_120);
+        let store = HostActionStore::new(None);
+        let update_job = store
+            .create_update_review("hsb8", "markus", 1_700_000_110)
+            .expect("active update restart");
+        let settings_job = store
+            .begin_settings_change("hsb8", "markus", 1_700_000_115)
+            .expect("active settings change");
+        let removal_job = store
+            .begin_removal(
+                "hsb8",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Unmanaged,
+                    successor: None,
+                    declaration_pending: false,
+                    credential_retirement_required: false,
+                },
+                1_700_000_120,
+            )
+            .expect("active removal");
+        let action_jobs = store.list();
+        let masked_action = most_relevant_host_action(&action_jobs, "hsb8").expect("removal wins");
+        assert_eq!(masked_action.id, removal_job.id);
+        assert_ne!(masked_action.id, update_job.id);
+        let lifecycle = host_lifecycle(&action_jobs, "hsb8", HostPreferencesState::Applied, false);
+        assert_eq!(lifecycle.slot, HostLifecycleSlot::RemoveHost);
+        assert_eq!(lifecycle.run_id.as_deref(), Some(removal_job.id.as_str()));
+        assert!(active_update_restart_for_host(&action_jobs, "hsb8").is_some());
+
+        let markup = host_actions_markup(
+            &pending_update,
+            HostActionRenderContext {
+                manifest: Some(&ready_manifest),
+                declared: true,
+                credential_retirement_required: false,
+                settings_state: HostPreferencesState::Applied,
+                settings_href: "/agora?host=hsb8",
+                backup: &backup,
+                surface: "card",
+                capabilities: FleetCapabilities {
+                    can_onboard: true,
+                    can_manage_fleet: true,
+                    system_update_available: true,
+                    host_removal_available: true,
+                },
+                action_jobs: &action_jobs,
+            },
+            Some(masked_action),
+            &lifecycle,
+        );
+        assert!(markup.contains(r#"data-update-restart-active="true""#));
+        assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
+        assert!(markup.contains(&format!(r#"data-lifecycle-run-id="{}""#, settings_job.id)));
+        assert!(markup.contains("Withdraw change request"));
+        assert!(!markup.contains("Continue update workflow"));
+
+        let payload = hosts_payload(
+            vec![pending_update],
+            &[ready_manifest],
+            &BTreeMap::new(),
+            &action_jobs,
+            1_700_000_130,
+        );
+        let emitted = payload["hosts"][0].as_object().expect("host object");
+        assert_eq!(emitted["update_restart_active"], true);
+        assert_eq!(emitted["settings_change_withdraw_run_id"], settings_job.id);
+        assert_eq!(emitted["lifecycle"]["slot"], "remove_host");
+        assert_eq!(emitted["host_action"]["workflow"]["kind"], "remove_host");
+        assert_eq!(emitted["lifecycle"]["run_id"], removal_job.id);
     }
 
     #[test]
@@ -5157,7 +6190,7 @@ mod tests {
             requested_preferences: None,
         };
 
-        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), 1000);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], 1000);
 
         assert_eq!(payload["as_of"], 1000);
         assert_eq!(
@@ -5184,11 +6217,148 @@ mod tests {
     }
 
     #[test]
+    fn hosts_json_payload_emits_one_complete_lifecycle_for_every_host() {
+        let quiet = host_with_backups("quiet", 970, vec![]);
+        let ready = host_with_backups("ready", 970, vec![]);
+        let mut failed = host_with_backups("failed-settings", 970, vec![]);
+        failed.requested_preferences = Some(HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        });
+        let mut kernel = host_with_backups("kernel-drift", 970, vec![]);
+        kernel.kernel = Some(reboot_required_kernel(965));
+
+        let actions = HostActionStore::new(None);
+        let settings_run = actions
+            .begin_settings_change("failed-settings", "markus", 900)
+            .expect("settings run created");
+        actions
+            .fail_settings_change(&settings_run.id, 901)
+            .expect("settings run failed");
+        let action_jobs = actions.list();
+        let declarations = BTreeMap::from([(
+            "ready".to_string(),
+            HostPreferences {
+                accent: Some("#9868d0".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        let payload = hosts_payload(
+            vec![quiet, ready, failed, kernel],
+            &[],
+            &declarations,
+            &action_jobs,
+            1000,
+        );
+        let hosts = payload["hosts"].as_array().expect("hosts array");
+        assert_eq!(hosts.len(), 4);
+        for host in hosts {
+            let lifecycle = host
+                .get("lifecycle")
+                .and_then(serde_json::Value::as_object)
+                .expect("every host has a lifecycle object");
+            for field in [
+                "slot",
+                "label",
+                "level",
+                "invoke",
+                "run_id",
+                "detail",
+                "blocked_by",
+            ] {
+                assert!(
+                    lifecycle.contains_key(field),
+                    "{} lifecycle misses {field}",
+                    host["name"]
+                );
+            }
+        }
+
+        let by_name = |name: &str| {
+            hosts
+                .iter()
+                .find(|host| host["name"] == name)
+                .expect("named host")
+        };
+        assert_eq!(by_name("quiet")["lifecycle"]["slot"], "quiet");
+        assert_eq!(by_name("ready")["lifecycle"]["label"], "Ready to apply");
+        assert_eq!(by_name("kernel-drift")["lifecycle"]["slot"], "kernel_drift");
+        let failed = by_name("failed-settings");
+        assert_eq!(failed["lifecycle"]["slot"], "settings_change");
+        assert_eq!(failed["lifecycle"]["run_id"], settings_run.id);
+        assert_ne!(failed["lifecycle"]["label"], "Change requested");
+        assert!(failed["lifecycle"]["primary_action"].is_null());
+        assert_eq!(failed["host_action"]["workflow"]["kind"], "settings_change");
+    }
+
+    #[test]
+    fn hosts_payload_lifecycle_run_id_differs_from_legacy_host_action() {
+        let store = HostActionStore::new(None);
+        let mut cancelled_settings = store
+            .begin_settings_change("diverge-host", "markus", 100)
+            .expect("settings workflow created");
+        cancelled_settings.state = HostActionState::Cancelled;
+        cancelled_settings.updated_at = 101;
+        let proposal = store
+            .begin_system_update_proposal("diverge-host", "markus", 200, None)
+            .expect("system update proposal created")
+            .job()
+            .clone();
+        let action_jobs = vec![cancelled_settings, proposal];
+        let host = host_with_backups("diverge-host", 970, vec![]);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &action_jobs, 1000);
+        let emitted = payload["hosts"][0].as_object().expect("host object");
+        let lifecycle = emitted["lifecycle"].as_object().expect("lifecycle object");
+        let host_action = emitted["host_action"]
+            .as_object()
+            .expect("host_action object");
+        assert_eq!(lifecycle["slot"], "settings_change");
+        assert_eq!(lifecycle["run_id"], action_jobs[0].id);
+        assert_eq!(host_action["id"], action_jobs[1].id);
+        assert_ne!(lifecycle["run_id"], host_action["id"]);
+    }
+
+    #[test]
+    fn fleet_render_hides_kernel_drift_when_update_restart_wins_lifecycle() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 100)
+            .expect("settings workflow created");
+        store
+            .fail_settings_change(&settings.id, 101)
+            .expect("settings workflow failed");
+        store
+            .create_update_review("hsb8", "markus", 200)
+            .expect("update restart review created");
+        let mut host = host_with_backups("hsb8", 970, vec![]);
+        host.kernel = Some(reboot_required_kernel(965));
+        let action_jobs = store.list();
+        let html = render_home(
+            RuntimeSnapshot {
+                hosts: std::slice::from_ref(&host),
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: None,
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+        assert!(html.contains("review queued"));
+        assert!(html.contains(r#"data-lifecycle-invoke="update_restart""#));
+        assert!(!html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
+    }
+
+    #[test]
     fn hosts_payload_and_fleet_expose_only_actionable_kernel_posture() {
         let mut staged = host_with_backups("csb0", 970, vec![]);
         staged.kernel = Some(reboot_required_kernel(965));
 
-        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), 1000);
+        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(payload["hosts"][0]["kernel"]["state"], "reboot_required");
         assert_eq!(payload["hosts"][0]["kernel"]["running_version"], "6.18.26");
         assert_eq!(payload["hosts"][0]["kernel"]["expected_version"], "7.0.14");
@@ -5203,11 +6373,10 @@ mod tests {
             shell("markus", true),
             true,
         );
-        assert!(html.contains(r#"<div class="kernel-slot" data-kernel-slot><details"#));
-        assert!(html.contains("Restart required"));
-        assert!(html.contains("csb0 is healthy"));
-        assert!(html.contains("Ready after restart"));
-        assert!(html.contains("Pharos will not restart this host."));
+        assert!(html.contains(r#"data-host-lifecycle-chip"#));
+        assert!(html.contains(r#"data-lifecycle-slot="kernel_drift""#));
+        assert!(html.contains(r#"<span data-host-lifecycle-chip-copy>Restart required</span>"#));
+        assert!(!html.contains("Continue: planned restart"));
         assert!(html.contains("restart required restart needed kernel reboot required"));
 
         let mut current = host_with_backups("hsb0", 970, vec![]);
@@ -5225,7 +6394,8 @@ mod tests {
             shell("markus", true),
             true,
         );
-        assert!(current_html.contains(r#"data-kernel-slot hidden"#));
+        assert!(current_html.contains(r#"data-host-lifecycle-chip-copy>Up to date</span>"#));
+        assert!(!current_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
     }
 
     #[test]
@@ -5826,7 +6996,7 @@ mod tests {
         );
         assert!(fleet.contains("down, backup, Nix freshness muted"));
         assert!(fleet.contains(r#"class="mute-note""#));
-        let applied_payload = hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), 1000);
+        let applied_payload = hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(
             applied_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             true
@@ -5864,7 +7034,7 @@ mod tests {
         );
         assert!(pending_fleet.contains(r#"class="mute-note" data-mute-note title="" hidden"#));
         assert!(!pending_fleet.contains("down, backup, Nix freshness muted"));
-        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), 1000);
+        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(
             pending_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             false
@@ -5910,7 +7080,7 @@ mod tests {
             .iter()
             .any(|event| event.title == "No heartbeat received"));
 
-        let payload = hosts_payload(vec![workstation.clone()], &[], &BTreeMap::new(), 1000);
+        let payload = hosts_payload(vec![workstation.clone()], &[], &BTreeMap::new(), &[], 1000);
         assert_eq!(payload["hosts"][0]["liveness"], "down");
         assert_eq!(
             payload["hosts"][0]["attention"]["label"],
@@ -5980,6 +7150,136 @@ mod tests {
         assert!(server_alerts
             .iter()
             .any(|alert| alert.source == "heartbeat"));
+    }
+
+    #[test]
+    fn appliance_probe_owns_liveness_without_false_boot_or_offline_alerts() {
+        let mut appliance = host_with_backups("appliance-test", 500, vec![]);
+        appliance.last_seen = None;
+        appliance.heartbeat_log.clear();
+        appliance.heartbeat_interval_secs = None;
+        // Beacon-less records retain the runtime default. Startup separately
+        // proves that this server-owned observation is backed by a declared
+        // workstation preference before it can reach these projections.
+        assert_eq!(appliance.preferences.kind, HostKind::Server);
+        appliance.service_observations = vec![ServiceObservation {
+            id: appliance_probes::APPLIANCE_OBSERVATION_ID.to_string(),
+            label: "Appliance convergence".to_string(),
+            state: ServiceObservationState::Healthy,
+            summary: "powered off as expected".to_string(),
+        }];
+
+        let offline_alerts = alert_items(
+            std::slice::from_ref(&appliance),
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(offline_alerts.is_empty());
+        let offline_attention = attention_reason(
+            Liveness::AwaitingFirstHeartbeat,
+            &appliance.freshness,
+            None,
+            &appliance.service_observations,
+            &appliance.preferences,
+        );
+        assert_eq!(offline_attention.label, "offline as expected");
+        assert_eq!(offline_attention.level, "ok");
+        let offline_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1000,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!offline_activity
+            .iter()
+            .any(|event| matches!(event.kind, "heartbeat" | "service")));
+
+        appliance.service_observations[0].state = ServiceObservationState::Unknown;
+        appliance.service_observations[0].summary =
+            "online; allowing SSH startup (1 of 3)".to_string();
+        let grace_alerts = alert_items(
+            std::slice::from_ref(&appliance),
+            &[],
+            "csb1",
+            1001,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(grace_alerts.is_empty());
+        let grace_attention = attention_reason(
+            Liveness::AwaitingFirstHeartbeat,
+            &appliance.freshness,
+            None,
+            &appliance.service_observations,
+            &appliance.preferences,
+        );
+        assert_eq!(grace_attention.label, "starting normally");
+        assert_eq!(grace_attention.level, "ok");
+        let grace_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1001,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!grace_activity
+            .iter()
+            .any(|event| matches!(event.kind, "heartbeat" | "service")));
+
+        appliance.service_observations[0].state = ServiceObservationState::Warning;
+        appliance.service_observations[0].summary =
+            "un-converged: online but SSH is unavailable".to_string();
+        let unconverged_alerts = alert_items(
+            std::slice::from_ref(&appliance),
+            &[],
+            "csb1",
+            1002,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(unconverged_alerts.len(), 1);
+        assert_eq!(unconverged_alerts[0].source, "service");
+        assert!(unconverged_alerts[0].detail.starts_with("un-converged:"));
+        assert!(unconverged_alerts[0]
+            .next_action
+            .contains("will not remediate"));
+        assert!(!unconverged_alerts
+            .iter()
+            .any(|alert| alert.source == "heartbeat"));
+        let unconverged_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1002,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!unconverged_activity
+            .iter()
+            .any(|event| event.kind == "heartbeat"));
+        let unconverged_event = unconverged_activity
+            .iter()
+            .find(|event| event.kind == "service")
+            .expect("un-converged service activity is present");
+        assert!(unconverged_event.detail.starts_with("un-converged:"));
     }
 
     #[test]
@@ -6742,6 +8042,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(marks.contains(r#"--mark-x:29.3%""#));
         assert!(marks.contains(r#"--mark-x:58.7%""#));
         assert!(!marks.contains(r#"--mark-x:64.0%""#));
+        assert!(marks.contains(r#"class="beat-mark" role="img" tabindex="0""#));
+        assert!(FOOT.contains(r#"class="beat-mark" role="img" tabindex="0""#));
     }
 
     #[test]
@@ -6873,7 +8175,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"href="/agora?host=poseidon""#));
         assert!(!html.contains(r#"class="card has-settings""#));
         assert!(html.contains(r#"data-settings-state="declared_not_applied""#));
-        assert!(html.contains(r#"aria-label="ready to apply for poseidon""#));
+        assert!(html.contains(r#"aria-label="Ready to apply""#));
         assert!(html.contains(r#"style="--pending-color:#48b8a8""#));
         assert_eq!(
             html.matches(
@@ -6882,17 +8184,18 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .count(),
             1
         );
-        assert!(html.contains(r#"data-host-action="host-settings" href="/agora?host=poseidon""#));
+        assert!(html.contains(
+            r#"data-host-action="host-settings" data-settings-state="declared_not_applied" href="/agora?host=poseidon""#
+        ));
         assert!(html.contains(
             r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
         ));
         assert!(html.contains(
-            r#"<a class="settings-wait-note" data-settings-note data-settings-state="declared_not_applied" href="/agora?host=poseidon" title="ready to apply for poseidon" aria-label="ready to apply for poseidon"><span class="settings-state-icon requested""#
+            r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings""#
         ));
-        assert!(html.contains(r#"<span data-settings-note-copy>Ready to apply</span></a>"#));
-        assert!(!html.contains(
-            r#"<span data-settings-note-copy>Ready to apply</span><span class="settings-swatch""#
-        ));
+        assert!(
+            html.contains(r#"<span data-host-lifecycle-chip-copy>Ready to apply</span></button>"#)
+        );
         assert!(!html.contains(r#"class="settings-wait-icon""#));
         assert!(!html.contains(r#"--host-color:#48b8a8""#));
         assert!(html.contains(r#"<div class="card-actions"><button class="drag-handle" type="button" data-drag-handle title="Move poseidon" aria-label="Move poseidon""#));
@@ -6913,11 +8216,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert!(applied.contains(r#"class="card has-settings""#));
         assert!(applied.contains(
-            r#"data-settings-state="applied" href="/agora?host=poseidon" title="Open host settings for poseidon" aria-label="Open host settings for poseidon"><span class="settings-state-icon requested""#
+            r#"data-settings-state="applied" data-lifecycle-slot="quiet" data-lifecycle-level="clear" data-lifecycle-invoke="host_settings""#
         ));
-        assert!(applied.contains(r#"<span data-settings-note-copy>Up to date</span></a>"#));
+        assert!(
+            applied.contains(r#"<span data-host-lifecycle-chip-copy>Up to date</span></button>"#)
+        );
         assert!(applied.contains(r#"style="--host-color:#48b8a8""#));
-        assert!(!applied.contains(r#"aria-label="ready to apply for poseidon""#));
+        assert!(!applied.contains(r#"aria-label="Ready to apply""#));
     }
 
     #[test]
@@ -6959,14 +8264,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             true,
         );
         assert!(lifecycle_html.contains(r#"<div class="card-maintenance">"#));
+        assert!(lifecycle_html
+            .contains(r#"<span data-host-lifecycle-chip-copy>Change requested</span></button>"#));
+        assert!(!lifecycle_html.contains(r#"<span data-host-lifecycle-chip-copy>Continue:"#));
+        assert!(!lifecycle_html.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
         assert!(
-            lifecycle_html.contains(r#"<span data-settings-note-copy>Change requested</span></a>"#)
+            HEAD.contains(".card-maintenance .host-lifecycle-chip{width:var(--lifecycle-width)")
         );
-        assert!(lifecycle_html.contains("Restart required"));
-        assert!(HEAD.contains(
-            "--lifecycle-width:calc(var(--fresh-cell-width) + var(--fresh-cell-width) + var(--indicator-gap))"
-        ));
-        assert!(HEAD.contains(".card-maintenance .settings-wait-note{width:var(--lifecycle-width)"));
         assert!(HEAD.contains(".card .fresh-row-compact{position:relative;display:flex"));
         assert!(HEAD.contains("width:var(--fresh-cell-width)"));
 
@@ -6986,6 +8290,112 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn server_rendered_lifecycle_preserves_existing_click_targets() {
+        let prefs = host_with_backups("prefs-target", 970, vec![]);
+        let mut run = host_with_backups("run-target", 970, vec![]);
+        run.requested_preferences = Some(HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        });
+        let mut kernel = host_with_backups("kernel-target", 970, vec![]);
+        kernel.kernel = Some(reboot_required_kernel(965));
+        let hosts = [prefs, run, kernel];
+        let declarations = BTreeMap::from([(
+            "prefs-target".to_string(),
+            HostPreferences {
+                accent: Some("#9868d0".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let actions = HostActionStore::new(None);
+        let settings_run = actions
+            .begin_settings_change("run-target", "markus", 900)
+            .expect("settings run created");
+        actions
+            .fail_settings_change(&settings_run.id, 901)
+            .expect("settings run failed");
+        let action_jobs = actions.list();
+
+        let html = render_home(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: Some(&declarations),
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("markus", true),
+            true,
+        );
+
+        let prefs_card = rendered_card(&html, "prefs-target");
+        assert!(prefs_card.contains(
+            r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="declared_not_applied" data-lifecycle-slot="prefs_drift" data-lifecycle-level="info" data-lifecycle-invoke="host_settings""#
+        ));
+        assert!(prefs_card
+            .contains(r#"<span data-host-lifecycle-chip-copy>Ready to apply</span></button>"#));
+        assert!(!prefs_card.contains("data-settings-note"));
+
+        let run_card = rendered_card(&html, "run-target");
+        assert!(run_card.contains("data-host-lifecycle-chip"));
+        assert!(run_card.contains(r#"data-lifecycle-slot="settings_change""#));
+        assert!(run_card.contains(r#"data-lifecycle-invoke="workflow""#));
+        assert!(run_card.contains(&format!(r#"data-lifecycle-run-id="{}"#, settings_run.id)));
+        assert!(run_card.contains(
+            r#"<span data-host-lifecycle-chip-copy>settings request stopped</span></button>"#
+        ));
+        assert!(run_card.contains(r#"data-host-action="lifecycle-continue""#));
+        assert!(!run_card.contains("Continue: Run recovery checks"));
+        assert!(run_card.contains(&format!(
+            r#"data-action-job-id="{}" data-action-kind="settings_change" data-action-state="failed""#,
+            settings_run.id
+        )));
+        assert!(!run_card.contains("Change requested"));
+        assert!(run_card.contains(r#"type="button" data-host-lifecycle-chip"#));
+
+        let read_only_html = render_home(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &[],
+                action_jobs: &action_jobs,
+                declared_preferences: Some(&declarations),
+                janus_managed_hosts: None,
+            },
+            "csb1",
+            1000,
+            &[],
+            shell("viewer", true),
+            false,
+        );
+        let read_only_run = rendered_card(&read_only_html, "run-target");
+        assert!(read_only_run.contains("data-host-lifecycle-chip"));
+        assert!(read_only_run.contains("disabled"));
+        assert!(read_only_run.contains("aria-disabled=\"true\""));
+        assert!(!read_only_run.contains("data-host-actions"));
+        let read_only_prefs = rendered_card(&read_only_html, "prefs-target");
+        assert!(read_only_prefs.contains("data-host-lifecycle-chip"));
+        assert!(read_only_prefs.contains("disabled"));
+
+        let kernel_card = rendered_card(&html, "kernel-target");
+        assert!(kernel_card.contains(
+            r#"data-lifecycle-slot="kernel_drift" data-lifecycle-level="warning" data-lifecycle-invoke="kernel_details""#
+        ));
+        assert!(kernel_card
+            .contains(r#"<span data-host-lifecycle-chip-copy>Restart required</span></button>"#));
+        assert!(!kernel_card.contains(r#"<span data-host-lifecycle-chip-copy>Continue:"#));
+        assert!(!kernel_card.contains(r#"<div class="kernel-slot" data-kernel-slot"#));
+
+        assert!(FOOT.contains("event.target.closest('[data-host-lifecycle-chip]')"));
+        assert!(FOOT.contains("chip.dataset.lifecycleInvoke"));
+        assert!(FOOT.contains("chip.dataset.lifecycleRunId"));
+        assert!(FOOT.contains("openHostLifecycleSheet"));
+        assert!(FOOT.contains("dialog.dataset.drift"));
+    }
+
+    #[test]
     fn registry_only_declaration_is_not_rendered_as_applied() {
         let host = host_with_backups("gpc0", 970, vec![]);
         let declared = HostPreferences {
@@ -6999,6 +8409,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             RuntimeSnapshot {
                 hosts: &hosts,
                 jobs: &[],
+                action_jobs: &[],
                 declared_preferences: Some(&declarations),
                 janus_managed_hosts: None,
             },
@@ -7013,7 +8424,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"style="--pending-color:#9868d0""#));
         assert!(!html.contains(r#"--host-color:#9868d0""#));
 
-        let payload = hosts_payload(vec![host], &[], &declarations, 1000);
+        let payload = hosts_payload(vec![host], &[], &declarations, &[], 1000);
         assert_eq!(payload["hosts"][0]["declared_preferences"], json!(declared));
         assert_eq!(
             payload["hosts"][0]["preferences_state"],
@@ -12194,6 +13605,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 ProviderConnectionStore::new(None).expect("in-memory provider store starts"),
             ),
             paid_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings_change_lock: Arc::new(tokio::sync::Mutex::new(())),
             nixcfg_dispatch: NixcfgDispatch::disabled(),
             retirement_owner: RetirementOwnerAuth::default(),
             host_actions: Arc::new(HostActionStore::new(None)),
@@ -12341,6 +13753,15 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         headers
     }
 
+    fn action_headers_with_ack(job_id: &str) -> HeaderMap {
+        let mut headers = action_headers();
+        headers.insert(
+            "X-Pharos-Acknowledge-Uncertainty",
+            axum::http::HeaderValue::from_str(job_id).expect("valid uncertainty acknowledgement"),
+        );
+        headers
+    }
+
     #[tokio::test]
     async fn host_action_job_reads_require_agora_and_host_access() {
         let mut state = report_test_state(false);
@@ -12398,6 +13819,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -12465,12 +13887,90 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn declared_apply_endpoint_is_typed_gated_and_names_the_fleet_lock_holder() {
+        let (state, manifest_path) = state_with_janus_manifest("hsb8", "apply-token");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::ApplyDeclared,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["intent"], "apply_declared");
+        assert_eq!(payload["job"]["ticket"], "PHAROS-216");
+
+        let (blocked_state, blocked_manifest_path) =
+            state_with_janus_manifest("hsb8", "blocked-apply-token");
+        let mut current = test_report("hsb8");
+        current.kernel = None;
+        blocked_state
+            .store
+            .record(current, now_unix().saturating_add(1))
+            .expect("current report replaces drift fixture");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(blocked_state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::ApplyDeclared,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("No declared preference or kernel drift")));
+
+        let (status, _) = request_update_restart_review(
+            State(blocked_state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::RestartOnly,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let mut drifted = test_report("hsb8");
+        drifted.kernel = Some(reboot_required_kernel(now_unix()));
+        blocked_state
+            .store
+            .record(drifted, now_unix().saturating_add(2))
+            .expect("kernel drift restored");
+        blocked_state
+            .host_actions
+            .create_update_review("csb0", "fixture-operator", now_unix())
+            .expect("other host holds fleet gate");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(blocked_state),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::ApplyDeclared,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("csb0 holds the fleet update lock")));
+
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_file(blocked_manifest_path);
+    }
+
+    #[tokio::test]
     async fn guarded_review_cancellation_is_persisted_and_releases_the_host() {
         let (state, manifest_path) = state_with_janus_manifest("hsb8", "action-token");
         let (status, Json(payload)) = request_update_restart_review(
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -12500,6 +14000,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -12513,6 +14014,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -12551,6 +14053,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -12886,14 +14389,119 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         (format!("http://{address}"), receiver)
     }
 
-    fn dispatch_token_file() -> PathBuf {
+    fn mock_counting_dispatch_endpoint() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock dispatch");
+        let address = listener.local_addr().expect("mock address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .or_else(|| line.strip_prefix("Content-Length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            count_clone.fetch_add(1, Ordering::SeqCst);
+                            let _ = stream
+                                .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+                            let _ = stream.flush();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (format!("http://{address}"), count)
+    }
+
+    fn mock_blocking_dispatch_endpoint() -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock dispatch");
+        let address = listener.local_addr().expect("mock address");
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    return;
+                }
+                raw.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .or_else(|| line.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if body.len() >= length {
+                    break;
+                }
+            }
+            let _ = arrived_tx.send(());
+            let _ = release_rx.recv();
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+            let _ = stream.flush();
+        });
+        (format!("http://{address}"), arrived_rx, release_tx)
+    }
+
+    struct DispatchTokenFixture {
+        path: PathBuf,
+    }
+
+    impl Drop for DispatchTokenFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn dispatch_token_file() -> DispatchTokenFixture {
         let path = std::env::temp_dir().join(format!(
             "pharos-197-dispatch-token-{}-{}",
             std::process::id(),
             JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&path, "test-dispatch-token\n").expect("write dispatch token fixture");
-        path
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write as _;
+        let mut file = options.open(&path).expect("create dispatch token fixture");
+        file.write_all(b"test-dispatch-token\n")
+            .expect("write dispatch token fixture");
+        DispatchTokenFixture { path }
     }
 
     fn janus_managed_undeclared_state() -> (PathBuf, AppState) {
@@ -12960,7 +14568,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         // PHAROS-197: a reachable proposal endpoint, so the retirement intent
         // this removal depends on is actually requested.
         let (api_base, dispatched) = mock_dispatch_endpoint();
-        state.nixcfg_dispatch = NixcfgDispatch::for_test(Some(dispatch_token_file()), api_base);
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
 
         let (status, Json(payload)) = request_host_removal(
             State(state.clone()),
@@ -13045,6 +14655,52 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert!(state.store.get("dsc0").is_none());
 
+        let _ = std::fs::remove_dir_all(generation_root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_removal_requests_send_exactly_one_dispatch() {
+        let (generation_root, mut state) = janus_managed_undeclared_state();
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+        let request = RemoveHostActionRequest {
+            confirmation: "dsc0".to_string(),
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+        };
+
+        let (left, right) = tokio::join!(
+            request_host_removal(
+                State(state.clone()),
+                action_headers(),
+                AxumPath("dsc0".to_string()),
+                Json(request.clone()),
+            ),
+            request_host_removal(
+                State(state.clone()),
+                action_headers(),
+                AxumPath("dsc0".to_string()),
+                Json(request),
+            ),
+        );
+        let statuses = [left.0, right.0];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::ACCEPTED)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(generation_root);
     }
 
@@ -13284,6 +14940,1154 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn system_update_duplicate_invoke_returns_conflict_with_active_job() {
+        let state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
+        state
+            .host_actions
+            .begin_system_update_proposal("gpc0", "markus", now_unix(), None)
+            .expect("active system update proposal recorded");
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers(),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(payload["job"]["state"], "proposal_requested");
+        assert!(payload["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already open")));
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.workflow_kind() == host_actions::HostWorkflowKind::SystemUpdateProposal
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_system_update_ack_sends_one_dispatch() {
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
+
+        let uncertain_id = "action-system-update-gpc0-concurrent-1".to_string();
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_id.clone(), "gpc0", "markus", 820)
+            .expect("uncertain job created");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_id, 821)
+            .expect("uncertain failure recorded");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let headers = action_headers_with_ack(&uncertain_id);
+        let (left, right) = tokio::join!(
+            request_system_update(
+                State(state.clone()),
+                headers.clone(),
+                Json(SystemUpdateActionRequest {
+                    host: "gpc0".to_string(),
+                }),
+            ),
+            request_system_update(
+                State(state.clone()),
+                headers,
+                Json(SystemUpdateActionRequest {
+                    host: "gpc0".to_string(),
+                }),
+            ),
+        );
+        assert_eq!(left.0, StatusCode::ACCEPTED);
+        assert_eq!(right.0, StatusCode::ACCEPTED);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn system_update_cross_host_ack_forbidden_without_foreign_job_or_dispatch() {
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        register_test_token(&state, "hsb8", "update-token-hsb8");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("gpc0 report persists");
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("hsb8 report persists");
+
+        let uncertain_gpc0 = "action-system-update-gpc0-cross-handler-1".to_string();
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_gpc0.clone(), "gpc0", "markus", 830)
+            .expect("gpc0 uncertain job created");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_gpc0, 831)
+            .expect("gpc0 uncertain failure recorded");
+        let replacement = state
+            .host_actions
+            .begin_system_update_proposal("gpc0", "markus", 832, Some(&uncertain_gpc0))
+            .expect("gpc0 replacement created")
+            .into_job();
+        state
+            .host_actions
+            .accept_system_update_proposal(&replacement.id, 833)
+            .expect("gpc0 replacement accepted");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_gpc0),
+            Json(SystemUpdateActionRequest {
+                host: "hsb8".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(payload.get("job").is_none());
+        assert!(payload.get("workflow_html").is_none());
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        let gpc0_prior = state
+            .host_actions
+            .get(&uncertain_gpc0)
+            .expect("gpc0 prior retained");
+        assert!(gpc0_prior.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        }));
+        let gpc0_replacement = state
+            .host_actions
+            .get(&replacement.id)
+            .expect("gpc0 replacement retained");
+        assert_eq!(gpc0_replacement.host, "gpc0");
+        assert_eq!(gpc0_replacement.state, HostActionState::Succeeded);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.host == "hsb8"
+                        && job.kind == host_actions::HostActionKind::SystemUpdateProposal
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_ack_replay_after_other_replacement_sends_no_dispatch() {
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token-gpc0");
+        register_test_token(&state, "hsb8", "update-token-hsb8");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("gpc0 report persists");
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("hsb8 report persists");
+
+        let uncertain_gpc0 = "action-system-update-gpc0-partial-handler-1".to_string();
+        let uncertain_hsb8 = "action-system-update-hsb8-partial-handler-1".to_string();
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_gpc0.clone(), "gpc0", "markus", 840)
+            .expect("gpc0 uncertain job created");
+        state
+            .host_actions
+            .create_system_update_proposal(uncertain_hsb8.clone(), "hsb8", "markus", 841)
+            .expect("hsb8 uncertain job created");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_gpc0, 842)
+            .expect("gpc0 uncertain failure recorded");
+        state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_hsb8, 843)
+            .expect("hsb8 uncertain failure recorded");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        assert!(matches!(
+            state
+                .host_actions
+                .begin_system_update_proposal("gpc0", "markus", 844, Some(&uncertain_gpc0)),
+            Err(HostActionStoreError::UncertaintyRequiresAcknowledgement(job))
+                if job.id == uncertain_hsb8
+        ));
+
+        let (lost_response_replay_status, Json(lost_response_replay_payload)) =
+            request_system_update(
+                State(state.clone()),
+                action_headers_with_ack(&uncertain_gpc0),
+                Json(SystemUpdateActionRequest {
+                    host: "gpc0".to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(lost_response_replay_status, StatusCode::CONFLICT);
+        assert_eq!(lost_response_replay_payload["job"]["id"], uncertain_hsb8);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+
+        let replacement = state
+            .host_actions
+            .begin_system_update_proposal("hsb8", "markus", 845, Some(&uncertain_hsb8))
+            .expect("hsb8 replacement created")
+            .into_job();
+        state
+            .host_actions
+            .accept_system_update_proposal(&replacement.id, 846)
+            .expect("hsb8 replacement accepted");
+
+        let headers = action_headers_with_ack(&uncertain_gpc0);
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            headers,
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(payload["job"]["id"], uncertain_gpc0);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.kind == host_actions::HostActionKind::SystemUpdateProposal
+                        && job.retry_of.as_deref() == Some(uncertain_gpc0.as_str())
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn system_update_presentation_distinguishes_handoff_rejection_and_uncertainty() {
+        let store = HostActionStore::new(None);
+        let handoff = store
+            .create_system_update_proposal(
+                "action-system-update-hsb8-800-1".to_string(),
+                "hsb8",
+                "markus",
+                800,
+            )
+            .expect("handoff proposal created");
+        let completed = store
+            .accept_system_update_proposal(&handoff.id, 801)
+            .expect("handoff completed");
+        let handoff_workflow = completed.summary().workflow;
+        assert_eq!(handoff_workflow.status_label, "review handed to nixcfg");
+        let handoff_html = host_workflow_markup(&handoff_workflow);
+        assert!(handoff_html.contains("continues in nixcfg"));
+        assert!(!handoff_html.contains("not attempted"));
+
+        let rejected = store
+            .create_system_update_proposal(
+                "action-system-update-gpc0-802-1".to_string(),
+                "gpc0",
+                "markus",
+                802,
+            )
+            .expect("rejected proposal created");
+        let failed = store
+            .fail_system_update_proposal(&rejected.id, 803)
+            .expect("known rejection recorded");
+        let rejected_workflow = failed.summary().workflow;
+        assert_eq!(rejected_workflow.status_label, "update review stopped");
+        let rejected_html = host_workflow_markup(&rejected_workflow);
+        assert!(rejected_html.contains("not attempted"));
+        assert!(!rejected_html.contains("continues in nixcfg"));
+
+        let uncertain = store
+            .create_system_update_proposal(
+                "action-system-update-athena-804-1".to_string(),
+                "athena",
+                "markus",
+                804,
+            )
+            .expect("uncertain proposal created");
+        let uncertain_failed = store
+            .fail_system_update_proposal_uncertain(&uncertain.id, 805)
+            .expect("uncertain failure recorded");
+        let uncertain_workflow = uncertain_failed.summary().workflow;
+        assert_eq!(
+            uncertain_workflow.status_label,
+            "dispatch outcome uncertain"
+        );
+        let uncertain_html = host_workflow_markup(&uncertain_workflow);
+        assert!(uncertain_html.contains("not confirmed"));
+        assert!(!uncertain_html.contains("did not accept"));
+        assert!(!uncertain_html.contains("continues in nixcfg"));
+
+        let handoff_dispatch = handoff_workflow
+            .evidence
+            .iter()
+            .find(|item| item.label == "Repository dispatch")
+            .expect("handoff dispatch evidence");
+        assert_eq!(handoff_dispatch.value, "accepted");
+        let rejected_dispatch = rejected_workflow
+            .evidence
+            .iter()
+            .find(|item| item.label == "Repository dispatch")
+            .expect("rejected dispatch evidence");
+        assert_eq!(rejected_dispatch.value, "stopped");
+        let uncertain_dispatch = uncertain_workflow
+            .evidence
+            .iter()
+            .find(|item| item.label == "Repository dispatch")
+            .expect("uncertain dispatch evidence");
+        assert_eq!(uncertain_dispatch.value, "outcome uncertain");
+        assert!(handoff_html.contains("Repository dispatch</dt><dd>accepted</dd>"));
+        assert!(rejected_html.contains("Repository dispatch</dt><dd>stopped</dd>"));
+        assert!(uncertain_html.contains("Repository dispatch</dt><dd>outcome uncertain</dd>"));
+    }
+
+    #[tokio::test]
+    async fn settings_and_removal_uncertainty_ack_endpoint_reopens_each_workflow() {
+        let state = report_test_state(true);
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 900)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .fail_settings_change_uncertain(&settings.id, 901)
+            .expect("settings uncertainty recorded");
+        let (status, Json(payload)) = acknowledge_dispatch_uncertainty(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "uncertainty acknowledged"
+        );
+        state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 902)
+            .expect("fresh settings request allowed");
+
+        let plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: false,
+        };
+        let removal = state
+            .host_actions
+            .begin_removal("gpc0", "markus", plan.clone(), 903)
+            .expect("removal workflow created");
+        state
+            .host_actions
+            .fail_removal_uncertain(&removal.id, 904)
+            .expect("removal uncertainty recorded");
+        let (status, Json(payload)) = acknowledge_dispatch_uncertainty(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(removal.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "uncertainty acknowledged"
+        );
+        state
+            .host_actions
+            .begin_removal("gpc0", "markus", plan, 905)
+            .expect("fresh removal request allowed");
+    }
+
+    #[tokio::test]
+    async fn accepted_settings_and_removal_dispatches_reconcile_locally_without_redispatch() {
+        let state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 910)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 911)
+            .expect("settings recovery payload recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, 912)
+            .expect("settings dispatch accepted");
+        let (status, Json(payload)) = reconcile_accepted_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["job"]["workflow"]["status_label"], "change waiting");
+        assert!(payload["job"]["workflow"]["primary_action"].is_null());
+        assert_eq!(
+            state
+                .store
+                .get("hsb8")
+                .and_then(|host| host.requested_preferences),
+            Some(requested)
+        );
+        let (second_status, _) = reconcile_accepted_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+
+        let plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Destroyed,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: true,
+        };
+        let removal = state
+            .host_actions
+            .begin_removal("gpc0", "markus", plan, 913)
+            .expect("removal workflow created");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&removal.id, 914)
+            .expect("removal dispatch accepted");
+        let (status, Json(payload)) = reconcile_accepted_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(removal.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "removal_pending");
+        assert!(payload["job"]["workflow"]["primary_action"].is_null());
+        assert!(state.retired_hosts.is_retired("gpc0"));
+        assert!(state.store.get("gpc0").is_none());
+
+        let (second_status, Json(second_payload)) =
+            reconcile_accepted_dispatch(State(state), action_headers(), AxumPath(removal.id)).await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert!(second_payload["error"]
+            .as_str()
+            .expect("safe reconciliation error")
+            .contains("Only a saved"));
+    }
+
+    #[tokio::test]
+    async fn withdrawn_settings_cannot_be_resurrected_by_queued_dispatch_reconciliation() {
+        let state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 916)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 917)
+            .expect("settings recovery payload recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, 918)
+            .expect("settings dispatch accepted");
+
+        let held = state.settings_change_lock.lock().await;
+        let withdraw_state = state.clone();
+        let withdraw_id = settings.id.clone();
+        let withdrawal = tokio::spawn(async move {
+            withdraw_settings_change(
+                State(withdraw_state),
+                action_headers(),
+                AxumPath(withdraw_id),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let reconcile_state = state.clone();
+        let reconcile_id = settings.id.clone();
+        let reconciliation = tokio::spawn(async move {
+            reconcile_accepted_dispatch(
+                State(reconcile_state),
+                action_headers(),
+                AxumPath(reconcile_id),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+
+        let (withdraw_status, Json(withdraw_payload)) = withdrawal.await.expect("withdrawal joins");
+        assert_eq!(withdraw_status, StatusCode::OK);
+        assert_eq!(withdraw_payload["job"]["state"], "cancelled");
+        let (reconcile_status, _) = reconciliation.await.expect("reconciliation joins");
+        assert_eq!(reconcile_status, StatusCode::CONFLICT);
+        assert!(state
+            .store
+            .get("hsb8")
+            .expect("host retained")
+            .requested_preferences
+            .is_none());
+        assert_eq!(
+            state
+                .host_actions
+                .get(&settings.id)
+                .expect("workflow retained")
+                .state,
+            HostActionState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_withdrawal_clears_pending_preferences_without_repository_dispatch() {
+        let mut state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        state
+            .store
+            .request_preferences("hsb8", requested.clone())
+            .expect("pending preferences recorded");
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 920)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 921)
+            .expect("settings request audit recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, 922)
+            .expect("repository handoff recorded");
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = withdraw_settings_change(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["job"]["state"], "cancelled");
+        assert_eq!(
+            payload["message"],
+            "Clears the pending request. An open nixcfg proposal stays open there."
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        let host = state.store.get("hsb8").expect("host remains recorded");
+        assert!(host.requested_preferences.is_none());
+        let payload = hosts_payload(
+            vec![host],
+            &[],
+            &BTreeMap::new(),
+            &state.host_actions.list(),
+            923,
+        );
+        assert_eq!(
+            payload["hosts"][0]["lifecycle"]["label"],
+            "settings change cancelled"
+        );
+        assert!(!payload.to_string().contains("Change requested"));
+
+        let (second_status, _) =
+            withdraw_settings_change(State(state), action_headers(), AxumPath(settings.id)).await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn settings_withdrawal_waits_for_in_flight_submission_then_clears_it() {
+        let mut state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let (api_base, dispatch_arrived, release_dispatch) = mock_blocking_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let submit_state = state.clone();
+        let submission = tokio::spawn(async move {
+            agora::request_host_preferences(
+                State(submit_state),
+                action_headers(),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "host": "hsb8",
+                        "preferences": { "accent": "#48b8a8" }
+                    }))
+                    .expect("settings request parses"),
+                ),
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            dispatch_arrived
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("dispatch reached blocking endpoint")
+        })
+        .await
+        .expect("dispatch waiter joins");
+
+        let settings = state
+            .host_actions
+            .latest_settings_change_for_host("hsb8")
+            .expect("in-flight settings workflow exists");
+        let withdraw_state = state.clone();
+        let settings_id = settings.id.clone();
+        let mut withdrawal = tokio::spawn(async move {
+            withdraw_settings_change(
+                State(withdraw_state),
+                action_headers(),
+                AxumPath(settings_id),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut withdrawal)
+                .await
+                .is_err(),
+            "withdrawal must wait for the in-flight submission transaction"
+        );
+
+        release_dispatch.send(()).expect("dispatch released");
+        let (submit_status, _) = submission.await.expect("submission joins");
+        assert_eq!(submit_status, StatusCode::OK);
+        let (withdraw_status, Json(withdraw_payload)) = withdrawal.await.expect("withdrawal joins");
+        assert_eq!(withdraw_status, StatusCode::OK);
+        assert_eq!(withdraw_payload["job"]["state"], "cancelled");
+        assert!(state
+            .store
+            .get("hsb8")
+            .expect("host retained")
+            .requested_preferences
+            .is_none());
+        assert_eq!(
+            state
+                .host_actions
+                .get(&settings.id)
+                .expect("workflow retained")
+                .state,
+            HostActionState::Cancelled
+        );
+    }
+
+    fn post_commit_host_actions_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pharos-post-commit-sync-failure-handler-{}-{}.json",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[tokio::test]
+    async fn settings_begin_persistence_committed_continues_same_request_through_dispatch() {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+        let settings_request = || {
+            serde_json::from_value(serde_json::json!({
+                "host": "hsb8",
+                "preferences": {
+                    "accent": "#48b8a8"
+                }
+            }))
+            .expect("settings request parses")
+        };
+        let (status, Json(payload)) = agora::request_host_preferences(
+            State(state.clone()),
+            action_headers(),
+            Json(settings_request()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["status"], "dispatch_accepted");
+        assert_eq!(payload["job"]["workflow"]["status_label"], "change waiting");
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.host == "hsb8"
+                        && job.workflow_kind() == host_actions::HostWorkflowKind::SettingsChange
+                })
+                .count(),
+            1
+        );
+
+        let (second_status, Json(second_payload)) = agora::request_host_preferences(
+            State(state.clone()),
+            action_headers(),
+            Json(settings_request()),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert_eq!(
+            second_payload["error"],
+            "A settings change is already waiting for this host"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn removal_begin_persistence_committed_continues_same_request_through_dispatch() {
+        let (generation_root, mut state) = janus_managed_undeclared_state();
+        let actions_path = post_commit_host_actions_path();
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+        let request = RemoveHostActionRequest {
+            confirmation: "dsc0".to_string(),
+            disposition: HostRetirementDisposition::Unmanaged,
+            successor: None,
+        };
+
+        let (status, Json(payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(request.clone()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "removal_pending");
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.host == "dsc0" && job.kind == host_actions::HostActionKind::RemoveHost
+                })
+                .count(),
+            1
+        );
+
+        let (second_status, Json(second_payload)) = request_host_removal(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("dsc0".to_string()),
+            Json(request),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert_eq!(
+            second_payload["error"],
+            "This host is already being removed"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(generation_root);
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_begin_persistence_committed_continues_same_request_through_dispatch() {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("system update host recorded");
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers(),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "succeeded");
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "review handed to nixcfg"
+        );
+        assert!(host_actions::system_update_dispatch_handed_off(
+            &state
+                .host_actions
+                .get(payload["job"]["id"].as_str().expect("job id"))
+                .expect("handed-off workflow retained")
+        ));
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| {
+                    job.workflow_kind() == host_actions::HostWorkflowKind::SystemUpdateProposal
+                })
+                .count(),
+            1
+        );
+
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_ack_replacement_begin_persistence_committed_continues_through_dispatch()
+    {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("system update host recorded");
+        let uncertain_id = format!(
+            "action-system-update-gpc0-post-commit-{}-{}",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        match state.host_actions.create_system_update_proposal(
+            uncertain_id.clone(),
+            "gpc0",
+            "markus",
+            850,
+        ) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update created: {error:?}"),
+        }
+        match state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_id, 851)
+        {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update recorded: {error:?}"),
+        }
+        assert!(state.host_actions.get(&uncertain_id).is_some());
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["state"], "succeeded");
+        assert_eq!(
+            payload["job"]["workflow"]["status_label"],
+            "review handed to nixcfg"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        let prior = state
+            .host_actions
+            .get(&uncertain_id)
+            .expect("acknowledged prior retained");
+        assert!(prior.events.iter().any(|event| {
+            event.kind == host_actions::HostActionEventKind::DispatchUncertaintyAcknowledged
+        }));
+        let replacement = state
+            .host_actions
+            .get(payload["job"]["id"].as_str().expect("replacement id"))
+            .expect("replacement workflow retained");
+        assert_eq!(replacement.retry_of.as_deref(), Some(uncertain_id.as_str()));
+        assert!(host_actions::system_update_dispatch_handed_off(
+            &replacement
+        ));
+
+        let (second_status, _) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::ACCEPTED);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_migration_persistence_committed_blocks_dispatch_with_failed_ack_replacement(
+    ) {
+        let actions_path = post_commit_host_actions_path();
+        let mut state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("system update host recorded");
+        let stale_at = now_unix() - 150;
+        let uncertain_id = format!(
+            "action-system-update-gpc0-migrate-handler-{}-{}",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        match state.host_actions.create_system_update_proposal(
+            uncertain_id.clone(),
+            "gpc0",
+            "markus",
+            stale_at.saturating_sub(200),
+        ) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update created: {error:?}"),
+        }
+        match state
+            .host_actions
+            .fail_system_update_proposal_uncertain(&uncertain_id, stale_at.saturating_sub(199))
+        {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("uncertain system update recorded: {error:?}"),
+        }
+        let replacement_created_at = stale_at.saturating_sub(50);
+        let replacement = match state.host_actions.begin_system_update_proposal(
+            "gpc0",
+            "markus",
+            replacement_created_at,
+            Some(&uncertain_id),
+        ) {
+            Ok(begin) => begin.into_job(),
+            Err(error) => panic!("ack replacement seeded: {error:?}"),
+        };
+        match state
+            .host_actions
+            .fail_system_update_proposal(&replacement.id, replacement_created_at + 1)
+        {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("failed replacement recorded: {error:?}"),
+        }
+        let stalled_id = format!(
+            "action-system-update-gpc0-stalled-handler-{}-{}",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        match state.host_actions.create_system_update_proposal(
+            stalled_id.clone(),
+            "gpc0",
+            "markus",
+            stale_at,
+        ) {
+            Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
+            Err(error) => panic!("stalled proposal seeded: {error:?}"),
+        }
+        let stalled = state
+            .host_actions
+            .get(&stalled_id)
+            .expect("stalled proposal retained in memory");
+        assert_eq!(
+            stalled.state,
+            host_actions::HostActionState::ProposalRequested
+        );
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            payload["error"],
+            "The update review checklist could not be recorded"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        let retained = state
+            .host_actions
+            .get(&replacement.id)
+            .expect("failed replacement retained");
+        assert_eq!(retained.state, host_actions::HostActionState::Failed);
+        assert!(!host_actions::system_update_dispatch_handed_off(&retained));
+
+        let (second_status, _) = request_system_update(
+            State(state.clone()),
+            action_headers_with_ack(&uncertain_id),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+        assert_ne!(second_status, StatusCode::ACCEPTED);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_file(actions_path);
+    }
+
+    #[tokio::test]
+    async fn system_update_active_job_conflict_never_panics_without_a_lookup_job() {
+        let state = report_test_state(true);
+        register_test_token(&state, "gpc0", "update-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
+        state
+            .host_actions
+            .begin_system_update_proposal("gpc0", "markus", now_unix(), None)
+            .expect("active system update proposal recorded");
+
+        let (status, Json(payload)) = request_system_update(
+            State(state.clone()),
+            action_headers(),
+            Json(SystemUpdateActionRequest {
+                host: "gpc0".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(payload["job"]["state"], "proposal_requested");
+    }
+
+    #[test]
+    fn system_update_success_copy_honestly_describes_nixcfg_handoff() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_system_update_proposal("hsb8", "markus", 700, None)
+            .expect("proposal workflow created")
+            .into_job();
+        let completed = store
+            .accept_system_update_proposal(&job.id, 701)
+            .expect("proposal dispatch accepted");
+        let message = action_message(&completed);
+        assert!(message.contains("handed"));
+        assert!(message.contains("nixcfg"));
+        assert!(message.contains("No host was deployed or verified from Pharos."));
+        assert!(!message.contains("guarded action completed"));
+
+        let workflow = completed.summary().workflow;
+        let html = host_workflow_markup(&workflow);
+        assert!(html.contains("continues in nixcfg"));
+        assert!(!html.contains("not required"));
+        assert!(html.contains("not deployed"));
+    }
+
+    #[test]
+    fn system_update_activity_title_describes_nixcfg_handoff() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_system_update_proposal("athena", "markus", 710, None)
+            .expect("proposal workflow created")
+            .into_job();
+        let completed = store
+            .accept_system_update_proposal(&job.id, 711)
+            .expect("proposal dispatch accepted");
+        let html = render_activity_with_actions(
+            runtime(&[], &[]),
+            "csb1",
+            720,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[completed],
+            },
+            shell("markus", true),
+        );
+        assert!(html.contains("System update review handed to nixcfg"));
+        assert!(!html.contains("System update review completed"));
+        assert!(html.contains("handed the update review request to nixcfg"));
+    }
+
+    #[tokio::test]
     async fn report_accepts_registered_host_without_token_when_strict_disabled() {
         let state = report_test_state(false);
         register_test_token(&state, "ares", "valid-token");
@@ -13303,6 +16107,30 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .find(|host| host.name == "ares")
             .and_then(|host| host.last_seen)
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn report_rejects_reserved_appliance_observation_without_mutating_host() {
+        let state = report_test_state(false);
+        register_test_token(&state, "ares", "valid-token");
+        let before = state.store.get("ares").expect("registered host exists");
+        let mut spoofed = test_report("ares");
+        spoofed.service_observations = vec![ServiceObservation {
+            id: appliance_probes::APPLIANCE_OBSERVATION_ID.to_string(),
+            label: "Appliance convergence".to_string(),
+            state: pharos_core::ServiceObservationState::Healthy,
+            summary: "powered off as expected".to_string(),
+        }];
+
+        let response = report(
+            State(state.clone()),
+            bearer_headers("valid-token"),
+            Json(spoofed),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.store.get("ares"), Some(before));
     }
 
     #[tokio::test]

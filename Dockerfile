@@ -17,10 +17,12 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
 # baked into the image.
-# openssh-client: pharosd can run read-only existing-host preflight probes when
-# the runtime has non-interactive SSH access configured. The Debian image and
-# package indexes share one immutable snapshot date. HTTP transport is safe here
-# because apt verifies Debian's signed Release metadata and package hashes.
+# openssh-client: pharosd can run read-only existing-host preflight and
+# convergence-marker probes when the runtime has non-interactive SSH access.
+# iputils-ping: the fixed appliance-presence signal used before testing SSH.
+# The Debian image and package indexes share one immutable snapshot date. HTTP
+# transport is safe here because apt verifies Debian's signed Release metadata
+# and package hashes.
 RUN printf '%s\n' \
       'Types: deb' \
       "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
@@ -37,7 +39,7 @@ RUN printf '%s\n' \
       'Check-Valid-Until: no' \
       > /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates openssh-client restic \
+    && apt-get install -y --no-install-recommends git ca-certificates iputils-ping openssh-client restic \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
 # /data owned by pharos so a named volume mounted here inherits writable
@@ -52,5 +54,15 @@ USER pharos
 ENV PHAROS_ADDR=0.0.0.0:8080 \
     RUST_LOG=info
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 CMD ["/usr/local/bin/pharosd", "healthcheck"]
+# Role-aware container probe (PHAROS-203/204). The image is shared by two
+# roles: `pharosd` (default entrypoint) and `pharos-beacon`. A beacon always
+# carries PHAROS_URL, so that selects its own report-freshness check; anything
+# else gets the daemon readiness probe, which refuses to guess a bind address
+# and prints its reason. Both verdicts land in `docker inspect .State.Health`.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+    CMD if [ -n "${PHAROS_URL:-}" ]; then \
+        exec /usr/local/bin/pharos-beacon healthcheck; \
+    else \
+        exec /usr/local/bin/pharosd healthcheck; \
+    fi
 ENTRYPOINT ["/usr/local/bin/pharosd"]

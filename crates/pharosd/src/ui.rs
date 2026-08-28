@@ -101,6 +101,7 @@ pub(super) const SETUP_ASSISTANT_TEMPLATE: &str = include_str!("../assets/ui/set
 #[cfg(test)]
 mod module_tests {
     use super::*;
+    use crate::host_actions::{HostLifecycle, HostLifecycleInvoke, HostLifecycleSlot};
 
     fn proven_current(channel: &str) -> NixFreshness {
         let source_revision = "1".repeat(40);
@@ -178,6 +179,101 @@ mod module_tests {
         assert!(reason.label.contains("end of life"), "{}", reason.label);
         assert_eq!(reason.level, "warn");
         assert_eq!(reason.rank, 1, "an expired channel outranks age drift");
+    }
+
+    #[test]
+    fn lifecycle_chip_is_button_without_agora_navigation() {
+        let quiet = HostLifecycle {
+            schema: "inspr.pharos.host-lifecycle.v1",
+            version: 1,
+            slot: HostLifecycleSlot::Quiet,
+            label: "Up to date".to_string(),
+            level: "clear",
+            invoke: HostLifecycleInvoke::HostSettings,
+            run_id: None,
+            update_restart_intent: None,
+            detail: "No host lifecycle work is waiting.".to_string(),
+            blocked_by: Vec::new(),
+            primary_action: None,
+        };
+        let chip = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, true, None);
+        assert!(chip.contains("data-host-lifecycle-chip"));
+        assert!(chip.contains("<button"));
+        assert!(!chip.contains("/agora"));
+        assert!(chip.contains("Up to date"));
+
+        let drift = HostLifecycle {
+            schema: "inspr.pharos.host-lifecycle.v1",
+            version: 1,
+            slot: HostLifecycleSlot::PrefsDrift,
+            label: "Change requested".to_string(),
+            level: "warning",
+            invoke: HostLifecycleInvoke::HostSettings,
+            run_id: None,
+            update_restart_intent: None,
+            detail: "Requested preferences have not yet been observed by the host.".to_string(),
+            blocked_by: vec!["host_report".to_string()],
+            primary_action: None,
+        };
+        let drift_chip =
+            host_lifecycle_chip_markup(&drift, HostPreferencesState::RequestPending, true, None);
+        assert!(drift_chip.contains("Change requested"));
+        assert!(!drift_chip.contains("Continue:"));
+        assert!(drift_chip.contains("data-lifecycle-blocked-by=\"host_report\""));
+
+        let inert = host_lifecycle_chip_markup(&quiet, HostPreferencesState::Applied, false, None);
+        assert!(inert.contains("disabled"));
+        assert!(inert.contains("aria-disabled=\"true\""));
+        assert!(inert.contains("tabindex=\"-1\""));
+        assert!(!inert.contains(" hidden"));
+    }
+
+    #[test]
+    fn requested_workflow_passes_the_query_job_id_without_host_action_fallback() {
+        let opener = FOOT
+            .split("function openRequestedWorkflow()")
+            .nth(1)
+            .and_then(|rest| rest.split("function parseBeats").next())
+            .expect("openRequestedWorkflow");
+        assert!(opener.contains(
+            "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'),workflowId)"
+        ));
+        assert!(!opener.contains("host_action"));
+        assert!(!opener.contains("storedMatches"));
+    }
+
+    #[test]
+    fn lifecycle_sheet_hides_every_workflow_only_section() {
+        let sheet = FOOT
+            .split("function openHostLifecycleSheet")
+            .nth(1)
+            .and_then(|rest| rest.split("function updateSettingsLinkSurfaces").next())
+            .expect("openHostLifecycleSheet");
+        assert!(sheet.contains("if(confirm)confirm.hidden=true"));
+        assert!(sheet.contains("if(dispositionField)dispositionField.hidden=true"));
+        assert!(sheet.contains("if(successorField)successorField.hidden=true"));
+        assert!(sheet.contains("if(attendedConfirm)attendedConfirm.hidden=true"));
+        assert!(sheet.contains("[data-host-remove-confirm]"));
+        assert!(sheet.contains("[data-host-remove-disposition-field]"));
+        assert!(sheet.contains("[data-host-remove-successor]"));
+        assert!(sheet.contains("[data-host-attended-confirm]"));
+    }
+
+    #[test]
+    fn preferences_summary_matches_safe_fleet_fact_format() {
+        let prefs = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            kind: HostKind::Workstation,
+            alerts: pharos_core::HostAlertPreferences {
+                suppress_backup: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            preferences_summary(&prefs),
+            "accent #48b8a8 · workstation · mute backup"
+        );
+        assert_eq!(preferences_summary(&HostPreferences::default()), "defaults");
     }
 
     #[test]
@@ -354,6 +450,12 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let declared_preferences =
         filter_declared_preferences_by_access(state.manifests.declared_preferences(), &access);
+    let action_jobs: Vec<_> = state
+        .host_actions
+        .list()
+        .into_iter()
+        .filter(|job| access.allows_host(&job.host))
+        .collect();
     // PHAROS-194: the removal dialog must name credential retirement before the
     // operator confirms. An unavailable generation is reported as unmanaged here;
     // the removal endpoint still fails closed on the same lookup.
@@ -371,6 +473,7 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
+            action_jobs: &action_jobs,
             declared_preferences: Some(&declared_preferences),
             janus_managed_hosts: Some(&janus_managed_hosts),
         },
@@ -465,6 +568,7 @@ pub(super) async fn alerts_page(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
+            action_jobs: &[],
             declared_preferences: None,
             janus_managed_hosts: None,
         },
@@ -519,6 +623,7 @@ pub(super) async fn activity_page(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
+            action_jobs: &action_jobs,
             declared_preferences: None,
             janus_managed_hosts: None,
         },
@@ -913,43 +1018,6 @@ pub(super) fn kernel_reboot_required(kernel: Option<&KernelPosture>) -> Option<&
     kernel.filter(|posture| posture.state == KernelPostureState::RebootRequired)
 }
 
-pub(super) fn kernel_posture_markup(
-    kernel: Option<&KernelPosture>,
-    host: &str,
-    live: Liveness,
-) -> String {
-    let reboot = kernel_reboot_required(kernel);
-    let explanation = reboot
-        .map(|_| {
-            if live == Liveness::Live {
-                format!(
-                    "{} is healthy. A newer system kernel is ready for its next planned restart.",
-                    host
-                )
-            } else {
-                format!(
-                    "{} has a newer system kernel ready for its next planned restart.",
-                    host
-                )
-            }
-        })
-        .unwrap_or_default();
-    let running = reboot
-        .and_then(|posture| posture.running_version.as_deref())
-        .unwrap_or_default();
-    let expected = reboot
-        .and_then(|posture| posture.expected_version.as_deref())
-        .unwrap_or_default();
-    let hidden = if reboot.is_none() { " hidden" } else { "" };
-    format!(
-        r#"<div class="kernel-slot" data-kernel-slot{hidden}><details class="kernel-posture" data-kernel-posture><summary>{icon}<span>Restart required</span></summary><div class="kernel-detail"><strong>Restart required</strong><p data-kernel-explanation>{explanation}</p><dl><div><dt>Running</dt><dd data-kernel-running>{running}</dd></div><div><dt>Ready after restart</dt><dd data-kernel-expected>{expected}</dd></div></dl><p class="kernel-boundary">Pharos will not restart this host.</p></div></details></div>"#,
-        icon = icons::REFRESH_CW,
-        explanation = html_escape(&explanation),
-        running = html_escape(running),
-        expected = html_escape(expected),
-    )
-}
-
 pub(super) struct AttentionReason {
     pub(super) label: String,
     pub(super) level: &'static str,
@@ -1077,6 +1145,12 @@ pub(super) fn service_observation_attention_reason(
     let unknown = observations
         .iter()
         .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
+        .filter(|observation| {
+            !appliance_probes::is_appliance_observation(observation)
+                || !observation
+                    .summary
+                    .starts_with("online; allowing SSH startup")
+        })
         .filter(|obs| obs.state == ServiceObservationState::Unknown)
         .count();
     if unknown > 0 {
@@ -1383,8 +1457,13 @@ pub(super) fn backup_glyph(level: &str) -> &'static str {
 pub(super) fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
     let title = format!("Backup: {} - {}", summary.label, summary.detail);
     let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
+    let hidden = if summary.state == "healthy" {
+        " hidden"
+    } else {
+        ""
+    };
     format!(
-        r#"<a class="header-chip backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
+        r#"<a class="header-chip backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"{hidden}><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
         level = html_escape(summary.level),
         host_query = html_escape(&url_query_escape(host)),
         state = html_escape(summary.state),
@@ -1398,26 +1477,47 @@ pub(super) fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> Strin
     )
 }
 
-pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<'_>) -> String {
+pub(super) fn host_actions_markup(
+    host: &Host,
+    context: HostActionRenderContext<'_>,
+    action: Option<&HostActionJob>,
+    lifecycle: &HostLifecycle,
+) -> String {
     let capabilities = context.capabilities;
     let name = html_escape(&host.name);
     let role = html_escape(&host.role);
     let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
     let title = html_escape(&format!("Actions for {}", host.name));
     let settings_href = html_escape(context.settings_href);
+    let settings_link_title = html_escape(&format!("Open host settings for {}", host.name));
+    let settings_state_key = context.settings_state.key();
     let settings_menu_item = if context.surface == "card" {
         format!(
-            r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="host-settings" href="{settings_href}">{icon}<span><strong>Host settings</strong><span>Color, alerts, and host type</span></span></a>"#,
+            r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="host-settings" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_link_title}" aria-label="{settings_link_title}">{icon}<span><strong>Host settings</strong><span>Color, alerts, and host type</span></span></a>"#,
             icon = icons::SLIDERS,
         )
     } else {
         String::new()
     };
-    let review_hidden = if context.settings_state == HostPreferencesState::Applied {
-        " hidden"
-    } else {
-        ""
-    };
+    let withdrawable_settings =
+        withdrawable_settings_change_for_host(context.action_jobs, &host.name);
+    let withdraw_settings_visible = withdrawable_settings.is_some();
+    let withdraw_settings_item = withdrawable_settings
+        .map_or_else(
+            || {
+                format!(
+                    r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" hidden>{history}<span><strong>Withdraw change request</strong><span>Clears the pending request. An open nixcfg proposal stays open there.</span></span></button>"#,
+                    history = icons::HISTORY,
+                )
+            },
+            |job| {
+                format!(
+                    r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" data-lifecycle-run-id="{run_id}">{history}<span><strong>Withdraw change request</strong><span>Clears the pending request. An open nixcfg proposal stays open there.</span></span></button>"#,
+                    run_id = html_escape(&job.id),
+                    history = icons::HISTORY,
+                )
+            },
+        );
     let update_hidden =
         if host.is_nix && capabilities.can_manage_fleet && capabilities.system_update_available {
             ""
@@ -1430,12 +1530,20 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
     });
     let reboot = kernel_reboot_required(host.kernel.as_ref());
     let update_pending = reboot.is_some() || host.freshness.has_proven_deployable_update();
-    let restart_hidden =
-        if host.is_nix && capabilities.can_manage_fleet && janus_ready && update_pending {
-            ""
-        } else {
-            " hidden"
-        };
+    let update_restart_active =
+        active_update_restart_for_host(context.action_jobs, &host.name).is_some();
+    let update_job_active = update_restart_active;
+    let restart_hidden = if host.is_nix
+        && capabilities.can_manage_fleet
+        && janus_ready
+        && update_pending
+        && !update_job_active
+        && lifecycle.slot != HostLifecycleSlot::Blocked
+    {
+        ""
+    } else {
+        " hidden"
+    };
     // PHAROS-197: a removal needs the nixcfg proposal whenever it must remove a
     // declaration or record a retirement intent. Offering it without a working
     // dispatch would only produce a refusal.
@@ -1447,8 +1555,24 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
     } else {
         " hidden"
     };
+    let lifecycle_continue = if let Some((action, run_id)) = lifecycle
+        .primary_action
+        .as_ref()
+        .zip(lifecycle.run_id.as_ref())
+    {
+        format!(
+            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" data-lifecycle-run-id="{run_id}" data-lifecycle-invoke="{invoke}">{history}<span><strong>Continue: {label}</strong><span>Open the saved workflow at this step</span></span></button>"#,
+            run_id = html_escape(run_id),
+            invoke = lifecycle.invoke.key(),
+            label = html_escape(&action.label),
+            history = icons::HISTORY,
+        )
+    } else {
+        r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" hidden><span><strong>Continue</strong><span>Open the saved workflow at this step</span></span></button>"#.to_string()
+    };
     let primary_separator_hidden = if !settings_menu_item.is_empty()
-        || review_hidden.is_empty()
+        || lifecycle.primary_action.is_some() && lifecycle.run_id.is_some()
+        || withdraw_settings_visible
         || update_hidden.is_empty()
         || restart_hidden.is_empty()
     {
@@ -1456,12 +1580,19 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
     } else {
         " hidden"
     };
-    let dot_hidden = if context.settings_state != HostPreferencesState::Applied || reboot.is_some()
-    {
+    let dot_hidden = if lifecycle.slot != HostLifecycleSlot::Quiet {
         ""
     } else {
         " hidden"
     };
+    let action_attributes = action.map_or_else(String::new, |job| {
+        format!(
+            r#" data-action-job-id="{}" data-action-kind="{}" data-action-state="{}""#,
+            html_escape(&job.id),
+            job.workflow_kind().key(),
+            job.state.key(),
+        )
+    });
     let kernel_state = host
         .kernel
         .as_ref()
@@ -1484,7 +1615,7 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
         .unwrap_or("not reported");
 
     format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-settings-state="{settings_state}" data-settings-href="{settings_href}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="review-pending" href="{settings_href}"{review_hidden}>{clock}<span><strong>Review pending change</strong><span>See what is waiting for this host</span></span></a><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-update-restart-active="{update_restart_active}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}{withdraw_settings_item}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
         is_nix = host.is_nix,
         declared = context.declared,
         credential_retirement = context.credential_retirement_required,
@@ -1493,14 +1624,16 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
         system_update_available = capabilities.system_update_available,
         host_removal_available = capabilities.host_removal_available,
         update_pending = update_pending,
+        update_restart_active = update_restart_active,
         settings_state = context.settings_state.key(),
         backup_state = html_escape(context.backup.state),
         backup_label = html_escape(&context.backup.label),
         kernel_state = html_escape(kernel_state),
         running_kernel = html_escape(running_kernel),
         expected_kernel = html_escape(expected_kernel),
+        action_attributes = action_attributes,
+        withdraw_settings_item = withdraw_settings_item,
         ellipsis = icons::ELLIPSIS,
-        clock = icons::CLOCK_3,
         package = icons::PACKAGE_SEARCH,
         power = icons::POWER,
         file = icons::FILE_TEXT,
@@ -1511,7 +1644,7 @@ pub(super) fn host_actions_markup(host: &Host, context: HostActionRenderContext<
 
 pub(crate) fn host_action_dialog() -> String {
     format!(
-        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="settings-change" hidden>{sliders}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><div class="host-workflow" data-host-workflow hidden></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel request</button><button class="host-action-dialog-button" type="button" data-host-action-close>Cancel</button><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button></span></footer></section></section>"#,
+        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="settings-change" hidden>{sliders}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="declared"><span>Declared</span><strong data-host-action-fact="declared"></strong></div><div class="host-action-fact" data-host-action-fact-row="observed"><span>Observed</span><strong data-host-action-fact="observed"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><div class="host-workflow" data-host-workflow hidden></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button></span></footer></section></section>"#,
         package = icons::PACKAGE_SEARCH,
         power = icons::POWER,
         sliders = icons::SLIDERS,
@@ -2033,7 +2166,22 @@ pub(super) fn attention_reason(
     observations: &[ServiceObservation],
     preferences: &HostPreferences,
 ) -> AttentionReason {
-    match live {
+    // The observation can only be published after startup validates the
+    // server-owned appliance registry against an existing host record and its
+    // declared workstation preference. Beacon reports cannot claim this ID.
+    let appliance = observations
+        .iter()
+        .find(|observation| appliance_probes::is_appliance_observation(observation));
+    // Appliance hosts intentionally have no beacon. Their fixed server-side
+    // presence/convergence observation owns operational liveness, so a missing
+    // heartbeat must not mask a real un-converged warning or create noise while
+    // the appliance is powered off.
+    let heartbeat_live = if appliance.is_some() {
+        Liveness::Live
+    } else {
+        live
+    };
+    match heartbeat_live {
         Liveness::Down if !preferences.suppresses_down_alerts() => AttentionReason {
             label: "silent heartbeat".to_string(),
             level: "down",
@@ -2067,7 +2215,17 @@ pub(super) fn attention_reason(
                 )
             })
             .unwrap_or_else(|| AttentionReason {
-                label: if live == Liveness::Down {
+                label: if appliance
+                    .is_some_and(|observation| observation.summary == "powered off as expected")
+                {
+                    "offline as expected"
+                } else if appliance.is_some_and(|observation| {
+                    observation
+                        .summary
+                        .starts_with("online; allowing SSH startup")
+                }) {
+                    "starting normally"
+                } else if live == Liveness::Down {
                     if preferences.kind == HostKind::Workstation {
                         "offline as expected"
                     } else {
@@ -2836,6 +2994,7 @@ pub(super) struct ShellContext<'a> {
 pub(super) struct RuntimeSnapshot<'a> {
     pub(super) hosts: &'a [Host],
     pub(super) jobs: &'a [ProvisioningJob],
+    pub(super) action_jobs: &'a [HostActionJob],
     pub(super) declared_preferences: Option<&'a BTreeMap<String, HostPreferences>>,
     /// PHAROS-194: hosts whose beacon credential Janus owns, so removal must also
     /// retire that credential. Independent of whether the host is declared.
@@ -2859,6 +3018,7 @@ pub(super) struct HostActionRenderContext<'a> {
     pub(super) backup: &'a BackupUiSummary,
     pub(super) surface: &'a str,
     pub(super) capabilities: FleetCapabilities,
+    pub(super) action_jobs: &'a [HostActionJob],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3739,73 +3899,93 @@ pub(super) fn manifest_by_host(manifests: &[HostManifest]) -> BTreeMap<&str, &Ho
     by_host
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum HostPreferencesState {
-    Applied,
-    RequestPending,
-    DeclaredNotApplied,
+pub(super) fn preferences_summary(prefs: &HostPreferences) -> String {
+    let mut parts = Vec::new();
+    if let Some(accent) = prefs.accent.as_deref() {
+        parts.push(format!("accent {}", accent));
+    }
+    if prefs.kind != HostKind::default() {
+        parts.push(prefs.kind.label().to_string());
+    }
+    let mut muted = Vec::new();
+    if prefs.alerts.suppress_down {
+        muted.push("down");
+    }
+    if prefs.alerts.suppress_backup {
+        muted.push("backup");
+    }
+    if prefs.alerts.suppress_nix_freshness {
+        muted.push("nix freshness");
+    }
+    if !muted.is_empty() {
+        parts.push(format!("mute {}", muted.join(", ")));
+    }
+    if parts.is_empty() {
+        "defaults".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
-impl HostPreferencesState {
-    pub(super) fn key(self) -> &'static str {
-        match self {
-            Self::Applied => "applied",
-            Self::RequestPending => "request_pending",
-            Self::DeclaredNotApplied => "declared_not_applied",
-        }
-    }
-
-    pub(super) fn card_label(self) -> &'static str {
-        match self {
-            Self::Applied => "",
-            Self::RequestPending => "change requested",
-            Self::DeclaredNotApplied => "ready to apply",
-        }
-    }
-}
-
-pub(super) fn settings_note_markup(
-    state: HostPreferencesState,
-    href: &str,
-    title: &str,
-    card: bool,
+pub(super) fn host_lifecycle_chip_markup(
+    lifecycle: &HostLifecycle,
+    settings_state: HostPreferencesState,
+    interactive: bool,
+    prefs_facts: Option<(String, String)>,
 ) -> String {
-    let label = match state {
-        HostPreferencesState::Applied if card => "Up to date",
-        HostPreferencesState::Applied => "",
-        HostPreferencesState::RequestPending => "Change requested",
-        HostPreferencesState::DeclaredNotApplied => "Ready to apply",
+    let label = lifecycle.label.clone();
+    let inert = if interactive {
+        ""
+    } else {
+        " disabled aria-disabled=\"true\" tabindex=\"-1\""
     };
-    let hidden = if label.is_empty() { " hidden" } else { "" };
+    let run_id_attr = lifecycle
+        .run_id
+        .as_ref()
+        .map(|id| format!(r#" data-lifecycle-run-id="{}""#, html_escape(id)))
+        .unwrap_or_default();
+    let intent_attr = lifecycle
+        .update_restart_intent
+        .map_or(String::new(), |intent| {
+            format!(
+                r#" data-lifecycle-update-restart-intent="{}""#,
+                intent.key()
+            )
+        });
+    let blocked_by_attr = if lifecycle.blocked_by.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#" data-lifecycle-blocked-by="{}""#,
+            html_escape(&lifecycle.blocked_by.join(","))
+        )
+    };
+    let fact_attrs = prefs_facts.map_or(String::new(), |(declared, observed)| {
+        format!(
+            r#" data-lifecycle-declared-summary="{declared}" data-lifecycle-observed-summary="{observed}""#,
+            declared = html_escape(&declared),
+            observed = html_escape(&observed),
+        )
+    });
+    let title = html_escape(&label);
     format!(
-        r#"<a class="settings-wait-note" data-settings-note data-settings-state="{state}" href="{href}" title="{title}" aria-label="{title}"{hidden}><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span data-settings-note-copy>{label}</span></a>"#,
-        state = state.key(),
-        href = html_escape(href),
-        title = html_escape(title),
-        label = html_escape(label),
+        r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="{state}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}" data-lifecycle-detail="{detail}"{run_id_attr}{intent_attr}{blocked_by_attr}{fact_attrs}{inert} title="{title}" aria-label="{title}"><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span class="settings-state-icon workflow" aria-hidden="true">{workflow_icon}</span><span data-host-lifecycle-chip-copy>{label}</span></button>"#,
+        state = settings_state.key(),
+        slot = lifecycle.slot.key(),
+        level = lifecycle.level,
+        invoke = lifecycle.invoke.key(),
+        detail = html_escape(&lifecycle.detail),
+        run_id_attr = run_id_attr,
+        intent_attr = intent_attr,
+        blocked_by_attr = blocked_by_attr,
+        fact_attrs = fact_attrs,
+        inert = inert,
+        title = title,
+        label = html_escape(&label),
         requested_icon = icons::CLOCK_3,
         ready_icon = icons::DOWNLOAD,
+        workflow_icon = icons::HISTORY,
     )
-}
-
-pub(super) fn host_preferences_state(
-    applied: &HostPreferences,
-    declared: Option<&HostPreferences>,
-    requested: Option<&HostPreferences>,
-) -> HostPreferencesState {
-    if let Some(requested) = requested {
-        if declared.is_some_and(|declared| declared == requested && declared != applied) {
-            return HostPreferencesState::DeclaredNotApplied;
-        }
-        if requested != applied {
-            return HostPreferencesState::RequestPending;
-        }
-    }
-    if declared.is_some_and(|declared| declared != applied) {
-        HostPreferencesState::DeclaredNotApplied
-    } else {
-        HostPreferencesState::Applied
-    }
 }
 
 pub(super) fn pending_preference_color<'a>(
@@ -4376,8 +4556,25 @@ pub(super) fn service_alert(
         return None;
     }
 
+    if appliance_probes::is_appliance_observation(observation)
+        && observation.state == ServiceObservationState::Unknown
+        && observation
+            .summary
+            .starts_with("online; allowing SSH startup")
+    {
+        return None;
+    }
+
     let (level, action) = match observation.state {
         ServiceObservationState::Healthy => return None,
+        ServiceObservationState::Warning
+            if appliance_probes::is_appliance_observation(observation) =>
+        {
+            (
+                "warning",
+                "Restore appliance convergence locally; Pharos will not remediate it.",
+            )
+        }
         ServiceObservationState::Warning => ("warning", "Inspect the service on the host."),
         ServiceObservationState::Stale => ("warning", "Verify the service is still reporting."),
         ServiceObservationState::Unknown => {
@@ -4690,7 +4887,12 @@ pub(super) fn alert_items(
 
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
+        let appliance_observed = host
+            .service_observations
+            .iter()
+            .any(appliance_probes::is_appliance_observation);
         match live {
+            _ if appliance_observed => {}
             Liveness::Down if !host.preferences.suppresses_down_alerts() => {
                 alerts.push(AlertItem {
                     level: "critical",
@@ -5305,7 +5507,7 @@ pub(super) fn activity_events(
                 ("info", "System update review requested")
             }
             (HostWorkflowKind::SystemUpdateProposal, HostActionState::Succeeded) => {
-                ("recovery", "System update review completed")
+                ("recovery", "System update review handed to nixcfg")
             }
             (HostWorkflowKind::SystemUpdateProposal, HostActionState::Failed) => {
                 ("warning", "System update review stopped")
@@ -5475,7 +5677,16 @@ pub(super) fn activity_events(
 
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-        match live {
+        let appliance_observed = host
+            .service_observations
+            .iter()
+            .any(appliance_probes::is_appliance_observation);
+        let heartbeat_live = if appliance_observed {
+            Liveness::Live
+        } else {
+            live
+        };
+        match heartbeat_live {
             Liveness::Down if !host.preferences.suppresses_down_alerts() => {
                 events.push(ActivityEvent::new(
                     now,
@@ -5557,6 +5768,15 @@ pub(super) fn activity_events(
 
         for observation in &host.service_observations {
             if is_nix_freshness_observation(observation) {
+                continue;
+            }
+            if appliance_probes::is_appliance_observation(observation)
+                && (observation.state == ServiceObservationState::Healthy
+                    || (observation.state == ServiceObservationState::Unknown
+                        && observation
+                            .summary
+                            .starts_with("online; allowing SSH startup")))
+            {
                 continue;
             }
 
@@ -5897,7 +6117,7 @@ pub(super) fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (
         let (level, label, detail) = heartbeat_history(log, idx, interval);
         let title = format!("{label} · {detail}");
         marks.push_str(&format!(
-            r#"<span class="beat-mark" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
+            r#"<span class="beat-mark" role="img" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
             level = html_escape(level),
             label = html_escape(&label),
             detail = html_escape(&detail),
@@ -6114,7 +6334,6 @@ pub(super) fn render_home_with_capabilities(
             kernel_required || freshness_is_attention || attention.label == "all clear",
         );
         let list_reason = reason_markup(&attention, kernel_required);
-        let kernel = kernel_posture_markup(h.kernel.as_ref(), &h.name, live);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
         let backup_chip = backup_chip_markup(&backup, &h.name);
@@ -6187,10 +6406,24 @@ pub(super) fn render_home_with_capabilities(
             declared_preferences,
             h.requested_preferences.as_ref(),
         );
-        let settings_state_key = settings_state.key();
-        let settings_state_label = settings_state.card_label();
-        if !settings_state_label.is_empty() {
-            search_parts.push(settings_state_label.to_string());
+        let relevant_action = most_relevant_host_action(runtime.action_jobs, &h.name);
+        let apply_declared_ready = h.is_nix
+            && manifest.is_some_and(|manifest| {
+                manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
+                    && manifest.policy.privileged_actions.janus_required
+            });
+        let normal_update_ready =
+            apply_declared_ready && (kernel_required || h.freshness.has_proven_deployable_update());
+        let lifecycle = host_lifecycle_with_apply(
+            runtime.action_jobs,
+            &h.name,
+            settings_state,
+            kernel_required,
+            apply_declared_ready,
+            normal_update_ready,
+        );
+        if lifecycle.slot != HostLifecycleSlot::Quiet {
+            search_parts.push(lifecycle.label.to_lowercase());
         }
         let search = html_escape(&search_parts.join(" "));
         let settings_href_raw = format!("/agora?host={}", url_query_escape(&h.name));
@@ -6225,11 +6458,8 @@ pub(super) fn render_home_with_capabilities(
         } else {
             format!(r#" style="{}""#, host_color_vars.join(";"))
         };
-        let settings_title = if settings_state_label.is_empty() {
-            format!("Open host settings for {name}")
-        } else {
-            format!("{settings_state_label} for {name}")
-        };
+        let settings_state_key = settings_state.key();
+        let settings_title = format!("Open host settings for {name}");
         let settings_action = format!(
             r#"<a class="header-chip settings-card" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"><span class="settings-icon">{settings_icon}</span><span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
             settings_icon = icons::SLIDERS,
@@ -6251,7 +6481,10 @@ pub(super) fn render_home_with_capabilities(
                     backup: &backup,
                     surface: "card",
                     capabilities,
+                    action_jobs: runtime.action_jobs,
                 },
+                relevant_action,
+                &lifecycle,
             )
         } else {
             String::new()
@@ -6267,21 +6500,39 @@ pub(super) fn render_home_with_capabilities(
                     settings_href: &settings_href_raw,
                     backup: &backup,
                     surface: "row",
+                    action_jobs: runtime.action_jobs,
                     capabilities,
                 },
+                relevant_action,
+                &lifecycle,
             )
         } else {
             String::new()
         };
-        let card_settings_note =
-            settings_note_markup(settings_state, &settings_href_raw, &settings_title, true);
-        let row_settings_note =
-            settings_note_markup(settings_state, &settings_href_raw, &settings_title, false);
-        let card_action_note = format!(
-            r#"<button class="settings-wait-note host-action-note" type="button" data-host-action-note hidden>{icon}<span data-host-action-note-copy></span></button>"#,
-            icon = icons::HISTORY,
+        let chip = host_lifecycle_chip_markup(
+            &lifecycle,
+            settings_state,
+            can_onboard,
+            if lifecycle.slot == HostLifecycleSlot::PrefsDrift {
+                let declared_source = match settings_state {
+                    HostPreferencesState::RequestPending => {
+                        h.requested_preferences.as_ref().or(declared_preferences)
+                    }
+                    HostPreferencesState::DeclaredNotApplied => {
+                        declared_preferences.or(h.requested_preferences.as_ref())
+                    }
+                    HostPreferencesState::Applied => None,
+                };
+                let observed_summary = preferences_summary(&h.preferences);
+                let declared_summary =
+                    preferences_summary(declared_source.unwrap_or(&h.preferences));
+                Some((declared_summary, observed_summary))
+            } else {
+                None
+            },
         );
-        let row_action_note = card_action_note.clone();
+        let card_lifecycle_chip = chip.clone();
+        let row_lifecycle_chip = chip;
         let drag_action = format!(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
@@ -6317,11 +6568,11 @@ pub(super) fn render_home_with_capabilities(
         let signal = signal_markup(&heartbeat_signal);
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_settings_note}{card_action_note}{kernel}</div>{card_reason}{muted}<div class="fresh" data-fresh>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh" data-fresh>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{row_settings_note}{row_action_note}{list_reason}{kernel}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
             live_key = live_key(live),
         ));
     }
