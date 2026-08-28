@@ -215,8 +215,8 @@ process start time) and is trusted only while that exact process is running:
 state left by a previous run never becomes healthy merely because an obstacle
 to resetting it clears, a crashed beacon is unhealthy at the next probe, and
 only a successful report by the current process restores health (on Linux
-the token includes the kernel boot id and is refused when that cannot be
-read). The state is reset at startup under the same lock: the beacon takes
+the token includes the kernel boot id, which must be the canonical lowercase
+UUID the kernel writes; anything else, or an unreadable boot id, is refused). The state is reset at startup under the same lock: the beacon takes
 it, notes which file the marker name points at, attempts the reset, and if
 that fails unlinks only that exact file (it never writes into an existing
 file); if the lock cannot be taken, nothing is touched. Deployments that disabled

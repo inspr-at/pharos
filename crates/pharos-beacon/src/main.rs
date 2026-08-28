@@ -273,18 +273,37 @@ impl ProcessGeneration {
     }
 }
 
+/// Whether `boot_id` is exactly what the kernel writes to
+/// `/proc/sys/kernel/random/boot_id` (after the trailing newline is
+/// trimmed): a canonical UUID of 8-4-4-4-12 hex digits with hyphens at
+/// positions 8, 13, 18 and 23 and nothing else. The kernel formats it with
+/// `%pU`, which only ever emits lowercase hex, so uppercase is rejected:
+/// anything else did not come from the kernel.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_canonical_boot_id(boot_id: &str) -> bool {
+    boot_id.len() == 36
+        && boot_id
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            })
+}
+
 /// Builds the Linux start token `<boot_id>:<starttime ticks>` from the raw
-/// `/proc/<pid>/stat` line and the boot id read. The boot id is mandatory:
-/// pid plus boot-relative ticks can repeat across reboots, so an unreadable
-/// or empty boot id fails closed instead of falling back to ticks alone.
+/// `/proc/<pid>/stat` line and the boot id read. The boot id is mandatory
+/// and must be canonical: pid plus boot-relative ticks can repeat across
+/// reboots, so an unreadable, empty or malformed boot id fails closed
+/// instead of falling back to ticks alone.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_start_token(stat: &str, boot_id: std::io::Result<String>) -> std::io::Result<String> {
     let invalid =
         |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_string());
     let boot_id = boot_id?;
-    let boot_id = boot_id.trim();
-    if boot_id.is_empty() || boot_id.chars().any(char::is_whitespace) {
-        return Err(invalid("boot id is empty or malformed"));
+    let boot_id = boot_id.strip_suffix('\n').unwrap_or(&boot_id);
+    if !is_canonical_boot_id(boot_id) {
+        return Err(invalid("boot id is not a canonical lowercase UUID"));
     }
     // The command name is parenthesised and may contain spaces; fields after
     // it start with the state. starttime is field 22 overall.
@@ -4538,8 +4557,14 @@ mod tests {
             .unwrap(),
             "a1b2c3d4-0000-4000-8000-000000000001:424242"
         );
-        // Unreadable or empty boot ids fail closed: pid plus boot-relative
-        // ticks alone can repeat after a reboot.
+        // The exact kernel form also without the trailing newline.
+        assert_eq!(
+            linux_start_token(stat, Ok("a1b2c3d4-0000-4000-8000-000000000001".to_string()))
+                .unwrap(),
+            "a1b2c3d4-0000-4000-8000-000000000001:424242"
+        );
+        // Unreadable boot ids fail closed: pid plus boot-relative ticks alone
+        // can repeat after a reboot.
         let unreadable = linux_start_token(
             stat,
             Err(std::io::Error::new(
@@ -4549,10 +4574,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(unreadable.kind(), std::io::ErrorKind::PermissionDenied);
-        for empty in ["", "\n", "   \n", "a b\n"] {
-            let err = linux_start_token(stat, Ok(empty.to_string())).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{empty:?}");
+        // Anything but a canonical lowercase UUID fails closed, one case per
+        // way of being wrong. Uppercase is rejected on purpose: the kernel
+        // prints the boot id with `%pU`, which is always lowercase.
+        for (label, bad) in [
+            ("empty", ""),
+            ("newline only", "\n"),
+            ("whitespace only", "   \n"),
+            ("garbage", "garbage\n"),
+            ("too short", "a1b2c3d4-0000-4000-8000-00000000000\n"),
+            ("too long", "a1b2c3d4-0000-4000-8000-0000000000012\n"),
+            ("missing hyphens", "a1b2c3d40000400080000000000000001abc\n"),
+            ("misplaced hyphen", "a1b2c3d4-0000-4000-80000-00000000001\n"),
+            ("non-hex", "g1b2c3d4-0000-4000-8000-000000000001\n"),
+            ("uppercase", "A1B2C3D4-0000-4000-8000-000000000001\n"),
+            ("embedded space", "a1b2c3d4 0000-4000-8000-000000000001\n"),
+            ("leading space", " a1b2c3d4-0000-4000-8000-000000000001\n"),
+            ("trailing char", "a1b2c3d4-0000-4000-8000-000000000001x\n"),
+            ("two newlines", "a1b2c3d4-0000-4000-8000-000000000001\n\n"),
+            ("crlf", "a1b2c3d4-0000-4000-8000-000000000001\r\n"),
+        ] {
+            let err = linux_start_token(stat, Ok(bad.to_string())).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{label}: {bad:?}"
+            );
+            assert!(
+                err.to_string().contains("canonical lowercase UUID"),
+                "{label}"
+            );
         }
+        assert!(is_canonical_boot_id("00000000-0000-0000-0000-000000000000"));
+        assert!(is_canonical_boot_id("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+        assert!(!is_canonical_boot_id(
+            "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
+        ));
         // Malformed stat lines fail too.
         let boot = || Ok("a1b2c3d4-0000-4000-8000-000000000001".to_string());
         assert!(linux_start_token("garbage", boot()).is_err());
