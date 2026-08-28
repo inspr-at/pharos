@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fail closed on beacon container health when the report state location is not writable: `pharos-beacon healthcheck` proves the atomic write is possible before trusting a recent marker and names the path and reason, and a failed startup reset invalidates any previous marker it can reach (PHAROS-203).
+
 ## 0.1.90 - 2026-08-28
 
 - Make container health diagnosable and truthful for both image roles: `pharosd healthcheck` refuses to guess the bind address when `PHAROS_ADDR` is unset and reports the failing target or HTTP status, `pharos-beacon healthcheck` states why the beacon is unhealthy (one-shot mode, missing or invalid report state, no successful report yet, clock skew, stale age against the interval), and `PHAROS_BEACON_HEALTH_FILE` relocates the beacon's report state; deployments can drop `--no-healthcheck` workarounds (PHAROS-203).

@@ -190,13 +190,17 @@ Each verdict prints its reason, visible with
 | Role | Healthy means | Unhealthy reasons |
 | --- | --- | --- |
 | `pharosd` | `GET /readyz` on the loopback side of `PHAROS_ADDR` answered 200 | `PHAROS_ADDR` unset or not a socket address (the probe never guesses `127.0.0.1:8080`), unreachable, non-200 status |
-| `pharos-beacon` | The last successful report is at most three `PHAROS_INTERVAL`s old | `PHAROS_INTERVAL` unset (one-shot beacon), report state missing, unreadable or invalid, no successful report yet, clock skew, report stale |
+| `pharos-beacon` | The beacon can write its report state where it is configured and the last successful report is at most three `PHAROS_INTERVAL`s old | `PHAROS_INTERVAL` unset (one-shot beacon), report state location not writable, report state missing, unreadable or invalid, no successful report yet, clock skew, report stale |
 
 The beacon records its last successful report in
 `/tmp/pharos-beacon-health-v1` (`PHAROS_BEACON_HEALTH_FILE` overrides the
-path); a read-only container needs a writable tmpfs there. The state is reset
-at startup, so a restarted beacon stays unhealthy until it reports again, and
-nothing outside the beacon can make it look healthy. Deployments that disabled
+path); a read-only container needs a writable tmpfs there. Every probe first
+proves it can perform the same atomic write the beacon uses (a temporary file
+created and removed next to the marker), so a leftover marker in a location
+the beacon cannot write is never trusted. The state is reset at startup, and a
+reset that cannot write destroys any previous marker it can reach, so a
+restarted beacon stays unhealthy until it reports again and nothing outside
+the beacon can make it look healthy. Deployments that disabled
 the inherited check (`--no-healthcheck`, Compose `healthcheck: disable: true`)
 as a workaround can remove that override.
 
