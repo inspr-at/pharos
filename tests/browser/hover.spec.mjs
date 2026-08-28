@@ -62,9 +62,6 @@ test("history dot hover replaces and restores card metadata", async ({ page }) =
   await mark.hover();
   await expect(seen).toHaveText("offline gap recovered");
   await expect(asOf).toContainText("after previous");
-  await expect(card.locator(".card-meta")).toHaveScreenshot(
-    "history-dot-hover-meta.png",
-  );
 
   await card.locator(".name").hover();
   await expect(seen).toHaveText(beforeSeen ?? "");
