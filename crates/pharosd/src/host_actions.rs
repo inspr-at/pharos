@@ -36,6 +36,29 @@ pub(crate) enum HostActionKind {
     RemoveHost,
 }
 
+/// The operator-selected purpose of an update/restart workflow.
+///
+/// Missing values on persisted v1 jobs deliberately mean `update`, preserving
+/// the contract of jobs written before PHAROS-216.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpdateRestartIntent {
+    #[default]
+    Update,
+    ApplyDeclared,
+    RestartOnly,
+}
+
+impl UpdateRestartIntent {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::ApplyDeclared => "apply_declared",
+            Self::RestartOnly => "restart_only",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HostWorkflowKind {
@@ -168,6 +191,7 @@ pub(crate) fn host_preferences_state(
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HostLifecycleSlot {
+    Blocked,
     RemoveHost,
     UpdateRestart,
     SettingsChange,
@@ -180,6 +204,7 @@ pub(crate) enum HostLifecycleSlot {
 impl HostLifecycleSlot {
     pub(crate) fn key(self) -> &'static str {
         match self {
+            Self::Blocked => "blocked",
             Self::RemoveHost => "remove_host",
             Self::UpdateRestart => "update_restart",
             Self::SettingsChange => "settings_change",
@@ -224,6 +249,8 @@ pub(crate) struct HostLifecycle {
     pub(crate) level: &'static str,
     pub(crate) invoke: HostLifecycleInvoke,
     pub(crate) run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) update_restart_intent: Option<UpdateRestartIntent>,
     pub(crate) detail: String,
     pub(crate) blocked_by: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -635,6 +662,8 @@ pub(crate) struct HostActionJob {
     pub(crate) host: String,
     pub(crate) kind: HostActionKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<UpdateRestartIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_kind: Option<HostWorkflowKind>,
     pub(crate) state: HostActionState,
     pub(crate) requested_by: String,
@@ -664,6 +693,14 @@ pub(crate) struct HostActionJob {
 impl HostActionJob {
     pub(crate) fn workflow_kind(&self) -> HostWorkflowKind {
         self.workflow_kind.unwrap_or_else(|| self.kind.into())
+    }
+
+    pub(crate) fn update_restart_intent(&self) -> UpdateRestartIntent {
+        if self.kind == HostActionKind::UpdateRestart {
+            self.intent.unwrap_or_default()
+        } else {
+            UpdateRestartIntent::Update
+        }
     }
 
     fn validate(&self) -> bool {
@@ -698,6 +735,7 @@ impl HostActionJob {
                     && self.kind == HostActionKind::SystemUpdateProposal
                     && self.removal_plan.is_none()
             })
+            && (self.kind == HostActionKind::UpdateRestart || self.intent.is_none())
             && self.recovery_started_at.is_none_or(|_| {
                 self.kind == HostActionKind::UpdateRestart && self.confirmed_at.is_some()
             })
@@ -826,6 +864,8 @@ impl HostActionJob {
             id: self.id.clone(),
             host: self.host.clone(),
             kind: self.kind,
+            intent: (self.kind == HostActionKind::UpdateRestart)
+                .then_some(self.update_restart_intent()),
             state: self.state,
             ticket: self.ticket.clone(),
             retry_of: self.retry_of.clone(),
@@ -1528,7 +1568,17 @@ impl HostActionJob {
                         workflow_evidence("Reviewed switch", evidence_result(result.switch_passed)),
                         workflow_evidence(
                             "Restart observed",
-                            evidence_result(result.reboot_observed),
+                            if !result.reboot_observed
+                                && self.plan.as_ref().is_some_and(|plan| {
+                                    !plan.restart_required
+                                        && self.update_restart_intent()
+                                            != UpdateRestartIntent::RestartOnly
+                                })
+                            {
+                                "not required"
+                            } else {
+                                evidence_result(result.reboot_observed)
+                            },
                         ),
                         workflow_evidence(
                             "Kernel verification",
@@ -1924,6 +1974,8 @@ impl HostActionJob {
         Vec<HostWorkflowStep>,
     ) {
         let plan = self.plan.as_ref();
+        let intent = self.update_restart_intent();
+        let applying_declared = intent == UpdateRestartIntent::ApplyDeclared;
         let confirmed = self.confirmed_at.is_some();
         let recovery = self.recovery_started_at.is_some();
         let recovered = recovery && self.state == HostActionState::Succeeded;
@@ -1934,7 +1986,12 @@ impl HostActionJob {
         let primary_action = match self.state {
             HostActionState::AwaitingConfirmation => Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Confirm,
-                label: "Confirm update".to_string(),
+                label: if applying_declared {
+                    "Confirm declared apply"
+                } else {
+                    "Confirm update"
+                }
+                .to_string(),
             }),
             HostActionState::Failed if self.review_retryable() => Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Retry,
@@ -1979,7 +2036,11 @@ impl HostActionJob {
             ),
             HostActionState::Applying => (
                 "The guarded live workflow is running on the target host.",
-                "applying update",
+                if applying_declared {
+                    "applying declared configuration"
+                } else {
+                    "applying update"
+                },
                 "warning",
             ),
             HostActionState::Rebooting if recovery => (
@@ -1998,8 +2059,16 @@ impl HostActionJob {
                 "clear",
             ),
             HostActionState::Succeeded => (
-                "The guarded update completed and all required evidence was recorded.",
-                "update completed",
+                if applying_declared {
+                    "The declared configuration was applied and all required evidence was recorded."
+                } else {
+                    "The guarded update completed and all required evidence was recorded."
+                },
+                if applying_declared {
+                    "declared configuration applied"
+                } else {
+                    "update completed"
+                },
                 "clear",
             ),
             HostActionState::Failed if preconfirm_failed => (
@@ -2086,7 +2155,9 @@ impl HostActionJob {
                 _ => WorkflowStepState::Queued,
             }
         };
-        let restart_state = if plan.is_some_and(|plan| !plan.restart_required) {
+        let restart_state = if plan.is_some_and(|plan| !plan.restart_required)
+            && intent != UpdateRestartIntent::RestartOnly
+        {
             WorkflowStepState::Skipped
         } else if recovered {
             WorkflowStepState::Recovered
@@ -2252,7 +2323,11 @@ impl HostActionJob {
             },
         ));
         (
-            format!("Update {}", self.host),
+            if applying_declared {
+                format!("Apply declared configuration to {}", self.host)
+            } else {
+                format!("Update {}", self.host)
+            },
             guidance,
             status_label.to_string(),
             status_level,
@@ -2615,6 +2690,7 @@ pub(crate) struct HostActionSummary {
     pub(crate) id: String,
     pub(crate) host: String,
     pub(crate) kind: HostActionKind,
+    pub(crate) intent: Option<UpdateRestartIntent>,
     pub(crate) state: HostActionState,
     pub(crate) ticket: String,
     pub(crate) retry_of: Option<String>,
@@ -2682,7 +2758,8 @@ fn lifecycle_run_priority(job: &HostActionJob) -> u8 {
         Some(HostLifecycleSlot::SettingsChange) => 2,
         Some(HostLifecycleSlot::SystemUpdateProposal) => 1,
         Some(
-            HostLifecycleSlot::PrefsDrift
+            HostLifecycleSlot::Blocked
+            | HostLifecycleSlot::PrefsDrift
             | HostLifecycleSlot::KernelDrift
             | HostLifecycleSlot::Quiet,
         )
@@ -2743,6 +2820,32 @@ pub(crate) fn active_update_restart_for_host<'a>(
         })
 }
 
+pub(crate) fn blocking_update_for_host<'a>(
+    jobs: &'a [HostActionJob],
+    host: &str,
+) -> Option<&'a HostActionJob> {
+    let mut latest_by_host: BTreeMap<&str, &HostActionJob> = BTreeMap::new();
+    for job in jobs
+        .iter()
+        .filter(|job| job.kind == HostActionKind::UpdateRestart)
+    {
+        let replace = latest_by_host.get(job.host.as_str()).is_none_or(|current| {
+            (job.created_at, job.updated_at, &job.id)
+                > (current.created_at, current.updated_at, &current.id)
+        });
+        if replace {
+            latest_by_host.insert(job.host.as_str(), job);
+        }
+    }
+    latest_by_host.into_values().find(|job| {
+        job.host != host
+            && !matches!(
+                job.state,
+                HostActionState::Succeeded | HostActionState::Cancelled
+            )
+    })
+}
+
 pub(crate) fn withdrawable_settings_change_for_host<'a>(
     jobs: &'a [HostActionJob],
     host: &str,
@@ -2796,6 +2899,8 @@ fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle 
             HostLifecycleInvoke::Workflow
         },
         run_id: Some(job.id.clone()),
+        update_restart_intent: (job.kind == HostActionKind::UpdateRestart)
+            .then_some(job.update_restart_intent()),
         detail,
         blocked_by,
         primary_action: if job.workflow_kind() == HostWorkflowKind::SettingsChange
@@ -2808,11 +2913,23 @@ fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle 
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn host_lifecycle(
     jobs: &[HostActionJob],
     host: &str,
     preferences: HostPreferencesState,
     kernel_drift: bool,
+) -> HostLifecycle {
+    host_lifecycle_with_apply(jobs, host, preferences, kernel_drift, false, false)
+}
+
+pub(crate) fn host_lifecycle_with_apply(
+    jobs: &[HostActionJob],
+    host: &str,
+    preferences: HostPreferencesState,
+    kernel_drift: bool,
+    apply_declared_ready: bool,
+    normal_update_ready: bool,
 ) -> HostLifecycle {
     let action = most_relevant_lifecycle_run(jobs, host);
     if let Some((job, slot)) = action
@@ -2820,6 +2937,39 @@ pub(crate) fn host_lifecycle(
         .filter(|(_, slot)| *slot != HostLifecycleSlot::SystemUpdateProposal)
     {
         return run_lifecycle(job, slot);
+    }
+
+    let apply_declared_waiting = apply_declared_ready
+        && (preferences == HostPreferencesState::DeclaredNotApplied || kernel_drift);
+    if apply_declared_waiting || normal_update_ready {
+        if let Some(blocker) = blocking_update_for_host(jobs, host) {
+            let intent = if apply_declared_waiting {
+                UpdateRestartIntent::ApplyDeclared
+            } else {
+                UpdateRestartIntent::Update
+            };
+            return HostLifecycle {
+                schema: HOST_LIFECYCLE_SCHEMA,
+                version: HOST_LIFECYCLE_VERSION,
+                slot: HostLifecycleSlot::Blocked,
+                label: format!("Blocked by {}", blocker.host),
+                level: "warning",
+                invoke: HostLifecycleInvoke::UpdateRestart,
+                run_id: None,
+                update_restart_intent: Some(intent),
+                detail: format!(
+                    "{} holds the fleet update lock. Finish or resolve that workflow before starting this host's guarded {}.",
+                    blocker.host,
+                    if intent == UpdateRestartIntent::ApplyDeclared {
+                        "declared apply"
+                    } else {
+                        "update"
+                    }
+                ),
+                blocked_by: vec![format!("fleet_update:{}", blocker.host)],
+                primary_action: None,
+            };
+        }
     }
 
     match preferences {
@@ -2832,6 +2982,7 @@ pub(crate) fn host_lifecycle(
                 level: "warning",
                 invoke: HostLifecycleInvoke::HostSettings,
                 run_id: None,
+                update_restart_intent: None,
                 detail: "Requested preferences have not yet been observed by the host.".to_string(),
                 blocked_by: vec!["host_report".to_string()],
                 primary_action: None,
@@ -2844,10 +2995,20 @@ pub(crate) fn host_lifecycle(
                 slot: HostLifecycleSlot::PrefsDrift,
                 label: "Ready to apply".to_string(),
                 level: "info",
-                invoke: HostLifecycleInvoke::HostSettings,
+                invoke: if apply_declared_ready {
+                    HostLifecycleInvoke::UpdateRestart
+                } else {
+                    HostLifecycleInvoke::HostSettings
+                },
                 run_id: None,
-                detail: "Declared preferences differ from the host's observed preferences."
-                    .to_string(),
+                update_restart_intent: apply_declared_ready
+                    .then_some(UpdateRestartIntent::ApplyDeclared),
+                detail: if apply_declared_ready {
+                    "Declared preferences differ from the host. Start a guarded apply with the normal backup and confirmation gates."
+                } else {
+                    "Declared preferences differ from the host's observed preferences."
+                }
+                .to_string(),
                 blocked_by: Vec::new(),
                 primary_action: None,
             };
@@ -2862,9 +3023,20 @@ pub(crate) fn host_lifecycle(
             slot: HostLifecycleSlot::KernelDrift,
             label: "Restart required".to_string(),
             level: "warning",
-            invoke: HostLifecycleInvoke::KernelDetails,
+            invoke: if apply_declared_ready {
+                HostLifecycleInvoke::UpdateRestart
+            } else {
+                HostLifecycleInvoke::KernelDetails
+            },
             run_id: None,
-            detail: "The running kernel differs from the kernel ready after restart.".to_string(),
+            update_restart_intent: apply_declared_ready
+                .then_some(UpdateRestartIntent::ApplyDeclared),
+            detail: if apply_declared_ready {
+                "The running kernel differs from the declared kernel. Start a guarded apply with the normal backup and confirmation gates."
+            } else {
+                "The running kernel differs from the kernel ready after restart."
+            }
+            .to_string(),
             blocked_by: vec!["planned_restart".to_string()],
             primary_action: None,
         };
@@ -2884,6 +3056,7 @@ pub(crate) fn host_lifecycle(
         level: "clear",
         invoke: HostLifecycleInvoke::HostSettings,
         run_id: None,
+        update_restart_intent: None,
         detail: "No host lifecycle work is waiting.".to_string(),
         blocked_by: Vec::new(),
         primary_action: None,
@@ -2931,6 +3104,7 @@ pub(crate) struct AgentActionLease {
     pub(crate) id: String,
     pub(crate) host: String,
     pub(crate) ticket: String,
+    pub(crate) intent: UpdateRestartIntent,
     pub(crate) phase: AgentActionPhase,
 }
 
@@ -3316,6 +3490,7 @@ impl HostActionStore {
             id: proposal.id,
             host: proposal.host.to_string(),
             kind: proposal.kind,
+            intent: None,
             workflow_kind: None,
             state: proposal.state,
             requested_by: proposal.actor.to_string(),
@@ -3457,6 +3632,7 @@ impl HostActionStore {
             id: action_id("system-update", host, now),
             host: host.to_string(),
             kind: HostActionKind::SystemUpdateProposal,
+            intent: None,
             workflow_kind: None,
             state: HostActionState::ProposalRequested,
             requested_by: actor.to_string(),
@@ -3695,10 +3871,21 @@ impl HostActionStore {
         Ok(updated)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_update_review(
         &self,
         host: &str,
         actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.create_update_review_with_intent(host, actor, UpdateRestartIntent::Update, now)
+    }
+
+    pub(crate) fn create_update_review_with_intent(
+        &self,
+        host: &str,
+        actor: &str,
+        intent: UpdateRestartIntent,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
@@ -3713,7 +3900,7 @@ impl HostActionStore {
         if Self::blocked_by_other_update(&jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
-        let job = Self::new_update_review(host, actor, now, None);
+        let job = Self::new_update_review(host, actor, intent, now, None);
         self.insert_locked(&mut jobs, job)
     }
 
@@ -3729,6 +3916,7 @@ impl HostActionStore {
         if existing.host != host {
             return Err(HostActionStoreError::WrongHost);
         }
+        let intent = existing.update_restart_intent();
         if !existing.review_retryable()
             || Self::latest_update_for(&jobs, host).is_none_or(|job| job.id != id)
         {
@@ -3740,7 +3928,7 @@ impl HostActionStore {
         if Self::blocked_by_other_update(&jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
-        let job = Self::new_update_review(host, actor, now, Some(id.to_string()));
+        let job = Self::new_update_review(host, actor, intent, now, Some(id.to_string()));
         self.insert_locked(&mut jobs, job)
     }
 
@@ -3892,6 +4080,7 @@ impl HostActionStore {
             id: action_id("remove-host", host, now),
             host: host.to_string(),
             kind: HostActionKind::RemoveHost,
+            intent: None,
             workflow_kind: None,
             state: HostActionState::ProposalRequested,
             requested_by: actor.to_string(),
@@ -4067,6 +4256,7 @@ impl HostActionStore {
             // Keep the persisted v1 action enum backward-readable. New clients
             // use workflow_kind for the precise user-facing workflow.
             kind: HostActionKind::SystemUpdateProposal,
+            intent: None,
             workflow_kind: Some(HostWorkflowKind::SettingsChange),
             state: HostActionState::ProposalRequested,
             requested_by: actor.to_string(),
@@ -4409,11 +4599,12 @@ impl HostActionStore {
             None,
         );
         let lease = AgentActionLease {
-            schema: "inspr.pharos.host-action-lease.v1",
-            version: 1,
+            schema: "inspr.pharos.host-action-lease.v2",
+            version: 2,
             id: job.id.clone(),
             host: job.host.clone(),
             ticket: job.ticket.clone(),
+            intent: job.update_restart_intent(),
             phase,
         };
         let id = job.id.clone();
@@ -4484,7 +4675,11 @@ impl HostActionStore {
                     AgentActionPhase::Apply | AgentActionPhase::Resume,
                     AgentActionOutcome::Rebooting,
                 ) => {
-                    if request.result.is_some() {
+                    let restart_expected = job.plan.as_ref().is_some_and(|plan| {
+                        plan.restart_required
+                            || job.update_restart_intent() == UpdateRestartIntent::RestartOnly
+                    });
+                    if request.result.is_some() || !restart_expected {
                         return Err(HostActionStoreError::InvalidJob);
                     }
                     job.state = HostActionState::Rebooting;
@@ -4499,9 +4694,13 @@ impl HostActionStore {
                     AgentActionOutcome::Succeeded,
                 ) => {
                     let result = request.result.ok_or(HostActionStoreError::InvalidJob)?;
+                    let restart_expected = job.plan.as_ref().is_some_and(|plan| {
+                        plan.restart_required
+                            || job.update_restart_intent() == UpdateRestartIntent::RestartOnly
+                    });
                     if !(result.backup_validated
                         && result.switch_passed
-                        && result.reboot_observed
+                        && (!restart_expected || result.reboot_observed)
                         && result.kernel_verified
                         && result.rollback_available)
                         || result.failure_gate.is_some()
@@ -4803,6 +5002,7 @@ impl HostActionStore {
     fn new_update_review(
         host: &str,
         actor: &str,
+        intent: UpdateRestartIntent,
         now: i64,
         retry_of: Option<String>,
     ) -> HostActionJob {
@@ -4812,10 +5012,17 @@ impl HostActionStore {
             id: action_id("update-restart", host, now),
             host: host.to_string(),
             kind: HostActionKind::UpdateRestart,
+            intent: Some(intent),
             workflow_kind: None,
             state: HostActionState::QueuedReview,
             requested_by: actor.to_string(),
-            ticket: "PHAROS-126".to_string(),
+            ticket: match intent {
+                UpdateRestartIntent::Update => "PHAROS-126",
+                UpdateRestartIntent::ApplyDeclared | UpdateRestartIntent::RestartOnly => {
+                    "PHAROS-216"
+                }
+            }
+            .to_string(),
             retry_of,
             created_at: now,
             updated_at: now,
@@ -4863,26 +5070,8 @@ impl HostActionStore {
     }
 
     fn blocked_by_other_update(jobs: &BTreeMap<String, HostActionJob>, host: &str) -> bool {
-        let mut latest_by_host: BTreeMap<&str, &HostActionJob> = BTreeMap::new();
-        for job in jobs
-            .values()
-            .filter(|job| job.kind == HostActionKind::UpdateRestart)
-        {
-            let replace = latest_by_host.get(job.host.as_str()).is_none_or(|current| {
-                (job.created_at, job.updated_at, &job.id)
-                    > (current.created_at, current.updated_at, &current.id)
-            });
-            if replace {
-                latest_by_host.insert(job.host.as_str(), job);
-            }
-        }
-        latest_by_host.values().any(|job| {
-            job.host != host
-                && !matches!(
-                    job.state,
-                    HostActionState::Succeeded | HostActionState::Cancelled
-                )
-        })
+        let snapshot = jobs.values().cloned().collect::<Vec<_>>();
+        blocking_update_for_host(&snapshot, host).is_some()
     }
 
     fn insert(&self, job: HostActionJob) -> Result<HostActionJob, HostActionStoreError> {
@@ -5494,6 +5683,8 @@ mod tests {
             id: format!("action-lifecycle-{}-{created_at}", kind.key()),
             host: "hsb8".to_string(),
             kind: action_kind,
+            intent: (action_kind == HostActionKind::UpdateRestart)
+                .then_some(UpdateRestartIntent::Update),
             workflow_kind: (kind == HostWorkflowKind::SettingsChange).then_some(kind),
             state,
             requested_by: "markus".to_string(),
@@ -5747,6 +5938,169 @@ mod tests {
         assert_eq!(
             store.claim("hsb8", 104).expect("claim").unwrap().phase,
             AgentActionPhase::Apply
+        );
+    }
+
+    #[test]
+    fn apply_declared_intent_survives_the_agent_contract_and_skips_unneeded_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-apply-declared-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let job = store
+            .create_update_review_with_intent(
+                "hsb8",
+                "markus",
+                UpdateRestartIntent::ApplyDeclared,
+                120,
+            )
+            .expect("declared apply created");
+        assert_eq!(job.ticket, "PHAROS-216");
+        assert_eq!(
+            job.update_restart_intent(),
+            UpdateRestartIntent::ApplyDeclared
+        );
+        assert_eq!(
+            job.summary().intent,
+            Some(UpdateRestartIntent::ApplyDeclared)
+        );
+
+        let review = store.claim("hsb8", 121).expect("claim").expect("lease");
+        assert_eq!(review.schema, "inspr.pharos.host-action-lease.v2");
+        assert_eq!(review.version, 2);
+        assert_eq!(review.intent, UpdateRestartIntent::ApplyDeclared);
+
+        let mut plan = ready_plan();
+        plan.restart_required = false;
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(plan),
+                    result: None,
+                },
+                122,
+            )
+            .expect("review stored");
+        let confirmed = store
+            .confirm_update(&job.id, "hsb8", "markus", 123)
+            .expect("confirmed");
+        let workflow = confirmed.summary().workflow;
+        assert_eq!(workflow.title, "Apply declared configuration to hsb8");
+        assert_eq!(
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.key == "restart")
+                .expect("restart step")
+                .state,
+            WorkflowStepState::Skipped
+        );
+
+        let apply = store.claim("hsb8", 124).expect("claim").expect("lease");
+        assert_eq!(apply.intent, UpdateRestartIntent::ApplyDeclared);
+        assert_eq!(
+            store.record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Rebooting,
+                    plan: None,
+                    result: None,
+                },
+                125,
+            ),
+            Err(HostActionStoreError::InvalidJob)
+        );
+        let completed = store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Apply,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: false,
+                        kernel_verified: true,
+                        rollback_available: true,
+                        failure_gate: None,
+                        recovery_mode: None,
+                    }),
+                },
+                126,
+            )
+            .expect("non-restarting apply accepted");
+        assert_eq!(completed.state, HostActionState::Succeeded);
+        assert!(completed
+            .summary()
+            .workflow
+            .evidence
+            .iter()
+            .any(|fact| fact.label == "Restart observed" && fact.value == "not required"));
+
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        assert_eq!(
+            reloaded
+                .get(&job.id)
+                .expect("declared apply reloads")
+                .update_restart_intent(),
+            UpdateRestartIntent::ApplyDeclared
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_apply_lifecycle_names_the_host_holding_the_fleet_lock() {
+        let mut blocker = lifecycle_job(
+            HostWorkflowKind::UpdateRestart,
+            HostActionState::QueuedReview,
+            150,
+        );
+        blocker.host = "csb0".to_string();
+
+        let blocked = host_lifecycle_with_apply(
+            &[blocker],
+            "hsb8",
+            HostPreferencesState::DeclaredNotApplied,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(blocked.slot, HostLifecycleSlot::Blocked);
+        assert_eq!(blocked.label, "Blocked by csb0");
+        assert!(blocked.detail.contains("csb0 holds the fleet update lock"));
+        assert_eq!(blocked.blocked_by, vec!["fleet_update:csb0"]);
+        assert_eq!(
+            blocked.update_restart_intent,
+            Some(UpdateRestartIntent::ApplyDeclared)
+        );
+        assert!(blocked.primary_action.is_none());
+
+        let ready = host_lifecycle_with_apply(
+            &[],
+            "hsb8",
+            HostPreferencesState::DeclaredNotApplied,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(ready.slot, HostLifecycleSlot::PrefsDrift);
+        assert_eq!(ready.invoke, HostLifecycleInvoke::UpdateRestart);
+        assert_eq!(
+            ready.update_restart_intent,
+            Some(UpdateRestartIntent::ApplyDeclared)
         );
     }
 
@@ -9550,6 +9904,7 @@ mod tests {
 
         let store = HostActionStore::new(Some(path.clone()));
         let job = store.latest_for_host("hsb8").expect("legacy update loaded");
+        assert_eq!(job.update_restart_intent(), UpdateRestartIntent::Update);
         assert_eq!(job.events[0].kind, HostActionEventKind::ApplyFailed);
         assert!(job
             .summary()
@@ -9565,6 +9920,7 @@ mod tests {
         let retry = HostActionStore::new_update_review(
             "hsb8",
             "markus",
+            UpdateRestartIntent::Update,
             300,
             Some("action-update-restart-csb0-200-1".to_string()),
         );

@@ -492,7 +492,17 @@ Pharos can coordinate changes without becoming a free-form command bus.
 
 ### Host update and restart
 
-The current workflow persists:
+The current workflow persists a typed `update`, `apply_declared`, or
+`restart_only` intent. Existing records without an intent remain `update`;
+`restart_only` is reserved and is not offered in the first UI. A declared
+preference or kernel drift can start `apply_declared` only for a reporting Nix
+host whose manifest requires Janus. It uses the same fresh-backup and attended
+confirmation gates as an update, and skips the restart step when the reviewed
+plan says no restart is required. One update/restart workflow holds the fleet
+lock at a time; other eligible hosts name the blocking host instead of issuing
+a request that would be rejected.
+
+Each workflow persists:
 
 1. operator intent;
 2. target-local review and preflight;

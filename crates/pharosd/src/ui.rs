@@ -191,6 +191,7 @@ mod module_tests {
             level: "clear",
             invoke: HostLifecycleInvoke::HostSettings,
             run_id: None,
+            update_restart_intent: None,
             detail: "No host lifecycle work is waiting.".to_string(),
             blocked_by: Vec::new(),
             primary_action: None,
@@ -209,6 +210,7 @@ mod module_tests {
             level: "warning",
             invoke: HostLifecycleInvoke::HostSettings,
             run_id: None,
+            update_restart_intent: None,
             detail: "Requested preferences have not yet been observed by the host.".to_string(),
             blocked_by: vec!["host_report".to_string()],
             primary_action: None,
@@ -1525,6 +1527,7 @@ pub(super) fn host_actions_markup(
         && janus_ready
         && update_pending
         && !update_job_active
+        && lifecycle.slot != HostLifecycleSlot::Blocked
     {
         ""
     } else {
@@ -3905,6 +3908,14 @@ pub(super) fn host_lifecycle_chip_markup(
         .as_ref()
         .map(|id| format!(r#" data-lifecycle-run-id="{}""#, html_escape(id)))
         .unwrap_or_default();
+    let intent_attr = lifecycle
+        .update_restart_intent
+        .map_or(String::new(), |intent| {
+            format!(
+                r#" data-lifecycle-update-restart-intent="{}""#,
+                intent.key()
+            )
+        });
     let blocked_by_attr = if lifecycle.blocked_by.is_empty() {
         String::new()
     } else {
@@ -3922,13 +3933,14 @@ pub(super) fn host_lifecycle_chip_markup(
     });
     let title = html_escape(&label);
     format!(
-        r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="{state}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}" data-lifecycle-detail="{detail}"{run_id_attr}{blocked_by_attr}{fact_attrs}{inert} title="{title}" aria-label="{title}"><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span class="settings-state-icon workflow" aria-hidden="true">{workflow_icon}</span><span data-host-lifecycle-chip-copy>{label}</span></button>"#,
+        r#"<button class="settings-wait-note host-lifecycle-chip" type="button" data-host-lifecycle-chip data-settings-state="{state}" data-lifecycle-slot="{slot}" data-lifecycle-level="{level}" data-lifecycle-invoke="{invoke}" data-lifecycle-detail="{detail}"{run_id_attr}{intent_attr}{blocked_by_attr}{fact_attrs}{inert} title="{title}" aria-label="{title}"><span class="settings-state-icon requested" aria-hidden="true">{requested_icon}</span><span class="settings-state-icon ready" aria-hidden="true">{ready_icon}</span><span class="settings-state-icon workflow" aria-hidden="true">{workflow_icon}</span><span data-host-lifecycle-chip-copy>{label}</span></button>"#,
         state = settings_state.key(),
         slot = lifecycle.slot.key(),
         level = lifecycle.level,
         invoke = lifecycle.invoke.key(),
         detail = html_escape(&lifecycle.detail),
         run_id_attr = run_id_attr,
+        intent_attr = intent_attr,
         blocked_by_attr = blocked_by_attr,
         fact_attrs = fact_attrs,
         inert = inert,
@@ -6319,11 +6331,20 @@ pub(super) fn render_home_with_capabilities(
             h.requested_preferences.as_ref(),
         );
         let relevant_action = most_relevant_host_action(runtime.action_jobs, &h.name);
-        let lifecycle = host_lifecycle(
+        let apply_declared_ready = h.is_nix
+            && manifest.is_some_and(|manifest| {
+                manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
+                    && manifest.policy.privileged_actions.janus_required
+            });
+        let normal_update_ready =
+            apply_declared_ready && (kernel_required || h.freshness.has_proven_deployable_update());
+        let lifecycle = host_lifecycle_with_apply(
             runtime.action_jobs,
             &h.name,
             settings_state,
             kernel_required,
+            apply_declared_ready,
+            normal_update_ready,
         );
         if lifecycle.slot != HostLifecycleSlot::Quiet {
             search_parts.push(lifecycle.label.to_lowercase());

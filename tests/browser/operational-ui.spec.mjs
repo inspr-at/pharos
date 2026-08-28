@@ -2783,6 +2783,101 @@ test("preference drift declared_not_applied sheet resolves in host settings", as
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
 });
 
+test("ready-to-apply lifecycle starts one typed guarded run from the drift sheet", async ({
+  page,
+}) => {
+  const host = "bl-declared-apply";
+  await reportRuntimeHost(page, host, { preferences: { accent: "#111111" } });
+  await page.goto("/");
+
+  const response = await page.request.get("/hosts.json");
+  const payload = await response.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  expect(hostData).toBeTruthy();
+  hostData.preferences_state = "declared_not_applied";
+  hostData.declared_preferences = { accent: "#48b8a8" };
+  hostData.lifecycle = {
+    schema: "inspr.pharos.host-lifecycle.v1",
+    version: 1,
+    slot: "prefs_drift",
+    label: "Ready to apply",
+    level: "info",
+    invoke: "update_restart",
+    run_id: null,
+    update_restart_intent: "apply_declared",
+    detail:
+      "Declared preferences differ from the host. Start a guarded apply with the normal backup and confirmation gates.",
+    blocked_by: [],
+  };
+  expect(await page.evaluate((body) => applyFleetSnapshot(body), payload)).toBe(true);
+
+  let submitted = null;
+  await page.route(`**/host-actions/${host}/update-restart/review`, async (route) => {
+    submitted = route.request().postDataJSON();
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: "Declared apply review queued.",
+        workflow_html: '<p data-test-declared-apply-run>Saved guarded run</p>',
+        job: {
+          id: "action-update-restart-bl-declared-apply-1",
+          host,
+          kind: "update_restart",
+          intent: "apply_declared",
+          state: "queued_review",
+          updated_at: 1,
+          workflow: {
+            kind: "update_restart",
+            title: `Apply declared configuration to ${host}`,
+            guidance: "The request is saved. No live change has started.",
+            status_label: "review queued",
+            primary_action: null,
+            can_cancel: true,
+          },
+        },
+      }),
+    });
+  });
+
+  const card = page.locator(`[data-host="${host}"][data-host-surface="runtime"].card`).first();
+  const chip = card.locator("[data-host-lifecycle-chip]");
+  await expect(chip).toHaveAttribute("data-lifecycle-invoke", "update_restart");
+  await expect(chip).toHaveAttribute(
+    "data-lifecycle-update-restart-intent",
+    "apply_declared",
+  );
+  await chip.click();
+
+  const dialog = page.getByRole("dialog");
+  const primary = dialog.locator("[data-host-action-primary]");
+  await expect(primary).toHaveText("Prepare guarded apply");
+  await expect(primary).toBeVisible();
+  await primary.click();
+
+  expect(submitted).toEqual({ intent: "apply_declared" });
+  await expect(dialog.locator("[data-host-workflow]")).toBeVisible();
+  await expect(dialog.locator("[data-test-declared-apply-run]")).toHaveText(
+    "Saved guarded run",
+  );
+  await expect(dialog.locator("[data-host-action-title]")).toHaveText(
+    `Apply declared configuration to ${host}`,
+  );
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await page.unroute(`**/host-actions/${host}/update-restart/review`);
+
+  const removal = await page.request.post(`/host-actions/${host}/remove`, {
+    headers: { "x-pharos-action": "1" },
+    data: { confirmation: host, disposition: "unmanaged", successor: null },
+  });
+  expect(removal.status()).toBe(202);
+  const reonboard = await page.request.post(
+    `/host-actions/${host}/allow-reonboarding`,
+    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+  );
+  expect(reonboard.ok()).toBe(true);
+});
+
 test("quiet lifecycle chip opens sheet without job polling or workflow steps", async ({
   page,
 }) => {
