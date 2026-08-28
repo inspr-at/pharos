@@ -5391,11 +5391,9 @@ mod tests {
                 .count(),
             2
         );
-        assert!(
-            html.contains(
-                r#"aria-label="Backup for athena: Protected, last success 2m 00s ago" hidden>"#
-            )
-        );
+        assert!(html.contains(
+            r#"aria-label="Backup for athena: Protected, last success 2m 00s ago" hidden>"#
+        ));
         assert!(html.contains(r#"href="/backups?host=athena""#));
         assert!(html.contains(r#"data-backup-level="clear" data-backup-glyph="check""#));
         assert!(
@@ -5429,16 +5427,22 @@ mod tests {
             ));
         }
         let healthy_html = backup_chip_markup(
-            &backup_ui_summary(&[backup_observation(BackupPostureState::Healthy)], 1_700_000_120),
+            &backup_ui_summary(
+                &[backup_observation(BackupPostureState::Healthy)],
+                1_700_000_120,
+            ),
             "athena",
         );
         assert!(healthy_html.contains(r#"data-backup-state="healthy""#));
         assert!(healthy_html.contains(" hidden>"));
         let failed_html = backup_chip_markup(
-            &backup_ui_summary(&[backup_observation(BackupPostureState::Failed)], 1_700_000_120),
+            &backup_ui_summary(
+                &[backup_observation(BackupPostureState::Failed)],
+                1_700_000_120,
+            ),
             "athena",
         );
-        assert!(!failed_html.contains(r#"data-backup-state="failed" hidden"#));
+        assert!(!failed_html.contains(" hidden>"));
     }
 
     #[test]
@@ -5465,14 +5469,16 @@ mod tests {
     fn fleet_card_header_actions_visible_backup_omitted_when_healthy() {
         let healthy = {
             let mut host = host_with_backups("healthy-header", 970, vec![]);
-            host.backup_observations =
-                vec![backup_observation(BackupPostureState::Healthy)];
+            host.backup_observations = vec![backup_observation(BackupPostureState::Healthy)];
             host
         };
         let failed = {
             let mut host = host_with_backups("failed-header", 970, vec![]);
-            host.backup_observations =
-                vec![backup_observation(BackupPostureState::Failed)];
+            host.backup_observations = vec![backup_observation(BackupPostureState::Failed)];
+            host.requested_preferences = Some(HostPreferences {
+                accent: Some("#48b8a8".to_string()),
+                ..Default::default()
+            });
             host
         };
         let html = render_home_with_capabilities(
@@ -5504,15 +5510,21 @@ mod tests {
                 .count(),
             2
         );
-        assert!(
-            html.contains(
-                r#"aria-label="Backup for healthy-header: Protected, last success 2m 00s ago" hidden>"#
+        assert!(html.contains(
+            r#"aria-label="Backup for healthy-header: Protected, last success 2m 00s ago" hidden>"#
+        ));
+        let failed_card = rendered_card(&html, "failed-header");
+        let failed_chip = failed_card
+            .split_once(r#"class="header-chip backup-chip critical""#)
+            .map(|(_, tail)| tail.split_once('>').map_or(tail, |(tag, _)| tag))
+            .expect("failed backup chip rendered");
+        assert!(!failed_chip.contains(" hidden"));
+        assert_eq!(
+            html.matches(
+                r#"class="host-action-dot" data-host-action-dot aria-hidden="true"></span>"#
             )
-        );
-        assert!(
-            !html.contains(
-                r#"aria-label="Backup for failed-header: Backup failed" hidden>"#
-            )
+            .count(),
+            2
         );
     }
 

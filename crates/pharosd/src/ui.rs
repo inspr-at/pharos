@@ -1457,7 +1457,11 @@ pub(super) fn backup_glyph(level: &str) -> &'static str {
 pub(super) fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
     let title = format!("Backup: {} - {}", summary.label, summary.detail);
     let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
-    let hidden = if summary.state == "healthy" { " hidden" } else { "" };
+    let hidden = if summary.state == "healthy" {
+        " hidden"
+    } else {
+        ""
+    };
     format!(
         r#"<a class="header-chip backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"{hidden}><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
         level = html_escape(summary.level),

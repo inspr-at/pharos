@@ -883,7 +883,7 @@ test("fleet card header keeps actions visible and backup shield only when not ok
   const failedHost = "header-actions-failed";
   const hosts = [healthyHost, failedHost];
 
-  for (const host of hosts) {
+  const reportBackup = async (host, observation) => {
     const report = await page.request.post("/report", {
       data: {
         schema: "inspr.pharos.host-report.v5",
@@ -917,60 +917,117 @@ test("fleet card header keeps actions visible and backup shield only when not ok
             relation: "current",
           },
         },
-        backup_observations:
-          host === healthyHost
-            ? [healthyBackupObservation()]
-            : [failedBackupObservation()],
+        backup_observations: [observation],
       },
     });
     expect(report.status()).toBe(204);
-  }
+  };
 
-  await page.goto("/");
-  await page.setViewportSize({ width: 1280, height: 1024 });
+  await reportBackup(healthyHost, healthyBackupObservation());
+  await reportBackup(failedHost, failedBackupObservation());
 
-  const healthyCard = page.locator(
-    `[data-grid] article[data-host="${healthyHost}"]`,
-  );
-  const healthyRow = page.locator(`tr[data-host="${healthyHost}"]`);
-  const failedCard = page.locator(`[data-grid] article[data-host="${failedHost}"]`);
-  const failedRow = page.locator(`tr[data-host="${failedHost}"]`);
+  try {
+    await page.goto("/");
 
-  await expect(healthyCard.locator("[data-host-actions-trigger]")).toBeVisible();
-  await expect(healthyCard.locator(".backup-chip")).toBeHidden();
-  await expect(failedCard.locator("[data-host-actions-trigger]")).toBeVisible();
-  await expect(failedCard.locator(".backup-chip")).toBeVisible();
+    const healthyCard = page.locator(
+      `[data-grid] article[data-host="${healthyHost}"]`,
+    );
+    const healthyRow = page.locator(`tr[data-host="${healthyHost}"]`);
+    const failedCard = page.locator(
+      `[data-grid] article[data-host="${failedHost}"]`,
+    );
+    const failedRow = page.locator(`tr[data-host="${failedHost}"]`);
+    const healthyCardChip = healthyCard.locator(".backup-chip");
+    const failedCardChip = failedCard.locator(".backup-chip");
 
-  const failedBackupChrome = await failedCard
-    .locator(".backup-chip")
-    .evaluate((el) => {
+    await expect(healthyCardChip).toHaveCount(1);
+    await expect(healthyCardChip).toHaveAttribute("hidden", "");
+    await expect(failedCardChip).toHaveCount(1);
+    await expect(failedCardChip).not.toHaveAttribute("hidden", "");
+
+    for (const width of [1440, 1024, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect(healthyCard.locator("[data-host-actions-trigger]")).toBeVisible();
+      await expect(failedCard.locator("[data-host-actions-trigger]")).toBeVisible();
+      await expect(failedCardChip).toBeVisible();
+
+      const cardChrome = await failedCard.evaluate((card) => {
+        const cardRect = card.getBoundingClientRect();
+        const actions = card.querySelector("[data-host-actions-trigger]");
+        const backup = card.querySelector(".backup-chip");
+        const actionsRect = actions?.getBoundingClientRect();
+        const backupRect = backup?.getBoundingClientRect();
+        return {
+          actionsInside:
+            actionsRect != null &&
+            actionsRect.left >= cardRect.left - 1 &&
+            actionsRect.right <= cardRect.right + 1,
+          backupInside:
+            backupRect != null &&
+            backupRect.left >= cardRect.left - 1 &&
+            backupRect.right <= cardRect.right + 1,
+        };
+      });
+      expect(cardChrome).toEqual({ actionsInside: true, backupInside: true });
+    }
+
+    const failedBackupChrome = await failedCardChip.evaluate((el) => {
       const style = getComputedStyle(el);
       return {
         borderColor: style.borderColor,
         backgroundColor: style.backgroundColor,
       };
     });
-  expect(failedBackupChrome.borderColor).not.toBe("rgba(0, 0, 0, 0)");
-  expect(failedBackupChrome.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+    expect(failedBackupChrome.borderColor).not.toBe("rgba(0, 0, 0, 0)");
+    expect(failedBackupChrome.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
 
-  await page.locator("[data-view-button='list']").click();
-  await expect(page.locator("main")).toHaveAttribute("data-view", "list");
-  await expect(healthyRow.locator("[data-host-actions-trigger]")).toBeVisible();
-  await expect(healthyRow.locator(".backup-chip")).toBeHidden();
-  await expect(failedRow.locator("[data-host-actions-trigger]")).toBeVisible();
-  await expect(failedRow.locator(".backup-chip")).toBeVisible();
+    const snapshotResponse = await page.request.get("/hosts.json");
+    expect(snapshotResponse.ok()).toBe(true);
+    const snapshot = await snapshotResponse.json();
+    const applyBackupSnapshot = (observation) => {
+      const payload = structuredClone(snapshot);
+      const host = payload.hosts.find((candidate) => candidate.name === failedHost);
+      expect(host).toBeDefined();
+      host.backup_observations = [observation];
+      return page.evaluate((body) => applyFleetSnapshot(body), payload);
+    };
 
-  for (const host of hosts) {
-    const removal = await page.request.post(`/host-actions/${host}/remove`, {
-      headers: { "x-pharos-action": "1" },
-      data: { confirmation: host, disposition: "unmanaged", successor: null },
-    });
-    expect(removal.status()).toBe(202);
-    const reonboard = await page.request.post(
-      `/host-actions/${host}/allow-reonboarding`,
-      { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
-    );
-    expect(reonboard.ok()).toBe(true);
+    await failedCardChip.focus();
+    await expect(failedCardChip).toBeFocused();
+    expect(await applyBackupSnapshot(healthyBackupObservation())).toBe(true);
+    await expect(failedCardChip).toHaveAttribute("hidden", "");
+    await expect(failedCardChip).toHaveAttribute("data-backup-state", "healthy");
+    await expect(failedCard.locator("[data-host-actions-trigger]")).toBeFocused();
+
+    expect(await applyBackupSnapshot(failedBackupObservation())).toBe(true);
+    await expect(failedCardChip).not.toHaveAttribute("hidden", "");
+    await expect(failedCardChip).toHaveAttribute("data-backup-state", "failed");
+
+    await page.locator("[data-view-button='list']").click();
+    await expect(page.locator("main")).toHaveAttribute("data-view", "list");
+    await expect(healthyRow.locator(".backup-chip")).toHaveCount(1);
+    await expect(healthyRow.locator(".backup-chip")).toHaveAttribute("hidden", "");
+    await expect(failedRow.locator(".backup-chip")).toHaveCount(1);
+    await expect(failedRow.locator(".backup-chip")).not.toHaveAttribute("hidden", "");
+    for (const width of [1440, 1024, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect(healthyRow.locator("[data-host-actions-trigger]")).toBeVisible();
+      await expect(failedRow.locator("[data-host-actions-trigger]")).toBeVisible();
+      await expect(failedRow.locator(".backup-chip")).toBeVisible();
+    }
+  } finally {
+    for (const host of hosts) {
+      const removal = await page.request.post(`/host-actions/${host}/remove`, {
+        headers: { "x-pharos-action": "1" },
+        data: { confirmation: host, disposition: "unmanaged", successor: null },
+      });
+      expect(removal.status()).toBe(202);
+      const reonboard = await page.request.post(
+        `/host-actions/${host}/allow-reonboarding`,
+        { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+      );
+      expect(reonboard.ok()).toBe(true);
+    }
   }
 });
 
