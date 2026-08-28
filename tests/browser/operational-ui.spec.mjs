@@ -560,6 +560,7 @@ test("stale side nixpkgs is visible as neutral context without host attention", 
           relation: "current",
         },
       },
+      backup_observations: [healthyBackupObservation()],
     },
   });
   expect(report.status()).toBe(204);
@@ -575,16 +576,13 @@ test("stale side nixpkgs is visible as neutral context without host attention", 
     .first();
   await expect(card).toBeVisible();
   await expect(card.locator("[data-reason]")).toContainText("all clear");
-  await expect(card.locator('[data-fresh-kind="flake-lock-age"]')).toContainText(
-    "exact",
-  );
-  await expect(card.locator('[data-fresh-kind="commits-behind"]')).toContainText(
-    "exact",
-  );
-  await expect(card.locator('[data-fresh-kind="deployed-sha"]')).toContainText(
-    "111111111111",
-  );
-  const secondary = card.locator('[data-fresh-kind="secondary-nixpkgs"]');
+  await expect(card.locator(".freshness-rail")).toHaveAttribute("hidden", "");
+  await expect(
+    card.locator(".freshness-rail .fresh-row-compact:not([hidden])"),
+  ).toHaveCount(0);
+  const secondary = page
+    .locator(`tr[data-host="${host}"]`)
+    .locator('[data-fresh-kind="secondary-nixpkgs"]');
   await expect(secondary).toContainText("Other root nixpkgs");
   await expect(secondary).toContainText("nixpkgs-stable");
   await expect(secondary).toContainText("nixos-25.05");
@@ -634,12 +632,16 @@ test("legacy numeric freshness is unverified rather than up to date", async ({ p
     .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
     .first();
   await expect(card.locator("[data-reason]")).toContainText("freshness unverified");
-  await expect(card.locator('[data-fresh-kind="deployed-sha"]')).toContainText(
-    "n/a",
+  await expect(card.locator(".freshness-rail")).not.toHaveAttribute(
+    "hidden",
+    "",
   );
-  await expect(card.locator('[data-fresh-kind="commits-behind"]')).toContainText(
-    "unknown",
-  );
+  await expect(
+    card.locator('[data-fresh-kind="freshness-unverified"]'),
+  ).toBeVisible();
+  await expect(
+    card.locator('[data-fresh-kind="freshness-unverified"]'),
+  ).toContainText("unverified");
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -939,11 +941,18 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     const failedRow = page.locator(`tr[data-host="${failedHost}"]`);
     const healthyCardChip = healthyCard.locator(".backup-chip");
     const failedCardChip = failedCard.locator(".backup-chip");
+    const healthyRail = healthyCard.locator(".freshness-rail");
+    const failedRail = failedCard.locator(".freshness-rail");
+    const failedRailBackup = failedRail.locator('[data-fresh-kind="backup-fault"]');
 
     await expect(healthyCardChip).toHaveCount(1);
     await expect(healthyCardChip).toHaveAttribute("hidden", "");
+    await expect(healthyRail).toHaveAttribute("hidden", "");
     await expect(failedCardChip).toHaveCount(1);
     await expect(failedCardChip).not.toHaveAttribute("hidden", "");
+    await expect(failedRail).not.toHaveAttribute("hidden", "");
+    await expect(failedRailBackup).toBeVisible();
+    await expect(failedRailBackup).toContainText("Backup failed");
 
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
@@ -998,10 +1007,14 @@ test("fleet card header keeps actions visible and backup shield only when not ok
     await expect(failedCardChip).toHaveAttribute("hidden", "");
     await expect(failedCardChip).toHaveAttribute("data-backup-state", "healthy");
     await expect(failedCard.locator("[data-host-actions-trigger]")).toBeFocused();
+    await expect(failedRail).toHaveAttribute("hidden", "");
+    await expect(failedRailBackup).toHaveAttribute("hidden", "");
 
     expect(await applyBackupSnapshot(failedBackupObservation())).toBe(true);
     await expect(failedCardChip).not.toHaveAttribute("hidden", "");
     await expect(failedCardChip).toHaveAttribute("data-backup-state", "failed");
+    await expect(failedRail).not.toHaveAttribute("hidden", "");
+    await expect(failedRailBackup).toBeVisible();
 
     await page.locator("[data-view-button='list']").click();
     await expect(page.locator("main")).toHaveAttribute("data-view", "list");
@@ -1031,197 +1044,257 @@ test("fleet card header keeps actions visible and backup shield only when not ok
   }
 });
 
-test("chip row does not overflow card boundary or paint into neighbors", async ({ page }) => {
-  const host = "browser-chip-overflow";
-  const report = await page.request.post("/report", {
-    data: {
-      schema: "inspr.pharos.host-report.v5",
-      version: 5,
-      name: host,
-      role: "test server",
-      is_nix: true,
-      heartbeat_interval_secs: 60,
-      freshness: {
-        applicable: true,
-        flake_lock_age_days: 0,
-        commits_behind: 0,
-        nixpkgs_age_days: 36,
-        nixpkgs_channel: "nixos-24.05",
-        deployment_evidence: {
-          schema: "inspr.pharos.nix-deployment-evidence.v1",
-          version: 1,
-          source_revision: "1111111111111111111111111111111111111111",
-          flake_lock_sha256:
-            "2222222222222222222222222222222222222222222222222222222222222222",
-          nixpkgs_revision: "3333333333333333333333333333333333333333",
-          nixpkgs_last_modified: 1700000000,
-          nixpkgs_channel: "nixos-24.05",
-        },
-        nixcfg_comparison: {
-          upstream_revision: "1111111111111111111111111111111111111111",
-          relation: "current",
-          commits_behind: 0,
-        },
-        nixpkgs_comparison: {
-          upstream_revision: "3333333333333333333333333333333333333333",
-          relation: "current",
-        },
-      },
-    },
-  });
-  expect(report.status()).toBe(204);
-
-  await page.goto("/");
-  await page.setViewportSize({ width: 1280, height: 1024 });
-
-  const card = page
-    .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
-    .first();
-  await expect(card).toBeVisible();
-
-  const chipRow = card.locator('.fresh[data-fresh]');
-  await expect(chipRow).toBeVisible();
-
-  const chips = chipRow.locator('.fresh-row-compact');
-  const chipCount = await chips.count();
-  expect(chipCount).toBeGreaterThan(0);
-
-  const cardBox = await card.boundingBox();
-  expect(cardBox).not.toBeNull();
-
-  const visibleChips = await chips.evaluateAll((elements, parentBox) => {
-    return elements.map((el) => {
-      const rect = el.getBoundingClientRect();
-      return {
-        left: rect.left,
-        right: rect.right,
-        width: rect.width,
-        overflows: rect.right > parentBox.left + parentBox.width,
-      };
-    });
-  }, cardBox);
-
-  visibleChips.forEach((chip, index) => {
-    expect(chip.overflows).toBe(false);
-  });
-
-  const removal = await page.request.post(`/host-actions/${host}/remove`, {
-    headers: { "x-pharos-action": "1" },
-    data: { confirmation: host, disposition: "unmanaged", successor: null },
-  });
-  expect(removal.status()).toBe(202);
-  const reonboard = await page.request.post(
-    `/host-actions/${host}/allow-reonboarding`,
-    { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
-  );
-  expect(reonboard.ok()).toBe(true);
-});
-
-test("freshness chips scroll horizontally without wrapping and show chevrons only when scrollable", async ({
+test("fault rail uses full card width, stays one line, and keeps quiet hashes in technical details", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.setViewportSize({ width: 1280, height: 1024 });
-
-  const card = page.locator('[data-host-surface="runtime"].card').first();
-  await expect(card).toBeVisible();
-
-  const freshContainer = card.locator('.fresh[data-fresh]');
-  await expect(freshContainer).toBeVisible();
-
-  const scrollContainer = freshContainer.locator('.fresh-scroll-container');
-  await expect(scrollContainer).toBeVisible();
-
-  const chips = scrollContainer.locator('.fresh-row-compact');
-  const chipCount = await chips.count();
-  expect(chipCount).toBeGreaterThan(0);
-
-  const chipsAreOnOneLine = await scrollContainer.evaluate((container) => {
-    const chips = Array.from(container.querySelectorAll('.fresh-row-compact'));
-    if (chips.length === 0) return true;
-    const firstTop = chips[0].getBoundingClientRect().top;
-    return chips.every(chip => {
-      const top = chip.getBoundingClientRect().top;
-      return Math.abs(top - firstTop) < 2;
+  const quietHost = "freshness-rail-quiet";
+  const faultHost = "freshness-rail-fault";
+  const hosts = [quietHost, faultHost];
+  const currentFreshness = {
+    applicable: true,
+    flake_lock_age_days: 1,
+    commits_behind: 0,
+    nixpkgs_age_days: 2,
+    nixpkgs_channel: "nixos-unstable",
+    deployment_evidence: {
+      schema: "inspr.pharos.nix-deployment-evidence.v1",
+      version: 1,
+      source_revision: "a".repeat(40),
+      flake_lock_sha256: "b".repeat(64),
+      nixpkgs_revision: "c".repeat(40),
+      nixpkgs_last_modified: 1_700_000_000,
+      nixpkgs_channel: "nixos-unstable",
+    },
+    nixcfg_comparison: {
+      upstream_revision: "a".repeat(40),
+      relation: "current",
+      commits_behind: 0,
+    },
+    nixpkgs_comparison: {
+      upstream_revision: "c".repeat(40),
+      relation: "current",
+    },
+  };
+  const reportHost = async (name, freshness, backup, kernel) => {
+    const report = await page.request.post("/report", {
+      data: {
+        schema: "inspr.pharos.host-report.v5",
+        version: 5,
+        name,
+        role: "server",
+        is_nix: true,
+        heartbeat_interval_secs: 60,
+        freshness,
+        backup_observations: [backup],
+        kernel: kernel
+          ? {
+              schema: "inspr.pharos.kernel-posture.v1",
+              version: 1,
+              ...kernel,
+            }
+          : undefined,
+      },
     });
-  });
-  expect(chipsAreOnOneLine).toBe(true);
+    expect(report.status()).toBe(204);
+  };
+  await reportHost(
+    quietHost,
+    currentFreshness,
+    healthyBackupObservation(),
+    {
+      state: "current",
+      running_version: "7.0.14",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  );
+  await reportHost(
+    faultHost,
+    {
+      ...structuredClone(currentFreshness),
+      commits_behind: 12,
+      nixpkgs_channel: "nixos-25.05",
+      deployment_evidence: {
+        ...structuredClone(currentFreshness.deployment_evidence),
+        nixpkgs_channel: "nixos-25.05",
+      },
+      nixcfg_comparison: {
+        upstream_revision: "d".repeat(40),
+        relation: "behind",
+        commits_behind: 12,
+      },
+      nixpkgs_comparison: {
+        upstream_revision: "e".repeat(40),
+        relation: "different",
+      },
+    },
+    failedBackupObservation(),
+    {
+      state: "reboot_required",
+      running_version: "6.18.26",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  );
 
-  const chipsStayInCard = await chips.evaluateAll((elements) => {
-    const card = elements[0]?.closest('.card');
-    if (!card) return true;
-    const cardRect = card.getBoundingClientRect();
-    return elements.every(chip => {
-      const chipRect = chip.getBoundingClientRect();
-      return chipRect.left >= cardRect.left && chipRect.right <= cardRect.right + 100;
-    });
-  });
-  expect(chipsStayInCard).toBe(true);
+  try {
+    await page.goto("/");
+    const quietCard = page.locator(`[data-grid] article[data-host="${quietHost}"]`);
+    const faultCard = page.locator(`[data-grid] article[data-host="${faultHost}"]`);
+    const quietRail = quietCard.locator(".freshness-rail");
+    const faultRail = faultCard.locator(".freshness-rail");
+    const visibleFaults = faultRail.locator(".fresh-row-compact:not([hidden])");
 
-  const chevronLeft = freshContainer.locator('.fresh-chevron-left');
-  const chevronRight = freshContainer.locator('.fresh-chevron-right');
-  await expect(chevronLeft).toBeAttached();
-  await expect(chevronRight).toBeAttached();
+    await expect(quietRail).toHaveAttribute("hidden", "");
+    await expect(quietRail.locator(".fresh-row-compact:not([hidden])")).toHaveCount(0);
+    await expect(faultRail).toBeVisible();
+    await expect(faultRail).toHaveAttribute("role", "group");
+    await expect(visibleFaults).toHaveCount(5);
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-eol"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="backup-fault"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toBeVisible();
+    await expect(faultRail.locator('[data-fresh-kind="deployed-sha"]')).toHaveCount(0);
+    await expect(faultRail.locator('[data-fresh-kind="nixcfg-sha"]')).toHaveCount(0);
+    await expect(faultRail.locator('[data-fresh-kind="nixpkgs-sha"]')).toHaveCount(0);
+    await expect(faultRail).not.toContainText("+N");
 
-  const scrollInfo = await scrollContainer.evaluate((container) => {
-    return {
-      scrollWidth: container.scrollWidth,
-      clientWidth: container.clientWidth,
-      hasOverflow: container.scrollWidth > container.clientWidth,
+    for (const width of [1440, 1024, 900, 390, 320]) {
+      await page.setViewportSize({ width, height: 1200 });
+      const geometry = await faultRail.evaluate((rail) => {
+        const card = rail.closest(".card");
+        const scroller = rail.querySelector("[data-fresh-scroll-container]");
+        const chips = Array.from(
+          rail.querySelectorAll(".fresh-row-compact:not([hidden])"),
+        );
+        const cardRect = card.getBoundingClientRect();
+        const railRect = rail.getBoundingClientRect();
+        const scrollerRect = scroller.getBoundingClientRect();
+        const style = getComputedStyle(card);
+        const innerWidth =
+          cardRect.width -
+          Number.parseFloat(style.paddingLeft) -
+          Number.parseFloat(style.paddingRight);
+        const tops = chips.map((chip) => Math.round(chip.getBoundingClientRect().top));
+        return {
+          railInside:
+            railRect.left >= cardRect.left - 1 &&
+            railRect.right <= cardRect.right + 1,
+          spansInnerWidth: Math.abs(railRect.width - innerWidth) <= 2,
+          scrollerInside:
+            scrollerRect.left >= railRect.left - 1 &&
+            scrollerRect.right <= railRect.right + 1,
+          oneLine: new Set(tops).size === 1,
+          overflow: scroller.scrollWidth > scroller.clientWidth + 1,
+          allChipsInside: chips.every((chip) => {
+            const rect = chip.getBoundingClientRect();
+            return rect.left >= scrollerRect.left - 1 && rect.right <= scrollerRect.right + 1;
+          }),
+        };
+      });
+      expect(geometry.railInside).toBe(true);
+      expect(geometry.spansInnerWidth).toBe(true);
+      expect(geometry.scrollerInside).toBe(true);
+      expect(geometry.oneLine).toBe(true);
+      if (width === 320) {
+        expect(geometry.overflow).toBe(true);
+        await expect(faultRail.locator(".fresh-chevron-right")).toHaveClass(/visible/);
+        await expect(faultRail).toHaveAttribute("data-overflow-right", "true");
+        const wheelBoundary = await faultRail.evaluate((rail) => {
+          const scroller = rail.querySelector("[data-fresh-scroll-container]");
+          scroller.style.scrollBehavior = "auto";
+          scroller.scrollLeft = 0;
+          const leavesPageScrollAtLeft = scroller.dispatchEvent(
+            new WheelEvent("wheel", { deltaY: -120, cancelable: true }),
+          );
+          scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth;
+          const leavesPageScrollAtRight = scroller.dispatchEvent(
+            new WheelEvent("wheel", { deltaY: 120, cancelable: true }),
+          );
+          scroller.scrollLeft = 0;
+          const consumesInwardScroll = !scroller.dispatchEvent(
+            new WheelEvent("wheel", { deltaY: 120, cancelable: true }),
+          );
+          return { leavesPageScrollAtLeft, leavesPageScrollAtRight, consumesInwardScroll };
+        });
+        expect(wheelBoundary).toEqual({
+          leavesPageScrollAtLeft: true,
+          leavesPageScrollAtRight: true,
+          consumesInwardScroll: true,
+        });
+      }
+    }
+
+    const offscreenFault = visibleFaults.last();
+    await offscreenFault.focus();
+    await expect(offscreenFault).toBeFocused();
+    await expect(page.locator('[data-fresh-popover][role="tooltip"]')).toBeVisible();
+
+    const firstFault = visibleFaults.first();
+    await expect(firstFault).not.toHaveAttribute("title", /.*/);
+    await firstFault.focus();
+    await expect(firstFault).toBeFocused();
+    await expect(page.locator('[data-fresh-popover][role="tooltip"]')).toBeVisible();
+    await expect(firstFault).toHaveAttribute(
+      "aria-describedby",
+      "freshness-fault-tooltip",
+    );
+    await expect(page.locator("[data-fresh-popover]")).toContainText(
+      await firstFault.locator("[data-fresh-value]").textContent(),
+    );
+    await page.keyboard.press("Escape");
+    await expect(page.locator("[data-fresh-popover]")).toBeHidden();
+    await expect(firstFault).not.toHaveAttribute("aria-describedby", /.*/);
+
+    await quietCard.locator("[data-host-actions-trigger]").click();
+    await quietCard.locator('[data-host-action="technical"]').click();
+    const technical = page.locator("[data-host-action-technical]");
+    await expect(technical).toBeVisible();
+    await expect(technical).toContainText("Deployed revision: " + "a".repeat(40));
+    await expect(technical).toContainText("nixcfg revision: " + "a".repeat(40));
+    await expect(technical).toContainText("nixpkgs revision: " + "c".repeat(40));
+    await page.evaluate(() => closeHostActionDialog());
+
+    const response = await page.request.get("/hosts.json");
+    expect(response.ok()).toBe(true);
+    const original = await response.json();
+    const healed = structuredClone(original);
+    const healedHost = healed.hosts.find((host) => host.name === faultHost);
+    expect(healedHost).toBeDefined();
+    healedHost.freshness = structuredClone(currentFreshness);
+    healedHost.backup_observations = [healthyBackupObservation()];
+    healedHost.kernel = {
+      state: "current",
+      running_version: "7.0.14",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
     };
-  });
+    await firstFault.focus();
+    await expect(page.locator("[data-fresh-popover]")).toBeVisible();
+    expect(await page.evaluate((body) => applyFleetSnapshot(body), healed)).toBe(true);
+    await expect(faultRail).toHaveAttribute("hidden", "");
+    await expect(visibleFaults).toHaveCount(0);
+    await expect(page.locator("[data-fresh-popover]")).toBeHidden();
 
-  const leftVisible = await chevronLeft.evaluate((el) => el.classList.contains('visible'));
-  const rightVisible = await chevronRight.evaluate((el) => el.classList.contains('visible'));
-
-  if (scrollInfo.hasOverflow) {
-    expect(leftVisible || rightVisible).toBe(true);
-  } else {
-    expect(leftVisible).toBe(false);
-    expect(rightVisible).toBe(false);
+    expect(await page.evaluate((body) => applyFleetSnapshot(body), original)).toBe(true);
+    await expect(faultRail).not.toHaveAttribute("hidden", "");
+    await expect(visibleFaults).toHaveCount(5);
+  } finally {
+    for (const host of hosts) {
+      const removal = await page.request.post(`/host-actions/${host}/remove`, {
+        headers: { "x-pharos-action": "1" },
+        data: { confirmation: host, disposition: "unmanaged", successor: null },
+      });
+      expect(removal.status()).toBe(202);
+      const reonboard = await page.request.post(
+        `/host-actions/${host}/allow-reonboarding`,
+        { headers: { "x-pharos-action": "1" }, data: { confirmation: host } },
+      );
+      expect(reonboard.ok()).toBe(true);
+    }
   }
-
-  const chipsHaveNoTitleAttr = await chips.evaluateAll((elements) => {
-    return elements.every(chip => !chip.hasAttribute('title'));
-  });
-  expect(chipsHaveNoTitleAttr).toBe(true);
-
-  const popoverExists = await page.evaluate(() => {
-    return document.querySelector('[data-fresh-popover]') !== null;
-  });
-  expect(popoverExists).toBe(true);
-
-  const firstChip = chips.first();
-  await firstChip.hover();
-  await page.waitForTimeout(100);
-
-  const popoverVisible = await page.evaluate(() => {
-    const popover = document.querySelector('[data-fresh-popover]');
-    return popover && popover.classList.contains('visible');
-  });
-  expect(popoverVisible).toBe(true);
-
-  const popoverRowCount = await page.evaluate(() => {
-    const popover = document.querySelector('[data-fresh-popover]');
-    return popover?.querySelectorAll('.fresh-popover-row').length || 0;
-  });
-  expect(popoverRowCount).toBeGreaterThan(0);
-  expect(popoverRowCount).toBeLessThanOrEqual(3);
-
-  const popoverContent = await page.evaluate(() => {
-    const popover = document.querySelector('[data-fresh-popover]');
-    return popover?.textContent || '';
-  });
-  expect(popoverContent.length).toBeGreaterThan(0);
-
-  await page.mouse.move(0, 0);
-  await page.waitForTimeout(100);
-
-  const popoverHidden = await page.evaluate(() => {
-    const popover = document.querySelector('[data-fresh-popover]');
-    return !popover || !popover.classList.contains('visible');
-  });
-  expect(popoverHidden).toBe(true);
+});
 async function reportRuntimeHost(page, name, extra = {}) {
   const isNix = extra.is_nix ?? false;
   const freshness =

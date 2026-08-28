@@ -91,7 +91,7 @@ function hostActionTechnicalText(root){
   const kernel=root.dataset.kernelState==='reboot_required'
     ? root.dataset.kernelRunning+' running; '+root.dataset.kernelExpected+' expected'
     : root.dataset.kernelState.replaceAll('_',' ');
-  return [
+  const lines=[
     'Host: '+root.dataset.host,
     'Role: '+root.dataset.role,
     'System: '+(root.dataset.isNix==='true'?'Nix':'non-Nix'),
@@ -101,7 +101,11 @@ function hostActionTechnicalText(root){
     'Settings: '+root.dataset.settingsState.replaceAll('_',' '),
     'Backup: '+root.dataset.backupLabel,
     'Kernel: '+kernel
-  ].join('\n');
+  ];
+  if(root.dataset.deployedRevision)lines.push('Deployed revision: '+root.dataset.deployedRevision);
+  if(root.dataset.nixcfgRevision)lines.push('nixcfg revision: '+root.dataset.nixcfgRevision);
+  if(root.dataset.nixpkgsRevision)lines.push('nixpkgs revision: '+root.dataset.nixpkgsRevision);
+  return lines.join('\n');
 }
 function closeHostActionDialog(restore=true){
   const overlay=document.querySelector('[data-host-action-overlay]');
@@ -560,6 +564,15 @@ function updateHostActionState(surface,host,backup){
   root.dataset.kernelState=kernelState;
   root.dataset.kernelRunning=String(kernel.running_version||'not reported');
   root.dataset.kernelExpected=String(kernel.expected_version||'not reported');
+  root.dataset.deployedRevision=String(host.freshness?.deployment_evidence?.source_revision||'');
+  root.dataset.nixcfgRevision=String(host.freshness?.nixcfg_comparison?.upstream_revision||'');
+  root.dataset.nixpkgsRevision=String(host.freshness?.deployment_evidence?.nixpkgs_revision||'');
+  setFreshRow(surface,'kernel-restart',{
+    value:'restart required',
+    klass:'warn',
+    label:'Kernel',
+    visible:kernelState==='reboot_required'
+  });
   root.dataset.retired=retirement?.pending===true?'true':'false';
   root.dataset.retirementDisposition=String(retirement?.disposition||'');
   root.dataset.retirementSuccessor=String(retirement?.successor||'');
@@ -763,10 +776,17 @@ function setFreshRow(surface,kind,state){
     value.className=state.klass;
     value.textContent=state.value;
   }
+  if(typeof state.visible==='boolean'){
+    row.hidden=!state.visible;
+    if(row.hidden&&activeFreshPopoverChip===row)hideFreshPopover();
+  }
   if(row.classList.contains('fresh-row-compact')){
     const label=labelNode?.textContent||kind;
     row.setAttribute('aria-label',label+': '+state.value);
-    row.title=label+': '+state.value;
+    row.dataset.freshLabel=label;
+    row.dataset.freshDetail=state.value;
+    if(row.closest('.freshness-rail'))row.removeAttribute('title');
+    else row.title=label+': '+state.value;
   }
 }
 function nixChannelEndOfLife(channel,now){
@@ -780,6 +800,37 @@ function nixChannelEndOfLife(channel,now){
   return year>releaseYear+1||(year===releaseYear+1&&month>=eolMonth);
 }
 function updateFreshness(surface,f,now){
+  if(surface.classList.contains('card')){
+    const applicable=Boolean(f&&f.applicable!==false);
+    const evidence=applicable?f.deployment_evidence:null;
+    const evidenceMissing=applicable&&!evidence;
+    const channel=String(evidence?.nixpkgs_channel||f?.nixpkgs_channel||'nixpkgs');
+    const eol=Boolean(evidence&&!evidenceMissing&&nixChannelEndOfLife(channel,now));
+    const nixpkgs=f?.nixpkgs_comparison;
+    const nixcfg=f?.nixcfg_comparison;
+    setFreshRow(surface,'freshness-unverified',{value:'unverified',klass:'na',label:'Freshness',visible:evidenceMissing});
+    setFreshRow(surface,'nixpkgs-eol',{value:channel+' end of life',klass:'warn',label:'nixpkgs',visible:eol});
+    setFreshRow(surface,'nixpkgs-drift',{
+      value:nixpkgs?.relation==='different'?'nixpkgs differs from '+channel:'nixpkgs comparison unknown',
+      klass:nixpkgs?.relation==='different'?'warn':'na',
+      label:'nixpkgs',
+      visible:Boolean(evidence&&nixpkgs?.relation!=='current')
+    });
+    const nixcfgValue=nixcfg?.relation==='behind'
+      ? String(Number(nixcfg.commits_behind)||0)+' commits behind'
+      : nixcfg?.relation==='ahead'
+        ? 'deployed revision ahead'
+        : nixcfg?.relation==='diverged'
+          ? 'deployed revision diverged'
+          : 'nixcfg comparison unknown';
+    setFreshRow(surface,'nixcfg-drift',{
+      value:nixcfgValue,
+      klass:nixcfg?.relation&&nixcfg.relation!=='current'?'warn':'na',
+      label:'nixcfg',
+      visible:Boolean(evidence&&nixcfg?.relation!=='current')
+    });
+    return;
+  }
   if(!f||f.applicable===false){
     setFreshRow(surface,'flake-lock-age',{value:'n/a',klass:'na',label:'Flake.lock age'});
     setFreshRow(surface,'commits-behind',{value:'n/a',klass:'na'});
@@ -902,8 +953,7 @@ function backupInfo(host,now){
 }
 function updateBackup(surface,info){
   const el=surface.querySelector('.backup-chip[data-backup-state]');
-  if(!el)return;
-  if(el.classList.contains('backup-chip')){
+  if(el&&el.classList.contains('backup-chip')){
     const glyph={clear:'check',watch:'question',warning:'alert',critical:'x'}[info.level]||'question';
     const host=surface.dataset.host||'';
     el.classList.remove('clear','watch','warning','critical');
@@ -918,6 +968,13 @@ function updateBackup(surface,info){
     if(shouldHide&&document.activeElement===el)surface.querySelector('[data-host-actions-trigger]')?.focus();
     el.hidden=shouldHide;
   }
+  setFreshRow(surface,'backup-fault',{
+    value:info.label,
+    klass:info.level==='critical'?'down':info.level==='warning'?'warn':'na',
+    label:'Backup',
+    visible:info.state!=='healthy'
+  });
+  syncFreshnessRail(surface);
 }
 function setReason(surface,reason){
   const el=surface.querySelector('[data-reason]');
@@ -3749,128 +3806,127 @@ function resumeRefresh(reason){
   }
   return recoverFleet(reason);
 }
+let activeFreshPopover=null;
+let activeFreshPopoverChip=null;
+function hideFreshPopover(){
+  if(activeFreshPopover)activeFreshPopover.classList.remove('visible');
+  if(activeFreshPopoverChip)activeFreshPopoverChip.removeAttribute('aria-describedby');
+  activeFreshPopoverChip=null;
+}
+function updateFreshnessRailOverflow(rail){
+  const container=rail.querySelector('[data-fresh-scroll-container]');
+  const left=rail.querySelector('.fresh-chevron-left');
+  const right=rail.querySelector('.fresh-chevron-right');
+  if(!container||!left||!right||rail.hidden)return;
+  const canLeft=container.scrollLeft>1;
+  const canRight=container.scrollLeft<container.scrollWidth-container.clientWidth-1;
+  left.classList.toggle('visible',canLeft);
+  right.classList.toggle('visible',canRight);
+  rail.dataset.overflowRight=canRight?'true':'false';
+}
+function syncFreshnessRail(surface){
+  const rail=surface.querySelector('.freshness-rail[data-fresh]');
+  if(!rail)return;
+  const visible=Array.from(rail.querySelectorAll('.fresh-row-compact')).filter(chip=>!chip.hidden);
+  rail.hidden=visible.length===0;
+  if(rail.hidden&&activeFreshPopoverChip&&rail.contains(activeFreshPopoverChip))hideFreshPopover();
+  if(!rail.hidden)requestAnimationFrame(()=>updateFreshnessRailOverflow(rail));
+}
 function initFreshnessChipScroll(){
   const chevronLeftIcon='<svg class="ico" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>';
   const chevronRightIcon='<svg class="ico" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>';
-  let activePopover=null;
-  let popoverTimeout=null;
-  function createPopover(){
+  const railScrollBehavior=window.matchMedia?.('(prefers-reduced-motion: reduce)').matches?'auto':'smooth';
+  function ensurePopover(){
+    if(activeFreshPopover)return activeFreshPopover;
     const popover=document.createElement('div');
+    popover.id='freshness-fault-tooltip';
     popover.className='fresh-popover';
     popover.dataset.freshPopover='true';
+    popover.setAttribute('role','tooltip');
     document.body.appendChild(popover);
+    activeFreshPopover=popover;
     return popover;
   }
-  function showPopover(chip,event){
-    if(popoverTimeout)clearTimeout(popoverTimeout);
-    if(!activePopover)activePopover=createPopover();
-    const container=chip.closest('[data-fresh]');
-    if(!container)return;
-    const allChips=container.querySelectorAll('.fresh-row-compact');
-    const chipData=[];
-    const kindOrder=['deployed-sha','nixcfg-sha','nixpkgs-sha'];
-    kindOrder.forEach(kind=>{
-      const targetChip=Array.from(allChips).find(c=>c.dataset.freshKind===kind);
-      if(targetChip){
-        const label=targetChip.querySelector('.fresh-row-label')?.textContent||targetChip.getAttribute('aria-label')?.split(':')[0]||kind;
-        const valueEl=targetChip.querySelector('[data-fresh-value]');
-        const value=valueEl?.textContent||'';
-        const valueClass=valueEl?.className||'';
-        chipData.push({label,value,valueClass});
-      }
-    });
-    if(chipData.length===0)return;
-    activePopover.innerHTML=chipData.map(d=>'<div class="fresh-popover-row"><span class="fresh-popover-label">'+d.label+'</span><span class="fresh-popover-value '+d.valueClass+'">'+d.value+'</span></div>').join('');
-    activePopover.classList.add('visible');
-    updatePopoverPosition(event);
-  }
-  function updatePopoverPosition(event){
-    if(!activePopover||!activePopover.classList.contains('visible'))return;
+  function positionPopover(chip,event){
+    const popover=ensurePopover();
+    const chipRect=chip.getBoundingClientRect();
+    const anchorX=Number.isFinite(event?.clientX)?event.clientX:chipRect.right;
+    const anchorY=Number.isFinite(event?.clientY)?event.clientY:chipRect.bottom;
     const offset=10;
-    const x=event.clientX+offset;
-    const y=event.clientY+offset;
-    const rect=activePopover.getBoundingClientRect();
-    const viewportWidth=window.innerWidth;
-    const viewportHeight=window.innerHeight;
-    let finalX=x;
-    let finalY=y;
-    if(x+rect.width>viewportWidth)finalX=event.clientX-rect.width-offset;
-    if(y+rect.height>viewportHeight)finalY=event.clientY-rect.height-offset;
-    activePopover.style.left=finalX+'px';
-    activePopover.style.top=finalY+'px';
+    const rect=popover.getBoundingClientRect();
+    const x=Math.max(12,Math.min(window.innerWidth-rect.width-12,anchorX+offset));
+    const y=anchorY+offset+rect.height<=window.innerHeight
+      ? anchorY+offset
+      : Math.max(12,anchorY-rect.height-offset);
+    popover.style.left=x+'px';
+    popover.style.top=y+'px';
   }
-  function hidePopover(){
-    if(popoverTimeout)clearTimeout(popoverTimeout);
-    popoverTimeout=setTimeout(()=>{
-      if(activePopover){
-        activePopover.classList.remove('visible');
-        popoverTimeout=null;
-      }
-    },50);
+  function showPopover(chip,event){
+    const popover=ensurePopover();
+    const label=document.createElement('span');
+    label.className='fresh-popover-label';
+    label.textContent=chip.dataset.freshLabel||'Host fault';
+    const value=document.createElement('span');
+    value.className='fresh-popover-value';
+    value.textContent=chip.dataset.freshDetail||chip.textContent||'Needs attention';
+    popover.replaceChildren(label,value);
+    popover.classList.add('visible');
+    if(activeFreshPopoverChip&&activeFreshPopoverChip!==chip)activeFreshPopoverChip.removeAttribute('aria-describedby');
+    activeFreshPopoverChip=chip;
+    chip.setAttribute('aria-describedby',popover.id);
+    positionPopover(chip,event);
   }
-  function updateChevronVisibility(container,chevronLeft,chevronRight){
-    const scrollLeft=container.scrollLeft;
-    const scrollWidth=container.scrollWidth;
-    const clientWidth=container.clientWidth;
-    const canScrollLeft=scrollLeft>1;
-    const canScrollRight=scrollLeft<scrollWidth-clientWidth-1;
-    if(canScrollLeft)chevronLeft.classList.add('visible');else chevronLeft.classList.remove('visible');
-    if(canScrollRight)chevronRight.classList.add('visible');else chevronRight.classList.remove('visible');
-  }
-  document.querySelectorAll('.card .fresh[data-fresh]').forEach(fresh=>{
-    const chips=Array.from(fresh.querySelectorAll('.fresh-row-compact'));
+  document.querySelectorAll('.card .freshness-rail[data-fresh]').forEach(rail=>{
+    const chips=Array.from(rail.querySelectorAll('.fresh-row-compact'));
     if(chips.length===0)return;
     const container=document.createElement('div');
     container.className='fresh-scroll-container';
     container.dataset.freshScrollContainer='true';
     chips.forEach(chip=>container.appendChild(chip));
-    fresh.innerHTML='';
-    fresh.appendChild(container);
-    const chevronLeft=document.createElement('button');
-    chevronLeft.className='fresh-chevron fresh-chevron-left';
-    chevronLeft.innerHTML=chevronLeftIcon;
-    chevronLeft.setAttribute('type','button');
-    chevronLeft.setAttribute('aria-label','Scroll left');
-    chevronLeft.addEventListener('click',()=>{
-      container.scrollBy({left:-120,behavior:'smooth'});
-    });
-    const chevronRight=document.createElement('button');
-    chevronRight.className='fresh-chevron fresh-chevron-right';
-    chevronRight.innerHTML=chevronRightIcon;
-    chevronRight.setAttribute('type','button');
-    chevronRight.setAttribute('aria-label','Scroll right');
-    chevronRight.addEventListener('click',()=>{
-      container.scrollBy({left:120,behavior:'smooth'});
-    });
-    fresh.appendChild(chevronLeft);
-    fresh.appendChild(chevronRight);
+    rail.replaceChildren(container);
+    const left=document.createElement('button');
+    left.className='fresh-chevron fresh-chevron-left';
+    left.innerHTML=chevronLeftIcon;
+    left.type='button';
+    left.setAttribute('aria-label','Scroll faults left');
+    const right=document.createElement('button');
+    right.className='fresh-chevron fresh-chevron-right';
+    right.innerHTML=chevronRightIcon;
+    right.type='button';
+    right.setAttribute('aria-label','Scroll faults right');
+    left.addEventListener('click',()=>container.scrollBy({left:-160,behavior:railScrollBehavior}));
+    right.addEventListener('click',()=>container.scrollBy({left:160,behavior:railScrollBehavior}));
+    rail.append(left,right);
     container.addEventListener('wheel',event=>{
-      if(Math.abs(event.deltaY)>0){
-        event.preventDefault();
-        container.scrollLeft+=event.deltaY;
-        updateChevronVisibility(container,chevronLeft,chevronRight);
-      }
+      if(container.scrollWidth<=container.clientWidth||Math.abs(event.deltaY)<=Math.abs(event.deltaX)||event.deltaY===0)return;
+      const maxScroll=container.scrollWidth-container.clientWidth;
+      const canMove=event.deltaY<0?container.scrollLeft>1:container.scrollLeft<maxScroll-1;
+      if(!canMove)return;
+      event.preventDefault();
+      container.scrollLeft+=event.deltaY;
+      updateFreshnessRailOverflow(rail);
     },{passive:false});
     container.addEventListener('scroll',()=>{
-      updateChevronVisibility(container,chevronLeft,chevronRight);
+      if(activeFreshPopoverChip!==document.activeElement)hideFreshPopover();
+      updateFreshnessRailOverflow(rail);
     });
     chips.forEach(chip=>{
+      chip.dataset.freshLabel=chip.querySelector('.fresh-row-label')?.textContent||'Host fault';
+      chip.dataset.freshDetail=chip.querySelector('[data-fresh-value]')?.textContent||'Needs attention';
       chip.removeAttribute('title');
-      chip.addEventListener('mouseenter',event=>{
-        if(popoverTimeout)clearTimeout(popoverTimeout);
-        showPopover(chip,event);
-      });
+      chip.addEventListener('mouseenter',event=>showPopover(chip,event));
       chip.addEventListener('mousemove',event=>{
-        if(activePopover&&activePopover.classList.contains('visible')){
-          updatePopoverPosition(event);
-        }
+        if(activeFreshPopoverChip===chip&&activeFreshPopover?.classList.contains('visible'))positionPopover(chip,event);
       });
-      chip.addEventListener('mouseleave',()=>{
-        hidePopover();
-      });
+      chip.addEventListener('mouseleave',hideFreshPopover);
+      chip.addEventListener('focus',()=>showPopover(chip));
+      chip.addEventListener('blur',hideFreshPopover);
     });
-    container.addEventListener('scroll',hidePopover);
-    setTimeout(()=>updateChevronVisibility(container,chevronLeft,chevronRight),0);
+    if(typeof ResizeObserver!=='undefined')new ResizeObserver(()=>updateFreshnessRailOverflow(rail)).observe(rail);
+    syncFreshnessRail(rail.closest('[data-host-surface="runtime"]'));
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Escape'&&activeFreshPopover?.classList.contains('visible'))hideFreshPopover();
   });
 }
 document.addEventListener('visibilitychange',()=>{if(document.hidden)suspendFleet();else recoverFleet('visible')});
