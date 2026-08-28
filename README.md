@@ -202,14 +202,21 @@ deny-delete ACLs, sticky-directory ownership or a filesystem without hard
 links that would refuse replacing the marker refuse the probe too, while the
 marker itself is never written or moved. The marker is only ever opened
 without following symlinks; a symlink, directory or device at that path is
-invalid state and is never followed. Probe and write artifacts use fixed
-sibling names (`.<marker>.tmp`, `.<marker>.probe-tmp`, `.<marker>.probe-link`)
-that each run removes first, so a run killed by the healthcheck timeout leaves
-at most one file per name. A marker the beacon cannot replace is never
-trusted, however recent it reads. The state is reset at startup, and a reset
-that cannot write unlinks the previous marker if it can (it never writes into
-an existing file), so a restarted beacon stays unhealthy until it reports
-again and nothing outside the beacon can make it look healthy. Deployments that disabled
+invalid state and is never followed. Writes and probes take a shared lock
+(`.<marker>.lock`, the one artifact that stays), so a probe never recovers or
+replaces anything while a refresh is in flight; under it, probe and write
+artifacts use fixed sibling names (`.<marker>.tmp`, `.<marker>.probe-tmp`,
+`.<marker>.probe-link`) that each run removes first, so a run killed by the
+healthcheck timeout leaves at most one file per name, and a write temporary
+that cannot be removed makes the probe unhealthy because no refresh could
+land. A marker the beacon cannot replace is never trusted, however recent it
+reads. The marker also records which beacon process wrote it (pid and kernel
+process start time) and is trusted only while that exact process is running:
+state left by a previous run never becomes healthy merely because an obstacle
+to resetting it clears, a crashed beacon is unhealthy at the next probe, and
+only a successful report by the current process restores health. The state is
+reset at startup, and a reset that cannot write unlinks the previous marker
+if it can (it never writes into an existing file). Deployments that disabled
 the inherited check (`--no-healthcheck`, Compose `healthcheck: disable: true`)
 as a workaround can remove that override.
 

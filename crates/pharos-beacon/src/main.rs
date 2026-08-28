@@ -228,6 +228,168 @@ fn beacon_health_sibling_path(path: &Path, suffix: &str) -> std::io::Result<Path
 const BEACON_HEALTH_WRITE_TEMP: &str = "tmp";
 const BEACON_HEALTH_PROBE_TEMP: &str = "probe-tmp";
 const BEACON_HEALTH_PROBE_LINK: &str = "probe-link";
+/// Lock shared by the beacon's marker writes and the container probe, so a
+/// probe never recovers or replaces anything while a refresh is in flight.
+/// It is the one artifact that stays: removing a lock file races its users.
+const BEACON_HEALTH_LOCK: &str = "lock";
+const BEACON_HEALTH_LOCK_WAIT: Duration = Duration::from_secs(2);
+const MAX_BEACON_HEALTH_MARKER_BYTES: u64 = 256;
+
+/// Identity of the beacon process that wrote a marker: its pid plus the
+/// kernel's start token for that pid (Linux: boot id and start time in ticks
+/// from `/proc/<pid>/stat`; macOS: the BSD process start time). A marker is
+/// only ever trusted while that exact process is still running, so state left
+/// by a previous run can never become healthy merely because an obstacle to
+/// resetting it clears; only a successful report by the current process can
+/// restore health (PHAROS-203).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessGeneration {
+    pid: u32,
+    start: String,
+}
+
+impl ProcessGeneration {
+    fn current() -> std::io::Result<Self> {
+        Self::for_pid(std::process::id())
+    }
+
+    fn for_pid(pid: u32) -> std::io::Result<Self> {
+        Ok(Self {
+            pid,
+            start: process_start_token(pid)?,
+        })
+    }
+
+    /// Whether the process this generation names is still the same process.
+    fn is_running(&self) -> Result<(), String> {
+        match process_start_token(self.pid) {
+            Ok(start) if start == self.start => Ok(()),
+            Ok(_) => Err(format!(
+                "pid {} now belongs to a different process",
+                self.pid
+            )),
+            Err(err) => Err(format!("pid {} is not running: {err}", self.pid)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_token(pid: u32) -> std::io::Result<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    // The command name is parenthesised and may contain spaces; fields after
+    // it start with the state. starttime is field 22 overall.
+    let after_comm = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed stat"))?;
+    let start_ticks = after_comm
+        .split_ascii_whitespace()
+        .nth(19)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "short stat"))?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|id| id.trim().to_string())
+        .unwrap_or_default();
+    Ok(format!("{boot_id}:{start_ticks}"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_token(pid: u32) -> std::io::Result<String> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid out of range"))?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, a
+    // correctly sized and aligned proc_bsdinfo, and returns the byte count.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(format!(
+        "{}.{:06}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_token(_pid: u32) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process start time is not available on this platform",
+    ))
+}
+
+/// Takes the marker lock, waiting a bounded time for a concurrent writer or
+/// probe. The lock file is opened without following symlinks; an immutable
+/// or read-only lock file still locks, so only a missing or non-regular lock
+/// path fails.
+fn lock_beacon_health(path: &Path) -> Result<File, String> {
+    let lock_path =
+        beacon_health_sibling_path(path, BEACON_HEALTH_LOCK).map_err(|err| err.to_string())?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = match options.open(&lock_path) {
+        Ok(file) => file,
+        Err(create_err) => {
+            let mut fallback = OpenOptions::new();
+            fallback.read(true);
+            #[cfg(unix)]
+            fallback.custom_flags(libc::O_NOFOLLOW);
+            fallback.open(&lock_path).map_err(|_| {
+                format!(
+                    "cannot open the marker lock {}: {create_err}",
+                    lock_path.display()
+                )
+            })?
+        }
+    };
+    if !file
+        .metadata()
+        .map_err(|err| {
+            format!(
+                "cannot inspect the marker lock {}: {err}",
+                lock_path.display()
+            )
+        })?
+        .is_file()
+    {
+        return Err(format!(
+            "the marker lock {} is not a regular file",
+            lock_path.display()
+        ));
+    }
+    let deadline = Instant::now() + BEACON_HEALTH_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "the marker lock {} has been held by another beacon write or probe for over {}s",
+                        lock_path.display(),
+                        BEACON_HEALTH_LOCK_WAIT.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(format!(
+                    "cannot lock the marker lock {}: {err}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+}
 
 /// Removes a leftover artifact of an earlier run; a missing file is fine.
 /// `remove_file` unlinks the name itself and never follows a symlink.
@@ -249,11 +411,22 @@ fn create_beacon_health_temp(temporary: &Path) -> std::io::Result<File> {
     options.open(temporary)
 }
 
-fn write_beacon_health(path: &Path, last_success_at: i64) -> std::io::Result<()> {
+/// Atomically publishes `v2 <last_success_at> <pid> <start>` under the
+/// marker lock, replacing any leftover of its own fixed temp name first.
+fn write_beacon_health(
+    path: &Path,
+    last_success_at: i64,
+    generation: &ProcessGeneration,
+) -> std::io::Result<()> {
+    let _lock = lock_beacon_health(path).map_err(std::io::Error::other)?;
     let temporary = beacon_health_sibling_path(path, BEACON_HEALTH_WRITE_TEMP)?;
     let write_result = (|| -> std::io::Result<()> {
         let mut file = create_beacon_health_temp(&temporary)?;
-        writeln!(file, "v1 {last_success_at}")?;
+        writeln!(
+            file,
+            "v2 {last_success_at} {} {}",
+            generation.pid, generation.start
+        )?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
         Ok(())
@@ -337,6 +510,18 @@ fn beacon_health_link_refusal(err: &std::io::Error) -> String {
 /// a probe killed midway is repaired by the next one; whatever cannot be
 /// removed is reported by path.
 fn probe_beacon_health_location(path: &Path) -> Result<(), String> {
+    let _lock = lock_beacon_health(path)?;
+    // Under the lock no write is in flight, so a writer temp is a leftover of
+    // a killed or blocked write. It must go, or the beacon cannot refresh:
+    // an immutable or foreign temp there blocks every future write.
+    let writer_temp = beacon_health_sibling_path(path, BEACON_HEALTH_WRITE_TEMP)
+        .map_err(|err| err.to_string())?;
+    remove_beacon_health_leftover(&writer_temp).map_err(|err| {
+        format!(
+            "the beacon's write temporary {} cannot be removed, so the marker cannot be refreshed: {err}",
+            writer_temp.display()
+        )
+    })?;
     let temporary = beacon_health_sibling_path(path, BEACON_HEALTH_PROBE_TEMP)
         .map_err(|err| err.to_string())?;
     let link = beacon_health_sibling_path(path, BEACON_HEALTH_PROBE_LINK)
@@ -401,8 +586,8 @@ fn invalidate_beacon_health(path: &Path) -> std::io::Result<()> {
 /// Startup reset of the marker. When the reset fails, no marker from a
 /// previous run may survive readable: the healthcheck must never trust state
 /// this beacon cannot write (PHAROS-203).
-fn initialize_beacon_health(path: &Path) -> Result<(), String> {
-    let Err(write_err) = write_beacon_health(path, 0) else {
+fn initialize_beacon_health(path: &Path, generation: &ProcessGeneration) -> Result<(), String> {
+    let Err(write_err) = write_beacon_health(path, 0, generation) else {
         return Ok(());
     };
     match invalidate_beacon_health(path) {
@@ -442,6 +627,11 @@ enum BeaconHealthProblem {
         error: String,
     },
     StateInvalid(PathBuf),
+    NotCurrentGeneration {
+        path: PathBuf,
+        pid: u32,
+        detail: String,
+    },
     NoSuccessfulReportYet,
     ClockSkew {
         last_success_at: i64,
@@ -474,6 +664,11 @@ impl std::fmt::Display for BeaconHealthProblem {
             Self::LocationUnwritable { path, error } => write!(
                 f,
                 "report state location for {} cannot be written ({error}); the beacon cannot reset or refresh its marker, so a recent one is not trusted (mount a writable tmpfs or set {BEACON_HEALTH_PATH_ENV})",
+                path.display()
+            ),
+            Self::NotCurrentGeneration { path, pid, detail } => write!(
+                f,
+                "marker at {} was written by beacon process {pid}, which is not the running one ({detail}); only a successful report by the current beacon process restores health",
                 path.display()
             ),
             Self::StateUnreadable { path, error } => write!(
@@ -510,38 +705,59 @@ impl std::fmt::Display for BeaconHealthProblem {
 
 /// Reads the recorded last-success timestamp. `Ok(None)` is the startup
 /// marker: the beacon is running but has not reported successfully yet.
-fn read_beacon_health(path: &Path) -> Result<Option<i64>, BeaconHealthProblem> {
+/// The marker's content: when the last report succeeded (`None` for the
+/// startup sentinel) and which process wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BeaconHealthRecord {
+    last_success_at: Option<i64>,
+    generation: ProcessGeneration,
+}
+
+fn read_beacon_health(path: &Path) -> Result<BeaconHealthRecord, BeaconHealthProblem> {
     let unreadable = |err: std::io::Error| BeaconHealthProblem::StateUnreadable {
         path: path.to_path_buf(),
         error: err.to_string(),
     };
+    let invalid = || BeaconHealthProblem::StateInvalid(path.to_path_buf());
     let mut file = match open_beacon_health_marker(path) {
         Ok(BeaconHealthMarker::Regular(file)) => file,
         Ok(BeaconHealthMarker::Missing) => {
             return Err(BeaconHealthProblem::StateMissing(path.to_path_buf()));
         }
-        Ok(BeaconHealthMarker::NotRegular) => {
-            return Err(BeaconHealthProblem::StateInvalid(path.to_path_buf()));
-        }
+        Ok(BeaconHealthMarker::NotRegular) => return Err(invalid()),
         Err(err) => return Err(unreadable(err)),
     };
-    if file.metadata().map_err(unreadable)?.len() > 64 {
-        return Err(BeaconHealthProblem::StateInvalid(path.to_path_buf()));
+    if file.metadata().map_err(unreadable)?.len() > MAX_BEACON_HEALTH_MARKER_BYTES {
+        return Err(invalid());
     }
     let mut raw = String::new();
     file.read_to_string(&mut raw).map_err(unreadable)?;
-    let mut fields = raw.split_ascii_whitespace();
-    if fields.next() != Some("v1") || fields.clone().count() != 1 {
-        return Err(BeaconHealthProblem::StateInvalid(path.to_path_buf()));
-    }
-    let last_success_at = fields
-        .next()
-        .and_then(|value| value.parse::<i64>().ok())
-        .ok_or_else(|| BeaconHealthProblem::StateInvalid(path.to_path_buf()))?;
-    match last_success_at {
-        0 => Ok(None),
-        stamp if stamp > 0 => Ok(Some(stamp)),
-        _ => Err(BeaconHealthProblem::StateInvalid(path.to_path_buf())),
+    let fields: Vec<&str> = raw.split_ascii_whitespace().collect();
+    match fields.as_slice() {
+        ["v2", stamp, pid, start] => {
+            let last_success_at = stamp.parse::<i64>().map_err(|_| invalid())?;
+            let pid = pid.parse::<u32>().map_err(|_| invalid())?;
+            let last_success_at = match last_success_at {
+                0 => None,
+                stamp if stamp > 0 => Some(stamp),
+                _ => return Err(invalid()),
+            };
+            Ok(BeaconHealthRecord {
+                last_success_at,
+                generation: ProcessGeneration {
+                    pid,
+                    start: (*start).to_string(),
+                },
+            })
+        }
+        // Markers from beacons before process generations existed: nothing
+        // proves which process wrote them, so they are never trusted.
+        ["v1", _] => Err(BeaconHealthProblem::NotCurrentGeneration {
+            path: path.to_path_buf(),
+            pid: 0,
+            detail: "the marker predates process generations".to_string(),
+        }),
+        _ => Err(invalid()),
     }
 }
 
@@ -570,8 +786,18 @@ fn beacon_health_verdict_with(
         path: path.to_path_buf(),
         error,
     })?;
-    let last_success_at =
-        read_beacon_health(path)?.ok_or(BeaconHealthProblem::NoSuccessfulReportYet)?;
+    let record = read_beacon_health(path)?;
+    record
+        .generation
+        .is_running()
+        .map_err(|detail| BeaconHealthProblem::NotCurrentGeneration {
+            path: path.to_path_buf(),
+            pid: record.generation.pid,
+            detail,
+        })?;
+    let last_success_at = record
+        .last_success_at
+        .ok_or(BeaconHealthProblem::NoSuccessfulReportYet)?;
     let age_secs = now
         .checked_sub(last_success_at)
         .and_then(|age| u64::try_from(age).ok())
@@ -2368,8 +2594,19 @@ fn main() {
     let mut last_report_rtt_ms: Option<u64> = None;
     let mut consecutive_failures = 0_u32;
     let health_path = beacon_health_path();
-    if interval.is_some() {
-        if let Err(reason) = initialize_beacon_health(&health_path) {
+    let generation = match ProcessGeneration::current() {
+        Ok(generation) => Some(generation),
+        Err(err) => {
+            if interval.is_some() {
+                eprintln!(
+                    "pharos-beacon: cannot determine this process's generation ({err}); the container healthcheck will stay unhealthy"
+                );
+            }
+            None
+        }
+    };
+    if let (Some(_), Some(generation)) = (interval, generation.as_ref()) {
+        if let Err(reason) = initialize_beacon_health(&health_path, generation) {
             eprintln!("pharos-beacon: {reason}; the container healthcheck will stay unhealthy");
         }
     }
@@ -2466,7 +2703,9 @@ fn main() {
                 let status = resp.status().as_u16();
                 last_report_rtt_ms = Some(report_rtt_millis(started.elapsed()));
                 consecutive_failures = 0;
-                if write_beacon_health(&health_path, now_unix()).is_err() {
+                if generation.as_ref().is_some_and(|generation| {
+                    write_beacon_health(&health_path, now_unix(), generation).is_err()
+                }) {
                     eprintln!(
                         "pharos-beacon: could not refresh container health state at {}",
                         health_path.display()
@@ -2535,6 +2774,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generation() -> ProcessGeneration {
+        ProcessGeneration::current().expect("current process generation")
+    }
+
+    fn write_marker(path: &Path, last_success_at: i64) -> std::io::Result<()> {
+        write_beacon_health(path, last_success_at, &generation())
+    }
+
+    /// The marker's last-success field, whoever wrote it.
+    fn marker_stamp(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .expect("marker readable")
+            .split_whitespace()
+            .nth(1)
+            .expect("marker stamp")
+            .to_string()
+    }
 
     fn kernel_fixture(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -3292,7 +3549,7 @@ mod tests {
     #[test]
     fn beacon_health_tracks_recent_success_and_stalled_reporting() {
         let path = kernel_fixture("container-health");
-        write_beacon_health(&path, 1_000).expect("write successful report health");
+        write_marker(&path, 1_000).expect("write successful report health");
 
         assert_eq!(beacon_health_verdict(&path, 60, 1_000), Ok(0));
         assert_eq!(beacon_health_verdict(&path, 60, 1_180), Ok(180));
@@ -3322,7 +3579,7 @@ mod tests {
         assert!(reason.contains(&path.display().to_string()), "{reason}");
         assert!(reason.contains(BEACON_HEALTH_PATH_ENV), "{reason}");
 
-        write_beacon_health(&path, 0).expect("write startup health state");
+        write_marker(&path, 0).expect("write startup health state");
         assert_eq!(
             beacon_health_verdict(&path, 60, 1_000),
             Err(BeaconHealthProblem::NoSuccessfulReportYet)
@@ -3332,7 +3589,7 @@ mod tests {
             Err(BeaconHealthProblem::InvalidInterval)
         );
 
-        write_beacon_health(&path, 1_000).expect("write successful report health");
+        write_marker(&path, 1_000).expect("write successful report health");
         assert_eq!(
             beacon_health_verdict(&path, 60, 999),
             Err(BeaconHealthProblem::ClockSkew {
@@ -3350,11 +3607,13 @@ mod tests {
 
         for invalid in [
             "not-health\n",
-            "v1\n",
-            "v1 12 34\n",
+            "v2\n",
             "v2 1000\n",
-            "v1 abc\n",
-            "v1 -5\n",
+            "v2 1000 7\n",
+            "v2 abc 7 start\n",
+            "v2 1000 pid start\n",
+            "v2 -5 7 start\n",
+            "v1 1000 7 start\n",
         ] {
             std::fs::write(&path, invalid).expect("write invalid health state");
             assert_eq!(
@@ -3405,7 +3664,7 @@ mod tests {
         // readable, recent marker is rejected as soon as the atomic-write
         // probe reports that this process could not have written it.
         let path = kernel_fixture("probe-rejected-health");
-        write_beacon_health(&path, 1_000).expect("write recent marker");
+        write_marker(&path, 1_000).expect("write recent marker");
         assert_eq!(
             beacon_health_verdict_with(&path, 60, 1_010, |_| Ok(())),
             Ok(10)
@@ -3433,7 +3692,7 @@ mod tests {
 
         // The probe outranks every marker-content verdict, including "no
         // successful report yet" and a missing marker.
-        write_beacon_health(&path, 0).expect("write startup marker");
+        write_marker(&path, 0).expect("write startup marker");
         assert!(matches!(
             beacon_health_verdict_with(&path, 60, 1_010, |_| Err("read-only".into())),
             Err(BeaconHealthProblem::LocationUnwritable { .. })
@@ -3451,13 +3710,9 @@ mod tests {
         let dir = kernel_fixture("probe-location");
         std::fs::create_dir(&dir).expect("create location");
         let path = dir.join("pharos-beacon-health-v1");
-        write_beacon_health(&path, 1_000).expect("write recent marker");
+        write_marker(&path, 1_000).expect("write recent marker");
         assert_eq!(probe_beacon_health_location(&path), Ok(()));
-        assert_eq!(
-            std::fs::read_dir(&dir).expect("list location").count(),
-            1,
-            "probe must clean up its temp file"
-        );
+        assert_eq!(entries(&dir).len(), 1, "probe must clean up its temp file");
         assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
 
         // Location that no user, root included, can create files in: the
@@ -3493,7 +3748,7 @@ mod tests {
             } else {
                 assert_eq!(probe_beacon_health_location(&path), Ok(()));
                 assert!(
-                    write_beacon_health(&path, 1_005).is_ok(),
+                    write_marker(&path, 1_005).is_ok(),
                     "a user the probe passes for must really be able to write"
                 );
             }
@@ -3519,7 +3774,7 @@ mod tests {
         if !applied.map(|status| status.success()).unwrap_or(false) {
             return false;
         }
-        if write_beacon_health(path, 1_005).is_ok() {
+        if write_marker(path, 1_005).is_ok() {
             unprotect_marker(path);
             return false;
         }
@@ -3538,6 +3793,8 @@ mod tests {
         };
     }
 
+    /// Directory entries except the persistent marker lock, which is the one
+    /// artifact that legitimately stays.
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .expect("list location")
@@ -3548,6 +3805,7 @@ mod tests {
                     .to_string_lossy()
                     .into_owned()
             })
+            .filter(|name| !name.ends_with(".lock"))
             .collect();
         names.sort();
         names
@@ -3561,14 +3819,11 @@ mod tests {
         let dir = kernel_fixture("immutable-marker");
         std::fs::create_dir(&dir).expect("create location");
         let path = dir.join("pharos-beacon-health-v1");
-        write_beacon_health(&path, 1_000).expect("write recent marker");
+        write_marker(&path, 1_000).expect("write recent marker");
 
         #[cfg(unix)]
         if protect_marker(&path) {
-            assert_eq!(
-                std::fs::read_to_string(&path).expect("marker readable"),
-                "v1 1000\n"
-            );
+            assert_eq!(marker_stamp(&path), "1000");
             let sibling = dir.join("sibling");
             assert!(
                 std::fs::File::create(&sibling).is_ok(),
@@ -3585,15 +3840,12 @@ mod tests {
                 "{verdict:?}"
             );
             assert!(verdict.to_string().contains(&path.display().to_string()));
-            let reason = initialize_beacon_health(&path).unwrap_err();
+            let reason = initialize_beacon_health(&path, &generation()).unwrap_err();
             assert!(reason.contains("could not be removed either"), "{reason}");
 
             // The marker was neither damaged nor moved, and nothing was left
             // behind next to it.
-            assert_eq!(
-                std::fs::read_to_string(&path).expect("marker readable"),
-                "v1 1000\n"
-            );
+            assert_eq!(marker_stamp(&path), "1000");
             assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
 
             unprotect_marker(&path);
@@ -3631,10 +3883,10 @@ mod tests {
         let dir = kernel_fixture("acl-marker");
         std::fs::create_dir(&dir).expect("create location");
         let path = dir.join("pharos-beacon-health-v1");
-        write_beacon_health(&path, 1_000).expect("write recent marker");
+        write_marker(&path, 1_000).expect("write recent marker");
         set_deny_delete_acl(&path, true);
         assert!(
-            write_beacon_health(&path, 1_005).is_err(),
+            write_marker(&path, 1_005).is_err(),
             "the ACL must really refuse replacing the marker"
         );
 
@@ -3644,10 +3896,7 @@ mod tests {
             beacon_health_verdict(&path, 60, 1_010),
             Err(BeaconHealthProblem::LocationUnwritable { .. })
         ));
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("marker readable"),
-            "v1 1000\n"
-        );
+        assert_eq!(marker_stamp(&path), "1000");
         // The deny-delete ACL also pins the probe link; a repeated probe
         // reports the leftover instead of piling up more.
         let error = probe_beacon_health_location(&path).unwrap_err();
@@ -3671,7 +3920,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1700))
             .expect("sticky location");
         let path = dir.join("pharos-beacon-health-v1");
-        write_beacon_health(&path, 1_000).expect("write recent marker");
+        write_marker(&path, 1_000).expect("write recent marker");
         assert_eq!(probe_beacon_health_location(&path), Ok(()));
         assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
         assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
@@ -3684,8 +3933,8 @@ mod tests {
         let dir = kernel_fixture("startup-reset");
         std::fs::create_dir(&dir).expect("create location");
         let path = dir.join("pharos-beacon-health-v1");
-        write_beacon_health(&path, 1_000).expect("write previous-run marker");
-        assert_eq!(initialize_beacon_health(&path), Ok(()));
+        write_marker(&path, 1_000).expect("write previous-run marker");
+        assert_eq!(initialize_beacon_health(&path, &generation()), Ok(()));
         assert_eq!(
             beacon_health_verdict(&path, 60, 1_010),
             Err(BeaconHealthProblem::NoSuccessfulReportYet)
@@ -3693,7 +3942,7 @@ mod tests {
 
         // Reset that cannot write but can still unlink: the prior state is
         // removed, never written into.
-        write_beacon_health(&path, 1_000).expect("write previous-run marker");
+        write_marker(&path, 1_000).expect("write previous-run marker");
         assert!(invalidate_beacon_health(&path).is_ok());
         assert!(matches!(
             read_beacon_health(&path),
@@ -3707,7 +3956,7 @@ mod tests {
         let blocker = kernel_fixture("startup-reset-parent-is-a-file");
         std::fs::write(&blocker, "not a directory\n").expect("write blocking file");
         let inside = blocker.join("pharos-beacon-health-v1");
-        let reason = initialize_beacon_health(&inside).unwrap_err();
+        let reason = initialize_beacon_health(&inside, &generation()).unwrap_err();
         assert!(reason.contains(&inside.display().to_string()), "{reason}");
         assert!(
             reason.contains("could not initialize container health state"),
@@ -3724,16 +3973,13 @@ mod tests {
         // refuses it. Skipped only when the user bypasses permission bits.
         #[cfg(unix)]
         {
-            write_beacon_health(&path, 1_000).expect("write previous-run marker");
+            write_marker(&path, 1_000).expect("write previous-run marker");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
                 .expect("read-only marker");
             if make_location_unwritable(&dir) {
-                let reason = initialize_beacon_health(&path).unwrap_err();
+                let reason = initialize_beacon_health(&path, &generation()).unwrap_err();
                 assert!(reason.contains("could not be removed either"), "{reason}");
-                assert_eq!(
-                    std::fs::read_to_string(&path).expect("marker still readable"),
-                    "v1 1000\n"
-                );
+                assert_eq!(marker_stamp(&path), "1000");
                 assert!(matches!(
                     beacon_health_verdict(&path, 60, 1_010),
                     Err(BeaconHealthProblem::LocationUnwritable { .. })
@@ -3782,9 +4028,9 @@ mod tests {
         // A startup reset in a writable directory replaces the symlink name
         // with a real marker by rename; the target is untouched.
         symlink(&valuable, &path).expect("plant symlink at marker path");
-        assert_eq!(initialize_beacon_health(&path), Ok(()));
+        assert_eq!(initialize_beacon_health(&path, &generation()), Ok(()));
         assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1 0\n");
+        assert_eq!(marker_stamp(&path), "0");
         assert_eq!(std::fs::read_to_string(&valuable).unwrap(), VALUABLE);
 
         // The reported defect: symlink at the marker path inside a directory
@@ -3795,7 +4041,7 @@ mod tests {
         std::fs::remove_file(&path).expect("remove marker");
         symlink(&valuable, &path).expect("plant symlink at marker path");
         if make_location_unwritable(&dir) {
-            let reason = initialize_beacon_health(&path).unwrap_err();
+            let reason = initialize_beacon_health(&path, &generation()).unwrap_err();
             assert!(reason.contains("could not be removed either"), "{reason}");
             assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
             assert!(matches!(
@@ -3803,7 +4049,7 @@ mod tests {
                 Err(BeaconHealthProblem::LocationUnwritable { .. })
             ));
         } else {
-            assert_eq!(initialize_beacon_health(&path), Ok(()));
+            assert_eq!(initialize_beacon_health(&path, &generation()), Ok(()));
         }
         assert_eq!(std::fs::read_to_string(&valuable).unwrap(), VALUABLE);
         restore_location(&dir, &path);
@@ -3819,7 +4065,7 @@ mod tests {
         let dir = kernel_fixture("crash-leftovers");
         std::fs::create_dir(&dir).expect("create location");
         let path = dir.join("pharos-beacon-health-v1");
-        write_beacon_health(&path, 1_000).expect("write recent marker");
+        write_marker(&path, 1_000).expect("write recent marker");
         let old_inode = dir.join("old-inode");
         std::fs::write(&old_inode, "stale\n").expect("write old inode");
         let leftovers = [
@@ -3841,28 +4087,25 @@ mod tests {
         std::fs::hard_link(&old_inode, &leftovers[2]).expect("stale probe link");
         std::fs::remove_file(&old_inode).expect("drop old inode name");
 
-        // The probe recovers its own two artifacts. It leaves the beacon's
-        // write temp alone (a live beacon may be mid-write); that one is
-        // bounded to a single name and recovered by the next write.
+        // Under the marker lock no write is in flight, so the probe recovers
+        // all three artifacts, the beacon's write temp included.
         assert_eq!(probe_beacon_health_location(&path), Ok(()));
         assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
-        assert_eq!(
-            entries(&dir),
-            vec![
-                ".pharos-beacon-health-v1.tmp".to_string(),
-                "pharos-beacon-health-v1".to_string()
-            ]
-        );
-        write_beacon_health(&path, 1_000).expect("write recovers its temp");
         assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
+        assert!(
+            beacon_health_sibling_path(&path, BEACON_HEALTH_LOCK)
+                .unwrap()
+                .is_file(),
+            "the lock is the only artifact that stays"
+        );
 
         // A stale probe link to the current marker is recovered the same way,
         // and the marker itself is not affected.
         std::fs::hard_link(&path, &leftovers[2]).expect("stale probe link");
         std::fs::write(&leftovers[0], "partial").expect("stale write temp");
-        write_beacon_health(&path, 1_005).expect("write over leftovers");
+        write_marker(&path, 1_005).expect("write over leftovers");
         assert_eq!(probe_beacon_health_location(&path), Ok(()));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1 1005\n");
+        assert_eq!(marker_stamp(&path), "1005");
         assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
         std::fs::remove_dir_all(&dir).expect("remove location");
     }
@@ -3957,10 +4200,16 @@ mod tests {
             .expect("sticky world-writable location");
         chown(&dir, Some(dir_owner), Some(dir_owner)).expect("chown directory");
         let path = dir.join("pharos-beacon-health-v1");
-        write_beacon_health(&path, 1_000).expect("write recent marker");
+        write_marker(&path, 1_000).expect("write recent marker");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
             .expect("world read-write marker");
         chown(&path, Some(marker_owner), Some(marker_owner)).expect("chown marker");
+        // Beacon and probe normally share one user; here root created the
+        // lock, so let the switched uids open it as they would their own.
+        let lock = beacon_health_sibling_path(&path, BEACON_HEALTH_LOCK).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666))
+            .expect("shared lock");
+        chown(&lock, Some(dir_owner), Some(dir_owner)).expect("chown lock");
         // The fixture directory's parent must be traversable by those uids.
         let parent = dir.parent().expect("fixture parent");
         let parent_mode = std::fs::metadata(parent).expect("parent").mode() & 0o7777;
@@ -3972,7 +4221,7 @@ mod tests {
         assert!(run_as(marker_owner, &path, true), "marker owner must pass");
         assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
         assert!(run_as(65532, &path, false), "third uid must be refused");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1 1000\n");
+        assert_eq!(marker_stamp(&path), "1000");
         // The refused uid could link the marker but can neither rename over
         // nor unlink that link in the sticky directory: at most the one
         // fixed-name leftover remains, which the next permitted probe removes.
@@ -3987,6 +4236,190 @@ mod tests {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(parent_mode))
             .expect("restore parent");
         std::fs::remove_dir_all(&dir).expect("remove location");
+    }
+
+    #[test]
+    fn markers_are_trusted_only_while_their_writing_process_runs() {
+        let dir = kernel_fixture("generation");
+        std::fs::create_dir(&dir).expect("create location");
+        let path = dir.join("pharos-beacon-health-v1");
+
+        // Written by this process: healthy while it runs (it does).
+        write_marker(&path, 1_000).expect("write own marker");
+        assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
+        assert_eq!(read_beacon_health(&path).unwrap().generation, generation());
+
+        // Written by a beacon from before process generations: never trusted.
+        std::fs::write(&path, "v1 1000\n").expect("write v1 marker");
+        let old = beacon_health_verdict(&path, 60, 1_010).unwrap_err();
+        assert!(
+            matches!(
+                old,
+                BeaconHealthProblem::NotCurrentGeneration { pid: 0, .. }
+            ),
+            "{old:?}"
+        );
+        assert!(
+            old.to_string().contains("predates process generations"),
+            "{old}"
+        );
+
+        // Written by another live process: trusted exactly as long as that
+        // process lives, and not one probe longer, whatever the timestamp.
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeper");
+        let other = ProcessGeneration::for_pid(child.id()).expect("child generation");
+        assert_ne!(other, generation());
+        write_beacon_health(&path, 1_000, &other).expect("write marker as child");
+        assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
+        child.kill().expect("kill sleeper");
+        child.wait().expect("reap sleeper");
+        let gone = beacon_health_verdict(&path, 60, 1_010).unwrap_err();
+        match &gone {
+            BeaconHealthProblem::NotCurrentGeneration { pid, detail, .. } => {
+                assert_eq!(*pid, child.id());
+                assert!(
+                    detail.contains("not running") || detail.contains("different process"),
+                    "{detail}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            gone.to_string().contains("only a successful report"),
+            "{gone}"
+        );
+        // Lifting every filesystem obstacle changes nothing: the pid is gone.
+        assert_eq!(probe_beacon_health_location(&path), Ok(()));
+        assert!(matches!(
+            beacon_health_verdict(&path, 60, 1_010),
+            Err(BeaconHealthProblem::NotCurrentGeneration { .. })
+        ));
+        // A successful write by the current process restores health.
+        write_marker(&path, 1_005).expect("current process reports");
+        assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(5));
+        std::fs::remove_dir_all(&dir).expect("remove location");
+    }
+
+    #[test]
+    fn concurrent_writer_and_probe_never_race_or_report_falsely() {
+        // A beacon refreshing as fast as it can while the container probe
+        // runs back to back: every write and every probe succeeds, every
+        // verdict is healthy, and nothing but the lock is left behind.
+        let dir = kernel_fixture("concurrent");
+        std::fs::create_dir(&dir).expect("create location");
+        let path = dir.join("pharos-beacon-health-v1");
+        write_marker(&path, 1_000).expect("write initial marker");
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let generation = generation();
+            (0..300).all(|i| write_beacon_health(&writer_path, 1_000 + i, &generation).is_ok())
+        });
+        let mut probes = 0;
+        let mut healthy = 0;
+        for _ in 0..300 {
+            match beacon_health_verdict(&path, 120, 1_300) {
+                Ok(_) => healthy += 1,
+                Err(problem) => panic!("probe under concurrent writes failed: {problem}"),
+            }
+            probes += 1;
+        }
+        assert!(
+            writer.join().expect("writer thread"),
+            "every write must succeed"
+        );
+        assert_eq!(healthy, probes);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .split_whitespace()
+                .nth(1),
+            Some("1299")
+        );
+        assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
+        std::fs::remove_dir_all(&dir).expect("remove location");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_blocked_writer_temp_makes_the_check_unhealthy() {
+        // The writer's fixed temp is immutable: the beacon can neither reuse
+        // nor remove it, so no refresh can ever land. A recent marker must
+        // not read as healthy while that is the case.
+        let dir = kernel_fixture("immutable-writer-temp");
+        std::fs::create_dir(&dir).expect("create location");
+        let path = dir.join("pharos-beacon-health-v1");
+        write_marker(&path, 1_000).expect("write recent marker");
+        let temp = beacon_health_sibling_path(&path, BEACON_HEALTH_WRITE_TEMP).unwrap();
+        std::fs::write(&temp, "partial\n").expect("plant writer temp");
+        if protect_marker(&temp) {
+            assert!(
+                write_marker(&path, 1_005).is_err(),
+                "refresh must be blocked"
+            );
+            let verdict = beacon_health_verdict(&path, 60, 1_010).unwrap_err();
+            match &verdict {
+                BeaconHealthProblem::LocationUnwritable { error, .. } => {
+                    assert!(error.contains(&temp.display().to_string()), "{error}");
+                    assert!(error.contains("cannot be refreshed"), "{error}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1),
+                Some("1000")
+            );
+            unprotect_marker(&temp);
+            assert_eq!(beacon_health_verdict(&path, 60, 1_010), Ok(10));
+            assert_eq!(entries(&dir), vec!["pharos-beacon-health-v1".to_string()]);
+            assert!(write_marker(&path, 1_005).is_ok());
+        } else {
+            eprintln!(
+                "note: no file-level immutability available for this user/filesystem; \
+                 skipping the immutable writer temp case"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("remove location");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_lock_path_fails_closed_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let elsewhere = kernel_fixture("lock-target-location");
+        std::fs::create_dir(&elsewhere).expect("create target location");
+        let valuable = elsewhere.join("valuable");
+        std::fs::write(&valuable, "valuable-data-must-survive\n").expect("write valuable");
+        let dir = kernel_fixture("symlinked-lock");
+        std::fs::create_dir(&dir).expect("create location");
+        let path = dir.join("pharos-beacon-health-v1");
+        symlink(
+            &valuable,
+            beacon_health_sibling_path(&path, BEACON_HEALTH_LOCK).unwrap(),
+        )
+        .expect("plant symlink at lock path");
+        let error = lock_beacon_health(&path).unwrap_err();
+        assert!(error.contains("marker lock"), "{error}");
+        assert!(write_marker(&path, 1_000).is_err());
+        assert!(matches!(
+            beacon_health_verdict(&path, 60, 1_010),
+            Err(BeaconHealthProblem::LocationUnwritable { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&valuable).unwrap(),
+            "valuable-data-must-survive\n"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove location");
+        std::fs::remove_dir_all(&elsewhere).expect("remove target location");
     }
 
     #[test]
