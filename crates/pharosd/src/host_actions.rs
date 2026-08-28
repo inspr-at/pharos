@@ -3104,7 +3104,6 @@ pub(crate) struct AgentActionLease {
     pub(crate) id: String,
     pub(crate) host: String,
     pub(crate) ticket: String,
-    pub(crate) intent: UpdateRestartIntent,
     pub(crate) phase: AgentActionPhase,
 }
 
@@ -4599,12 +4598,14 @@ impl HostActionStore {
             None,
         );
         let lease = AgentActionLease {
-            schema: "inspr.pharos.host-action-lease.v2",
-            version: 2,
+            // The deployed nixcfg consumer requires this exact v1 six-field
+            // envelope and PHAROS-126 ticket. PHAROS-216 intent/provenance is
+            // control-plane state, not target-agent wire authority.
+            schema: "inspr.pharos.host-action-lease.v1",
+            version: 1,
             id: job.id.clone(),
             host: job.host.clone(),
-            ticket: job.ticket.clone(),
-            intent: job.update_restart_intent(),
+            ticket: "PHAROS-126".to_string(),
             phase,
         };
         let id = job.id.clone();
@@ -5942,7 +5943,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_declared_intent_survives_the_agent_contract_and_skips_unneeded_restart() {
+    fn apply_declared_intent_stays_control_plane_only_and_skips_unneeded_restart() {
         let path = std::env::temp_dir().join(format!(
             "pharos-apply-declared-{}-{}.json",
             std::process::id(),
@@ -5968,9 +5969,19 @@ mod tests {
         );
 
         let review = store.claim("hsb8", 121).expect("claim").expect("lease");
-        assert_eq!(review.schema, "inspr.pharos.host-action-lease.v2");
-        assert_eq!(review.version, 2);
-        assert_eq!(review.intent, UpdateRestartIntent::ApplyDeclared);
+        let actual = serde_json::to_value(&review).expect("lease serializes");
+        let mut expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/nixcfg-host-action-lease-v1.json"
+        ))
+        .expect("nixcfg contract fixture parses");
+        // Action IDs include a process-global counter. Normalize only that
+        // value; every authority-bearing declaration and the exact key set
+        // remain pinned to the deployed cross-repository consumer contract.
+        expected["id"] = actual["id"].clone();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.as_object().expect("lease object").len(), 6);
+        assert_eq!(review.id, job.id);
+        assert_eq!(review.ticket, "PHAROS-126");
 
         let mut plan = ready_plan();
         plan.restart_required = false;
@@ -6004,7 +6015,17 @@ mod tests {
         );
 
         let apply = store.claim("hsb8", 124).expect("claim").expect("lease");
-        assert_eq!(apply.intent, UpdateRestartIntent::ApplyDeclared);
+        assert_eq!(apply.schema, "inspr.pharos.host-action-lease.v1");
+        assert_eq!(apply.version, 1);
+        assert_eq!(apply.ticket, "PHAROS-126");
+        assert_eq!(
+            serde_json::to_value(&apply)
+                .expect("apply lease serializes")
+                .as_object()
+                .expect("apply lease object")
+                .len(),
+            6
+        );
         assert_eq!(
             store.record_agent_result(
                 &job.id,

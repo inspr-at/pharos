@@ -500,7 +500,9 @@ host whose manifest requires Janus. It uses the same fresh-backup and attended
 confirmation gates as an update, and skips the restart step when the reviewed
 plan says no restart is required. One update/restart workflow holds the fleet
 lock at a time; other eligible hosts name the blocking host instead of issuing
-a request that would be rejected.
+a request that would be rejected. The target-agent lease deliberately remains
+the deployed v1 six-field `PHAROS-126` envelope; intent and `PHAROS-216`
+provenance stay in Pharos's durable job, events and summary.
 
 Each workflow persists:
 
