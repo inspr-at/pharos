@@ -13,8 +13,10 @@
 //!      PHAROS_NIXPKGS_CHANNEL_BASE_URL (authoritative channel publication),
 //!      PHAROS_NIXPKGS_REMOTE_URL (legacy/custom authoritative Git fallback),
 //!      PHAROS_TOKEN / PHAROS_TOKEN_FILE (per-host bearer token from /register),
-//!      PHAROS_BACKUP_MODE (auto/off/restic/status-file/command).
+//!      PHAROS_BACKUP_MODE (auto/off/restic/status-file/command),
+//!      PHAROS_SERVICE_OBSERVATION_MODE (auto/off/compose; fixed local probe).
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -33,7 +35,7 @@ use pharos_core::{
     HostPreferencesRegistry, HostReport, HostReportResponse, KernelPosture, NixDeploymentEvidence,
     NixFreshness, NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness,
     NixpkgsRevisionRelation, ServiceObservation, ServiceObservationState, HOST_REPORT_SCHEMA,
-    HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS,
+    HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS, MAX_SERVICE_OBSERVATIONS,
     MIN_HEARTBEAT_INTERVAL_SECS,
 };
 use sha2::{Digest, Sha256};
@@ -51,6 +53,10 @@ const MAX_FLAKE_LOCK_BYTES: u64 = 8 * 1024 * 1024;
 const BEACON_HEALTH_PATH: &str = "/tmp/pharos-beacon-health-v1";
 const BEACON_HEALTH_PATH_ENV: &str = "PHAROS_BEACON_HEALTH_FILE";
 const BEACON_HEALTH_STALE_INTERVALS: u64 = 3;
+const COMPOSE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const COMPOSE_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
+const DEFAULT_SERVICE_OBSERVATION_INTERVAL_SECS: u64 = 300;
+const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportEndpoint {
@@ -2051,6 +2057,395 @@ fn collect_backup_observations(now: i64) -> Vec<BackupObservation> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceObservationMode {
+    Off,
+    Auto,
+    Compose,
+    Invalid,
+}
+
+impl ServiceObservationMode {
+    fn from_env_value(value: Option<String>) -> Self {
+        match value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("auto") => Self::Auto,
+            Some("off") | Some("none") | Some("disabled") => Self::Off,
+            Some("compose") | Some("docker-compose") => Self::Compose,
+            Some(_) => Self::Invalid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeHealth {
+    Healthy,
+    Unhealthy,
+    Starting,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposeContainer {
+    project: String,
+    service: String,
+    running: bool,
+    health: ComposeHealth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ComposeService {
+    project: String,
+    service: String,
+    replicas: usize,
+    running: usize,
+    healthy: usize,
+    unhealthy: usize,
+    starting: usize,
+    without_healthcheck: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComposeSnapshot {
+    NotApplicable,
+    Unavailable(&'static str),
+    Services(Vec<ComposeService>),
+}
+
+#[derive(Debug)]
+struct ServiceObservationCache {
+    mode: ServiceObservationMode,
+    refresh_interval: Duration,
+    last_collected: Option<Instant>,
+    snapshot: ComposeSnapshot,
+}
+
+impl ServiceObservationCache {
+    fn from_env() -> Self {
+        let mut mode =
+            ServiceObservationMode::from_env_value(env_value("PHAROS_SERVICE_OBSERVATION_MODE"));
+        let refresh_interval = match service_observation_interval(env_value(
+            "PHAROS_SERVICE_OBSERVATION_INTERVAL_SECS",
+        )) {
+            Ok(interval) => interval,
+            Err(_) => {
+                mode = ServiceObservationMode::Invalid;
+                Duration::from_secs(DEFAULT_SERVICE_OBSERVATION_INTERVAL_SECS)
+            }
+        };
+        Self {
+            mode,
+            refresh_interval,
+            last_collected: None,
+            snapshot: ComposeSnapshot::NotApplicable,
+        }
+    }
+
+    fn observations(&mut self, limit: usize) -> Vec<ServiceObservation> {
+        if self.mode == ServiceObservationMode::Off || limit == 0 {
+            return Vec::new();
+        }
+        if self
+            .last_collected
+            .is_none_or(|at| at.elapsed() >= self.refresh_interval)
+        {
+            self.snapshot = collect_compose_snapshot(self.mode);
+            self.last_collected = Some(Instant::now());
+        }
+        compose_snapshot_observations(&self.snapshot, limit)
+    }
+}
+
+fn service_observation_interval(value: Option<String>) -> Result<Duration, &'static str> {
+    match value {
+        None => Ok(Duration::from_secs(
+            DEFAULT_SERVICE_OBSERVATION_INTERVAL_SECS,
+        )),
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (60..=3_600).contains(seconds))
+            .map(Duration::from_secs)
+            .ok_or("invalid_interval"),
+    }
+}
+
+fn valid_compose_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn parse_compose_health(state: &str, health: &str) -> Result<ComposeHealth, &'static str> {
+    if state != "running" {
+        return Ok(ComposeHealth::Missing);
+    }
+    match health {
+        "healthy" => Ok(ComposeHealth::Healthy),
+        "unhealthy" => Ok(ComposeHealth::Unhealthy),
+        "starting" => Ok(ComposeHealth::Starting),
+        "" => Ok(ComposeHealth::Missing),
+        _ => Err("invalid_output"),
+    }
+}
+
+fn parse_compose_containers(raw: &str) -> Result<Vec<ComposeContainer>, &'static str> {
+    let mut containers = Vec::new();
+    for line in raw.lines().filter(|line| !line.is_empty()) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 5
+            || !valid_compose_name(fields[0])
+            || !valid_compose_name(fields[1])
+            || !matches!(fields[2], "" | "False" | "false" | "True" | "true")
+            || fields[3].is_empty()
+            || fields[3].len() > 32
+            || !fields[3].bytes().all(|byte| byte.is_ascii_lowercase())
+        {
+            return Err("invalid_output");
+        }
+        let health = parse_compose_health(fields[3], fields[4])?;
+        if matches!(fields[2], "True" | "true") {
+            continue;
+        }
+        containers.push(ComposeContainer {
+            project: fields[0].to_string(),
+            service: fields[1].to_string(),
+            running: fields[3] == "running",
+            health,
+        });
+    }
+    Ok(containers)
+}
+
+fn aggregate_compose_services(containers: Vec<ComposeContainer>) -> Vec<ComposeService> {
+    let mut services = BTreeMap::<(String, String), ComposeService>::new();
+    for container in containers {
+        let key = (container.project.clone(), container.service.clone());
+        let service = services.entry(key).or_insert_with(|| ComposeService {
+            project: container.project,
+            service: container.service,
+            ..ComposeService::default()
+        });
+        service.replicas += 1;
+        service.running += usize::from(container.running);
+        match container.health {
+            ComposeHealth::Healthy => service.healthy += 1,
+            ComposeHealth::Unhealthy => service.unhealthy += 1,
+            ComposeHealth::Starting => service.starting += 1,
+            ComposeHealth::Missing if container.running => service.without_healthcheck += 1,
+            ComposeHealth::Missing => {}
+        }
+    }
+    services.into_values().collect()
+}
+
+fn compose_service_id(project: &str, service: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(project.as_bytes());
+    digest.update([0]);
+    digest.update(service.as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    format!("compose-{}", &digest[..24])
+}
+
+fn compose_service_observation(service: &ComposeService) -> ServiceObservation {
+    let (state, summary) = if service.running != service.replicas || service.unhealthy > 0 {
+        let failed = service.replicas.saturating_sub(service.running) + service.unhealthy;
+        (
+            ServiceObservationState::Warning,
+            format!(
+                "{}/{} replicas running; {failed} failed or unhealthy",
+                service.running, service.replicas
+            ),
+        )
+    } else if service.starting > 0 {
+        (
+            ServiceObservationState::Unknown,
+            format!(
+                "{}/{} replicas running; {} healthcheck(s) starting",
+                service.running, service.replicas, service.starting
+            ),
+        )
+    } else if service.without_healthcheck > 0 {
+        (
+            ServiceObservationState::Unknown,
+            format!(
+                "{}/{} replicas running; {}/{} without healthcheck",
+                service.running, service.replicas, service.without_healthcheck, service.replicas
+            ),
+        )
+    } else {
+        (
+            ServiceObservationState::Healthy,
+            format!(
+                "{}/{} replicas running; healthchecks healthy",
+                service.running, service.replicas
+            ),
+        )
+    };
+    let id = compose_service_id(&service.project, &service.service);
+    let mut observation = ServiceObservation {
+        id: id.clone(),
+        label: format!("{} / {}", service.project, service.service),
+        state,
+        summary,
+    };
+    if observation.validate_contract().is_err() {
+        observation.label = format!("Compose service {}", &id[8..20]);
+    }
+    observation
+}
+
+fn compose_snapshot_observations(
+    snapshot: &ComposeSnapshot,
+    limit: usize,
+) -> Vec<ServiceObservation> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    match snapshot {
+        ComposeSnapshot::NotApplicable => Vec::new(),
+        ComposeSnapshot::Unavailable(reason) => vec![ServiceObservation {
+            id: "compose-discovery".to_string(),
+            label: "Compose discovery".to_string(),
+            state: ServiceObservationState::Unknown,
+            summary: (*reason).to_string(),
+        }],
+        ComposeSnapshot::Services(services) if services.len() <= limit => {
+            services.iter().map(compose_service_observation).collect()
+        }
+        ComposeSnapshot::Services(services) => {
+            let keep = limit.saturating_sub(1);
+            let mut observations = services
+                .iter()
+                .take(keep)
+                .map(compose_service_observation)
+                .collect::<Vec<_>>();
+            observations.push(ServiceObservation {
+                id: "compose-overflow".to_string(),
+                label: "Compose services".to_string(),
+                state: ServiceObservationState::Warning,
+                summary: format!(
+                    "{} additional service(s) omitted by the report limit",
+                    services.len().saturating_sub(keep)
+                ),
+            });
+            observations
+        }
+    }
+}
+
+fn docker_socket_path() -> Result<PathBuf, &'static str> {
+    let path = env_value("PHAROS_DOCKER_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DOCKER_SOCKET));
+    if !path.is_absolute()
+        || path.as_os_str().len() > 4_096
+        || path.to_str().is_none()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("Compose discovery configuration is invalid");
+    }
+    Ok(path)
+}
+
+fn run_compose_command(command: &str, socket: &Path) -> Result<String, &'static str> {
+    let socket = socket
+        .to_str()
+        .ok_or("Compose discovery configuration is invalid")?;
+    let mut command = Command::new(command);
+    command
+        .args([
+            "--host",
+            &format!("unix://{socket}"),
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.HealthStatus}}",
+        ])
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("DOCKER_TLS_VERIFY")
+        .env_remove("DOCKER_CERT_PATH")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    isolate_process_group(&mut command);
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "docker_not_found"
+        } else {
+            "docker_spawn_failed"
+        }
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| drain_bounded(pipe, COMPOSE_COMMAND_OUTPUT_LIMIT_BYTES))
+        .ok_or("Compose discovery output unavailable")?;
+    let deadline = Instant::now() + COMPOSE_COMMAND_TIMEOUT;
+    let status = wait_for_child(&mut child, deadline).map_err(|reason| match reason {
+        "timeout" => "Compose discovery timed out",
+        _ => "Compose discovery process failed",
+    })?;
+    let stdout = collect_bounded(&stdout, deadline)
+        .and_then(output_string)
+        .map_err(|reason| match reason {
+            "output_limit" => "Compose discovery output exceeded the limit",
+            _ => "Compose discovery output unavailable",
+        })?;
+    if !status.success() {
+        return Err("Compose discovery failed");
+    }
+    Ok(stdout)
+}
+
+fn collect_compose_snapshot(mode: ServiceObservationMode) -> ComposeSnapshot {
+    if mode == ServiceObservationMode::Invalid {
+        return ComposeSnapshot::Unavailable("Compose discovery configuration is invalid");
+    }
+    let socket = match docker_socket_path() {
+        Ok(path) => path,
+        Err(reason) => return ComposeSnapshot::Unavailable(reason),
+    };
+    collect_compose_snapshot_at(mode, &socket, "docker")
+}
+
+fn collect_compose_snapshot_at(
+    mode: ServiceObservationMode,
+    socket: &Path,
+    command: &str,
+) -> ComposeSnapshot {
+    if mode == ServiceObservationMode::Auto && !socket.exists() {
+        return ComposeSnapshot::NotApplicable;
+    }
+    let raw = match run_compose_command(command, socket) {
+        Ok(raw) => raw,
+        Err("docker_not_found") => {
+            return ComposeSnapshot::Unavailable("Docker CLI is unavailable");
+        }
+        Err(reason) => return ComposeSnapshot::Unavailable(reason),
+    };
+    match parse_compose_containers(&raw) {
+        Ok(containers) => ComposeSnapshot::Services(aggregate_compose_services(containers)),
+        Err(_) => ComposeSnapshot::Unavailable("Compose discovery returned invalid status"),
+    }
+}
+
 fn backup_log_summary(observations: &[BackupObservation]) -> String {
     if observations.is_empty() {
         return "backup=not-observed".to_string();
@@ -2165,6 +2560,7 @@ fn main() {
     let agent = deadlines.agent();
     let mut last_report_rtt_ms: Option<u64> = None;
     let mut consecutive_failures = 0_u32;
+    let mut service_observation_cache = ServiceObservationCache::from_env();
     let health_path = beacon_health_path();
     if interval.is_some() && write_beacon_health(&health_path, 0).is_err() {
         eprintln!(
@@ -2229,6 +2625,10 @@ fn main() {
         if let Some(error) = preferences_apply_error {
             service_observations.push(error.observation());
         }
+        let remaining_service_observations =
+            MAX_SERVICE_OBSERVATIONS.saturating_sub(service_observations.len());
+        service_observations
+            .extend(service_observation_cache.observations(remaining_service_observations));
         let observed_at = now_unix();
         let kernel = collect_kernel_posture(is_nix, observed_at);
         let location = collect_location(observed_at);
@@ -2355,6 +2755,232 @@ mod tests {
             std::fs::create_dir(expected_path.join(version)).expect("create version fixture");
         }
         (running_path, expected_path)
+    }
+
+    #[test]
+    fn compose_observations_aggregate_replicas_and_keep_unknown_honest() {
+        let raw = concat!(
+            "alpha\tweb\tFalse\trunning\thealthy\n",
+            "alpha\tweb\tfalse\trunning\thealthy\n",
+            "alpha\tworker\t\trunning\t\n",
+            "beta\tapi\tFalse\texited\t\n",
+            "beta\tapi\tFalse\trunning\tunhealthy\n",
+            "beta\toneoff\tTrue\texited\t\n",
+        );
+        let services = aggregate_compose_services(
+            parse_compose_containers(raw).expect("bounded Docker output parses"),
+        );
+        assert_eq!(
+            services
+                .iter()
+                .map(|service| format!("{}/{}", service.project, service.service))
+                .collect::<Vec<_>>(),
+            vec!["alpha/web", "alpha/worker", "beta/api"]
+        );
+
+        let observations = compose_snapshot_observations(&ComposeSnapshot::Services(services), 63);
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0].state, ServiceObservationState::Healthy);
+        assert_eq!(
+            observations[0].summary,
+            "2/2 replicas running; healthchecks healthy"
+        );
+        assert_eq!(observations[1].state, ServiceObservationState::Unknown);
+        assert_eq!(
+            observations[1].summary,
+            "1/1 replicas running; 1/1 without healthcheck"
+        );
+        assert_eq!(observations[2].state, ServiceObservationState::Warning);
+        assert_eq!(
+            observations[2].summary,
+            "1/2 replicas running; 2 failed or unhealthy"
+        );
+        for observation in observations {
+            observation
+                .validate_contract()
+                .expect("Compose observation is contract-safe");
+        }
+    }
+
+    #[test]
+    fn compose_observations_fail_probe_and_malformed_rows_closed() {
+        for malformed in [
+            "alpha\tweb\tFalse\trunning\n",
+            "alpha\tweb\tFalse\trunning\thealthy\textra\n",
+            "alpha\t../../secret\tFalse\trunning\thealthy\n",
+            "alpha\tweb\tMaybe\trunning\thealthy\n",
+            "alpha\tweb\tFalse\trunning\tsecret\n",
+        ] {
+            assert_eq!(parse_compose_containers(malformed), Err("invalid_output"));
+        }
+        let unavailable = compose_snapshot_observations(
+            &ComposeSnapshot::Unavailable("Compose discovery failed"),
+            10,
+        );
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].id, "compose-discovery");
+        assert_eq!(unavailable[0].state, ServiceObservationState::Unknown);
+        assert_eq!(unavailable[0].summary, "Compose discovery failed");
+        assert!(compose_snapshot_observations(&ComposeSnapshot::NotApplicable, 10).is_empty());
+    }
+
+    #[test]
+    fn compose_observations_reserve_a_deterministic_overflow_slot() {
+        let services = (0..70)
+            .map(|index| ComposeService {
+                project: "fleet".to_string(),
+                service: format!("service-{index:02}"),
+                replicas: 1,
+                running: 1,
+                healthy: 1,
+                ..ComposeService::default()
+            })
+            .collect::<Vec<_>>();
+        let observations = compose_snapshot_observations(&ComposeSnapshot::Services(services), 5);
+        assert_eq!(observations.len(), 5);
+        assert_eq!(observations[0].label, "fleet / service-00");
+        assert_eq!(observations[3].label, "fleet / service-03");
+        assert_eq!(observations[4].id, "compose-overflow");
+        assert_eq!(
+            observations[4].summary,
+            "66 additional service(s) omitted by the report limit"
+        );
+    }
+
+    #[test]
+    fn compose_observations_never_publish_secret_shaped_labels_or_raw_status() {
+        let service = ComposeService {
+            project: "password-manager".to_string(),
+            service: "api".to_string(),
+            replicas: 1,
+            running: 1,
+            healthy: 1,
+            ..ComposeService::default()
+        };
+        let observation = compose_service_observation(&service);
+        observation
+            .validate_contract()
+            .expect("fallback label validates");
+        let encoded = serde_json::to_string(&observation).expect("observation serializes");
+        assert_eq!(observation.label.len(), "Compose service ".len() + 12);
+        assert!(!encoded.contains("password-manager"));
+        assert!(!encoded.contains("api"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_probe_uses_only_the_fixed_local_docker_query() {
+        let root = kernel_fixture("compose-command");
+        std::fs::create_dir_all(&root).expect("create command fixture");
+        let command = root.join("docker-fixture");
+        std::fs::write(
+            &command,
+            concat!(
+                "#!/bin/sh\n",
+                "test \"$#\" -eq 9 || exit 10\n",
+                "test \"$1\" = --host || exit 11\n",
+                "test \"$2\" = unix:///tmp/pharos-docker.sock || exit 12\n",
+                "test \"$3\" = container || exit 13\n",
+                "test \"$4\" = ls || exit 14\n",
+                "test \"$5\" = --all || exit 15\n",
+                "test \"$6\" = --filter || exit 16\n",
+                "test \"$7\" = label=com.docker.compose.project || exit 17\n",
+                "test \"$8\" = --format || exit 18\n",
+                "printf 'alpha\\tweb\\tFalse\\trunning\\thealthy\\n'\n",
+            ),
+        )
+        .expect("write command fixture");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
+            .expect("make command fixture executable");
+
+        let raw = run_compose_command(
+            &command.to_string_lossy(),
+            Path::new("/tmp/pharos-docker.sock"),
+        )
+        .expect("fixed local query succeeds");
+        assert_eq!(parse_compose_containers(&raw).unwrap().len(), 1);
+        assert_eq!(
+            collect_compose_snapshot_at(
+                ServiceObservationMode::Auto,
+                &root.join("missing.sock"),
+                &command.to_string_lossy()
+            ),
+            ComposeSnapshot::NotApplicable
+        );
+        assert_eq!(
+            collect_compose_snapshot_at(
+                ServiceObservationMode::Compose,
+                &root.join("missing.sock"),
+                &command.to_string_lossy()
+            ),
+            ComposeSnapshot::Unavailable("Compose discovery failed")
+        );
+
+        let failure = root.join("docker-failure");
+        std::fs::write(
+            &failure,
+            "#!/bin/sh\nprintf 'credential-bearing diagnostic' >&2\nexit 1\n",
+        )
+        .expect("write failure fixture");
+        std::fs::set_permissions(&failure, std::fs::Permissions::from_mode(0o700))
+            .expect("make failure fixture executable");
+        assert_eq!(
+            run_compose_command(
+                &failure.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock")
+            ),
+            Err("Compose discovery failed")
+        );
+
+        let oversized = root.join("docker-oversized");
+        std::fs::write(&oversized, "#!/bin/sh\nhead -c 140000 /dev/zero\n")
+            .expect("write oversized fixture");
+        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700))
+            .expect("make oversized fixture executable");
+        assert_eq!(
+            run_compose_command(
+                &oversized.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock")
+            ),
+            Err("Compose discovery output exceeded the limit")
+        );
+        std::fs::remove_dir_all(root).expect("remove command fixture");
+    }
+
+    #[test]
+    fn service_observation_mode_is_explicit_and_fail_closed() {
+        assert_eq!(
+            ServiceObservationMode::from_env_value(None),
+            ServiceObservationMode::Auto
+        );
+        assert_eq!(
+            ServiceObservationMode::from_env_value(Some(" compose ".to_string())),
+            ServiceObservationMode::Compose
+        );
+        assert_eq!(
+            ServiceObservationMode::from_env_value(Some("off".to_string())),
+            ServiceObservationMode::Off
+        );
+        assert_eq!(
+            ServiceObservationMode::from_env_value(Some("command".to_string())),
+            ServiceObservationMode::Invalid
+        );
+        assert_eq!(
+            service_observation_interval(None),
+            Ok(Duration::from_secs(300))
+        );
+        assert_eq!(
+            service_observation_interval(Some("60".to_string())),
+            Ok(Duration::from_secs(60))
+        );
+        assert_eq!(
+            service_observation_interval(Some("59".to_string())),
+            Err("invalid_interval")
+        );
+        assert_eq!(
+            service_observation_interval(Some("not-a-number".to_string())),
+            Err("invalid_interval")
+        );
     }
 
     #[test]

@@ -476,6 +476,9 @@ Collectors are explicit and bounded:
 - host identity, role and heartbeat interval;
 - Nix `flake.lock` age and commits behind the configured checkout;
 - running versus current kernel posture;
+- Compose services discovered through a fixed, local Docker query. Replica
+  failures are warnings, missing healthchecks stay unknown, and probe failure
+  is reported separately from service failure;
 - optional backup observations from Restic, a status file or a configured
   bounded command;
 - optional location from static configuration, a bounded command or an
@@ -485,6 +488,20 @@ Collectors are explicit and bounded:
 
 Unknown or malformed contract fields fail validation. A missing observation is
 shown as unknown rather than guessed.
+
+Service observation deliberately uses discovery, not the declared-host
+manifest: the useful signal is what Compose actually has, including stopped
+replicas. It groups containers by Compose project and service, ignores one-off
+jobs, sorts groups deterministically, and reserves the final available report
+slot for an overflow warning. The probe asks Docker only for Compose
+project/service/one-off labels, lifecycle state and coarse health state; raw
+inspect documents, environment, mounts, ports and probe payloads are never
+requested or reported. The local beacon user still needs permission to connect
+to the Docker socket;
+granting Docker-group access is root-equivalent and therefore remains an
+explicit host-operator decision. The collector interface is runtime-specific,
+so a future systemd collector can add fixed unit-state discovery without
+changing the report contract or creating a general inspection channel.
 
 ## Guarded operations
 
@@ -639,6 +656,9 @@ promised third-party API. The important boundaries are:
 | `PHAROS_NIXPKGS_CHANNEL_BASE_URL` | Optional credential-free HTTPS base for bounded `<channel>/git-revision` documents; overrides the automatic official channel base |
 | `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
 | `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
+| `PHAROS_SERVICE_OBSERVATION_MODE` | `auto` (default), `off` or `compose`; auto stays silent when the local Docker socket is absent, while an indicated but inaccessible or failed local probe reports unknown |
+| `PHAROS_SERVICE_OBSERVATION_INTERVAL_SECS` | Compose discovery cadence, 60–3600 seconds (default 300); cached coarse observations are carried on faster heartbeats |
+| `PHAROS_DOCKER_SOCKET` | Absolute local Docker Unix socket path (default `/var/run/docker.sock`); remote Docker endpoints are never used |
 | `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
 
 ### Read-only CLI

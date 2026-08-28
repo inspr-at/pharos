@@ -230,6 +230,7 @@ in
       after = [ "network-online.target" ];
 
       path = [
+        pkgs.docker-client
         pkgs.gitMinimal
         pkgs.restic
       ];
