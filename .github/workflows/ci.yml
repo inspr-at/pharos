@@ -101,6 +101,8 @@ jobs:
           PHAROS_ALLOWED_OPERATORS=email:alice@example.com \
           PHAROS_REGISTRATION_TOKEN_FILE=/run/secrets/test-registration-token \
           docker compose -f docker-compose.selfhost.yml config >/dev/null
+      - name: Compose observation Docker formatter contract
+        run: scripts/check-compose-observation-contract.sh
       - name: build
         run: cargo build --all --locked
       - name: persistence and alert failure injection
