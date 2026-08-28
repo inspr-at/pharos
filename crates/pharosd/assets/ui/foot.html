@@ -771,6 +771,7 @@ function setFreshRow(surface,kind,state){
     value.textContent=state.value;
   }
   if(typeof state.visible==='boolean'){
+    if(!state.visible&&document.activeElement===row)focusFreshnessFallback(surface,row);
     row.hidden=!state.visible;
     if(row.hidden&&activeFreshPopoverChip===row)hideFreshPopover();
   }
@@ -3816,6 +3817,32 @@ function hideFreshPopover(){
   if(activeFreshPopoverChip)activeFreshPopoverChip.removeAttribute('aria-describedby');
   activeFreshPopoverChip=null;
 }
+function focusFreshnessFallback(surface,current,preferred=[]){
+  const rail=current?.closest?.('.freshness-rail')||surface.querySelector('.freshness-rail');
+  const isAvailable=node=>Boolean(node)&&!node.hidden&&(
+    node.classList.contains('fresh-row-compact')
+      ||(node.classList.contains('fresh-chevron')&&node.classList.contains('visible'))
+      ||node.matches('[data-host-actions-trigger]')
+  );
+  let target=preferred.find(isAvailable)||null;
+  if(!target&&rail&&!rail.hidden&&current?.classList?.contains('fresh-row-compact')){
+    const chips=Array.from(rail.querySelectorAll('.fresh-row-compact'));
+    const index=chips.indexOf(current);
+    target=chips.slice(index+1).find(isAvailable)
+      ||chips.slice(0,Math.max(0,index)).reverse().find(isAvailable)
+      ||null;
+  }
+  if(!target&&rail&&!rail.hidden){
+    target=Array.from(rail.querySelectorAll('.fresh-chevron.visible')).find(isAvailable)||null;
+  }
+  if(!target)target=surface.querySelector('[data-host-actions-trigger]:not([hidden])');
+  if(target&&target!==current){
+    target.focus();
+    return;
+  }
+  surface.setAttribute('tabindex','-1');
+  surface.focus();
+}
 function updateFreshnessRailOverflow(rail){
   const container=rail.querySelector('[data-fresh-scroll-container]');
   const left=rail.querySelector('.fresh-chevron-left');
@@ -3823,8 +3850,12 @@ function updateFreshnessRailOverflow(rail){
   if(!container||!left||!right||rail.hidden)return;
   const canLeft=container.scrollLeft>1;
   const canRight=container.scrollLeft<container.scrollWidth-container.clientWidth-1;
+  const focused=document.activeElement;
   left.classList.toggle('visible',canLeft);
   right.classList.toggle('visible',canRight);
+  const surface=rail.closest('[data-host-surface="runtime"]');
+  if(surface&&focused===left&&!canLeft)focusFreshnessFallback(surface,left,canRight?[right]:[]);
+  if(surface&&focused===right&&!canRight)focusFreshnessFallback(surface,right,canLeft?[left]:[]);
   rail.dataset.overflowRight=canRight?'true':'false';
 }
 function syncFreshnessRail(surface){
@@ -3832,6 +3863,7 @@ function syncFreshnessRail(surface){
   if(!rail)return;
   const visible=Array.from(rail.querySelectorAll('.fresh-row-compact')).filter(chip=>!chip.hidden);
   rail.hidden=visible.length===0;
+  if(rail.hidden&&rail.contains(document.activeElement))focusFreshnessFallback(surface,document.activeElement);
   if(rail.hidden&&activeFreshPopoverChip&&rail.contains(activeFreshPopoverChip))hideFreshPopover();
   if(!rail.hidden)requestAnimationFrame(()=>updateFreshnessRailOverflow(rail));
 }

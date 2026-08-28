@@ -1154,6 +1154,19 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     await expect(faultRail.locator('[data-fresh-kind="nixpkgs-drift"]')).toBeVisible();
     await expect(faultRail.locator('[data-fresh-kind="nixcfg-drift"]')).toBeVisible();
     await expect(faultRail.locator('[data-fresh-kind="backup-fault"]')).toBeVisible();
+    const failedBackupValue = faultRail.locator(
+      '[data-fresh-kind="backup-fault"] [data-fresh-value]',
+    );
+    await expect(failedBackupValue).toHaveClass("down");
+    const failedBackupColors = await failedBackupValue.evaluate((value) => {
+      const probe = document.createElement("span");
+      probe.style.color = "var(--down)";
+      value.appendChild(probe);
+      const expected = getComputedStyle(probe).color;
+      probe.remove();
+      return { actual: getComputedStyle(value).color, expected };
+    });
+    expect(failedBackupColors.actual).toBe(failedBackupColors.expected);
     await expect(faultRail.locator('[data-fresh-kind="kernel-restart"]')).toBeVisible();
     await expect(faultRail.locator('[data-fresh-kind="deployed-sha"]')).toHaveCount(0);
     await expect(faultRail.locator('[data-fresh-kind="nixcfg-sha"]')).toHaveCount(0);
@@ -1223,6 +1236,18 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
           leavesPageScrollAtRight: true,
           consumesInwardScroll: true,
         });
+        const rightChevron = faultRail.locator(".fresh-chevron-right");
+        const leftChevron = faultRail.locator(".fresh-chevron-left");
+        await rightChevron.focus();
+        await expect(rightChevron).toBeFocused();
+        await faultRail.evaluate((rail) => {
+          const scroller = rail.querySelector("[data-fresh-scroll-container]");
+          scroller.style.scrollBehavior = "auto";
+          scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth;
+          scroller.dispatchEvent(new Event("scroll"));
+        });
+        await expect(rightChevron).not.toHaveClass(/visible/);
+        await expect(leftChevron).toBeFocused();
       }
     }
 
@@ -1278,6 +1303,7 @@ test("fault rail uses full card width, stays one line, and keeps quiet hashes in
     await expect(faultRail).toHaveAttribute("hidden", "");
     await expect(visibleFaults).toHaveCount(0);
     await expect(page.locator("[data-fresh-popover]")).toBeHidden();
+    await expect(faultCard).toBeFocused();
 
     expect(await page.evaluate((body) => applyFleetSnapshot(body), original)).toBe(true);
     await expect(faultRail).not.toHaveAttribute("hidden", "");
