@@ -657,7 +657,7 @@ promised third-party API. The important boundaries are:
 | `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
 | `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
 | `PHAROS_SERVICE_OBSERVATION_MODE` | `auto` (default), `off` or `compose`; auto stays silent when the local Docker socket is absent, while an indicated but inaccessible or failed local probe reports unknown |
-| `PHAROS_SERVICE_OBSERVATION_INTERVAL_SECS` | Compose discovery cadence, 60–3600 seconds (default 300); cached coarse observations are carried on faster heartbeats |
+| `PHAROS_SERVICE_OBSERVATION_INTERVAL_SECS` | Compose discovery cadence, 60–3600 seconds (default 300); cached coarse observations are carried on faster heartbeats and failed probes retry after at most 60 seconds |
 | `PHAROS_DOCKER_SOCKET` | Absolute local Docker Unix socket path (default `/var/run/docker.sock`); remote Docker endpoints are never used |
 | `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
 

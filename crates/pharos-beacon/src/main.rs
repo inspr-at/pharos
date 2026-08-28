@@ -57,6 +57,7 @@ const COMPOSE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const COMPOSE_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
 const DEFAULT_SERVICE_OBSERVATION_INTERVAL_SECS: u64 = 300;
 const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
+const COMPOSE_DOCKER_FORMAT: &str = "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.HealthStatus}}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportEndpoint {
@@ -2149,9 +2150,14 @@ impl ServiceObservationCache {
         if self.mode == ServiceObservationMode::Off || limit == 0 {
             return Vec::new();
         }
+        let refresh_interval = if matches!(self.snapshot, ComposeSnapshot::Unavailable(_)) {
+            self.refresh_interval.min(Duration::from_secs(60))
+        } else {
+            self.refresh_interval
+        };
         if self
             .last_collected
-            .is_none_or(|at| at.elapsed() >= self.refresh_interval)
+            .is_none_or(|at| at.elapsed() >= refresh_interval)
         {
             self.snapshot = collect_compose_snapshot(self.mode);
             self.last_collected = Some(Instant::now());
@@ -2191,7 +2197,7 @@ fn parse_compose_health(state: &str, health: &str) -> Result<ComposeHealth, &'st
         "healthy" => Ok(ComposeHealth::Healthy),
         "unhealthy" => Ok(ComposeHealth::Unhealthy),
         "starting" => Ok(ComposeHealth::Starting),
-        "" => Ok(ComposeHealth::Missing),
+        "" | "none" => Ok(ComposeHealth::Missing),
         _ => Err("invalid_output"),
     }
 }
@@ -2210,10 +2216,10 @@ fn parse_compose_containers(raw: &str) -> Result<Vec<ComposeContainer>, &'static
         {
             return Err("invalid_output");
         }
-        let health = parse_compose_health(fields[3], fields[4])?;
         if matches!(fields[2], "True" | "true") {
             continue;
         }
+        let health = parse_compose_health(fields[3], fields[4])?;
         containers.push(ComposeContainer {
             project: fields[0].to_string(),
             service: fields[1].to_string(),
@@ -2261,7 +2267,7 @@ fn compose_service_observation(service: &ComposeService) -> ServiceObservation {
         (
             ServiceObservationState::Warning,
             format!(
-                "{}/{} replicas running; {failed} failed or unhealthy",
+                "{}/{} replicas running; {failed} not running or unhealthy",
                 service.running, service.replicas
             ),
         )
@@ -2376,12 +2382,15 @@ fn run_compose_command(command: &str, socket: &Path) -> Result<String, &'static 
             "--filter",
             "label=com.docker.compose.project",
             "--format",
-            "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.HealthStatus}}",
+            COMPOSE_DOCKER_FORMAT,
         ])
         .env_remove("DOCKER_HOST")
         .env_remove("DOCKER_CONTEXT")
         .env_remove("DOCKER_TLS_VERIFY")
         .env_remove("DOCKER_CERT_PATH")
+        .env_remove("DOCKER_API_VERSION")
+        .env_remove("DOCKER_CUSTOM_HEADERS")
+        .env_remove("DOCKER_AUTH_CONFIG")
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     isolate_process_group(&mut command);
@@ -2765,7 +2774,7 @@ mod tests {
             "alpha\tworker\t\trunning\t\n",
             "beta\tapi\tFalse\texited\t\n",
             "beta\tapi\tFalse\trunning\tunhealthy\n",
-            "beta\toneoff\tTrue\texited\t\n",
+            "beta\toneoff\tTrue\texited\tignored-invalid-health\n",
         );
         let services = aggregate_compose_services(
             parse_compose_containers(raw).expect("bounded Docker output parses"),
@@ -2793,7 +2802,7 @@ mod tests {
         assert_eq!(observations[2].state, ServiceObservationState::Warning);
         assert_eq!(
             observations[2].summary,
-            "1/2 replicas running; 2 failed or unhealthy"
+            "1/2 replicas running; 2 not running or unhealthy"
         );
         for observation in observations {
             observation
@@ -2822,6 +2831,10 @@ mod tests {
         assert_eq!(unavailable[0].state, ServiceObservationState::Unknown);
         assert_eq!(unavailable[0].summary, "Compose discovery failed");
         assert!(compose_snapshot_observations(&ComposeSnapshot::NotApplicable, 10).is_empty());
+        assert_eq!(
+            parse_compose_health("running", "none"),
+            Ok(ComposeHealth::Missing)
+        );
     }
 
     #[test]
@@ -2886,6 +2899,7 @@ mod tests {
                 "test \"$6\" = --filter || exit 16\n",
                 "test \"$7\" = label=com.docker.compose.project || exit 17\n",
                 "test \"$8\" = --format || exit 18\n",
+                "test \"$9\" = '{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.HealthStatus}}' || exit 19\n",
                 "printf 'alpha\\tweb\\tFalse\\trunning\\thealthy\\n'\n",
             ),
         )
