@@ -490,7 +490,12 @@ fn reconcile_host_liveness(
             incident.active && incident.kind == IncidentKind::HostDown && incident.host == host.name
         })
         .map(|incident| incident.incident_id.clone());
-    let down = host.last_seen.is_some()
+    let appliance_observed = host
+        .service_observations
+        .iter()
+        .any(crate::appliance_probes::is_appliance_observation);
+    let down = !appliance_observed
+        && host.last_seen.is_some()
         && liveness(host.last_seen, host.heartbeat_interval_secs, now) == Liveness::Down;
     if down && !host.preferences.suppresses_down_alerts() {
         let last_seen = host.last_seen.expect("down host has last_seen");
@@ -1105,7 +1110,7 @@ mod tests {
     use super::*;
     use pharos_core::{
         BackupConfiguredState, BackupEngine, BackupRunState, HostPreferences, NixFreshness,
-        HOST_REPORT_VERSION,
+        ServiceObservation, ServiceObservationState, HOST_REPORT_VERSION,
     };
 
     fn host(last_seen: i64) -> Host {
@@ -1190,6 +1195,23 @@ mod tests {
         assert!(delivered.event(&event_id).unwrap().delivered_at.is_some());
         assert!(!delivered.due_event_ids(i64::MAX).contains(&event_id));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn appliance_observation_suppresses_durable_host_down_incidents() {
+        let store = AlertStore::new(None).unwrap();
+        let mut appliance = host(100);
+        appliance.service_observations = vec![ServiceObservation {
+            id: crate::appliance_probes::APPLIANCE_OBSERVATION_ID.to_string(),
+            label: "Appliance convergence".to_string(),
+            state: ServiceObservationState::Healthy,
+            summary: "powered off as expected".to_string(),
+        }];
+
+        store.reconcile_hosts(&[appliance], 1_000).unwrap();
+
+        assert_eq!(store.pending_count(), 0);
+        assert!(store.due_event_ids(1_000).is_empty());
     }
 
     #[test]

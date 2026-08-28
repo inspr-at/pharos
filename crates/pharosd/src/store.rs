@@ -6,7 +6,7 @@ use std::sync::RwLock;
 
 use pharos_core::{
     Host, HostPreferences, HostRegistration, HostReport, InboundRttObservation, NixFreshness,
-    UnixSeconds,
+    ServiceObservation, UnixSeconds,
 };
 
 use crate::durable_file::{atomic_write_json, load_optional_json, DurableFileError};
@@ -102,6 +102,55 @@ impl Store {
 
     pub(crate) fn get(&self, host: &str) -> Option<Host> {
         self.hosts.read().expect("store lock").get(host).cloned()
+    }
+
+    /// Replace one server-owned observation across the fleet in a single
+    /// durable transaction. Beacon-owned observations with other IDs are
+    /// preserved. Configured hosts missing from the registry are returned so
+    /// the caller can report the declaration error.
+    pub(crate) fn replace_server_observations(
+        &self,
+        observation_id: &str,
+        observations: &BTreeMap<String, ServiceObservation>,
+    ) -> Result<Vec<String>, StoreError> {
+        let id_contract = ServiceObservation {
+            id: observation_id.to_string(),
+            label: "Server observation".to_string(),
+            state: pharos_core::ServiceObservationState::Unknown,
+            summary: "server-owned observation".to_string(),
+        };
+        if id_contract.validate_contract().is_err()
+            || observations.values().any(|observation| {
+                observation.id != observation_id || observation.validate_contract().is_err()
+            })
+        {
+            return Err(StoreError::InvalidContract);
+        }
+        let mut hosts = self.hosts.write().expect("store lock");
+        let previous = hosts.clone();
+        for host in hosts.values_mut() {
+            host.service_observations
+                .retain(|observation| observation.id != observation_id);
+            if let Some(observation) = observations.get(&host.name) {
+                host.service_observations.push(observation.clone());
+                host.service_observations
+                    .sort_by(|left, right| left.id.cmp(&right.id));
+            }
+        }
+        let missing = observations
+            .keys()
+            .filter(|host| !hosts.contains_key(*host))
+            .cloned()
+            .collect();
+        if *hosts != previous {
+            if let Err(error) = self.persist(&hosts) {
+                if !store_error_replaced_final_file(&error) {
+                    *hosts = previous;
+                }
+                return Err(error);
+            }
+        }
+        Ok(missing)
     }
 
     pub(crate) fn remove(&self, host: &str) -> Result<Option<Host>, StoreError> {
@@ -877,5 +926,85 @@ mod tests {
             store.request_preferences("missing", malformed),
             Err(StoreError::InvalidPreferences)
         ));
+    }
+
+    #[test]
+    fn server_observation_overlay_is_atomic_persistent_and_id_scoped() {
+        let directory = temporary_directory("server-observation");
+        let path = directory.join("hosts.json");
+        let store = Store::new(Some(path.clone())).expect("durable store starts");
+        store
+            .register(registration("appliance-test"), "hash".to_string())
+            .expect("host registration persists");
+        let beacon_observation = ServiceObservation {
+            id: "compose-web".to_string(),
+            label: "Compose web".to_string(),
+            state: pharos_core::ServiceObservationState::Healthy,
+            summary: "all replicas healthy".to_string(),
+        };
+        let mut report = basic_report("appliance-test");
+        report.service_observations = vec![beacon_observation.clone()];
+        store.record(report, 100).expect("beacon report persists");
+
+        let server_observation = ServiceObservation {
+            id: "appliance-convergence".to_string(),
+            label: "Appliance convergence".to_string(),
+            state: pharos_core::ServiceObservationState::Warning,
+            summary: "un-converged: online but SSH is unavailable".to_string(),
+        };
+        let missing = store
+            .replace_server_observations(
+                "appliance-convergence",
+                &BTreeMap::from([
+                    ("appliance-test".to_string(), server_observation.clone()),
+                    ("missing-host".to_string(), server_observation.clone()),
+                ]),
+            )
+            .expect("server overlay persists");
+        assert_eq!(missing, vec!["missing-host"]);
+        assert_eq!(
+            store.get("appliance-test").unwrap().service_observations,
+            vec![server_observation.clone(), beacon_observation.clone()]
+        );
+        drop(store);
+
+        let reloaded = Store::new(Some(path.clone())).expect("overlay reloads");
+        assert_eq!(
+            reloaded.get("appliance-test").unwrap().service_observations,
+            vec![server_observation, beacon_observation.clone()]
+        );
+        reloaded
+            .replace_server_observations("appliance-convergence", &BTreeMap::new())
+            .expect("server observation cleanup persists");
+        assert_eq!(
+            reloaded.get("appliance-test").unwrap().service_observations,
+            vec![beacon_observation.clone()]
+        );
+
+        assert!(matches!(
+            reloaded.replace_server_observations(
+                "appliance-convergence",
+                &BTreeMap::from([(
+                    "appliance-test".to_string(),
+                    ServiceObservation {
+                        id: "wrong-id".to_string(),
+                        label: "Appliance convergence".to_string(),
+                        state: pharos_core::ServiceObservationState::Healthy,
+                        summary: "converged".to_string(),
+                    }
+                )]),
+            ),
+            Err(StoreError::InvalidContract)
+        ));
+        assert!(matches!(
+            reloaded.replace_server_observations("Not Canonical", &BTreeMap::new()),
+            Err(StoreError::InvalidContract)
+        ));
+        assert_eq!(
+            reloaded.get("appliance-test").unwrap().service_observations,
+            vec![beacon_observation]
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

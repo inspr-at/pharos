@@ -11,6 +11,7 @@
 mod agora;
 mod alerting;
 mod alerts;
+mod appliance_probes;
 mod auth;
 mod durable_file;
 mod host_actions;
@@ -92,6 +93,7 @@ use url::Url;
 
 use crate::alerting::*;
 use crate::alerts::{AlertEvent, AlertStore, AlertWorkerHealth};
+use crate::appliance_probes::{spawn_appliance_probe_loop, ApplianceProbeRuntime};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 #[cfg(test)]
 use crate::host_actions::host_lifecycle;
@@ -2657,6 +2659,14 @@ async fn report(
         tracing::warn!(error = %error, "report rejected: invalid report contract");
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if rep
+        .service_observations
+        .iter()
+        .any(appliance_probes::is_appliance_observation)
+    {
+        tracing::warn!(host = %rep.name, "report rejected: reserved server observation");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if let Some(token) = bearer_token(&headers) {
         match state
             .beacon_auth
@@ -4261,6 +4271,20 @@ async fn main() {
         .unwrap_or_else(|err| panic!("Pharos authentication startup failed: {err}"));
     let beacon_auth = startup.beacon_auth;
     let provider_runtime = ProviderRuntimeConfig::from_env();
+    let appliance_probes = ApplianceProbeRuntime::from_env(
+        host_store_path.as_deref(),
+        provider_runtime.existing_host.clone(),
+    )
+    .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
+    if let Some(runtime) = appliance_probes.as_ref() {
+        runtime
+            .validate_host_records(&store, &manifests)
+            .unwrap_or_else(|error| panic!("appliance probe startup failed: {error}"));
+    }
+    let appliance_probes = appliance_probes.map(Arc::new);
+    store
+        .replace_server_observations(appliance_probes::APPLIANCE_OBSERVATION_ID, &BTreeMap::new())
+        .unwrap_or_else(|error| panic!("stale appliance observation cleanup failed: {error}"));
     let nixcfg_dispatch = NixcfgDispatch::from_env();
     let retirement_owner = RetirementOwnerAuth::from_env();
     let alert_notifier = AlertNotifier::from_env(alert_store)
@@ -4292,6 +4316,9 @@ async fn main() {
     };
     let _ = reconcile_completed_removals(&state, now_unix());
     spawn_alert_loop(state.clone(), alert_notifier);
+    if let Some(runtime) = appliance_probes {
+        spawn_appliance_probe_loop(runtime, Arc::clone(&state.store));
+    }
     if let Some(adapter) = paimos_delivery {
         adapter.spawn();
     }
@@ -7036,6 +7063,136 @@ mod tests {
         assert!(server_alerts
             .iter()
             .any(|alert| alert.source == "heartbeat"));
+    }
+
+    #[test]
+    fn appliance_probe_owns_liveness_without_false_boot_or_offline_alerts() {
+        let mut appliance = host_with_backups("appliance-test", 500, vec![]);
+        appliance.last_seen = None;
+        appliance.heartbeat_log.clear();
+        appliance.heartbeat_interval_secs = None;
+        // Beacon-less records retain the runtime default. Startup separately
+        // proves that this server-owned observation is backed by a declared
+        // workstation preference before it can reach these projections.
+        assert_eq!(appliance.preferences.kind, HostKind::Server);
+        appliance.service_observations = vec![ServiceObservation {
+            id: appliance_probes::APPLIANCE_OBSERVATION_ID.to_string(),
+            label: "Appliance convergence".to_string(),
+            state: ServiceObservationState::Healthy,
+            summary: "powered off as expected".to_string(),
+        }];
+
+        let offline_alerts = alert_items(
+            std::slice::from_ref(&appliance),
+            &[],
+            "csb1",
+            1000,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(offline_alerts.is_empty());
+        let offline_attention = attention_reason(
+            Liveness::AwaitingFirstHeartbeat,
+            &appliance.freshness,
+            None,
+            &appliance.service_observations,
+            &appliance.preferences,
+        );
+        assert_eq!(offline_attention.label, "offline as expected");
+        assert_eq!(offline_attention.level, "ok");
+        let offline_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1000,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!offline_activity
+            .iter()
+            .any(|event| matches!(event.kind, "heartbeat" | "service")));
+
+        appliance.service_observations[0].state = ServiceObservationState::Unknown;
+        appliance.service_observations[0].summary =
+            "online; allowing SSH startup (1 of 3)".to_string();
+        let grace_alerts = alert_items(
+            std::slice::from_ref(&appliance),
+            &[],
+            "csb1",
+            1001,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(grace_alerts.is_empty());
+        let grace_attention = attention_reason(
+            Liveness::AwaitingFirstHeartbeat,
+            &appliance.freshness,
+            None,
+            &appliance.service_observations,
+            &appliance.preferences,
+        );
+        assert_eq!(grace_attention.label, "starting normally");
+        assert_eq!(grace_attention.level, "ok");
+        let grace_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1001,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!grace_activity
+            .iter()
+            .any(|event| matches!(event.kind, "heartbeat" | "service")));
+
+        appliance.service_observations[0].state = ServiceObservationState::Warning;
+        appliance.service_observations[0].summary =
+            "un-converged: online but SSH is unavailable".to_string();
+        let unconverged_alerts = alert_items(
+            std::slice::from_ref(&appliance),
+            &[],
+            "csb1",
+            1002,
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(unconverged_alerts.len(), 1);
+        assert_eq!(unconverged_alerts[0].source, "service");
+        assert!(unconverged_alerts[0].detail.starts_with("un-converged:"));
+        assert!(unconverged_alerts[0]
+            .next_action
+            .contains("will not remediate"));
+        assert!(!unconverged_alerts
+            .iter()
+            .any(|alert| alert.source == "heartbeat"));
+        let unconverged_activity = activity_events(
+            runtime(std::slice::from_ref(&appliance), &[]),
+            "csb1",
+            1002,
+            ActivitySources {
+                manifests: &[],
+                load_errors: &[],
+                server_probes: &BTreeMap::new(),
+                action_jobs: &[],
+            },
+        );
+        assert!(!unconverged_activity
+            .iter()
+            .any(|event| event.kind == "heartbeat"));
+        let unconverged_event = unconverged_activity
+            .iter()
+            .find(|event| event.kind == "service")
+            .expect("un-converged service activity is present");
+        assert!(unconverged_event.detail.starts_with("un-converged:"));
     }
 
     #[test]
@@ -15863,6 +16020,30 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .find(|host| host.name == "ares")
             .and_then(|host| host.last_seen)
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn report_rejects_reserved_appliance_observation_without_mutating_host() {
+        let state = report_test_state(false);
+        register_test_token(&state, "ares", "valid-token");
+        let before = state.store.get("ares").expect("registered host exists");
+        let mut spoofed = test_report("ares");
+        spoofed.service_observations = vec![ServiceObservation {
+            id: appliance_probes::APPLIANCE_OBSERVATION_ID.to_string(),
+            label: "Appliance convergence".to_string(),
+            state: pharos_core::ServiceObservationState::Healthy,
+            summary: "powered off as expected".to_string(),
+        }];
+
+        let response = report(
+            State(state.clone()),
+            bearer_headers("valid-token"),
+            Json(spoofed),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.store.get("ares"), Some(before));
     }
 
     #[tokio::test]

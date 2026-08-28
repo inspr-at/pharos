@@ -504,6 +504,43 @@ explicit host-operator decision. The collector interface is runtime-specific,
 so a future systemd collector can add fixed unit-state discovery without
 changing the report contract or creating a general inspection channel.
 
+### Appliance convergence observations
+
+Appliance-tier hosts deliberately run no beacon and hold no Pharos secret.
+When `PHAROS_APPLIANCE_PROBES_PATH` names a reviewed registry using
+`inspr.pharos.appliance-probes.v1`, `pharosd` makes only two fixed network
+checks: one ICMP presence probe and one TCP connection to the declared SSH
+port. Targets are used for those calls only and are never returned in the API,
+logs, observations or durable debounce state.
+
+Every registry host must already have a Pharos host record and be declared
+`kind: workstation` through the existing PHAROS-109 preference contract;
+startup rejects missing records or server-kind declarations. Record creation
+and real-host acceptance remain owned by OPS-19. Once validated, an ICMP-down
+appliance is recorded as `powered off as expected` and creates no heartbeat
+alert. ICMP-up with SSH closed remains non-alerting boot grace until the
+declared 2–10 consecutive-sample threshold is reached; it then becomes the
+distinct warning
+`un-converged: online but SSH is unavailable`. SSH recovery resets the durable
+counter. Pharos only detects and reports this state—it never tries to enable
+SSH, run a bootstrap, install an agent or otherwise remediate the appliance.
+
+If the existing-host strict SSH boundary has both an owner-controlled identity
+file and a pinned `known_hosts` file, Pharos also runs one fixed read-only
+marker command after SSH becomes reachable. The marker is at the registry's
+validated absolute path and contains exactly:
+
+```text
+<build-id> <RFC3339 timestamp>
+```
+
+The response is limited to 256 ASCII bytes; only a 1–64 byte
+`[A-Za-z0-9._-]` build identifier and a valid RFC3339 timestamp are surfaced.
+Missing, malformed, oversized or unavailable markers are named coarsely, and
+raw SSH output is never logged or stored. The registry contains no credential;
+the committed `contracts/appliance-probes-v1.json` is a synthetic shape
+fixture. `PHAROS_DB` is required so the debounce counter survives restarts.
+
 ## Guarded operations
 
 Pharos can coordinate changes without becoming a free-form command bus.
@@ -636,6 +673,9 @@ promised third-party API. The important boundaries are:
 | `PHAROS_BEACON_TOKEN_HASH_DIR` | Private Janus v2 token-generation root containing `current` and immutable generation files |
 | `PHAROS_MANIFEST_PATHS` | Read-only declared-host manifests |
 | `PHAROS_HOST_PREFERENCES_PATH` | Read-only declared preference registry |
+| `PHAROS_APPLIANCE_PROBES_PATH` | Optional owner-controlled `inspr.pharos.appliance-probes.v1` registry for fixed ICMP/SSH convergence observations; requires `PHAROS_DB` |
+| `PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE` | Owner-controlled pinned SSH host-key file used by existing-host and optional appliance marker reads |
+| `PHAROS_EXISTING_HOST_IDENTITY_FILE` | Owner-controlled SSH identity path; required with the pinned host-key file before appliance marker reads are attempted |
 | `PHAROS_ALERT_WEBHOOK_URL` | Optional HTTP(S) or Telegram alert target; enables durable host-down and backup Stale/Failed incidents, escalation and recovery delivery with redirects disabled |
 | `PHAROS_ALERT_DB` | Optional explicit durable incident/outbox path; derived beside `PHAROS_DB` when unset and required when alert delivery is configured |
 | `PHAROS_ALERT_CHECK_SECS` | Durable alert sweep interval, minimum 5 seconds |

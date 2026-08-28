@@ -1145,6 +1145,12 @@ pub(super) fn service_observation_attention_reason(
     let unknown = observations
         .iter()
         .filter(|observation| !suppress_nix_freshness || !is_nix_freshness_observation(observation))
+        .filter(|observation| {
+            !appliance_probes::is_appliance_observation(observation)
+                || !observation
+                    .summary
+                    .starts_with("online; allowing SSH startup")
+        })
         .filter(|obs| obs.state == ServiceObservationState::Unknown)
         .count();
     if unknown > 0 {
@@ -2155,7 +2161,22 @@ pub(super) fn attention_reason(
     observations: &[ServiceObservation],
     preferences: &HostPreferences,
 ) -> AttentionReason {
-    match live {
+    // The observation can only be published after startup validates the
+    // server-owned appliance registry against an existing host record and its
+    // declared workstation preference. Beacon reports cannot claim this ID.
+    let appliance = observations
+        .iter()
+        .find(|observation| appliance_probes::is_appliance_observation(observation));
+    // Appliance hosts intentionally have no beacon. Their fixed server-side
+    // presence/convergence observation owns operational liveness, so a missing
+    // heartbeat must not mask a real un-converged warning or create noise while
+    // the appliance is powered off.
+    let heartbeat_live = if appliance.is_some() {
+        Liveness::Live
+    } else {
+        live
+    };
+    match heartbeat_live {
         Liveness::Down if !preferences.suppresses_down_alerts() => AttentionReason {
             label: "silent heartbeat".to_string(),
             level: "down",
@@ -2189,7 +2210,17 @@ pub(super) fn attention_reason(
                 )
             })
             .unwrap_or_else(|| AttentionReason {
-                label: if live == Liveness::Down {
+                label: if appliance
+                    .is_some_and(|observation| observation.summary == "powered off as expected")
+                {
+                    "offline as expected"
+                } else if appliance.is_some_and(|observation| {
+                    observation
+                        .summary
+                        .starts_with("online; allowing SSH startup")
+                }) {
+                    "starting normally"
+                } else if live == Liveness::Down {
                     if preferences.kind == HostKind::Workstation {
                         "offline as expected"
                     } else {
@@ -4520,8 +4551,25 @@ pub(super) fn service_alert(
         return None;
     }
 
+    if appliance_probes::is_appliance_observation(observation)
+        && observation.state == ServiceObservationState::Unknown
+        && observation
+            .summary
+            .starts_with("online; allowing SSH startup")
+    {
+        return None;
+    }
+
     let (level, action) = match observation.state {
         ServiceObservationState::Healthy => return None,
+        ServiceObservationState::Warning
+            if appliance_probes::is_appliance_observation(observation) =>
+        {
+            (
+                "warning",
+                "Restore appliance convergence locally; Pharos will not remediate it.",
+            )
+        }
         ServiceObservationState::Warning => ("warning", "Inspect the service on the host."),
         ServiceObservationState::Stale => ("warning", "Verify the service is still reporting."),
         ServiceObservationState::Unknown => {
@@ -4834,7 +4882,12 @@ pub(super) fn alert_items(
 
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
+        let appliance_observed = host
+            .service_observations
+            .iter()
+            .any(appliance_probes::is_appliance_observation);
         match live {
+            _ if appliance_observed => {}
             Liveness::Down if !host.preferences.suppresses_down_alerts() => {
                 alerts.push(AlertItem {
                     level: "critical",
@@ -5619,7 +5672,16 @@ pub(super) fn activity_events(
 
     for host in hosts {
         let live = liveness(host.last_seen, host.heartbeat_interval_secs, now);
-        match live {
+        let appliance_observed = host
+            .service_observations
+            .iter()
+            .any(appliance_probes::is_appliance_observation);
+        let heartbeat_live = if appliance_observed {
+            Liveness::Live
+        } else {
+            live
+        };
+        match heartbeat_live {
             Liveness::Down if !host.preferences.suppresses_down_alerts() => {
                 events.push(ActivityEvent::new(
                     now,
@@ -5701,6 +5763,15 @@ pub(super) fn activity_events(
 
         for observation in &host.service_observations {
             if is_nix_freshness_observation(observation) {
+                continue;
+            }
+            if appliance_probes::is_appliance_observation(observation)
+                && (observation.state == ServiceObservationState::Healthy
+                    || (observation.state == ServiceObservationState::Unknown
+                        && observation
+                            .summary
+                            .starts_with("online; allowing SSH startup")))
+            {
                 continue;
             }
 
