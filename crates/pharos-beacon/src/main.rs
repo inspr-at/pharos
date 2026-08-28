@@ -57,7 +57,7 @@ const COMPOSE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const COMPOSE_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
 const DEFAULT_SERVICE_OBSERVATION_INTERVAL_SECS: u64 = 300;
 const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
-const COMPOSE_DOCKER_FORMAT: &str = "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.HealthStatus}}";
+const COMPOSE_DOCKER_FORMAT: &str = "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.Status}}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportEndpoint {
@@ -2189,16 +2189,20 @@ fn valid_compose_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn parse_compose_health(state: &str, health: &str) -> Result<ComposeHealth, &'static str> {
+fn parse_compose_health(state: &str, status: &str) -> Result<ComposeHealth, &'static str> {
     if state != "running" {
         return Ok(ComposeHealth::Missing);
     }
-    match health {
-        "healthy" => Ok(ComposeHealth::Healthy),
-        "unhealthy" => Ok(ComposeHealth::Unhealthy),
-        "starting" => Ok(ComposeHealth::Starting),
-        "" | "none" => Ok(ComposeHealth::Missing),
-        _ => Err("invalid_output"),
+    if status.ends_with("(unhealthy)") {
+        Ok(ComposeHealth::Unhealthy)
+    } else if status.ends_with("(health: starting)") {
+        Ok(ComposeHealth::Starting)
+    } else if status.ends_with("(healthy)") {
+        Ok(ComposeHealth::Healthy)
+    } else if status == "Up" || status.starts_with("Up ") {
+        Ok(ComposeHealth::Missing)
+    } else {
+        Err("invalid_output")
     }
 }
 
@@ -2213,6 +2217,9 @@ fn parse_compose_containers(raw: &str) -> Result<Vec<ComposeContainer>, &'static
             || fields[3].is_empty()
             || fields[3].len() > 32
             || !fields[3].bytes().all(|byte| byte.is_ascii_lowercase())
+            || fields[4].len() > 256
+            || !fields[4].is_ascii()
+            || fields[4].bytes().any(|byte| byte.is_ascii_control())
         {
             return Err("invalid_output");
         }
@@ -2769,11 +2776,11 @@ mod tests {
     #[test]
     fn compose_observations_aggregate_replicas_and_keep_unknown_honest() {
         let raw = concat!(
-            "alpha\tweb\tFalse\trunning\thealthy\n",
-            "alpha\tweb\tfalse\trunning\thealthy\n",
-            "alpha\tworker\t\trunning\t\n",
-            "beta\tapi\tFalse\texited\t\n",
-            "beta\tapi\tFalse\trunning\tunhealthy\n",
+            "alpha\tweb\tFalse\trunning\tUp 2 minutes (healthy)\n",
+            "alpha\tweb\tfalse\trunning\tUp 2 minutes (healthy)\n",
+            "alpha\tworker\t\trunning\tUp 2 minutes\n",
+            "beta\tapi\tFalse\texited\tExited (1) 5 seconds ago\n",
+            "beta\tapi\tFalse\trunning\tUp 5 seconds (unhealthy)\n",
             "beta\toneoff\tTrue\texited\tignored-invalid-health\n",
         );
         let services = aggregate_compose_services(
@@ -2815,9 +2822,9 @@ mod tests {
     fn compose_observations_fail_probe_and_malformed_rows_closed() {
         for malformed in [
             "alpha\tweb\tFalse\trunning\n",
-            "alpha\tweb\tFalse\trunning\thealthy\textra\n",
-            "alpha\t../../secret\tFalse\trunning\thealthy\n",
-            "alpha\tweb\tMaybe\trunning\thealthy\n",
+            "alpha\tweb\tFalse\trunning\tUp (healthy)\textra\n",
+            "alpha\t../../secret\tFalse\trunning\tUp (healthy)\n",
+            "alpha\tweb\tMaybe\trunning\tUp (healthy)\n",
             "alpha\tweb\tFalse\trunning\tsecret\n",
         ] {
             assert_eq!(parse_compose_containers(malformed), Err("invalid_output"));
@@ -2832,8 +2839,12 @@ mod tests {
         assert_eq!(unavailable[0].summary, "Compose discovery failed");
         assert!(compose_snapshot_observations(&ComposeSnapshot::NotApplicable, 10).is_empty());
         assert_eq!(
-            parse_compose_health("running", "none"),
+            parse_compose_health("running", "Up 2 minutes"),
             Ok(ComposeHealth::Missing)
+        );
+        assert_eq!(
+            parse_compose_health("running", "Up 2 seconds (health: starting)"),
+            Ok(ComposeHealth::Starting)
         );
     }
 
@@ -2899,8 +2910,8 @@ mod tests {
                 "test \"$6\" = --filter || exit 16\n",
                 "test \"$7\" = label=com.docker.compose.project || exit 17\n",
                 "test \"$8\" = --format || exit 18\n",
-                "test \"$9\" = '{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.HealthStatus}}' || exit 19\n",
-                "printf 'alpha\\tweb\\tFalse\\trunning\\thealthy\\n'\n",
+                "test \"$9\" = '{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.Status}}' || exit 19\n",
+                "printf 'alpha\\tweb\\tFalse\\trunning\\tUp 2 minutes (healthy)\\n'\n",
             ),
         )
         .expect("write command fixture");

@@ -494,9 +494,10 @@ manifest: the useful signal is what Compose actually has, including stopped
 replicas. It groups containers by Compose project and service, ignores one-off
 jobs, sorts groups deterministically, and reserves the final available report
 slot for an overflow warning. The probe asks Docker only for Compose
-project/service/one-off labels, lifecycle state and coarse health state; raw
-inspect documents, environment, mounts, ports and probe payloads are never
-requested or reported. The local beacon user still needs permission to connect
+project/service/one-off labels, lifecycle state and bounded status. It derives
+only the fixed healthy, unhealthy, starting, or no-healthcheck states; raw
+status, inspect documents, environment, mounts, ports and probe payloads are
+never reported. The local beacon user still needs permission to connect
 to the Docker socket;
 granting Docker-group access is root-equivalent and therefore remains an
 explicit host-operator decision. The collector interface is runtime-specific,
