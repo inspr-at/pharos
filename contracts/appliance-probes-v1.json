@@ -1,0 +1,15 @@
+{
+  "schema": "inspr.pharos.appliance-probes.v1",
+  "version": 1,
+  "probe_interval_secs": 30,
+  "appliances": [
+    {
+      "host": "appliance-test",
+      "target": "appliance.example.test",
+      "ssh_user": "operator",
+      "ssh_port": 22,
+      "marker_path": "/home/operator/.appliance-converged",
+      "debounce_samples": 3
+    }
+  ]
+}
