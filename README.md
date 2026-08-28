@@ -190,13 +190,36 @@ Each verdict prints its reason, visible with
 | Role | Healthy means | Unhealthy reasons |
 | --- | --- | --- |
 | `pharosd` | `GET /readyz` on the loopback side of `PHAROS_ADDR` answered 200 | `PHAROS_ADDR` unset or not a socket address (the probe never guesses `127.0.0.1:8080`), unreachable, non-200 status |
-| `pharos-beacon` | The last successful report is at most three `PHAROS_INTERVAL`s old | `PHAROS_INTERVAL` unset (one-shot beacon), report state missing, unreadable or invalid, no successful report yet, clock skew, report stale |
+| `pharos-beacon` | The beacon can write its report state where it is configured and the last successful report is at most three `PHAROS_INTERVAL`s old | `PHAROS_INTERVAL` unset (one-shot beacon), report state location not writable, report state missing, unreadable or invalid, no successful report yet, clock skew, report stale |
 
 The beacon records its last successful report in
 `/tmp/pharos-beacon-health-v1` (`PHAROS_BEACON_HEALTH_FILE` overrides the
-path); a read-only container needs a writable tmpfs there. The state is reset
-at startup, so a restarted beacon stays unhealthy until it reports again, and
-nothing outside the beacon can make it look healthy. Deployments that disabled
+path); a read-only container needs a writable tmpfs there. Every probe first
+proves it can perform the same atomic write the beacon uses: it creates a
+temporary file next to the marker, hard-links the existing marker to a
+sibling name and renames the temporary over that link, so immutable flags,
+deny-delete ACLs, sticky-directory ownership or a filesystem without hard
+links that would refuse replacing the marker refuse the probe too, while the
+marker itself is never written or moved. The marker is only ever opened
+without following symlinks; a symlink, directory or device at that path is
+invalid state and is never followed. Writes and probes take a shared lock
+(`.<marker>.lock`, the one artifact that stays), so a probe never recovers or
+replaces anything while a refresh is in flight; under it, probe and write
+artifacts use fixed sibling names (`.<marker>.tmp`, `.<marker>.probe-tmp`,
+`.<marker>.probe-link`) that each run removes first, so a run killed by the
+healthcheck timeout leaves at most one file per name, and a write temporary
+that cannot be removed makes the probe unhealthy because no refresh could
+land. A marker the beacon cannot replace is never trusted, however recent it
+reads. The marker also records which beacon process wrote it (pid and kernel
+process start time) and is trusted only while that exact process is running:
+state left by a previous run never becomes healthy merely because an obstacle
+to resetting it clears, a crashed beacon is unhealthy at the next probe, and
+only a successful report by the current process restores health (on Linux
+the token includes the kernel boot id, which must be the canonical lowercase
+UUID the kernel writes; anything else, or an unreadable boot id, is refused). The state is reset at startup under the same lock: the beacon takes
+it, notes which file the marker name points at, attempts the reset, and if
+that fails unlinks only that exact file (it never writes into an existing
+file); if the lock cannot be taken, nothing is touched. Deployments that disabled
 the inherited check (`--no-healthcheck`, Compose `healthcheck: disable: true`)
 as a workaround can remove that override.
 
