@@ -93,13 +93,16 @@ use url::Url;
 use crate::alerting::*;
 use crate::alerts::{AlertEvent, AlertStore, AlertWorkerHealth};
 use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
+#[cfg(test)]
+use crate::host_actions::host_lifecycle;
 use crate::host_actions::{
-    active_update_restart_for_host, host_lifecycle, host_preferences_state,
-    most_relevant_host_action, withdrawable_settings_change_for_host, AgentActionOutcome,
-    AgentActionResultRequest, HostActionEventSource, HostActionJob, HostActionState,
-    HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot, HostPreferencesState,
-    HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind, HostWorkflowSummary, RetiredHost,
-    RetiredHostStore, RetirementAgentResultRequest, SystemUpdateProposalBegin,
+    active_update_restart_for_host, blocking_update_for_host, host_lifecycle_with_apply,
+    host_preferences_state, most_relevant_host_action, withdrawable_settings_change_for_host,
+    AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
+    HostActionState, HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot,
+    HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind,
+    HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
+    SystemUpdateProposalBegin, UpdateRestartIntent,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -508,6 +511,13 @@ fn new_beacon_token() -> std::io::Result<String> {
 #[serde(deny_unknown_fields)]
 struct SystemUpdateActionRequest {
     host: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateRestartActionRequest {
+    #[serde(default)]
+    intent: UpdateRestartIntent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,7 +950,11 @@ fn host_janus_actions_ready(state: &AppState, host: &str) -> bool {
     })
 }
 
-fn update_restart_target_error(state: &AppState, host: &str) -> Option<(StatusCode, &'static str)> {
+fn update_restart_target_error(
+    state: &AppState,
+    host: &str,
+    intent: UpdateRestartIntent,
+) -> Option<(StatusCode, &'static str)> {
     let Some(runtime) = state.store.get(host) else {
         return Some((StatusCode::NOT_FOUND, "Host is not reporting to Pharos"));
     };
@@ -956,13 +970,38 @@ fn update_restart_target_error(state: &AppState, host: &str) -> Option<(StatusCo
             "This host is not prepared for target-local Janus actions yet",
         ));
     }
-    if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
-        && !runtime.freshness.has_proven_deployable_update()
-    {
-        return Some((
-            StatusCode::CONFLICT,
-            "No pending system update or restart is currently reported for this host",
-        ));
+    match intent {
+        UpdateRestartIntent::Update => {
+            if kernel_reboot_required(runtime.kernel.as_ref()).is_none()
+                && !runtime.freshness.has_proven_deployable_update()
+            {
+                return Some((
+                    StatusCode::CONFLICT,
+                    "No pending system update or restart is currently reported for this host",
+                ));
+            }
+        }
+        UpdateRestartIntent::ApplyDeclared => {
+            let preferences = host_preferences_state(
+                &runtime.preferences,
+                state.manifests.declared_preferences_for(host),
+                runtime.requested_preferences.as_ref(),
+            );
+            if preferences != HostPreferencesState::DeclaredNotApplied
+                && kernel_reboot_required(runtime.kernel.as_ref()).is_none()
+            {
+                return Some((
+                    StatusCode::CONFLICT,
+                    "No declared preference or kernel drift is ready to apply for this host",
+                ));
+            }
+        }
+        UpdateRestartIntent::RestartOnly => {
+            return Some((
+                StatusCode::CONFLICT,
+                "Restart-only workflows are not available in this release",
+            ));
+        }
     }
     None
 }
@@ -1135,6 +1174,7 @@ async fn request_update_restart_review(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(host): AxumPath<String>,
+    Json(request): Json<UpdateRestartActionRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let access = access_for_headers(&state.auth, &headers);
     if !action_request_header(&headers) || !access.can_manage_fleet() || !access.allows_host(&host)
@@ -1144,16 +1184,18 @@ async fn request_update_restart_review(
             "Guarded host action access is not granted",
         );
     }
-    if let Some((status, message)) = update_restart_target_error(&state, &host) {
+    if let Some((status, message)) = update_restart_target_error(&state, &host, request.intent) {
         return action_error(status, message);
     }
     let actor = action_actor(&state.auth, &headers);
-    match state
-        .host_actions
-        .create_update_review(&host, &actor, now_unix())
-    {
+    match state.host_actions.create_update_review_with_intent(
+        &host,
+        &actor,
+        request.intent,
+        now_unix(),
+    ) {
         Ok(job) => {
-            tracing::info!(host = %host, actor = %actor, ticket = "PHAROS-126", "guarded host review queued");
+            tracing::info!(host = %host, actor = %actor, intent = request.intent.key(), ticket = %job.ticket, "guarded host review queued");
             action_response(StatusCode::ACCEPTED, &job)
         }
         Err(HostActionStoreError::ActiveJob) => action_error(
@@ -1164,10 +1206,19 @@ async fn request_update_restart_review(
             StatusCode::CONFLICT,
             "The latest guarded review failed; retry that recorded attempt",
         ),
-        Err(HostActionStoreError::BlockedByFleetGate) => action_error(
-            StatusCode::CONFLICT,
-            "Another host update workflow must finish or be resolved first",
-        ),
+        Err(HostActionStoreError::BlockedByFleetGate) => {
+            let jobs = state.host_actions.list();
+            let message = blocking_update_for_host(&jobs, &host).map_or_else(
+                || "Another host update workflow must finish or be resolved first".to_string(),
+                |blocker| {
+                    format!(
+                        "{} holds the fleet update lock; finish or resolve that workflow first",
+                        blocker.host
+                    )
+                },
+            );
+            action_error(StatusCode::CONFLICT, &message)
+        }
         Err(_) => action_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "The guarded review could not be recorded",
@@ -1193,7 +1244,9 @@ async fn retry_update_restart_review(
             "Guarded host action access is not granted",
         );
     }
-    if let Some((status, message)) = update_restart_target_error(&state, &existing.host) {
+    if let Some((status, message)) =
+        update_restart_target_error(&state, &existing.host, existing.update_restart_intent())
+    {
         return action_error(status, message);
     }
     let actor = action_actor(&state.auth, &headers);
@@ -1213,10 +1266,19 @@ async fn retry_update_restart_review(
             StatusCode::CONFLICT,
             "A guarded update workflow is already active for this host",
         ),
-        Err(HostActionStoreError::BlockedByFleetGate) => action_error(
-            StatusCode::CONFLICT,
-            "Another host update workflow must finish or be resolved first",
-        ),
+        Err(HostActionStoreError::BlockedByFleetGate) => {
+            let jobs = state.host_actions.list();
+            let message = blocking_update_for_host(&jobs, &existing.host).map_or_else(
+                || "Another host update workflow must finish or be resolved first".to_string(),
+                |blocker| {
+                    format!(
+                        "{} holds the fleet update lock; finish or resolve that workflow first",
+                        blocker.host
+                    )
+                },
+            );
+            action_error(StatusCode::CONFLICT, &message)
+        }
         Err(HostActionStoreError::NotFound) => {
             action_error(StatusCode::NOT_FOUND, "Guarded action was not found")
         }
@@ -2844,11 +2906,21 @@ fn hosts_payload(
                 h.requested_preferences.as_ref(),
             );
             let action = most_relevant_host_action(action_jobs, &h.name);
-            let lifecycle = host_lifecycle(
+            let apply_declared_ready = h.is_nix
+                && manifest.is_some_and(|manifest| {
+                    manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
+                        && manifest.policy.privileged_actions.janus_required
+                });
+            let normal_update_ready = apply_declared_ready
+                && (kernel_reboot_required(h.kernel.as_ref()).is_some()
+                    || h.freshness.has_proven_deployable_update());
+            let lifecycle = host_lifecycle_with_apply(
                 action_jobs,
                 &h.name,
                 preferences_state,
                 kernel_reboot_required(h.kernel.as_ref()).is_some(),
+                apply_declared_ready,
+                normal_update_ready,
             );
             let action_summary = action.map(HostActionJob::summary);
             let withdrawable_settings_change =
@@ -13503,6 +13575,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -13570,12 +13643,90 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn declared_apply_endpoint_is_typed_gated_and_names_the_fleet_lock_holder() {
+        let (state, manifest_path) = state_with_janus_manifest("hsb8", "apply-token");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::ApplyDeclared,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(payload["job"]["intent"], "apply_declared");
+        assert_eq!(payload["job"]["ticket"], "PHAROS-216");
+
+        let (blocked_state, blocked_manifest_path) =
+            state_with_janus_manifest("hsb8", "blocked-apply-token");
+        let mut current = test_report("hsb8");
+        current.kernel = None;
+        blocked_state
+            .store
+            .record(current, now_unix().saturating_add(1))
+            .expect("current report replaces drift fixture");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(blocked_state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::ApplyDeclared,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("No declared preference or kernel drift")));
+
+        let (status, _) = request_update_restart_review(
+            State(blocked_state.clone()),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::RestartOnly,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let mut drifted = test_report("hsb8");
+        drifted.kernel = Some(reboot_required_kernel(now_unix()));
+        blocked_state
+            .store
+            .record(drifted, now_unix().saturating_add(2))
+            .expect("kernel drift restored");
+        blocked_state
+            .host_actions
+            .create_update_review("csb0", "fixture-operator", now_unix())
+            .expect("other host holds fleet gate");
+        let (status, Json(payload)) = request_update_restart_review(
+            State(blocked_state),
+            action_headers(),
+            AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest {
+                intent: UpdateRestartIntent::ApplyDeclared,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("csb0 holds the fleet update lock")));
+
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_file(blocked_manifest_path);
+    }
+
+    #[tokio::test]
     async fn guarded_review_cancellation_is_persisted_and_releases_the_host() {
         let (state, manifest_path) = state_with_janus_manifest("hsb8", "action-token");
         let (status, Json(payload)) = request_update_restart_review(
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -13605,6 +13756,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -13618,6 +13770,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -13656,6 +13809,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             State(state.clone()),
             action_headers(),
             AxumPath("hsb8".to_string()),
+            Json(UpdateRestartActionRequest::default()),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);

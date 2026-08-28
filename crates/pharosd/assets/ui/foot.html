@@ -484,7 +484,7 @@ async function submitHostAction(){
     else if(action==='update-restart'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/confirm',{confirmation:host,attended:true});
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
-    else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{});
+    else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{intent:hostActionContext.intent||'update'});
     else if((action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/acknowledge-dispatch-uncertainty',{});
     else if((action==='settings'||action==='remove')&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/reconcile-accepted-dispatch',{});
     else if(action==='remove'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry-retirement',{});
@@ -576,6 +576,7 @@ function updateHostActionState(surface,host,backup){
   const removeSeparator=root.querySelector('[data-remove-separator]');
   const updateJobActive=host.update_restart_active===true;
   const updatePending=kernelState==='reboot_required'||provenGitUpdate||provenNixpkgsUpdate;
+  const lifecycle=host.lifecycle||{};
   root.dataset.updatePending=updatePending?'true':'false';
   root.dataset.updateRestartActive=host.update_restart_active===true?'true':'false';
   const retired=retirement?.pending===true;
@@ -592,13 +593,12 @@ function updateHostActionState(surface,host,backup){
   const removalReady=!needsRemovalProposal||hostRemovalAvailable;
   if(update)update.hidden=retired||!(root.dataset.isNix==='true'&&canManage&&systemUpdateAvailable);
   if(restart){
-    restart.hidden=retired||updateJobActive||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&updatePending);
+    restart.hidden=retired||updateJobActive||lifecycle.slot==='blocked'||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&updatePending);
     const strong=restart.querySelector('strong');
     if(strong)strong.textContent='Apply update and restart';
   }
   if(remove)remove.hidden=!removalReady||!canManage||retired;
   const continueBtn=root.querySelector('[data-host-action="lifecycle-continue"]');
-  const lifecycle=host.lifecycle||{};
   const lifecycleAction=lifecycle.primary_action;
   const lifecycleRunId=lifecycle.run_id?String(lifecycle.run_id):'';
   if(continueBtn){
@@ -976,13 +976,14 @@ function formatPreferencesSummary(prefs){
   return parts.length?parts.join(' · '):'defaults';
 }
 function lifecycleDriftSlot(slot){
-  return slot==='prefs_drift'||slot==='kernel_drift';
+  return slot==='blocked'||slot==='prefs_drift'||slot==='kernel_drift';
 }
 function lifecycleFromChip(chip){
   const blockedRaw=String(chip.dataset.lifecycleBlockedBy||'');
   return {
     slot:String(chip.dataset.lifecycleSlot||'quiet'),
     invoke:String(chip.dataset.lifecycleInvoke||'host_settings'),
+    update_restart_intent:chip.dataset.lifecycleUpdateRestartIntent||null,
     label:chip.querySelector('[data-host-lifecycle-chip-copy]')?.textContent||'',
     level:String(chip.dataset.lifecycleLevel||'clear'),
     run_id:chip.dataset.lifecycleRunId||null,
@@ -991,6 +992,13 @@ function lifecycleFromChip(chip){
   };
 }
 function lifecycleDriftResolver(slot,blockedBy){
+  if(slot==='blocked'){
+    const blocker=blockedBy.find(value=>value.startsWith('fleet_update:'))?.slice('fleet_update:'.length)||'another host';
+    return {
+      title:'Wait for '+blocker,
+      copy:'Only one guarded host update may run at a time. Finish or resolve that recorded workflow before starting this host.',
+    };
+  }
   if(slot==='prefs_drift'){
     if(blockedBy.includes('host_report')){
       return {
@@ -1017,6 +1025,10 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   if(!overlay||!dialog||!root)return;
   const slot=String(lifecycle?.slot||'quiet');
   const isDrift=lifecycleDriftSlot(slot);
+  const applyDeclared=slot!=='blocked'
+    &&lifecycle?.invoke==='update_restart'
+    &&lifecycle?.update_restart_intent==='apply_declared'
+    &&root.dataset.canManage==='true';
   const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
   const isRun=runId&&(lifecycle.invoke==='workflow'||lifecycle.invoke==='update_restart');
   if(isRun){
@@ -1026,7 +1038,7 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   }
   stopHostActionPoll();
   closeHostActions(root);
-  hostActionContext={action:'lifecycle',root,host:root.dataset.host,lifecycle};
+  hostActionContext={action:applyDeclared?'update-restart':'lifecycle',root,host:root.dataset.host,lifecycle,intent:applyDeclared?'apply_declared':null};
   hostActionReturnFocus=chip;
   dialog.dataset.workflow='false';
   dialog.dataset.drift=isDrift?'true':'false';
@@ -1077,11 +1089,19 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
   setHostActionFact('observed','',false);
   if(isDrift){
     const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
-    const resolver=lifecycleDriftResolver(slot,blockedBy);
+    const resolver=applyDeclared?{
+      title:'Guarded apply',
+      copy:'This starts a read-only target review. Backup evidence and attended confirmation remain required before any live switch or restart.',
+    }:lifecycleDriftResolver(slot,blockedBy);
     if(title)title.textContent=String(lifecycle.label||'');
     if(copy)copy.textContent=String(lifecycle.detail||'');
     if(infoTitle)infoTitle.textContent=resolver.title;
     if(infoCopy)infoCopy.textContent=resolver.copy;
+    if(applyDeclared&&primary){
+      primary.hidden=false;
+      primary.textContent='Prepare guarded apply';
+      setHostActionFact('scope',root.dataset.host+' only · backup required',true);
+    }
     if(slot==='prefs_drift'){
       const declaredSummary=chip.dataset.lifecycleDeclaredSummary
         ||formatPreferencesSummary(host.declared_preferences||host.requested_preferences||host.preferences||{});
@@ -1133,6 +1153,7 @@ function updateHostLifecycle(surface,host){
     const invoke=String(lifecycle?.invoke||'host_settings');
     const level=String(lifecycle?.level||'clear');
     const runId=lifecycle?.run_id?String(lifecycle.run_id):'';
+    const intent=lifecycle?.update_restart_intent?String(lifecycle.update_restart_intent):'';
     const blockedBy=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
     chip.hidden=false;
     chip.dataset.settingsState=String(host.preferences_state||'applied');
@@ -1142,6 +1163,8 @@ function updateHostLifecycle(surface,host){
     chip.dataset.lifecycleDetail=String(lifecycle?.detail||'');
     if(runId)chip.dataset.lifecycleRunId=runId;
     else delete chip.dataset.lifecycleRunId;
+    if(intent)chip.dataset.lifecycleUpdateRestartIntent=intent;
+    else delete chip.dataset.lifecycleUpdateRestartIntent;
     if(blockedBy.length)chip.dataset.lifecycleBlockedBy=blockedBy.join(',');
     else delete chip.dataset.lifecycleBlockedBy;
     if(slot==='prefs_drift'){
