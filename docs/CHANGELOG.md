@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fail closed on beacon container health when the report marker cannot be replaced: `pharos-beacon healthcheck` proves the beacon's atomic temp+rename write is possible (directory writable and the existing marker replaceable despite immutable flags, ACLs or sticky ownership, probed through a hard link so the marker is never touched, with fixed-name artifacts that every run recovers) before trusting a recent marker, names the path and reason otherwise, never follows a symlink at the marker path, a failed startup reset only unlinks the previous marker, never writing into it, writes and probes share a marker lock so a blocked write temporary is detected instead of raced, the startup reset runs in one lock scope and unlinks only the marker it observed, and the marker names the beacon process that wrote it (with the canonical kernel boot id on Linux) so state from a previous run is never healthy again once its obstacle clears (PHAROS-203).
+
 ## 0.1.90 - 2026-08-28
 
 - Make container health diagnosable and truthful for both image roles: `pharosd healthcheck` refuses to guess the bind address when `PHAROS_ADDR` is unset and reports the failing target or HTTP status, `pharos-beacon healthcheck` states why the beacon is unhealthy (one-shot mode, missing or invalid report state, no successful report yet, clock skew, stale age against the interval), and `PHAROS_BEACON_HEALTH_FILE` relocates the beacon's report state; deployments can drop `--no-healthcheck` workarounds (PHAROS-203).
