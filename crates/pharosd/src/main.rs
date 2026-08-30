@@ -5264,11 +5264,11 @@ mod tests {
         assert!(html.contains(r#"--mark-x:58.7%""#));
         assert!(!html.contains(r#"--mark-x:64.0%""#));
         assert!(html.contains("nixpkgs lock (nixos-unstable)"));
-        assert!(html.contains(r#"data-fresh-kind="flake-lock-age" tabindex="0""#));
-        assert!(html.contains(r#"<strong class="ok" data-fresh-value>0d · exact</strong>"#));
-        assert!(html.contains("nixcfg revision"));
-        assert!(html.contains(r#"data-fresh-kind="commits-behind" tabindex="0""#));
-        assert!(html.contains(r#"<strong class="warn" data-fresh-value>3 behind</strong>"#));
+        assert!(html.contains(r#"data-fresh-kind="nixcfg-drift" tabindex="0""#));
+        assert!(html.contains(r#"<strong class="warn" data-fresh-value>3 commits behind</strong>"#));
+        assert!(html.contains(r#"data-deployed-revision=""#));
+        assert!(html.contains(r#"data-nixcfg-revision=""#));
+        assert!(html.contains(r#"data-nixpkgs-revision=""#));
         assert!(html.contains(r#"data-seen data-seen-card>Seen 30s ago</span>"#));
         assert!(html.contains(r#"data-card-asof data-card-asof-compact>00:16</span>"#));
         assert!(html.contains("beat-fill"));
@@ -5446,7 +5446,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_header_chips_expand_while_freshness_cells_stay_stable() {
+    fn fleet_header_chips_expand_while_fault_rail_uses_full_width() {
         assert!(HEAD.contains(".header-chip{position:relative;appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:0;width:25px;height:25px"));
         assert!(HEAD.contains(".header-chip:hover,.header-chip:focus-visible{width:86px"));
         assert!(HEAD.contains(".header-chip-label{display:block;max-width:0;opacity:0"));
@@ -5459,10 +5459,13 @@ mod tests {
             ".host-actions-trigger{color:#4c6780;border-color:rgba(188,211,222,.92);background:rgba(255,255,255,.88)"
         ));
         assert!(HEAD.contains(
-            ".card .fresh-row-compact{position:relative;display:flex;align-items:center;justify-content:flex-start;gap:0;flex:0 0 var(--fresh-cell-width);width:var(--fresh-cell-width);min-height:28px;padding:0 8px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:rgba(247,251,252,.82);outline:0;overflow:hidden}"
+            ".card .fresh{position:relative;display:flex;align-items:center;width:100%;min-width:0"
         ));
+        assert!(HEAD.contains("flex:0 0 auto;width:max-content"));
         assert!(HEAD.contains(".card .fresh-row-label{display:none}"));
         assert!(HEAD.contains(".card .fresh-row-label,.card .fresh-row strong{transition:none}"));
+        assert!(FOOT
+            .contains("matchMedia?.('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'"));
     }
 
     #[test]
@@ -8246,7 +8249,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             r#"<div class="reason warn" data-reason hidden><span>nixpkgs differs from nixos-unstable</span></div>"#
         ));
         assert!(drift_html.contains(
-            r#"data-fresh-kind="flake-lock-age" tabindex="0" title="nixpkgs lock (nixos-unstable): 0d · differs" aria-label="nixpkgs lock (nixos-unstable): 0d · differs""#
+            r#"data-fresh-kind="nixpkgs-drift" tabindex="0" title="nixpkgs: nixpkgs differs from nixos-unstable" aria-label="nixpkgs: nixpkgs differs from nixos-unstable""#
         ));
 
         let mut lifecycle = host_with_backups("lifecycle", 970, vec![]);
@@ -8272,7 +8275,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             HEAD.contains(".card-maintenance .host-lifecycle-chip{width:var(--lifecycle-width)")
         );
         assert!(HEAD.contains(".card .fresh-row-compact{position:relative;display:flex"));
-        assert!(HEAD.contains("width:var(--fresh-cell-width)"));
+        assert!(HEAD.contains("width:max-content"));
 
         let card_start = lifecycle_html
             .find(r#"<article class="card"#)

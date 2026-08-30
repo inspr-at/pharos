@@ -324,6 +324,55 @@ mod module_tests {
             ServiceObservationState::Healthy
         );
     }
+
+    #[test]
+    fn card_freshness_rail_contains_only_actionable_exceptions() {
+        let now = 1_786_310_400;
+        let current = proven_current("nixos-unstable");
+        let mut healthy_backup = backup_ui_summary(&[], now);
+        healthy_backup.state = "healthy";
+        healthy_backup.level = "clear";
+        healthy_backup.label = "Protected".to_string();
+
+        let (quiet, quiet_visible) =
+            card_freshness_fault_markup(&current, &healthy_backup, None, now);
+        assert!(!quiet_visible, "{quiet}");
+        assert_eq!(quiet.matches(" hidden").count(), 6, "{quiet}");
+        assert!(!quiet.contains("deployed-sha"), "{quiet}");
+        assert!(!quiet.contains("nixcfg-sha"), "{quiet}");
+        assert!(!quiet.contains("nixpkgs-sha"), "{quiet}");
+        assert!(!quiet.contains(&"1".repeat(40)), "{quiet}");
+        assert!(!quiet.contains(&"2".repeat(40)), "{quiet}");
+
+        let mut drift = proven_current("nixos-25.05");
+        drift.nixcfg_comparison = Some(NixcfgGitComparison {
+            upstream_revision: "4".repeat(40),
+            relation: GitRevisionRelation::Behind,
+            commits_behind: Some(12),
+        });
+        drift.commits_behind = Some(12);
+        drift.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: "5".repeat(40),
+            relation: NixpkgsRevisionRelation::Different,
+        });
+        let failed_backup = BackupUiSummary {
+            state: "failed",
+            level: "critical",
+            label: "Backup failed".to_string(),
+            ..healthy_backup
+        };
+        let (faults, faults_visible) =
+            card_freshness_fault_markup(&drift, &failed_backup, None, now);
+        assert!(faults_visible, "{faults}");
+        assert!(faults.contains("nixos-25.05 end of life"), "{faults}");
+        assert!(
+            faults.contains("nixpkgs differs from nixos-25.05"),
+            "{faults}"
+        );
+        assert!(faults.contains("12 commits behind"), "{faults}");
+        assert!(faults.contains("Backup failed"), "{faults}");
+        assert!(!faults.contains("+N"), "{faults}");
+    }
 }
 
 pub(super) fn render_no_access_page(
@@ -1014,6 +1063,140 @@ pub(super) fn freshness_markup(freshness: &NixFreshness, compact: bool, now: i64
     )
 }
 
+fn freshness_fault_row(
+    kind: &str,
+    label: &str,
+    value: &str,
+    class: &str,
+    icon: &str,
+    visible: bool,
+) -> String {
+    let hidden = if visible { "" } else { " hidden" };
+    format!(
+        r#"<div class="fresh-row fresh-row-compact" data-fresh-kind="{kind}" tabindex="0" title="{label}: {value}" aria-label="{label}: {value}"{hidden}><span class="fresh-row-icon" aria-hidden="true">{icon}</span><span class="fresh-row-label">{label}</span><strong class="{class}" data-fresh-value>{value}</strong></div>"#,
+        kind = html_escape(kind),
+        label = html_escape(label),
+        value = html_escape(value),
+        class = html_escape(class),
+    )
+}
+
+pub(super) fn card_freshness_fault_markup(
+    freshness: &NixFreshness,
+    backup: &BackupUiSummary,
+    kernel: Option<&KernelPosture>,
+    now: i64,
+) -> (String, bool) {
+    let evidence_missing = freshness.applicable && freshness.deployment_evidence.is_none();
+    let (year, month) = pharos_core::utc_year_month(now);
+    let channel = freshness
+        .deployment_evidence
+        .as_ref()
+        .map(|evidence| evidence.nixpkgs_channel.as_str())
+        .or(freshness.nixpkgs_channel.as_deref())
+        .unwrap_or("nixpkgs");
+    let channel_eol = freshness.applicable
+        && !evidence_missing
+        && freshness.channel_state(year, month) == Some(pharos_core::NixChannelState::EndOfLife);
+    let (nixpkgs_value, nixpkgs_class, nixpkgs_visible) =
+        if !freshness.applicable || evidence_missing {
+            (String::new(), "na", false)
+        } else {
+            match freshness.nixpkgs_comparison.as_ref() {
+                Some(comparison) if comparison.relation == NixpkgsRevisionRelation::Current => {
+                    (String::new(), "ok", false)
+                }
+                Some(_) => (format!("nixpkgs differs from {channel}"), "warn", true),
+                None => ("nixpkgs comparison unknown".to_string(), "na", true),
+            }
+        };
+    let (nixcfg_value, nixcfg_class, nixcfg_visible) = if !freshness.applicable || evidence_missing
+    {
+        (String::new(), "na", false)
+    } else {
+        match freshness.nixcfg_comparison.as_ref() {
+            Some(comparison) if comparison.relation == GitRevisionRelation::Current => {
+                (String::new(), "ok", false)
+            }
+            Some(comparison) if comparison.relation == GitRevisionRelation::Behind => (
+                format!("{} commits behind", comparison.commits_behind.unwrap_or(0)),
+                "warn",
+                true,
+            ),
+            Some(comparison) if comparison.relation == GitRevisionRelation::Ahead => {
+                ("deployed revision ahead".to_string(), "warn", true)
+            }
+            Some(_) => ("deployed revision diverged".to_string(), "warn", true),
+            None => ("nixcfg comparison unknown".to_string(), "na", true),
+        }
+    };
+    let backup_visible = backup.state != "healthy";
+    let backup_class = match backup.level {
+        "critical" => "down",
+        "warning" => "warn",
+        _ => "na",
+    };
+    let kernel_visible = kernel_reboot_required(kernel).is_some();
+    let any_visible = evidence_missing
+        || channel_eol
+        || nixpkgs_visible
+        || nixcfg_visible
+        || backup_visible
+        || kernel_visible;
+    let markup = format!(
+        "{}{}{}{}{}{}",
+        freshness_fault_row(
+            "freshness-unverified",
+            "Freshness",
+            "unverified",
+            "na",
+            icons::PACKAGE_SEARCH,
+            evidence_missing,
+        ),
+        freshness_fault_row(
+            "nixpkgs-eol",
+            "nixpkgs",
+            &format!("{channel} end of life"),
+            "warn",
+            icons::PACKAGE_CALENDAR,
+            channel_eol,
+        ),
+        freshness_fault_row(
+            "nixpkgs-drift",
+            "nixpkgs",
+            &nixpkgs_value,
+            nixpkgs_class,
+            icons::PACKAGE_CALENDAR,
+            nixpkgs_visible,
+        ),
+        freshness_fault_row(
+            "nixcfg-drift",
+            "nixcfg",
+            &nixcfg_value,
+            nixcfg_class,
+            icons::GIT_COMMIT_HORIZONTAL,
+            nixcfg_visible,
+        ),
+        freshness_fault_row(
+            "backup-fault",
+            "Backup",
+            &backup.label,
+            backup_class,
+            icons::SHIELD_ALERT,
+            backup_visible,
+        ),
+        freshness_fault_row(
+            "kernel-restart",
+            "Kernel",
+            "restart required",
+            "warn",
+            icons::POWER,
+            kernel_visible,
+        ),
+    );
+    (markup, any_visible)
+}
+
 pub(super) fn kernel_reboot_required(kernel: Option<&KernelPosture>) -> Option<&KernelPosture> {
     kernel.filter(|posture| posture.state == KernelPostureState::RebootRequired)
 }
@@ -1613,9 +1796,27 @@ pub(super) fn host_actions_markup(
         .as_ref()
         .and_then(|kernel| kernel.expected_version.as_deref())
         .unwrap_or("not reported");
+    let deployed_revision = host
+        .freshness
+        .deployment_evidence
+        .as_ref()
+        .map(|evidence| evidence.source_revision.as_str())
+        .unwrap_or("");
+    let nixcfg_revision = host
+        .freshness
+        .nixcfg_comparison
+        .as_ref()
+        .map(|comparison| comparison.upstream_revision.as_str())
+        .unwrap_or("");
+    let nixpkgs_revision = host
+        .freshness
+        .deployment_evidence
+        .as_ref()
+        .map(|evidence| evidence.nixpkgs_revision.as_str())
+        .unwrap_or("");
 
     format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-update-restart-active="{update_restart_active}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}{withdraw_settings_item}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-update-restart-active="{update_restart_active}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}" data-deployed-revision="{deployed_revision}" data-nixcfg-revision="{nixcfg_revision}" data-nixpkgs-revision="{nixpkgs_revision}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}{withdraw_settings_item}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
         is_nix = host.is_nix,
         declared = context.declared,
         credential_retirement = context.credential_retirement_required,
@@ -1631,6 +1832,9 @@ pub(super) fn host_actions_markup(
         kernel_state = html_escape(kernel_state),
         running_kernel = html_escape(running_kernel),
         expected_kernel = html_escape(expected_kernel),
+        deployed_revision = html_escape(deployed_revision),
+        nixcfg_revision = html_escape(nixcfg_revision),
+        nixpkgs_revision = html_escape(nixpkgs_revision),
         action_attributes = action_attributes,
         withdraw_settings_item = withdraw_settings_item,
         ellipsis = icons::ELLIPSIS,
@@ -6317,7 +6521,6 @@ pub(super) fn render_home_with_capabilities(
         let name = html_escape(&h.name);
         let role = html_escape(&h.role);
         let fresh_tldr = h.freshness.tldr();
-        let card_fresh = freshness_markup(&h.freshness, true, now);
         let list_fresh = freshness_markup(&h.freshness, false, now);
         let attention = attention_reason(
             live,
@@ -6336,6 +6539,9 @@ pub(super) fn render_home_with_capabilities(
         let list_reason = reason_markup(&attention, kernel_required);
         let muted = muted_preferences_markup(&h.preferences);
         let backup = backup_ui_summary(&h.backup_observations, now);
+        let (card_fresh, card_fresh_visible) =
+            card_freshness_fault_markup(&h.freshness, &backup, h.kernel.as_ref(), now);
+        let card_fresh_hidden = if card_fresh_visible { "" } else { " hidden" };
         let backup_chip = backup_chip_markup(&backup, &h.name);
         let protection = protection_onboarding_status(h, runtime.jobs, now);
         let protection_card = protection
@@ -6568,7 +6774,7 @@ pub(super) fn render_home_with_capabilities(
         let signal = signal_markup(&heartbeat_signal);
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh" data-fresh>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
