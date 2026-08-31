@@ -356,7 +356,13 @@ pub(crate) async fn request_host_preferences(
             let active = state
                 .host_actions
                 .latest_settings_change_for_host(canonical_host);
-            let summary = active.as_ref().map(|job| job.summary());
+            let summary = active.as_ref().map(|job| {
+                job.summary_with_settings_context(
+                    declared_preferences,
+                    runtime_host.requested_preferences.as_ref(),
+                    runtime_host.is_nix,
+                )
+            });
             let workflow_html = summary
                 .as_ref()
                 .map(|summary| crate::host_workflow_markup(&summary.workflow));
@@ -777,6 +783,7 @@ function renderSettingsWorkflow(data){{
   const status=dialog.querySelector('[data-host-action-status]');
   const safe=dialog.querySelector('[data-host-action-safe-note]');
   const terminal=['succeeded','failed','cancelled'].includes(job.state);
+  const actionRequired=['continue','restart'].includes(primaryAction?.kind||'');
   settingsWorkflow.mode='workflow';
   settingsWorkflow.confirming=false;
   settingsWorkflow.terminal=terminal;
@@ -785,7 +792,7 @@ function renderSettingsWorkflow(data){{
   if(technical)technical.hidden=true;
   if(checklist){{checklist.hidden=false;checklist.innerHTML=data.workflow_html||''}}
   if(primary){{
-    primary.hidden=!['acknowledge','recover'].includes(primaryAction?.kind||'');
+    primary.hidden=!['acknowledge','recover','continue','restart'].includes(primaryAction?.kind||'');
     primary.disabled=false;
     primary.dataset.workflowAction=primaryAction?.kind||'';
     primary.textContent=primaryAction?.label||'Continue';
@@ -794,8 +801,11 @@ function renderSettingsWorkflow(data){{
   if(cancel)cancel.textContent='Close';
   if(status)status.textContent=data.message||'';
   if(safe){{
-    safe.dataset.workflowLive=terminal?'false':'true';
-    safe.textContent=terminal?'Run complete and saved':'Watching for recorded host evidence';
+    safe.dataset.workflowLive=terminal||actionRequired?'false':'true';
+    safe.textContent=terminal?'Run complete and saved'
+      :primaryAction?.kind==='continue'?'Ready to continue the saved request'
+      :primaryAction?.kind==='restart'?'Operator action required'
+      :'Watching for recorded host evidence';
   }}
   overlay.hidden=false;
   document.body.dataset.hostActionDialogOpen='true';
@@ -805,7 +815,7 @@ function renderSettingsWorkflow(data){{
     if(settingsWorkflow.timer!=null)clearTimeout(settingsWorkflow.timer);
     settingsWorkflow.timer=null;
     setSettingsWorkflowSuspended(false);
-  }}else scheduleSettingsWorkflowPoll(job.id);
+  }}else if(!actionRequired)scheduleSettingsWorkflowPoll(job.id);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
 }}
 async function pollSettingsWorkflow(id){{
@@ -839,8 +849,16 @@ document.querySelector('[data-host-action-overlay]')?.addEventListener('click',e
   if(acknowledge&&settingsWorkflow.id&&settingsWorkflow.mode==='workflow'){{
     event.preventDefault();
     acknowledge.disabled=true;
-    const recover=acknowledge.dataset.workflowAction==='recover';
-    const endpoint=recover?'reconcile-accepted-dispatch':'acknowledge-dispatch-uncertainty';
+    const action=acknowledge.dataset.workflowAction||'';
+    const endpoint=action==='recover'?'reconcile-accepted-dispatch'
+      :action==='continue'?'continue-settings-dispatch'
+      :action==='restart'?'withdraw'
+      :'acknowledge-dispatch-uncertainty';
+    const status=document.querySelector('[data-host-action-status]');
+    if(status)status.textContent=action==='continue'
+      ?'Continuing the saved request through nixcfg…'
+      :action==='restart'?'Clearing the incomplete request…'
+      :'Reconciling the saved workflow…';
     fetch('/host-actions/jobs/'+encodeURIComponent(settingsWorkflow.id)+'/'+endpoint,{{
       method:'POST',
       credentials:'same-origin',
@@ -851,7 +869,6 @@ document.querySelector('[data-host-action-overlay]')?.addEventListener('click',e
       if(!response.ok)throw new Error(data.error||'Could not reconcile the saved workflow.');
       renderSettingsWorkflow(data);
     }}).catch(error=>{{
-      const status=document.querySelector('[data-host-action-status]');
       if(status)status.textContent=error.message||'Could not reconcile the saved workflow.';
       acknowledge.disabled=false;
     }});
@@ -2075,6 +2092,24 @@ mod tests {
         );
         assert!(html.contains("window.addEventListener('pagehide',stopSettingsWorkflowPoll)"));
         assert!(!html.contains("setInterval("));
+    }
+
+    #[test]
+    fn settings_workflow_requires_an_explicit_legacy_continuation() {
+        let html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime_host("hsb8")],
+            Some("hsb8"),
+            "markus",
+            true,
+        );
+
+        assert!(html.contains("const actionRequired=['continue','restart']"));
+        assert!(html.contains("else if(!actionRequired)scheduleSettingsWorkflowPoll(job.id)"));
+        assert!(html.contains(":action==='continue'?'continue-settings-dispatch'"));
+        assert!(html.contains("'Continuing the saved request through nixcfg…'"));
+        assert!(html.contains("'Ready to continue the saved request'"));
     }
 
     #[test]

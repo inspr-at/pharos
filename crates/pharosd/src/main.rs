@@ -102,9 +102,9 @@ use crate::host_actions::{
     host_preferences_state, most_relevant_host_action, withdrawable_settings_change_for_host,
     AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
     HostActionState, HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot,
-    HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostWorkflowKind,
-    HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
-    SystemUpdateProposalBegin, UpdateRestartIntent,
+    HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostSettingsContext,
+    HostWorkflowKind, HostWorkflowSummary, RetiredHost, RetiredHostStore,
+    RetirementAgentResultRequest, SystemUpdateProposalBegin, UpdateRestartIntent,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -731,13 +731,56 @@ fn action_response_with_message(
     )
 }
 
-fn action_response_with_declared_preferences(
+fn action_response_with_settings_context(
     status: StatusCode,
     job: &HostActionJob,
     declared_preferences: Option<&HostPreferences>,
+    pending_preferences: Option<&HostPreferences>,
+    legacy_nix_host: bool,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let message = action_message(job);
-    let summary = job.summary_with_declared_preferences(declared_preferences);
+    let summary = job.summary_with_settings_context(
+        declared_preferences,
+        pending_preferences,
+        legacy_nix_host,
+    );
+    let message = match summary
+        .workflow
+        .primary_action
+        .as_ref()
+        .map(|action| action.kind)
+    {
+        Some(host_actions::HostWorkflowActionKind::Continue) => Cow::Borrowed(
+            "Pharos has the exact saved settings, but no durable repository receipt. Choose Continue request to send them through the reviewed nixcfg workflow.",
+        ),
+        Some(host_actions::HostWorkflowActionKind::Restart) => Cow::Borrowed(
+            "The exact saved settings are no longer available. Clear this request and start over.",
+        ),
+        _ => action_message(job),
+    };
+    let workflow_html = host_workflow_markup(&summary.workflow);
+    (
+        status,
+        Json(json!({
+            "message": message,
+            "job": summary,
+            "workflow_html": workflow_html,
+        })),
+    )
+}
+
+fn action_response_with_settings_context_and_message(
+    status: StatusCode,
+    job: &HostActionJob,
+    declared_preferences: Option<&HostPreferences>,
+    pending_preferences: Option<&HostPreferences>,
+    legacy_nix_host: bool,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let summary = job.summary_with_settings_context(
+        declared_preferences,
+        pending_preferences,
+        legacy_nix_host,
+    );
     let workflow_html = host_workflow_markup(&summary.workflow);
     (
         status,
@@ -1568,10 +1611,15 @@ async fn host_action_job_json(
             "Guarded action access is not granted",
         );
     }
-    action_response_with_declared_preferences(
+    let runtime_host = state.store.get(&job.host);
+    action_response_with_settings_context(
         StatusCode::OK,
         &job,
         state.manifests.declared_preferences_for(&job.host),
+        runtime_host
+            .as_ref()
+            .and_then(|host| host.requested_preferences.as_ref()),
+        runtime_host.as_ref().is_some_and(|host| host.is_nix),
     )
 }
 
@@ -1618,6 +1666,164 @@ async fn acknowledge_dispatch_uncertainty(
             "The dispatch uncertainty acknowledgement could not be recorded",
         ),
     }
+}
+
+async fn continue_legacy_settings_dispatch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(preview) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers) || !access.can_agora() || !access.allows_host(&preview.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Settings continuation access is not granted",
+        );
+    }
+
+    // The old flow dispatched before it persisted a repository receipt. Keep
+    // continuation, withdrawal, and fresh submission in one total order so a
+    // double click cannot send twice or resurrect a cancelled request.
+    let _settings_change_guard = state.settings_change_lock.lock().await;
+    let Some(existing) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
+    };
+    if !existing.can_continue_legacy_settings() {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Only an accepted older settings request without a saved repository receipt can continue",
+        );
+    }
+    let Some(runtime_host) = state.store.get(&existing.host) else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The host is no longer in the fleet store; clear this request and start over",
+        );
+    };
+    if !runtime_host.is_nix {
+        return action_error(
+            StatusCode::CONFLICT,
+            "Only a Nix host settings request can continue through nixcfg",
+        );
+    }
+    let Some(preferences) = runtime_host.requested_preferences.clone() else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The exact settings are no longer recoverable; clear this request and start over",
+        );
+    };
+    let declared_preferences = state.manifests.declared_preferences_for(&existing.host);
+    if declared_preferences == Some(&preferences) {
+        return action_response_with_settings_context_and_message(
+            StatusCode::OK,
+            &existing,
+            declared_preferences,
+            Some(&preferences),
+            true,
+            "The loaded nixcfg declaration already contains these settings. Deploy the host, then check again.",
+        );
+    }
+
+    let recorded = match state.host_actions.prepare_legacy_settings_continuation(
+        &existing.id,
+        &preferences,
+        now_unix(),
+    ) {
+        Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            let Some(job) = state.host_actions.get(&existing.id).filter(|job| {
+                job.requested_preferences() == Some(&preferences) && !job.dispatch_submitted()
+            }) else {
+                return action_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The recovered settings were persisted but could not be reloaded safely",
+                );
+            };
+            job
+        }
+        Err(_) => {
+            return action_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The recovered settings could not be saved before repository handoff",
+            );
+        }
+    };
+
+    let request_id = match state
+        .nixcfg_dispatch
+        .dispatch(&existing.host, &preferences)
+        .await
+    {
+        Ok(request_id) => request_id,
+        Err(error) => {
+            let failed = match error {
+                NixcfgDispatchError::OutcomeUncertain => state
+                    .host_actions
+                    .fail_settings_change_uncertain(&existing.id, now_unix())
+                    .ok(),
+                _ => state
+                    .host_actions
+                    .fail_settings_change(&existing.id, now_unix())
+                    .ok(),
+            }
+            .or_else(|| state.host_actions.get(&existing.id))
+            .unwrap_or(recorded);
+            let status = match &error {
+                NixcfgDispatchError::Disabled | NixcfgDispatchError::CredentialUnavailable => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                NixcfgDispatchError::InvalidHost
+                | NixcfgDispatchError::InvalidPreferences
+                | NixcfgDispatchError::InvalidRemovalIntent => StatusCode::BAD_REQUEST,
+                NixcfgDispatchError::OutcomeUncertain => StatusCode::CONFLICT,
+                NixcfgDispatchError::Rejected(_) => StatusCode::BAD_GATEWAY,
+            };
+            return action_response_with_message(status, &failed, error.safe_message());
+        }
+    };
+
+    let submitted = match state.host_actions.mark_settings_dispatch_submitted(
+        &existing.id,
+        &request_id,
+        now_unix(),
+    ) {
+        Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => state
+            .host_actions
+            .get(&existing.id)
+            .unwrap_or_else(|| recorded.clone()),
+        Err(_) => {
+            let uncertain = state
+                .host_actions
+                .fail_settings_change_uncertain(&existing.id, now_unix())
+                .ok()
+                .or_else(|| state.host_actions.get(&existing.id))
+                .unwrap_or(recorded);
+            return action_response_with_message(
+                StatusCode::CONFLICT,
+                &uncertain,
+                "nixcfg may have accepted the recovered request, but Pharos could not save that receipt. Verify nixcfg before any retry.",
+            );
+        }
+    };
+
+    tracing::info!(
+        host = %submitted.host,
+        ticket = "PHAROS-240",
+        "legacy settings request continued through nixcfg"
+    );
+    action_response_with_settings_context_and_message(
+        StatusCode::ACCEPTED,
+        &submitted,
+        declared_preferences,
+        Some(&preferences),
+        true,
+        "The recovered settings were sent to the reviewed nixcfg workflow. Deployment and matching host evidence are still required.",
+    )
 }
 
 async fn reconcile_accepted_dispatch(
@@ -2965,9 +3171,18 @@ fn hosts_payload(
                 kernel_reboot_required(h.kernel.as_ref()).is_some(),
                 apply_declared_ready,
                 normal_update_ready,
+                HostSettingsContext {
+                    declared_preferences: declared_preferences.as_ref(),
+                    pending_preferences: h.requested_preferences.as_ref(),
+                    legacy_nix_host: h.is_nix,
+                },
             );
             let action_summary = action.map(|action| {
-                action.summary_with_declared_preferences(declared_preferences.as_ref())
+                action.summary_with_settings_context(
+                    declared_preferences.as_ref(),
+                    h.requested_preferences.as_ref(),
+                    h.is_nix,
+                )
             });
             let withdrawable_settings_change =
                 withdrawable_settings_change_for_host(action_jobs, &h.name);
@@ -15555,6 +15770,217 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .as_str()
             .expect("safe reconciliation error")
             .contains("Only a saved"));
+    }
+
+    #[tokio::test]
+    async fn legacy_accepted_settings_continue_dispatches_once_and_saves_the_receipt() {
+        let mut state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        state
+            .store
+            .request_preferences("hsb8", requested.clone())
+            .expect("legacy pending preferences retained");
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 915)
+            .expect("legacy settings workflow created");
+        state
+            .host_actions
+            .accept_settings_change(&settings.id, 916)
+            .expect("legacy request accepted without receipt");
+
+        let (read_status, Json(read_payload)) = host_action_job_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(read_status, StatusCode::OK);
+        assert!(read_payload["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no durable repository receipt")));
+        assert_eq!(
+            read_payload["job"]["workflow"]["primary_action"]["label"],
+            "Continue request"
+        );
+        let host = state.store.get("hsb8").expect("settings host retained");
+        let fleet_payload = hosts_payload(
+            vec![host],
+            &[],
+            &BTreeMap::new(),
+            &state.host_actions.list(),
+            916,
+        );
+        assert_eq!(
+            fleet_payload["hosts"][0]["lifecycle"]["label"],
+            "request needs continuation"
+        );
+        assert_eq!(
+            fleet_payload["hosts"][0]["lifecycle"]["primary_action"]["label"],
+            "Continue request"
+        );
+        assert_eq!(
+            fleet_payload["hosts"][0]["host_action"]["workflow"]["status_label"],
+            "request needs continuation"
+        );
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = continue_legacy_settings_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            payload["job"]["workflow"]["primary_action"]["label"],
+            "Check host now"
+        );
+        assert!(payload["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("reviewed nixcfg workflow")));
+        let continued = state
+            .host_actions
+            .get(&settings.id)
+            .expect("continued workflow retained");
+        assert_eq!(continued.requested_preferences(), Some(&requested));
+        assert!(continued.dispatch_submitted());
+        assert!(continued
+            .summary()
+            .workflow
+            .evidence
+            .iter()
+            .any(|item| item.label == "Repository request"));
+
+        let (second_status, _) = continue_legacy_settings_dispatch(
+            State(state),
+            action_headers(),
+            AxumPath(settings.id),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CONFLICT);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_accepted_settings_continue_skips_dispatch_when_declaration_matches() {
+        let mut state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        state
+            .store
+            .request_preferences("hsb8", requested.clone())
+            .expect("legacy pending preferences retained");
+        let preferences_path = std::env::temp_dir().join(format!(
+            "pharos-legacy-settings-declared-{}-{}.json",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &preferences_path,
+            serde_json::to_vec(&json!({
+                "schema": "inspr.pharos.host-preferences.v1",
+                "version": 1,
+                "hosts": { "hsb8": requested.clone() }
+            }))
+            .expect("declared preferences serialize"),
+        )
+        .expect("declared preferences fixture writes");
+        state.manifests = Arc::new(ManifestRegistry::from_sources(
+            Vec::new(),
+            Some(preferences_path.clone()),
+        ));
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 917)
+            .expect("legacy settings workflow created");
+        state
+            .host_actions
+            .accept_settings_change(&settings.id, 918)
+            .expect("legacy request accepted without receipt");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = continue_legacy_settings_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            payload["job"]["workflow"]["primary_action"]["label"],
+            "Check host now"
+        );
+        assert!(payload["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already contains these settings")));
+        let unchanged = state
+            .host_actions
+            .get(&settings.id)
+            .expect("legacy workflow retained");
+        assert!(!unchanged.dispatch_submitted());
+        assert!(unchanged.requested_preferences().is_none());
+        std::fs::remove_file(preferences_path).expect("remove declared preferences fixture");
+    }
+
+    #[tokio::test]
+    async fn legacy_accepted_settings_continue_without_saved_values_never_dispatches() {
+        let mut state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("settings host recorded");
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 919)
+            .expect("legacy settings workflow created");
+        state
+            .host_actions
+            .accept_settings_change(&settings.id, 920)
+            .expect("legacy request accepted without receipt");
+
+        let (api_base, dispatch_count) = mock_counting_dispatch_endpoint();
+        let dispatch_token = dispatch_token_file();
+        state.nixcfg_dispatch =
+            NixcfgDispatch::for_test(Some(dispatch_token.path.clone()), api_base);
+
+        let (status, Json(payload)) = continue_legacy_settings_dispatch(
+            State(state),
+            action_headers(),
+            AxumPath(settings.id),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("no longer recoverable")));
     }
 
     #[tokio::test]

@@ -291,6 +291,7 @@ pub(crate) enum HostActionEventKind {
     RecoveryPassed,
     RecoveryFailed,
     SettingsRequestAccepted,
+    SettingsContinuationPrepared,
     SettingsApplied,
     SettingsFailed,
     RemovalAccessRevoked,
@@ -517,6 +518,15 @@ pub(crate) enum HostWorkflowActionKind {
     Recover,
     Acknowledge,
     Refresh,
+    Continue,
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacySettingsResolution {
+    Continue,
+    Verify,
+    Restart,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -874,6 +884,15 @@ impl HostActionJob {
         &self,
         declared_preferences: Option<&HostPreferences>,
     ) -> HostActionSummary {
+        self.summary_with_settings_context(declared_preferences, None, false)
+    }
+
+    pub(crate) fn summary_with_settings_context(
+        &self,
+        declared_preferences: Option<&HostPreferences>,
+        pending_preferences: Option<&HostPreferences>,
+        legacy_nix_host: bool,
+    ) -> HostActionSummary {
         HostActionSummary {
             id: self.id.clone(),
             host: self.host.clone(),
@@ -889,7 +908,7 @@ impl HostActionJob {
             plan: self.plan.clone(),
             removal_plan: self.removal_plan.clone(),
             result: self.result.clone(),
-            workflow: self.workflow(declared_preferences),
+            workflow: self.workflow(declared_preferences, pending_preferences, legacy_nix_host),
         }
     }
 
@@ -978,16 +997,37 @@ impl HostActionJob {
         self.workflow_kind() == HostWorkflowKind::SettingsChange && !self.state.is_terminal()
     }
 
-    fn workflow(&self, declared_preferences: Option<&HostPreferences>) -> HostWorkflowSummary {
+    fn workflow(
+        &self,
+        declared_preferences: Option<&HostPreferences>,
+        pending_preferences: Option<&HostPreferences>,
+        legacy_nix_host: bool,
+    ) -> HostWorkflowSummary {
         let kind = self.workflow_kind();
+        let legacy_settings_resolution = self.legacy_settings_resolution(
+            pending_preferences,
+            declared_preferences,
+            legacy_nix_host,
+        );
+        let requested_preferences = self.requested_preferences.as_ref().or_else(|| {
+            legacy_settings_resolution
+                .is_some_and(|resolution| {
+                    matches!(
+                        resolution,
+                        LegacySettingsResolution::Continue | LegacySettingsResolution::Verify
+                    )
+                })
+                .then_some(pending_preferences)
+                .flatten()
+        });
         let declaration_matches = kind == HostWorkflowKind::SettingsChange
-            && self
-                .requested_preferences
-                .as_ref()
+            && requested_preferences
                 .zip(declared_preferences)
                 .is_some_and(|(requested, declared)| requested == declared);
         let (title, guidance, status_label, status_level, primary_action, steps) = match kind {
-            HostWorkflowKind::SettingsChange => self.settings_workflow(declaration_matches),
+            HostWorkflowKind::SettingsChange => {
+                self.settings_workflow(declaration_matches, legacy_settings_resolution)
+            }
             HostWorkflowKind::SystemUpdateProposal => self.system_update_workflow(),
             HostWorkflowKind::UpdateRestart => self.update_restart_workflow(),
             HostWorkflowKind::RemoveHost => self.removal_workflow(),
@@ -999,8 +1039,8 @@ impl HostActionJob {
                 .find(|step| step.key == key)
                 .map(|step| step.location)
         });
-        let evidence = self.workflow_evidence();
-        let ladder = self.workflow_ladder(declaration_matches);
+        let evidence = self.workflow_evidence(legacy_settings_resolution);
+        let ladder = self.workflow_ladder(declaration_matches, legacy_settings_resolution);
         let next = self.workflow_next(primary_action.as_ref(), current_location);
         let events = self
             .events
@@ -1040,6 +1080,31 @@ impl HostActionJob {
         }
     }
 
+    pub(crate) fn can_continue_legacy_settings(&self) -> bool {
+        self.workflow_kind() == HostWorkflowKind::SettingsChange
+            && self.state == HostActionState::ProposalRequested
+            && self.has_event(HostActionEventKind::SettingsRequestAccepted)
+            && !self.has_event(HostActionEventKind::DispatchSubmitted)
+            && self.requested_preferences.is_none()
+    }
+
+    fn legacy_settings_resolution(
+        &self,
+        pending_preferences: Option<&HostPreferences>,
+        declared_preferences: Option<&HostPreferences>,
+        legacy_nix_host: bool,
+    ) -> Option<LegacySettingsResolution> {
+        (legacy_nix_host && self.can_continue_legacy_settings()).then_some(
+            match pending_preferences {
+                Some(pending) if declared_preferences == Some(pending) => {
+                    LegacySettingsResolution::Verify
+                }
+                Some(_) => LegacySettingsResolution::Continue,
+                None => LegacySettingsResolution::Restart,
+            },
+        )
+    }
+
     fn latest_event(&self, kinds: &[HostActionEventKind]) -> Option<&HostActionEvent> {
         self.events
             .iter()
@@ -1063,7 +1128,11 @@ impl HostActionJob {
         }
     }
 
-    fn workflow_ladder(&self, declaration_matches: bool) -> Vec<HostWorkflowLadderFact> {
+    fn workflow_ladder(
+        &self,
+        declaration_matches: bool,
+        legacy_settings_resolution: Option<LegacySettingsResolution>,
+    ) -> Vec<HostWorkflowLadderFact> {
         let requested = self.latest_event(&[HostActionEventKind::Requested]);
         let cancelled = self.state == HostActionState::Cancelled;
         let stopped_state = if cancelled || self.state == HostActionState::Failed {
@@ -1115,14 +1184,28 @@ impl HostActionJob {
                     Self::ladder_fact(
                         "requested",
                         "Requested",
-                        if submitted.is_some() || accepted.is_some() {
+                        if legacy_settings_resolution == Some(LegacySettingsResolution::Continue)
+                            || legacy_settings_resolution == Some(LegacySettingsResolution::Restart)
+                        {
+                            "current"
+                        } else if submitted.is_some() || accepted.is_some() {
                             "complete"
                         } else if cancelled || self.state == HostActionState::Failed {
                             "stopped"
                         } else {
                             "current"
                         },
-                        if submitted.is_some() {
+                        if legacy_settings_resolution == Some(LegacySettingsResolution::Continue) {
+                            "Saved settings have no durable repository receipt"
+                        } else if legacy_settings_resolution
+                            == Some(LegacySettingsResolution::Verify)
+                        {
+                            "Loaded declaration already contains the saved settings"
+                        } else if legacy_settings_resolution
+                            == Some(LegacySettingsResolution::Restart)
+                        {
+                            "Old request has no recoverable settings payload"
+                        } else if submitted.is_some() {
                             "Repository handoff accepted"
                         } else if accepted.is_some() {
                             "Pending request saved for host delivery"
@@ -1426,7 +1509,10 @@ impl HostActionJob {
             Some(HostWorkflowActionKind::Recover | HostWorkflowActionKind::Acknowledge) => {
                 HostWorkflowExecutionLocation::Pharos
             }
-            Some(HostWorkflowActionKind::Refresh) => HostWorkflowExecutionLocation::Pharos,
+            Some(HostWorkflowActionKind::Continue) => HostWorkflowExecutionLocation::Github,
+            Some(HostWorkflowActionKind::Refresh | HostWorkflowActionKind::Restart) => {
+                HostWorkflowExecutionLocation::Pharos
+            }
             None => current_location.unwrap_or(HostWorkflowExecutionLocation::Pharos),
         }
         .label(&self.host);
@@ -1460,6 +1546,16 @@ impl HostActionJob {
                     self.host
                 ),
             ),
+            Some(HostWorkflowActionKind::Continue) => (
+                primary.expect("matched primary action").label.clone(),
+                "Sends the retained settings to the reviewed nixcfg workflow, which may open and merge its narrow proposal; deployment and matching host evidence are still required."
+                    .to_string(),
+            ),
+            Some(HostWorkflowActionKind::Restart) => (
+                primary.expect("matched primary action").label.clone(),
+                "Clears this incomplete saved request so the desired settings can be reviewed and submitted again."
+                    .to_string(),
+            ),
             None if self.state == HostActionState::Cancelled => (
                 "No next action".to_string(),
                 if self.workflow_kind() == HostWorkflowKind::SettingsChange {
@@ -1481,7 +1577,7 @@ impl HostActionJob {
         };
         let boundary = match self.workflow_kind() {
             HostWorkflowKind::SettingsChange => {
-                "Pharos will not close or merge a nixcfg proposal."
+                "nixcfg owns proposal validation and merge; this action does not deploy the host."
             }
             HostWorkflowKind::SystemUpdateProposal => {
                 "Pharos will not merge, deploy, or verify a host change."
@@ -1501,7 +1597,10 @@ impl HostActionJob {
         }
     }
 
-    fn workflow_evidence(&self) -> Vec<HostWorkflowEvidence> {
+    fn workflow_evidence(
+        &self,
+        legacy_settings_resolution: Option<LegacySettingsResolution>,
+    ) -> Vec<HostWorkflowEvidence> {
         let mut evidence = Vec::new();
         match self.workflow_kind() {
             HostWorkflowKind::SettingsChange => {
@@ -1523,6 +1622,14 @@ impl HostActionJob {
                         "outcome uncertain"
                     } else if self.state == HostActionState::Failed {
                         "stopped"
+                    } else if legacy_settings_resolution == Some(LegacySettingsResolution::Continue)
+                    {
+                        "repository receipt not recorded"
+                    } else if legacy_settings_resolution == Some(LegacySettingsResolution::Restart)
+                    {
+                        "settings payload unavailable"
+                    } else if legacy_settings_resolution == Some(LegacySettingsResolution::Verify) {
+                        "settings present in loaded declaration"
                     } else if accepted || submitted || self.state == HostActionState::Succeeded {
                         "accepted"
                     } else {
@@ -1718,6 +1825,7 @@ impl HostActionJob {
     fn settings_workflow(
         &self,
         declaration_matches: bool,
+        legacy_settings_resolution: Option<LegacySettingsResolution>,
     ) -> (
         String,
         String,
@@ -1776,6 +1884,21 @@ impl HostActionJob {
                 "settings request stopped",
                 "warning",
             ),
+            _ if legacy_settings_resolution == Some(LegacySettingsResolution::Continue) => (
+                "This older request has no saved repository receipt. Pharos recovered the exact requested settings and can continue the same run; continuing may resend the same values to nixcfg.",
+                "request needs continuation",
+                "warning",
+            ),
+            _ if legacy_settings_resolution == Some(LegacySettingsResolution::Verify) => (
+                repository_wait_guidance.as_str(),
+                "change waiting",
+                "warning",
+            ),
+            _ if legacy_settings_resolution == Some(LegacySettingsResolution::Restart) => (
+                "Pharos cannot recover the exact settings for this older request, so it will not resend anything. Clear this run, review the current settings, and submit the change again.",
+                "request needs resubmission",
+                "warning",
+            ),
             _ if handoff_needs_reconciliation => (
                 "The repository accepted this settings request. Pharos is preserving the handoff while its local pending record is reconciled; do not resend it.",
                 "dispatch accepted",
@@ -1802,6 +1925,13 @@ impl HostActionJob {
             HostActionState::Cancelled => WorkflowStepState::Cancelled,
             HostActionState::Failed if outcome_uncertain => WorkflowStepState::ActionRequired,
             HostActionState::Failed => WorkflowStepState::Failed,
+            _ if matches!(
+                legacy_settings_resolution,
+                Some(LegacySettingsResolution::Continue | LegacySettingsResolution::Restart)
+            ) =>
+            {
+                WorkflowStepState::ActionRequired
+            }
             _ if accepted || submitted => WorkflowStepState::Passed,
             _ => WorkflowStepState::Running,
         };
@@ -1810,6 +1940,13 @@ impl HostActionJob {
             HostActionState::Cancelled => WorkflowStepState::Skipped,
             HostActionState::Failed if outcome_uncertain => WorkflowStepState::Queued,
             HostActionState::Failed => WorkflowStepState::Skipped,
+            _ if matches!(
+                legacy_settings_resolution,
+                Some(LegacySettingsResolution::Continue | LegacySettingsResolution::Restart)
+            ) =>
+            {
+                WorkflowStepState::Queued
+            }
             _ if accepted => WorkflowStepState::Waiting,
             _ => WorkflowStepState::Queued,
         };
@@ -1831,7 +1968,19 @@ impl HostActionJob {
                     kind: HostWorkflowActionKind::Acknowledge,
                     label: "I verified nixcfg — allow a new request".to_string(),
                 })
-            } else if accepted && submitted {
+            } else if legacy_settings_resolution == Some(LegacySettingsResolution::Continue) {
+                Some(HostWorkflowAction {
+                    kind: HostWorkflowActionKind::Continue,
+                    label: "Continue request".to_string(),
+                })
+            } else if legacy_settings_resolution == Some(LegacySettingsResolution::Restart) {
+                Some(HostWorkflowAction {
+                    kind: HostWorkflowActionKind::Restart,
+                    label: "Clear and start over".to_string(),
+                })
+            } else if legacy_settings_resolution == Some(LegacySettingsResolution::Verify)
+                || (accepted && submitted)
+            {
                 Some(HostWorkflowAction {
                     kind: HostWorkflowActionKind::Refresh,
                     label: "Check host now".to_string(),
@@ -1863,13 +2012,33 @@ impl HostActionJob {
                         "The delivery workflow did not accept the request."
                     } else if submitted {
                         "The durable delivery workflow accepted the request."
+                    } else if legacy_settings_resolution
+                        == Some(LegacySettingsResolution::Continue)
+                    {
+                        "The settings are saved, but the repository handoff has no durable receipt."
+                    } else if legacy_settings_resolution
+                        == Some(LegacySettingsResolution::Verify)
+                    {
+                        "The loaded declaration already contains the saved settings."
+                    } else if legacy_settings_resolution
+                        == Some(LegacySettingsResolution::Restart)
+                    {
+                        "The exact settings payload is unavailable; clear this run before resubmitting."
                     } else if accepted {
                         "Pharos saved the request for host delivery."
                     } else {
                         "Pharos is recording the delivery request."
                     },
                 )
-                .at(if repository_delivery {
+                .at(if repository_delivery
+                    || matches!(
+                        legacy_settings_resolution,
+                        Some(
+                            LegacySettingsResolution::Continue
+                                | LegacySettingsResolution::Verify
+                        )
+                    )
+                {
                     HostWorkflowExecutionLocation::Github
                 } else {
                     HostWorkflowExecutionLocation::Pharos
@@ -2721,6 +2890,9 @@ fn event_label(event: &HostActionEvent) -> String {
         HostActionEventKind::RecoveryPassed => "Recovery verification passed",
         HostActionEventKind::RecoveryFailed => "Recovery verification stopped",
         HostActionEventKind::SettingsRequestAccepted => "Settings request accepted",
+        HostActionEventKind::SettingsContinuationPrepared => {
+            "Legacy settings continuation prepared"
+        }
         HostActionEventKind::SettingsApplied => "Host reported the requested settings",
         HostActionEventKind::SettingsFailed => "Settings request stopped",
         HostActionEventKind::RemovalAccessRevoked => "Host reporting access revoked",
@@ -2934,8 +3106,23 @@ fn most_relevant_lifecycle_run<'a>(
         .max_by_key(|job| (lifecycle_run_priority(job), job.updated_at, job.created_at))
 }
 
-fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle {
-    let workflow = job.workflow(None);
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostSettingsContext<'a> {
+    pub(crate) declared_preferences: Option<&'a HostPreferences>,
+    pub(crate) pending_preferences: Option<&'a HostPreferences>,
+    pub(crate) legacy_nix_host: bool,
+}
+
+fn run_lifecycle(
+    job: &HostActionJob,
+    slot: HostLifecycleSlot,
+    settings: HostSettingsContext<'_>,
+) -> HostLifecycle {
+    let workflow = job.workflow(
+        settings.declared_preferences,
+        settings.pending_preferences,
+        settings.legacy_nix_host,
+    );
     let (label, level, detail, blocked_by) = if job.workflow_kind()
         == HostWorkflowKind::SettingsChange
         && job.state == HostActionState::Cancelled
@@ -2988,7 +3175,15 @@ pub(crate) fn host_lifecycle(
     preferences: HostPreferencesState,
     kernel_drift: bool,
 ) -> HostLifecycle {
-    host_lifecycle_with_apply(jobs, host, preferences, kernel_drift, false, false)
+    host_lifecycle_with_apply(
+        jobs,
+        host,
+        preferences,
+        kernel_drift,
+        false,
+        false,
+        HostSettingsContext::default(),
+    )
 }
 
 pub(crate) fn host_lifecycle_with_apply(
@@ -2998,13 +3193,14 @@ pub(crate) fn host_lifecycle_with_apply(
     kernel_drift: bool,
     apply_declared_ready: bool,
     normal_update_ready: bool,
+    settings: HostSettingsContext<'_>,
 ) -> HostLifecycle {
     let action = most_relevant_lifecycle_run(jobs, host);
     if let Some((job, slot)) = action
         .and_then(|job| lifecycle_run_slot(job).map(|slot| (job, slot)))
         .filter(|(_, slot)| *slot != HostLifecycleSlot::SystemUpdateProposal)
     {
-        return run_lifecycle(job, slot);
+        return run_lifecycle(job, slot, settings);
     }
 
     let apply_declared_waiting = apply_declared_ready
@@ -3113,7 +3309,7 @@ pub(crate) fn host_lifecycle_with_apply(
     if let Some((job, HostLifecycleSlot::SystemUpdateProposal)) =
         action.and_then(|job| lifecycle_run_slot(job).map(|slot| (job, slot)))
     {
-        return run_lifecycle(job, HostLifecycleSlot::SystemUpdateProposal);
+        return run_lifecycle(job, HostLifecycleSlot::SystemUpdateProposal, settings);
     }
 
     HostLifecycle {
@@ -3878,6 +4074,46 @@ impl HostActionStore {
             let previous = job.clone();
             job.updated_at = job.updated_at.max(now);
             job.requested_preferences = Some(preferences.clone());
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            if !error.persistence_committed() {
+                jobs.insert(id.to_string(), previous);
+            }
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn prepare_legacy_settings_continuation(
+        &self,
+        id: &str,
+        preferences: &HostPreferences,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if preferences.validate_contract().is_err() {
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if !job.can_continue_legacy_settings() {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            let previous = job.clone();
+            let event_at = job.updated_at.max(now);
+            job.updated_at = event_at;
+            job.requested_preferences = Some(preferences.clone());
+            job.record_event(
+                event_at,
+                HostActionEventSource::Pharos,
+                HostActionEventKind::SettingsContinuationPrepared,
+                None,
+            );
             (previous, job.clone())
         };
         if !updated.validate() {
@@ -5510,8 +5746,9 @@ fn reconcile_orphaned_host_dispatch(job: &mut HostActionJob, now: i64) -> bool {
     }
     match job.workflow_kind() {
         HostWorkflowKind::SettingsChange => {
-            if job.has_event(HostActionEventKind::SettingsRequestAccepted)
-                || job.requested_preferences.is_none()
+            if job.requested_preferences.is_none()
+                || (job.has_event(HostActionEventKind::SettingsRequestAccepted)
+                    && !job.has_event(HostActionEventKind::SettingsContinuationPrepared))
             {
                 return false;
             }
@@ -6206,6 +6443,7 @@ mod tests {
             false,
             true,
             false,
+            HostSettingsContext::default(),
         );
         assert_eq!(blocked.slot, HostLifecycleSlot::Blocked);
         assert_eq!(blocked.label, "Blocked by csb0");
@@ -6224,6 +6462,7 @@ mod tests {
             false,
             true,
             false,
+            HostSettingsContext::default(),
         );
         assert_eq!(ready.slot, HostLifecycleSlot::PrefsDrift);
         assert_eq!(ready.invoke, HostLifecycleInvoke::UpdateRestart);
@@ -6839,7 +7078,7 @@ mod tests {
             .contains("completion still requires csb0 to report the requested values"));
         assert_eq!(
             workflow.next.boundary,
-            "Pharos will not close or merge a nixcfg proposal."
+            "nixcfg owns proposal validation and merge; this action does not deploy the host."
         );
 
         let unchanged = store.get(&job.id).expect("waiting run retained");
@@ -9944,6 +10183,158 @@ mod tests {
         assert!(!waiting.has_event(HostActionEventKind::DispatchOutcomeUncertain));
         assert_eq!(waiting.summary().workflow.status_label, "change waiting");
         assert!(waiting.summary().workflow.primary_action.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_accepted_nix_settings_offer_truthful_recovery_actions() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb0", "markus", 550)
+            .expect("legacy settings workflow created");
+        let waiting = store
+            .accept_settings_change(&settings.id, 551)
+            .expect("legacy settings request accepted without dispatch receipt");
+        let requested = HostPreferences {
+            accent: Some("#25845f".to_string()),
+            ..Default::default()
+        };
+        let different_declaration = HostPreferences {
+            accent: Some("#d4c060".to_string()),
+            ..Default::default()
+        };
+
+        let recoverable = waiting.summary_with_settings_context(
+            Some(&different_declaration),
+            Some(&requested),
+            true,
+        );
+        assert_eq!(
+            recoverable.workflow.status_label,
+            "request needs continuation"
+        );
+        assert_eq!(
+            recoverable.workflow.primary_action,
+            Some(HostWorkflowAction {
+                kind: HostWorkflowActionKind::Continue,
+                label: "Continue request".to_string(),
+            })
+        );
+        assert_eq!(
+            recoverable.workflow.current_step.as_deref(),
+            Some("request")
+        );
+        assert_eq!(recoverable.workflow.next.location, "GitHub");
+        assert!(recoverable
+            .workflow
+            .guidance
+            .contains("may resend the same values"));
+        assert_eq!(
+            recoverable
+                .workflow
+                .ladder
+                .iter()
+                .find(|fact| fact.key == "requested")
+                .map(|fact| (fact.state, fact.fact.as_str())),
+            Some((
+                "current",
+                "Saved settings have no durable repository receipt"
+            ))
+        );
+        assert_eq!(
+            recoverable
+                .workflow
+                .evidence
+                .iter()
+                .find(|item| item.label == "Delivery")
+                .map(|item| item.value.as_str()),
+            Some("repository receipt not recorded")
+        );
+
+        let already_declared =
+            waiting.summary_with_settings_context(Some(&requested), Some(&requested), true);
+        assert_eq!(
+            already_declared
+                .workflow
+                .primary_action
+                .as_ref()
+                .map(|action| action.kind),
+            Some(HostWorkflowActionKind::Refresh)
+        );
+        assert_eq!(
+            already_declared.workflow.current_step.as_deref(),
+            Some("host")
+        );
+        assert_eq!(
+            already_declared
+                .workflow
+                .ladder
+                .iter()
+                .find(|fact| fact.key == "declared")
+                .map(|fact| fact.state),
+            Some("complete")
+        );
+
+        let unrecoverable =
+            waiting.summary_with_settings_context(Some(&different_declaration), None, true);
+        assert_eq!(
+            unrecoverable.workflow.status_label,
+            "request needs resubmission"
+        );
+        assert_eq!(
+            unrecoverable.workflow.primary_action,
+            Some(HostWorkflowAction {
+                kind: HostWorkflowActionKind::Restart,
+                label: "Clear and start over".to_string(),
+            })
+        );
+
+        let non_nix = waiting.summary_with_settings_context(None, Some(&requested), false);
+        assert_eq!(non_nix.workflow.status_label, "change waiting");
+        assert!(non_nix.workflow.primary_action.is_none());
+    }
+
+    #[test]
+    fn accepted_settings_with_recovered_payload_reload_as_uncertain() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-legacy-continued-settings-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let settings = store
+            .begin_settings_change("hsb0", "markus", 560)
+            .expect("legacy settings workflow created");
+        store
+            .accept_settings_change(&settings.id, 561)
+            .expect("legacy settings request accepted");
+        store
+            .prepare_legacy_settings_continuation(
+                &settings.id,
+                &HostPreferences {
+                    accent: Some("#25845f".to_string()),
+                    ..Default::default()
+                },
+                562,
+            )
+            .expect("recovered payload persisted before dispatch");
+        drop(store);
+
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        let uncertain = reloaded
+            .get(&settings.id)
+            .expect("continued settings workflow reloaded");
+        assert_eq!(uncertain.state, HostActionState::Failed);
+        assert!(uncertain.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        assert_eq!(
+            uncertain
+                .summary()
+                .workflow
+                .primary_action
+                .as_ref()
+                .map(|action| action.kind),
+            Some(HostWorkflowActionKind::Acknowledge)
+        );
         let _ = std::fs::remove_file(path);
     }
 
