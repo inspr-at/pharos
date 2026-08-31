@@ -679,6 +679,8 @@ pub(crate) struct HostActionJob {
     pub(crate) removal_plan: Option<HostRemovalPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requested_preferences: Option<HostPreferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_request_id: Option<String>,
     pub(crate) result: Option<HostActionResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recovery_started_at: Option<i64>,
@@ -731,6 +733,10 @@ impl HostActionJob {
                     self.workflow_kind() == HostWorkflowKind::SettingsChange
                         && preferences.validate_contract().is_ok()
                 })
+            && self
+                .repository_request_id
+                .as_deref()
+                .is_none_or(safe_action_id)
             && self.workflow_kind.is_none_or(|kind| {
                 kind == HostWorkflowKind::SettingsChange
                     && self.kind == HostActionKind::SystemUpdateProposal
@@ -861,6 +867,13 @@ impl HostActionJob {
     }
 
     pub(crate) fn summary(&self) -> HostActionSummary {
+        self.summary_with_declared_preferences(None)
+    }
+
+    pub(crate) fn summary_with_declared_preferences(
+        &self,
+        declared_preferences: Option<&HostPreferences>,
+    ) -> HostActionSummary {
         HostActionSummary {
             id: self.id.clone(),
             host: self.host.clone(),
@@ -876,7 +889,7 @@ impl HostActionJob {
             plan: self.plan.clone(),
             removal_plan: self.removal_plan.clone(),
             result: self.result.clone(),
-            workflow: self.workflow(),
+            workflow: self.workflow(declared_preferences),
         }
     }
 
@@ -965,10 +978,16 @@ impl HostActionJob {
         self.workflow_kind() == HostWorkflowKind::SettingsChange && !self.state.is_terminal()
     }
 
-    fn workflow(&self) -> HostWorkflowSummary {
+    fn workflow(&self, declared_preferences: Option<&HostPreferences>) -> HostWorkflowSummary {
         let kind = self.workflow_kind();
+        let declaration_matches = kind == HostWorkflowKind::SettingsChange
+            && self
+                .requested_preferences
+                .as_ref()
+                .zip(declared_preferences)
+                .is_some_and(|(requested, declared)| requested == declared);
         let (title, guidance, status_label, status_level, primary_action, steps) = match kind {
-            HostWorkflowKind::SettingsChange => self.settings_workflow(),
+            HostWorkflowKind::SettingsChange => self.settings_workflow(declaration_matches),
             HostWorkflowKind::SystemUpdateProposal => self.system_update_workflow(),
             HostWorkflowKind::UpdateRestart => self.update_restart_workflow(),
             HostWorkflowKind::RemoveHost => self.removal_workflow(),
@@ -981,7 +1000,7 @@ impl HostActionJob {
                 .map(|step| step.location)
         });
         let evidence = self.workflow_evidence();
-        let ladder = self.workflow_ladder();
+        let ladder = self.workflow_ladder(declaration_matches);
         let next = self.workflow_next(primary_action.as_ref(), current_location);
         let events = self
             .events
@@ -1044,7 +1063,7 @@ impl HostActionJob {
         }
     }
 
-    fn workflow_ladder(&self) -> Vec<HostWorkflowLadderFact> {
+    fn workflow_ladder(&self, declaration_matches: bool) -> Vec<HostWorkflowLadderFact> {
         let requested = self.latest_event(&[HostActionEventKind::Requested]);
         let cancelled = self.state == HostActionState::Cancelled;
         let stopped_state = if cancelled || self.state == HostActionState::Failed {
@@ -1081,8 +1100,16 @@ impl HostActionJob {
                     Self::ladder_fact(
                         "declared",
                         "Declared",
-                        "not_observed",
-                        "No declaration merge is observed by this run",
+                        if declaration_matches {
+                            "complete"
+                        } else {
+                            "not_observed"
+                        },
+                        if declaration_matches {
+                            "Loaded nixcfg declaration matches the requested values"
+                        } else {
+                            "No matching nixcfg declaration is loaded"
+                        },
                         None,
                     ),
                     Self::ladder_fact(
@@ -1475,9 +1502,12 @@ impl HostActionJob {
     }
 
     fn workflow_evidence(&self) -> Vec<HostWorkflowEvidence> {
-        let mut evidence = vec![workflow_evidence("Tracking", self.ticket.clone())];
+        let mut evidence = Vec::new();
         match self.workflow_kind() {
             HostWorkflowKind::SettingsChange => {
+                if let Some(request_id) = &self.repository_request_id {
+                    evidence.push(workflow_evidence("Repository request", request_id.clone()));
+                }
                 let accepted = self
                     .events
                     .iter()
@@ -1509,6 +1539,7 @@ impl HostActionJob {
                 ));
             }
             HostWorkflowKind::SystemUpdateProposal => {
+                evidence.push(workflow_evidence("Tracking", self.ticket.clone()));
                 let accepted = self
                     .events
                     .iter()
@@ -1532,6 +1563,7 @@ impl HostActionJob {
                 evidence.push(workflow_evidence("Live host change", "not authorized"));
             }
             HostWorkflowKind::UpdateRestart => {
+                evidence.push(workflow_evidence("Tracking", self.ticket.clone()));
                 if let Some(plan) = &self.plan {
                     evidence.extend([
                         workflow_evidence("Changed files", plan.changed_file_count.to_string()),
@@ -1617,6 +1649,7 @@ impl HostActionJob {
                 }
             }
             HostWorkflowKind::RemoveHost => {
+                evidence.push(workflow_evidence("Tracking", self.ticket.clone()));
                 let outcome_uncertain =
                     self.has_event(HostActionEventKind::DispatchOutcomeUncertain);
                 let submitted = self.has_event(HostActionEventKind::DispatchSubmitted);
@@ -1684,6 +1717,7 @@ impl HostActionJob {
 
     fn settings_workflow(
         &self,
+        declaration_matches: bool,
     ) -> (
         String,
         String,
@@ -1705,10 +1739,17 @@ impl HostActionJob {
         let uncertainty_acknowledged =
             self.has_event(HostActionEventKind::DispatchUncertaintyAcknowledged);
         let uncertainty_needs_ack = outcome_uncertain && !uncertainty_acknowledged;
-        let repository_wait_guidance = format!(
-            "The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then {} must report the requested values; Pharos will not mark this run complete without that matching host evidence.",
-            self.host
-        );
+        let repository_wait_guidance = if declaration_matches {
+            format!(
+                "The requested values are present in the loaded nixcfg declaration, but no matching host report is recorded. Deploy or recreate the beacon on {}, then check again; Pharos completes this run only from matching host evidence.",
+                self.host
+            )
+        } else {
+            format!(
+                "The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then {} must report the requested values; Pharos will not mark this run complete without that matching host evidence.",
+                self.host
+            )
+        };
         let (guidance, status_label, status_level) = match self.state {
             HostActionState::Succeeded => (
                 "The host reported the requested settings. The saved workflow is complete.",
@@ -2894,7 +2935,7 @@ fn most_relevant_lifecycle_run<'a>(
 }
 
 fn run_lifecycle(job: &HostActionJob, slot: HostLifecycleSlot) -> HostLifecycle {
-    let workflow = job.workflow();
+    let workflow = job.workflow(None);
     let (label, level, detail, blocked_by) = if job.workflow_kind()
         == HostWorkflowKind::SettingsChange
         && job.state == HostActionState::Cancelled
@@ -3528,6 +3569,7 @@ impl HostActionStore {
             plan: None,
             removal_plan: proposal.removal_plan,
             requested_preferences: None,
+            repository_request_id: None,
             result: None,
             recovery_started_at: None,
             events: Vec::new(),
@@ -3670,6 +3712,7 @@ impl HostActionStore {
             plan: None,
             removal_plan: None,
             requested_preferences: None,
+            repository_request_id: None,
             result: None,
             recovery_started_at: None,
             events: Vec::new(),
@@ -3855,6 +3898,27 @@ impl HostActionStore {
         id: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
+        self.mark_dispatch_submitted_inner(id, None, now)
+    }
+
+    pub(crate) fn mark_settings_dispatch_submitted(
+        &self,
+        id: &str,
+        request_id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if !safe_action_id(request_id) {
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        self.mark_dispatch_submitted_inner(id, Some(request_id), now)
+    }
+
+    fn mark_dispatch_submitted_inner(
+        &self,
+        id: &str,
+        request_id: Option<&str>,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
         let (previous, updated) = {
             let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
@@ -3867,7 +3931,20 @@ impl HostActionStore {
             {
                 return Err(HostActionStoreError::InvalidTransition);
             }
+            if request_id.is_some() && job.workflow_kind() != HostWorkflowKind::SettingsChange {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
             let previous = job.clone();
+            if let Some(request_id) = request_id {
+                if job
+                    .repository_request_id
+                    .as_deref()
+                    .is_some_and(|existing| existing != request_id)
+                {
+                    return Err(HostActionStoreError::InvalidTransition);
+                }
+                job.repository_request_id = Some(request_id.to_string());
+            }
             if !job.has_event(HostActionEventKind::DispatchSubmitted) {
                 let at = job.updated_at.max(now);
                 if job.workflow_kind() == HostWorkflowKind::SystemUpdateProposal {
@@ -4118,6 +4195,7 @@ impl HostActionStore {
             plan: None,
             removal_plan: Some(removal_plan),
             requested_preferences: None,
+            repository_request_id: None,
             result: None,
             recovery_started_at: None,
             events: Vec::new(),
@@ -4286,7 +4364,7 @@ impl HostActionStore {
             workflow_kind: Some(HostWorkflowKind::SettingsChange),
             state: HostActionState::ProposalRequested,
             requested_by: actor.to_string(),
-            ticket: "PHAROS-129".to_string(),
+            ticket: "PHAROS-239".to_string(),
             retry_of: None,
             created_at: now,
             updated_at: now,
@@ -4294,6 +4372,7 @@ impl HostActionStore {
             plan: None,
             removal_plan: None,
             requested_preferences: None,
+            repository_request_id: None,
             result: None,
             recovery_started_at: None,
             events: Vec::new(),
@@ -5058,6 +5137,7 @@ impl HostActionStore {
             plan: None,
             removal_plan: None,
             requested_preferences: None,
+            repository_request_id: None,
             result: None,
             recovery_started_at: None,
             events: Vec::new(),
@@ -5735,6 +5815,7 @@ mod tests {
             lease_until: None,
             retirement_lease_until: None,
             requested_preferences: None,
+            repository_request_id: None,
         }
     }
 
@@ -6778,6 +6859,114 @@ mod tests {
             completed_workflow.events.last().map(|event| event.at),
             Some(423)
         );
+    }
+
+    #[test]
+    fn accepted_settings_handoff_reports_loaded_declaration_without_claiming_host_execution() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("csb0", "markus", 430)
+            .expect("settings workflow created");
+        let requested = HostPreferences {
+            accent: Some("#98b8d8".to_string()),
+            ..HostPreferences::default()
+        };
+        store
+            .record_settings_request(&job.id, &requested, 431)
+            .expect("settings request recorded");
+        store
+            .mark_settings_dispatch_submitted(&job.id, "pharos-settings-csb0-1787814372023-1", 432)
+            .expect("correlated repository handoff recorded");
+        let waiting = store
+            .accept_settings_change(&job.id, 433)
+            .expect("repository handoff accepted");
+
+        let workflow = waiting
+            .summary_with_declared_preferences(Some(&requested))
+            .workflow;
+        let declared = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "declared")
+            .expect("declared ladder fact");
+        let executed = workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "executed")
+            .expect("executed ladder fact");
+
+        assert_eq!(declared.state, "complete");
+        assert_eq!(
+            declared.fact,
+            "Loaded nixcfg declaration matches the requested values"
+        );
+        assert_eq!(executed.state, "pending");
+        assert_eq!(executed.fact, "No host execution reported");
+        assert!(workflow
+            .guidance
+            .contains("Deploy or recreate the beacon on csb0"));
+        assert!(workflow.evidence.iter().any(|evidence| {
+            evidence.label == "Repository request"
+                && evidence.value == "pharos-settings-csb0-1787814372023-1"
+        }));
+        assert!(!workflow
+            .evidence
+            .iter()
+            .any(|evidence| evidence.label == "Tracking"));
+
+        let mismatched = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..HostPreferences::default()
+        };
+        let mismatched_workflow = waiting
+            .summary_with_declared_preferences(Some(&mismatched))
+            .workflow;
+        let mismatched_declared = mismatched_workflow
+            .ladder
+            .iter()
+            .find(|fact| fact.key == "declared")
+            .expect("mismatched declared ladder fact");
+        assert_eq!(mismatched_declared.state, "not_observed");
+        assert_eq!(
+            mismatched_declared.fact,
+            "No matching nixcfg declaration is loaded"
+        );
+    }
+
+    #[test]
+    fn settings_request_correlation_is_backward_compatible_and_persisted() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-settings-correlation-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let legacy = store
+            .begin_settings_change("csb0", "markus", 440)
+            .expect("legacy-compatible settings workflow created");
+        let serialized = serde_json::to_value(&legacy).expect("settings workflow serializes");
+        assert!(serialized.get("repository_request_id").is_none());
+
+        store
+            .mark_settings_dispatch_submitted(
+                &legacy.id,
+                "pharos-settings-csb0-1787814372023-2",
+                441,
+            )
+            .expect("request correlation persisted");
+        drop(store);
+
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        let workflow = reloaded
+            .get(&legacy.id)
+            .expect("correlated workflow reloads")
+            .summary()
+            .workflow;
+        assert!(workflow.evidence.iter().any(|evidence| {
+            evidence.label == "Repository request"
+                && evidence.value == "pharos-settings-csb0-1787814372023-2"
+        }));
+        std::fs::remove_file(path).expect("remove test persistence file");
     }
 
     #[test]

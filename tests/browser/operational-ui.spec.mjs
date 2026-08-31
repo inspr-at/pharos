@@ -3204,6 +3204,67 @@ test("preference drift host_report resolver uses blocked_by without active run",
   expect(reonboard.ok()).toBe(true);
 });
 
+test("settings run recognizes a loaded declaration but still waits for host evidence", async ({
+  page,
+}) => {
+  const manifest = requireFixtureManifest(
+    test,
+    "loaded declaration settings run requires local dispatch fixture",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
+
+  const host = "bl-prefs-declared-drift";
+  const desired = {
+    accent: "#48b8a8",
+    kind: "server",
+    alerts: {
+      suppress_down: false,
+      suppress_backup: false,
+      suppress_nix_freshness: false,
+    },
+  };
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    preferences: { accent: "#111111" },
+  });
+  const response = await page.request.post(
+    "/agora/requests/host-preferences.json",
+    { data: { host, preferences: desired } },
+  );
+  expect(response.ok()).toBe(true);
+  const requested = await response.json();
+
+  await page.goto(
+    `/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(requested.job.id)}`,
+  );
+  const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator('[data-ladder-key="declared"]')).toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+  );
+  await expect(dialog.locator('[data-ladder-key="executed"]')).not.toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+  );
+  await expect(dialog.locator("[data-host-action-copy]")).toContainText(
+    `Deploy or recreate the beacon on ${host}`,
+  );
+  await dialog.locator(".host-workflow-advanced summary").click();
+  await expect(dialog.locator(".host-workflow-advanced")).toContainText(
+    "Repository request",
+  );
+
+  await reportRuntimeHost(page, host, { is_nix: true, preferences: desired });
+  await expect(dialog.locator('[data-ladder-key="verified"]')).toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+    { timeout: 8_000 },
+  );
+  resetDispatchAcceptFlag(manifest.acceptFlagPath);
+});
+
 test("preference drift declared_not_applied sheet resolves in host settings", async ({
   page,
 }) => {

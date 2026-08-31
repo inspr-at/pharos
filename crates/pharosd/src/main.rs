@@ -731,6 +731,24 @@ fn action_response_with_message(
     )
 }
 
+fn action_response_with_declared_preferences(
+    status: StatusCode,
+    job: &HostActionJob,
+    declared_preferences: Option<&HostPreferences>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let message = action_message(job);
+    let summary = job.summary_with_declared_preferences(declared_preferences);
+    let workflow_html = host_workflow_markup(&summary.workflow);
+    (
+        status,
+        Json(json!({
+            "message": message,
+            "job": summary,
+            "workflow_html": workflow_html,
+        })),
+    )
+}
+
 pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
     let ladder = workflow
         .ladder
@@ -1550,7 +1568,11 @@ async fn host_action_job_json(
             "Guarded action access is not granted",
         );
     }
-    action_response(StatusCode::OK, &job)
+    action_response_with_declared_preferences(
+        StatusCode::OK,
+        &job,
+        state.manifests.declared_preferences_for(&job.host),
+    )
 }
 
 async fn acknowledge_dispatch_uncertainty(
@@ -2742,11 +2764,11 @@ async fn report(
     if settings_applied {
         match state.host_actions.complete_settings_change(&host_name, now) {
             Ok(Some(_)) => {
-                tracing::info!(host = %host_name, ticket = "PHAROS-129", "host settings workflow completed");
+                tracing::info!(host = %host_name, ticket = "PHAROS-239", "host settings workflow completed");
             }
             Ok(None) => {}
             Err(_) => {
-                tracing::warn!(host = %host_name, ticket = "PHAROS-129", "host settings applied but workflow completion could not be persisted");
+                tracing::warn!(host = %host_name, ticket = "PHAROS-239", "host settings applied but workflow completion could not be persisted");
             }
         }
     }
@@ -2944,7 +2966,9 @@ fn hosts_payload(
                 apply_declared_ready,
                 normal_update_ready,
             );
-            let action_summary = action.map(HostActionJob::summary);
+            let action_summary = action.map(|action| {
+                action.summary_with_declared_preferences(declared_preferences.as_ref())
+            });
             let withdrawable_settings_change =
                 withdrawable_settings_change_for_host(action_jobs, &h.name);
             let live = liveness(h.last_seen, h.heartbeat_interval_secs, now);
@@ -13811,17 +13835,44 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     async fn settings_host_check_is_an_idempotent_read_of_the_same_durable_run() {
         let mut state = report_test_state(false);
         state.auth = AuthState::for_test_access(AccessGrant::full());
+        let requested = HostPreferences {
+            accent: Some("#98b8d8".to_string()),
+            ..HostPreferences::default()
+        };
+        let preferences_path = std::env::temp_dir().join(format!(
+            "pharos-settings-host-check-{}-{}.json",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &preferences_path,
+            serde_json::to_vec(&json!({
+                "schema": "inspr.pharos.host-preferences.v1",
+                "version": 1,
+                "hosts": { "csb0": requested.clone() }
+            }))
+            .expect("declared preferences serialize"),
+        )
+        .expect("declared preferences fixture writes");
+        state.manifests = Arc::new(ManifestRegistry::from_sources(
+            Vec::new(),
+            Some(preferences_path.clone()),
+        ));
         let job = state
             .host_actions
             .begin_settings_change("csb0", "fixture-operator", 1_700_000_200)
             .expect("settings workflow starts");
         state
             .host_actions
-            .mark_dispatch_submitted(&job.id, 1_700_000_201)
+            .record_settings_request(&job.id, &requested, 1_700_000_201)
+            .expect("requested settings recorded");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&job.id, 1_700_000_202)
             .expect("repository handoff recorded");
         state
             .host_actions
-            .accept_settings_change(&job.id, 1_700_000_202)
+            .accept_settings_change(&job.id, 1_700_000_203)
             .expect("repository handoff accepted");
 
         let before = state.host_actions.get(&job.id).expect("saved run exists");
@@ -13851,9 +13902,15 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             first["job"]["workflow"]["primary_action"]["label"],
             "Check host now"
         );
+        assert_eq!(first["job"]["workflow"]["ladder"][1]["key"], "declared");
+        assert_eq!(first["job"]["workflow"]["ladder"][1]["state"], "complete");
+        assert!(first["job"]["workflow"]["guidance"]
+            .as_str()
+            .is_some_and(|guidance| guidance.contains("Deploy or recreate the beacon on csb0")));
         assert_eq!(after.state, HostActionState::ProposalRequested);
         assert_eq!(after.updated_at, before.updated_at);
         assert_eq!(after.events, before.events);
+        std::fs::remove_file(preferences_path).expect("remove declared preferences fixture");
     }
 
     fn state_with_janus_manifest(host: &str, token: &str) -> (AppState, PathBuf) {
