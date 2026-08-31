@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.94 - 2026-08-31
+
+- Recover older accepted settings runs that have retained exact pending values but no durable nixcfg receipt: show the missing handoff honestly across Fleet and Agora, pause background polling until the operator chooses one guarded `Continue request`, persist the recovered payload before dispatch, prevent duplicate sends, fail uncertain outcomes closed, skip redispatch when the reviewed declaration already matches, and offer a clear fresh-start path when the values are unavailable (PHAROS-240).
+
 ## 0.1.93 - 2026-08-31
 
 - Reconcile saved settings workflows with the currently loaded reviewed nixcfg declaration, retain the exact repository request correlation for new handoffs, keep declaration separate from host execution, and tell operators when deployment or beacon recreation is the remaining step; matching beacon evidence remains the only success path (PHAROS-239).
