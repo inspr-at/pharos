@@ -428,10 +428,11 @@ pub(crate) async fn request_host_preferences(
             .await
         {
             Ok(request_id) => {
-                match state
-                    .host_actions
-                    .mark_dispatch_submitted(&workflow.id, crate::now_unix())
-                {
+                match state.host_actions.mark_settings_dispatch_submitted(
+                    &workflow.id,
+                    &request_id,
+                    crate::now_unix(),
+                ) {
                     Ok(_) | Err(HostActionStoreError::PersistenceCommitted) => {}
                     Err(_) => {
                         let current = state
@@ -529,7 +530,10 @@ pub(crate) async fn request_host_preferences(
             } else {
                 accepted
             };
-            let summary = workflow.summary();
+            let summary = workflow.summary_with_declared_preferences(
+                declared_preferences
+                    .or_else(|| manifest.map(|manifest| &manifest.host.preferences)),
+            );
             let workflow_html = crate::host_workflow_markup(&summary.workflow);
             let status = if dispatch_request_id.is_some() {
                 "dispatch_accepted"
