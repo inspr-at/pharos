@@ -2711,6 +2711,12 @@ test("settings sheet live wait advances only from host evidence and stops termin
   page,
 }, testInfo) => {
   test.setTimeout(30_000);
+  const manifest = requireFixtureManifest(
+    test,
+    "settings host-check fixture requires local dispatch manifest",
+  );
+  if (!manifest) return;
+  fs.writeFileSync(manifest.acceptFlagPath, "true", { mode: 0o600 });
   const host = `settings-live-wait-${testInfo.project.name}`;
   const desired = {
     accent: "#48b8a8",
@@ -2721,7 +2727,10 @@ test("settings sheet live wait advances only from host evidence and stops termin
       suppress_nix_freshness: false,
     },
   };
-  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    preferences: { accent: "#224466" },
+  });
   const requestedUrls = [];
   page.on("request", (request) => requestedUrls.push(request.url()));
 
@@ -2740,6 +2749,15 @@ test("settings sheet live wait advances only from host evidence and stops termin
   const requestPayload = await (await responsePromise).json();
   const runId = requestPayload.job.id;
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  const exactGuidance = `The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then ${host} must report the requested values; Pharos will not mark this run complete without that matching host evidence.`;
+  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
+  await expect(dialog.locator('[data-step-state="waiting"]')).toContainText(
+    "The nixcfg review, merge, and deployment must finish first",
+  );
+  const checkHost = dialog.getByRole("button", { name: "Check host now" });
+  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(1);
+  await expect(dialog.locator("[data-host-action-primary]")).toBeHidden();
+  await expect(checkHost).toBeVisible();
   await expect(dialog.locator("[data-host-action-safe-note]")).toHaveAttribute(
     "data-workflow-live",
     "true",
@@ -2757,7 +2775,70 @@ test("settings sheet live wait advances only from host evidence and stops termin
     "complete",
   );
 
-  await reportRuntimeHost(page, host, { preferences: desired });
+  const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  const exactJobRequests = [];
+  const manualCheckRequests = [];
+  let recordingManualCheck = false;
+  page.on("request", (request) => {
+    if (recordingManualCheck) {
+      manualCheckRequests.push({
+        method: request.method(),
+        path: new URL(request.url()).pathname,
+      });
+    }
+    if (new URL(request.url()).pathname === jobPath) {
+      exactJobRequests.push(request.method());
+    }
+  });
+  const checkResponsePromise = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === jobPath &&
+      response.request().method() === "GET",
+  );
+  recordingManualCheck = true;
+  await checkHost.click();
+  expect((await checkResponsePromise).ok()).toBe(true);
+  recordingManualCheck = false;
+  expect(exactJobRequests.length).toBeGreaterThan(0);
+  expect(exactJobRequests.every((method) => method === "GET")).toBe(true);
+  expect(manualCheckRequests.some((request) => request.path === jobPath)).toBe(true);
+  expect(manualCheckRequests.filter((request) => request.method === "POST")).toEqual([]);
+  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
+  await expect(checkHost).toBeEnabled();
+
+  const secondCheckResponsePromise = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === jobPath &&
+      response.request().method() === "GET",
+  );
+  recordingManualCheck = true;
+  await checkHost.click();
+  expect((await secondCheckResponsePromise).ok()).toBe(true);
+  recordingManualCheck = false;
+  await expect(checkHost).toBeEnabled();
+  expect(manualCheckRequests.filter((request) => request.method === "POST")).toEqual([]);
+
+  const readsAfterManualChecks = exactJobRequests.length;
+  await expect
+    .poll(() => exactJobRequests.length, { timeout: 3_500 })
+    .toBe(readsAfterManualChecks + 1);
+  await page.waitForTimeout(500);
+  expect(exactJobRequests).toHaveLength(readsAfterManualChecks + 1);
+
+  const resumedResponsePromise = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === jobPath &&
+      response.request().method() === "GET",
+  );
+  await page.goto(`/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(runId)}`);
+  const resumedPayload = await (await resumedResponsePromise).json();
+  expect(resumedPayload.job.id).toBe(runId);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
+  await expect(dialog.getByRole("button", { name: "Check host now" })).toBeVisible();
+  await expect(dialog.locator(".host-workflow-meta")).toContainText("Started");
+
+  await reportRuntimeHost(page, host, { is_nix: true, preferences: desired });
   await expect(dialog.locator('[data-ladder-key="executed"]')).toHaveAttribute(
     "data-ladder-state",
     "complete",
@@ -2771,7 +2852,15 @@ test("settings sheet live wait advances only from host evidence and stops termin
     "data-workflow-live",
     "false",
   );
-  const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  await expect(dialog.getByRole("button", { name: "Check host now" })).toBeHidden();
+  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(
+    "The host reported the requested settings. The saved workflow is complete.",
+  );
+  await dialog.locator(".host-workflow-advanced summary").click();
+  await expect(dialog.locator(".host-workflow-advanced")).toContainText("Last update");
+  await expect(dialog.locator(".host-workflow-advanced")).toContainText(
+    "Host reported the requested settings",
+  );
   const terminalPollCount = requestedUrls.filter((url) => url.includes(jobPath)).length;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.waitForTimeout(2_500);
@@ -2779,6 +2868,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
     terminalPollCount,
   );
   expect(requestedUrls.some((url) => url.includes("fleet.barta.cm"))).toBe(false);
+  resetDispatchAcceptFlag(manifest.acceptFlagPath);
 });
 
 test("settings dispatch uncertainty stays recoverable after page reload", async ({

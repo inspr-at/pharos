@@ -516,6 +516,7 @@ pub(crate) enum HostWorkflowActionKind {
     Retry,
     Recover,
     Acknowledge,
+    Refresh,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1398,6 +1399,7 @@ impl HostActionJob {
             Some(HostWorkflowActionKind::Recover | HostWorkflowActionKind::Acknowledge) => {
                 HostWorkflowExecutionLocation::Pharos
             }
+            Some(HostWorkflowActionKind::Refresh) => HostWorkflowExecutionLocation::Pharos,
             None => current_location.unwrap_or(HostWorkflowExecutionLocation::Pharos),
         }
         .label(&self.host);
@@ -1423,6 +1425,13 @@ impl HostActionJob {
                 primary.expect("matched primary action").label.clone(),
                 "Records that the repository outcome was checked and permits a deliberate new request."
                     .to_string(),
+            ),
+            Some(HostWorkflowActionKind::Refresh) => (
+                primary.expect("matched primary action").label.clone(),
+                format!(
+                    "Reads this saved run again. It does not resend the request; completion still requires {} to report the requested values.",
+                    self.host
+                ),
             ),
             None if self.state == HostActionState::Cancelled => (
                 "No next action".to_string(),
@@ -1696,6 +1705,10 @@ impl HostActionJob {
         let uncertainty_acknowledged =
             self.has_event(HostActionEventKind::DispatchUncertaintyAcknowledged);
         let uncertainty_needs_ack = outcome_uncertain && !uncertainty_acknowledged;
+        let repository_wait_guidance = format!(
+            "The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then {} must report the requested values; Pharos will not mark this run complete without that matching host evidence.",
+            self.host
+        );
         let (guidance, status_label, status_level) = match self.state {
             HostActionState::Succeeded => (
                 "The host reported the requested settings. The saved workflow is complete.",
@@ -1725,6 +1738,11 @@ impl HostActionJob {
             _ if handoff_needs_reconciliation => (
                 "The repository accepted this settings request. Pharos is preserving the handoff while its local pending record is reconciled; do not resend it.",
                 "dispatch accepted",
+                "warning",
+            ),
+            _ if accepted && submitted => (
+                repository_wait_guidance.as_str(),
+                "change waiting",
                 "warning",
             ),
             _ if accepted => (
@@ -1772,6 +1790,11 @@ impl HostActionJob {
                     kind: HostWorkflowActionKind::Acknowledge,
                     label: "I verified nixcfg — allow a new request".to_string(),
                 })
+            } else if accepted && submitted {
+                Some(HostWorkflowAction {
+                    kind: HostWorkflowActionKind::Refresh,
+                    label: "Check host now".to_string(),
+                })
             } else {
                 handoff_needs_reconciliation.then(|| HostWorkflowAction {
                     kind: HostWorkflowActionKind::Recover,
@@ -1815,7 +1838,11 @@ impl HostActionJob {
                     "APPLY",
                     "Wait for the host",
                     wait_state,
-                    "Applied state changes only after the host reports the requested values.",
+                    if accepted && submitted {
+                        "The nixcfg review, merge, and deployment must finish first. This run completes only after the named host reports the requested values."
+                    } else {
+                        "Applied state changes only after the host reports the requested values."
+                    },
                 )
                 .at(HostWorkflowExecutionLocation::TargetHost),
                 workflow_step(
@@ -6692,6 +6719,65 @@ mod tests {
             "settings applied"
         );
         assert_eq!(WorkflowStepState::Cancelled.key(), "cancelled");
+    }
+
+    #[test]
+    fn accepted_settings_handoff_names_missing_evidence_and_only_offers_refresh() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .begin_settings_change("csb0", "markus", 420)
+            .expect("settings workflow created");
+        store
+            .mark_dispatch_submitted(&job.id, 421)
+            .expect("repository handoff recorded");
+        let waiting = store
+            .accept_settings_change(&job.id, 422)
+            .expect("repository handoff accepted");
+        let workflow = waiting.summary().workflow;
+
+        assert_eq!(
+            workflow.guidance,
+            "The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then csb0 must report the requested values; Pharos will not mark this run complete without that matching host evidence."
+        );
+        assert_eq!(workflow.current_step.as_deref(), Some("host"));
+        assert_eq!(
+            workflow.primary_action,
+            Some(HostWorkflowAction {
+                kind: HostWorkflowActionKind::Refresh,
+                label: "Check host now".to_string(),
+            })
+        );
+        assert_eq!(workflow.next.location, "Pharos");
+        assert!(workflow
+            .next
+            .consequence
+            .contains("Reads this saved run again"));
+        assert!(workflow
+            .next
+            .consequence
+            .contains("completion still requires csb0 to report the requested values"));
+        assert_eq!(
+            workflow.next.boundary,
+            "Pharos will not close or merge a nixcfg proposal."
+        );
+
+        let unchanged = store.get(&job.id).expect("waiting run retained");
+        assert_eq!(unchanged.state, HostActionState::ProposalRequested);
+        assert_eq!(unchanged.updated_at, 422);
+        assert_eq!(unchanged.events.len(), 3);
+
+        let completed = store
+            .complete_settings_change("csb0", 423)
+            .expect("matching host report persisted")
+            .expect("settings workflow completed");
+        let completed_workflow = completed.summary().workflow;
+        assert_eq!(completed.state, HostActionState::Succeeded);
+        assert!(completed_workflow.primary_action.is_none());
+        assert_eq!(completed_workflow.current_step, None);
+        assert_eq!(
+            completed_workflow.events.last().map(|event| event.at),
+            Some(423)
+        );
     }
 
     #[test]
