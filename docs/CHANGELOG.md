@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.92 - 2026-08-31
+
+- Keep the Fleet host-actions control visibly chromed at rest in grid and list views, badge it when lifecycle work needs attention, and hide healthy backup chips while leaving non-healthy backup posture visible; live refreshes preserve those visibility rules and move focus safely when a healthy chip disappears (PHAROS-221).
+- Make the Fleet freshness rail exception-first: keep quiet revision evidence in technical details, show only unverified, end-of-life, drift, backup, and reboot faults in one horizontally scrollable row, preserve severity and focus across live refreshes, and provide overflow controls plus accessible pointer and keyboard popovers (PHAROS-222).
+- Keep the desktop lifecycle-ladder connector behind its labels without changing the narrow-screen vertical rail, with browser coverage for both desktop and mobile viewport geometry (PHAROS-236).
+- Make accepted settings handoffs name the outstanding nixcfg review, merge, deployment, and matching host evidence; offer an idempotent `Check host now` read of the same durable workflow, keep manual checks on one poll loop, restore the wait after reload, and complete only from the matching host report (PHAROS-237).
+
 ## 0.1.91 - 2026-08-28
 
 - Turn Ready to apply into a guarded `apply_declared` host workflow with the same fresh-backup and confirmation gates as an update, skip restart only when the reviewed plan says it is unnecessary, preserve the deployed v1 target-agent lease, and show the fleet-lock owner before an operator can issue a request that would be rejected (PHAROS-216).
