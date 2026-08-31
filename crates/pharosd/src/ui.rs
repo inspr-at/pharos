@@ -6627,6 +6627,11 @@ pub(super) fn render_home_with_capabilities(
             kernel_required,
             apply_declared_ready,
             normal_update_ready,
+            HostSettingsContext {
+                declared_preferences,
+                pending_preferences: h.requested_preferences.as_ref(),
+                legacy_nix_host: h.is_nix,
+            },
         );
         if lifecycle.slot != HostLifecycleSlot::Quiet {
             search_parts.push(lifecycle.label.to_lowercase());

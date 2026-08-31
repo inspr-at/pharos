@@ -373,6 +373,7 @@ function renderHostActionJob(job,message,workflowHtml){
   const workflow=job.workflow||{};
   const workflowKind=String(workflow.kind||job.kind||'');
   const primaryAction=workflow.primary_action||null;
+  const actionRequired=['continue','restart'].includes(primaryAction?.kind||'');
   hostActionContext.jobId=job.id;
   hostActionContext.workflowHost=job.host||hostActionContext.host;
   hostActionContext.action=hostActionFromWorkflowKind(workflowKind);
@@ -395,9 +396,12 @@ function renderHostActionJob(job,message,workflowHtml){
     ||(workflowKind==='remove_host'&&job.state==='removal_pending');
   hostActionPoll.terminal=!active;
   if(safeNote){
-    const liveSettings=workflowKind==='settings_change'&&active;
+    const liveSettings=workflowKind==='settings_change'&&active&&!actionRequired;
     safeNote.dataset.workflowLive=liveSettings?'true':'false';
-    safeNote.textContent=liveSettings?'Watching for recorded host evidence':active?'Persisted and reviewable':'Run complete and saved';
+    safeNote.textContent=primaryAction?.kind==='continue'?'Ready to continue the saved request'
+      :primaryAction?.kind==='restart'?'Operator action required'
+      :liveSettings?'Watching for recorded host evidence'
+      :active?'Persisted and reviewable':'Run complete and saved';
   }
   if(status)status.textContent=message||'';
   if(cancel)cancel.textContent='Close';
@@ -429,7 +433,7 @@ function renderHostActionJob(job,message,workflowHtml){
   }else if(primary){
     primary.hidden=true;
   }
-  if(active)scheduleHostActionPoll(job.id,hostActionPollDelay(job));
+  if(active&&!actionRequired)scheduleHostActionPoll(job.id,hostActionPollDelay(job));
   else{
     if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
     hostActionPoll.timer=null;
@@ -483,7 +487,9 @@ async function submitHostAction(){
   const status=overlay?.querySelector('[data-host-action-status]');
   if(!primary||!status)return;
   primary.disabled=true;
-  status.textContent=(action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge'?'Recording the nixcfg verification…'
+  status.textContent=action==='settings'&&hostActionContext.stage==='continue'?'Continuing the saved request through nixcfg…'
+    :action==='settings'&&hostActionContext.stage==='restart'?'Clearing the incomplete request…'
+    :(action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge'?'Recording the nixcfg verification…'
     :(action==='settings'||action==='remove')&&hostActionContext.stage==='recover'?'Retrying the local save without another repository dispatch…'
     :action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
     :action==='remove'?'Recording retirement and revoking reports…'
@@ -502,6 +508,8 @@ async function submitHostAction(){
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
     else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{intent:hostActionContext.intent||'update'});
+    else if(action==='settings'&&hostActionContext.stage==='continue')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/continue-settings-dispatch',{});
+    else if(action==='settings'&&hostActionContext.stage==='restart')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/withdraw',{});
     else if((action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/acknowledge-dispatch-uncertainty',{});
     else if((action==='settings'||action==='remove')&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/reconcile-accepted-dispatch',{});
     else if(action==='remove'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry-retirement',{});

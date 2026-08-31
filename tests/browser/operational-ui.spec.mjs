@@ -2707,6 +2707,123 @@ test("settings confirm-creates-one-run and opens the workflow sheet", async ({
   expect(hostData.lifecycle.run_id).toBe(payload.job.id);
 });
 
+test("legacy settings receipt gap pauses polling and continues through one explicit action", async ({
+  page,
+}, testInfo) => {
+  const host = `settings-legacy-continue-${testInfo.project.name}`;
+  const runId = `action-settings-change-${host}-1700000200-1`;
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    preferences: { accent: "#224466" },
+  });
+
+  const workflowHtml = `
+    <section data-host-workflow>
+      <div data-ladder-key="requested" data-ladder-state="current">
+        Saved settings have no durable repository receipt
+      </div>
+    </section>`;
+  const continuedWorkflowHtml = `
+    <section data-host-workflow>
+      <button type="button" data-host-action-refresh>Check host now</button>
+    </section>`;
+  const legacyJob = {
+    id: runId,
+    host,
+    kind: "system_update_proposal",
+    state: "proposal_requested",
+    updated_at: 1_700_000_201,
+    workflow: {
+      kind: "settings_change",
+      title: `Change ${host} settings`,
+      guidance:
+        "Pharos has the exact saved settings, but no durable repository receipt. Continuing may resend the same values to the reviewed nixcfg workflow.",
+      status_label: "request needs continuation",
+      primary_action: { kind: "continue", label: "Continue request" },
+      can_cancel: false,
+    },
+  };
+  const continuedJob = {
+    ...legacyJob,
+    updated_at: 1_700_000_202,
+    workflow: {
+      ...legacyJob.workflow,
+      guidance:
+        "The repository handoff is accepted. Finish the nixcfg review, merge, and deployment, then check host evidence.",
+      status_label: "change waiting",
+      primary_action: { kind: "refresh", label: "Check host now" },
+    },
+  };
+  const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  const continuePath = `${jobPath}/continue-settings-dispatch`;
+  const jobGets = [];
+  const continuationPosts = [];
+  await page.route("**/host-actions/jobs/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET" && pathname === jobPath) {
+      jobGets.push(pathname);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job: legacyJob,
+          message: "The saved request needs an explicit continuation.",
+          workflow_html: workflowHtml,
+        }),
+      });
+      return;
+    }
+    if (request.method() === "POST" && pathname === continuePath) {
+      continuationPosts.push({
+        headers: request.headers(),
+        body: request.postDataJSON(),
+      });
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job: continuedJob,
+          message:
+            "The recovered settings were sent to the reviewed nixcfg workflow.",
+          workflow_html: continuedWorkflowHtml,
+        }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(runId)}`);
+  const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("[data-host-action-copy]")).toContainText(
+    "may resend the same values",
+  );
+  await expect(dialog.locator("[data-host-action-safe-note]")).toHaveText(
+    "Ready to continue the saved request",
+  );
+  await expect(dialog.locator("[data-host-action-safe-note]")).toHaveAttribute(
+    "data-workflow-live",
+    "false",
+  );
+  const continueRequest = dialog.getByRole("button", { name: "Continue request" });
+  await expect(continueRequest).toBeVisible();
+  expect(jobGets).toHaveLength(1);
+  await page.waitForTimeout(2_500);
+  expect(jobGets).toHaveLength(1);
+
+  await continueRequest.click();
+  await expect.poll(() => continuationPosts.length).toBe(1);
+  expect(continuationPosts[0].headers["x-pharos-action"]).toBe("1");
+  expect(continuationPosts[0].body).toEqual({});
+  await expect(dialog.getByRole("button", { name: "Check host now" })).toBeVisible();
+  await expect(continueRequest).toBeHidden();
+  await expect(dialog.locator("[data-host-action-status]")).toContainText(
+    "sent to the reviewed nixcfg workflow",
+  );
+});
+
 test("settings sheet live wait advances only from host evidence and stops terminal polling", async ({
   page,
 }, testInfo) => {

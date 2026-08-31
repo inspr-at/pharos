@@ -112,6 +112,10 @@ fn human_routes() -> Router<AppState> {
             post(reconcile_accepted_dispatch),
         )
         .route(
+            "/host-actions/jobs/{id}/continue-settings-dispatch",
+            post(continue_legacy_settings_dispatch),
+        )
+        .route(
             "/host-actions/jobs/{id}/retry",
             post(retry_update_restart_review),
         )
