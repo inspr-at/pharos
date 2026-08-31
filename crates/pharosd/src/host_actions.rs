@@ -519,6 +519,7 @@ pub(crate) enum HostWorkflowActionKind {
     Acknowledge,
     Refresh,
     Continue,
+    ApplyDeclared,
     Restart,
 }
 
@@ -533,6 +534,8 @@ enum LegacySettingsResolution {
 pub(crate) struct HostWorkflowAction {
     pub(crate) kind: HostWorkflowActionKind,
     pub(crate) label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -576,6 +579,12 @@ pub(crate) struct HostWorkflowSummary {
     pub(crate) host: String,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) linked_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) linked_run_state: Option<HostActionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) linked_run_updated_at: Option<i64>,
     pub(crate) recorded_duration_secs: i64,
     pub(crate) title: String,
     pub(crate) guidance: String,
@@ -681,6 +690,8 @@ pub(crate) struct HostActionJob {
     pub(crate) ticket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retry_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settings_change_id: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
     pub(crate) confirmed_at: Option<i64>,
@@ -725,6 +736,15 @@ impl HostActionJob {
             && valid_ticket(&self.ticket)
             && self.retry_of.as_deref().is_none_or(safe_action_id)
             && self.retry_of.as_ref().is_none_or(|id| id != &self.id)
+            && self
+                .settings_change_id
+                .as_deref()
+                .is_none_or(safe_action_id)
+            && self.settings_change_id.as_ref().is_none_or(|id| {
+                id != &self.id
+                    && self.kind == HostActionKind::UpdateRestart
+                    && self.update_restart_intent() == UpdateRestartIntent::ApplyDeclared
+            })
             && self.created_at > 0
             && self.updated_at >= self.created_at
             && self
@@ -818,6 +838,10 @@ impl HostActionJob {
         self.requested_preferences.as_ref()
     }
 
+    pub(crate) fn settings_change_id(&self) -> Option<&str> {
+        self.settings_change_id.as_deref()
+    }
+
     pub(crate) fn accepted_dispatch_reconciled(&self) -> bool {
         match self.workflow_kind() {
             HostWorkflowKind::SettingsChange => {
@@ -893,6 +917,18 @@ impl HostActionJob {
         pending_preferences: Option<&HostPreferences>,
         legacy_nix_host: bool,
     ) -> HostActionSummary {
+        self.summary_with_host_settings_context(HostSettingsContext {
+            declared_preferences,
+            pending_preferences,
+            legacy_nix_host,
+            ..HostSettingsContext::default()
+        })
+    }
+
+    pub(crate) fn summary_with_host_settings_context(
+        &self,
+        settings: HostSettingsContext<'_>,
+    ) -> HostActionSummary {
         HostActionSummary {
             id: self.id.clone(),
             host: self.host.clone(),
@@ -902,13 +938,14 @@ impl HostActionJob {
             state: self.state,
             ticket: self.ticket.clone(),
             retry_of: self.retry_of.clone(),
+            settings_change_id: self.settings_change_id.clone(),
             retryable: self.review_retryable(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             plan: self.plan.clone(),
             removal_plan: self.removal_plan.clone(),
             result: self.result.clone(),
-            workflow: self.workflow(declared_preferences, pending_preferences, legacy_nix_host),
+            workflow: self.workflow(settings),
         }
     }
 
@@ -997,12 +1034,10 @@ impl HostActionJob {
         self.workflow_kind() == HostWorkflowKind::SettingsChange && !self.state.is_terminal()
     }
 
-    fn workflow(
-        &self,
-        declared_preferences: Option<&HostPreferences>,
-        pending_preferences: Option<&HostPreferences>,
-        legacy_nix_host: bool,
-    ) -> HostWorkflowSummary {
+    fn workflow(&self, settings: HostSettingsContext<'_>) -> HostWorkflowSummary {
+        let declared_preferences = settings.declared_preferences;
+        let pending_preferences = settings.pending_preferences;
+        let legacy_nix_host = settings.legacy_nix_host;
         let kind = self.workflow_kind();
         let legacy_settings_resolution = self.legacy_settings_resolution(
             pending_preferences,
@@ -1025,9 +1060,14 @@ impl HostActionJob {
                 .zip(declared_preferences)
                 .is_some_and(|(requested, declared)| requested == declared);
         let (title, guidance, status_label, status_level, primary_action, steps) = match kind {
-            HostWorkflowKind::SettingsChange => {
-                self.settings_workflow(declaration_matches, legacy_settings_resolution)
-            }
+            HostWorkflowKind::SettingsChange => self.settings_workflow(
+                declaration_matches,
+                legacy_settings_resolution,
+                settings.apply_declared_ready,
+                settings.apply_declared_unavailable_reason,
+                settings.linked_apply,
+                settings.apply_blocked_by,
+            ),
             HostWorkflowKind::SystemUpdateProposal => self.system_update_workflow(),
             HostWorkflowKind::UpdateRestart => self.update_restart_workflow(),
             HostWorkflowKind::RemoveHost => self.removal_workflow(),
@@ -1061,6 +1101,9 @@ impl HostActionJob {
             host: self.host.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            linked_run_id: settings.linked_apply.map(|job| job.id.clone()),
+            linked_run_state: settings.linked_apply.map(|job| job.state),
+            linked_run_updated_at: settings.linked_apply.map(|job| job.updated_at),
             recorded_duration_secs: self.updated_at.saturating_sub(self.created_at),
             title,
             guidance,
@@ -1069,7 +1112,7 @@ impl HostActionJob {
             current_step,
             current_location,
             can_cancel: self.can_cancel(),
-            can_withdraw: self.can_withdraw(),
+            can_withdraw: self.can_withdraw() && settings.linked_apply.is_none(),
             persisted: true,
             primary_action,
             ladder,
@@ -1494,7 +1537,9 @@ impl HostActionJob {
         current_location: Option<HostWorkflowExecutionLocation>,
     ) -> HostWorkflowNext {
         let location = match primary.map(|action| action.kind) {
-            Some(HostWorkflowActionKind::Confirm) => HostWorkflowExecutionLocation::TargetHost,
+            Some(HostWorkflowActionKind::Confirm | HostWorkflowActionKind::ApplyDeclared) => {
+                HostWorkflowExecutionLocation::TargetHost
+            }
             Some(HostWorkflowActionKind::Retry)
                 if self.workflow_kind() == HostWorkflowKind::RemoveHost =>
             {
@@ -1517,6 +1562,11 @@ impl HostActionJob {
         }
         .label(&self.host);
         let (title, consequence) = match primary.map(|action| action.kind) {
+            Some(HostWorkflowActionKind::ApplyDeclared) => (
+                primary.expect("matched primary action").label.clone(),
+                "Starts the guarded deployment review. Backup, Janus authorization, attended confirmation, verification, rollback, and exact host evidence remain required."
+                    .to_string(),
+            ),
             Some(HostWorkflowActionKind::Confirm) => (
                 primary.expect("matched primary action").label.clone(),
                 "Queues the reviewed change for target-local execution, then waits for fresh host verification.".to_string(),
@@ -1577,7 +1627,19 @@ impl HostActionJob {
         };
         let boundary = match self.workflow_kind() {
             HostWorkflowKind::SettingsChange => {
-                "nixcfg owns proposal validation and merge; this action does not deploy the host."
+                if primary.is_some_and(|action| {
+                    matches!(
+                        action.kind,
+                        HostWorkflowActionKind::ApplyDeclared
+                            | HostWorkflowActionKind::Confirm
+                            | HostWorkflowActionKind::Retry
+                    ) || (action.kind == HostWorkflowActionKind::Recover
+                        && action.target_run_id.is_some())
+                }) {
+                    "This step will not bypass backup, Janus, attended confirmation, rollback, or exact host verification."
+                } else {
+                    "nixcfg owns proposal validation and merge; this action does not deploy the host."
+                }
             }
             HostWorkflowKind::SystemUpdateProposal => {
                 "Pharos will not merge, deploy, or verify a host change."
@@ -1826,6 +1888,10 @@ impl HostActionJob {
         &self,
         declaration_matches: bool,
         legacy_settings_resolution: Option<LegacySettingsResolution>,
+        apply_declared_ready: bool,
+        settings_apply_unavailable_reason: Option<&str>,
+        linked_apply: Option<&HostActionJob>,
+        apply_blocked_by: Option<&str>,
     ) -> (
         String,
         String,
@@ -1834,6 +1900,9 @@ impl HostActionJob {
         Option<HostWorkflowAction>,
         Vec<HostWorkflowStep>,
     ) {
+        let linked_apply = (!self.state.is_terminal())
+            .then_some(linked_apply)
+            .flatten();
         let accepted = self
             .events
             .iter()
@@ -1858,7 +1927,7 @@ impl HostActionJob {
                 self.host
             )
         };
-        let (guidance, status_label, status_level) = match self.state {
+        let (base_guidance, base_status_label, base_status_level) = match self.state {
             HostActionState::Succeeded => (
                 "The host reported the requested settings. The saved workflow is complete.",
                 "settings applied",
@@ -1920,6 +1989,100 @@ impl HostActionJob {
                 "warning",
             ),
         };
+        let ready_to_apply = !self.state.is_terminal()
+            && accepted
+            && submitted
+            && declaration_matches
+            && legacy_settings_resolution.is_none()
+            && apply_declared_ready;
+        let (guidance, status_label, status_level) = if let Some(apply) = linked_apply {
+            match apply.state {
+                HostActionState::QueuedReview | HostActionState::Reviewing => (
+                    "The guarded deployment review is running. Pharos will require the reviewed plan and attended confirmation before this host can change.".to_string(),
+                    "reviewing guarded apply".to_string(),
+                    "warning",
+                ),
+                HostActionState::AwaitingConfirmation => (
+                    format!("The guarded plan is ready. Confirm the attended apply for {}; backup, Janus authorization, verification, and rollback gates remain enforced.", self.host),
+                    "confirmation required".to_string(),
+                    "warning",
+                ),
+                HostActionState::QueuedApply | HostActionState::Applying | HostActionState::Rebooting => (
+                    format!("The guarded apply is running on {}. This settings request remains open until that host reports the exact requested values.", self.host),
+                    "applying on host".to_string(),
+                    "warning",
+                ),
+                HostActionState::Failed if apply.review_retryable() => (
+                    "The guarded review stopped before confirmation. Retry the recorded review after resolving its failure gate.".to_string(),
+                    "guarded review stopped".to_string(),
+                    "warning",
+                ),
+                HostActionState::Failed if apply.recoverable() => (
+                    "The confirmed guarded apply stopped safely. Run the recorded recovery path; Pharos will not start a second deployment.".to_string(),
+                    "guarded apply needs recovery".to_string(),
+                    "warning",
+                ),
+                HostActionState::Failed => (
+                    "The guarded apply stopped at a recorded safety gate. Resolve that workflow before changing the request.".to_string(),
+                    "guarded apply stopped".to_string(),
+                    "warning",
+                ),
+                HostActionState::Succeeded => (
+                    format!("The guarded deployment completed on {}, but this request is not complete until the host reports the exact requested values. Check the host now.", self.host),
+                    "deployment complete; verifying host".to_string(),
+                    "warning",
+                ),
+                HostActionState::Cancelled => (
+                    apply_blocked_by.map_or_else(
+                        || "The earlier guarded review was cancelled before apply. The saved settings request remains open and can start a new guarded review.".to_string(),
+                        |blocker| format!("The earlier guarded review was cancelled. {blocker} now holds the fleet update lock; finish or resolve that workflow before applying the declaration on {}.", self.host),
+                    ),
+                    apply_blocked_by.map_or_else(
+                        || "ready to apply".to_string(),
+                        |blocker| format!("blocked by {blocker}"),
+                    ),
+                    "warning",
+                ),
+                _ => (
+                    base_guidance.to_string(),
+                    base_status_label.to_string(),
+                    base_status_level,
+                ),
+            }
+        } else if ready_to_apply {
+            if let Some(blocker) = apply_blocked_by {
+                (
+                    format!("{} holds the fleet update lock. Finish or resolve that guarded workflow before applying the declaration on {}.", blocker, self.host),
+                    format!("blocked by {}", blocker),
+                    "warning",
+                )
+            } else {
+                (
+                    format!("The accepted nixcfg declaration is ready. Apply it on {} through the guarded backup, Janus, attended-confirmation, verification, and rollback workflow.", self.host),
+                    "ready to apply".to_string(),
+                    "warning",
+                )
+            }
+        } else if !self.state.is_terminal()
+            && accepted
+            && submitted
+            && declaration_matches
+            && legacy_settings_resolution.is_none()
+            && settings_apply_unavailable_reason.is_some()
+        {
+            let reason = settings_apply_unavailable_reason.unwrap_or_default();
+            (
+                format!("The accepted nixcfg declaration differs from the host, but Pharos cannot start its guarded apply. {reason}"),
+                "guarded apply unavailable".to_string(),
+                "warning",
+            )
+        } else {
+            (
+                base_guidance.to_string(),
+                base_status_label.to_string(),
+                base_status_level,
+            )
+        };
         let request_state = match self.state {
             HostActionState::Succeeded => WorkflowStepState::Passed,
             HostActionState::Cancelled => WorkflowStepState::Cancelled,
@@ -1935,20 +2098,39 @@ impl HostActionJob {
             _ if accepted || submitted => WorkflowStepState::Passed,
             _ => WorkflowStepState::Running,
         };
-        let wait_state = match self.state {
-            HostActionState::Succeeded => WorkflowStepState::Passed,
-            HostActionState::Cancelled => WorkflowStepState::Skipped,
-            HostActionState::Failed if outcome_uncertain => WorkflowStepState::Queued,
-            HostActionState::Failed => WorkflowStepState::Skipped,
-            _ if matches!(
-                legacy_settings_resolution,
-                Some(LegacySettingsResolution::Continue | LegacySettingsResolution::Restart)
-            ) =>
-            {
-                WorkflowStepState::Queued
+        let wait_state = if let Some(apply) = linked_apply {
+            match apply.state {
+                HostActionState::QueuedReview | HostActionState::Reviewing => {
+                    WorkflowStepState::Running
+                }
+                HostActionState::AwaitingConfirmation | HostActionState::Failed => {
+                    WorkflowStepState::ActionRequired
+                }
+                HostActionState::QueuedApply
+                | HostActionState::Applying
+                | HostActionState::Rebooting => WorkflowStepState::Running,
+                HostActionState::Succeeded => WorkflowStepState::Waiting,
+                HostActionState::Cancelled => WorkflowStepState::ActionRequired,
+                _ => WorkflowStepState::Waiting,
             }
-            _ if accepted => WorkflowStepState::Waiting,
-            _ => WorkflowStepState::Queued,
+        } else if ready_to_apply && apply_blocked_by.is_none() {
+            WorkflowStepState::ActionRequired
+        } else {
+            match self.state {
+                HostActionState::Succeeded => WorkflowStepState::Passed,
+                HostActionState::Cancelled => WorkflowStepState::Skipped,
+                HostActionState::Failed if outcome_uncertain => WorkflowStepState::Queued,
+                HostActionState::Failed => WorkflowStepState::Skipped,
+                _ if matches!(
+                    legacy_settings_resolution,
+                    Some(LegacySettingsResolution::Continue | LegacySettingsResolution::Restart)
+                ) =>
+                {
+                    WorkflowStepState::Queued
+                }
+                _ if accepted => WorkflowStepState::Waiting,
+                _ => WorkflowStepState::Queued,
+            }
         };
         let record_state = match self.state {
             HostActionState::Succeeded | HostActionState::Failed | HostActionState::Cancelled => {
@@ -1961,34 +2143,84 @@ impl HostActionJob {
             guidance.to_string(),
             status_label.to_string(),
             status_level,
-            if self.state.is_terminal() && self.state != HostActionState::Failed {
+            if let Some(apply) = linked_apply {
+                match apply.state {
+                    HostActionState::AwaitingConfirmation => Some(HostWorkflowAction {
+                        kind: HostWorkflowActionKind::Confirm,
+                        label: format!("Confirm apply on {}", self.host),
+                        target_run_id: Some(apply.id.clone()),
+                    }),
+                    HostActionState::Failed if apply.review_retryable() => {
+                        Some(HostWorkflowAction {
+                            kind: HostWorkflowActionKind::Retry,
+                            label: "Retry guarded review".to_string(),
+                            target_run_id: Some(apply.id.clone()),
+                        })
+                    }
+                    HostActionState::Failed if apply.recoverable() => Some(HostWorkflowAction {
+                        kind: HostWorkflowActionKind::Recover,
+                        label: "Run guarded recovery".to_string(),
+                        target_run_id: Some(apply.id.clone()),
+                    }),
+                    HostActionState::Succeeded => Some(HostWorkflowAction {
+                        kind: HostWorkflowActionKind::Refresh,
+                        label: "Check host now".to_string(),
+                        target_run_id: None,
+                    }),
+                    HostActionState::Cancelled if ready_to_apply && apply_blocked_by.is_none() => {
+                        Some(HostWorkflowAction {
+                            kind: HostWorkflowActionKind::ApplyDeclared,
+                            label: format!("Apply on {}", self.host),
+                            target_run_id: None,
+                        })
+                    }
+                    _ => None,
+                }
+            } else if ready_to_apply && apply_blocked_by.is_none() {
+                Some(HostWorkflowAction {
+                    kind: HostWorkflowActionKind::ApplyDeclared,
+                    label: format!("Apply on {}", self.host),
+                    target_run_id: None,
+                })
+            } else if self.state.is_terminal() && self.state != HostActionState::Failed {
                 None
             } else if uncertainty_needs_ack {
                 Some(HostWorkflowAction {
                     kind: HostWorkflowActionKind::Acknowledge,
                     label: "I verified nixcfg — allow a new request".to_string(),
+                    target_run_id: None,
                 })
             } else if legacy_settings_resolution == Some(LegacySettingsResolution::Continue) {
                 Some(HostWorkflowAction {
                     kind: HostWorkflowActionKind::Continue,
                     label: "Continue request".to_string(),
+                    target_run_id: None,
                 })
             } else if legacy_settings_resolution == Some(LegacySettingsResolution::Restart) {
                 Some(HostWorkflowAction {
                     kind: HostWorkflowActionKind::Restart,
                     label: "Clear and start over".to_string(),
+                    target_run_id: None,
                 })
+            } else if accepted
+                && submitted
+                && declaration_matches
+                && settings_apply_unavailable_reason.is_some()
+            {
+                None
             } else if legacy_settings_resolution == Some(LegacySettingsResolution::Verify)
                 || (accepted && submitted)
             {
                 Some(HostWorkflowAction {
                     kind: HostWorkflowActionKind::Refresh,
                     label: "Check host now".to_string(),
+                    target_run_id: None,
                 })
             } else {
                 handoff_needs_reconciliation.then(|| HostWorkflowAction {
                     kind: HostWorkflowActionKind::Recover,
                     label: "Retry local settings save".to_string(),
+                    target_run_id: None,
                 })
             },
             vec![
@@ -2229,10 +2461,12 @@ impl HostActionJob {
                     "Confirm update"
                 }
                 .to_string(),
+                target_run_id: None,
             }),
             HostActionState::Failed if self.review_retryable() => Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Retry,
                 label: "Retry guarded review".to_string(),
+                target_run_id: None,
             }),
             HostActionState::Failed if self.recoverable() => Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Recover,
@@ -2242,6 +2476,7 @@ impl HostActionJob {
                     "Run recovery checks"
                 }
                 .to_string(),
+                target_run_id: None,
             }),
             _ => None,
         };
@@ -2604,16 +2839,19 @@ impl HostActionJob {
             Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Acknowledge,
                 label: "I verified nixcfg — allow a new removal request".to_string(),
+                target_run_id: None,
             })
         } else if preparing && submitted {
             Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Recover,
                 label: "Retry local retirement save".to_string(),
+                target_run_id: None,
             })
         } else {
             credential_retry_required.then(|| HostWorkflowAction {
                 kind: HostWorkflowActionKind::Retry,
                 label: "Retry credential retirement".to_string(),
+                target_run_id: None,
             })
         };
         (
@@ -2934,6 +3172,7 @@ pub(crate) struct HostActionSummary {
     pub(crate) state: HostActionState,
     pub(crate) ticket: String,
     pub(crate) retry_of: Option<String>,
+    pub(crate) settings_change_id: Option<String>,
     pub(crate) retryable: bool,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
@@ -3086,14 +3325,30 @@ pub(crate) fn blocking_update_for_host<'a>(
     })
 }
 
+pub(crate) fn linked_settings_apply<'a>(
+    jobs: &'a [HostActionJob],
+    settings_change_id: &str,
+) -> Option<&'a HostActionJob> {
+    jobs.iter()
+        .filter(|job| {
+            job.kind == HostActionKind::UpdateRestart
+                && job.update_restart_intent() == UpdateRestartIntent::ApplyDeclared
+                && job.settings_change_id() == Some(settings_change_id)
+        })
+        .max_by_key(|job| (job.created_at, job.updated_at, &job.id))
+}
+
 pub(crate) fn withdrawable_settings_change_for_host<'a>(
     jobs: &'a [HostActionJob],
     host: &str,
 ) -> Option<&'a HostActionJob> {
-    dedupe_latest_workflow_jobs(jobs, host)
+    let settings = dedupe_latest_workflow_jobs(jobs, host)
         .into_iter()
         .find(|job| job.workflow_kind() == HostWorkflowKind::SettingsChange)
-        .filter(|job| job.can_withdraw())
+        .filter(|job| job.can_withdraw())?;
+    linked_settings_apply(jobs, &settings.id)
+        .is_none()
+        .then_some(settings)
 }
 
 fn most_relevant_lifecycle_run<'a>(
@@ -3111,6 +3366,10 @@ pub(crate) struct HostSettingsContext<'a> {
     pub(crate) declared_preferences: Option<&'a HostPreferences>,
     pub(crate) pending_preferences: Option<&'a HostPreferences>,
     pub(crate) legacy_nix_host: bool,
+    pub(crate) apply_declared_ready: bool,
+    pub(crate) apply_declared_unavailable_reason: Option<&'a str>,
+    pub(crate) linked_apply: Option<&'a HostActionJob>,
+    pub(crate) apply_blocked_by: Option<&'a str>,
 }
 
 fn run_lifecycle(
@@ -3118,11 +3377,7 @@ fn run_lifecycle(
     slot: HostLifecycleSlot,
     settings: HostSettingsContext<'_>,
 ) -> HostLifecycle {
-    let workflow = job.workflow(
-        settings.declared_preferences,
-        settings.pending_preferences,
-        settings.legacy_nix_host,
-    );
+    let workflow = job.workflow(settings);
     let (label, level, detail, blocked_by) = if job.workflow_kind()
         == HostWorkflowKind::SettingsChange
         && job.state == HostActionState::Cancelled
@@ -3330,6 +3585,13 @@ pub(crate) fn host_lifecycle_with_apply(
 fn valid_action_jobs(jobs: &BTreeMap<String, HostActionJob>) -> bool {
     jobs.values().all(|job| {
         job.validate()
+            && job.settings_change_id.as_ref().is_none_or(|settings_id| {
+                jobs.get(settings_id).is_some_and(|settings| {
+                    settings.host == job.host
+                        && settings.workflow_kind() == HostWorkflowKind::SettingsChange
+                        && settings.created_at <= job.created_at
+                })
+            })
             && job.retry_of.as_ref().is_none_or(|retry_of| {
                 jobs.get(retry_of).is_some_and(|prior| {
                     prior.host == job.host
@@ -3337,6 +3599,7 @@ fn valid_action_jobs(jobs: &BTreeMap<String, HostActionJob>) -> bool {
                         && match (job.kind, prior.kind) {
                             (HostActionKind::UpdateRestart, HostActionKind::UpdateRestart) => {
                                 prior.state == HostActionState::Failed
+                                    && job.settings_change_id == prior.settings_change_id
                             }
                             (
                                 HostActionKind::SystemUpdateProposal,
@@ -3759,6 +4022,7 @@ impl HostActionStore {
             requested_by: proposal.actor.to_string(),
             ticket: proposal.ticket.to_string(),
             retry_of: None,
+            settings_change_id: None,
             created_at: proposal.now,
             updated_at: proposal.now,
             confirmed_at: None,
@@ -3902,6 +4166,7 @@ impl HostActionStore {
             requested_by: actor.to_string(),
             ticket: "PHAROS-125".to_string(),
             retry_of,
+            settings_change_id: None,
             created_at: now,
             updated_at: now,
             confirmed_at: None,
@@ -4239,7 +4504,64 @@ impl HostActionStore {
         if Self::blocked_by_other_update(&jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
-        let job = Self::new_update_review(host, actor, intent, now, None);
+        let job = Self::new_update_review(host, actor, intent, now, None, None);
+        self.insert_locked(&mut jobs, job)
+    }
+
+    pub(crate) fn begin_settings_apply_review(
+        &self,
+        settings_id: &str,
+        host: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let settings = jobs
+            .get(settings_id)
+            .ok_or(HostActionStoreError::NotFound)?;
+        if settings.host != host {
+            return Err(HostActionStoreError::WrongHost);
+        }
+        if settings.workflow_kind() != HostWorkflowKind::SettingsChange
+            || settings.state != HostActionState::ProposalRequested
+            || settings.requested_preferences.is_none()
+            || !settings.has_event(HostActionEventKind::SettingsRequestAccepted)
+            || !settings.has_event(HostActionEventKind::DispatchSubmitted)
+        {
+            return Err(HostActionStoreError::InvalidTransition);
+        }
+        if let Some(existing) = jobs
+            .values()
+            .filter(|job| {
+                job.settings_change_id() == Some(settings_id)
+                    && job.kind == HostActionKind::UpdateRestart
+                    && job.update_restart_intent() == UpdateRestartIntent::ApplyDeclared
+            })
+            .max_by_key(|job| (job.created_at, job.updated_at, &job.id))
+            .filter(|job| job.state != HostActionState::Cancelled)
+        {
+            return Ok(existing.clone());
+        }
+        if Self::has_active(&jobs, host, HostActionKind::UpdateRestart) {
+            return Err(HostActionStoreError::ActiveJob);
+        }
+        if Self::latest_update_for(&jobs, host)
+            .is_some_and(|job| job.state == HostActionState::Failed)
+        {
+            return Err(HostActionStoreError::FailedJobRequiresRetry);
+        }
+        if Self::blocked_by_other_update(&jobs, host) {
+            return Err(HostActionStoreError::BlockedByFleetGate);
+        }
+        let now = Self::next_workflow_time(&jobs, host, HostWorkflowKind::UpdateRestart, now);
+        let job = Self::new_update_review(
+            host,
+            actor,
+            UpdateRestartIntent::ApplyDeclared,
+            now,
+            None,
+            Some(settings_id.to_string()),
+        );
         self.insert_locked(&mut jobs, job)
     }
 
@@ -4256,6 +4578,7 @@ impl HostActionStore {
             return Err(HostActionStoreError::WrongHost);
         }
         let intent = existing.update_restart_intent();
+        let settings_change_id = existing.settings_change_id.clone();
         if !existing.review_retryable()
             || Self::latest_update_for(&jobs, host).is_none_or(|job| job.id != id)
         {
@@ -4267,7 +4590,14 @@ impl HostActionStore {
         if Self::blocked_by_other_update(&jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
-        let job = Self::new_update_review(host, actor, intent, now, Some(id.to_string()));
+        let job = Self::new_update_review(
+            host,
+            actor,
+            intent,
+            now,
+            Some(id.to_string()),
+            settings_change_id,
+        );
         self.insert_locked(&mut jobs, job)
     }
 
@@ -4324,6 +4654,13 @@ impl HostActionStore {
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
+        if jobs.values().any(|job| {
+            job.settings_change_id() == Some(id)
+                && job.kind == HostActionKind::UpdateRestart
+                && job.state != HostActionState::Cancelled
+        }) {
+            return Err(HostActionStoreError::InvalidTransition);
+        }
         let (previous, updated) = {
             let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
             if job.host != host {
@@ -4425,6 +4762,7 @@ impl HostActionStore {
             requested_by: actor.to_string(),
             ticket: "PHAROS-127".to_string(),
             retry_of: None,
+            settings_change_id: None,
             created_at: now,
             updated_at: now,
             confirmed_at: None,
@@ -4602,6 +4940,7 @@ impl HostActionStore {
             requested_by: actor.to_string(),
             ticket: "PHAROS-239".to_string(),
             retry_of: None,
+            settings_change_id: None,
             created_at: now,
             updated_at: now,
             confirmed_at: None,
@@ -5348,6 +5687,7 @@ impl HostActionStore {
         intent: UpdateRestartIntent,
         now: i64,
         retry_of: Option<String>,
+        settings_change_id: Option<String>,
     ) -> HostActionJob {
         let mut job = HostActionJob {
             schema: ACTION_SCHEMA.to_string(),
@@ -5359,14 +5699,19 @@ impl HostActionStore {
             workflow_kind: None,
             state: HostActionState::QueuedReview,
             requested_by: actor.to_string(),
-            ticket: match intent {
-                UpdateRestartIntent::Update => "PHAROS-126",
-                UpdateRestartIntent::ApplyDeclared | UpdateRestartIntent::RestartOnly => {
-                    "PHAROS-216"
+            ticket: if settings_change_id.is_some() {
+                "PHAROS-241"
+            } else {
+                match intent {
+                    UpdateRestartIntent::Update => "PHAROS-126",
+                    UpdateRestartIntent::ApplyDeclared | UpdateRestartIntent::RestartOnly => {
+                        "PHAROS-216"
+                    }
                 }
             }
             .to_string(),
             retry_of,
+            settings_change_id,
             created_at: now,
             updated_at: now,
             confirmed_at: None,
@@ -6035,6 +6380,7 @@ mod tests {
             requested_by: "markus".to_string(),
             ticket: "PHAROS-214".to_string(),
             retry_of: None,
+            settings_change_id: None,
             created_at,
             updated_at: created_at,
             confirmed_at: None,
@@ -7065,6 +7411,7 @@ mod tests {
             Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Refresh,
                 label: "Check host now".to_string(),
+                target_run_id: None,
             })
         );
         assert_eq!(workflow.next.location, "Pharos");
@@ -7273,6 +7620,170 @@ mod tests {
         store
             .begin_settings_change("hsb8", "markus", 415)
             .expect("a fresh settings change can start after withdrawal");
+    }
+
+    #[test]
+    fn accepted_declared_settings_create_one_guarded_apply_and_keep_parent_open() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 450)
+            .expect("settings workflow created");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..HostPreferences::default()
+        };
+        store
+            .record_settings_request(&settings.id, &requested, 451)
+            .expect("settings request recorded");
+        store
+            .mark_dispatch_submitted(&settings.id, 452)
+            .expect("repository handoff recorded");
+        let settings = store
+            .accept_settings_change(&settings.id, 453)
+            .expect("repository handoff accepted");
+
+        let ready = settings.summary_with_host_settings_context(HostSettingsContext {
+            declared_preferences: Some(&requested),
+            pending_preferences: Some(&requested),
+            legacy_nix_host: true,
+            apply_declared_ready: true,
+            apply_declared_unavailable_reason: None,
+            linked_apply: None,
+            apply_blocked_by: None,
+        });
+        assert_eq!(
+            ready.workflow.primary_action,
+            Some(HostWorkflowAction {
+                kind: HostWorkflowActionKind::ApplyDeclared,
+                label: "Apply on hsb8".to_string(),
+                target_run_id: None,
+            })
+        );
+
+        let first = store
+            .begin_settings_apply_review(&settings.id, "hsb8", "markus", 454)
+            .expect("guarded apply linked");
+        let replay = store
+            .begin_settings_apply_review(&settings.id, "hsb8", "markus", 455)
+            .expect("lost response is idempotent");
+        assert_eq!(replay.id, first.id);
+        assert_eq!(first.settings_change_id(), Some(settings.id.as_str()));
+        assert_eq!(
+            first.update_restart_intent(),
+            UpdateRestartIntent::ApplyDeclared
+        );
+        assert_eq!(
+            store.get(&settings.id).expect("parent retained").state,
+            HostActionState::ProposalRequested
+        );
+        assert_eq!(
+            store.withdraw_settings_change(&settings.id, "hsb8", "markus", 456),
+            Err(HostActionStoreError::InvalidTransition)
+        );
+
+        let projected = settings.summary_with_host_settings_context(HostSettingsContext {
+            declared_preferences: Some(&requested),
+            pending_preferences: Some(&requested),
+            legacy_nix_host: true,
+            apply_declared_ready: true,
+            apply_declared_unavailable_reason: None,
+            linked_apply: Some(&first),
+            apply_blocked_by: None,
+        });
+        assert_eq!(
+            projected.workflow.linked_run_id.as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(
+            projected.workflow.linked_run_state,
+            Some(HostActionState::QueuedReview)
+        );
+        assert!(!projected.workflow.can_withdraw);
+        assert!(projected.workflow.primary_action.is_none());
+
+        let cancelled = store
+            .cancel_update_review(&first.id, "hsb8", "markus", 457)
+            .expect("linked review cancelled");
+        store
+            .create_update_review("csb0", "markus", 458)
+            .expect("another host acquires fleet gate");
+        let blocked = settings.summary_with_host_settings_context(HostSettingsContext {
+            declared_preferences: Some(&requested),
+            pending_preferences: Some(&requested),
+            legacy_nix_host: true,
+            apply_declared_ready: true,
+            apply_declared_unavailable_reason: None,
+            linked_apply: Some(&cancelled),
+            apply_blocked_by: Some("csb0"),
+        });
+        assert_eq!(blocked.workflow.status_label, "blocked by csb0");
+        assert!(blocked.workflow.guidance.contains("csb0 now holds"));
+        assert!(blocked.workflow.primary_action.is_none());
+    }
+
+    #[test]
+    fn settings_apply_rejects_unaccepted_or_cross_host_parent() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 460)
+            .expect("settings workflow created");
+        assert_eq!(
+            store.begin_settings_apply_review(&settings.id, "hsb8", "markus", 461),
+            Err(HostActionStoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store.begin_settings_apply_review(&settings.id, "csb0", "markus", 462),
+            Err(HostActionStoreError::WrongHost)
+        );
+    }
+
+    #[test]
+    fn concurrent_settings_apply_clicks_share_one_linked_run() {
+        let store = std::sync::Arc::new(HostActionStore::new(None));
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 470)
+            .expect("settings workflow created");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..HostPreferences::default()
+        };
+        store
+            .record_settings_request(&settings.id, &requested, 471)
+            .expect("request saved");
+        store
+            .mark_dispatch_submitted(&settings.id, 472)
+            .expect("handoff submitted");
+        store
+            .accept_settings_change(&settings.id, 473)
+            .expect("handoff accepted");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let settings_id = settings.id.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .begin_settings_apply_review(&settings_id, "hsb8", "markus", 474)
+                    .expect("concurrent click resolves")
+                    .id
+            }));
+        }
+        barrier.wait();
+        let ids = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("click thread completes"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(
+            store
+                .list()
+                .into_iter()
+                .filter(|job| job.settings_change_id() == Some(settings.id.as_str()))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -10218,6 +10729,7 @@ mod tests {
             Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Continue,
                 label: "Continue request".to_string(),
+                target_run_id: None,
             })
         );
         assert_eq!(
@@ -10286,6 +10798,7 @@ mod tests {
             Some(HostWorkflowAction {
                 kind: HostWorkflowActionKind::Restart,
                 label: "Clear and start over".to_string(),
+                target_run_id: None,
             })
         );
 
@@ -10610,6 +11123,7 @@ mod tests {
             UpdateRestartIntent::Update,
             300,
             Some("action-update-restart-csb0-200-1".to_string()),
+            None,
         );
         let mut jobs = BTreeMap::new();
         jobs.insert(retry.id.clone(), retry);

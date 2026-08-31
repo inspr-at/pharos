@@ -373,14 +373,15 @@ function renderHostActionJob(job,message,workflowHtml){
   const workflow=job.workflow||{};
   const workflowKind=String(workflow.kind||job.kind||'');
   const primaryAction=workflow.primary_action||null;
-  const actionRequired=['continue','restart'].includes(primaryAction?.kind||'');
+  const actionRequired=['continue','restart','apply_declared','confirm','retry','recover'].includes(primaryAction?.kind||'');
   hostActionContext.jobId=job.id;
+  hostActionContext.actionTargetId=primaryAction?.target_run_id||job.id;
   hostActionContext.workflowHost=job.host||hostActionContext.host;
   hostActionContext.action=hostActionFromWorkflowKind(workflowKind);
   hostActionContext.root.dataset.actionJobId=job.id;
   hostActionContext.root.dataset.actionKind=workflowKind;
   hostActionContext.root.dataset.actionState=job.state;
-  hostActionPoll.lastRevision=[job.id,job.state,job.updated_at].join(':');
+  hostActionPoll.lastRevision=[job.id,job.state,job.updated_at,workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||''].join(':');
   if(dialog){dialog.dataset.workflow='true';dialog.dataset.action=workflowKind.replaceAll('_','-')}
   dialog?.querySelectorAll('[data-action-icon]').forEach(icon=>{
     const iconKind=workflowKind==='settings_change'?'settings-change':workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':'system-update';
@@ -426,10 +427,13 @@ function renderHostActionJob(job,message,workflowHtml){
     primary.hidden=true;
     hostActionContext.stage='refresh';
   }else if(primaryAction&&primary){
+    const fleetAction=['apply_declared','confirm','retry'].includes(primaryAction.kind)||(primaryAction.kind==='recover'&&Boolean(primaryAction.target_run_id));
     primary.hidden=false;
     primary.classList.remove('danger');
     primary.textContent=primaryAction.label||'Continue';
-    primary.disabled=primaryAction.kind==='confirm'?!hostActionConfirmationReady():false;
+    primary.disabled=fleetAction&&hostActionContext.root.dataset.canManage!=='true'
+      ?true
+      :primaryAction.kind==='confirm'?!hostActionConfirmationReady():false;
   }else if(primary){
     primary.hidden=true;
   }
@@ -454,7 +458,8 @@ async function pollHostActionJob(id,immediate=false){
     const payload=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(payload.error||'Could not refresh guarded action state.');
     hostActionPoll.failures=0;
-    const revision=[payload.job?.id,payload.job?.state,payload.job?.updated_at].join(':');
+    const workflow=payload.job?.workflow||{};
+    const revision=[payload.job?.id,payload.job?.state,payload.job?.updated_at,workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||''].join(':');
     if(immediate||revision!==hostActionPoll.lastRevision)renderHostActionJob(payload.job,payload.message,payload.workflow_html);
     else scheduleHostActionPoll(id,hostActionPollDelay(payload.job));
   }catch(error){
@@ -481,6 +486,8 @@ async function submitHostAction(){
   if(!hostActionContext)return;
   if(hostActionContext.stage==='loading')return;
   const {action,root,host,workflowHost}=hostActionContext;
+  const parentJobId=hostActionContext.jobId;
+  const actionTargetId=hostActionContext.actionTargetId||parentJobId;
   const workflowHostName=workflowHost||host;
   const overlay=document.querySelector('[data-host-action-overlay]');
   const primary=overlay?.querySelector('[data-host-action-primary]');
@@ -490,6 +497,10 @@ async function submitHostAction(){
   status.textContent=action==='settings'&&hostActionContext.stage==='continue'?'Continuing the saved request through nixcfg…'
     :action==='settings'&&hostActionContext.stage==='restart'?'Clearing the incomplete request…'
     :(action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge'?'Recording the nixcfg verification…'
+    :action==='settings'&&hostActionContext.stage==='apply_declared'?'Starting the guarded deployment review…'
+    :action==='settings'&&hostActionContext.stage==='confirm'?'Recording attended confirmation for the guarded apply…'
+    :action==='settings'&&hostActionContext.stage==='retry'?'Retrying the recorded guarded review…'
+    :action==='settings'&&hostActionContext.stage==='recover'&&actionTargetId!==parentJobId?'Queueing guarded recovery checks…'
     :(action==='settings'||action==='remove')&&hostActionContext.stage==='recover'?'Retrying the local save without another repository dispatch…'
     :action==='remove'&&hostActionContext.stage==='retry'?'Queueing credential retirement retry…'
     :action==='remove'?'Recording retirement and revoking reports…'
@@ -508,6 +519,10 @@ async function submitHostAction(){
     else if(action==='update-restart'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/retry',{});
     else if(action==='update-restart'&&hostActionContext.stage==='recover')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/recover',{});
     else if(action==='update-restart')result=await requestHostAction('/host-actions/'+encodeURIComponent(host)+'/update-restart/review',{intent:hostActionContext.intent||'update'});
+    else if(action==='settings'&&hostActionContext.stage==='apply_declared')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(parentJobId)+'/apply-declared',{});
+    else if(action==='settings'&&hostActionContext.stage==='confirm')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(actionTargetId)+'/confirm',{confirmation:host,attended:true});
+    else if(action==='settings'&&hostActionContext.stage==='retry')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(actionTargetId)+'/retry',{});
+    else if(action==='settings'&&hostActionContext.stage==='recover'&&actionTargetId!==parentJobId)result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(actionTargetId)+'/recover',{});
     else if(action==='settings'&&hostActionContext.stage==='continue')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/continue-settings-dispatch',{});
     else if(action==='settings'&&hostActionContext.stage==='restart')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/withdraw',{});
     else if((action==='settings'||action==='remove')&&hostActionContext.stage==='acknowledge')result=await requestHostAction('/host-actions/jobs/'+encodeURIComponent(hostActionContext.jobId)+'/acknowledge-dispatch-uncertainty',{});
@@ -520,7 +535,9 @@ async function submitHostAction(){
     }
     else return;
     status.textContent=result.message||'Request recorded.';
-    if(result?.job)renderHostActionJob(result.job,result.message,result.workflow_html);
+    const linkedMutation=action==='settings'&&['confirm','retry','recover'].includes(hostActionContext.stage)&&actionTargetId!==parentJobId;
+    if(linkedMutation){hostActionPoll.terminal=false;await pollHostActionJob(parentJobId,true)}
+    else if(result?.job)renderHostActionJob(result.job,result.message,result.workflow_html);
     else primary.hidden=true;
   }catch(error){
     status.textContent=error instanceof Error?error.message:'The guarded action could not be requested.';
@@ -717,13 +734,13 @@ function initHostActions(){
     const primary=document.querySelector('[data-host-action-primary]');
     if(!primary||!hostActionContext)return;
     if(hostActionContext.action==='remove')primary.disabled=!hostActionConfirmationReady();
-    else if(hostActionContext.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
+    else if((hostActionContext.action==='update-restart'||hostActionContext.action==='settings')&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
   });
   document.querySelector('[data-host-remove-disposition]')?.addEventListener('change',updateHostRemovalForm);
   document.querySelector('[data-host-remove-successor-input]')?.addEventListener('input',updateHostRemovalForm);
   document.querySelector('[data-host-attended-input]')?.addEventListener('change',()=>{
     const primary=document.querySelector('[data-host-action-primary]');
-    if(primary&&hostActionContext?.action==='update-restart'&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
+    if(primary&&(hostActionContext?.action==='update-restart'||hostActionContext?.action==='settings')&&hostActionContext.stage==='confirm')primary.disabled=!hostActionConfirmationReady();
   });
   document.querySelector('[data-host-action-cancel]')?.addEventListener('click',submitHostActionCancellation);
   document.addEventListener('visibilitychange',()=>{
