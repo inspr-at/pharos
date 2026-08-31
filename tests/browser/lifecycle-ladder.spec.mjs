@@ -25,7 +25,11 @@ test("lifecycle ladder masks its desktop connector without changing the mobile r
   page,
 }) => {
   await page.setViewportSize({ width: 760, height: 500 });
-  await page.setContent(`<style>${stylesheet}</style><main>${ladder}</main>`);
+  await page.setContent(`
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>${stylesheet}</style>
+    <main>${ladder}</main>
+  `);
 
   const desktop = await page
     .locator(".host-workflow-ladder li")
@@ -67,22 +71,29 @@ test("lifecycle ladder masks its desktop connector without changing the mobile r
       const copy = step.lastElementChild;
       const connectorStyle = getComputedStyle(step, "::after");
       const markerBox = marker.getBoundingClientRect();
+      const copyBox = copy.getBoundingClientRect();
       const stepBox = step.getBoundingClientRect();
       return {
         connectorHeight: connectorStyle.height,
         connectorStart: stepBox.left + Number.parseFloat(connectorStyle.left),
         connectorWidth: connectorStyle.width,
         copyBackground: getComputedStyle(copy).backgroundColor,
+        copyLeft: copyBox.left,
         copyPosition: getComputedStyle(copy).position,
         markerCentre: markerBox.left + markerBox.width / 2,
+        mobileMediaMatches: matchMedia("(max-width: 640px)").matches,
       };
     });
 
+  expect(mobile.mobileMediaMatches).toBe(true);
   expect(mobile.connectorWidth).toBe("1px");
   expect(Number.parseFloat(mobile.connectorHeight)).toBeGreaterThan(15);
   expect(
     Math.abs(mobile.connectorStart - mobile.markerCentre),
   ).toBeLessThanOrEqual(0.5);
+  expect(
+    mobile.connectorStart + Number.parseFloat(mobile.connectorWidth),
+  ).toBeLessThanOrEqual(mobile.copyLeft);
   expect(mobile.copyPosition).toBe("static");
   expect(mobile.copyBackground).toBe("rgba(0, 0, 0, 0)");
 });
