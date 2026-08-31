@@ -15438,7 +15438,18 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["job"]["workflow"]["status_label"], "change waiting");
-        assert!(payload["job"]["workflow"]["primary_action"].is_null());
+        assert_eq!(
+            payload["job"]["workflow"]["primary_action"]["kind"],
+            "refresh"
+        );
+        assert_eq!(
+            payload["job"]["workflow"]["primary_action"]["label"],
+            "Check host now"
+        );
+        assert_eq!(payload["job"]["workflow"]["next"]["location"], "Pharos");
+        assert!(payload["job"]["workflow"]["next"]["consequence"]
+            .as_str()
+            .is_some_and(|consequence| consequence.contains("Reads this saved run again")));
         assert_eq!(
             state
                 .store
