@@ -3321,7 +3321,7 @@ test("preference drift host_report resolver uses blocked_by without active run",
   expect(reonboard.ok()).toBe(true);
 });
 
-test("settings run recognizes a loaded declaration but still waits for host evidence", async ({
+test("settings run offers one-click guarded apply for a loaded declaration", async ({
   page,
 }) => {
   const manifest = requireFixtureManifest(
@@ -3366,20 +3366,307 @@ test("settings run recognizes a loaded declaration but still waits for host evid
     "complete",
   );
   await expect(dialog.locator("[data-host-action-copy]")).toContainText(
-    `Deploy or recreate the beacon on ${host}`,
+    `Apply it on ${host}`,
   );
+  await expect(
+    dialog.getByRole("button", { name: `Apply on ${host}`, exact: true }),
+  ).toBeEnabled();
   await dialog.locator(".host-workflow-advanced summary").click();
   await expect(dialog.locator(".host-workflow-advanced")).toContainText(
     "Repository request",
   );
 
   await reportRuntimeHost(page, host, { is_nix: true, preferences: desired });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(dialog.locator('[data-ladder-key="verified"]')).toHaveAttribute(
     "data-ladder-state",
     "complete",
     { timeout: 8_000 },
   );
   resetDispatchAcceptFlag(manifest.acceptFlagPath);
+});
+
+test("settings guarded apply retains its parent run through linked confirmation and exact host evidence", async ({
+  page,
+}, testInfo) => {
+  const host = `settings-linked-apply-${testInfo.project.name}`;
+  const parentId = `action-settings-change-${host}-1700000400-1`;
+  const childId = `action-update-restart-${host}-1700000401-1`;
+  const desired = {
+    accent: "#48b8a8",
+    kind: "server",
+    alerts: {
+      suppress_down: false,
+      suppress_backup: false,
+      suppress_nix_freshness: false,
+    },
+  };
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    preferences: { ...desired, accent: "#111111" },
+  });
+
+  const workflowHtml = ({ applyState = "action_required", verified = false } = {}) => `
+    <section data-host-workflow>
+      <div data-ladder-key="requested" data-ladder-state="complete">Requested</div>
+      <div data-ladder-key="declared" data-ladder-state="complete">Declared</div>
+      <div data-ladder-key="executed" data-ladder-state="${verified ? "complete" : applyState}">Executed</div>
+      <div data-ladder-key="verified" data-ladder-state="${verified ? "complete" : "queued"}">Verified</div>
+      ${applyState === "waiting" ? '<button type="button" data-host-action-refresh>Check host now</button>' : ""}
+    </section>`;
+  const parentJob = ({
+    state = "proposal_requested",
+    updatedAt,
+    linkedState = null,
+    linkedUpdatedAt = null,
+    primaryAction = null,
+    guidance,
+  }) => ({
+    id: parentId,
+    host,
+    kind: "system_update_proposal",
+    state,
+    updated_at: updatedAt,
+    workflow: {
+      kind: "settings_change",
+      title: `Change ${host} settings`,
+      guidance,
+      status_label: state === "succeeded" ? "change complete" : "change waiting",
+      primary_action: primaryAction,
+      can_cancel: false,
+      linked_run_id: linkedState ? childId : null,
+      linked_run_state: linkedState,
+      linked_run_updated_at: linkedUpdatedAt,
+    },
+  });
+  const readyJob = parentJob({
+    updatedAt: 1_700_000_400,
+    primaryAction: { kind: "apply_declared", label: `Apply on ${host}` },
+    guidance: `The accepted nixcfg declaration is ready. Apply it on ${host} through the guarded workflow.`,
+  });
+  const confirmationJob = parentJob({
+    updatedAt: 1_700_000_400,
+    linkedState: "awaiting_confirmation",
+    linkedUpdatedAt: 1_700_000_402,
+    primaryAction: {
+      kind: "confirm",
+      label: `Confirm apply on ${host}`,
+      target_run_id: childId,
+    },
+    guidance: `The guarded plan is ready. Confirm the attended apply for ${host}.`,
+  });
+  const waitingForEvidenceJob = parentJob({
+    updatedAt: 1_700_000_400,
+    linkedState: "succeeded",
+    linkedUpdatedAt: 1_700_000_403,
+    primaryAction: { kind: "refresh", label: "Check host now" },
+    guidance: `The guarded deployment completed on ${host}, but this request is not complete until the host reports the exact requested values.`,
+  });
+  const completedJob = parentJob({
+    state: "succeeded",
+    updatedAt: 1_700_000_404,
+    linkedState: "succeeded",
+    linkedUpdatedAt: 1_700_000_403,
+    guidance: "The host reported the requested settings. The saved workflow is complete.",
+  });
+  const childJob = {
+    id: childId,
+    host,
+    kind: "update_restart",
+    intent: "apply_declared",
+    state: "queued_apply",
+    updated_at: 1_700_000_403,
+    settings_change_id: parentId,
+    workflow: {
+      kind: "update_restart",
+      title: `Apply declared configuration to ${host}`,
+      guidance: "Attended confirmation recorded.",
+      status_label: "confirmed",
+      primary_action: null,
+      can_cancel: false,
+    },
+  };
+
+  let phase = "ready";
+  const parentGets = [];
+  const applyPosts = [];
+  const confirmPosts = [];
+  const parentPath = `/host-actions/jobs/${encodeURIComponent(parentId)}`;
+  const applyPath = `${parentPath}/apply-declared`;
+  const confirmPath = `/host-actions/jobs/${encodeURIComponent(childId)}/confirm`;
+  await page.route("**/host-actions/jobs/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET" && pathname === parentPath) {
+      parentGets.push(pathname);
+      const [job, html] = phase === "complete"
+        ? [completedJob, workflowHtml({ applyState: "complete", verified: true })]
+        : phase === "waiting_for_evidence"
+          ? [waitingForEvidenceJob, workflowHtml({ applyState: "waiting" })]
+          : [readyJob, workflowHtml()];
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ job, message: job.workflow.guidance, workflow_html: html }),
+      });
+      return;
+    }
+    if (request.method() === "POST" && pathname === applyPath) {
+      applyPosts.push({ headers: request.headers(), body: request.postDataJSON() });
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job: confirmationJob,
+          message: confirmationJob.workflow.guidance,
+          workflow_html: workflowHtml(),
+        }),
+      });
+      return;
+    }
+    if (request.method() === "POST" && pathname === confirmPath) {
+      confirmPosts.push({ headers: request.headers(), body: request.postDataJSON() });
+      phase = "waiting_for_evidence";
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job: childJob,
+          message: "Attended confirmation recorded.",
+          workflow_html: "<section data-host-workflow>Confirmed child run</section>",
+        }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(
+    `/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(parentId)}`,
+  );
+  const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  const hostActions = page
+    .locator(`[data-host="${host}"][data-host-surface="runtime"]`)
+    .first()
+    .locator("[data-host-actions]");
+  await expect(dialog).toBeVisible();
+  await expect(hostActions).toHaveAttribute("data-action-job-id", parentId);
+
+  const apply = dialog.getByRole("button", { name: `Apply on ${host}`, exact: true });
+  await expect(apply).toBeEnabled();
+  await apply.click();
+  await expect.poll(() => applyPosts.length).toBe(1);
+  expect(applyPosts[0].headers["x-pharos-action"]).toBe("1");
+  expect(applyPosts[0].body).toEqual({});
+  await expect(hostActions).toHaveAttribute("data-action-job-id", parentId);
+
+  const confirm = dialog.getByRole("button", {
+    name: `Confirm apply on ${host}`,
+    exact: true,
+  });
+  const confirmationInput = dialog.locator("[data-host-remove-input]");
+  const attended = dialog.locator("[data-host-attended-input]");
+  await expect(confirm).toBeDisabled();
+  await confirmationInput.fill(host);
+  await expect(confirm).toBeDisabled();
+  await attended.check();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+
+  await expect.poll(() => confirmPosts.length).toBe(1);
+  expect(confirmPosts[0].headers["x-pharos-action"]).toBe("1");
+  expect(confirmPosts[0].body).toEqual({ confirmation: host, attended: true });
+  await expect(hostActions).toHaveAttribute("data-action-job-id", parentId);
+  await expect(dialog.locator("[data-host-action-copy]")).toContainText(
+    "not complete until the host reports the exact requested values",
+  );
+  await expect(dialog.locator('[data-ladder-key="verified"]')).not.toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+  );
+  expect(applyPosts).toHaveLength(1);
+  expect(parentGets.length).toBeGreaterThanOrEqual(2);
+
+  await reportRuntimeHost(page, host, { is_nix: true, preferences: desired });
+  phase = "complete";
+  await dialog.getByRole("button", { name: "Check host now", exact: true }).click();
+  await expect(dialog.locator('[data-ladder-key="verified"]')).toHaveAttribute(
+    "data-ladder-state",
+    "complete",
+  );
+  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(
+    "The host reported the requested settings. The saved workflow is complete.",
+  );
+  await expect(hostActions).toHaveAttribute("data-action-job-id", parentId);
+  expect(applyPosts).toHaveLength(1);
+});
+
+test("Agora keeps guarded settings apply read-only without fleet operator access", async ({
+  page,
+}, testInfo) => {
+  const host = `settings-viewer-apply-${testInfo.project.name}`;
+  const parentId = `action-settings-change-${host}-1700000450-1`;
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    preferences: { accent: "#111111" },
+  });
+  const applyPosts = [];
+  await page.route("**/agora/requests/host-preferences.json", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "requested",
+        job: {
+          id: parentId,
+          host,
+          kind: "system_update_proposal",
+          state: "proposal_requested",
+          updated_at: 1_700_000_451,
+          workflow: {
+            kind: "settings_change",
+            title: `Change ${host} settings`,
+            guidance: `The declaration is ready for guarded apply on ${host}.`,
+            status_label: "ready to apply",
+            primary_action: { kind: "apply_declared", label: `Apply on ${host}` },
+            can_cancel: false,
+          },
+        },
+        message: "The declaration is ready.",
+        workflow_html: "<section data-host-workflow>Ready for guarded apply</section>",
+      }),
+    });
+  });
+  await page.route("**/host-actions/jobs/*/apply-declared", async (route) => {
+    applyPosts.push(route.request().url());
+    await route.fulfill({ status: 403, contentType: "application/json", body: '{"error":"forbidden"}' });
+  });
+
+  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.locator(".settings-main").evaluate((main) => {
+    main.dataset.canManageFleet = "false";
+  });
+  await page.locator("[data-color]").evaluate((input) => {
+    input.value = "#48b8a8";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.locator("[data-review-settings]").click();
+  await page.getByRole("button", { name: "Confirm change request" }).click();
+
+  const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  const apply = dialog.getByRole("button", { name: `Apply on ${host}`, exact: true });
+  await expect(page.locator(".settings-main")).toHaveAttribute(
+    "data-can-manage-fleet",
+    "false",
+  );
+  await expect(apply).toBeVisible();
+  await expect(apply).toBeDisabled();
+  await expect(dialog.locator("[data-host-action-safe-note]")).toContainText(
+    "Fleet operator access is required",
+  );
+  await apply.evaluate((button) => button.click());
+  expect(applyPosts).toHaveLength(0);
 });
 
 test("preference drift declared_not_applied sheet resolves in host settings", async ({

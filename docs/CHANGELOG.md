@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.95 - 2026-08-31
+
+- Turn an accepted settings request whose exact nixcfg declaration is loaded into a one-click `Apply on <host>` path: atomically link one idempotent guarded deployment, preserve the settings request as the visible parent across review, confirmation, retry, recovery, and reload, keep backup, Janus, fleet-lock, rollback, and attended-confirmation gates intact, block withdrawal once guarded work exists, and complete only when the host reports the exact requested values (PHAROS-241).
+
 ## 0.1.94 - 2026-08-31
 
 - Recover older accepted settings runs that have retained exact pending values but no durable nixcfg receipt: show the missing handoff honestly across Fleet and Agora, pause background polling until the operator chooses one guarded `Continue request`, persist the recovered payload before dispatch, prevent duplicate sends, fail uncertain outcomes closed, skip redispatch when the reviewed declaration already matches, and offer a clear fresh-start path when the values are unavailable (PHAROS-240).

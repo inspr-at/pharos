@@ -104,6 +104,10 @@ fn human_routes() -> Router<AppState> {
         )
         .route("/host-actions/jobs/{id}", get(host_action_job_json))
         .route(
+            "/host-actions/jobs/{id}/apply-declared",
+            post(apply_declared_settings_change),
+        )
+        .route(
             "/host-actions/jobs/{id}/acknowledge-dispatch-uncertainty",
             post(acknowledge_dispatch_uncertainty),
         )

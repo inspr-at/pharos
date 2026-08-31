@@ -6614,6 +6614,9 @@ pub(super) fn render_home_with_capabilities(
         );
         let relevant_action = most_relevant_host_action(runtime.action_jobs, &h.name);
         let apply_declared_ready = h.is_nix
+            && runtime
+                .janus_managed_hosts
+                .is_some_and(|hosts| hosts.contains(&h.name))
             && manifest.is_some_and(|manifest| {
                 manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
                     && manifest.policy.privileged_actions.janus_required
@@ -6631,6 +6634,9 @@ pub(super) fn render_home_with_capabilities(
                 declared_preferences,
                 pending_preferences: h.requested_preferences.as_ref(),
                 legacy_nix_host: h.is_nix,
+                apply_declared_unavailable_reason: (!apply_declared_ready)
+                    .then_some(crate::SETTINGS_APPLY_UNAVAILABLE_REASON),
+                ..HostSettingsContext::default()
             },
         );
         if lifecycle.slot != HostLifecycleSlot::Quiet {

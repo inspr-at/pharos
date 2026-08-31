@@ -4,6 +4,7 @@ import path from "node:path";
 import { assertHarnessOwnedRunDir } from "./harness-path.mjs";
 
 const MACHINE_OPERATOR_SCHEMA = "inspr.pharos.machine-operator-token-generation.v2";
+const BEACON_TOKEN_SCHEMA = "inspr.pharos.beacon-token-generation.v2";
 const runDir = assertHarnessOwnedRunDir(process.env.PHAROS_BROWSER_RUN_DIR);
 
 function writeSecretFile(name, content) {
@@ -40,6 +41,19 @@ function machineOperatorGenerationId(operators) {
     for (const scope of scopes) {
       hashGenerationField(digest, scope);
     }
+  }
+  return digest.digest("hex");
+}
+
+function beaconTokenGenerationId(hosts) {
+  const digest = crypto.createHash("sha256");
+  digest.update(BEACON_TOKEN_SCHEMA);
+  digest.update(Buffer.from([0]));
+  for (const host of [...hosts].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  )) {
+    hashGenerationField(digest, host.name);
+    digest.update(host.token_sha256);
   }
   return digest.digest("hex");
 }
@@ -88,6 +102,7 @@ const KERNEL_VS_RESTART_PROJECTS = ["chromium-mobile"];
 const SAVED_RESTART_LOADING_PROJECTS = ["chromium-desktop", "chromium-mobile"];
 const REMOVAL_VS_RESTART_PROJECTS = ["chromium-desktop", "chromium-mobile"];
 const PREFS_DECLARED_DRIFT_HOST = "bl-prefs-declared-drift";
+const RETIREMENT_OWNER_HOST = "browser-retirement-owner";
 
 function janusReadyHostManifest(hostName) {
   return {
@@ -147,6 +162,30 @@ const janusReadyHostNames = [
   ),
   ...REMOVAL_VS_RESTART_PROJECTS.map((project) => `bl-removal-vs-restart-${project}`),
 ];
+const beaconHosts = [
+  ...janusReadyHostNames,
+  PREFS_DECLARED_DRIFT_HOST,
+  RETIREMENT_OWNER_HOST,
+].map((name) => ({
+  name,
+  token_sha256: sha256Hex(`browser-only-beacon-fixture:${name}`),
+}));
+const beaconGeneration = beaconTokenGenerationId(beaconHosts);
+const beaconRoot = path.join(runDir, "beacon-token");
+fs.mkdirSync(beaconRoot, { recursive: true, mode: 0o700 });
+fs.writeFileSync(
+  path.join(beaconRoot, `generation-${beaconGeneration}.json`),
+  JSON.stringify({
+    schema: BEACON_TOKEN_SCHEMA,
+    generation: beaconGeneration,
+    hosts: beaconHosts,
+  }),
+  { mode: 0o600 },
+);
+fs.writeFileSync(path.join(beaconRoot, "current"), `${beaconGeneration}\n`, {
+  mode: 0o600,
+});
+
 const manifestPaths = janusReadyHostNames.map((hostName) => {
   const manifestPath = path.join(manifestDir, `${hostName}.json`);
   fs.writeFileSync(

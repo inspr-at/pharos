@@ -231,13 +231,14 @@ pub(crate) async fn page(
         .into_iter()
         .filter(|host| access.allows_host(&host.name))
         .collect();
-    Html(render_page(
+    Html(render_page_with_access(
         &manifests,
         &declared_preferences,
         &runtime_hosts,
         query.host.as_deref(),
         &user_label,
         state.auth.is_some(),
+        access.can_manage_fleet(),
     ))
 }
 
@@ -654,6 +655,7 @@ pub(crate) async fn location_proposal(
     }
 }
 
+#[cfg(test)]
 fn render_page(
     manifests: &[HostManifest],
     declared_preferences: &BTreeMap<String, HostPreferences>,
@@ -661,6 +663,26 @@ fn render_page(
     requested_host: Option<&str>,
     user_label: &str,
     logout_enabled: bool,
+) -> String {
+    render_page_with_access(
+        manifests,
+        declared_preferences,
+        runtime_hosts,
+        requested_host,
+        user_label,
+        logout_enabled,
+        true,
+    )
+}
+
+fn render_page_with_access(
+    manifests: &[HostManifest],
+    declared_preferences: &BTreeMap<String, HostPreferences>,
+    runtime_hosts: &[Host],
+    requested_host: Option<&str>,
+    user_label: &str,
+    logout_enabled: bool,
+    can_manage_fleet: bool,
 ) -> String {
     let mut hosts = host_views(manifests, declared_preferences, runtime_hosts);
     let requested_host = requested_host
@@ -695,7 +717,7 @@ fn render_page(
 
     if hosts.is_empty() {
         return format!(
-            r#"{head}{sidebar}<main class="settings-main">{header}<section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#,
+            r#"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}<section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#,
             header = crate::page_header(
                 "Host settings",
                 "Color and alerts per host",
@@ -713,12 +735,25 @@ fn render_page(
     };
 
     format!(
-        r##"{head}{sidebar}<main class="settings-main">{header}{host_table}{content}</main>{action_dialog}<script>
+        r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{host_table}{content}</main>{action_dialog}<script>
 document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{{
   window.location.assign('/agora?host='+encodeURIComponent(event.target.value));
 }});
 const root=document.querySelector('[data-color-root]');
 const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:'',failures:0,terminal:false,mode:null,confirming:false}};
+function settingsCanManageFleet(){{return document.querySelector('.settings-main')?.dataset.canManageFleet==='true'}}
+function settingsWorkflowRevision(data){{
+  const job=data?.job||{{}};
+  const workflow=job.workflow||{{}};
+  const action=workflow.primary_action||{{}};
+  return JSON.stringify([job.id,job.state,job.updated_at,workflow.updated_at,workflow.status_label,workflow.current_step,action.kind,action.target_run_id,data?.workflow_html||'']);
+}}
+function settingsApplyConfirmationReady(){{
+  const dialog=document.querySelector('[data-host-action-dialog]');
+  const confirmation=dialog?.querySelector('[data-host-remove-input]')?.value||'';
+  const attended=dialog?.querySelector('[data-host-attended-input]')?.checked===true;
+  return confirmation===root?.dataset.host&&attended;
+}}
 function setSettingsWorkflowSuspended(suspended){{
   const overlay=document.querySelector('[data-host-action-overlay]');
   if(overlay)overlay.dataset.suspended=suspended?'true':'false';
@@ -742,6 +777,14 @@ function closeSettingsWorkflow(){{
   settingsWorkflow.mode=null;
   settingsWorkflow.confirming=false;
   const overlay=document.querySelector('[data-host-action-overlay]');
+  const confirmation=overlay?.querySelector('[data-host-remove-confirm]');
+  const confirmationInput=overlay?.querySelector('[data-host-remove-input]');
+  const attended=overlay?.querySelector('[data-host-attended-confirm]');
+  const attendedInput=overlay?.querySelector('[data-host-attended-input]');
+  if(confirmation)confirmation.hidden=true;
+  if(confirmationInput)confirmationInput.value='';
+  if(attended)attended.hidden=true;
+  if(attendedInput)attendedInput.checked=false;
   if(overlay)overlay.hidden=true;
   document.body.removeAttribute('data-host-action-dialog-open');
 }}
@@ -782,8 +825,15 @@ function renderSettingsWorkflow(data){{
   const cancel=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
   const status=dialog.querySelector('[data-host-action-status]');
   const safe=dialog.querySelector('[data-host-action-safe-note]');
+  const confirmation=dialog.querySelector('[data-host-remove-confirm]');
+  const confirmationName=dialog.querySelector('[data-host-remove-name]');
+  const confirmationInput=dialog.querySelector('[data-host-remove-input]');
+  const attended=dialog.querySelector('[data-host-attended-confirm]');
+  const attendedInput=dialog.querySelector('[data-host-attended-input]');
   const terminal=['succeeded','failed','cancelled'].includes(job.state);
-  const actionRequired=['continue','restart'].includes(primaryAction?.kind||'');
+  const actionKind=primaryAction?.kind||'';
+  const guardedAction=['apply_declared','confirm','retry'].includes(actionKind)||(actionKind==='recover'&&Boolean(primaryAction?.target_run_id));
+  const actionRequired=['acknowledge','apply_declared','confirm','retry','recover','continue','restart'].includes(actionKind);
   settingsWorkflow.mode='workflow';
   settingsWorkflow.confirming=false;
   settingsWorkflow.terminal=terminal;
@@ -791,10 +841,20 @@ function renderSettingsWorkflow(data){{
   if(facts)facts.hidden=true;
   if(technical)technical.hidden=true;
   if(checklist){{checklist.hidden=false;checklist.innerHTML=data.workflow_html||''}}
+  if(confirmation)confirmation.hidden=actionKind!=='confirm';
+  if(confirmationName)confirmationName.textContent=root?.dataset.host||job.host||'';
+  if(attended)attended.hidden=actionKind!=='confirm';
+  if(actionKind!=='confirm'){{
+    if(confirmationInput)confirmationInput.value='';
+    if(attendedInput)attendedInput.checked=false;
+  }}
   if(primary){{
-    primary.hidden=!['acknowledge','recover','continue','restart'].includes(primaryAction?.kind||'');
-    primary.disabled=false;
-    primary.dataset.workflowAction=primaryAction?.kind||'';
+    primary.hidden=!actionRequired;
+    primary.disabled=guardedAction&&!settingsCanManageFleet()
+      ?true
+      :actionKind==='confirm'?!settingsApplyConfirmationReady():false;
+    primary.dataset.workflowAction=actionKind;
+    primary.dataset.workflowTargetRunId=primaryAction?.target_run_id||'';
     primary.textContent=primaryAction?.label||'Continue';
   }}
   if(cancelRequest){{cancelRequest.hidden=true;cancelRequest.disabled=false}}
@@ -802,20 +862,25 @@ function renderSettingsWorkflow(data){{
   if(status)status.textContent=data.message||'';
   if(safe){{
     safe.dataset.workflowLive=terminal||actionRequired?'false':'true';
-    safe.textContent=terminal?'Run complete and saved'
+    safe.textContent=guardedAction&&!settingsCanManageFleet()?'Fleet operator access is required for this guarded action'
+      :terminal?'Run complete and saved'
       :primaryAction?.kind==='continue'?'Ready to continue the saved request'
       :primaryAction?.kind==='restart'?'Operator action required'
+      :primaryAction?.kind==='apply_declared'?'Ready to prepare the guarded apply'
+      :primaryAction?.kind==='confirm'?'Attended confirmation required'
+      :primaryAction?.kind==='retry'?'Ready to retry the guarded review'
+      :primaryAction?.kind==='recover'?'Ready to run guarded recovery checks'
       :'Watching for recorded host evidence';
   }}
   overlay.hidden=false;
   document.body.dataset.hostActionDialogOpen='true';
-  settingsWorkflow.id=job.id;
-  settingsWorkflow.lastRevision=[job.id,job.state,job.updated_at].join(':');
+  settingsWorkflow.id=settingsWorkflow.id||job.id;
+  settingsWorkflow.lastRevision=settingsWorkflowRevision(data);
   if(terminal){{
     if(settingsWorkflow.timer!=null)clearTimeout(settingsWorkflow.timer);
     settingsWorkflow.timer=null;
     setSettingsWorkflowSuspended(false);
-  }}else if(!actionRequired)scheduleSettingsWorkflowPoll(job.id);
+  }}else if(!actionRequired)scheduleSettingsWorkflowPoll(settingsWorkflow.id);
   requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
 }}
 async function pollSettingsWorkflow(id){{
@@ -831,7 +896,7 @@ async function pollSettingsWorkflow(id){{
     const data=await response.json().catch(()=>({{}}));
     if(!response.ok)throw new Error(data.error||'Could not refresh the settings workflow.');
     settingsWorkflow.failures=0;
-    const revision=[data.job?.id,data.job?.state,data.job?.updated_at].join(':');
+    const revision=settingsWorkflowRevision(data);
     if(revision!==settingsWorkflow.lastRevision)renderSettingsWorkflow(data);
     else scheduleSettingsWorkflowPoll(id);
   }}catch(error){{
@@ -845,34 +910,62 @@ async function pollSettingsWorkflow(id){{
 }}
 document.querySelector('[data-host-action-overlay]')?.addEventListener('click',event=>{{
   if(event.target.closest('[data-host-action-close]')){{event.preventDefault();closeSettingsWorkflow()}}
-  const acknowledge=event.target.closest('[data-host-action-primary]');
-  if(acknowledge&&settingsWorkflow.id&&settingsWorkflow.mode==='workflow'){{
+  const primary=event.target.closest('[data-host-action-primary]');
+  if(primary&&settingsWorkflow.id&&settingsWorkflow.mode==='workflow'){{
     event.preventDefault();
-    acknowledge.disabled=true;
-    const action=acknowledge.dataset.workflowAction||'';
-    const endpoint=action==='recover'?'reconcile-accepted-dispatch'
+    const action=primary.dataset.workflowAction||'';
+    const targetRunId=primary.dataset.workflowTargetRunId||'';
+    const guardedAction=['apply_declared','confirm','retry'].includes(action)||(action==='recover'&&Boolean(targetRunId));
+    if(guardedAction&&!settingsCanManageFleet())return;
+    if(action==='confirm'&&!settingsApplyConfirmationReady())return;
+    if(['confirm','retry'].includes(action)&&!targetRunId)return;
+    primary.disabled=true;
+    const requestRunId=targetRunId||settingsWorkflow.id;
+    const endpoint=action==='apply_declared'?'apply-declared'
+      :action==='confirm'?'confirm'
+      :action==='retry'?'retry'
+      :action==='recover'&&targetRunId?'recover'
+      :action==='recover'?'reconcile-accepted-dispatch'
       :action==='continue'?'continue-settings-dispatch'
       :action==='restart'?'withdraw'
       :'acknowledge-dispatch-uncertainty';
+    const body=action==='confirm'
+      ?JSON.stringify({{confirmation:root.dataset.host,attended:true}})
+      :'{{}}';
     const status=document.querySelector('[data-host-action-status]');
-    if(status)status.textContent=action==='continue'
-      ?'Continuing the saved request through nixcfg…'
+    if(status)status.textContent=action==='apply_declared'
+      ?'Preparing the guarded apply review…'
+      :action==='confirm'?'Recording attended confirmation…'
+      :action==='retry'?'Retrying the guarded review…'
+      :action==='recover'&&targetRunId?'Queueing target-local recovery checks…'
+      :action==='continue'?'Continuing the saved request through nixcfg…'
       :action==='restart'?'Clearing the incomplete request…'
       :'Reconciling the saved workflow…';
-    fetch('/host-actions/jobs/'+encodeURIComponent(settingsWorkflow.id)+'/'+endpoint,{{
+    fetch('/host-actions/jobs/'+encodeURIComponent(requestRunId)+'/'+endpoint,{{
       method:'POST',
       credentials:'same-origin',
       headers:{{'Content-Type':'application/json','X-Pharos-Action':'1'}},
-      body:'{{}}',
+      body,
     }}).then(async response=>{{
       const data=await response.json().catch(()=>({{}}));
       if(!response.ok)throw new Error(data.error||'Could not reconcile the saved workflow.');
-      renderSettingsWorkflow(data);
+      if(data.job?.id===settingsWorkflow.id)renderSettingsWorkflow(data);
+      else scheduleSettingsWorkflowPoll(settingsWorkflow.id,0);
     }}).catch(error=>{{
       if(status)status.textContent=error.message||'Could not reconcile the saved workflow.';
-      acknowledge.disabled=false;
+      if(primary.isConnected)primary.disabled=guardedAction&&!settingsCanManageFleet()||action==='confirm'&&!settingsApplyConfirmationReady();
     }});
   }}
+}});
+document.querySelector('[data-host-action-overlay]')?.addEventListener('input',event=>{{
+  if(!event.target.matches('[data-host-remove-input]'))return;
+  const primary=document.querySelector('[data-host-action-primary]');
+  if(primary&&settingsWorkflow.mode==='workflow'&&primary.dataset.workflowAction==='confirm')primary.disabled=!settingsCanManageFleet()||!settingsApplyConfirmationReady();
+}});
+document.querySelector('[data-host-action-overlay]')?.addEventListener('change',event=>{{
+  if(!event.target.matches('[data-host-attended-input]'))return;
+  const primary=document.querySelector('[data-host-action-primary]');
+  if(primary&&settingsWorkflow.mode==='workflow'&&primary.dataset.workflowAction==='confirm')primary.disabled=!settingsCanManageFleet()||!settingsApplyConfirmationReady();
 }});
 document.addEventListener('keydown',event=>{{if(event.key==='Escape'&&(settingsWorkflow.id||settingsWorkflow.mode==='confirm')){{event.preventDefault();closeSettingsWorkflow()}}}});
 document.addEventListener('visibilitychange',()=>{{
@@ -1010,12 +1103,20 @@ if(root){{
     const close=dialog.querySelector('.host-action-dialog-buttons [data-host-action-close]');
     const sheetStatus=dialog.querySelector('[data-host-action-status]');
     const safe=dialog.querySelector('[data-host-action-safe-note]');
+    const confirmation=dialog.querySelector('[data-host-remove-confirm]');
+    const confirmationInput=dialog.querySelector('[data-host-remove-input]');
+    const attended=dialog.querySelector('[data-host-attended-confirm]');
+    const attendedInput=dialog.querySelector('[data-host-attended-input]');
     if(title)title.textContent='Confirm changes for '+root.dataset.host;
     if(copy)copy.textContent='Review the draft before Pharos creates a saved settings workflow.';
     if(info)info.hidden=true;
     if(facts)facts.hidden=true;
     if(technical)technical.hidden=true;
     if(checklist){{checklist.hidden=false;checklist.replaceChildren(draftReviewSection(changes))}}
+    if(confirmation)confirmation.hidden=true;
+    if(confirmationInput)confirmationInput.value='';
+    if(attended)attended.hidden=true;
+    if(attendedInput)attendedInput.checked=false;
     if(primary){{primary.hidden=false;primary.disabled=false;primary.dataset.workflowAction='confirm-settings';primary.textContent='Confirm change request'}}
     if(discard){{discard.hidden=false;discard.disabled=false;discard.textContent='Discard draft'}}
     if(close)close.textContent='Keep editing';
@@ -1056,9 +1157,8 @@ if(root){{
         body:JSON.stringify({{host:root.dataset.host,preferences:draftPreferences()}}),
       }});
       const data=await res.json();
-      if(data.job)renderSettingsWorkflow(data);
       if(!res.ok){{
-        if(data.job){{setStatus('error',data.error||'Request already exists.');return}}
+        if(data.job){{renderSettingsWorkflow(data);setStatus('error',data.error||'Request already exists.');return}}
         throw new Error(data.error||'Request failed');
       }}
       savedPreferences=draftPreferences();
@@ -1072,6 +1172,7 @@ if(root){{
       root.querySelector('[data-review-settings]')?.setAttribute('disabled','');
       root.querySelector('[data-discard-settings]')?.setAttribute('disabled','');
       await loadReview();
+      if(data.job)renderSettingsWorkflow(data);
     }}catch(error){{
       settingsWorkflow.confirming=false;
       setStatus('error',error.message||'Request failed');
@@ -1107,7 +1208,8 @@ if(root){{
         ),
         host_table = host_table,
         action_dialog = crate::host_action_dialog(),
-        accent = html_escape(&selected.declared_accent)
+        accent = html_escape(&selected.declared_accent),
+        can_manage_fleet = can_manage_fleet,
     )
 }
 
@@ -2105,11 +2207,62 @@ mod tests {
             true,
         );
 
-        assert!(html.contains("const actionRequired=['continue','restart']"));
-        assert!(html.contains("else if(!actionRequired)scheduleSettingsWorkflowPoll(job.id)"));
+        assert!(html.contains(
+            "const actionRequired=['acknowledge','apply_declared','confirm','retry','recover','continue','restart']"
+        ));
+        assert!(html
+            .contains("else if(!actionRequired)scheduleSettingsWorkflowPoll(settingsWorkflow.id)"));
         assert!(html.contains(":action==='continue'?'continue-settings-dispatch'"));
         assert!(html.contains("'Continuing the saved request through nixcfg…'"));
         assert!(html.contains("'Ready to continue the saved request'"));
+    }
+
+    #[test]
+    fn settings_workflow_drives_linked_apply_without_losing_the_parent_run() {
+        let html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime_host("hsb8")],
+            Some("hsb8"),
+            "markus",
+            true,
+        );
+
+        assert!(html.contains("action.target_run_id"));
+        assert!(html.contains("primary.dataset.workflowTargetRunId"));
+        assert!(html.contains("settingsWorkflow.id=settingsWorkflow.id||job.id"));
+        assert!(html.contains(
+            "action==='apply_declared'?'apply-declared'\n      :action==='confirm'?'confirm'\n      :action==='retry'?'retry'"
+        ));
+        assert!(html.contains("action==='recover'&&targetRunId?'recover'"));
+        assert!(html.contains("JSON.stringify({confirmation:root.dataset.host,attended:true})"));
+        assert!(html.contains(
+            "if(data.job?.id===settingsWorkflow.id)renderSettingsWorkflow(data);\n      else scheduleSettingsWorkflowPoll(settingsWorkflow.id,0)"
+        ));
+        assert!(html.contains("const revision=settingsWorkflowRevision(data)"));
+        assert!(html.contains("data?.workflow_html||''"));
+        assert!(html.contains(
+            "primary.disabled=!settingsCanManageFleet()||!settingsApplyConfirmationReady()"
+        ));
+        assert!(html.contains("guardedAction&&!settingsCanManageFleet()"));
+    }
+
+    #[test]
+    fn guarded_settings_controls_are_read_only_without_fleet_operator_access() {
+        let html = render_page_with_access(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime_host("hsb8")],
+            Some("hsb8"),
+            "viewer",
+            true,
+            false,
+        );
+
+        assert!(html.contains(r#"data-can-manage-fleet="false""#));
+        assert!(html.contains("Fleet operator access is required for this guarded action"));
+        assert!(html.contains("if(guardedAction&&!settingsCanManageFleet())return"));
+        assert!(html.contains("action==='recover'&&Boolean(targetRunId)"));
     }
 
     #[test]

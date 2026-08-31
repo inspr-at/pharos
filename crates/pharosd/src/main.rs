@@ -99,12 +99,13 @@ use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 use crate::host_actions::host_lifecycle;
 use crate::host_actions::{
     active_update_restart_for_host, blocking_update_for_host, host_lifecycle_with_apply,
-    host_preferences_state, most_relevant_host_action, withdrawable_settings_change_for_host,
-    AgentActionOutcome, AgentActionResultRequest, HostActionEventSource, HostActionJob,
-    HostActionState, HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot,
-    HostPreferencesState, HostRemovalPlan, HostRetirementDisposition, HostSettingsContext,
-    HostWorkflowKind, HostWorkflowSummary, RetiredHost, RetiredHostStore,
-    RetirementAgentResultRequest, SystemUpdateProposalBegin, UpdateRestartIntent,
+    host_preferences_state, linked_settings_apply, most_relevant_host_action,
+    withdrawable_settings_change_for_host, AgentActionOutcome, AgentActionResultRequest,
+    HostActionEventSource, HostActionJob, HostActionState, HostActionStore, HostActionStoreError,
+    HostLifecycle, HostLifecycleSlot, HostPreferencesState, HostRemovalPlan,
+    HostRetirementDisposition, HostSettingsContext, HostWorkflowKind, HostWorkflowSummary,
+    RetiredHost, RetiredHostStore, RetirementAgentResultRequest, SystemUpdateProposalBegin,
+    UpdateRestartIntent,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -132,6 +133,8 @@ use crate::ui::*;
 const SERVER_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 const EXISTING_HOST_SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const EXISTING_HOST_SSH_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+const SETTINGS_APPLY_UNAVAILABLE_REASON: &str =
+    "Guarded apply is not prepared for this host because target-local Janus actions are not enabled.";
 /// Combined app state. Handlers extract `Arc<Store>` or `AuthState` via `FromRef`.
 #[derive(Clone)]
 struct AppState {
@@ -731,18 +734,12 @@ fn action_response_with_message(
     )
 }
 
-fn action_response_with_settings_context(
+fn action_response_with_host_settings_context(
     status: StatusCode,
     job: &HostActionJob,
-    declared_preferences: Option<&HostPreferences>,
-    pending_preferences: Option<&HostPreferences>,
-    legacy_nix_host: bool,
+    settings: HostSettingsContext<'_>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let summary = job.summary_with_settings_context(
-        declared_preferences,
-        pending_preferences,
-        legacy_nix_host,
-    );
+    let summary = job.summary_with_host_settings_context(settings);
     let message = match summary
         .workflow
         .primary_action
@@ -755,6 +752,10 @@ fn action_response_with_settings_context(
         Some(host_actions::HostWorkflowActionKind::Restart) => Cow::Borrowed(
             "The exact saved settings are no longer available. Clear this request and start over.",
         ),
+        Some(host_actions::HostWorkflowActionKind::ApplyDeclared) => Cow::Owned(format!(
+            "The declaration is ready. Apply it on {} through the guarded deployment workflow.",
+            job.host
+        )),
         _ => action_message(job),
     };
     let workflow_html = host_workflow_markup(&summary.workflow);
@@ -894,13 +895,28 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
             )
         })
         .collect::<String>();
+    let linked_evidence = workflow
+        .linked_run_id
+        .as_ref()
+        .map_or_else(String::new, |id| {
+            let state = workflow
+                .linked_run_state
+                .map(|state| state.key().replace('_', " "))
+                .unwrap_or_else(|| "recorded".to_string());
+            format!(
+                "<dt>Guarded apply run</dt><dd>{}</dd><dt>Guarded apply state</dt><dd>{}</dd>",
+                html_escape(id),
+                html_escape(&state),
+            )
+        });
     let evidence = format!(
-        "<dt>Run ID</dt><dd>{run_id}</dd><dt>Host</dt><dd>{host}</dd><dt>Started</dt><dd>{created}</dd><dt>Last update</dt><dd>{updated}</dd><dt>Recorded span</dt><dd>{duration}</dd>{workflow_evidence}",
+        "<dt>Run ID</dt><dd>{run_id}</dd><dt>Host</dt><dd>{host}</dd><dt>Started</dt><dd>{created}</dd><dt>Last update</dt><dd>{updated}</dd><dt>Recorded span</dt><dd>{duration}</dd>{linked_evidence}{workflow_evidence}",
         run_id = html_escape(&workflow.run_id),
         host = html_escape(&workflow.host),
         created = html_escape(&clock_label(workflow.created_at)),
         updated = html_escape(&clock_label(workflow.updated_at)),
         duration = html_escape(&duration_label(workflow.recorded_duration_secs)),
+        linked_evidence = linked_evidence,
     );
     let events = workflow
         .events
@@ -1018,11 +1034,12 @@ fn host_needs_declaration_cleanup(state: &AppState, host: &str) -> bool {
 }
 
 fn host_janus_actions_ready(state: &AppState, host: &str) -> bool {
-    state.manifests.manifests().iter().any(|manifest| {
+    let declared_ready = state.manifests.manifests().iter().any(|manifest| {
         (manifest.host.name == host || manifest.slug == host)
             && manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
             && manifest.policy.privileged_actions.janus_required
-    })
+    });
+    declared_ready && state.beacon_auth.janus_manages_host(host).unwrap_or(false)
 }
 
 fn update_restart_target_error(
@@ -1299,6 +1316,128 @@ async fn request_update_restart_review(
             "The guarded review could not be recorded",
         ),
     }
+}
+
+async fn apply_declared_settings_change(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let _settings_change_guard = state.settings_change_lock.lock().await;
+    let Some(settings) = state.host_actions.get(&id) else {
+        return action_error(StatusCode::NOT_FOUND, "Settings request was not found");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&settings.host)
+    {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Guarded settings apply access is not granted",
+        );
+    }
+    if settings.workflow_kind() != HostWorkflowKind::SettingsChange {
+        return action_error(StatusCode::CONFLICT, "This run is not a settings request");
+    }
+    let declared = state.manifests.declared_preferences_for(&settings.host);
+    if settings.requested_preferences().is_none() || settings.requested_preferences() != declared {
+        return action_error(
+            StatusCode::CONFLICT,
+            "The loaded nixcfg declaration does not exactly match this saved settings request",
+        );
+    }
+    if let Some((status, message)) =
+        update_restart_target_error(&state, &settings.host, UpdateRestartIntent::ApplyDeclared)
+    {
+        return action_error(status, message);
+    }
+    let actor = action_actor(&state.auth, &headers);
+    let linked = match state.host_actions.begin_settings_apply_review(
+        &id,
+        &settings.host,
+        &actor,
+        now_unix(),
+    ) {
+        Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            let jobs = state.host_actions.list();
+            match linked_settings_apply(&jobs, &id).cloned() {
+                Some(job) => job,
+                None => {
+                    return action_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "The guarded review was saved but could not be reloaded",
+                    )
+                }
+            }
+        }
+        Err(HostActionStoreError::ActiveJob) => {
+            return action_error(
+                StatusCode::CONFLICT,
+                "A guarded update workflow is already active for this host",
+            )
+        }
+        Err(HostActionStoreError::FailedJobRequiresRetry) => {
+            return action_error(
+                StatusCode::CONFLICT,
+                "The latest guarded review failed; retry that recorded attempt",
+            )
+        }
+        Err(HostActionStoreError::BlockedByFleetGate) => {
+            let jobs = state.host_actions.list();
+            let message = blocking_update_for_host(&jobs, &settings.host).map_or_else(
+                || "Another guarded host workflow must finish first".to_string(),
+                |blocker| {
+                    format!(
+                        "{} holds the fleet update lock; finish or resolve that workflow first",
+                        blocker.host
+                    )
+                },
+            );
+            return action_error(StatusCode::CONFLICT, &message);
+        }
+        Err(HostActionStoreError::WrongHost) => {
+            return action_error(
+                StatusCode::FORBIDDEN,
+                "Settings request belongs to another host",
+            )
+        }
+        Err(HostActionStoreError::NotFound) => {
+            return action_error(StatusCode::NOT_FOUND, "Settings request was not found")
+        }
+        Err(HostActionStoreError::InvalidTransition) => {
+            return action_error(
+                StatusCode::CONFLICT,
+                "The repository handoff is not durably accepted and ready to apply",
+            )
+        }
+        Err(_) => {
+            return action_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The guarded settings review could not be recorded",
+            )
+        }
+    };
+    tracing::info!(host = %settings.host, actor = %actor, settings_run = %id, guarded_run = %linked.id, ticket = "PHAROS-241", "guarded declared settings review linked");
+    let runtime_host = state.store.get(&settings.host);
+    let jobs = state.host_actions.list();
+    let linked_apply = linked_settings_apply(&jobs, &id);
+    action_response_with_host_settings_context(
+        StatusCode::ACCEPTED,
+        &settings,
+        HostSettingsContext {
+            declared_preferences: declared,
+            pending_preferences: runtime_host
+                .as_ref()
+                .and_then(|host| host.requested_preferences.as_ref()),
+            legacy_nix_host: runtime_host.as_ref().is_some_and(|host| host.is_nix),
+            apply_declared_ready: true,
+            apply_declared_unavailable_reason: None,
+            linked_apply,
+            apply_blocked_by: None,
+        },
+    )
 }
 
 async fn retry_update_restart_review(
@@ -1612,14 +1751,37 @@ async fn host_action_job_json(
         );
     }
     let runtime_host = state.store.get(&job.host);
-    action_response_with_settings_context(
+    let jobs = state.host_actions.list();
+    let linked_apply = (job.workflow_kind() == HostWorkflowKind::SettingsChange)
+        .then(|| linked_settings_apply(&jobs, &job.id))
+        .flatten();
+    let blocker = blocking_update_for_host(&jobs, &job.host);
+    let declared_preferences = state.manifests.declared_preferences_for(&job.host);
+    let apply_declared_ready = runtime_host.as_ref().is_some_and(|host| {
+        host.is_nix
+            && host_janus_actions_ready(&state, &job.host)
+            && (host_preferences_state(
+                &host.preferences,
+                declared_preferences,
+                host.requested_preferences.as_ref(),
+            ) == HostPreferencesState::DeclaredNotApplied
+                || kernel_reboot_required(host.kernel.as_ref()).is_some())
+    });
+    action_response_with_host_settings_context(
         StatusCode::OK,
         &job,
-        state.manifests.declared_preferences_for(&job.host),
-        runtime_host
-            .as_ref()
-            .and_then(|host| host.requested_preferences.as_ref()),
-        runtime_host.as_ref().is_some_and(|host| host.is_nix),
+        HostSettingsContext {
+            declared_preferences,
+            pending_preferences: runtime_host
+                .as_ref()
+                .and_then(|host| host.requested_preferences.as_ref()),
+            legacy_nix_host: runtime_host.as_ref().is_some_and(|host| host.is_nix),
+            apply_declared_ready,
+            apply_declared_unavailable_reason: (!apply_declared_ready)
+                .then_some(SETTINGS_APPLY_UNAVAILABLE_REASON),
+            linked_apply,
+            apply_blocked_by: blocker.map(|job| job.host.as_str()),
+        },
     )
 }
 
@@ -3088,11 +3250,17 @@ async fn hosts_json(State(state): State<AppState>, headers: HeaderMap) -> impl I
         .into_iter()
         .filter(|job| access.allows_host(&job.host))
         .collect();
+    let janus_action_hosts: BTreeSet<String> = runtime_hosts
+        .iter()
+        .filter(|host| host_janus_actions_ready(&state, &host.name))
+        .map(|host| host.name.clone())
+        .collect();
     let mut payload = hosts_payload(
         runtime_hosts,
         &manifests,
         &declared_preferences,
         &action_jobs,
+        Some(&janus_action_hosts),
         now,
     );
     if let Some(hosts) = payload
@@ -3139,6 +3307,7 @@ fn hosts_payload(
     manifests: &[HostManifest],
     declared_preferences: &BTreeMap<String, HostPreferences>,
     action_jobs: &[HostActionJob],
+    janus_action_hosts: Option<&BTreeSet<String>>,
     now: i64,
 ) -> serde_json::Value {
     let manifests = manifest_by_host(manifests);
@@ -3157,6 +3326,7 @@ fn hosts_payload(
             );
             let action = most_relevant_host_action(action_jobs, &h.name);
             let apply_declared_ready = h.is_nix
+                && janus_action_hosts.is_some_and(|hosts| hosts.contains(&h.name))
                 && manifest.is_some_and(|manifest| {
                     manifest.policy.privileged_actions.mode == PrivilegedActionMode::Janus
                         && manifest.policy.privileged_actions.janus_required
@@ -3164,6 +3334,24 @@ fn hosts_payload(
             let normal_update_ready = apply_declared_ready
                 && (kernel_reboot_required(h.kernel.as_ref()).is_some()
                     || h.freshness.has_proven_deployable_update());
+            let linked_apply = action
+                .filter(|job| job.workflow_kind() == HostWorkflowKind::SettingsChange)
+                .and_then(|job| linked_settings_apply(action_jobs, &job.id));
+            let apply_blocker = (preferences_state == HostPreferencesState::DeclaredNotApplied)
+                .then(|| blocking_update_for_host(action_jobs, &h.name))
+                .flatten();
+            let settings_context = HostSettingsContext {
+                declared_preferences: declared_preferences.as_ref(),
+                pending_preferences: h.requested_preferences.as_ref(),
+                legacy_nix_host: h.is_nix,
+                apply_declared_ready: apply_declared_ready
+                    && (preferences_state == HostPreferencesState::DeclaredNotApplied
+                        || kernel_reboot_required(h.kernel.as_ref()).is_some()),
+                apply_declared_unavailable_reason: (!apply_declared_ready)
+                    .then_some(SETTINGS_APPLY_UNAVAILABLE_REASON),
+                linked_apply,
+                apply_blocked_by: apply_blocker.map(|job| job.host.as_str()),
+            };
             let lifecycle = host_lifecycle_with_apply(
                 action_jobs,
                 &h.name,
@@ -3171,18 +3359,10 @@ fn hosts_payload(
                 kernel_reboot_required(h.kernel.as_ref()).is_some(),
                 apply_declared_ready,
                 normal_update_ready,
-                HostSettingsContext {
-                    declared_preferences: declared_preferences.as_ref(),
-                    pending_preferences: h.requested_preferences.as_ref(),
-                    legacy_nix_host: h.is_nix,
-                },
+                settings_context,
             );
             let action_summary = action.map(|action| {
-                action.summary_with_settings_context(
-                    declared_preferences.as_ref(),
-                    h.requested_preferences.as_ref(),
-                    h.is_nix,
-                )
+                action.summary_with_host_settings_context(settings_context)
             });
             let withdrawable_settings_change =
                 withdrawable_settings_change_for_host(action_jobs, &h.name);
@@ -6289,6 +6469,7 @@ mod tests {
             &[ready_manifest],
             &BTreeMap::new(),
             &action_jobs,
+            None,
             1_700_000_130,
         );
         let emitted = payload["hosts"][0].as_object().expect("host object");
@@ -6449,7 +6630,7 @@ mod tests {
             requested_preferences: None,
         };
 
-        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], 1000);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], None, 1000);
 
         assert_eq!(payload["as_of"], 1000);
         assert_eq!(
@@ -6508,6 +6689,7 @@ mod tests {
             &[],
             &declarations,
             &action_jobs,
+            None,
             1000,
         );
         let hosts = payload["hosts"].as_array().expect("hosts array");
@@ -6566,7 +6748,7 @@ mod tests {
             .clone();
         let action_jobs = vec![cancelled_settings, proposal];
         let host = host_with_backups("diverge-host", 970, vec![]);
-        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &action_jobs, 1000);
+        let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &action_jobs, None, 1000);
         let emitted = payload["hosts"][0].as_object().expect("host object");
         let lifecycle = emitted["lifecycle"].as_object().expect("lifecycle object");
         let host_action = emitted["host_action"]
@@ -6617,7 +6799,7 @@ mod tests {
         let mut staged = host_with_backups("csb0", 970, vec![]);
         staged.kernel = Some(reboot_required_kernel(965));
 
-        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), &[], 1000);
+        let payload = hosts_payload(vec![staged.clone()], &[], &BTreeMap::new(), &[], None, 1000);
         assert_eq!(payload["hosts"][0]["kernel"]["state"], "reboot_required");
         assert_eq!(payload["hosts"][0]["kernel"]["running_version"], "6.18.26");
         assert_eq!(payload["hosts"][0]["kernel"]["expected_version"], "7.0.14");
@@ -7255,7 +7437,8 @@ mod tests {
         );
         assert!(fleet.contains("down, backup, Nix freshness muted"));
         assert!(fleet.contains(r#"class="mute-note""#));
-        let applied_payload = hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), &[], 1000);
+        let applied_payload =
+            hosts_payload(vec![host.clone()], &[], &BTreeMap::new(), &[], None, 1000);
         assert_eq!(
             applied_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             true
@@ -7293,7 +7476,7 @@ mod tests {
         );
         assert!(pending_fleet.contains(r#"class="mute-note" data-mute-note title="" hidden"#));
         assert!(!pending_fleet.contains("down, backup, Nix freshness muted"));
-        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], 1000);
+        let pending_payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], None, 1000);
         assert_eq!(
             pending_payload["hosts"][0]["preferences"]["alerts"]["suppress_down"],
             false
@@ -7339,7 +7522,14 @@ mod tests {
             .iter()
             .any(|event| event.title == "No heartbeat received"));
 
-        let payload = hosts_payload(vec![workstation.clone()], &[], &BTreeMap::new(), &[], 1000);
+        let payload = hosts_payload(
+            vec![workstation.clone()],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            None,
+            1000,
+        );
         assert_eq!(payload["hosts"][0]["liveness"], "down");
         assert_eq!(
             payload["hosts"][0]["attention"]["label"],
@@ -8683,7 +8873,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"style="--pending-color:#9868d0""#));
         assert!(!html.contains(r#"--host-color:#9868d0""#));
 
-        let payload = hosts_payload(vec![host], &[], &declarations, &[], 1000);
+        let payload = hosts_payload(vec![host], &[], &declarations, &[], None, 1000);
         assert_eq!(payload["hosts"][0]["declared_preferences"], json!(declared));
         assert_eq!(
             payload["hosts"][0]["preferences_state"],
@@ -14109,26 +14299,35 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(second_status, StatusCode::OK);
         assert_eq!(first, second);
         assert_eq!(first["job"]["id"], job.id);
-        assert_eq!(
-            first["job"]["workflow"]["primary_action"]["kind"],
-            "refresh"
-        );
-        assert_eq!(
-            first["job"]["workflow"]["primary_action"]["label"],
-            "Check host now"
-        );
+        assert!(first["job"]["workflow"]["primary_action"].is_null());
         assert_eq!(first["job"]["workflow"]["ladder"][1]["key"], "declared");
         assert_eq!(first["job"]["workflow"]["ladder"][1]["state"], "complete");
-        assert!(first["job"]["workflow"]["guidance"]
-            .as_str()
-            .is_some_and(|guidance| guidance.contains("Deploy or recreate the beacon on csb0")));
+        assert_eq!(
+            first["job"]["workflow"]["status_label"],
+            "guarded apply unavailable"
+        );
+        assert!(first["job"]["workflow"]["guidance"].as_str().is_some_and(
+            |guidance| guidance.contains("target-local Janus actions are not enabled")
+        ));
         assert_eq!(after.state, HostActionState::ProposalRequested);
         assert_eq!(after.updated_at, before.updated_at);
         assert_eq!(after.events, before.events);
         std::fs::remove_file(preferences_path).expect("remove declared preferences fixture");
     }
 
-    fn state_with_janus_manifest(host: &str, token: &str) -> (AppState, PathBuf) {
+    struct JanusActionFixture {
+        manifest_path: PathBuf,
+        generation_root: PathBuf,
+    }
+
+    impl Drop for JanusActionFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.manifest_path);
+            let _ = std::fs::remove_dir_all(&self.generation_root);
+        }
+    }
+
+    fn state_with_janus_manifest(host: &str, token: &str) -> (AppState, JanusActionFixture) {
         let path = std::env::temp_dir().join(format!(
             "pharos-action-manifest-{}-{}-{}.json",
             std::process::id(),
@@ -14140,7 +14339,14 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             serde_json::to_vec(&test_manifest(host, true)).expect("manifest serializes"),
         )
         .expect("write action manifest");
-        let mut state = report_test_state(true);
+        let (generation_root, janus_tokens) = janus_test_store(&[(host, token)]);
+        let mut state = report_test_state_with_auth(BeaconAuth {
+            registration_token: None,
+            require_report_token: true,
+            report_token_mode: BeaconTokenMode::Dual,
+            janus_tokens: Some(janus_tokens),
+            local_register_enabled: true,
+        });
         state.manifests = Arc::new(ManifestRegistry::from_paths(vec![path.clone()]));
         register_test_token(&state, host, token);
         let mut report = test_report(host);
@@ -14150,12 +14356,18 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .store
             .record(report, now_unix())
             .expect("test report persists");
-        (state, path)
+        (
+            state,
+            JanusActionFixture {
+                manifest_path: path,
+                generation_root,
+            },
+        )
     }
 
     #[tokio::test]
     async fn guarded_update_endpoint_requires_host_review_and_attended_confirmation() {
-        let (state, manifest_path) = state_with_janus_manifest("hsb8", "action-token");
+        let (state, _fixture) = state_with_janus_manifest("hsb8", "action-token");
         let (status, Json(payload)) = request_update_restart_review(
             State(state.clone()),
             action_headers(),
@@ -14224,12 +14436,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(payload["job"]["state"], "queued_apply");
-        let _ = std::fs::remove_file(manifest_path);
     }
 
     #[tokio::test]
     async fn declared_apply_endpoint_is_typed_gated_and_names_the_fleet_lock_holder() {
-        let (state, manifest_path) = state_with_janus_manifest("hsb8", "apply-token");
+        let (state, _fixture) = state_with_janus_manifest("hsb8", "apply-token");
         let (status, Json(payload)) = request_update_restart_review(
             State(state.clone()),
             action_headers(),
@@ -14243,7 +14454,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(payload["job"]["intent"], "apply_declared");
         assert_eq!(payload["job"]["ticket"], "PHAROS-216");
 
-        let (blocked_state, blocked_manifest_path) =
+        let (blocked_state, _blocked_fixture) =
             state_with_janus_manifest("hsb8", "blocked-apply-token");
         let mut current = test_report("hsb8");
         current.kernel = None;
@@ -14299,14 +14510,131 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(payload["error"]
             .as_str()
             .is_some_and(|message| message.contains("csb0 holds the fleet update lock")));
+    }
 
-        let _ = std::fs::remove_file(manifest_path);
-        let _ = std::fs::remove_file(blocked_manifest_path);
+    #[tokio::test]
+    async fn settings_apply_endpoint_links_once_and_keeps_parent_until_exact_beacon() {
+        let (state, _fixture) = state_with_janus_manifest("hsb8", "settings-apply-token");
+        let requested = state
+            .manifests
+            .declared_preferences_for("hsb8")
+            .expect("declared preferences")
+            .clone();
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "fixture-operator", now_unix())
+            .expect("settings workflow starts");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, now_unix())
+            .expect("request saved");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&settings.id, now_unix())
+            .expect("handoff submitted");
+        state
+            .host_actions
+            .accept_settings_change(&settings.id, now_unix())
+            .expect("handoff accepted");
+
+        let (denied, _) = apply_declared_settings_change(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(denied, StatusCode::FORBIDDEN);
+
+        let (first_status, Json(first)) = apply_declared_settings_change(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        let (second_status, Json(second)) = apply_declared_settings_change(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+
+        assert_eq!(first_status, StatusCode::ACCEPTED);
+        assert_eq!(second_status, StatusCode::ACCEPTED);
+        assert_eq!(first["job"]["id"], settings.id);
+        assert_eq!(second["job"]["id"], settings.id);
+        assert_eq!(
+            first["job"]["workflow"]["linked_run_id"],
+            second["job"]["workflow"]["linked_run_id"]
+        );
+        assert_eq!(
+            first["job"]["workflow"]["linked_run_state"],
+            "queued_review"
+        );
+        assert_eq!(first["job"]["workflow"]["can_withdraw"], false);
+        assert_eq!(
+            state
+                .host_actions
+                .list()
+                .into_iter()
+                .filter(|job| job.settings_change_id() == Some(settings.id.as_str()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .host_actions
+                .get(&settings.id)
+                .expect("parent remains open")
+                .state,
+            HostActionState::ProposalRequested
+        );
+    }
+
+    #[test]
+    fn accepted_declared_settings_name_missing_target_local_janus_in_fleet_payload() {
+        let mut manifest = test_manifest("hsb0", true);
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..HostPreferences::default()
+        };
+        manifest.host.preferences = requested.clone();
+        let mut host = host_with_backups("hsb0", 970, vec![]);
+        host.requested_preferences = Some(requested.clone());
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb0", "markus", 950)
+            .expect("settings workflow starts");
+        store
+            .record_settings_request(&settings.id, &requested, 951)
+            .expect("settings request recorded");
+        store
+            .mark_dispatch_submitted(&settings.id, 952)
+            .expect("repository handoff recorded");
+        store
+            .accept_settings_change(&settings.id, 953)
+            .expect("repository handoff accepted");
+        let declarations = BTreeMap::from([("hsb0".to_string(), requested)]);
+        let no_janus_agents = BTreeSet::new();
+
+        let payload = hosts_payload(
+            vec![host],
+            &[manifest],
+            &declarations,
+            &store.list(),
+            Some(&no_janus_agents),
+            1_000,
+        );
+        let workflow = &payload["hosts"][0]["host_action"]["workflow"];
+        assert_eq!(workflow["status_label"], "guarded apply unavailable");
+        assert!(workflow["guidance"].as_str().is_some_and(
+            |guidance| guidance.contains("target-local Janus actions are not enabled")
+        ));
+        assert!(workflow["primary_action"].is_null());
     }
 
     #[tokio::test]
     async fn guarded_review_cancellation_is_persisted_and_releases_the_host() {
-        let (state, manifest_path) = state_with_janus_manifest("hsb8", "action-token");
+        let (state, _fixture) = state_with_janus_manifest("hsb8", "action-token");
         let (status, Json(payload)) = request_update_restart_review(
             State(state.clone()),
             action_headers(),
@@ -14345,12 +14673,11 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
-        let _ = std::fs::remove_file(manifest_path);
     }
 
     #[tokio::test]
     async fn failed_guarded_review_requires_explicit_linked_retry() {
-        let (state, manifest_path) = state_with_janus_manifest("hsb8", "action-token");
+        let (state, _fixture) = state_with_janus_manifest("hsb8", "action-token");
         let (status, Json(payload)) = request_update_restart_review(
             State(state.clone()),
             action_headers(),
@@ -14437,7 +14764,6 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .status(),
             StatusCode::OK
         );
-        let _ = std::fs::remove_file(manifest_path);
     }
 
     #[tokio::test]
@@ -14599,7 +14925,23 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[tokio::test]
     async fn declarative_host_removal_fails_closed_without_declarative_dispatch() {
-        let (state, manifest_path) = state_with_janus_manifest("gpc0", "remove-token");
+        let manifest_path = std::env::temp_dir().join(format!(
+            "pharos-removal-manifest-only-{}-{}.json",
+            std::process::id(),
+            JANUS_HASH_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&test_manifest("gpc0", true)).expect("manifest serializes"),
+        )
+        .expect("manifest written");
+        let mut state = report_test_state(true);
+        state.manifests = Arc::new(ManifestRegistry::from_paths(vec![manifest_path.clone()]));
+        register_test_token(&state, "gpc0", "remove-token");
+        state
+            .store
+            .record(test_report("gpc0"), now_unix())
+            .expect("test report persists");
 
         let (status, Json(payload)) = request_host_removal(
             State(state.clone()),
@@ -15816,6 +16158,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             &[],
             &BTreeMap::new(),
             &state.host_actions.list(),
+            None,
             916,
         );
         assert_eq!(
@@ -16106,6 +16449,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             &[],
             &BTreeMap::new(),
             &state.host_actions.list(),
+            None,
             923,
         );
         assert_eq!(
