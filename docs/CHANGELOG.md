@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.93 - 2026-08-31
+
+- Reconcile saved settings workflows with the currently loaded reviewed nixcfg declaration, retain the exact repository request correlation for new handoffs, keep declaration separate from host execution, and tell operators when deployment or beacon recreation is the remaining step; matching beacon evidence remains the only success path (PHAROS-239).
+
 ## 0.1.92 - 2026-08-31
 
 - Keep the Fleet host-actions control visibly chromed at rest in grid and list views, badge it when lifecycle work needs attention, and hide healthy backup chips while leaving non-healthy backup posture visible; live refreshes preserve those visibility rules and move focus safely when a healthy chip disappears (PHAROS-221).
