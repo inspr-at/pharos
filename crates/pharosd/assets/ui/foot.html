@@ -418,6 +418,9 @@ function renderHostActionJob(job,message,workflowHtml){
     primary.textContent='I verified nixcfg — request again';
     primary.disabled=false;
     hostActionContext.stage='acknowledge-uncertainty';
+  }else if(primaryAction?.kind==='refresh'&&primary){
+    primary.hidden=true;
+    hostActionContext.stage='refresh';
   }else if(primaryAction&&primary){
     primary.hidden=false;
     primary.classList.remove('danger');
@@ -459,6 +462,14 @@ async function pollHostActionJob(id,immediate=false){
   }finally{
     if(hostActionPoll.controller===controller)hostActionPoll.controller=null;
   }
+}
+async function checkHostActionNow(button){
+  if(!hostActionContext?.jobId||hostActionContext.stage!=='refresh')return;
+  const status=document.querySelector('[data-host-action-status]');
+  button.disabled=true;
+  if(status)status.textContent='Checking the saved run for a matching host report…';
+  await pollHostActionJob(hostActionContext.jobId,true);
+  if(button.isConnected&&hostActionContext?.stage==='refresh')button.disabled=false;
 }
 async function submitHostAction(){
   if(!hostActionContext)return;
@@ -654,6 +665,12 @@ function initHostActions(){
         return;
       }
       openHostActionDialog(actionItem.dataset.hostAction,root,actionItem);
+      return;
+    }
+    const refresh=event.target.closest('[data-host-action-refresh]');
+    if(refresh&&!refresh.disabled){
+      event.preventDefault();
+      checkHostActionNow(refresh);
       return;
     }
     const primary=event.target.closest('[data-host-action-primary]');

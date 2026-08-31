@@ -750,10 +750,22 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
             )
         })
         .collect::<String>();
+    let next_action = workflow
+        .primary_action
+        .as_ref()
+        .filter(|action| action.kind == host_actions::HostWorkflowActionKind::Refresh)
+        .map(|action| {
+            format!(
+                r#"<button class="host-action-dialog-button primary" type="button" data-host-action-refresh>{}</button>"#,
+                html_escape(&action.label)
+            )
+        })
+        .unwrap_or_default();
     let next = format!(
-        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p><dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>"#,
+        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p>{next_action}<dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>"#,
         title = html_escape(&workflow.next.title),
         consequence = html_escape(&workflow.next.consequence),
+        next_action = next_action,
         location = html_escape(&workflow.next.location),
         boundary = html_escape(&workflow.next.boundary),
     );
@@ -5753,21 +5765,26 @@ mod tests {
         let job = store
             .begin_settings_change("hsb8", "markus", 1_700_000_200)
             .expect("settings workflow created");
+        store
+            .mark_dispatch_submitted(&job.id, 1_700_000_201)
+            .expect("repository handoff recorded");
         let waiting = store
-            .accept_settings_change(&job.id, 1_700_000_201)
+            .accept_settings_change(&job.id, 1_700_000_202)
             .expect("settings request accepted");
         let waiting_html = host_workflow_markup(&waiting.summary().workflow);
         assert!(waiting_html.contains(
             r#"data-step-state="waiting" data-current="true" data-waiting-for-evidence="true" aria-busy="true""#
         ));
+        assert!(waiting_html.contains(r#"data-host-action-refresh>Check host now</button>"#));
         assert!(waiting_html.contains(r#"data-ladder-key="verified" data-ladder-state="pending""#));
 
         let completed = store
-            .complete_settings_change("hsb8", 1_700_000_202)
+            .complete_settings_change("hsb8", 1_700_000_203)
             .expect("settings completion persisted")
             .expect("settings workflow completed");
         let completed_html = host_workflow_markup(&completed.summary().workflow);
         assert!(!completed_html.contains(r#"data-waiting-for-evidence="true""#));
+        assert!(!completed_html.contains("data-host-action-refresh"));
         assert!(
             completed_html.contains(r#"data-ladder-key="verified" data-ladder-state="complete""#)
         );
@@ -13788,6 +13805,55 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let (status, _) =
             host_action_job_json(State(state), HeaderMap::new(), AxumPath(job.id)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn settings_host_check_is_an_idempotent_read_of_the_same_durable_run() {
+        let mut state = report_test_state(false);
+        state.auth = AuthState::for_test_access(AccessGrant::full());
+        let job = state
+            .host_actions
+            .begin_settings_change("csb0", "fixture-operator", 1_700_000_200)
+            .expect("settings workflow starts");
+        state
+            .host_actions
+            .mark_dispatch_submitted(&job.id, 1_700_000_201)
+            .expect("repository handoff recorded");
+        state
+            .host_actions
+            .accept_settings_change(&job.id, 1_700_000_202)
+            .expect("repository handoff accepted");
+
+        let before = state.host_actions.get(&job.id).expect("saved run exists");
+        let (first_status, Json(first)) = host_action_job_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath(job.id.clone()),
+        )
+        .await;
+        let (second_status, Json(second)) = host_action_job_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath(job.id.clone()),
+        )
+        .await;
+        let after = state.host_actions.get(&job.id).expect("saved run retained");
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(first, second);
+        assert_eq!(first["job"]["id"], job.id);
+        assert_eq!(
+            first["job"]["workflow"]["primary_action"]["kind"],
+            "refresh"
+        );
+        assert_eq!(
+            first["job"]["workflow"]["primary_action"]["label"],
+            "Check host now"
+        );
+        assert_eq!(after.state, HostActionState::ProposalRequested);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.events, before.events);
     }
 
     fn state_with_janus_manifest(host: &str, token: &str) -> (AppState, PathBuf) {
