@@ -468,6 +468,8 @@ async function checkHostActionNow(button){
   const status=document.querySelector('[data-host-action-status]');
   button.disabled=true;
   if(status)status.textContent='Checking the saved run for a matching host report…';
+  if(hostActionPoll.timer!=null)clearTimeout(hostActionPoll.timer);
+  hostActionPoll.timer=null;
   await pollHostActionJob(hostActionContext.jobId,true);
   if(button.isConnected&&hostActionContext?.stage==='refresh')button.disabled=false;
 }

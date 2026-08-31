@@ -2806,6 +2806,25 @@ test("settings sheet live wait advances only from host evidence and stops termin
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
   await expect(checkHost).toBeEnabled();
 
+  const secondCheckResponsePromise = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === jobPath &&
+      response.request().method() === "GET",
+  );
+  recordingManualCheck = true;
+  await checkHost.click();
+  expect((await secondCheckResponsePromise).ok()).toBe(true);
+  recordingManualCheck = false;
+  await expect(checkHost).toBeEnabled();
+  expect(manualCheckRequests.filter((request) => request.method === "POST")).toEqual([]);
+
+  const readsAfterManualChecks = exactJobRequests.length;
+  await expect
+    .poll(() => exactJobRequests.length, { timeout: 3_500 })
+    .toBe(readsAfterManualChecks + 1);
+  await page.waitForTimeout(500);
+  expect(exactJobRequests).toHaveLength(readsAfterManualChecks + 1);
+
   const resumedResponsePromise = page.waitForResponse(
     (response) =>
       new URL(response.url()).pathname === jobPath &&
