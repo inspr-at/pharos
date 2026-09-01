@@ -1526,23 +1526,67 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
         receipts: [
           {
             workflow_id: `receipt-${host}`,
-            workflow_kind: "settings_change",
-            receipt_kind: "verified",
+            workflow_kind: "update_restart",
+            receipt_kind: "completion",
             completed_at: 1_788_265_200,
-            owner: "host agent",
-            requested: { recorded: true },
-            declared: { recorded: true },
-            executed: { recorded: true },
-            verified: { recorded: true },
-            workflow_href: `/hosts/${host}?workflow=receipt-${host}`,
-            activity_href: `/activity?host=${host}#workflow-receipt-${host}`,
+            owner: {
+              source: "beacon",
+              key: `host-beacon:${host}`,
+              label: `${host} beacon`,
+            },
+            evidence: [
+              {
+                stage: "verified",
+                event: "apply_passed",
+                recorded_at: 1_788_265_200,
+                owner: {
+                  source: "beacon",
+                  key: `host-beacon:${host}`,
+                  label: `${host} beacon`,
+                },
+              },
+              {
+                stage: "requested",
+                event: "requested",
+                recorded_at: 1_788_265_100,
+                owner: {
+                  source: "operator",
+                  key: "operator",
+                  label: "operator",
+                },
+              },
+              {
+                stage: "declared",
+                event: "review_passed",
+                recorded_at: 1_788_265_125,
+                owner: {
+                  source: "operator",
+                  key: "operator",
+                  label: "operator",
+                },
+              },
+              {
+                stage: "executed",
+                event: "apply_passed",
+                recorded_at: 1_788_265_175,
+                owner: {
+                  source: "host_agent",
+                  key: `host-agent:${host}`,
+                  label: `${host} host agent`,
+                },
+              },
+              { stage: "unsupported", event: "ignored", recorded_at: 1 },
+            ],
+            workflow_href: `/?host=${host}&workflow=receipt-${host}`,
+            activity_href: `/activity?host=${host}&workflow=receipt-${host}#workflow-receipt-${host}`,
           },
           {
             workflow_id: `unsafe-receipt-${host}`,
             workflow_kind: "host_update",
             receipt_kind: "completed",
             completed_at: "2026-09-01T10:00:00Z",
-            owner: "host agent",
+            owner: { source: "host_agent" },
+            evidence: "not-an-array",
             workflow_href: "//outside.example/workflow",
             activity_href: "/\\outside.example/activity",
           },
@@ -1581,20 +1625,28 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
   await expect(page.locator("[data-host-workspace-receipts]")).toBeVisible();
   const receipt = page.locator(`[data-workflow-receipt="receipt-${host}"]`);
-  await expect(receipt).toContainText("verified");
+  await expect(receipt).toContainText("completion");
+  await expect(receipt).toContainText(`${host} beacon`);
+  await expect(receipt).not.toContainText("[object Object]");
   await expect(receipt).toContainText("Evidence: requested · declared · executed · verified");
+  await expect(receipt).not.toContainText("unsupported");
   await expect(receipt.getByRole("link", { name: "Open workflow" })).toHaveAttribute(
     "href",
-    `/hosts/${host}?workflow=receipt-${host}`,
+    `/?host=${host}&workflow=receipt-${host}`,
   );
   await expect(receipt.getByRole("link", { name: "Open in Activity" })).toHaveAttribute(
     "href",
-    `/activity?host=${host}#workflow-receipt-${host}`,
+    `/activity?host=${host}&workflow=receipt-${host}#workflow-receipt-${host}`,
   );
   const unsafeReceipt = page.locator(
     `[data-workflow-receipt="unsafe-receipt-${host}"]`,
   );
   await expect(unsafeReceipt).toContainText("2026");
+  await expect(unsafeReceipt).toContainText("Recorded owner");
+  await expect(unsafeReceipt).not.toContainText("[object Object]");
+  await expect(unsafeReceipt).toContainText(
+    "Terminal evidence is recorded with this workflow.",
+  );
   await expect(unsafeReceipt.getByRole("link")).toHaveCount(0);
   const workspaceA11y = await new AxeBuilder({ page })
     .include("[data-host-workspace]")
@@ -2619,6 +2671,102 @@ test("fleet refresh hides generic update-restart when removal masks host_action"
       "data-lifecycle-run-id",
       removalRunId,
     );
+
+    const removalJobPath = `/host-actions/jobs/${encodeURIComponent(removalRunId)}`;
+    const retryPath = `${removalJobPath}/retry-retirement`;
+    const recoveryPath = `${removalJobPath}/reconcile-accepted-dispatch`;
+    const retryPosts = [];
+    const recoveryPosts = [];
+    const removalJob = (primaryAction, updatedAt) => ({
+      id: removalRunId,
+      host,
+      kind: "remove_host",
+      state: "removal_pending",
+      updated_at: updatedAt,
+      workflow: {
+        kind: "remove_host",
+        title: `Remove ${host}`,
+        guidance: "Continue the saved retirement from its recorded safe boundary.",
+        status_label: "removal needs attention",
+        primary_action: primaryAction,
+        can_cancel: false,
+      },
+    });
+    let removalWorkflowJob = removalJob(
+      { kind: "retry", label: "Retry credential retirement" },
+      1_788_270_101,
+    );
+    await page.route("**/host-actions/jobs/**", async (route) => {
+      const request = route.request();
+      const pathname = new URL(request.url()).pathname;
+      if (request.method() === "GET" && pathname === removalJobPath) {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            job: removalWorkflowJob,
+            message: removalWorkflowJob.workflow.guidance,
+            workflow_html: "<section data-host-workflow>Saved removal workflow</section>",
+          }),
+        });
+        return;
+      }
+      if (request.method() === "POST" && pathname === retryPath) {
+        retryPosts.push({ headers: request.headers(), body: request.postDataJSON() });
+        removalWorkflowJob = removalJob(
+          { kind: "recover", label: "Retry local removal save" },
+          1_788_270_102,
+        );
+        await route.fulfill({
+          status: 202,
+          contentType: "application/json",
+          body: JSON.stringify({
+            job: removalWorkflowJob,
+            message: removalWorkflowJob.workflow.guidance,
+            workflow_html: "<section data-host-workflow>Local recovery is available</section>",
+          }),
+        });
+        return;
+      }
+      if (request.method() === "POST" && pathname === recoveryPath) {
+        recoveryPosts.push({ headers: request.headers(), body: request.postDataJSON() });
+        removalWorkflowJob = removalJob(null, 1_788_270_103);
+        await route.fulfill({
+          status: 202,
+          contentType: "application/json",
+          body: JSON.stringify({
+            job: removalWorkflowJob,
+            message: "The local removal record was reconciled.",
+            workflow_html: "<section data-host-workflow>Recovery recorded</section>",
+          }),
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto(`/hosts/${encodeURIComponent(host)}`);
+    const workspacePrimary = page.locator("[data-host-workspace-primary]");
+    await expect(workspacePrimary).toHaveAttribute("data-workflow-handler", "host-actions");
+    await expect(workspacePrimary).toHaveAttribute(
+      "href",
+      `/?host=${host}&workflow=${removalRunId}`,
+    );
+    await workspacePrimary.click();
+    const removalDialog = page.getByRole("dialog", { name: `Remove ${host}` });
+    await expect(removalDialog).toBeVisible();
+    await removalDialog
+      .getByRole("button", { name: "Retry credential retirement" })
+      .click();
+    await expect.poll(() => retryPosts.length).toBe(1);
+    expect(retryPosts[0].headers["x-pharos-action"]).toBe("1");
+    expect(retryPosts[0].body).toEqual({});
+    await removalDialog.getByRole("button", { name: "Retry local removal save" }).click();
+    await expect.poll(() => recoveryPosts.length).toBe(1);
+    expect(recoveryPosts[0].headers["x-pharos-action"]).toBe("1");
+    expect(recoveryPosts[0].body).toEqual({});
+    await removalDialog.getByRole("button", { name: "Close", exact: true }).click();
+    await page.unroute("**/host-actions/jobs/**");
   } finally {
     await cleanupRemovalRestartFixture(page, host, {
       acceptFlagPath: manifest.acceptFlagPath,
@@ -2651,6 +2799,88 @@ test("saved update-restart stays read-only until the exact job renders", async (
   const runId = hostData?.lifecycle?.run_id;
   expect(hostData?.lifecycle?.slot).toBe("update_restart");
   expect(runId).toBeTruthy();
+
+  const workspaceJobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  const confirmPath = `${workspaceJobPath}/confirm`;
+  const confirmPosts = [];
+  const confirmationJob = {
+    id: runId,
+    host,
+    kind: "update_restart",
+    state: "awaiting_confirmation",
+    updated_at: 1_788_270_001,
+    workflow: {
+      kind: "update_restart",
+      title: `Apply update and restart ${host}`,
+      guidance: "The guarded plan is ready for attended confirmation.",
+      status_label: "confirmation required",
+      primary_action: { kind: "confirm", label: "Confirm update and restart" },
+      can_cancel: false,
+    },
+  };
+  await page.route("**/host-actions/jobs/**", async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET" && pathname === workspaceJobPath) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job: confirmationJob,
+          message: confirmationJob.workflow.guidance,
+          workflow_html: "<section data-host-workflow>Attended confirmation required</section>",
+        }),
+      });
+      return;
+    }
+    if (request.method() === "POST" && pathname === confirmPath) {
+      confirmPosts.push({ headers: request.headers(), body: request.postDataJSON() });
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          job: {
+            ...confirmationJob,
+            state: "queued_apply",
+            updated_at: 1_788_270_002,
+            workflow: { ...confirmationJob.workflow, primary_action: null },
+          },
+          message: "Attended confirmation recorded.",
+          workflow_html: "<section data-host-workflow>Apply queued</section>",
+        }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`/hosts/${encodeURIComponent(host)}`);
+  const workspacePrimary = page.locator("[data-host-workspace-primary]");
+  await expect(workspacePrimary).toHaveAttribute("data-workflow-handler", "host-actions");
+  await expect(workspacePrimary).toHaveAttribute(
+    "href",
+    `/?host=${host}&workflow=${runId}`,
+  );
+  await workspacePrimary.click();
+  await expect(page).toHaveURL(
+    new RegExp(`\\/\\?host=${host}&workflow=${encodeURIComponent(runId)}$`),
+  );
+  const workspaceDialog = page.getByRole("dialog", {
+    name: `Apply update and restart ${host}`,
+  });
+  await expect(workspaceDialog).toBeVisible();
+  const confirm = workspaceDialog.getByRole("button", {
+    name: "Confirm update and restart",
+  });
+  await workspaceDialog.locator("[data-host-remove-input]").fill(host);
+  await workspaceDialog.locator("[data-host-attended-input]").check();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect.poll(() => confirmPosts.length).toBe(1);
+  expect(confirmPosts[0].headers["x-pharos-action"]).toBe("1");
+  expect(confirmPosts[0].body).toEqual({ confirmation: host, attended: true });
+  await workspaceDialog.getByRole("button", { name: "Close", exact: true }).click();
+  await page.unroute("**/host-actions/jobs/**");
 
   const pauseFleetRefresh = async () => {
     await page.evaluate(() => {
