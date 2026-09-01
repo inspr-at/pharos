@@ -229,6 +229,7 @@ pub(crate) struct ManagedOperationSummary {
     pub reason_code: Option<ManagedOperationReason>,
     pub created_at_unix_secs: i64,
     pub updated_at_unix_secs: i64,
+    pub deadline_unix_secs: i64,
     pub health: Option<ManagedHealthSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback: Option<ManagedRollbackSummary>,
@@ -284,6 +285,7 @@ impl From<&ManagedOperationRecord> for ManagedOperationSummary {
             reason_code: record.reason_code,
             created_at_unix_secs: record.created_at_unix_secs,
             updated_at_unix_secs: record.updated_at_unix_secs,
+            deadline_unix_secs: record.deadline_unix_secs,
             health: record.health.as_ref().map(|health| ManagedHealthSummary {
                 generation: health.generation,
                 outcome: health.outcome,

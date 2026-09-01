@@ -83,6 +83,10 @@ document.querySelectorAll('[data-managed-verification-retry]').forEach(button=>b
         ?'This declaration changed. Refresh the page before trying again.'
         :'Fresh verification could not be requested. Nothing changed; try again.';
   }
+}));
+document.querySelectorAll('[data-managed-details-target]').forEach(button=>button.addEventListener('click',()=>{
+  const details=document.getElementById(button.dataset.managedDetailsTarget||'');
+  if(details){details.open=true;details.scrollIntoView({block:'nearest'});}
 }));"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,7 +414,7 @@ fn render_service_detail(
         ));
     }
     format!(
-        r#"{HEAD}{sidebar}<main class="managed-services-main managed-service-detail"><a class="managed-back" href="/services">{back} Services</a><div class="top managed-detail-top"><div><span class="managed-kicker">Managed service</span><div class="brand"><h1>{service_label}</h1></div><p class="fleet">{host_label} · {slot_count}</p></div><span class="managed-lock">{lock} Declared target</span></div><section class="managed-slot-list" aria-label="Secret slots">{slots}</section><details class="managed-service-details"><summary>Technical details</summary><dl><div><dt>Host reference</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service reference</dt><dd><code>{service_ref}</code></dd></div><div><dt>Runtime</dt><dd>Managed Compose service</dd></div></dl></details><script>{runtime}</script></main></div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="managed-services-main managed-service-detail"><a class="managed-back" href="/services">{back} Services</a><div class="top managed-detail-top"><div><span class="managed-kicker">Managed service</span><div class="brand"><h1>{service_label}</h1></div><p class="fleet">{host_label} · {slot_count}</p></div><span class="managed-lock">{lock} Declared target</span></div><section class="managed-slot-list" aria-label="Secret slots">{slots}</section><details class="managed-service-details" id="managed-setup-configuration"><summary>Managed setup requirements</summary><p>Pharos never holds a secret value. A fleet operator must configure the reviewed Janus setup integration before create, replace, or removal requests can be issued.</p><p>After that configuration is present, refresh this declared service and use the enabled action for the current state.</p></details><details class="managed-service-details"><summary>Technical details</summary><dl><div><dt>Host reference</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service reference</dt><dd><code>{service_ref}</code></dd></div><div><dt>Runtime</dt><dd>Managed Compose service</dd></div></dl></details><script>{runtime}</script></main></div></body></html>"#,
         back = icons::ARROW_LEFT,
         service_label = html_escape(&service.safe_label),
         host_label = html_escape(&managed_host_label(&manifest.host_ref)),
@@ -435,6 +439,16 @@ fn render_slot(
     setup_enabled: bool,
     now: i64,
 ) -> String {
+    let operation_details_action = operation
+        .map(|operation| {
+            format!(
+                r##"<a class="managed-secondary" href="#managed-operation-{operation_ref}" data-managed-details-target="managed-operation-{operation_ref}">View operation details</a>"##,
+                operation_ref = html_escape(&operation.operation_ref),
+            )
+        })
+        .unwrap_or_else(|| {
+            r##"<a class="managed-secondary" href="#managed-setup-configuration" data-managed-details-target="managed-setup-configuration">Check managed setup requirements</a>"##.to_string()
+        });
     let action = if state == ManagedSecretSlotState::Missing && setup_enabled {
         format!(
             r#"<button class="managed-primary" type="button" data-managed-secret-action data-operation-kind="create" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Add missing secret</button>"#,
@@ -468,8 +482,7 @@ fn render_slot(
             slot_ref = html_escape(&slot.slot_ref),
         )
     } else if state == ManagedSecretSlotState::Missing {
-        r#"<button class="managed-primary" type="button" disabled>Setup unavailable</button>"#
-            .to_string()
+        operation_details_action.clone()
     } else if matches!(
         state,
         ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
@@ -488,14 +501,13 @@ fn render_slot(
     ) && setup_enabled
     {
         format!(
-            r#"<button class="managed-secondary" type="button" data-managed-secret-action data-operation-kind="replace" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Replace / rotate secret</button><button class="managed-link-danger" type="button" disabled aria-describedby="managed-detach-{slot_ref}">Remove secret…</button><span id="managed-detach-{slot_ref}" class="managed-detach-note">Detach this slot in nixcfg and deploy that reviewed change first.</span>"#,
+            r##"<button class="managed-secondary" type="button" data-managed-secret-action data-operation-kind="replace" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Replace / rotate secret</button><a class="managed-link-danger" href="#managed-detach-{slot_ref}" data-managed-details-target="managed-detach-{slot_ref}">Prepare nixcfg detachment review</a>"##,
             host_ref = html_escape(&manifest.host_ref),
             service_ref = html_escape(&service.service_ref),
             slot_ref = html_escape(&slot.slot_ref),
         )
     } else {
-        r#"<button class="managed-secondary" type="button" disabled>View operation details</button>"#
-            .to_string()
+        operation_details_action
     };
     let progress = operation
         .map(|operation| {
@@ -507,8 +519,10 @@ fn render_slot(
         })
         .unwrap_or_default();
     let separation = render_operation_separation(operation, now);
+    let operation_details = render_operation_details(operation);
+    let detachment_task = render_detachment_owner_task(manifest, service, slot);
     format!(
-        r#"<article class="managed-slot-card"><div class="managed-slot-head"><div><span class="managed-kicker">Service secret</span><h2>{slot_label}</h2></div><span class="managed-state {tone}">{state_label}</span></div><p class="managed-slot-guidance">{guidance}</p><dl class="managed-slot-facts"><div><dt>Consumer</dt><dd>{service_label}</dd></div><div><dt>Delivery</dt><dd>Private environment file</dd></div><div><dt>Reveal</dt><dd>Never</dd></div></dl>{separation}{progress}<div class="managed-slot-action">{action}<p role="status" aria-live="polite" data-managed-action-status>{availability}</p></div></article>"#,
+        r#"<article class="managed-slot-card"><div class="managed-slot-head"><div><span class="managed-kicker">Service secret</span><h2>{slot_label}</h2></div><span class="managed-state {tone}">{state_label}</span></div><p class="managed-slot-guidance">{guidance}</p><dl class="managed-slot-facts"><div><dt>Consumer</dt><dd>{service_label}</dd></div><div><dt>Delivery</dt><dd>Private environment file</dd></div><div><dt>Reveal</dt><dd>Never</dd></div></dl>{separation}{progress}{operation_details}{detachment_task}<div class="managed-slot-action">{action}<p role="status" aria-live="polite" data-managed-action-status>{availability}</p></div></article>"#,
         slot_label = html_escape(&slot.safe_label),
         tone = state.tone(),
         state_label = state.label(),
@@ -516,6 +530,8 @@ fn render_slot(
         service_label = html_escape(&service.safe_label),
         separation = separation,
         progress = progress,
+        operation_details = operation_details,
+        detachment_task = detachment_task,
         action = action,
         availability = if setup_enabled
             && matches!(
@@ -556,6 +572,91 @@ fn render_slot(
         } else {
             "Managed setup is not configured on this Pharos instance."
         },
+    )
+}
+
+fn render_detachment_owner_task(
+    manifest: &ManagedServiceManifestV1,
+    service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
+    slot: &pharos_core::managed_services::ManagedSecretSlotDeclarationV1,
+) -> String {
+    if slot.binding_state != pharos_core::managed_services::ManagedBindingState::Required {
+        return String::new();
+    }
+    format!(
+        r#"<details class="managed-service-details" id="managed-detach-{slot_ref}"><summary>nixcfg detachment review</summary><p>Owner: nixcfg. Prepare a reviewed declaration change for this exact declared slot, then merge and deploy it before requesting removal.</p><dl><div><dt>Host</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service</dt><dd><code>{service_ref}</code></dd></div><div><dt>Slot</dt><dd><code>{slot_ref}</code></dd></div><div><dt>Required evidence</dt><dd>Current declaration reports Detached and supplies its declared detach profile.</dd></div><div><dt>Resume</dt><dd>Refresh this page after the deployed declaration is observed; Pharos enables the value-free removal request only then.</dd></div></dl></details>"#,
+        host_ref = html_escape(&manifest.host_ref),
+        service_ref = html_escape(&service.service_ref),
+        slot_ref = html_escape(&slot.slot_ref),
+    )
+}
+
+fn render_operation_details(
+    operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
+) -> String {
+    let Some(operation) = operation else {
+        return String::new();
+    };
+    let kind = match operation.operation_kind {
+        pharos_core::managed_operations::ManagedOperationKind::Create => "Create",
+        pharos_core::managed_operations::ManagedOperationKind::Replace => "Replace",
+        pharos_core::managed_operations::ManagedOperationKind::Remove => "Remove",
+    };
+    let reason = operation
+        .reason_code
+        .map(|reason| format!("{reason:?}"))
+        .unwrap_or_else(|| "Awaiting host result".to_string());
+    let retry = if operation.verification_retryable {
+        "A fresh exact-generation verification can be requested; it does not create or reveal a secret."
+    } else if operation.phase == ManagedOperationPhase::Removed {
+        "No browser retry is needed. Final encrypted cleanup remains an idempotent owner task after the recovery window."
+    } else if operation.phase.terminal() {
+        "This terminal record is retained as evidence. Start a new reviewed operation only from the enabled next step."
+    } else {
+        "The declared host owns the next leased phase. Refresh to observe new evidence; Pharos will not replay it from the browser."
+    };
+    let terminal_evidence = if let Some(health) = &operation.health {
+        format!(
+            "Healthy generation {} accepted at {}.",
+            health.generation,
+            clock_label(health.accepted_at_unix_secs),
+        )
+    } else if let Some(rollback) = &operation.rollback {
+        format!(
+            "Previous generation {} was restored and accepted at {}.",
+            rollback.restored_generation,
+            clock_label(rollback.accepted_at_unix_secs),
+        )
+    } else if let Some(removal) = &operation.removal {
+        format!(
+            "Generation {} was stopped with runtime absence evidence accepted at {}.",
+            removal.generation,
+            clock_label(removal.accepted_at_unix_secs),
+        )
+    } else {
+        "No terminal health or removal evidence has been accepted yet.".to_string()
+    };
+    let recovery = operation
+        .purge_not_before_unix_secs
+        .map(|deadline| {
+            format!(
+                "Recovery window closes no earlier than {}.",
+                clock_label(deadline)
+            )
+        })
+        .unwrap_or_else(|| "No removal recovery window applies.".to_string());
+    format!(
+        r#"<details class="managed-service-details" id="managed-operation-{operation_ref}"><summary>Operation details</summary><dl><div><dt>Operation</dt><dd><code>{operation_ref}</code> · {kind}</dd></div><div><dt>Owner</dt><dd>nixcfg declares; Janus keeps custody; the declared host executes.</dd></div><div><dt>Progress</dt><dd>{phase}</dd></div><div><dt>Reason</dt><dd>{reason}</dd></div><div><dt>Started</dt><dd>{created}</dd></div><div><dt>Last updated</dt><dd>{updated}</dd></div><div><dt>Current phase deadline</dt><dd>{deadline}</dd></div><div><dt>Retry</dt><dd>{retry}</dd></div><div><dt>Terminal evidence</dt><dd>{terminal_evidence}</dd></div><div><dt>Recovery</dt><dd>{recovery}</dd></div></dl></details>"#,
+        operation_ref = html_escape(&operation.operation_ref),
+        kind = kind,
+        phase = html_escape(operation.phase.name()),
+        reason = html_escape(&reason),
+        created = html_escape(&clock_label(operation.created_at_unix_secs)),
+        updated = html_escape(&clock_label(operation.updated_at_unix_secs)),
+        deadline = html_escape(&clock_label(operation.deadline_unix_secs)),
+        retry = html_escape(retry),
+        terminal_evidence = html_escape(&terminal_evidence),
+        recovery = html_escape(&recovery),
     )
 }
 
@@ -799,7 +900,9 @@ mod tests {
             1_800_000_000,
         );
         assert!(required.contains("Replace / rotate secret"));
-        assert!(required.contains("Detach this slot in nixcfg"));
+        assert!(required.contains("Prepare nixcfg detachment review"));
+        assert!(required.contains("nixcfg detachment review"));
+        assert!(required.contains("Current declaration reports Detached"));
         assert!(required.contains(r#"data-operation-kind="replace""#));
         assert!(!required.contains(r#"data-operation-kind="remove""#));
 
@@ -1002,6 +1105,11 @@ mod tests {
             "already installed",
             "fresh exact-generation health evidence",
             "no secret is created or revealed",
+            "Operation details",
+            "Owner",
+            "Current phase deadline",
+            "Terminal evidence",
+            "A fresh exact-generation verification can be requested",
         ] {
             assert!(html.contains(expected), "missing {expected}");
         }
@@ -1117,7 +1225,9 @@ mod tests {
             1_800_000_000,
         );
         assert!(detail.contains("&lt;Canary &amp; service&gt;"));
-        assert!(detail.contains("Setup unavailable"));
+        assert!(detail.contains("Check managed setup requirements"));
+        assert!(detail.contains("Managed setup requirements"));
+        assert!(!detail.contains("Setup unavailable"));
 
         let empty = render_services_page(&[], &[], shell(), &operations, 1_800_000_000);
         assert!(empty.contains("No managed services yet"));
