@@ -6382,12 +6382,10 @@ mod tests {
         ));
         assert!(!html.contains("openHostActionDialog('workflow',root,actionItem,runId)"));
         assert!(html.contains("Withdraw settings request"));
-        assert!(
-            html.contains("Clears the pending request. An open nixcfg proposal stays open there.")
-        );
+        assert!(html.contains("Stops this Pharos run; it does not close an open nixcfg proposal."));
         assert!(html.contains(r#"data-host-action-cancel hidden"#));
         assert!(html.contains(
-            r#"data-host-action-primary>Continue</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button>"#
+            r#"data-host-action-primary>Review action</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Withdraw run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button>"#
         ));
         assert!(html.contains("openRequestedWorkflow()"));
         assert!(html.contains(

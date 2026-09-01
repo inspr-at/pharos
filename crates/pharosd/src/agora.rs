@@ -294,15 +294,17 @@ pub(crate) async fn host_workspace_page(
         &manifests,
         &declared_preferences,
         &runtime_hosts,
-        Some(&selected.name),
-        &user_label,
-        state.auth.is_some(),
-        access.can_manage_fleet(),
-        Some(HostWorkspaceContext {
-            runtime,
-            lifecycle: &lifecycle,
-            settings_state,
-        }),
+        PageContext {
+            requested_host: Some(&selected.name),
+            user_label: &user_label,
+            logout_enabled: state.auth.is_some(),
+            can_manage_fleet: access.can_manage_fleet(),
+            workspace: Some(HostWorkspaceContext {
+                runtime,
+                lifecycle: &lifecycle,
+                settings_state,
+            }),
+        },
     ))
 }
 
@@ -311,6 +313,15 @@ struct HostWorkspaceContext<'a> {
     runtime: Option<&'a Host>,
     lifecycle: &'a crate::HostLifecycle,
     settings_state: crate::HostPreferencesState,
+}
+
+#[derive(Clone, Copy)]
+struct PageContext<'a> {
+    requested_host: Option<&'a str>,
+    user_label: &'a str,
+    logout_enabled: bool,
+    can_manage_fleet: bool,
+    workspace: Option<HostWorkspaceContext<'a>>,
 }
 
 fn render_host_workspace(
@@ -861,11 +872,13 @@ fn render_page(
         manifests,
         declared_preferences,
         runtime_hosts,
-        requested_host,
-        user_label,
-        logout_enabled,
-        true,
-        None,
+        PageContext {
+            requested_host,
+            user_label,
+            logout_enabled,
+            can_manage_fleet: true,
+            workspace: None,
+        },
     )
 }
 
@@ -873,12 +886,15 @@ fn render_page_with_access(
     manifests: &[HostManifest],
     declared_preferences: &BTreeMap<String, HostPreferences>,
     runtime_hosts: &[Host],
-    requested_host: Option<&str>,
-    user_label: &str,
-    logout_enabled: bool,
-    can_manage_fleet: bool,
-    workspace: Option<HostWorkspaceContext<'_>>,
+    page: PageContext<'_>,
 ) -> String {
+    let PageContext {
+        requested_host,
+        user_label,
+        logout_enabled,
+        can_manage_fleet,
+        workspace,
+    } = page;
     let mut hosts = host_views(manifests, declared_preferences, runtime_hosts);
     let requested_host = requested_host
         .map(str::trim)
@@ -2620,11 +2636,13 @@ mod tests {
             &[manifest()],
             &BTreeMap::new(),
             &[runtime_host("hsb8")],
-            Some("hsb8"),
-            "viewer",
-            true,
-            false,
-            None,
+            PageContext {
+                requested_host: Some("hsb8"),
+                user_label: "viewer",
+                logout_enabled: true,
+                can_manage_fleet: false,
+                workspace: None,
+            },
         );
 
         assert!(html.contains(r#"data-can-manage-fleet="false""#));
