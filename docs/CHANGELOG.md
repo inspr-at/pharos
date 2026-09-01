@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.97 - 2026-09-01
+
+- Refresh the immutable Debian bookworm runtime base and snapshot so published images include the fixed `libexpat1` package for CVE-2026-56408; keep the release vulnerability, SBOM, provenance, and signature gates fail-closed (PHAROS-252).
+
 ## 0.1.96 - 2026-09-01
 
 - Add a durable per-host workspace with a state-aware settings task rail, stable deep links, and responsive desktop/mobile layout so the operator always has one visible safe next step (PHAROS-244).
