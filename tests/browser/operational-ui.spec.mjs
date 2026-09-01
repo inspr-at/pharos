@@ -2041,7 +2041,7 @@ test("open Fleet workflow repaints a timing-only overdue transition", async ({ p
         },
       },
     };
-    const workflowHtml = `<section class="host-workflow-summary" data-workflow-timing-state="${overdue ? "overdue" : "on-schedule"}"><section class="host-workflow-timing" data-workflow-timing="${overdue ? "overdue" : "on-schedule"}"><strong>${overdue ? "Taking longer than expected" : "Background progress is active"}</strong></section></section>`;
+    const workflowHtml = `<section class="host-workflow-summary" data-workflow-timing-state="${overdue ? "overdue" : "on-schedule"}"><section class="host-workflow-timing" data-workflow-timing="${overdue ? "overdue" : "on-schedule"}"><strong>${overdue ? "Taking longer than expected" : "Background progress is active"}</strong></section><details class="host-workflow-advanced"><summary>Advanced details</summary><div>Evidence ${overdue ? "overdue" : "current"}</div></details></section>`;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -2058,10 +2058,18 @@ test("open Fleet workflow repaints a timing-only overdue transition", async ({ p
   await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
     "Background progress is active",
   );
+  const advanced = dialog.locator(".host-workflow-advanced");
+  const advancedSummary = advanced.locator("summary");
+  await advancedSummary.click();
+  await expect(advanced).toHaveAttribute("open", "");
+  await expect(advancedSummary).toBeFocused();
   await expect(dialog.locator('[data-workflow-timing="overdue"]')).toContainText(
     "Taking longer than expected",
     { timeout: 4_000 },
   );
+  await expect(advanced).toHaveAttribute("open", "");
+  await expect(advanced).toContainText("Evidence overdue");
+  await expect(advancedSummary).toBeFocused();
   expect(polls).toBe(2);
   await page.waitForTimeout(500);
   expect(polls).toBe(2);
@@ -3322,6 +3330,11 @@ test("settings sheet live wait advances only from host evidence and stops termin
     "data-ladder-state",
     "complete",
   );
+  const liveAdvanced = dialog.locator(".host-workflow-advanced");
+  const liveAdvancedSummary = liveAdvanced.locator("summary");
+  await liveAdvancedSummary.click();
+  await expect(liveAdvanced).toHaveAttribute("open", "");
+  await expect(liveAdvancedSummary).toBeFocused();
 
   const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
   const exactJobRequests = [];
@@ -3338,6 +3351,8 @@ test("settings sheet live wait advances only from host evidence and stops termin
   expect(exactJobRequests).toHaveLength(readsBeforeAutomaticPoll + 1);
   expect(exactJobRequests.every((method) => method === "GET")).toBe(true);
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
+  await expect(liveAdvanced).toHaveAttribute("open", "");
+  await expect(liveAdvancedSummary).toBeFocused();
 
   const resumedResponsePromise = page.waitForResponse(
     (response) =>

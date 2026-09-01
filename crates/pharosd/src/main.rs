@@ -6376,6 +6376,11 @@ mod tests {
         assert!(FOOT.contains("function hostActionWorkflowRevision(job,workflowHtml)"));
         assert!(FOOT.contains("timing.overdue===true"));
         assert!(FOOT.contains("workflowHtml||''"));
+        assert!(FOOT.contains("function replaceHostWorkflowHtml(root,workflowHtml)"));
+        assert!(FOOT.contains("if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;"));
+        assert!(FOOT.contains(
+            "if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({preventScroll:true});"
+        ));
         assert!(FOOT
             .contains("hostActionPoll.lastRevision=hostActionWorkflowRevision(job,workflowHtml);"));
         assert!(FOOT.contains(

@@ -961,6 +961,17 @@ function settingsWorkflowRevision(data){{
   const action=workflow.primary_action||{{}};
   return JSON.stringify([job.id,job.state,job.updated_at,workflow.updated_at,workflow.status_label,workflow.current_step,action.kind,action.target_run_id,data?.workflow_html||'']);
 }}
+function replaceSettingsWorkflowHtml(root,workflowHtml){{
+  if(!root)return;
+  const advanced=root.querySelector('.host-workflow-advanced');
+  const summary=advanced?.querySelector('summary');
+  const keepAdvancedOpen=advanced?.open===true;
+  const restoreSummaryFocus=document.activeElement===summary;
+  root.innerHTML=workflowHtml||'';
+  const nextAdvanced=root.querySelector('.host-workflow-advanced');
+  if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;
+  if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({{preventScroll:true}});
+}}
 function settingsApplyConfirmationReady(){{
   const dialog=document.querySelector('[data-host-action-dialog]');
   const confirmation=dialog?.querySelector('[data-host-remove-input]')?.value||'';
@@ -1022,6 +1033,7 @@ function renderSettingsWorkflow(data){{
   const overlay=document.querySelector('[data-host-action-overlay]');
   const dialog=overlay?.querySelector('[data-host-action-dialog]');
   if(!overlay||!dialog)return;
+  const initialWorkflowOpen=overlay.hidden||settingsWorkflow.mode!=='workflow';
   dialog.dataset.workflow='true';
   dialog.dataset.action='settings-change';
   dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{{icon.hidden=icon.dataset.actionIcon!=='settings-change'}});
@@ -1053,7 +1065,7 @@ function renderSettingsWorkflow(data){{
   if(info)info.hidden=true;
   if(facts)facts.hidden=true;
   if(technical)technical.hidden=true;
-  if(checklist){{checklist.hidden=false;checklist.innerHTML=data.workflow_html||''}}
+  if(checklist){{checklist.hidden=false;replaceSettingsWorkflowHtml(checklist,data.workflow_html)}}
   if(confirmation)confirmation.hidden=actionKind!=='confirm';
   if(confirmationName)confirmationName.textContent=root?.dataset.host||job.host||'';
   if(attended)attended.hidden=actionKind!=='confirm';
@@ -1094,7 +1106,7 @@ function renderSettingsWorkflow(data){{
     settingsWorkflow.timer=null;
     setSettingsWorkflowSuspended(false);
   }}else if(!actionRequired)scheduleSettingsWorkflowPoll(settingsWorkflow.id);
-  requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
+  if(initialWorkflowOpen)requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
 }}
 async function pollSettingsWorkflow(id){{
   settingsWorkflow.timer=null;
@@ -2423,6 +2435,14 @@ mod tests {
 
         assert!(html.contains("function pauseSettingsWorkflowPoll()"));
         assert!(html.contains("function stopSettingsWorkflowPoll()"));
+        assert!(html.contains("function replaceSettingsWorkflowHtml(root,workflowHtml)"));
+        assert!(html.contains("if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;"));
+        assert!(html.contains(
+            "if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({preventScroll:true});"
+        ));
+        assert!(html.contains(
+            "if(initialWorkflowOpen)requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus())"
+        ));
         assert!(html.contains("function scheduleSettingsWorkflowPoll(id,delay=2000)"));
         assert!(html.contains("if(settingsWorkflow.terminal)return"));
         assert!(html.contains("settingsWorkflow.timer=null;\n    pollSettingsWorkflow(id);"));

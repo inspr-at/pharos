@@ -535,6 +535,17 @@ function hostActionWorkflowRevision(job,workflowHtml){
     workflowHtml||''
   ]);
 }
+function replaceHostWorkflowHtml(root,workflowHtml){
+  if(!root)return;
+  const advanced=root.querySelector('.host-workflow-advanced');
+  const summary=advanced?.querySelector('summary');
+  const keepAdvancedOpen=advanced?.open===true;
+  const restoreSummaryFocus=document.activeElement===summary;
+  root.innerHTML=workflowHtml||'';
+  const nextAdvanced=root.querySelector('.host-workflow-advanced');
+  if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;
+  if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({preventScroll:true});
+}
 function renderHostActionJob(job,message,workflowHtml){
   if(!hostActionContext||!job)return;
   const overlay=document.querySelector('[data-host-action-overlay]');
@@ -573,7 +584,7 @@ function renderHostActionJob(job,message,workflowHtml){
   if(copy)copy.textContent=workflow.guidance||message||hostActionStateLabel(job.state)+'.';
   if(info)info.hidden=true;
   if(facts)facts.hidden=true;
-  if(workflowRoot){workflowRoot.hidden=false;workflowRoot.innerHTML=workflowHtml||''}
+  if(workflowRoot){workflowRoot.hidden=false;replaceHostWorkflowHtml(workflowRoot,workflowHtml)}
   const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
     ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
     ||(workflowKind==='remove_host'&&job.state==='removal_pending');
