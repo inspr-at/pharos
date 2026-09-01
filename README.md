@@ -7,17 +7,22 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
-It turns scattered heartbeats, host declarations, backup facts and guarded
-operations into one legible operating picture.
+It turns server onboarding, scattered heartbeats, host declarations, backup
+evidence and guarded deployment into one legible operating picture.
 
 It is deliberately not a generic remote shell. Pharos separates what a host
 reported, what configuration declares, what an operator requested and what an
 executor proved. That separation is the product.
 
-[Product site](https://pharos.inspr.at) ·
+[Product site](https://pharos.inspr.at/) ·
+[Deutsch](https://pharos.inspr.at/de/) ·
 [Source](https://github.com/inspr-at/pharos) ·
 [Changelog](docs/CHANGELOG.md) ·
 [INSPR](https://www.inspr.at)
+
+Pharos is part of the open INSPR product family and is authored and published
+by [Markus Barta](https://github.com/markus-barta). Augmentoring's professional
+services deploy and operate Pharos; Augmentoring is not the product owner.
 
 ## Why Pharos exists
 
@@ -851,6 +856,8 @@ source-lock digest hashes, in order, the exact bytes of `Cargo.lock`,
 `/version`.
 
 ## License
+
+Copyright © 2026 [Markus Barta](https://github.com/markus-barta).
 
 Pharos is licensed under the
 [GNU Affero General Public License v3.0 only](LICENSE), expressed as
