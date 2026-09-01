@@ -28,6 +28,7 @@ const OPERATION_TIMEOUT_SECONDS: i64 = 30 * 60;
 const MAX_UNCERTAIN_ATTEMPTS: u8 = 3;
 const HEALTH_EVIDENCE_MAX_AGE_SECONDS: i64 = 120;
 const CLOCK_SKEW_SECONDS: i64 = 30;
+pub(crate) const REMOVAL_RETRY_WINDOW_SECONDS: i64 = LEASE_SECONDS + CLOCK_SKEW_SECONDS;
 const MIN_REMOVAL_RECOVERY_SECONDS: i64 = 5 * 60;
 const MAX_REMOVAL_RECOVERY_SECONDS: i64 = 7 * 24 * 60 * 60;
 
@@ -556,7 +557,8 @@ impl ManagedServiceOperationStore {
             }
             return Ok(ManagedOperationSummary::from(&current));
         }
-        if !(verification_retryable(&current) || removal_retryable(&current))
+        if !(verification_retryable(&current)
+            || removal_retryable(&current) && removal_window_open(&current, now))
             || document.operations.values().any(|candidate| {
                 candidate.host_ref == current.host_ref
                     && candidate.service_ref == current.service_ref
@@ -880,6 +882,13 @@ fn removal_retryable(operation: &ManagedOperationRecord) -> bool {
         )
 }
 
+fn removal_window_open(operation: &ManagedOperationRecord, now: i64) -> bool {
+    operation.operation_kind == ManagedOperationKind::Remove
+        && operation
+            .purge_not_before_unix_secs
+            .is_some_and(|deadline| deadline > now.saturating_add(REMOVAL_RETRY_WINDOW_SECONDS))
+}
+
 fn apply_success(
     operation: &mut ManagedOperationRecord,
     request: &ManagedOperationResultV1,
@@ -1021,6 +1030,16 @@ fn validate_rollback_evidence(
 
 fn reconcile(document: &mut ManagedOperationDocument, now: i64) {
     for operation in document.operations.values_mut() {
+        if !operation.phase.terminal()
+            && operation.operation_kind == ManagedOperationKind::Remove
+            && !removal_window_open(operation, now)
+        {
+            operation.phase = ManagedOperationPhase::Failed;
+            operation.reason_code = Some(ManagedOperationReason::RemovalUncertain);
+            operation.active_lease = None;
+            operation.updated_at_unix_secs = now;
+            continue;
+        }
         if operation.phase == ManagedOperationPhase::Active {
             let health_is_stale = operation.health.as_ref().is_none_or(|health| {
                 [
@@ -1577,6 +1596,66 @@ mod tests {
             Some(1)
         );
         assert!(!terminal.value_returned);
+    }
+
+    #[test]
+    fn failed_removal_retry_closes_before_the_lease_and_proof_window_runs_out() {
+        let store = ManagedServiceOperationStore::new(None).unwrap();
+        let manifest = fixture();
+        activate(&store, &manifest, "op_create_retrydeadline", 1, NOW);
+
+        let mut detached = manifest.services[0].slots[0].clone();
+        detached.binding_state = ManagedBindingState::Detached;
+        let mut removal = ready("op_retrydeadline01", 1);
+        removal.operation_kind = ManagedOperationKind::Remove;
+        let recovery_deadline = NOW + 10 + MIN_REMOVAL_RECOVERY_SECONDS;
+        removal.purge_not_before_unix_secs = Some(recovery_deadline);
+        store.register(&removal, &detached, NOW + 10).unwrap();
+        let lease = store.claim(&manifest.host_ref, NOW + 11).unwrap().unwrap();
+        store
+            .record_result(
+                &result(
+                    &lease,
+                    ManagedOperationAgentOutcome::Failed,
+                    ManagedOperationReason::RemovalFailed,
+                ),
+                NOW + 12,
+            )
+            .unwrap();
+
+        let before_cutoff = recovery_deadline - REMOVAL_RETRY_WINDOW_SECONDS - 1;
+        let pending = store.retry(&removal.operation_ref, before_cutoff).unwrap();
+        assert_eq!(pending.phase, ManagedOperationPhase::RemovalPending);
+        assert_eq!(pending.purge_not_before_unix_secs, Some(recovery_deadline));
+
+        let cutoff = recovery_deadline - REMOVAL_RETRY_WINDOW_SECONDS;
+        let closed = store.get(&removal.operation_ref, cutoff).unwrap();
+        assert_eq!(closed.phase, ManagedOperationPhase::Failed);
+        assert_eq!(
+            closed.reason_code,
+            Some(ManagedOperationReason::RemovalUncertain)
+        );
+        assert!(closed.removal.is_none());
+        assert_ne!(
+            store
+                .claim(&manifest.host_ref, cutoff)
+                .unwrap()
+                .as_ref()
+                .map(|lease| lease.operation_ref.as_str()),
+            Some(removal.operation_ref.as_str())
+        );
+        assert_eq!(
+            store.retry(&removal.operation_ref, cutoff),
+            Err(ManagedOperationStoreError::Conflict)
+        );
+        assert_eq!(
+            store.retry(&removal.operation_ref, recovery_deadline),
+            Err(ManagedOperationStoreError::Conflict)
+        );
+        assert_eq!(
+            store.retry(&removal.operation_ref, recovery_deadline + 1),
+            Err(ManagedOperationStoreError::Conflict)
+        );
     }
 
     #[test]

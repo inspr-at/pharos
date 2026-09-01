@@ -5,7 +5,7 @@
 //! setup intent.
 
 use super::*;
-use crate::managed_service_operations::ManagedOperationPhase;
+use crate::managed_service_operations::{ManagedOperationPhase, REMOVAL_RETRY_WINDOW_SECONDS};
 
 const MANAGED_SETUP_RUNTIME: &str = r#"
 document.querySelectorAll('[data-managed-secret-action]').forEach(button=>button.addEventListener('click',async()=>{
@@ -132,6 +132,7 @@ pub(crate) enum ManagedSecretSlotState {
     Removing,
     Removed,
     RemovalFinalizing,
+    RemovalRecoveryRequired,
 }
 
 impl ManagedSecretSlotState {
@@ -159,6 +160,7 @@ impl ManagedSecretSlotState {
             Self::Removing => "Removing",
             Self::Removed => "Removed · recovery window",
             Self::RemovalFinalizing => "Removed · final cleanup",
+            Self::RemovalRecoveryRequired => "Removal recovery required",
         }
     }
 
@@ -171,7 +173,7 @@ impl ManagedSecretSlotState {
             Self::Removed => "missing",
             Self::Active => "active",
             Self::RollbackRestored => "active",
-            Self::ActionNeeded => "attention",
+            Self::ActionNeeded | Self::RemovalRecoveryRequired => "attention",
         }
     }
 
@@ -195,6 +197,9 @@ impl ManagedSecretSlotState {
             }
             Self::RemovalFinalizing => {
                 "The recovery window ended. Final encrypted cleanup is being retried safely."
+            }
+            Self::RemovalRecoveryRequired => {
+                "The recovery window closed without accepted absence proof, so this removal cannot be retried."
             }
         }
     }
@@ -471,6 +476,13 @@ fn render_slot(
     setup_enabled: bool,
     now: i64,
 ) -> String {
+    let state = if state == ManagedSecretSlotState::ActionNeeded
+        && removal_recovery_required(operation, now)
+    {
+        ManagedSecretSlotState::RemovalRecoveryRequired
+    } else {
+        state
+    };
     let operation_details_action = operation
         .map(|operation| {
             format!(
@@ -501,13 +513,22 @@ fn render_slot(
             ),
         )
     } else if state == ManagedSecretSlotState::ActionNeeded
-        && operation.is_some_and(|operation| operation.removal_retryable)
+        && operation.is_some_and(|operation| removal_retry_available(operation, now))
     {
         format!(
             r#"<button class="managed-primary managed-danger" type="button" data-managed-removal-retry data-operation-ref="{operation_ref}">Retry safe removal</button>"#,
             operation_ref = html_escape(
                 &operation
                     .expect("retryable removal has an operation")
+                    .operation_ref
+            ),
+        )
+    } else if state == ManagedSecretSlotState::RemovalRecoveryRequired {
+        format!(
+            r##"<a class="managed-link-danger" href="#managed-removal-recovery-{operation_ref}" data-managed-details-target="managed-removal-recovery-{operation_ref}">Open nixcfg recovery review</a>"##,
+            operation_ref = html_escape(
+                &operation
+                    .expect("failed removal recovery has an operation")
                     .operation_ref
             ),
         )
@@ -562,10 +583,12 @@ fn render_slot(
         })
         .unwrap_or_default();
     let separation = render_operation_separation(operation, now);
-    let operation_details = render_operation_details(operation);
+    let operation_details = render_operation_details(operation, now);
     let detachment_task = render_detachment_owner_task(manifest, service, slot);
+    let removal_recovery_task =
+        render_removal_recovery_task(manifest, service, slot, operation, now);
     format!(
-        r#"<article class="managed-slot-card"><div class="managed-slot-head"><div><span class="managed-kicker">Service secret</span><h2>{slot_label}</h2></div><span class="managed-state {tone}">{state_label}</span></div><p class="managed-slot-guidance">{guidance}</p><dl class="managed-slot-facts"><div><dt>Consumer</dt><dd>{service_label}</dd></div><div><dt>Delivery</dt><dd>Private environment file</dd></div><div><dt>Reveal</dt><dd>Never</dd></div></dl>{separation}{progress}{operation_details}{detachment_task}<div class="managed-slot-action">{action}<p role="status" aria-live="polite" data-managed-action-status>{availability}</p></div></article>"#,
+        r#"<article class="managed-slot-card"><div class="managed-slot-head"><div><span class="managed-kicker">Service secret</span><h2>{slot_label}</h2></div><span class="managed-state {tone}">{state_label}</span></div><p class="managed-slot-guidance">{guidance}</p><dl class="managed-slot-facts"><div><dt>Consumer</dt><dd>{service_label}</dd></div><div><dt>Delivery</dt><dd>Private environment file</dd></div><div><dt>Reveal</dt><dd>Never</dd></div></dl>{separation}{progress}{operation_details}{detachment_task}{removal_recovery_task}<div class="managed-slot-action">{action}<p role="status" aria-live="polite" data-managed-action-status>{availability}</p></div></article>"#,
         slot_label = html_escape(&slot.safe_label),
         tone = state.tone(),
         state_label = state.label(),
@@ -575,6 +598,7 @@ fn render_slot(
         progress = progress,
         operation_details = operation_details,
         detachment_task = detachment_task,
+        removal_recovery_task = removal_recovery_task,
         action = action,
         availability = if setup_enabled
             && matches!(
@@ -597,13 +621,15 @@ fn render_slot(
             "Active use has ended. Encrypted quarantine remains recoverable until the displayed recovery window closes."
         } else if state == ManagedSecretSlotState::RemovalFinalizing {
             "Active use remains stopped while exact encrypted cleanup is retried."
+        } else if state == ManagedSecretSlotState::RemovalRecoveryRequired {
+            "The recovery cutoff passed without accepted runtime absence evidence. Pharos will not requeue destructive work; complete the linked nixcfg recovery review."
         } else if setup_enabled
             && state == ManagedSecretSlotState::ActionNeeded
             && operation.is_some_and(|operation| operation.verification_retryable)
         {
             "The encrypted generation is already installed. Pharos will request fresh exact-generation health evidence; no secret is created or revealed."
         } else if state == ManagedSecretSlotState::ActionNeeded
-            && operation.is_some_and(|operation| operation.removal_retryable)
+            && operation.is_some_and(|operation| removal_retry_available(operation, now))
         {
             "Pharos will retry the same declared removal generation and detach profile. The host must provide fresh exact absence evidence; no secret is created or revealed."
         } else if setup_enabled
@@ -638,8 +664,51 @@ fn render_detachment_owner_task(
     )
 }
 
+fn removal_retry_available(
+    operation: &crate::managed_service_operations::ManagedOperationSummary,
+    now: i64,
+) -> bool {
+    operation.removal_retryable
+        && operation
+            .purge_not_before_unix_secs
+            .is_some_and(|deadline| deadline > now.saturating_add(REMOVAL_RETRY_WINDOW_SECONDS))
+}
+
+fn removal_recovery_required(
+    operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
+    now: i64,
+) -> bool {
+    operation.is_some_and(|operation| {
+        operation.operation_kind == pharos_core::managed_operations::ManagedOperationKind::Remove
+            && operation.phase == ManagedOperationPhase::Failed
+            && !removal_retry_available(operation, now)
+    })
+}
+
+fn render_removal_recovery_task(
+    manifest: &ManagedServiceManifestV1,
+    service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
+    slot: &pharos_core::managed_services::ManagedSecretSlotDeclarationV1,
+    operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
+    now: i64,
+) -> String {
+    let Some(operation) =
+        operation.filter(|operation| removal_recovery_required(Some(operation), now))
+    else {
+        return String::new();
+    };
+    format!(
+        r#"<details class="managed-service-details" id="managed-removal-recovery-{operation_ref}"><summary>nixcfg removal recovery review</summary><p>Owner: nixcfg. The recovery cutoff passed without accepted proof that the declared service stopped and its runtime material is absent. Pharos will not requeue this destructive operation.</p><dl><div><dt>Host</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service</dt><dd><code>{service_ref}</code></dd></div><div><dt>Slot</dt><dd><code>{slot_ref}</code></dd></div><div><dt>Terminal evidence</dt><dd>No exact absence evidence was accepted before the recovery cutoff.</dd></div><div><dt>Recovery</dt><dd>Review the deployed declaration and choose a new reviewed lifecycle. If the binding is restored, wait for the new declaration before starting fresh value-free setup.</dd></div></dl></details>"#,
+        operation_ref = html_escape(&operation.operation_ref),
+        host_ref = html_escape(&manifest.host_ref),
+        service_ref = html_escape(&service.service_ref),
+        slot_ref = html_escape(&slot.slot_ref),
+    )
+}
+
 fn render_operation_details(
     operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
+    now: i64,
 ) -> String {
     let Some(operation) = operation else {
         return String::new();
@@ -655,8 +724,10 @@ fn render_operation_details(
         .unwrap_or_else(|| "Awaiting host result".to_string());
     let retry = if operation.verification_retryable {
         "A fresh exact-generation verification can be requested; it does not create or reveal a secret."
-    } else if operation.removal_retryable {
+    } else if removal_retry_available(operation, now) {
         "The same declared removal can be retried. It reuses the generation and detach profile, and requires fresh exact absence evidence without creating or revealing a secret."
+    } else if removal_recovery_required(Some(operation), now) {
+        "The removal retry window is closed. Pharos will not requeue a lease that cannot return exact absence evidence before the recovery cutoff; use the linked nixcfg recovery review."
     } else if operation.phase == ManagedOperationPhase::Removed {
         "No browser retry is needed. Final encrypted cleanup remains an idempotent owner task after the recovery window."
     } else if operation.phase.terminal() {
@@ -890,6 +961,7 @@ mod tests {
             ManagedSecretSlotState::Removing,
             ManagedSecretSlotState::Removed,
             ManagedSecretSlotState::RemovalFinalizing,
+            ManagedSecretSlotState::RemovalRecoveryRequired,
         ];
         assert_eq!(
             states.map(ManagedSecretSlotState::label),
@@ -902,7 +974,8 @@ mod tests {
                 "Replacing",
                 "Removing",
                 "Removed · recovery window",
-                "Removed · final cleanup"
+                "Removed · final cleanup",
+                "Removal recovery required"
             ]
         );
         for state in states {
@@ -1135,6 +1208,61 @@ mod tests {
             assert!(!html.contains(forbidden), "found {forbidden}");
         }
         assert!(MANAGED_SETUP_RUNTIME.contains("Safe removal retry requested"));
+    }
+
+    #[test]
+    fn failed_removal_at_the_retry_cutoff_offers_recovery_not_an_impossible_retry() {
+        let manifest = fixture();
+        let now = 1_800_000_020;
+        let operation = crate::managed_service_operations::ManagedOperationSummary {
+            operation_ref: "op_retrydeadline_ui".to_string(),
+            operation_kind: ManagedOperationKind::Remove,
+            host_ref: manifest.host_ref.clone(),
+            service_ref: manifest.services[0].service_ref.clone(),
+            slot_ref: manifest.services[0].slots[0].slot_ref.clone(),
+            declaration_fingerprint: manifest.declaration_fingerprint.clone(),
+            generation: 1,
+            purge_not_before_unix_secs: Some(now + REMOVAL_RETRY_WINDOW_SECONDS),
+            phase: ManagedOperationPhase::Failed,
+            reason_code: Some(ManagedOperationReason::RemovalUncertain),
+            created_at_unix_secs: 1_800_000_000,
+            updated_at_unix_secs: now,
+            deadline_unix_secs: 1_800_001_800,
+            health: None,
+            rollback: None,
+            removal: None,
+            value_returned: false,
+            verification_retryable: false,
+            removal_retryable: true,
+        };
+        let html = render_slot(
+            &manifest,
+            &manifest.services[0],
+            &manifest.services[0].slots[0],
+            ManagedSecretSlotState::ActionNeeded,
+            Some(&operation),
+            false,
+            now,
+        );
+        for expected in [
+            "Removal recovery required",
+            "Open nixcfg recovery review",
+            "nixcfg removal recovery review",
+            "No terminal health or removal evidence has been accepted yet.",
+            "The removal retry window is closed",
+            "Pharos will not requeue destructive work",
+        ] {
+            assert!(html.contains(expected), "missing {expected}");
+        }
+        for forbidden in [
+            "Retry safe removal",
+            "data-managed-removal-retry",
+            "data-managed-secret-action",
+            "secret_value",
+            "name=\"source\"",
+        ] {
+            assert!(!html.contains(forbidden), "found {forbidden}");
+        }
     }
 
     #[test]

@@ -421,6 +421,13 @@ test("managed service secrets stay value-free, accessible, and narrow-screen saf
       '<p data-managed-action-status></p>',
     ].join("");
     document.body.append(card);
+    const recovery = document.createElement("article");
+    recovery.setAttribute("data-managed-removal-recovery-fixture", "");
+    recovery.innerHTML = [
+      '<a href="#managed-removal-recovery-op_retrydeadline_browser" data-managed-details-target="managed-removal-recovery-op_retrydeadline_browser">Open nixcfg recovery review</a>',
+      '<details id="managed-removal-recovery-op_retrydeadline_browser"><summary>Removal recovery task</summary><p>Pharos will not requeue destructive work.</p></details>',
+    ].join("");
+    document.body.append(recovery);
     new Function(runtime)();
   }, managedRuntime);
   const removalRetry = page.getByRole("button", { name: "Retry safe removal" });
@@ -436,6 +443,17 @@ test("managed service secrets stay value-free, accessible, and narrow-screen saf
   expect(retry.headers()["x-pharos-action"]).toBe("1");
   expect(retry.postData()).toBeNull();
   await expect(page.getByText("Safe removal could not be requested.")).toBeVisible();
+
+  const removalRecovery = page.locator("[data-managed-removal-recovery-fixture]");
+  await expect(removalRecovery.getByRole("button", { name: "Retry safe removal" })).toHaveCount(0);
+  const recoveryReview = removalRecovery.getByRole("link", {
+    name: "Open nixcfg recovery review",
+  });
+  await recoveryReview.click();
+  await expect(
+    removalRecovery.locator("#managed-removal-recovery-op_retrydeadline_browser"),
+  ).toHaveAttribute("open", "");
+  await expect(removalRecovery).toContainText("Pharos will not requeue destructive work.");
 
   const html = await page.content();
   for (const forbidden of [
