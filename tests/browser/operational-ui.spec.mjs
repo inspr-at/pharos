@@ -400,7 +400,15 @@ test("managed service secrets stay value-free, accessible, and narrow-screen saf
   await expect(page.getByText("Service secret", { exact: true })).toBeVisible();
   await expect(page.getByText("Reveal", { exact: true })).toBeVisible();
   await expect(page.getByText("Never", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Setup unavailable" })).toBeDisabled();
+  const setupRequirements = page.getByRole("link", {
+    name: "Check managed setup requirements",
+  });
+  await expect(setupRequirements).toBeVisible();
+  await expect(setupRequirements).toHaveAttribute("href", "#managed-setup-configuration");
+  await setupRequirements.click();
+  await expect(page.locator("#managed-setup-configuration")).toHaveAttribute("open", "");
+  await expect(page.getByText("Pharos never holds a secret value.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Setup unavailable" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /reveal|show|copy/i })).toHaveCount(0);
   await expect(page.getByRole("link", { name: /reveal|show|copy/i })).toHaveCount(0);
 
@@ -1391,9 +1399,13 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
 
   await page.goto("/");
-  const fleetLink = page
-    .locator(`[data-host="${host}"] a[data-settings-state]`)
-    .first();
+  const card = page.locator(
+    `article[data-host="${host}"][data-host-surface="runtime"]`,
+  );
+  await card.locator("[data-host-actions-trigger]").click();
+  const fleetLink = card.locator(
+    `[data-host-actions-menu]:not([hidden]) [data-host-action="host-settings"]`,
+  );
   await expect(fleetLink).toHaveAttribute("href", `/hosts/${host}`);
   await fleetLink.click();
   await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
