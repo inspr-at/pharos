@@ -14458,6 +14458,45 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(payload["reason_code"], IntentReason::Forbidden.code());
     }
 
+    #[tokio::test]
+    async fn scoped_viewers_can_read_provider_plans_but_cannot_start_provisioning() {
+        let mut state = report_test_state(false);
+        state.auth = AuthState::for_test_access(AccessGrant::limited(["hsb8"], true));
+
+        let query = serde_json::from_value(json!({
+            "provider": "manual-import",
+            "template": "manual-import"
+        }))
+        .expect("safe provider-plan query parses");
+        let read_response =
+            setup_provider_plan_json(State(state.clone()), HeaderMap::new(), Query(query))
+                .await
+                .into_response();
+        assert_eq!(read_response.status(), StatusCode::OK);
+
+        let request = serde_json::from_value(json!({
+            "provider": "existing-host",
+            "template": "native-systemd",
+            "apply": true,
+            "host_name": "viewer-denied",
+            "role": "server",
+            "is_nix": false,
+            "ssh": {
+                "route": "tailnet",
+                "user": "root",
+                "host": "viewer-denied"
+            }
+        }))
+        .expect("existing-host request parses");
+        let mutation_response =
+            create_provisioning_job(State(state.clone()), action_headers(), Json(request))
+                .await
+                .into_response();
+
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        assert!(state.provisioning_jobs.list().is_empty());
+    }
+
     static JANUS_HASH_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn janus_generation_dir(entries: &[(&str, &str)]) -> PathBuf {

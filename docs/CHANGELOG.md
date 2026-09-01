@@ -16,7 +16,7 @@
 - Give read-only users one consistent access-request path across Fleet, host
   settings, provider connections and managed services; name the required Fleet
   manager role and Pharos administrator owner while enforcing the same manager
-  boundary at every settings and managed-service mutation endpoint
+  boundary at settings, provisioning, and managed-service mutation endpoints
   (PHAROS-248).
 
 ## 0.1.97 - 2026-09-01

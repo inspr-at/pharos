@@ -130,6 +130,19 @@ test("read-only users get one access path and cannot call mutation endpoints", a
   );
   expect(provider.status()).toBe(403);
 
+  const existingHost = await page.request.post("/setup/provisioning-jobs", {
+    data: {
+      provider: "existing-host",
+      template: "native-systemd",
+      apply: true,
+      host_name: "viewer-denied",
+      role: "server",
+      is_nix: false,
+      ssh: { route: "tailnet", user: "root", host: "viewer-denied" },
+    },
+  });
+  expect(existingHost.status()).toBe(403);
+
   await context.close();
 });
 

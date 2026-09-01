@@ -5364,6 +5364,15 @@ pub(super) async fn create_provisioning_job(
     headers: HeaderMap,
     Json(request): Json<ProvisioningJobStartRequest>,
 ) -> impl IntoResponse {
+    if !access_for_headers(&state.auth, &headers).can_manage_fleet() {
+        return (
+            StatusCode::FORBIDDEN,
+            no_store_headers(),
+            Json(
+                json!({ "error": "Fleet management access is required to start provisioning work" }),
+            ),
+        );
+    }
     if request.provider == "hetzner-cloud" && request.apply {
         return (
             StatusCode::BAD_REQUEST,
@@ -5371,13 +5380,6 @@ pub(super) async fn create_provisioning_job(
             Json(json!({
                 "error": "Direct apply is not allowed. Persist a reviewed plan, authorize that exact plan, then create it in a separate request."
             })),
-        );
-    }
-    if !access_for_headers(&state.auth, &headers).can_agora() {
-        return (
-            StatusCode::FORBIDDEN,
-            no_store_headers(),
-            Json(json!({ "error": "Agora access is not granted for this account" })),
         );
     }
     let mut provider_runtime = state.provider_runtime.clone();
