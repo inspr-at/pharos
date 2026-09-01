@@ -22,6 +22,7 @@ mod managed_service_operations;
 mod managed_service_ui;
 mod managed_setup_intents;
 mod manifests;
+mod next_action;
 mod nixcfg_dispatch;
 mod paimos_delivery;
 mod provider_connections;
@@ -1214,7 +1215,11 @@ async fn request_system_update(
             unreachable!("existing replacements handled above")
         }
     };
-    if let Err(error) = state.nixcfg_dispatch.dispatch_system_update(host).await {
+    if let Err(error) = state
+        .nixcfg_dispatch
+        .dispatch_system_update_with_key(host, &workflow.id)
+        .await
+    {
         let failed = match error {
             NixcfgDispatchError::OutcomeUncertain => state
                 .host_actions
@@ -1235,10 +1240,11 @@ async fn request_system_update(
             error.system_update_message(),
         );
     }
-    let submitted = match state
-        .host_actions
-        .mark_dispatch_submitted(&workflow.id, now_unix())
-    {
+    let submitted = match state.host_actions.mark_dispatch_submitted_with_request_id(
+        &workflow.id,
+        &workflow.id,
+        now_unix(),
+    ) {
         Ok(job) => job,
         Err(HostActionStoreError::PersistenceCommitted) => state
             .host_actions
@@ -1917,7 +1923,7 @@ async fn continue_legacy_settings_dispatch(
 
     let request_id = match state
         .nixcfg_dispatch
-        .dispatch(&existing.host, &preferences)
+        .dispatch_settings_with_key(&existing.host, &preferences, &existing.id)
         .await
     {
         Ok(request_id) => request_id,
@@ -2589,6 +2595,70 @@ fn reconcile_completed_removals(state: &AppState, now: i64) -> usize {
         }
     }
     transitions
+}
+
+/// Advance durable owner handoffs from value-free local evidence.
+///
+/// This pass is intentionally idempotent: it never dispatches a repository
+/// workflow or replays a live host action. It repairs accepted local receipts,
+/// observes already-matching host state, and lets the existing removal
+/// reconciler finish recorded retirement gates.
+fn reconcile_saved_next_actions(state: &AppState, now: i64) -> usize {
+    let mut transitions = 0usize;
+    let _ = state.host_actions.reconcile_orphaned_host_dispatches(now);
+    for job in state.host_actions.list() {
+        if job.workflow_kind() != HostWorkflowKind::SettingsChange || job.state.is_terminal() {
+            continue;
+        }
+        let Some(requested) = job.requested_preferences().cloned() else {
+            continue;
+        };
+        let Some(host) = state.store.get(&job.host) else {
+            continue;
+        };
+        if job.dispatch_submitted()
+            && !job.accepted_dispatch_reconciled()
+            && state
+                .store
+                .request_preferences(&job.host, requested.clone())
+                .is_ok()
+            && state
+                .host_actions
+                .accept_settings_change(&job.id, now)
+                .is_ok()
+        {
+            transitions += 1;
+        }
+        if host.preferences == requested
+            && state
+                .host_actions
+                .complete_settings_change(&job.host, now)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            transitions += 1;
+        }
+    }
+    transitions + reconcile_completed_removals(state, now)
+}
+
+fn spawn_next_action_loop(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let advanced = reconcile_saved_next_actions(&state, now_unix());
+            if advanced > 0 {
+                tracing::info!(
+                    advanced,
+                    ticket = "PHAROS-245",
+                    "saved next actions reconciled"
+                );
+            }
+        }
+    });
 }
 
 fn agent_authorized(state: &AppState, headers: &HeaderMap, host: &str) -> Result<(), StatusCode> {
@@ -4745,7 +4815,8 @@ async fn main() {
         retired_hosts,
         alert_health,
     };
-    let _ = reconcile_completed_removals(&state, now_unix());
+    let _ = reconcile_saved_next_actions(&state, now_unix());
+    spawn_next_action_loop(state.clone());
     spawn_alert_loop(state.clone(), alert_notifier);
     if let Some(runtime) = appliance_probes {
         spawn_appliance_probe_loop(runtime, Arc::clone(&state.store));
@@ -6194,7 +6265,7 @@ mod tests {
         assert!(waiting_html.contains(
             r#"data-step-state="waiting" data-current="true" data-waiting-for-evidence="true" aria-busy="true""#
         ));
-        assert!(waiting_html.contains(r#"data-host-action-refresh>Check host now</button>"#));
+        assert!(!waiting_html.contains("data-host-action-refresh"));
         assert!(waiting_html.contains(r#"data-ladder-key="verified" data-ladder-state="pending""#));
 
         let completed = store
@@ -16052,18 +16123,19 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["job"]["workflow"]["status_label"], "change waiting");
+        assert!(payload["job"]["workflow"]["primary_action"].is_null());
         assert_eq!(
-            payload["job"]["workflow"]["primary_action"]["kind"],
-            "refresh"
+            payload["job"]["workflow"]["next_action"]["availability"]["operation"],
+            "poll_host_evidence"
         );
         assert_eq!(
-            payload["job"]["workflow"]["primary_action"]["label"],
-            "Check host now"
+            payload["job"]["workflow"]["next_action"]["availability"]["execution"],
+            "automatic"
         );
-        assert_eq!(payload["job"]["workflow"]["next"]["location"], "Pharos");
+        assert_eq!(payload["job"]["workflow"]["next"]["location"], "hsb8");
         assert!(payload["job"]["workflow"]["next"]["consequence"]
             .as_str()
-            .is_some_and(|consequence| consequence.contains("Reads this saved run again")));
+            .is_some_and(|consequence| consequence.contains("keeps this run saved")));
         assert_eq!(
             state
                 .store
@@ -16188,9 +16260,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        assert!(payload["job"]["workflow"]["primary_action"].is_null());
         assert_eq!(
-            payload["job"]["workflow"]["primary_action"]["label"],
-            "Check host now"
+            payload["job"]["workflow"]["next_action"]["availability"]["operation"],
+            "poll_host_evidence"
         );
         assert!(payload["message"]
             .as_str()
@@ -16275,9 +16348,10 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(dispatch_count.load(Ordering::SeqCst), 0);
+        assert!(payload["job"]["workflow"]["primary_action"].is_null());
         assert_eq!(
-            payload["job"]["workflow"]["primary_action"]["label"],
-            "Check host now"
+            payload["job"]["workflow"]["next_action"]["availability"]["operation"],
+            "poll_host_evidence"
         );
         assert!(payload["message"]
             .as_str()
@@ -17583,5 +17657,45 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(observation.server_reachable, Some(true));
         assert_eq!(observation.client_reachable, None);
         assert_eq!(observation.kind, "tcp-connect");
+    }
+
+    #[test]
+    fn background_next_action_reconciles_saved_settings_receipt_once() {
+        let state = report_test_state(true);
+        state
+            .store
+            .record(test_report("hsb8"), 1_000)
+            .expect("settings host recorded");
+        let requested = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 1_001)
+            .expect("settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&settings.id, &requested, 1_002)
+            .expect("settings payload recorded");
+        state
+            .host_actions
+            .mark_settings_dispatch_submitted(&settings.id, &settings.id, 1_003)
+            .expect("repository receipt recorded");
+
+        assert_eq!(reconcile_saved_next_actions(&state, 1_004), 1);
+        assert_eq!(reconcile_saved_next_actions(&state, 1_005), 0);
+        let reconciled = state
+            .host_actions
+            .get(&settings.id)
+            .expect("saved run remains available");
+        assert!(reconciled.accepted_dispatch_reconciled());
+        assert_eq!(
+            state
+                .store
+                .get("hsb8")
+                .and_then(|host| host.requested_preferences),
+            Some(requested)
+        );
     }
 }
