@@ -3355,6 +3355,16 @@ async fn version() -> Json<serde_json::Value> {
     Json(json!({
         "name": "pharosd",
         "version": APP_VERSION,
+        "version_scheme": VERSION_SCHEME,
+        "release_channel": RELEASE_CHANNEL,
+        "release_sequence": RELEASE_SEQUENCE.parse::<u64>().expect("embedded release sequence"),
+        "ecosystem_versions": { "cargo_semver": env!("CARGO_PKG_VERSION") },
+        "migration_anchor": {
+            "last_legacy_version": LAST_LEGACY_VERSION,
+            "last_legacy_release_sequence": LAST_LEGACY_RELEASE_SEQUENCE.parse::<u64>().expect("embedded legacy sequence"),
+            "first_calendar_version": FIRST_CALENDAR_VERSION,
+            "first_calendar_release_sequence": FIRST_CALENDAR_RELEASE_SEQUENCE.parse::<u64>().expect("embedded first calendar sequence")
+        },
         "git_commit": GIT_COMMIT,
         "display_version": release_label()
     }))
@@ -5079,8 +5089,9 @@ async fn main() {
         .await
         .expect("bind PHAROS_ADDR");
     tracing::info!(
-        "pharosd v{} listening on http://{}",
-        env!("CARGO_PKG_VERSION"),
+        "pharosd v{} ({}) listening on http://{}",
+        APP_VERSION,
+        VERSION_SCHEME,
         startup.addr
     );
     axum::serve(listener, app).await.expect("serve");
@@ -5268,6 +5279,29 @@ mod tests {
 
         assert_eq!(payload["name"], "pharosd");
         assert_eq!(payload["version"], APP_VERSION);
+        assert_eq!(payload["version_scheme"], VERSION_SCHEME);
+        assert_eq!(payload["release_channel"], RELEASE_CHANNEL);
+        assert_eq!(payload["release_sequence"], 1);
+        assert_eq!(
+            payload["ecosystem_versions"]["cargo_semver"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            payload["migration_anchor"]["last_legacy_version"],
+            LAST_LEGACY_VERSION
+        );
+        assert_eq!(
+            payload["migration_anchor"]["last_legacy_release_sequence"],
+            0
+        );
+        assert_eq!(
+            payload["migration_anchor"]["first_calendar_version"],
+            FIRST_CALENDAR_VERSION
+        );
+        assert_eq!(
+            payload["migration_anchor"]["first_calendar_release_sequence"],
+            1
+        );
         assert_eq!(payload["display_version"], release_label());
         assert_eq!(payload["git_commit"], GIT_COMMIT);
     }

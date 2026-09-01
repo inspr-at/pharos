@@ -9,7 +9,7 @@ name: pharos-selfhost
 
 services:
   pharosd:
-    image: ghcr.io/inspr-at/pharos/pharosd:${PHAROS_IMAGE_TAG:-0.1.62}
+    image: ${PHAROS_IMAGE_REFERENCE:?set a signed tag@sha256 digest reference}
     restart: unless-stopped
     init: true
     read_only: true

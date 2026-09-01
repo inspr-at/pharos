@@ -9,7 +9,7 @@
 
 rustPlatform.buildRustPackage {
   pname = binaryName;
-  version = lib.removeSuffix "\n" (builtins.readFile (src + "/VERSION"));
+  version = (builtins.fromJSON (builtins.readFile (src + "/RELEASE.json"))).version;
 
   inherit src;
 

@@ -156,6 +156,10 @@ fn render(command: &Command, status: StatusCode, body: &str) -> Result<String, S
     let value: Value =
         serde_json::from_str(body).map_err(|_| "Pharos returned malformed JSON".to_string())?;
     let value = match command {
+        Command::Version => {
+            validate_version_response(&value)?;
+            value
+        }
         Command::BeaconLastSeen(host_filter) => {
             let hosts = value
                 .get("hosts")
@@ -185,6 +189,81 @@ fn render(command: &Command, status: StatusCode, body: &str) -> Result<String, S
     };
     serde_json::to_string_pretty(&value)
         .map_err(|_| "could not render the Pharos response".to_string())
+}
+
+fn validate_version_response(value: &Value) -> Result<(), String> {
+    let scheme = value
+        .get("version_scheme")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Pharos version response has no explicit version scheme".to_string())?;
+    let version = value
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Pharos version response is missing version".to_string())?;
+    let channel = value
+        .get("release_channel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Pharos version response is missing release channel".to_string())?;
+    let sequence = value
+        .get("release_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Pharos version response is missing release sequence".to_string())?;
+    if channel != "stable" {
+        return Err("Pharos version response has an unknown release channel".to_string());
+    }
+    match scheme {
+        "legacy" if sequence == 0 && valid_legacy_version(version) => Ok(()),
+        "inspr-calendar-v1" if sequence > 0 && valid_calendar_version(version) => Ok(()),
+        "legacy" | "inspr-calendar-v1" => {
+            Err("Pharos version response has invalid release metadata".to_string())
+        }
+        _ => Err("Pharos version response has an unknown version scheme".to_string()),
+    }
+}
+
+fn valid_legacy_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == &"0" || !part.starts_with('0'))
+        })
+}
+
+fn valid_calendar_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() != 6
+        || parts
+            .iter()
+            .any(|part| part.len() != 2 || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    let numbers = parts
+        .iter()
+        .map(|part| part.parse::<u32>())
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(numbers) = numbers else {
+        return false;
+    };
+    let (year, month, day, hour, minute, second) = (
+        2000 + numbers[0],
+        numbers[1],
+        numbers[2],
+        numbers[3],
+        numbers[4],
+        numbers[5],
+    );
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
 }
 
 #[tokio::main]
@@ -260,5 +339,52 @@ mod tests {
         let output = render(&Command::BeaconLastSeen(None), StatusCode::OK, &body).unwrap();
         assert!(output.contains("last_seen"));
         assert!(!output.contains("role"));
+    }
+
+    #[test]
+    fn version_view_accepts_explicit_calendar_and_legacy_metadata() {
+        for body in [
+            json!({
+                "version_scheme": "inspr-calendar-v1",
+                "version": "26.09.01.13.29.31",
+                "release_channel": "stable",
+                "release_sequence": 1
+            }),
+            json!({
+                "version_scheme": "legacy",
+                "version": "0.2.0",
+                "release_channel": "stable",
+                "release_sequence": 0
+            }),
+        ] {
+            assert!(render(&Command::Version, StatusCode::OK, &body.to_string()).is_ok());
+        }
+    }
+
+    #[test]
+    fn version_view_fails_closed_on_ambiguous_or_invalid_metadata() {
+        for body in [
+            json!({"version": "26.09.01"}),
+            json!({
+                "version_scheme": "inspr-calendar-v2",
+                "version": "26.09.01.13.29.31",
+                "release_channel": "stable",
+                "release_sequence": 1
+            }),
+            json!({
+                "version_scheme": "inspr-calendar-v1",
+                "version": "26.02.29.13.29.31",
+                "release_channel": "stable",
+                "release_sequence": 1
+            }),
+            json!({
+                "version_scheme": "inspr-calendar-v1",
+                "version": "٢٦.09.01.13.29.31",
+                "release_channel": "stable",
+                "release_sequence": 1
+            }),
+        ] {
+            assert!(render(&Command::Version, StatusCode::OK, &body.to_string()).is_err());
+        }
     }
 }

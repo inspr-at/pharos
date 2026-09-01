@@ -21,6 +21,14 @@ pub(super) const LEAFLET_MARKER_SHADOW_PNG: &[u8] =
 pub(super) const D3_JS: &str = include_str!("../assets/vendor/d3-7.9.0/d3.min.js");
 pub(super) const FAVICON_SVG: &str = include_str!("../assets/ui/favicon.svg");
 pub(super) const APP_VERSION: &str = env!("PHAROS_APP_VERSION");
+pub(super) const VERSION_SCHEME: &str = env!("PHAROS_VERSION_SCHEME");
+pub(super) const RELEASE_CHANNEL: &str = env!("PHAROS_RELEASE_CHANNEL");
+pub(super) const RELEASE_SEQUENCE: &str = env!("PHAROS_RELEASE_SEQUENCE");
+pub(super) const LAST_LEGACY_VERSION: &str = env!("PHAROS_LAST_LEGACY_VERSION");
+pub(super) const LAST_LEGACY_RELEASE_SEQUENCE: &str = env!("PHAROS_LAST_LEGACY_RELEASE_SEQUENCE");
+pub(super) const FIRST_CALENDAR_VERSION: &str = env!("PHAROS_FIRST_CALENDAR_VERSION");
+pub(super) const FIRST_CALENDAR_RELEASE_SEQUENCE: &str =
+    env!("PHAROS_FIRST_CALENDAR_RELEASE_SEQUENCE");
 pub(super) const GIT_COMMIT: &str = env!("PHAROS_GIT_COMMIT");
 pub(super) const CHANGELOG_MD: &str = include_str!("../../../docs/CHANGELOG.md");
 
@@ -36,6 +44,21 @@ pub(super) const SIGNAL_DEFAULT_WINDOW_SECS: i64 = 10 * 60;
 
 pub(super) fn release_label() -> String {
     format!("v{APP_VERSION}")
+}
+
+pub(super) fn release_scheme_label() -> &'static str {
+    match VERSION_SCHEME {
+        "inspr-calendar-v1" => "Calendar v1",
+        "legacy" => "Legacy",
+        _ => "Unknown",
+    }
+}
+
+pub(super) fn release_set_url() -> String {
+    format!(
+        "https://github.com/inspr-at/pharos/releases/download/{}/release-set.json",
+        release_label()
+    )
 }
 
 pub(super) fn changelog_html() -> String {
@@ -84,9 +107,13 @@ pub(super) fn changelog_html() -> String {
 
 pub(super) fn release_dialog() -> String {
     format!(
-        r#"<section class="release-overlay" data-release-modal hidden aria-label="release history"><div class="release-backdrop" data-release-close></div><div class="release-sheet" role="dialog" aria-modal="true" aria-labelledby="release-history-title"><header class="release-head"><div><h2 id="release-history-title">Release history</h2><p>Running {version} · build {commit}</p></div><button class="release-close" type="button" data-release-close>Close</button></header><div class="release-body">{history}</div></div></section>"#,
+        r#"<section class="release-overlay" data-release-modal hidden aria-label="release history"><div class="release-backdrop" data-release-close></div><div class="release-sheet" role="dialog" aria-modal="true" aria-labelledby="release-history-title"><header class="release-head"><div><h2 id="release-history-title">Release history</h2><p>Running {version} · build {commit}</p><dl class="release-identity" data-release-identity><div><dt>Scheme</dt><dd>{scheme}</dd></div><div><dt>Channel</dt><dd>{channel}</dd></div><div><dt>Sequence</dt><dd>#{sequence}</dd></div></dl><a class="release-set-link" data-release-set href="{release_set}" target="_blank" rel="noopener noreferrer">Open exact release set</a></div><button class="release-close" type="button" data-release-close>Close</button></header><div class="release-body">{history}</div></div></section>"#,
         version = html_escape(&release_label()),
         commit = html_escape(GIT_COMMIT),
+        scheme = html_escape(release_scheme_label()),
+        channel = html_escape(RELEASE_CHANNEL),
+        sequence = html_escape(RELEASE_SEQUENCE),
+        release_set = html_escape(&release_set_url()),
         history = changelog_html()
     )
 }
@@ -164,6 +191,18 @@ mod module_tests {
         assert!(RELEASE_HISTORY_PORTAL.contains("data-release"));
         assert!(SETUP_ASSISTANT_TEMPLATE.contains("data-setup-assistant"));
         assert_eq!(html_escape("<&\"'>"), "&lt;&amp;&quot;&#39;&gt;");
+    }
+
+    #[test]
+    fn release_dialog_exposes_discriminated_identity_and_exact_manifest_link() {
+        let dialog = release_dialog();
+        assert!(dialog.contains(">Calendar v1<"));
+        assert!(dialog.contains(">stable<"));
+        assert!(dialog.contains(&format!(">#{RELEASE_SEQUENCE}<")));
+        assert!(dialog.contains(&format!(
+            "href=\"https://github.com/inspr-at/pharos/releases/download/v{APP_VERSION}/release-set.json\""
+        )));
+        assert!(dialog.contains("rel=\"noopener noreferrer\""));
     }
 
     #[test]

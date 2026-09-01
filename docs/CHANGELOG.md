@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 26.09.01.13.29.31 - 2026-09-01
+
+- Adopt INSPR Calendar Version v1 with an explicit legacy migration anchor,
+  stable-channel sequence and reversible Cargo ecosystem mapping (PHAROS-255).
+- Make release publication tag-only and recoverable, validate an untagged
+  digest-only candidate before final OCI admission, and sign an exact
+  release-set with supply-chain evidence plus the v0.2.0 rollback authority
+  before moving the mutable `latest` alias (PHAROS-255).
+- Add version scheme, channel, sequence and ecosystem metadata to `/version`
+  while preserving the canonical calendar coordinate in the UI and CLI
+  (PHAROS-255).
+
 ## 0.2.0 - 2026-09-01
 
 - Replace generic workflow buttons with state-specific, consequence-aware next

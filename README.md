@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.2.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-26.09.01.13.29.31-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -34,31 +34,31 @@ mean five different answers to basic questions:
 Most dashboards flatten these questions into a green or red dot. Pharos keeps
 their sources and meanings visible.
 
-| State | Meaning | Source |
-| --- | --- | --- |
-| **Observed** | What a host or bounded probe reported | `pharos-beacon`, server receive time, optional probes |
-| **Declared** | What should exist | Read-only host manifests and the nixcfg preference registry |
-| **Requested** | What an operator asked to change | Persisted Pharos workflow state |
-| **Executed** | What a bounded agent or provider operation attempted | Leased action result |
-| **Verified** | What fresh evidence confirms after the action | New heartbeat, kernel, service and backup evidence |
+| State         | Meaning                                              | Source                                                      |
+| ------------- | ---------------------------------------------------- | ----------------------------------------------------------- |
+| **Observed**  | What a host or bounded probe reported                | `pharos-beacon`, server receive time, optional probes       |
+| **Declared**  | What should exist                                    | Read-only host manifests and the nixcfg preference registry |
+| **Requested** | What an operator asked to change                     | Persisted Pharos workflow state                             |
+| **Executed**  | What a bounded agent or provider operation attempted | Leased action result                                        |
+| **Verified**  | What fresh evidence confirms after the action        | New heartbeat, kernel, service and backup evidence          |
 
 That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v0.2.0
+## What ships in v26.09.01.13.29.31
 
-| Area | Current capability |
-| --- | --- |
-| **Fleet** | Grid and list views, search, sorting, host liveness, heartbeat history, Nix freshness, kernel posture and service observations |
-| **Map** | Optional host location and reachability signals without turning location into a control channel |
-| **Backups** | Per-host backup posture from beacon observations, including protected, stale, failed and unreported states |
-| **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications |
-| **Host settings** | Durable per-host workspace and task rail for color, server/workstation kind and alert preferences, with requested, declared and applied state shown separately |
-| **Onboarding** | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions |
-| **Providers** | English/German Hetzner portal guidance with Fish-safe commands and exact destination paths, read-only provider checks, exact paid-plan review, attended authorization, single-use creation and ownership-checked cleanup |
-| **Guarded actions** | Fixed review/apply/restart, fleet-update, host-retirement and managed-service workflows with durable next-action ownership, idempotent handoffs, leases, confirmation and recovery evidence |
-| **Access** | OIDC Authorization Code + PKCE for people; scoped machine-operator credentials for read-only clients; independent per-host bearer authentication for beacons |
+| Area                    | Current capability                                                                                                                                                                                                       |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Fleet**               | Grid and list views, search, sorting, host liveness, heartbeat history, Nix freshness, kernel posture and service observations                                                                                           |
+| **Map**                 | Optional host location and reachability signals without turning location into a control channel                                                                                                                          |
+| **Backups**             | Per-host backup posture from beacon observations, including protected, stale, failed and unreported states                                                                                                               |
+| **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications                                                                                                             |
+| **Host settings**       | Durable per-host workspace and task rail for color, server/workstation kind and alert preferences, with requested, declared and applied state shown separately                                                           |
+| **Onboarding**          | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions                                                                                                 |
+| **Providers**           | English/German Hetzner portal guidance with Fish-safe commands and exact destination paths, read-only provider checks, exact paid-plan review, attended authorization, single-use creation and ownership-checked cleanup |
+| **Guarded actions**     | Fixed review/apply/restart, fleet-update, host-retirement and managed-service workflows with durable next-action ownership, idempotent handoffs, leases, confirmation and recovery evidence                              |
+| **Access**              | OIDC Authorization Code + PKCE for people; scoped machine-operator credentials for read-only clients; independent per-host bearer authentication for beacons                                                             |
 
 The UI is server-rendered HTML with a focused vanilla-JavaScript interaction
 layer. There is no separate frontend build or client framework.
@@ -86,12 +86,12 @@ layer. There is no separate frontend build or client framework.
 
 ### Workspace
 
-| Crate | Responsibility |
-| --- | --- |
-| `pharos-core` | Versioned host, report, liveness, preferences, provisioning and manifest contracts shared by server and agent |
-| `pharosd` | Fleet store, OIDC guard, machine APIs, server-rendered dashboard, provider connections and guarded workflows |
+| Crate           | Responsibility                                                                                                                    |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `pharos-core`   | Versioned host, report, liveness, preferences, provisioning and manifest contracts shared by server and agent                     |
+| `pharosd`       | Fleet store, OIDC guard, machine APIs, server-rendered dashboard, provider connections and guarded workflows                      |
 | `pharos-beacon` | Small per-host reporter for heartbeat, generation-proven Nix freshness, kernel, backup, location and bounded service observations |
-| `pharos-cli` | Read-only `pharos` operator CLI for health/version, hosts, declarations, beacon last-seen, proofs and provisioning jobs |
+| `pharos-cli`    | Read-only `pharos` operator CLI for health/version, hosts, declarations, beacon last-seen, proofs and provisioning jobs           |
 
 The shared Rust contracts matter: server and beacon cannot silently drift onto
 different report schemas. The current report contract is
@@ -187,9 +187,9 @@ is role-aware: a container with `PHAROS_URL` set is a beacon and runs
 Each verdict prints its reason, visible with
 `docker inspect --format '{{json .State.Health}}' <container>`.
 
-| Role | Healthy means | Unhealthy reasons |
-| --- | --- | --- |
-| `pharosd` | `GET /readyz` on the loopback side of `PHAROS_ADDR` answered 200 | `PHAROS_ADDR` unset or not a socket address (the probe never guesses `127.0.0.1:8080`), unreachable, non-200 status |
+| Role            | Healthy means                                                                                                                       | Unhealthy reasons                                                                                                                                                              |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pharosd`       | `GET /readyz` on the loopback side of `PHAROS_ADDR` answered 200                                                                    | `PHAROS_ADDR` unset or not a socket address (the probe never guesses `127.0.0.1:8080`), unreachable, non-200 status                                                            |
 | `pharos-beacon` | The beacon can write its report state where it is configured and the last successful report is at most three `PHAROS_INTERVAL`s old | `PHAROS_INTERVAL` unset (one-shot beacon), report state location not writable, report state missing, unreadable or invalid, no successful report yet, clock skew, report stale |
 
 The beacon records its last successful report in
@@ -333,11 +333,11 @@ Beacon identity remains per host.
 Local registration returns a raw beacon token exactly once and stores only its
 SHA-256 hash. Report verification uses constant-time comparison.
 
-| `PHAROS_BEACON_TOKEN_MODE` | Accepted token source |
-| --- | --- |
-| `local` | Hashes persisted by local `/register` |
-| `dual` | Local hashes or the active Janus v2 generation during migration |
-| `janus` | The active Janus v2 generation only; strict report auth and disabled local registration are enforced at startup |
+| `PHAROS_BEACON_TOKEN_MODE` | Accepted token source                                                                                           |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `local`                    | Hashes persisted by local `/register`                                                                           |
+| `dual`                     | Local hashes or the active Janus v2 generation during migration                                                 |
+| `janus`                    | The active Janus v2 generation only; strict report auth and disabled local registration are enforced at startup |
 
 Unknown mode values reject startup. Janus mode also rejects a local registration
 credential and requires one readable, non-empty v2 generation root. The retired
@@ -441,11 +441,11 @@ but receives no Pharos credentials, host payload, or HTTP referrer. Deployments
 whose policy forbids that metadata disclosure should block the CARTO tile host;
 the inventory/site view and map labels continue to work without the basemap.
 
-| Vendored file | SHA-256 |
-| --- | --- |
+| Vendored file               | SHA-256                                                            |
+| --------------------------- | ------------------------------------------------------------------ |
 | `leaflet-1.9.4/leaflet.css` | `337bfca5cabd03b39815b2700febe2b3b7edf55921c59cd49f88ecb328212303` |
-| `leaflet-1.9.4/leaflet.js` | `db49d009c841f5ca34a888c96511ae936fd9f5533e90d8b2c4d57596f4e5641a` |
-| `d3-7.9.0/d3.min.js` | `f2094bbf6141b359722c4fe454eb6c4b0f0e42cc10cc7af921fc158fceb86539` |
+| `leaflet-1.9.4/leaflet.js`  | `db49d009c841f5ca34a888c96511ae936fd9f5533e90d8b2c4d57596f4e5641a` |
+| `d3-7.9.0/d3.min.js`        | `f2094bbf6141b359722c4fe454eb6c4b0f0e42cc10cc7af921fc158fceb86539` |
 
 ## Beacons
 
@@ -675,71 +675,71 @@ Pharos does not claim ordering, billing or free-tier guarantees for them.
 The full UI and internal JSON routes are implementation interfaces, not a
 promised third-party API. The important boundaries are:
 
-| Route | Boundary |
-| --- | --- |
-| `GET /healthz`, `GET /version` | Public health and build metadata |
-| `POST /register` | Strict versioned registration contract plus deployment bootstrap token; issues one per-host token |
-| `POST /report` | Strict 64 KiB beacon v5/v4 contract and per-host bearer token |
-| `GET /hosts.json`, `GET /declared-hosts.json`, `GET /proof/{host}` | OIDC/access-policy or scoped machine-operator guarded fleet views |
-| `POST /host-need-intents` | Stores a typed need and creates only the existing immutable Hetzner plan review; authorization and create remain separate |
-| `POST /setup/existing-host/preflight` | Guarded read-only onboarding facts |
-| `/host-actions/...` | OIDC/operator guarded workflow requests |
-| `/agent/actions/...`, `/agent/retirements/...` | Machine-authenticated fixed leases and value-free results |
+| Route                                                              | Boundary                                                                                                                  |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `GET /healthz`, `GET /version`                                     | Public health and build metadata                                                                                          |
+| `POST /register`                                                   | Strict versioned registration contract plus deployment bootstrap token; issues one per-host token                         |
+| `POST /report`                                                     | Strict 64 KiB beacon v5/v4 contract and per-host bearer token                                                             |
+| `GET /hosts.json`, `GET /declared-hosts.json`, `GET /proof/{host}` | OIDC/access-policy or scoped machine-operator guarded fleet views                                                         |
+| `POST /host-need-intents`                                          | Stores a typed need and creates only the existing immutable Hetzner plan review; authorization and create remain separate |
+| `POST /setup/existing-host/preflight`                              | Guarded read-only onboarding facts                                                                                        |
+| `/host-actions/...`                                                | OIDC/operator guarded workflow requests                                                                                   |
+| `/agent/actions/...`, `/agent/retirements/...`                     | Machine-authenticated fixed leases and value-free results                                                                 |
 
 ## Configuration map
 
 ### Server
 
-| Variable | Purpose |
-| --- | --- |
-| `PHAROS_ADDR` | Listen address, default `127.0.0.1:8080` |
-| `PHAROS_PUBLIC_ADDR` | Optional effective public bind used to validate explicit loopback-only open mode behind a local container port mapping |
-| `PHAROS_ALLOW_OPEN` | Explicitly allow unauthenticated human routes; valid only for a loopback public address |
-| `PHAROS_DB` | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly |
-| `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE` | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files |
-| `PHAROS_PROVISIONING_JOBS_DB` | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset |
-| `PHAROS_OIDC_ISSUER` | OIDC discovery issuer |
-| `PHAROS_OIDC_CLIENT_ID` | Public OIDC client identifier |
-| `PHAROS_OIDC_REDIRECT_URI` | Exact callback URI |
-| `PHAROS_ALLOWED_OPERATORS` | Comma/space-separated `operator-ref:<sha256>`, `verified-email-ref:<sha256>`, or `email:<verified-address>` full-fleet identities |
-| `PHAROS_ACCESS_POLICY_FILE` | Optional scoped policy using the same strict OIDC authorization identifiers |
-| `PHAROS_ACCESS_REQUEST_URL` | Optional credential-free HTTPS help destination or local absolute path for the read-only user's GET-only **Request access** action |
-| `PHAROS_JANUS_PROJECTION_ROOT` | Capability-named Janus projection root; Pharos resolves `pharos-beacon-token` and `pharos-machine-operator` beneath it |
-| `PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR` | Migration-compatible direct root for the scoped machine-operator hash-dir v2 (`current` plus immutable `generation-{id}.json` documents using schema `inspr.pharos.machine-operator-token-generation.v2`); cannot be combined with the capability root |
-| `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for local registration; the file form wins and is preferred |
-| `PHAROS_REQUIRE_BEACON_TOKEN` | Require a valid machine token on every report |
-| `PHAROS_BEACON_TOKEN_MODE` | `local`, `dual` or `janus` |
-| `PHAROS_BEACON_TOKEN_HASH_DIR` | Private Janus v2 token-generation root containing `current` and immutable generation files |
-| `PHAROS_MANIFEST_PATHS` | Read-only declared-host manifests |
-| `PHAROS_HOST_PREFERENCES_PATH` | Read-only declared preference registry |
-| `PHAROS_APPLIANCE_PROBES_PATH` | Optional owner-controlled `inspr.pharos.appliance-probes.v1` registry for fixed ICMP/SSH convergence observations; requires `PHAROS_DB` |
-| `PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE` | Owner-controlled pinned SSH host-key file used by existing-host and optional appliance marker reads |
-| `PHAROS_EXISTING_HOST_IDENTITY_FILE` | Owner-controlled SSH identity path; required with the pinned host-key file before appliance marker reads are attempted |
-| `PHAROS_ALERT_WEBHOOK_URL` | Optional HTTP(S) or Telegram alert target; enables durable host-down and backup Stale/Failed incidents, escalation and recovery delivery with redirects disabled |
-| `PHAROS_ALERT_DB` | Optional explicit durable incident/outbox path; derived beside `PHAROS_DB` when unset and required when alert delivery is configured |
-| `PHAROS_ALERT_CHECK_SECS` | Durable alert sweep interval, minimum 5 seconds |
-| `PHAROS_ALERT_WEBHOOK_TIMEOUT_SECS` | Per-request alert delivery timeout, minimum 1 second |
+| Variable                                                       | Purpose                                                                                                                                                                                                                                                |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PHAROS_ADDR`                                                  | Listen address, default `127.0.0.1:8080`                                                                                                                                                                                                               |
+| `PHAROS_PUBLIC_ADDR`                                           | Optional effective public bind used to validate explicit loopback-only open mode behind a local container port mapping                                                                                                                                 |
+| `PHAROS_ALLOW_OPEN`                                            | Explicitly allow unauthenticated human routes; valid only for a loopback public address                                                                                                                                                                |
+| `PHAROS_DB`                                                    | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly                                                                                                             |
+| `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE`                           | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files                                                        |
+| `PHAROS_PROVISIONING_JOBS_DB`                                  | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset                                                                                                                                          |
+| `PHAROS_OIDC_ISSUER`                                           | OIDC discovery issuer                                                                                                                                                                                                                                  |
+| `PHAROS_OIDC_CLIENT_ID`                                        | Public OIDC client identifier                                                                                                                                                                                                                          |
+| `PHAROS_OIDC_REDIRECT_URI`                                     | Exact callback URI                                                                                                                                                                                                                                     |
+| `PHAROS_ALLOWED_OPERATORS`                                     | Comma/space-separated `operator-ref:<sha256>`, `verified-email-ref:<sha256>`, or `email:<verified-address>` full-fleet identities                                                                                                                      |
+| `PHAROS_ACCESS_POLICY_FILE`                                    | Optional scoped policy using the same strict OIDC authorization identifiers                                                                                                                                                                            |
+| `PHAROS_ACCESS_REQUEST_URL`                                    | Optional credential-free HTTPS help destination or local absolute path for the read-only user's GET-only **Request access** action                                                                                                                     |
+| `PHAROS_JANUS_PROJECTION_ROOT`                                 | Capability-named Janus projection root; Pharos resolves `pharos-beacon-token` and `pharos-machine-operator` beneath it                                                                                                                                 |
+| `PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR`                       | Migration-compatible direct root for the scoped machine-operator hash-dir v2 (`current` plus immutable `generation-{id}.json` documents using schema `inspr.pharos.machine-operator-token-generation.v2`); cannot be combined with the capability root |
+| `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for local registration; the file form wins and is preferred                                                                                                                                                                    |
+| `PHAROS_REQUIRE_BEACON_TOKEN`                                  | Require a valid machine token on every report                                                                                                                                                                                                          |
+| `PHAROS_BEACON_TOKEN_MODE`                                     | `local`, `dual` or `janus`                                                                                                                                                                                                                             |
+| `PHAROS_BEACON_TOKEN_HASH_DIR`                                 | Private Janus v2 token-generation root containing `current` and immutable generation files                                                                                                                                                             |
+| `PHAROS_MANIFEST_PATHS`                                        | Read-only declared-host manifests                                                                                                                                                                                                                      |
+| `PHAROS_HOST_PREFERENCES_PATH`                                 | Read-only declared preference registry                                                                                                                                                                                                                 |
+| `PHAROS_APPLIANCE_PROBES_PATH`                                 | Optional owner-controlled `inspr.pharos.appliance-probes.v1` registry for fixed ICMP/SSH convergence observations; requires `PHAROS_DB`                                                                                                                |
+| `PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE`                        | Owner-controlled pinned SSH host-key file used by existing-host and optional appliance marker reads                                                                                                                                                    |
+| `PHAROS_EXISTING_HOST_IDENTITY_FILE`                           | Owner-controlled SSH identity path; required with the pinned host-key file before appliance marker reads are attempted                                                                                                                                 |
+| `PHAROS_ALERT_WEBHOOK_URL`                                     | Optional HTTP(S) or Telegram alert target; enables durable host-down and backup Stale/Failed incidents, escalation and recovery delivery with redirects disabled                                                                                       |
+| `PHAROS_ALERT_DB`                                              | Optional explicit durable incident/outbox path; derived beside `PHAROS_DB` when unset and required when alert delivery is configured                                                                                                                   |
+| `PHAROS_ALERT_CHECK_SECS`                                      | Durable alert sweep interval, minimum 5 seconds                                                                                                                                                                                                        |
+| `PHAROS_ALERT_WEBHOOK_TIMEOUT_SECS`                            | Per-request alert delivery timeout, minimum 1 second                                                                                                                                                                                                   |
 
 ### Beacon
 
-| Variable | Purpose |
-| --- | --- |
-| `PHAROS_URL` | Validated HTTP(S) base URL of `pharosd`; userinfo, query strings and fragments are rejected |
-| `PHAROS_INTERVAL` | Recurring report interval from 10–3600 seconds; unset means report once |
-| `PHAROS_HOSTNAME`, `PHAROS_ROLE` | Explicit reported identity |
-| `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE` | Per-host bearer credential; the file form wins and is preferred |
-| `NIXCFG_DIR` | Read-only checkout used as a Git object source; lock context is accepted only when its digest matches the active generation |
-| `PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE` | Strict generation-owned deployment evidence; missing or malformed evidence renders freshness unverified |
-| `PHAROS_NIXCFG_REMOTE_URL` | Credential-free HTTPS Git repository used as authoritative nixcfg source |
-| `PHAROS_NIXCFG_REMOTE_REF` | Exact `refs/heads/*` authoritative nixcfg branch |
-| `PHAROS_NIXPKGS_REMOTE_URL` | Credential-free HTTPS nixpkgs Git repository; the official NixOS/nixpkgs remote uses the bounded official channel publication, while custom remotes use exact fail-closed Git comparison |
-| `PHAROS_NIXPKGS_CHANNEL_BASE_URL` | Optional credential-free HTTPS base for bounded `<channel>/git-revision` documents; overrides the automatic official channel base |
-| `PHAROS_PREFERENCES_FILE` | Declared or private applied-preferences file |
-| `PHAROS_BACKUP_MODE` | `auto`, `off`, `restic`, `status-file` or `command` |
-| `PHAROS_SERVICE_OBSERVATION_MODE` | `auto` (default), `off` or `compose`; auto stays silent when the local Docker socket is absent, while an indicated but inaccessible or failed local probe reports unknown |
-| `PHAROS_SERVICE_OBSERVATION_INTERVAL_SECS` | Compose discovery cadence, 60–3600 seconds (default 300); cached coarse observations are carried on faster heartbeats and failed probes retry after at most 60 seconds |
-| `PHAROS_DOCKER_SOCKET` | Absolute local Docker Unix socket path (default `/var/run/docker.sock`); remote Docker endpoints are never used |
-| `PHAROS_LOCATION_MODE` | `off`, `env`, `ip-api` or `command` |
+| Variable                                   | Purpose                                                                                                                                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PHAROS_URL`                               | Validated HTTP(S) base URL of `pharosd`; userinfo, query strings and fragments are rejected                                                                                              |
+| `PHAROS_INTERVAL`                          | Recurring report interval from 10–3600 seconds; unset means report once                                                                                                                  |
+| `PHAROS_HOSTNAME`, `PHAROS_ROLE`           | Explicit reported identity                                                                                                                                                               |
+| `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE`       | Per-host bearer credential; the file form wins and is preferred                                                                                                                          |
+| `NIXCFG_DIR`                               | Read-only checkout used as a Git object source; lock context is accepted only when its digest matches the active generation                                                              |
+| `PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE`      | Strict generation-owned deployment evidence; missing or malformed evidence renders freshness unverified                                                                                  |
+| `PHAROS_NIXCFG_REMOTE_URL`                 | Credential-free HTTPS Git repository used as authoritative nixcfg source                                                                                                                 |
+| `PHAROS_NIXCFG_REMOTE_REF`                 | Exact `refs/heads/*` authoritative nixcfg branch                                                                                                                                         |
+| `PHAROS_NIXPKGS_REMOTE_URL`                | Credential-free HTTPS nixpkgs Git repository; the official NixOS/nixpkgs remote uses the bounded official channel publication, while custom remotes use exact fail-closed Git comparison |
+| `PHAROS_NIXPKGS_CHANNEL_BASE_URL`          | Optional credential-free HTTPS base for bounded `<channel>/git-revision` documents; overrides the automatic official channel base                                                        |
+| `PHAROS_PREFERENCES_FILE`                  | Declared or private applied-preferences file                                                                                                                                             |
+| `PHAROS_BACKUP_MODE`                       | `auto`, `off`, `restic`, `status-file` or `command`                                                                                                                                      |
+| `PHAROS_SERVICE_OBSERVATION_MODE`          | `auto` (default), `off` or `compose`; auto stays silent when the local Docker socket is absent, while an indicated but inaccessible or failed local probe reports unknown                |
+| `PHAROS_SERVICE_OBSERVATION_INTERVAL_SECS` | Compose discovery cadence, 60–3600 seconds (default 300); cached coarse observations are carried on faster heartbeats and failed probes retry after at most 60 seconds                   |
+| `PHAROS_DOCKER_SOCKET`                     | Absolute local Docker Unix socket path (default `/var/run/docker.sock`); remote Docker endpoints are never used                                                                          |
+| `PHAROS_LOCATION_MODE`                     | `off`, `env`, `ip-api` or `command`                                                                                                                                                      |
 
 ### Read-only CLI
 
@@ -752,15 +752,18 @@ public service endpoints. The CLI has no write command and never calls
 See the committed Compose files and NixOS module for the complete wiring.
 
 The Paimos adapter config uses schema
-`inspr.pharos.paimos-delivery-adapter.v1`. It requires a credential-free HTTPS
+`inspr.pharos.paimos-delivery-adapter.v2`. It requires a credential-free HTTPS
 origin, `poll_interval_secs` from 5–3600,
 `verification_freshness_secs` from 30–900, one `api_key_file`, and 1–128 strict
 intents. A deployment intent has `stage: "deployment"`,
 `workflow: "deploy-production"` and `update_restart_job_id`; a verification
 intent has `stage: "verification"`, `workflow: "verify-production"` and
 `deployment_handoff_id`. Both carry locally selected `handoff_id`,
-`handoff_secret_file`, `host`, `environment`, and an artifact containing a
-bounded version, `sha256:` digest and lowercase 40- or 64-hex commit digest.
+`handoff_secret_file`, `host`, `environment`, and a legacy-only artifact
+containing `version_scheme: "legacy"`, a bounded version, `sha256:` digest and
+lowercase 40- or 64-hex commit digest. The scheme is bound into local intent
+identity but omitted from the frozen external-stage v1 wire artifact; Calendar
+evidence remains refused until the additive external-stage v2 contract lands.
 Unknown fields, unsafe origins, mismatched deployment/verification pairs and
 shared credential files reject startup. The bundled contract verifier is
 `scripts/check-paimos-delivery-contract.sh`.
@@ -786,7 +789,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.98**. It is already used as a real
+Pharos is an active early release at **v26.09.01.13.29.31**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
@@ -834,9 +837,18 @@ paths for ad-hoc evidence and synthetic fixture data only. Cargo's ignored
 `target/` directory is disposable build cache: never park tests or fleet
 captures there, and never commit captured infrastructure data as a fixture.
 
-The visible version in [`VERSION`](VERSION), the Cargo workspace version and
-the latest entry in [`docs/CHANGELOG.md`](docs/CHANGELOG.md) must stay aligned.
-`pharosd` exposes the version and build commit at `/version`.
+[`RELEASE.json`](RELEASE.json) is the single authoritative release coordinate.
+It records the canonical Calendar Version, stable-channel sequence, migration
+anchor, exact legacy rollback authority and injective Cargo SemVer mapping. The
+consistency gate keeps Cargo, Nix, the changelog and release workflow aligned.
+Each release first validates an untagged digest-only OCI candidate, then signs
+an exact release-set containing both immutable image coordinates and the real
+OCI signature, provenance and SBOM digests before admitting final tags. Its
+source-lock digest hashes, in order, the exact bytes of `Cargo.lock`,
+`devenv.lock`, `flake.lock`, and `package-lock.json` under the domain
+`inspr.pharos.source-lock-set.v1`.
+`pharosd` exposes both the canonical identity and compatibility mapping at
+`/version`.
 
 ## License
 
