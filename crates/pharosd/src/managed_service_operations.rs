@@ -238,6 +238,8 @@ pub(crate) struct ManagedOperationSummary {
     pub value_returned: bool,
     #[serde(skip)]
     pub verification_retryable: bool,
+    #[serde(skip)]
+    pub removal_retryable: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -318,6 +320,7 @@ impl From<&ManagedOperationRecord> for ManagedOperationSummary {
                 }),
             value_returned: false,
             verification_retryable: verification_retryable(record),
+            removal_retryable: removal_retryable(record),
         }
     }
 }
@@ -517,7 +520,7 @@ impl ManagedServiceOperationStore {
         summary.ok_or(ManagedOperationStoreError::NotFound)
     }
 
-    pub(crate) fn retry_verification(
+    pub(crate) fn retry(
         &self,
         operation_ref: &str,
         now: i64,
@@ -543,7 +546,17 @@ impl ManagedServiceOperationStore {
             }
             return Ok(ManagedOperationSummary::from(&current));
         }
-        if !verification_retryable(&current)
+        if matches!(
+            current.phase,
+            ManagedOperationPhase::RemovalPending | ManagedOperationPhase::Removing
+        ) && current.reason_code == Some(ManagedOperationReason::RemovalUncertain)
+        {
+            if *document != previous {
+                self.persist_or_restore(&mut document, previous)?;
+            }
+            return Ok(ManagedOperationSummary::from(&current));
+        }
+        if !(verification_retryable(&current) || removal_retryable(&current))
             || document.operations.values().any(|candidate| {
                 candidate.host_ref == current.host_ref
                     && candidate.service_ref == current.service_ref
@@ -568,8 +581,13 @@ impl ManagedServiceOperationStore {
             .operations
             .get_mut(operation_ref)
             .expect("retry operation exists");
-        operation.phase = ManagedOperationPhase::VerifyPending;
-        operation.reason_code = Some(ManagedOperationReason::EvidenceStale);
+        if operation.operation_kind == ManagedOperationKind::Remove {
+            operation.phase = ManagedOperationPhase::RemovalPending;
+            operation.reason_code = Some(ManagedOperationReason::RemovalUncertain);
+        } else {
+            operation.phase = ManagedOperationPhase::VerifyPending;
+            operation.reason_code = Some(ManagedOperationReason::EvidenceStale);
+        }
         operation.health = None;
         operation.active_lease = None;
         operation.uncertain_attempts = 0;
@@ -837,6 +855,26 @@ fn verification_retryable(operation: &ManagedOperationRecord) -> bool {
                 ManagedOperationReason::VerificationFailed
                     | ManagedOperationReason::ExecutorFailed
                     | ManagedOperationReason::HeartbeatStale
+                    | ManagedOperationReason::OperationTimeout
+            )
+        )
+}
+
+fn removal_retryable(operation: &ManagedOperationRecord) -> bool {
+    operation.operation_kind == ManagedOperationKind::Remove
+        && operation.phase == ManagedOperationPhase::Failed
+        && operation.detach_profile_ref.is_some()
+        && operation.health.is_none()
+        && operation.rollback.is_none()
+        && operation.removal.is_none()
+        && operation.active_lease.is_none()
+        && matches!(
+            operation.reason_code,
+            Some(
+                ManagedOperationReason::RemovalFailed
+                    | ManagedOperationReason::RemovalUncertain
+                    | ManagedOperationReason::ExecutorFailed
+                    | ManagedOperationReason::LeaseExpired
                     | ManagedOperationReason::OperationTimeout
             )
         )
@@ -1466,6 +1504,82 @@ mod tests {
     }
 
     #[test]
+    fn failed_removal_retries_the_same_generation_and_detach_profile_idempotently() {
+        let store = ManagedServiceOperationStore::new(None).unwrap();
+        let manifest = fixture();
+        activate(&store, &manifest, "op_create_retryremove", 1, NOW);
+
+        let mut detached = manifest.services[0].slots[0].clone();
+        detached.binding_state = ManagedBindingState::Detached;
+        let mut removal = ready("op_retryremove01", 1);
+        removal.operation_kind = ManagedOperationKind::Remove;
+        removal.purge_not_before_unix_secs = Some(NOW + 86_400);
+        store.register(&removal, &detached, NOW + 10).unwrap();
+        let first_lease = store.claim(&manifest.host_ref, NOW + 11).unwrap().unwrap();
+        let failed = store
+            .record_result(
+                &result(
+                    &first_lease,
+                    ManagedOperationAgentOutcome::Failed,
+                    ManagedOperationReason::RemovalFailed,
+                ),
+                NOW + 12,
+            )
+            .unwrap();
+        assert_eq!(failed.phase, ManagedOperationPhase::Failed);
+        assert!(failed.removal_retryable);
+        assert!(!failed.value_returned);
+
+        let pending = store.retry(&removal.operation_ref, NOW + 13).unwrap();
+        assert_eq!(pending.phase, ManagedOperationPhase::RemovalPending);
+        assert_eq!(
+            pending.reason_code,
+            Some(ManagedOperationReason::RemovalUncertain)
+        );
+        assert!(!pending.removal_retryable);
+        assert_eq!(
+            store.retry(&removal.operation_ref, NOW + 14).unwrap(),
+            pending
+        );
+
+        let retry_lease = store.claim(&manifest.host_ref, NOW + 15).unwrap().unwrap();
+        assert_eq!(retry_lease.operation_ref, removal.operation_ref);
+        assert_eq!(retry_lease.operation_kind, ManagedOperationKind::Remove);
+        assert_eq!(retry_lease.phase, ManagedOperationAgentPhase::Remove);
+        assert_eq!(retry_lease.generation, 1);
+        assert_eq!(
+            retry_lease.profile_ref,
+            detached.detach.as_ref().unwrap().profile_ref
+        );
+        assert_eq!(
+            store.retry(&removal.operation_ref, NOW + 16).unwrap().phase,
+            ManagedOperationPhase::Removing
+        );
+
+        let mut removed = result(
+            &retry_lease,
+            ManagedOperationAgentOutcome::Succeeded,
+            ManagedOperationReason::PhaseSucceeded,
+        );
+        removed.removal_evidence = Some(ManagedRemovalEvidenceV1 {
+            generation: 1,
+            runtime_absent: true,
+            process_state: ManagedProcessState::Stopped,
+            cache_state: ManagedCacheState::Quarantined,
+            heartbeat_observed_at_unix_secs: NOW + 17,
+            process_observed_at_unix_secs: NOW + 17,
+            cache_observed_at_unix_secs: NOW + 17,
+        });
+        let terminal = store.record_result(&removed, NOW + 17).unwrap();
+        assert_eq!(terminal.phase, ManagedOperationPhase::Removed);
+        assert_eq!(
+            terminal.removal.as_ref().map(|proof| proof.generation),
+            Some(1)
+        );
+        assert!(!terminal.value_returned);
+    }
+
+    #[test]
     fn removal_after_failed_replacement_targets_the_restored_active_generation() {
         let store = ManagedServiceOperationStore::new(None).unwrap();
         let manifest = fixture();
@@ -1701,7 +1815,7 @@ mod tests {
         }
 
         let store = ManagedServiceOperationStore::new(Some(path.clone())).unwrap();
-        let pending = store.retry_verification(operation_ref, NOW + 7).unwrap();
+        let pending = store.retry(operation_ref, NOW + 7).unwrap();
         assert_eq!(pending.phase, ManagedOperationPhase::VerifyPending);
         assert_eq!(
             pending.reason_code,
@@ -1710,10 +1824,7 @@ mod tests {
         assert!(!pending.verification_retryable);
         assert!(pending.health.is_none());
         assert!(!pending.value_returned);
-        assert_eq!(
-            store.retry_verification(operation_ref, NOW + 8).unwrap(),
-            pending
-        );
+        assert_eq!(store.retry(operation_ref, NOW + 8).unwrap(), pending);
 
         let verify = store.claim(&manifest.host_ref, NOW + 9).unwrap().unwrap();
         assert_eq!(verify.operation_ref, operation_ref);
@@ -1737,7 +1848,7 @@ mod tests {
         assert_eq!(active.health.as_ref().unwrap().generation, 1);
         assert!(!active.verification_retryable);
         assert_eq!(
-            store.retry_verification(operation_ref, NOW + 11),
+            store.retry(operation_ref, NOW + 11),
             Err(ManagedOperationStoreError::Conflict)
         );
         fs::remove_file(path).unwrap();
@@ -1763,7 +1874,7 @@ mod tests {
         assert_eq!(failed.phase, ManagedOperationPhase::Failed);
         assert!(!failed.verification_retryable);
         assert_eq!(
-            incomplete.retry_verification(&failed.operation_ref, NOW + 3),
+            incomplete.retry(&failed.operation_ref, NOW + 3),
             Err(ManagedOperationStoreError::Conflict)
         );
     }

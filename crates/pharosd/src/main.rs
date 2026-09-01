@@ -3748,10 +3748,7 @@ async fn retry_managed_service_verification(
     {
         return managed_operation_denial(ManagedOperationStoreError::DeclarationDrift);
     }
-    match state
-        .managed_service_operations
-        .retry_verification(&operation_ref, now)
-    {
+    match state.managed_service_operations.retry(&operation_ref, now) {
         Ok(operation) => (
             StatusCode::OK,
             no_store_headers(),

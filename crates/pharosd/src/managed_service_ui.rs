@@ -84,6 +84,38 @@ document.querySelectorAll('[data-managed-verification-retry]').forEach(button=>b
         :'Fresh verification could not be requested. Nothing changed; try again.';
   }
 }));
+document.querySelectorAll('[data-managed-removal-retry]').forEach(button=>button.addEventListener('click',async()=>{
+  if(button.disabled)return;
+  const status=button.closest('.managed-slot-card')?.querySelector('[data-managed-action-status]');
+  const original=button.textContent;
+  button.disabled=true;button.textContent='Retrying safe removal…';
+  if(status)status.textContent='Requesting the same declared removal again; no secret is created or revealed…';
+  try{
+    const operationRef=button.dataset.operationRef||'';
+    const response=await fetch(`/managed-service-operations/${encodeURIComponent(operationRef)}/retry-verification`,{
+      method:'POST',
+      credentials:'same-origin',
+      headers:{'X-Pharos-Action':'1'}
+    });
+    const contentType=response.headers.get('content-type')||'';
+    if(!contentType.includes('application/json'))throw new Error('invalid_response');
+    const data=await response.json();
+    if(!response.ok
+      ||data.value_returned!==false
+      ||data.operation?.operation_ref!==operationRef
+      ||!['removal_pending','removing','removed'].includes(data.operation?.phase)
+    )throw new Error(data.reason_code||'removal_retry_unavailable');
+    if(status)status.textContent='Safe removal retry requested. Waiting for fresh exact absence evidence from the declared host…';
+    window.location.reload();
+  }catch(error){
+    button.disabled=false;button.textContent=original;
+    if(status)status.textContent=!navigator.onLine
+      ?'You are offline. Reconnect, then retry safe removal.'
+      :error.message==='managed_operation_declaration_drift'
+        ?'This declaration changed. Refresh the page and complete the current nixcfg review first.'
+        :'Safe removal could not be requested. Encrypted recovery material remains protected; try again.';
+  }
+}));
 document.querySelectorAll('[data-managed-details-target]').forEach(button=>button.addEventListener('click',()=>{
   const details=document.getElementById(button.dataset.managedDetailsTarget||'');
   if(details){details.open=true;details.scrollIntoView({block:'nearest'});}
@@ -469,6 +501,17 @@ fn render_slot(
             ),
         )
     } else if state == ManagedSecretSlotState::ActionNeeded
+        && operation.is_some_and(|operation| operation.removal_retryable)
+    {
+        format!(
+            r#"<button class="managed-primary managed-danger" type="button" data-managed-removal-retry data-operation-ref="{operation_ref}">Retry safe removal</button>"#,
+            operation_ref = html_escape(
+                &operation
+                    .expect("retryable removal has an operation")
+                    .operation_ref
+            ),
+        )
+    } else if state == ManagedSecretSlotState::ActionNeeded
         && setup_enabled
         && operation.is_some_and(|operation| {
             operation.operation_kind
@@ -559,6 +602,10 @@ fn render_slot(
             && operation.is_some_and(|operation| operation.verification_retryable)
         {
             "The encrypted generation is already installed. Pharos will request fresh exact-generation health evidence; no secret is created or revealed."
+        } else if state == ManagedSecretSlotState::ActionNeeded
+            && operation.is_some_and(|operation| operation.removal_retryable)
+        {
+            "Pharos will retry the same declared removal generation and detach profile. The host must provide fresh exact absence evidence; no secret is created or revealed."
         } else if setup_enabled
             && state == ManagedSecretSlotState::ActionNeeded
             && operation.is_some_and(|operation| {
@@ -608,6 +655,8 @@ fn render_operation_details(
         .unwrap_or_else(|| "Awaiting host result".to_string());
     let retry = if operation.verification_retryable {
         "A fresh exact-generation verification can be requested; it does not create or reveal a secret."
+    } else if operation.removal_retryable {
+        "The same declared removal can be retried. It reuses the generation and detach profile, and requires fresh exact absence evidence without creating or revealing a secret."
     } else if operation.phase == ManagedOperationPhase::Removed {
         "No browser retry is needed. Final encrypted cleanup remains an idempotent owner task after the recovery window."
     } else if operation.phase.terminal() {
@@ -1031,6 +1080,61 @@ mod tests {
         }
         assert!(!html.contains("View operation details"));
         assert!(!html.contains("secret_value"));
+    }
+
+    #[test]
+    fn failed_removal_offers_the_same_safe_removal_retry_with_recovery_evidence() {
+        let manifest = fixture();
+        let operation = crate::managed_service_operations::ManagedOperationSummary {
+            operation_ref: "op_retryremove_ui".to_string(),
+            operation_kind: ManagedOperationKind::Remove,
+            host_ref: manifest.host_ref.clone(),
+            service_ref: manifest.services[0].service_ref.clone(),
+            slot_ref: manifest.services[0].slots[0].slot_ref.clone(),
+            declaration_fingerprint: manifest.declaration_fingerprint.clone(),
+            generation: 1,
+            purge_not_before_unix_secs: Some(1_800_086_400),
+            phase: ManagedOperationPhase::Failed,
+            reason_code: Some(ManagedOperationReason::RemovalFailed),
+            created_at_unix_secs: 1_800_000_000,
+            updated_at_unix_secs: 1_800_000_010,
+            deadline_unix_secs: 1_800_001_800,
+            health: None,
+            rollback: None,
+            removal: None,
+            value_returned: false,
+            verification_retryable: false,
+            removal_retryable: true,
+        };
+        let html = render_slot(
+            &manifest,
+            &manifest.services[0],
+            &manifest.services[0].slots[0],
+            ManagedSecretSlotState::ActionNeeded,
+            Some(&operation),
+            false,
+            1_800_000_020,
+        );
+        for expected in [
+            "Retry safe removal",
+            "data-managed-removal-retry",
+            "op_retryremove_ui",
+            "same declared removal generation and detach profile",
+            "The same declared removal can be retried",
+            "Operation details",
+            "Terminal evidence",
+        ] {
+            assert!(html.contains(expected), "missing {expected}");
+        }
+        for forbidden in [
+            "data-managed-secret-action",
+            "secret_value",
+            "name=\"source\"",
+            "callback_url",
+        ] {
+            assert!(!html.contains(forbidden), "found {forbidden}");
+        }
+        assert!(MANAGED_SETUP_RUNTIME.contains("Safe removal retry requested"));
     }
 
     #[test]

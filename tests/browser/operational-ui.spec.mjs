@@ -412,6 +412,31 @@ test("managed service secrets stay value-free, accessible, and narrow-screen saf
   await expect(page.getByRole("button", { name: /reveal|show|copy/i })).toHaveCount(0);
   await expect(page.getByRole("link", { name: /reveal|show|copy/i })).toHaveCount(0);
 
+  const managedRuntime = await page.locator("main script").textContent();
+  await page.evaluate((runtime) => {
+    const card = document.createElement("article");
+    card.className = "managed-slot-card";
+    card.innerHTML = [
+      '<button type="button" data-managed-removal-retry data-operation-ref="op_retryremove_browser">Retry safe removal</button>',
+      '<p data-managed-action-status></p>',
+    ].join("");
+    document.body.append(card);
+    new Function(runtime)();
+  }, managedRuntime);
+  const removalRetry = page.getByRole("button", { name: "Retry safe removal" });
+  await expect(removalRetry).toBeVisible();
+  const retryRequest = page.waitForRequest(
+    (request) =>
+      new URL(request.url()).pathname ===
+        "/managed-service-operations/op_retryremove_browser/retry-verification" &&
+      request.method() === "POST",
+  );
+  await removalRetry.click();
+  const retry = await retryRequest;
+  expect(retry.headers()["x-pharos-action"]).toBe("1");
+  expect(retry.postData()).toBeNull();
+  await expect(page.getByText("Safe removal could not be requested.")).toBeVisible();
+
   const html = await page.content();
   for (const forbidden of [
     'name="secret_value"',
