@@ -1399,9 +1399,14 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
 
   await page.goto("/");
+  await page.evaluate(() => {
+    clearRefreshTimer();
+    abandonRefresh();
+  });
   const card = page.locator(
     `article[data-host="${host}"][data-host-surface="runtime"]`,
   );
+  await card.scrollIntoViewIfNeeded();
   await card.locator("[data-host-actions-trigger]").click();
   const fleetLink = card.locator(
     `[data-host-actions-menu]:not([hidden]) [data-host-action="host-settings"]`,
