@@ -2911,16 +2911,41 @@ test("settings sheet live wait advances only from host evidence and stops termin
   await page.getByRole("button", { name: "Confirm change request" }).click();
   const requestPayload = await (await responsePromise).json();
   const runId = requestPayload.job.id;
+  const nextAction = requestPayload.job.workflow.next_action;
+  expect(requestPayload.job.workflow.primary_action).toBeNull();
+  expect(nextAction).toMatchObject({
+    schema: "inspr.pharos.next-action.v1",
+    version: 1,
+    owner: {
+      kind: "host_agent",
+      key: `host-agent:${host}`,
+    },
+    effect: "runtime_verification",
+    availability: {
+      executable: true,
+      execution: "automatic",
+      state: "scheduled",
+      operation: "poll_host_evidence",
+    },
+    idempotency: {
+      key: `${runId}:poll-host-evidence`,
+      duplicate: "return_same_run",
+      uncertain_response: "reconcile_before_retry",
+    },
+    recovery: {
+      strategy: "automatic_retry",
+      escalation_owner: "pharos",
+    },
+  });
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
   const exactGuidance = `The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then ${host} must report the requested values; Pharos will not mark this run complete without that matching host evidence.`;
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
   await expect(dialog.locator('[data-step-state="waiting"]')).toContainText(
     "The nixcfg review, merge, and deployment must finish first",
   );
-  const checkHost = dialog.getByRole("button", { name: "Check host now" });
-  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(1);
+  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-primary]")).toBeHidden();
-  await expect(checkHost).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Check host now" })).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-safe-note]")).toHaveAttribute(
     "data-workflow-live",
     "true",
@@ -2940,53 +2965,19 @@ test("settings sheet live wait advances only from host evidence and stops termin
 
   const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
   const exactJobRequests = [];
-  const manualCheckRequests = [];
-  let recordingManualCheck = false;
   page.on("request", (request) => {
-    if (recordingManualCheck) {
-      manualCheckRequests.push({
-        method: request.method(),
-        path: new URL(request.url()).pathname,
-      });
-    }
     if (new URL(request.url()).pathname === jobPath) {
       exactJobRequests.push(request.method());
     }
   });
-  const checkResponsePromise = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === jobPath &&
-      response.request().method() === "GET",
-  );
-  recordingManualCheck = true;
-  await checkHost.click();
-  expect((await checkResponsePromise).ok()).toBe(true);
-  recordingManualCheck = false;
-  expect(exactJobRequests.length).toBeGreaterThan(0);
-  expect(exactJobRequests.every((method) => method === "GET")).toBe(true);
-  expect(manualCheckRequests.some((request) => request.path === jobPath)).toBe(true);
-  expect(manualCheckRequests.filter((request) => request.method === "POST")).toEqual([]);
-  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
-  await expect(checkHost).toBeEnabled();
-
-  const secondCheckResponsePromise = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === jobPath &&
-      response.request().method() === "GET",
-  );
-  recordingManualCheck = true;
-  await checkHost.click();
-  expect((await secondCheckResponsePromise).ok()).toBe(true);
-  recordingManualCheck = false;
-  await expect(checkHost).toBeEnabled();
-  expect(manualCheckRequests.filter((request) => request.method === "POST")).toEqual([]);
-
-  const readsAfterManualChecks = exactJobRequests.length;
+  const readsBeforeAutomaticPoll = exactJobRequests.length;
   await expect
     .poll(() => exactJobRequests.length, { timeout: 3_500 })
-    .toBe(readsAfterManualChecks + 1);
+    .toBe(readsBeforeAutomaticPoll + 1);
   await page.waitForTimeout(500);
-  expect(exactJobRequests).toHaveLength(readsAfterManualChecks + 1);
+  expect(exactJobRequests).toHaveLength(readsBeforeAutomaticPoll + 1);
+  expect(exactJobRequests.every((method) => method === "GET")).toBe(true);
+  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
 
   const resumedResponsePromise = page.waitForResponse(
     (response) =>
@@ -2996,9 +2987,19 @@ test("settings sheet live wait advances only from host evidence and stops termin
   await page.goto(`/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(runId)}`);
   const resumedPayload = await (await resumedResponsePromise).json();
   expect(resumedPayload.job.id).toBe(runId);
+  expect(resumedPayload.job.workflow.next_action).toMatchObject({
+    owner: { kind: "host_agent", key: `host-agent:${host}` },
+    availability: {
+      executable: true,
+      execution: "automatic",
+      operation: "poll_host_evidence",
+    },
+    idempotency: { key: nextAction.idempotency.key },
+  });
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
-  await expect(dialog.getByRole("button", { name: "Check host now" })).toBeVisible();
+  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Check host now" })).toHaveCount(0);
   await expect(dialog.locator(".host-workflow-meta")).toContainText("Started");
 
   await reportRuntimeHost(page, host, { is_nix: true, preferences: desired });
@@ -3015,7 +3016,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
     "data-workflow-live",
     "false",
   );
-  await expect(dialog.getByRole("button", { name: "Check host now" })).toBeHidden();
+  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(
     "The host reported the requested settings. The saved workflow is complete.",
   );
@@ -3023,6 +3024,23 @@ test("settings sheet live wait advances only from host evidence and stops termin
   await expect(dialog.locator(".host-workflow-advanced")).toContainText("Last update");
   await expect(dialog.locator(".host-workflow-advanced")).toContainText(
     "Host reported the requested settings",
+  );
+  const terminalPayload = await page.request
+    .get(jobPath)
+    .then((response) => response.json());
+  expect(terminalPayload.job.workflow.next_action).toBeUndefined();
+  expect(terminalPayload.job.workflow.primary_action).toBeNull();
+  expect(terminalPayload.job.workflow.terminal_receipt).toMatchObject({
+    schema: "inspr.pharos.terminal-receipt.v1",
+    version: 1,
+    run_id: runId,
+    outcome: "succeeded",
+  });
+  expect(terminalPayload.job.workflow.terminal_receipt.evidence).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ kind: "repository_accepted" }),
+      expect.objectContaining({ kind: "host_state_verified" }),
+    ]),
   );
   const terminalPollCount = requestedUrls.filter((url) => url.includes(jobPath)).length;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
