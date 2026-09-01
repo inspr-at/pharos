@@ -19,7 +19,7 @@ const test = base.extend({
 });
 
 function openHostSettingsTitle(host) {
-  return `Open host settings for ${host}`;
+  return `Open host workspace for ${host}`;
 }
 
 test("fleet has no serious accessibility violations and serves hardened headers", async ({
@@ -84,7 +84,6 @@ test("read-only users get one access path and cannot call mutation endpoints", a
 
   for (const [path, scope] of [
     ["/", "fleet"],
-    ["/agora", "settings"],
     ["/settings/providers", "provider"],
     ["/services", "managed-service"],
   ]) {
@@ -1519,6 +1518,38 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
 }, testInfo) => {
   const host = `host-workspace-${testInfo.project.name}`;
   await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+  await page.route(`**/hosts/${host}/workflow-receipts.json`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        receipts: [
+          {
+            workflow_id: `receipt-${host}`,
+            workflow_kind: "settings_change",
+            receipt_kind: "verified",
+            completed_at: 1_788_265_200,
+            owner: "host agent",
+            requested: { recorded: true },
+            declared: { recorded: true },
+            executed: { recorded: true },
+            verified: { recorded: true },
+            workflow_href: `/hosts/${host}?workflow=receipt-${host}`,
+            activity_href: `/activity?host=${host}#workflow-receipt-${host}`,
+          },
+          {
+            workflow_id: `unsafe-receipt-${host}`,
+            workflow_kind: "host_update",
+            receipt_kind: "completed",
+            completed_at: "2026-09-01T10:00:00Z",
+            owner: "host agent",
+            workflow_href: "//outside.example/workflow",
+            activity_href: "/\\outside.example/activity",
+          },
+        ],
+      }),
+    });
+  });
 
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/");
@@ -1544,9 +1575,36 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-host-task-rail]")).toContainText("Up to date");
   await expect(page.locator("[data-host-workspace-primary]")).toHaveAttribute(
     "href",
-    `/agora?host=${host}`,
+    "#host-settings-editor",
   );
   await expect(page.locator("[data-host-workspace-settings]")).toBeVisible();
+  await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
+  await expect(page.locator("[data-host-workspace-receipts]")).toBeVisible();
+  const receipt = page.locator(`[data-workflow-receipt="receipt-${host}"]`);
+  await expect(receipt).toContainText("verified");
+  await expect(receipt).toContainText("Evidence: requested · declared · executed · verified");
+  await expect(receipt.getByRole("link", { name: "Open workflow" })).toHaveAttribute(
+    "href",
+    `/hosts/${host}?workflow=receipt-${host}`,
+  );
+  await expect(receipt.getByRole("link", { name: "Open in Activity" })).toHaveAttribute(
+    "href",
+    `/activity?host=${host}#workflow-receipt-${host}`,
+  );
+  const unsafeReceipt = page.locator(
+    `[data-workflow-receipt="unsafe-receipt-${host}"]`,
+  );
+  await expect(unsafeReceipt).toContainText("2026");
+  await expect(unsafeReceipt.getByRole("link")).toHaveCount(0);
+  const workspaceA11y = await new AxeBuilder({ page })
+    .include("[data-host-workspace]")
+    .analyze();
+  expect(
+    workspaceA11y.violations.filter(({ impact }) =>
+      ["serious", "critical"].includes(impact),
+    ),
+  ).toEqual([]);
+  await expect(page.locator('nav.side-nav a[href="/agora"]')).toHaveCount(0);
   await expect(page.locator("[data-host-workspace-protection]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-services]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-activity]")).toBeVisible();
@@ -1568,6 +1626,24 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
   await page.setViewportSize({ width: 640, height: 900 });
   await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "static");
+});
+
+test("legacy Agora links hand host context to the host workspace and never dead-end", async ({
+  page,
+}, testInfo) => {
+  const host = `agora-compat-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { preferences: { accent: "#315d7c" } });
+
+  const selected = await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  expect(selected?.status()).toBe(200);
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page.locator("[data-host-workspace]")).toHaveAttribute("data-host", host);
+  await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
+
+  await page.goto("/agora");
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.locator("[data-grid]")).toBeVisible();
+  await expect(page.locator('nav.side-nav a[href="/agora"]')).toHaveCount(0);
 });
 
 test("fleet host drawer keeps context and hands a local draft to guarded settings review", async ({
@@ -1689,7 +1765,7 @@ test("fleet host drawer keeps context and hands a local draft to guarded setting
 
   await color.fill("#48b8a8");
   await review.click();
-  await expect(page).toHaveURL(new RegExp(`/agora\\?host=${host}$`));
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
   const settings = page.locator("[data-color-root]");
   await expect(settings).toHaveAttribute("data-host", host);
   await expect(settings.locator("[data-color]")).toHaveValue("#48b8a8");
@@ -2628,14 +2704,16 @@ test("saved update-restart stays read-only until the exact job renders", async (
     actionsRoot.locator("[data-host-action='lifecycle-continue']:not([hidden])"),
   ).toHaveCount(1);
   await expect(actionsRoot.locator("[data-host-action='lifecycle-continue'] strong")).toHaveText(
-    "Continue: Resume guarded update",
+    "Resume guarded update",
   );
   await expect(actionsRoot.locator("[data-host-action='lifecycle-continue']")).toHaveAttribute(
     "data-lifecycle-run-id",
     runId,
   );
   await expect(
-    actionsRoot.locator(".host-action-item:not([hidden])").filter({ hasText: /^Continue:/ }),
+    actionsRoot
+      .locator(".host-action-item:not([hidden])")
+      .filter({ hasText: /^Resume guarded update/ }),
   ).toHaveCount(1);
 
   await card.scrollIntoViewIfNeeded();
@@ -3085,7 +3163,7 @@ test("settings confirm-creates-one-run and opens the workflow sheet", async ({
       response.url().includes("/agora/requests/host-preferences.json") &&
       response.request().method() === "POST",
   );
-  await dialog.getByRole("button", { name: "Confirm change request" }).click();
+  await dialog.getByRole("button", { name: "Send settings request" }).click();
   const response = await responsePromise;
   expect(response.ok()).toBe(true);
   const payload = await response.json();
@@ -3192,7 +3270,7 @@ test("legacy settings receipt gap pauses polling and continues through one expli
     "may resend the same values",
   );
   await expect(dialog.locator("[data-host-action-safe-note]")).toHaveText(
-    "Ready to continue the saved request",
+    "Advance this saved workflow at its recorded next step.",
   );
   await expect(dialog.locator("[data-host-action-safe-note]")).toHaveAttribute(
     "data-workflow-live",
@@ -3253,7 +3331,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
       response.url().includes("/agora/requests/host-preferences.json") &&
       response.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "Confirm change request" }).click();
+  await page.getByRole("button", { name: "Send settings request" }).click();
   const requestPayload = await (await responsePromise).json();
   const runId = requestPayload.job.id;
   const nextAction = requestPayload.job.workflow.next_action;
@@ -3488,7 +3566,7 @@ test("settings dispatch uncertainty stays recoverable after page reload", async 
   const review = page.locator("[data-review-settings]");
   await expect(review).toBeEnabled();
   await review.click();
-  const confirm = page.getByRole("button", { name: "Confirm change request" });
+  const confirm = page.getByRole("button", { name: "Send settings request" });
   await expect(confirm).toBeVisible();
   const activeConflict = page.waitForResponse(
     (response) =>
@@ -4093,7 +4171,7 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await page.locator("[data-review-settings]").click();
-  await page.getByRole("button", { name: "Confirm change request" }).click();
+  await page.getByRole("button", { name: "Send settings request" }).click();
 
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
   const apply = dialog.getByRole("button", { name: `Apply on ${host}`, exact: true });
@@ -4371,7 +4449,7 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
   await expect(card.locator("[data-host-actions-menu]:not([hidden])")).toBeVisible();
   await expect(continueBtn).toBeVisible();
   await expect(continueBtn).toContainText(
-    "Continue: I verified nixcfg — allow a new request",
+    "I verified nixcfg — allow a new request",
   );
   await expect(continueBtn).toHaveAttribute(
     "data-lifecycle-run-id",
@@ -4453,7 +4531,7 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
   );
   await failedCard.locator("[data-host-actions-trigger]").click();
   await expect(failedContinue).toBeVisible();
-  await expect(failedContinue).toContainText("Continue: Run recovery checks");
+  await expect(failedContinue).toContainText("Run recovery checks");
   await expect(failedContinue).toHaveAttribute("data-lifecycle-run-id", failedRunId);
 
   fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
@@ -4758,9 +4836,9 @@ test("settings run shows five-state truth and withdraw clears only the Pharos re
   expect(menuBox.y).toBeGreaterThanOrEqual(0);
   expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(viewport.width);
   expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(viewport.height);
-  await expect(withdraw).toContainText("Withdraw change request");
+  await expect(withdraw).toContainText("Withdraw settings request");
   await expect(withdraw).toContainText(
-    "Clears the pending request. An open nixcfg proposal stays open there.",
+    "Stops this Pharos run; it does not close an open nixcfg proposal.",
   );
   const withdrawalResponse = page.waitForResponse(
     (response) =>
