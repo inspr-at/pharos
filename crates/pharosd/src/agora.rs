@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::Json;
@@ -18,6 +18,7 @@ use serde_json::json;
 
 use crate::{
     auth::{access_for_headers, AccessGrant},
+    host_actions::host_lifecycle,
     host_actions::HostActionStoreError,
     html_escape,
     nixcfg_dispatch::NixcfgDispatchError,
@@ -240,6 +241,183 @@ pub(crate) async fn page(
         state.auth.is_some(),
         access.can_manage_fleet(),
     ))
+}
+
+/// Stable, host-scoped entry point for the durable operator workspace.
+///
+/// The settings editor remains on Agora because it owns the existing draft,
+/// review, and guarded-apply contract. This page deliberately links to that
+/// concrete task (or a saved workflow) instead of implying that refreshing an
+/// observation will advance host work.
+pub(crate) async fn host_workspace_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(host_ref): Path<String>,
+) -> Html<String> {
+    let user_label = crate::sidebar_user_label(&state.auth, &headers);
+    let access = access_for_headers(&state.auth, &headers);
+    let manifests: Vec<_> = state
+        .manifests
+        .manifests()
+        .iter()
+        .filter(|manifest| {
+            access.allows_host(&manifest.host.name) || access.allows_host(&manifest.slug)
+        })
+        .cloned()
+        .collect();
+    let declared_preferences: BTreeMap<_, _> = state
+        .manifests
+        .declared_preferences()
+        .iter()
+        .filter(|(host, _)| access.allows_host(host))
+        .map(|(host, preferences)| (host.clone(), preferences.clone()))
+        .collect();
+    let runtime_hosts: Vec<_> = state
+        .store
+        .list()
+        .into_iter()
+        .filter(|host| access.allows_host(&host.name))
+        .collect();
+    let views = host_views(&manifests, &declared_preferences, &runtime_hosts);
+    let selected = views
+        .iter()
+        .find(|host| host.name == host_ref || host.slug == host_ref);
+
+    if !access.can_agora() || selected.is_none() {
+        return Html(crate::render_no_access_page(
+            "Host workspace",
+            "A durable view of one host",
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            "fleet",
+        ));
+    }
+
+    let selected = selected.expect("checked above");
+    let runtime = runtime_hosts.iter().find(|host| host.name == selected.name);
+    let observed = runtime
+        .map(|host| host.preferences.clone())
+        .unwrap_or_else(HostPreferences::default);
+    let requested = runtime.and_then(|host| host.requested_preferences.as_ref());
+    let declared = declared_preferences.get(&selected.name);
+    let settings_state = crate::host_preferences_state(&observed, declared, requested);
+    let action_jobs: Vec<_> = state
+        .host_actions
+        .list()
+        .into_iter()
+        .filter(|job| job.host == selected.name)
+        .collect();
+    let lifecycle = host_lifecycle(&action_jobs, &selected.name, settings_state, false);
+
+    Html(render_host_workspace(
+        selected,
+        runtime,
+        &lifecycle,
+        settings_state,
+        &user_label,
+        state.auth.is_some(),
+        access.can_manage_fleet(),
+    ))
+}
+
+fn render_host_workspace(
+    host: &AgoraHostView,
+    runtime: Option<&Host>,
+    lifecycle: &crate::HostLifecycle,
+    settings_state: crate::HostPreferencesState,
+    user_label: &str,
+    logout_enabled: bool,
+    can_manage_fleet: bool,
+) -> String {
+    let extra_css = format!(
+        r#"{AGORA_CSS}<style>
+.host-workspace{{width:min(1320px,100%);display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:22px;align-items:start}}
+.host-workspace-main{{display:grid;gap:16px}}.host-workspace-identity,.host-workspace-section,.host-task-rail{{border:1px solid rgba(210,226,234,.92);border-radius:10px;background:rgba(255,255,255,.9);box-shadow:0 10px 30px rgba(45,75,95,.05)}}
+.host-workspace-identity{{padding:22px;display:flex;gap:15px;align-items:center}}.host-workspace-identity h2,.host-workspace-section h2,.host-task-rail h2{{margin:0;font-family:Georgia,"Times New Roman",serif;font-weight:500}}.host-workspace-identity p,.host-workspace-section p,.host-task-rail p{{margin:5px 0 0;color:var(--muted)}}
+.host-workspace-mark{{display:grid;place-items:center;width:48px;height:48px;border:3px solid {accent};border-radius:50%;color:var(--accent);background:#fff;box-shadow:0 0 0 7px color-mix(in srgb,{accent} 13%,transparent)}}
+.host-workspace-section{{padding:18px}}.host-workspace-section h2{{font-size:18px}}.host-workspace-facts{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:14px}}.host-workspace-facts div{{padding:10px;border-radius:7px;background:#f7fcfd}}.host-workspace-facts span,.host-workspace-facts strong{{display:block}}.host-workspace-facts span{{font-size:11px;color:var(--muted)}}.host-workspace-facts strong{{margin-top:3px;font-size:13px;overflow-wrap:anywhere}}
+.host-task-rail{{position:sticky;top:18px;padding:18px}}.host-task-rail[data-manager="false"]{{border-style:dashed}}.host-task-rail .primary-action{{display:flex;align-items:center;justify-content:center;text-decoration:none;margin-top:16px}}.host-task-rail .task-kind{{display:inline-block;margin-top:11px;color:var(--muted);font-size:12px}}.host-task-rail .task-note{{font-size:12px;line-height:1.45}}.host-workspace-link{{color:#1e668f;font-weight:700}}
+@media(max-width:780px){{.host-workspace{{grid-template-columns:1fr}}.host-task-rail{{position:static;order:0}}.host-workspace-main{{order:1}}.host-workspace-facts{{grid-template-columns:1fr}}}}
+</style>"#,
+        accent = html_escape(&host.declared_accent),
+    );
+    let host_path = crate::url_query_escape(&host.name);
+    let settings_href = format!("/agora?host={host_path}");
+    let (primary_href, primary_label, task_kind) = if let Some(run_id) = lifecycle.run_id.as_deref()
+    {
+        (
+            format!(
+                "/?host={host_path}&workflow={}",
+                crate::url_query_escape(run_id)
+            ),
+            lifecycle
+                .primary_action
+                .as_ref()
+                .map(|action| action.label.as_str())
+                .unwrap_or("Open saved workflow"),
+            "Saved workflow",
+        )
+    } else {
+        (
+            settings_href.clone(),
+            if settings_state == crate::HostPreferencesState::Applied {
+                "Open settings task"
+            } else {
+                "Continue settings task"
+            },
+            "Settings task",
+        )
+    };
+    let report = runtime
+        .and_then(|host| host.last_seen)
+        .map(|seen| seen.to_string())
+        .unwrap_or_else(|| "No host report yet".to_string());
+    let services = runtime
+        .map(|host| host.service_observations.len().to_string())
+        .unwrap_or_else(|| "No observation yet".to_string());
+    let protection = runtime
+        .map(|host| host.backup_observations.len().to_string())
+        .unwrap_or_else(|| "No protection observation yet".to_string());
+    let manager_note = if can_manage_fleet {
+        "You can make guarded changes after the existing review and confirmation gates."
+    } else {
+        "Viewer access: this workspace is read-only; open the owner task to inspect the saved state."
+    };
+    let blocked_by = if lifecycle.blocked_by.is_empty() {
+        "Nothing recorded".to_string()
+    } else {
+        lifecycle.blocked_by.join(", ")
+    };
+    format!(
+        r#"{head}{sidebar}<main class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}"><aside class="host-task-rail" data-host-task-rail data-manager="{can_manage}" aria-label="Next safe action"><span class="task-kind">{task_kind}</span><h2>{lifecycle_label}</h2><p>{lifecycle_detail}</p><a class="primary-action" data-host-workspace-primary href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><a class="host-workspace-link" href="{settings_href}">Open full settings and review</a></aside><div class="host-workspace-main"><header class="host-workspace-identity"><span class="host-workspace-mark">{badge}</span><div><h1>{host_name}</h1><p>{role} · stable workspace</p></div></header><section class="host-workspace-section" data-host-workspace-lifecycle><h2>Lifecycle</h2><p>{lifecycle_detail}</p><div class="host-workspace-facts"><div><span>State</span><strong>{lifecycle_label}</strong></div><div><span>Blocked by</span><strong>{blocked_by}</strong></div></div></section><section class="host-workspace-section" data-host-workspace-settings><h2>Settings</h2><p>Observed, declared, and requested settings continue through the existing Agora review and guarded-apply workflow.</p><div class="host-workspace-facts"><div><span>Settings state</span><strong>{settings_state}</strong></div><div><span>Target</span><strong>{target}</strong></div></div></section><section class="host-workspace-section" data-host-workspace-protection><h2>Protection</h2><p>Backup evidence remains host-reported; Pharos does not claim progress from a refresh.</p><div class="host-workspace-facts"><div><span>Backup observations</span><strong>{protection}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/backups?host={host_path}">Open backup evidence</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-services><h2>Services</h2><p>Non-secret service observations stay linked to this host.</p><div class="host-workspace-facts"><div><span>Observed services</span><strong>{services}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/services">Open services</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-activity><h2>Activity</h2><p>The recorded host report is evidence, not an action.</p><div class="host-workspace-facts"><div><span>Last report</span><strong>{report}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/activity">Open activity</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-technical><h2>Technical context</h2><div class="host-workspace-facts"><div><span>Host reference</span><strong>{host_name}</strong></div><div><span>Configuration target</span><strong>{target}</strong></div></div></section></div></main>{foot}"#,
+        head = crate::head_with_extra(&extra_css),
+        sidebar = crate::sidebar(user_label, logout_enabled, "fleet"),
+        foot = crate::FOOT,
+        host_name = html_escape(&host.name),
+        role = html_escape(&host.role),
+        badge = if host.is_nix {
+            crate::icons::SNOWFLAKE
+        } else {
+            crate::icons::SERVER
+        },
+        can_manage = can_manage_fleet,
+        task_kind = task_kind,
+        lifecycle_label = html_escape(&lifecycle.label),
+        lifecycle_detail = html_escape(&lifecycle.detail),
+        primary_href = html_escape(&primary_href),
+        primary_label = html_escape(primary_label),
+        manager_note = html_escape(manager_note),
+        settings_href = html_escape(&settings_href),
+        blocked_by = html_escape(&blocked_by),
+        settings_state = settings_state.key(),
+        target = html_escape(&host.target_attribute),
+        host_path = html_escape(&host_path),
+        protection = html_escape(&protection),
+        services = html_escape(&services),
+        report = html_escape(&report),
+    )
 }
 
 pub(crate) async fn palette_proposal(

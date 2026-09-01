@@ -4562,7 +4562,7 @@ pub(super) fn map_hosts(
                 outbound_level: outbound.level,
                 outbound_title: outbound.title,
                 outbound_policy: outbound.policy.unwrap_or("unknown"),
-                settings_href: format!("/agora?host={}", url_query_escape(&host.name)),
+                settings_href: format!("/hosts/{}", url_query_escape(&host.name)),
             }
         })
         .collect::<Vec<_>>();
@@ -6643,7 +6643,7 @@ pub(super) fn render_home_with_capabilities(
             search_parts.push(lifecycle.label.to_lowercase());
         }
         let search = html_escape(&search_parts.join(" "));
-        let settings_href_raw = format!("/agora?host={}", url_query_escape(&h.name));
+        let settings_href_raw = format!("/hosts/{}", url_query_escape(&h.name));
         let settings_href = html_escape(&settings_href_raw);
         let settings_color = h
             .preferences

@@ -1384,6 +1384,40 @@ async function reportRuntimeHost(page, name, extra = {}) {
   expect(response.status()).toBe(204);
 }
 
+test("host workspace is a durable manager task rail that becomes in-flow on mobile", async ({
+  page,
+}, testInfo) => {
+  const host = `host-workspace-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+
+  await page.goto("/");
+  const fleetLink = page
+    .locator(`[data-host="${host}"] a[data-settings-state]`)
+    .first();
+  await expect(fleetLink).toHaveAttribute("href", `/hosts/${host}`);
+  await fleetLink.click();
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page.locator("[data-host-workspace]")).toHaveAttribute(
+    "data-can-manage-fleet",
+    "true",
+  );
+  await expect(page.locator("[data-host-task-rail]")).toContainText("Up to date");
+  await expect(page.locator("[data-host-workspace-primary]")).toHaveAttribute(
+    "href",
+    `/agora?host=${host}`,
+  );
+  await expect(page.locator("[data-host-workspace-settings]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-protection]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-services]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-activity]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-technical]")).toBeVisible();
+
+  await page.reload();
+  await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
+  await page.setViewportSize({ width: 640, height: 900 });
+  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "static");
+});
+
 async function applyServerFleetSnapshot(page) {
   const snapshot = await page.request.get("/hosts.json");
   expect(snapshot.ok()).toBe(true);
