@@ -96,10 +96,21 @@ impl NixcfgDispatch {
         host: &str,
         preferences: &HostPreferences,
     ) -> Result<String, NixcfgDispatchError> {
+        let request_id = request_id("settings", host);
+        self.dispatch_settings_with_key(host, preferences, &request_id)
+            .await
+    }
+
+    pub(crate) async fn dispatch_settings_with_key(
+        &self,
+        host: &str,
+        preferences: &HostPreferences,
+        request_id: &str,
+    ) -> Result<String, NixcfgDispatchError> {
         if !self.enabled {
             return Err(NixcfgDispatchError::Disabled);
         }
-        if !valid_host_name(host) {
+        if !valid_host_name(host) || !valid_request_id(request_id) {
             return Err(NixcfgDispatchError::InvalidHost);
         }
         preferences
@@ -109,7 +120,6 @@ impl NixcfgDispatch {
             .accent
             .as_deref()
             .ok_or(NixcfgDispatchError::InvalidPreferences)?;
-        let request_id = request_id("settings", host);
         let request = WorkflowDispatchRequest {
             git_ref: WORKFLOW_REF,
             inputs: WorkflowDispatchInputs {
@@ -119,33 +129,43 @@ impl NixcfgDispatch {
                 suppress_down: preferences.alerts.suppress_down,
                 suppress_backup: preferences.alerts.suppress_backup,
                 suppress_nix_freshness: preferences.alerts.suppress_nix_freshness,
-                request_id: &request_id,
+                request_id,
             },
         };
         self.send(DISPATCH_PATH, &request).await?;
-        Ok(request_id)
+        Ok(request_id.to_string())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn dispatch_system_update(
         &self,
         source_host: &str,
     ) -> Result<String, NixcfgDispatchError> {
+        let request_id = request_id("system-update", source_host);
+        self.dispatch_system_update_with_key(source_host, &request_id)
+            .await
+    }
+
+    pub(crate) async fn dispatch_system_update_with_key(
+        &self,
+        source_host: &str,
+        request_id: &str,
+    ) -> Result<String, NixcfgDispatchError> {
         if !self.system_update_available() {
             return Err(NixcfgDispatchError::Disabled);
         }
-        if !valid_host_name(source_host) {
+        if !valid_host_name(source_host) || !valid_request_id(request_id) {
             return Err(NixcfgDispatchError::InvalidHost);
         }
-        let request_id = request_id("system-update", source_host);
         let request = SystemUpdateDispatchRequest {
             git_ref: WORKFLOW_REF,
             inputs: SystemUpdateDispatchInputs {
                 source_host,
-                request_id: &request_id,
+                request_id,
             },
         };
         self.send(SYSTEM_UPDATE_DISPATCH_PATH, &request).await?;
-        Ok(request_id)
+        Ok(request_id.to_string())
     }
 
     pub(crate) async fn dispatch_host_removal(
@@ -436,6 +456,13 @@ fn valid_host_name(host: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
+fn valid_request_id(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn valid_removal_intent(host: &str, disposition: &str, successor: Option<&str>) -> bool {
     match disposition {
         "rebuilt" => successor.is_some_and(|value| valid_host_name(value) && value != host),
@@ -709,6 +736,25 @@ mod tests {
         assert_eq!(payload["inputs"]["request_id"], request_id);
         assert!(request_id.starts_with("pharos-system-update-hsb8-"));
 
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn saved_run_key_is_the_repository_idempotency_coordinate() {
+        let token_path = token_file();
+        let run_id = "action-system-update-hsb8-1700000000-1";
+        for _ in 0..2 {
+            let (base, request) = mock_github(204);
+            let returned = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+                .dispatch_system_update_with_key("hsb8", run_id)
+                .await
+                .expect("dispatch accepted");
+            let raw = request.recv().expect("request captured");
+            let (_, body) = raw.split_once("\r\n\r\n").expect("request body");
+            let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+            assert_eq!(returned, run_id);
+            assert_eq!(payload["inputs"]["request_id"], run_id);
+        }
         let _ = std::fs::remove_file(token_path);
     }
 
