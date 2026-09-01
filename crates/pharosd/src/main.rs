@@ -6381,7 +6381,7 @@ mod tests {
             "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));"
         ));
         assert!(!html.contains("openHostActionDialog('workflow',root,actionItem,runId)"));
-        assert!(html.contains("Withdraw change request"));
+        assert!(html.contains("Withdraw settings request"));
         assert!(
             html.contains("Clears the pending request. An open nixcfg proposal stays open there.")
         );
@@ -6780,7 +6780,7 @@ mod tests {
         assert!(markup.contains(r#"data-update-restart-active="true""#));
         assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
         assert!(markup.contains(&format!(r#"data-lifecycle-run-id="{}""#, settings_job.id)));
-        assert!(markup.contains("Withdraw change request"));
+        assert!(markup.contains("Withdraw settings request"));
         assert!(!markup.contains("Continue update workflow"));
 
         let payload = hosts_payload(
