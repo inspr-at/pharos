@@ -1491,6 +1491,134 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "static");
 });
 
+test("fleet host drawer keeps context and hands a local draft to guarded settings review", async ({
+  page,
+}, testInfo) => {
+  const host = `host-drawer-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, {
+    preferences: {
+      accent: "#224466",
+      kind: "server",
+      alerts: {
+        suppress_down: false,
+        suppress_backup: false,
+        suppress_nix_freshness: false,
+      },
+    },
+  });
+
+  let settingsDispatches = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      new URL(request.url()).pathname === "/agora/requests/host-preferences.json"
+    ) {
+      settingsDispatches += 1;
+    }
+  });
+
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/");
+  await page.evaluate(() => {
+    clearRefreshTimer();
+    abandonRefresh();
+  });
+  const search = page.locator("input[data-search]");
+  await search.fill(host);
+  const card = page.locator(
+    `article[data-host="${host}"][data-host-surface="runtime"]`,
+  );
+  const trigger = card.locator("[data-host-drawer-trigger]");
+  await card.scrollIntoViewIfNeeded();
+  const beforeScroll = await page.evaluate(() => window.scrollY);
+  await trigger.click();
+
+  const layer = page.locator("[data-host-drawer-layer]");
+  const drawer = page.locator("[data-host-drawer]");
+  await expect(layer).toBeVisible();
+  await expect(drawer).toHaveAttribute("role", "dialog");
+  await expect(drawer.locator("[data-host-drawer-title]")).toHaveText(host);
+  await expect(drawer.locator("[data-host-drawer-owner]")).toHaveText(
+    "No action owner",
+  );
+  await expect(drawer.locator("[data-host-drawer-next]")).toHaveText(
+    "Review host settings",
+  );
+  await expect(drawer.locator("[data-host-drawer-workspace]")).toHaveAttribute(
+    "href",
+    `/hosts/${host}`,
+  );
+  await expect(drawer.locator(".host-drawer-close")).toBeFocused();
+  expect(await page.evaluate(() => window.scrollY)).toBe(beforeScroll);
+  await expect(search).toHaveValue(host);
+  const drawerA11y = await new AxeBuilder({ page })
+    .include("[data-host-drawer]")
+    .analyze();
+  expect(
+    drawerA11y.violations.filter(({ impact }) =>
+      ["serious", "critical"].includes(impact),
+    ),
+  ).toEqual([]);
+
+  const color = drawer.locator("[data-host-drawer-color]");
+  const review = drawer.locator("[data-host-drawer-review]");
+  const discard = drawer.locator("[data-host-drawer-discard]");
+  await expect(color).toHaveValue("#224466");
+  await expect(review).toBeDisabled();
+  await color.fill("#48b8a8");
+  await expect(drawer.locator("[data-host-drawer-draft-status]")).toContainText(
+    "no request sent",
+  );
+  await expect(review).toBeEnabled();
+  expect(settingsDispatches).toBe(0);
+  await drawer.locator(".host-drawer-close").focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(review).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(drawer.locator(".host-drawer-close")).toBeFocused();
+  await page.screenshot({
+    path: testInfo.outputPath("host-drawer-desktop.png"),
+  });
+  await discard.click();
+  await expect(color).toHaveValue("#224466");
+  await expect(review).toBeDisabled();
+  expect(settingsDispatches).toBe(0);
+
+  await page.keyboard.press("Escape");
+  await expect(layer).toBeHidden();
+  await expect(trigger).toBeFocused();
+  await expect(search).toHaveValue(host);
+  expect(await page.evaluate(() => window.scrollY)).toBe(beforeScroll);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await trigger.click();
+  const mobileGeometry = await drawer.evaluate((panel) => {
+    const rect = panel.getBoundingClientRect();
+    return {
+      bottomGap: Math.abs(window.innerHeight - rect.bottom),
+      width: rect.width,
+      viewportWidth: window.innerWidth,
+      horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth,
+    };
+  });
+  expect(mobileGeometry.bottomGap).toBeLessThanOrEqual(32);
+  expect(mobileGeometry.width).toBeLessThanOrEqual(mobileGeometry.viewportWidth);
+  expect(mobileGeometry.horizontalOverflow).toBe(false);
+  await page.screenshot({
+    path: testInfo.outputPath("host-drawer-mobile.png"),
+  });
+
+  await color.fill("#48b8a8");
+  await review.click();
+  await expect(page).toHaveURL(new RegExp(`/agora\\?host=${host}$`));
+  const settings = page.locator("[data-color-root]");
+  await expect(settings).toHaveAttribute("data-host", host);
+  await expect(settings.locator("[data-color]")).toHaveValue("#48b8a8");
+  await expect(settings.locator("[data-draft-summary]")).toContainText("unsent");
+  await expect(settings.locator("[data-review-settings]")).toBeEnabled();
+  expect(settingsDispatches).toBe(0);
+});
+
 async function applyServerFleetSnapshot(page) {
   const snapshot = await page.request.get("/hosts.json");
   expect(snapshot.ok()).toBe(true);

@@ -243,6 +243,32 @@ mod module_tests {
     }
 
     #[test]
+    fn host_quick_drawer_is_a_local_draft_with_an_explicit_workspace_exit() {
+        let drawer = host_quick_drawer(true);
+        assert!(drawer.contains(r#"role="dialog" aria-modal="true""#));
+        assert!(drawer.contains("data-host-drawer-workspace"));
+        assert!(drawer.contains("Prepare a local draft"));
+        assert!(drawer.contains("Closing or discarding removes the draft completely"));
+        assert!(drawer.contains("Review in host settings"));
+
+        let runtime = FOOT
+            .split("function initHostDrawer()")
+            .nth(1)
+            .and_then(|rest| rest.split("let openHostActionsRoot").next())
+            .expect("host drawer runtime");
+        assert!(runtime.contains("closeHostDrawer()"));
+        assert!(runtime.contains("reviewHostDrawerDraft()"));
+        assert!(
+            !runtime.contains("fetch("),
+            "drawer drafts must not dispatch"
+        );
+
+        let viewer = host_quick_drawer(false);
+        assert!(viewer.contains(r#"data-can-manage="false""#));
+        assert!(viewer.contains("Fleet operator access is required"));
+    }
+
+    #[test]
     fn lifecycle_sheet_hides_every_workflow_only_section() {
         let sheet = FOOT
             .split("function openHostLifecycleSheet")
@@ -1843,6 +1869,17 @@ pub(super) fn host_actions_markup(
         file = icons::FILE_TEXT,
         trash = icons::TRASH_2,
         shield = icons::SHIELD_CHECK,
+    )
+}
+
+fn host_quick_drawer(can_manage_fleet: bool) -> String {
+    format!(
+        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="/">Open host workspace {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review in host settings</button></div><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form></div></aside></div>"#,
+        can_manage = can_manage_fleet,
+        server = icons::SERVER,
+        close = icons::X,
+        arrow = icons::ARROW_RIGHT,
+        viewer_hidden = if can_manage_fleet { " hidden" } else { "" },
     )
 }
 
@@ -6676,6 +6713,53 @@ pub(super) fn render_home_with_capabilities(
             format!(r#" style="{}""#, host_color_vars.join(";"))
         };
         let settings_state_key = settings_state.key();
+        let drawer_accent = settings_color.as_deref().unwrap_or("#1f7fb5");
+        let lifecycle_owner = if lifecycle.primary_action.is_some() {
+            "Operator"
+        } else if lifecycle
+            .blocked_by
+            .iter()
+            .any(|blocker| blocker == "host_report")
+        {
+            "Host agent"
+        } else if lifecycle.blocked_by.is_empty() {
+            "No action owner"
+        } else {
+            "Recorded dependency"
+        };
+        let drawer_next = lifecycle
+            .primary_action
+            .as_ref()
+            .map(|action| action.label.as_str())
+            .unwrap_or_else(|| match lifecycle.slot {
+                HostLifecycleSlot::Quiet => "Review host settings",
+                HostLifecycleSlot::PrefsDrift
+                    if lifecycle
+                        .blocked_by
+                        .iter()
+                        .any(|blocker| blocker == "host_report") =>
+                {
+                    "Wait for the next host report"
+                }
+                HostLifecycleSlot::Blocked => "Open the blocking workflow",
+                _ => "Open the host workspace",
+            });
+        let workspace_href = format!("/hosts/{}", url_query_escape(&h.name));
+        let drawer_attrs = format!(
+            r#" data-drawer-accent="{}" data-drawer-kind="{}" data-drawer-suppress-down="{}" data-drawer-suppress-backup="{}" data-drawer-suppress-nix="{}" data-drawer-settings-state="{}" data-drawer-lifecycle-label="{}" data-drawer-lifecycle-detail="{}" data-drawer-lifecycle-owner="{}" data-drawer-next-action="{}" data-drawer-workspace-href="{}" data-drawer-can-manage="{}""#,
+            html_escape(drawer_accent),
+            h.preferences.kind.label(),
+            h.preferences.alerts.suppress_down,
+            h.preferences.alerts.suppress_backup,
+            h.preferences.alerts.suppress_nix_freshness,
+            settings_state_key,
+            html_escape(&lifecycle.label),
+            html_escape(&lifecycle.detail),
+            lifecycle_owner,
+            html_escape(drawer_next),
+            html_escape(&workspace_href),
+            capabilities.can_manage_fleet,
+        );
         let settings_title = format!("Open host settings for {name}");
         let settings_action = format!(
             r#"<a class="header-chip settings-card" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"><span class="settings-icon">{settings_icon}</span><span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
@@ -6754,6 +6838,11 @@ pub(super) fn render_home_with_capabilities(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
         );
+        let drawer_title = html_escape(&format!("Open overview for {}", h.name));
+        let card_identity = format!(
+            r#"<button class="host host-drawer-trigger" type="button" data-host-drawer-trigger title="{drawer_title}" aria-label="{drawer_title}" aria-haspopup="dialog" aria-controls="host-quick-drawer" aria-expanded="false"><span class="nix">{nix_icon}</span><span><span class="name">{name}</span><span class="role">{role}</span></span></button>"#,
+        );
+        let row_identity = card_identity.clone();
         let card_heartbeat = heartbeat_card(
             h.last_seen,
             &h.heartbeat_log,
@@ -6785,11 +6874,11 @@ pub(super) fn render_home_with_capabilities(
         let signal = signal_markup(&heartbeat_signal);
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}>{beam}<header class="card-head">{card_identity}<div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}><td>{row_identity}</td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
             live_key = live_key(live),
         ));
     }
@@ -6817,14 +6906,16 @@ pub(super) fn render_home_with_capabilities(
     } else {
         String::new()
     };
+    let host_drawer = host_quick_drawer(capabilities.can_manage_fleet);
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{action_dialog}{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         toolbar = toolbar(),
         assistant = assistant,
+        host_drawer = host_drawer,
         action_dialog = action_dialog,
         now = now,
     )

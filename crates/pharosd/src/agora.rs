@@ -1406,6 +1406,26 @@ if(root){{
   setPicked(color?.value||'{accent}');
   syncDownAlertPolicy();
   savedPreferences=draftPreferences();
+  const incomingDraft=new URLSearchParams(window.location.search);
+  if(settingsCanManageFleet()&&incomingDraft.get('draft')==='fleet-drawer'&&incomingDraft.get('host')===root.dataset.host){{
+    const incomingAccent=incomingDraft.get('draft_accent')||'';
+    const incomingKind=incomingDraft.get('draft_kind')||'';
+    const boolValue=name=>incomingDraft.get(name)==='true';
+    if(/^#[0-9a-fA-F]{{6}}$/.test(incomingAccent)&&['server','workstation'].includes(incomingKind)){{
+      applyPreferences({{
+        accent:incomingAccent,
+        kind:incomingKind,
+        alerts:{{
+          suppress_down:boolValue('draft_suppress_down'),
+          suppress_backup:boolValue('draft_suppress_backup'),
+          suppress_nix_freshness:boolValue('draft_suppress_nix'),
+        }},
+      }});
+      const cleanUrl=new URL(window.location.href);
+      ['draft','draft_accent','draft_kind','draft_suppress_down','draft_suppress_backup','draft_suppress_nix'].forEach(key=>cleanUrl.searchParams.delete(key));
+      window.history.replaceState(null,'',cleanUrl.pathname+(cleanUrl.searchParams.size?'?'+cleanUrl.searchParams.toString():''));
+    }}
+  }}
   updateDraftState();
 }}
 </script></div></body></html>"##,
