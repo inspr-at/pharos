@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.95-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.96-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -46,7 +46,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v0.1.95
+## What ships in v0.1.96
 
 | Area | Current capability |
 | --- | --- |
@@ -54,10 +54,10 @@ operation.
 | **Map** | Optional host location and reachability signals without turning location into a control channel |
 | **Backups** | Per-host backup posture from beacon observations, including protected, stale, failed and unreported states |
 | **Alerts and activity** | Actionable fleet attention, value-free workflow history and optional outbound silent-heartbeat notifications |
-| **Host settings** | Color, server/workstation kind and alert preferences with requested, declared and applied state shown separately |
+| **Host settings** | Durable per-host workspace and task rail for color, server/workstation kind and alert preferences, with requested, declared and applied state shown separately |
 | **Onboarding** | Existing-host preflight, native beacon or NixOS handoff, first-heartbeat tracking and explicit backup/location decisions |
 | **Providers** | English/German Hetzner portal guidance with Fish-safe commands and exact destination paths, read-only provider checks, exact paid-plan review, attended authorization, single-use creation and ownership-checked cleanup |
-| **Guarded actions** | Fixed review/apply/restart, fleet-update proposal and host-retirement workflows with leases, confirmation and recovery evidence |
+| **Guarded actions** | Fixed review/apply/restart, fleet-update, host-retirement and managed-service workflows with durable next-action ownership, idempotent handoffs, leases, confirmation and recovery evidence |
 | **Access** | OIDC Authorization Code + PKCE for people; scoped machine-operator credentials for read-only clients; independent per-host bearer authentication for beacons |
 
 The UI is server-rendered HTML with a focused vanilla-JavaScript interaction
@@ -770,7 +770,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.95**. It is already used as a real
+Pharos is an active early release at **v0.1.96**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

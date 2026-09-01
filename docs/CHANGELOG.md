@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.96 - 2026-09-01
+
+- Add a durable per-host workspace with a state-aware settings task rail, stable deep links, and responsive desktop/mobile layout so the operator always has one visible safe next step (PHAROS-244).
+- Persist value-free next-action ownership, timing, idempotency, recovery, and terminal receipts across settings and removal handoffs; automatically reconcile exact host evidence without refresh-as-progress, survive restarts and uncertain responses, and serialize withdrawal/replacement races against exact-run completion (PHAROS-245).
+- Replace managed-service dead ends with executable setup, retry, recovery, and owner-review actions; failed removals reuse the same reviewed generation safely, respect recovery deadlines and active leases, and never expose or recreate secret values (PHAROS-246).
+
 ## 0.1.95 - 2026-08-31
 
 - Turn an accepted settings request whose exact nixcfg declaration is loaded into a one-click `Apply on <host>` path: atomically link one idempotent guarded deployment, preserve the settings request as the visible parent across review, confirmation, retry, recovery, and reload, keep backup, Janus, fleet-lock, rollback, and attended-confirmation gates intact, block withdrawal once guarded work exists, and complete only when the host reports the exact requested values (PHAROS-241).
