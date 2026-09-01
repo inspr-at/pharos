@@ -100,6 +100,7 @@ jobs:
           PHAROS_OIDC_REDIRECT_URI=https://pharos.example/auth/callback \
           PHAROS_ALLOWED_OPERATORS=email:alice@example.com \
           PHAROS_REGISTRATION_TOKEN_FILE=/run/secrets/test-registration-token \
+          PHAROS_IMAGE_REFERENCE="$(jq -er '.legacy_rollback.reference' RELEASE.json)" \
           docker compose -f docker-compose.selfhost.yml config >/dev/null
       - name: Compose observation Docker formatter contract
         run: scripts/check-compose-observation-contract.sh
