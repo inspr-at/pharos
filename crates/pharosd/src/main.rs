@@ -6375,6 +6375,14 @@ mod tests {
         assert!(FOOT.contains("if(hostActionPoll.terminal)return;"));
         assert!(FOOT.contains("hostActionPoll.terminal=!active;"));
         assert!(FOOT.contains("Watching for recorded host evidence"));
+        assert!(FOOT.contains("function hostActionWorkflowRevision(job,workflowHtml)"));
+        assert!(FOOT.contains("timing.overdue===true"));
+        assert!(FOOT.contains("workflowHtml||''"));
+        assert!(FOOT
+            .contains("hostActionPoll.lastRevision=hostActionWorkflowRevision(job,workflowHtml);"));
+        assert!(FOOT.contains(
+            "const revision=hostActionWorkflowRevision(payload.job,payload.workflow_html);"
+        ));
         assert!(FOOT.contains("function scheduleHostActionPoll(id,delay=2000)"));
         assert!(FOOT.contains("hostActionPoll.timer=null;\n    pollHostActionJob(id,false);"));
         assert!(FOOT.contains("if(document.hidden){pauseHostActionPoll();return}"));

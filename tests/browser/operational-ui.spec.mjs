@@ -1982,6 +1982,70 @@ test("lifecycle chip opens persisted run sheet without agora navigation", async 
   expect(reonboard.ok()).toBe(true);
 });
 
+test("open Fleet workflow repaints a timing-only overdue transition", async ({ page }) => {
+  const host = "bl-workflow-timing-transition";
+  const runId = "action-settings-timing-transition-1";
+  const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  await reportRuntimeHost(page, host, { is_nix: true });
+
+  let polls = 0;
+  await page.route("**/host-actions/jobs/**", async (route) => {
+    const request = route.request();
+    if (request.method() !== "GET" || new URL(request.url()).pathname !== jobPath) {
+      await route.continue();
+      return;
+    }
+    polls += 1;
+    const overdue = polls >= 2;
+    const job = {
+      id: runId,
+      host,
+      kind: "system_update_proposal",
+      state: "proposal_requested",
+      updated_at: 1_700_000_100,
+      workflow: {
+        kind: "settings_change",
+        title: `Change ${host} settings`,
+        guidance: "Waiting for matching host evidence.",
+        status_label: "waiting for host",
+        primary_action: null,
+        can_cancel: false,
+        next_action: {
+          timing: {
+            as_of: overdue ? 1_700_000_401 : 1_700_000_399,
+            next_check_at: overdue ? 1_700_000_416 : 1_700_000_414,
+            overdue,
+            escalation_due: false,
+          },
+        },
+      },
+    };
+    const workflowHtml = `<section class="host-workflow-summary" data-workflow-timing-state="${overdue ? "overdue" : "on-schedule"}"><section class="host-workflow-timing" data-workflow-timing="${overdue ? "overdue" : "on-schedule"}"><strong>${overdue ? "Taking longer than expected" : "Background progress is active"}</strong></section></section>`;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        job,
+        message: job.workflow.guidance,
+        workflow_html: workflowHtml,
+      }),
+    });
+  });
+
+  await page.goto(`/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(runId)}`);
+  const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "Background progress is active",
+  );
+  await expect(dialog.locator('[data-workflow-timing="overdue"]')).toContainText(
+    "Taking longer than expected",
+    { timeout: 4_000 },
+  );
+  expect(polls).toBe(2);
+  await page.waitForTimeout(500);
+  expect(polls).toBe(2);
+});
+
 test("fleet refresh kernel chip follows server lifecycle transitions", async ({ page }) => {
   const host = "bl-kernel-lifecycle";
   await reportRuntimeHost(page, host, {

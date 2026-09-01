@@ -525,6 +525,16 @@ function hostActionPollDelay(job){
   if(kind==='remove_host')return 10000;
   return job?.state==='rebooting'?5000:2000;
 }
+function hostActionWorkflowRevision(job,workflowHtml){
+  const workflow=job?.workflow||{};
+  const timing=workflow.next_action?.timing||{};
+  return JSON.stringify([
+    job?.id,job?.state,job?.updated_at,
+    workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||'',
+    timing.as_of||'',timing.next_check_at||'',timing.overdue===true,timing.escalation_due===true,
+    workflowHtml||''
+  ]);
+}
 function renderHostActionJob(job,message,workflowHtml){
   if(!hostActionContext||!job)return;
   const overlay=document.querySelector('[data-host-action-overlay]');
@@ -553,7 +563,7 @@ function renderHostActionJob(job,message,workflowHtml){
   hostActionContext.root.dataset.actionJobId=job.id;
   hostActionContext.root.dataset.actionKind=workflowKind;
   hostActionContext.root.dataset.actionState=job.state;
-  hostActionPoll.lastRevision=[job.id,job.state,job.updated_at,workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||''].join(':');
+  hostActionPoll.lastRevision=hostActionWorkflowRevision(job,workflowHtml);
   if(dialog){dialog.dataset.workflow='true';dialog.dataset.action=workflowKind.replaceAll('_','-')}
   dialog?.querySelectorAll('[data-action-icon]').forEach(icon=>{
     const iconKind=workflowKind==='settings_change'?'settings-change':workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':'system-update';
@@ -630,8 +640,7 @@ async function pollHostActionJob(id,immediate=false){
     const payload=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(payload.error||'Could not refresh guarded action state.');
     hostActionPoll.failures=0;
-    const workflow=payload.job?.workflow||{};
-    const revision=[payload.job?.id,payload.job?.state,payload.job?.updated_at,workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||''].join(':');
+    const revision=hostActionWorkflowRevision(payload.job,payload.workflow_html);
     if(immediate||revision!==hostActionPoll.lastRevision)renderHostActionJob(payload.job,payload.message,payload.workflow_html);
     else scheduleHostActionPoll(id,hostActionPollDelay(payload.job));
   }catch(error){
