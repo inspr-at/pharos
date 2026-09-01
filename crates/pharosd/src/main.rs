@@ -5735,7 +5735,7 @@ mod tests {
         assert!(html.contains(r#"data-seen data-seen-compact"#));
         assert!(html.contains(r#"class="list-actions""#));
         assert!(html.contains("seen.hasAttribute('data-seen-compact')"));
-        assert!(html.contains(r#"href="/agora?host=poseidon""#));
+        assert!(html.contains(r#"href="/hosts/poseidon""#));
         assert!(!html.contains("No settings yet"));
         assert!(!html.contains("Not set up yet"));
         assert!(!html.contains("control light"));
@@ -8692,7 +8692,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             true,
         );
 
-        assert!(html.contains(r#"href="/agora?host=poseidon""#));
+        assert!(html.contains(r#"href="/hosts/poseidon""#));
         assert!(!html.contains(r#"class="card has-settings""#));
         assert!(html.contains(r#"data-settings-state="declared_not_applied""#));
         assert!(html.contains(r#"aria-label="Ready to apply""#));
@@ -8705,7 +8705,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             1
         );
         assert!(html.contains(
-            r#"data-host-action="host-settings" data-settings-state="declared_not_applied" href="/agora?host=poseidon""#
+            r#"data-host-action="host-settings" data-settings-state="declared_not_applied" href="/hosts/poseidon""#
         ));
         assert!(html.contains(
             r#"<span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#
