@@ -138,12 +138,211 @@ fn retry_delay(cadence_secs: u64, consecutive_failures: u32, jitter_seed: u64) -
     )
 }
 
+fn report_failure_delay(
+    failure: ReportFailure,
+    cadence_secs: u64,
+    consecutive_failures: u32,
+    jitter_seed: u64,
+) -> Option<Duration> {
+    (failure.disposition == ReportFailureDisposition::Retryable)
+        .then(|| retry_delay(cadence_secs, consecutive_failures, jitter_seed))
+}
+
 fn jitter_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0)
         ^ u64::from(std::process::id())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportFailureDisposition {
+    Retryable,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportFailureCode {
+    LocalContract,
+    Dns,
+    Tls,
+    Timeout,
+    Connection,
+    Transport,
+    HttpContract,
+    HttpAuthentication,
+    HttpRetired,
+    HttpRetryable,
+    HttpRejected,
+}
+
+impl ReportFailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalContract => "local.contract",
+            Self::Dns => "transport.dns",
+            Self::Tls => "transport.tls",
+            Self::Timeout => "transport.timeout",
+            Self::Connection => "transport.connection",
+            Self::Transport => "transport.other",
+            Self::HttpContract => "http.contract",
+            Self::HttpAuthentication => "http.authentication",
+            Self::HttpRetired => "http.retired",
+            Self::HttpRetryable => "http.retryable",
+            Self::HttpRejected => "http.rejected",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "local.contract" => Self::LocalContract,
+            "transport.dns" => Self::Dns,
+            "transport.tls" => Self::Tls,
+            "transport.timeout" => Self::Timeout,
+            "transport.connection" => Self::Connection,
+            "transport.other" => Self::Transport,
+            "http.contract" => Self::HttpContract,
+            "http.authentication" => Self::HttpAuthentication,
+            "http.retired" => Self::HttpRetired,
+            "http.retryable" => Self::HttpRetryable,
+            "http.rejected" => Self::HttpRejected,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReportFailure {
+    code: ReportFailureCode,
+    http_status: Option<u16>,
+    disposition: ReportFailureDisposition,
+}
+
+impl ReportFailure {
+    fn local_contract() -> Self {
+        Self {
+            code: ReportFailureCode::LocalContract,
+            http_status: None,
+            disposition: ReportFailureDisposition::Terminal,
+        }
+    }
+
+    fn from_http_status(status: u16) -> Self {
+        let (code, disposition) = match status {
+            400 | 409 | 422 => (
+                ReportFailureCode::HttpContract,
+                ReportFailureDisposition::Terminal,
+            ),
+            401 | 403 => (
+                ReportFailureCode::HttpAuthentication,
+                ReportFailureDisposition::Terminal,
+            ),
+            410 => (
+                ReportFailureCode::HttpRetired,
+                ReportFailureDisposition::Terminal,
+            ),
+            408 | 425 | 429 | 500..=599 => (
+                ReportFailureCode::HttpRetryable,
+                ReportFailureDisposition::Retryable,
+            ),
+            _ => (
+                ReportFailureCode::HttpRejected,
+                ReportFailureDisposition::Terminal,
+            ),
+        };
+        Self {
+            code,
+            http_status: Some(status),
+            disposition,
+        }
+    }
+
+    fn from_ureq(error: &ureq::Error) -> Self {
+        if let ureq::Error::StatusCode(status) = error {
+            return Self::from_http_status(*status);
+        }
+        let code = match error {
+            ureq::Error::HostNotFound => ReportFailureCode::Dns,
+            ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::TlsRequired => {
+                ReportFailureCode::Tls
+            }
+            ureq::Error::Timeout(_) => ReportFailureCode::Timeout,
+            ureq::Error::ConnectionFailed => ReportFailureCode::Connection,
+            ureq::Error::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                ReportFailureCode::Connection
+            }
+            ureq::Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                ReportFailureCode::Timeout
+            }
+            _ => ReportFailureCode::Transport,
+        };
+        Self {
+            code,
+            http_status: None,
+            disposition: ReportFailureDisposition::Retryable,
+        }
+    }
+
+    fn owner(self) -> &'static str {
+        match self.code {
+            ReportFailureCode::LocalContract | ReportFailureCode::HttpContract => {
+                "Pharos release owner"
+            }
+            ReportFailureCode::HttpAuthentication => "Janus credential owner",
+            ReportFailureCode::HttpRetired => "fleet configuration owner",
+            ReportFailureCode::Dns
+            | ReportFailureCode::Tls
+            | ReportFailureCode::Timeout
+            | ReportFailureCode::Connection
+            | ReportFailureCode::Transport => "host network owner",
+            ReportFailureCode::HttpRetryable => "Pharos service owner",
+            ReportFailureCode::HttpRejected => "Pharos access owner",
+        }
+    }
+
+    fn next_step(self) -> &'static str {
+        match self.code {
+            ReportFailureCode::LocalContract => "update or repair the beacon report producer",
+            ReportFailureCode::HttpContract => {
+                "update the beacon and receiver to compatible releases"
+            }
+            ReportFailureCode::HttpAuthentication => "rotate or reissue the host credential",
+            ReportFailureCode::HttpRetired => {
+                "choose governed host re-enrolment or remove the retired beacon declaration"
+            }
+            ReportFailureCode::Dns => "restore control-plane name resolution",
+            ReportFailureCode::Tls => "repair the control-plane TLS trust path",
+            ReportFailureCode::Timeout | ReportFailureCode::Connection => {
+                "restore connectivity to the control plane"
+            }
+            ReportFailureCode::Transport => "check the host-to-control-plane network path",
+            ReportFailureCode::HttpRetryable => "wait for the bounded automatic retry",
+            ReportFailureCode::HttpRejected => "review the host access policy",
+        }
+    }
+
+    fn diagnostic(self) -> String {
+        let status = self
+            .http_status
+            .map(|status| format!("; HTTP {status}"))
+            .unwrap_or_default();
+        format!(
+            "reason_code={}{}; owner={}; next={}",
+            self.code.as_str(),
+            status,
+            self.owner(),
+            self.next_step()
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -169,6 +368,30 @@ fn systemd_notify(message: &str) {
 
 #[cfg(not(target_os = "linux"))]
 fn systemd_notify(_message: &str) {}
+
+fn publish_report_failure(
+    health_path: &Path,
+    generation: Option<&ProcessGeneration>,
+    last_success_at: Option<i64>,
+    failure: ReportFailure,
+) {
+    let diagnostic = failure.diagnostic();
+    systemd_notify(&format!("STATUS=Report failed; {diagnostic}"));
+    eprintln!("pharos-beacon: report failed ({diagnostic})");
+    if generation.is_some_and(|generation| {
+        write_beacon_failure(health_path, last_success_at, generation, failure).is_err()
+    }) {
+        eprintln!("pharos-beacon: could not publish the report failure to container health");
+    }
+}
+
+fn hold_terminal_report_failure(cadence_secs: u64, failure: ReportFailure) -> ! {
+    let status = format!("STATUS=Report quarantined; {}", failure.diagnostic());
+    loop {
+        thread::sleep(Duration::from_secs(cadence_secs));
+        systemd_notify(&format!("WATCHDOG=1\n{status}"));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreferencesApplyError {
@@ -458,15 +681,31 @@ fn create_beacon_health_temp(temporary: &Path) -> std::io::Result<File> {
     options.open(temporary)
 }
 
-/// Atomically publishes `v2 <last_success_at> <pid> <start>` under the
-/// marker lock, replacing any leftover of its own fixed temp name first.
+/// Atomically publishes a successful report under the marker lock, replacing
+/// any leftover of its own fixed temp name first.
 fn write_beacon_health(
     path: &Path,
     last_success_at: i64,
     generation: &ProcessGeneration,
 ) -> std::io::Result<()> {
     let lock = lock_beacon_health(path).map_err(std::io::Error::other)?;
-    write_beacon_health_locked(path, last_success_at, generation, &lock)
+    write_beacon_health_locked(path, last_success_at, generation, None, &lock)
+}
+
+fn write_beacon_failure(
+    path: &Path,
+    last_success_at: Option<i64>,
+    generation: &ProcessGeneration,
+    failure: ReportFailure,
+) -> std::io::Result<()> {
+    let lock = lock_beacon_health(path).map_err(std::io::Error::other)?;
+    write_beacon_health_locked(
+        path,
+        last_success_at.unwrap_or(0),
+        generation,
+        Some(failure),
+        &lock,
+    )
 }
 
 /// The write itself; `_lock` is the caller's held marker lock, so this can
@@ -475,14 +714,18 @@ fn write_beacon_health_locked(
     path: &Path,
     last_success_at: i64,
     generation: &ProcessGeneration,
+    last_failure: Option<ReportFailure>,
     _lock: &File,
 ) -> std::io::Result<()> {
     let temporary = beacon_health_sibling_path(path, BEACON_HEALTH_WRITE_TEMP)?;
     let write_result = (|| -> std::io::Result<()> {
         let mut file = create_beacon_health_temp(&temporary)?;
+        let (failure_code, http_status) = last_failure
+            .map(|failure| (failure.code.as_str(), failure.http_status.unwrap_or(0)))
+            .unwrap_or(("none", 0));
         writeln!(
             file,
-            "v2 {last_success_at} {} {}",
+            "v3 {last_success_at} {} {} {failure_code} {http_status}",
             generation.pid, generation.start
         )?;
         file.sync_all()?;
@@ -711,7 +954,7 @@ fn initialize_beacon_health_within(
             path.display()
         )
     })?;
-    let Err(write_err) = write_beacon_health_locked(path, 0, generation, &lock) else {
+    let Err(write_err) = write_beacon_health_locked(path, 0, generation, None, &lock) else {
         return Ok(());
     };
     match invalidate_beacon_health_locked(path, &observed, &lock) {
@@ -757,6 +1000,7 @@ enum BeaconHealthProblem {
         detail: String,
     },
     NoSuccessfulReportYet,
+    ReportFailed(ReportFailure),
     ClockSkew {
         last_success_at: i64,
         now: i64,
@@ -808,6 +1052,9 @@ impl std::fmt::Display for BeaconHealthProblem {
             Self::NoSuccessfulReportYet => {
                 write!(f, "no successful report to the control plane yet")
             }
+            Self::ReportFailed(failure) => {
+                write!(f, "last report failed ({})", failure.diagnostic())
+            }
             Self::ClockSkew {
                 last_success_at,
                 now,
@@ -834,6 +1081,7 @@ impl std::fmt::Display for BeaconHealthProblem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BeaconHealthRecord {
     last_success_at: Option<i64>,
+    last_failure: Option<ReportFailure>,
     generation: ProcessGeneration,
 }
 
@@ -858,6 +1106,68 @@ fn read_beacon_health(path: &Path) -> Result<BeaconHealthRecord, BeaconHealthPro
     file.read_to_string(&mut raw).map_err(unreadable)?;
     let fields: Vec<&str> = raw.split_ascii_whitespace().collect();
     match fields.as_slice() {
+        ["v3", stamp, pid, start, failure_code, status] => {
+            let last_success_at = stamp.parse::<i64>().map_err(|_| invalid())?;
+            let pid = pid.parse::<u32>().map_err(|_| invalid())?;
+            let status = status.parse::<u16>().map_err(|_| invalid())?;
+            let last_success_at = match last_success_at {
+                0 => None,
+                stamp if stamp > 0 => Some(stamp),
+                _ => return Err(invalid()),
+            };
+            let last_failure = match (*failure_code, status) {
+                ("none", 0) => None,
+                ("none", _) => return Err(invalid()),
+                (code, status) => {
+                    let code = ReportFailureCode::parse(code).ok_or_else(invalid)?;
+                    let http_status = match code {
+                        ReportFailureCode::HttpContract
+                        | ReportFailureCode::HttpAuthentication
+                        | ReportFailureCode::HttpRetired
+                        | ReportFailureCode::HttpRetryable
+                        | ReportFailureCode::HttpRejected
+                            if status >= 100 =>
+                        {
+                            Some(status)
+                        }
+                        ReportFailureCode::LocalContract
+                        | ReportFailureCode::Dns
+                        | ReportFailureCode::Tls
+                        | ReportFailureCode::Timeout
+                        | ReportFailureCode::Connection
+                        | ReportFailureCode::Transport
+                            if status == 0 =>
+                        {
+                            None
+                        }
+                        _ => return Err(invalid()),
+                    };
+                    let expected = http_status
+                        .map(ReportFailure::from_http_status)
+                        .unwrap_or_else(|| ReportFailure {
+                            code,
+                            http_status: None,
+                            disposition: if code == ReportFailureCode::LocalContract {
+                                ReportFailureDisposition::Terminal
+                            } else {
+                                ReportFailureDisposition::Retryable
+                            },
+                        });
+                    if expected.code != code {
+                        return Err(invalid());
+                    }
+                    Some(expected)
+                }
+            };
+            Ok(BeaconHealthRecord {
+                last_success_at,
+                last_failure,
+                generation: ProcessGeneration {
+                    pid,
+                    start: (*start).to_string(),
+                },
+            })
+        }
         ["v2", stamp, pid, start] => {
             let last_success_at = stamp.parse::<i64>().map_err(|_| invalid())?;
             let pid = pid.parse::<u32>().map_err(|_| invalid())?;
@@ -868,6 +1178,7 @@ fn read_beacon_health(path: &Path) -> Result<BeaconHealthRecord, BeaconHealthPro
             };
             Ok(BeaconHealthRecord {
                 last_success_at,
+                last_failure: None,
                 generation: ProcessGeneration {
                     pid,
                     start: (*start).to_string(),
@@ -919,6 +1230,9 @@ fn beacon_health_verdict_with(
             pid: record.generation.pid,
             detail,
         })?;
+    if let Some(failure) = record.last_failure {
+        return Err(BeaconHealthProblem::ReportFailed(failure));
+    }
     let last_success_at = record
         .last_success_at
         .ok_or(BeaconHealthProblem::NoSuccessfulReportYet)?;
@@ -3120,6 +3434,7 @@ fn main() {
     let deadlines = RequestDeadlines::for_cadence(beat).expect("default cadence is valid");
     let agent = deadlines.agent();
     let mut last_report_rtt_ms: Option<u64> = None;
+    let mut last_success_at: Option<i64> = None;
     let mut consecutive_failures = 0_u32;
     let mut service_observation_cache = ServiceObservationCache::from_env();
     let health_path = beacon_health_path();
@@ -3220,8 +3535,12 @@ fn main() {
             preferences: preferences.clone(),
         };
         if report.validate_contract().is_err() {
-            eprintln!("pharos-beacon: locally collected report violates the report contract");
-            std::process::exit(2);
+            let failure = ReportFailure::local_contract();
+            publish_report_failure(&health_path, generation.as_ref(), last_success_at, failure);
+            match interval {
+                Some(cadence) => hold_terminal_report_failure(cadence, failure),
+                None => std::process::exit(2),
+            }
         }
         let body = serde_json::to_string(&report).expect("serialize report");
         let mut request = agent
@@ -3231,13 +3550,15 @@ fn main() {
             request = request.header("Authorization", &format!("Bearer {token}"));
         }
         let started = Instant::now();
-        let report_succeeded = match request.send(body.as_str()) {
+        let report_failure = match request.send(body.as_str()) {
             Ok(resp) if resp.status().is_success() => {
                 let status = resp.status().as_u16();
                 last_report_rtt_ms = Some(report_rtt_millis(started.elapsed()));
+                let succeeded_at = now_unix();
+                last_success_at = Some(succeeded_at);
                 consecutive_failures = 0;
                 if generation.as_ref().is_some_and(|generation| {
-                    write_beacon_health(&health_path, now_unix(), generation).is_err()
+                    write_beacon_health(&health_path, succeeded_at, generation).is_err()
                 }) {
                     eprintln!(
                         "pharos-beacon: could not refresh container health state at {}",
@@ -3273,33 +3594,37 @@ fn main() {
                         );
                     }
                 }
-                true
+                None
             }
-            Ok(_) => {
+            Ok(response) => {
+                let failure = ReportFailure::from_http_status(response.status().as_u16());
                 last_report_rtt_ms = None;
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                systemd_notify("STATUS=Report failed; retrying");
-                eprintln!("pharos-beacon: report failed (unexpected HTTP status)");
-                false
+                publish_report_failure(&health_path, generation.as_ref(), last_success_at, failure);
+                Some(failure)
             }
-            Err(_) => {
+            Err(error) => {
+                let failure = ReportFailure::from_ureq(&error);
                 last_report_rtt_ms = None;
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                systemd_notify("STATUS=Report failed; retrying");
-                eprintln!("pharos-beacon: report failed (transport or HTTP error)");
-                false
+                publish_report_failure(&health_path, generation.as_ref(), last_success_at, failure);
+                Some(failure)
             }
         };
         let Some(cadence) = interval else {
-            if !report_succeeded {
+            if report_failure.is_some() {
                 std::process::exit(1);
             }
             break;
         };
-        if report_succeeded {
-            thread::sleep(Duration::from_secs(cadence));
-        } else {
-            thread::sleep(retry_delay(cadence, consecutive_failures, jitter_seed()));
+        match report_failure {
+            None => thread::sleep(Duration::from_secs(cadence)),
+            Some(failure) => {
+                match report_failure_delay(failure, cadence, consecutive_failures, jitter_seed()) {
+                    Some(delay) => thread::sleep(delay),
+                    None => hold_terminal_report_failure(cadence, failure),
+                }
+            }
         }
     }
 }
@@ -4322,6 +4647,108 @@ mod tests {
     }
 
     #[test]
+    fn report_failures_classify_http_contract_authentication_retirement_and_retry() {
+        let classify = |status| ReportFailure::from_ureq(&ureq::Error::StatusCode(status));
+        let contract = classify(400);
+        assert_eq!(contract.code, ReportFailureCode::HttpContract);
+        assert_eq!(contract.disposition, ReportFailureDisposition::Terminal);
+
+        let authentication = classify(401);
+        assert_eq!(authentication.code, ReportFailureCode::HttpAuthentication);
+        assert_eq!(
+            authentication.disposition,
+            ReportFailureDisposition::Terminal
+        );
+
+        let retired = classify(410);
+        assert_eq!(retired.code, ReportFailureCode::HttpRetired);
+        assert_eq!(retired.disposition, ReportFailureDisposition::Terminal);
+        assert!(retired.diagnostic().contains("HTTP 410"));
+        assert!(retired.diagnostic().contains("re-enrolment"));
+        assert!(retired.diagnostic().contains("remove"));
+
+        let unavailable = classify(503);
+        assert_eq!(unavailable.code, ReportFailureCode::HttpRetryable);
+        assert_eq!(unavailable.disposition, ReportFailureDisposition::Retryable);
+        assert!(report_failure_delay(unavailable, 60, 1, 0).is_some());
+        assert!(report_failure_delay(retired, 60, 1, 0).is_none());
+    }
+
+    #[test]
+    fn report_failures_classify_transport_without_exposing_error_details() {
+        let cases = [
+            (
+                ureq::Error::HostNotFound,
+                ReportFailureCode::Dns,
+                "restore control-plane name resolution",
+            ),
+            (
+                ureq::Error::Tls("credential-shaped internal detail"),
+                ReportFailureCode::Tls,
+                "repair the control-plane TLS trust path",
+            ),
+            (
+                ureq::Error::Timeout(ureq::Timeout::Global),
+                ReportFailureCode::Timeout,
+                "restore connectivity to the control plane",
+            ),
+            (
+                ureq::Error::ConnectionFailed,
+                ReportFailureCode::Connection,
+                "restore connectivity to the control plane",
+            ),
+        ];
+
+        for (error, expected_code, expected_next_step) in cases {
+            let failure = ReportFailure::from_ureq(&error);
+            let diagnostic = failure.diagnostic();
+            assert_eq!(failure.code, expected_code);
+            assert_eq!(failure.disposition, ReportFailureDisposition::Retryable);
+            assert!(diagnostic.contains(expected_code.as_str()));
+            assert!(diagnostic.contains(expected_next_step));
+            assert!(!diagnostic.contains("credential-shaped"));
+        }
+
+        let timed_out_io = ureq::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "private command output",
+        ));
+        let failure = ReportFailure::from_ureq(&timed_out_io);
+        assert_eq!(failure.code, ReportFailureCode::Timeout);
+        assert!(!failure.diagnostic().contains("private command output"));
+    }
+
+    #[test]
+    fn report_failure_health_uses_the_same_actionable_value_free_diagnostic() {
+        let path = kernel_fixture("report-failure-health");
+        let failure = ReportFailure::from_http_status(410);
+        write_beacon_failure(&path, Some(1_000), &generation(), failure)
+            .expect("write failed-report health");
+
+        let problem = beacon_health_verdict(&path, 60, 1_001).unwrap_err();
+        assert_eq!(problem, BeaconHealthProblem::ReportFailed(failure));
+        let health_diagnostic = problem.to_string();
+        assert!(health_diagnostic.contains(&failure.diagnostic()));
+        assert!(!health_diagnostic.contains("token"));
+        assert!(!health_diagnostic.contains("/report"));
+
+        write_marker(&path, 1_002).expect("a later success clears the failure");
+        assert_eq!(beacon_health_verdict(&path, 60, 1_003), Ok(1));
+        std::fs::remove_file(path).expect("remove health fixture");
+    }
+
+    #[test]
+    fn local_report_contract_failure_is_terminal_and_actionable() {
+        let failure = ReportFailure::local_contract();
+        assert_eq!(failure.code, ReportFailureCode::LocalContract);
+        assert_eq!(failure.disposition, ReportFailureDisposition::Terminal);
+        assert!(failure.diagnostic().contains("Pharos release owner"));
+        assert!(failure
+            .diagnostic()
+            .contains("repair the beacon report producer"));
+    }
+
+    #[test]
     fn beacon_health_tracks_recent_success_and_stalled_reporting() {
         let path = kernel_fixture("container-health");
         write_marker(&path, 1_000).expect("write successful report health");
@@ -5321,7 +5748,7 @@ mod tests {
             )
         });
         std::fs::remove_dir(&temp).expect("unblock temp for the publisher");
-        write_beacon_health_locked(&path, 1_005, &generation(), &publisher)
+        write_beacon_health_locked(&path, 1_005, &generation(), None, &publisher)
             .expect("publish under the held lock");
         std::fs::create_dir(&temp).expect("block the writer temp again");
         let reason = startup.join().expect("startup thread").unwrap_err();
