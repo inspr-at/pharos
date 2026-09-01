@@ -1698,6 +1698,69 @@ test("legacy Agora links hand host context to the host workspace and never dead-
   await expect(page.locator('nav.side-nav a[href="/agora"]')).toHaveCount(0);
 });
 
+test("Activity receipt links resolve, focus, and recover without exposing another host", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "chromium-desktop",
+    "the exact Activity receipt-link contract is covered once on desktop",
+  );
+  const host = "activity-receipt-link";
+  await reportRuntimeHost(page, host, {
+    is_nix: true,
+    kernel: {
+      state: "reboot_required",
+      running_version: "6.18.26",
+      expected_version: "7.0.14",
+      observed_at: 1_700_000_000,
+    },
+  });
+  const request = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host, preferences: { accent: "#315d7c" } },
+  });
+  expect(request.status()).toBe(409);
+  const snapshot = await page.request.get("/hosts.json");
+  expect(snapshot.ok()).toBe(true);
+  const payload = await snapshot.json();
+  const hostData = payload.hosts.find((entry) => entry.name === host);
+  const workflow = hostData?.lifecycle?.run_id;
+  expect(workflow).toBeTruthy();
+
+  await page.goto(
+    `/activity?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(workflow)}#workflow-${encodeURIComponent(workflow)}`,
+  );
+  const row = page.locator(`[id="workflow-${workflow}"]`);
+  await expect(page.locator("[data-activity-workflow-focus]")).toContainText(host);
+  await expect(page.locator("[data-ops-row]")).toHaveCount(1);
+  await expect(row).toBeVisible();
+  await expect(row).toHaveAttribute("data-workflow-id", workflow);
+  await expect(row).toHaveAttribute("data-host", host);
+  await expect(row).toHaveAttribute("data-deep-linked", "true");
+  await expect(row).toHaveAttribute("aria-current", "location");
+  await expect(row).toBeFocused();
+  await expect(page.getByRole("link", { name: "Show all activity" })).toHaveAttribute(
+    "href",
+    "/activity",
+  );
+
+  const wrongHost = "activity-receipt-other-host";
+  await page.goto(
+    `/activity?host=${wrongHost}&workflow=${encodeURIComponent(workflow)}#workflow-${encodeURIComponent(workflow)}`,
+  );
+  await expect(page.locator("[data-activity-workflow-unavailable]")).toBeVisible();
+  await expect(page.locator("[data-activity-workflow-unavailable]")).toContainText(
+    "unknown, belongs to another host, or is not available to your account",
+  );
+  await expect(page.locator("[data-ops-row]")).toHaveCount(0);
+  await expect(page.locator("main")).not.toContainText(workflow);
+  await expect(page.locator("main")).not.toContainText(host);
+  await expect(page.getByRole("link", { name: "Show all activity" })).toHaveAttribute(
+    "href",
+    "/activity",
+  );
+
+});
+
 test("fleet host drawer keeps context and hands a local draft to guarded settings review", async ({
   page,
 }, testInfo) => {

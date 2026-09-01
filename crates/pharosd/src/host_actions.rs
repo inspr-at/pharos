@@ -1686,7 +1686,10 @@ impl HostActionJob {
         self.push_receipt_evidence(
             &mut evidence,
             HostWorkflowReceiptStage::Requested,
-            &[HostActionEventKind::Requested],
+            &[
+                HostActionEventKind::Requested,
+                HostActionEventKind::DispatchFailed,
+            ],
         );
         self.push_receipt_evidence(
             &mut evidence,
@@ -1694,14 +1697,22 @@ impl HostActionJob {
             &[
                 HostActionEventKind::RemovalDeclarationCompleted,
                 HostActionEventKind::ReviewPassed,
+                HostActionEventKind::ReviewFailed,
             ],
         );
         self.push_receipt_evidence(
             &mut evidence,
             HostWorkflowReceiptStage::Executed,
             &[
+                HostActionEventKind::RemovalAccessRevoked,
+                HostActionEventKind::RemovalCredentialRetired,
                 HostActionEventKind::RecoveryPassed,
                 HostActionEventKind::ApplyPassed,
+                HostActionEventKind::ApplyFailed,
+                HostActionEventKind::RecoveryFailed,
+                HostActionEventKind::SettingsFailed,
+                HostActionEventKind::RemovalCredentialFailed,
+                HostActionEventKind::RemovalFailed,
             ],
         );
         self.push_receipt_evidence(
@@ -1740,15 +1751,17 @@ impl HostActionJob {
         stage: HostWorkflowReceiptStage,
         kinds: &[HostActionEventKind],
     ) {
-        let Some(event) = self.latest_event(kinds) else {
-            return;
-        };
-        receipt.push(HostWorkflowReceiptEvidence {
-            stage,
-            event: event.kind,
-            recorded_at: event.at,
-            owner: receipt_owner(&self.host, event),
-        });
+        for kind in kinds {
+            let Some(event) = self.latest_event(&[*kind]) else {
+                continue;
+            };
+            receipt.push(HostWorkflowReceiptEvidence {
+                stage,
+                event: event.kind,
+                recorded_at: event.at,
+                owner: receipt_owner(&self.host, event),
+            });
+        }
     }
 
     pub(crate) fn can_continue_legacy_settings(&self) -> bool {
@@ -8128,6 +8141,48 @@ mod tests {
                 .state,
             WorkflowStepState::ActionRequired
         );
+
+        store
+            .queue_recovery(&job.id, "hsb8", "markus", 329)
+            .expect("second recovery queued");
+        store.claim("hsb8", 330).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Resume,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: true,
+                        kernel_verified: true,
+                        rollback_available: true,
+                        failure_gate: None,
+                        recovery_mode: Some(HostActionRecoveryMode::TrustedDescendant),
+                    }),
+                },
+                331,
+            )
+            .expect("second recovery succeeds");
+        let receipt = store
+            .recent_terminal_receipts_for_host("hsb8")
+            .expect("valid host")
+            .into_iter()
+            .next()
+            .expect("terminal recovery receipt");
+        for event in [
+            HostActionEventKind::ApplyFailed,
+            HostActionEventKind::RecoveryFailed,
+            HostActionEventKind::RecoveryPassed,
+        ] {
+            assert!(receipt.evidence.iter().any(|fact| {
+                fact.stage == HostWorkflowReceiptStage::Executed && fact.event == event
+            }));
+        }
     }
 
     #[test]
@@ -11939,6 +11994,45 @@ mod tests {
             None,
             "all removal gates are complete"
         );
+        let receipt = store
+            .recent_terminal_receipts_for_host("hsb8")
+            .expect("valid host")
+            .into_iter()
+            .next()
+            .expect("removal receipt");
+        assert_eq!(receipt.workflow_kind, HostWorkflowKind::RemoveHost);
+        assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Completion);
+        for event in [
+            HostActionEventKind::RemovalAccessRevoked,
+            HostActionEventKind::RemovalCredentialFailed,
+            HostActionEventKind::RemovalCredentialRetired,
+            HostActionEventKind::RemovalCompleted,
+        ] {
+            assert!(
+                receipt.evidence.iter().any(|fact| fact.event == event),
+                "receipt omits {event:?}"
+            );
+        }
+        assert_eq!(
+            receipt
+                .evidence
+                .iter()
+                .find(|fact| fact.event == HostActionEventKind::RemovalAccessRevoked)
+                .expect("access fact")
+                .owner
+                .source,
+            HostActionEventSource::Pharos
+        );
+        assert_eq!(
+            receipt
+                .evidence
+                .iter()
+                .find(|fact| fact.event == HostActionEventKind::RemovalCredentialRetired)
+                .expect("credential fact")
+                .owner
+                .source,
+            HostActionEventSource::RetirementAgent
+        );
     }
 
     #[test]
@@ -12338,6 +12432,53 @@ mod tests {
             .evidence
             .iter()
             .any(|fact| fact.kind == TerminalEvidenceKind::HostStateVerified));
+    }
+
+    #[test]
+    fn failed_host_receipts_retain_typed_value_free_failure_evidence() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 450)
+            .expect("settings run");
+        store
+            .fail_settings_change(&settings.id, 451)
+            .expect("settings failure persists");
+        let removal = store
+            .begin_removal(
+                "gpc0",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Destroyed,
+                    successor: None,
+                    declaration_pending: true,
+                    credential_retirement_required: true,
+                },
+                452,
+            )
+            .expect("removal run");
+        store
+            .fail_removal(&removal.id, 453)
+            .expect("removal failure persists");
+
+        for (host, event) in [
+            ("hsb8", HostActionEventKind::SettingsFailed),
+            ("gpc0", HostActionEventKind::RemovalFailed),
+        ] {
+            let receipt = store
+                .recent_terminal_receipts_for_host(host)
+                .expect("valid host")
+                .into_iter()
+                .next()
+                .expect("failure receipt");
+            assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Failure);
+            assert_eq!(receipt.outcome, TerminalOutcome::Failed);
+            assert!(receipt.evidence.iter().any(|fact| {
+                fact.stage == HostWorkflowReceiptStage::Executed && fact.event == event
+            }));
+            let serialized = serde_json::to_string(&receipt).expect("receipt serializes");
+            assert!(!serialized.to_ascii_lowercase().contains("token"));
+            assert!(!serialized.contains("https://"));
+        }
     }
 
     #[test]

@@ -167,6 +167,94 @@ mod module_tests {
     }
 
     #[test]
+    fn activity_focus_resolves_only_an_exact_authorized_host_and_workflow() {
+        let job = HostActionStore::new(None)
+            .create_system_update_proposal(
+                "activity-workflow-known".to_string(),
+                "athena",
+                "markus",
+                1_000,
+            )
+            .expect("action fixture");
+        let exact: ActivityQuery = serde_json::from_value(serde_json::json!({
+            "host": "athena",
+            "workflow": "activity-workflow-known"
+        }))
+        .expect("activity query");
+        assert_eq!(
+            activity_focus(&exact, std::slice::from_ref(&job)),
+            ActivityFocus::Workflow {
+                host: "athena".to_string(),
+                workflow_id: "activity-workflow-known".to_string(),
+            }
+        );
+
+        for unavailable in [
+            serde_json::json!({
+                "host": "other-host",
+                "workflow": "activity-workflow-known"
+            }),
+            serde_json::json!({
+                "host": "athena",
+                "workflow": "activity-workflow-unknown"
+            }),
+            serde_json::json!({"workflow": "activity-workflow-known"}),
+        ] {
+            let query: ActivityQuery = serde_json::from_value(unavailable).expect("activity query");
+            assert_eq!(
+                activity_focus(&query, std::slice::from_ref(&job)),
+                ActivityFocus::Unavailable
+            );
+        }
+
+        let recovery = activity_focus_path(&ActivityFocus::Unavailable);
+        assert!(recovery.contains("Workflow activity unavailable"));
+        assert!(recovery.contains(r#"href="/activity""#));
+        assert!(!recovery.contains("activity-workflow-known"));
+    }
+
+    #[test]
+    fn focused_activity_renders_the_exact_anchored_row_beyond_the_history_limit() {
+        let mut events: Vec<_> = (0..80)
+            .map(|index| {
+                ActivityEvent::new(
+                    2_000 - index,
+                    format!("host-{index}"),
+                    "info",
+                    "heartbeat",
+                    "Heartbeat received",
+                    "Host checked in.",
+                    "heartbeat",
+                )
+            })
+            .collect();
+        events.push(
+            ActivityEvent::new(
+                1,
+                "athena",
+                "recovery",
+                "action",
+                "Guarded host update completed",
+                "PHAROS-251 · requested by operator.",
+                "guarded action",
+            )
+            .with_workflow("activity-workflow-oldest"),
+        );
+
+        assert!(!activity_rows(&events).contains("activity-workflow-oldest"));
+        let focus = ActivityFocus::Workflow {
+            host: "athena".to_string(),
+            workflow_id: "activity-workflow-oldest".to_string(),
+        };
+        let focused = focus_activity_events(events, &focus);
+        assert_eq!(focused.len(), 1);
+        let rows = activity_rows(&focused);
+        assert!(rows.contains(r#"id="workflow-activity-workflow-oldest""#));
+        assert!(rows.contains(r#"data-workflow-id="activity-workflow-oldest""#));
+        assert!(rows.contains(r#"data-host="athena""#));
+    }
+
+    #[test]
     fn viewer_access_path_names_role_owner_and_get_only_help_route() {
         for scope in ["fleet", "settings", "provider", "managed-service"] {
             let html = viewer_access_path(scope);
@@ -757,6 +845,7 @@ pub(super) async fn alerts_page(
 pub(super) async fn activity_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ActivityQuery>,
 ) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
@@ -789,7 +878,8 @@ pub(super) async fn activity_page(
         .into_iter()
         .filter(|job| access.allows_host(&job.host))
         .collect();
-    no_store_html(render_activity_with_actions(
+    let focus = activity_focus(&query, &action_jobs);
+    no_store_html(render_activity_with_focus(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
@@ -809,6 +899,7 @@ pub(super) async fn activity_page(
             user_label: &user_label,
             logout_enabled: state.auth.is_some(),
         },
+        focus,
     ))
 }
 
@@ -3376,6 +3467,41 @@ pub(super) struct ActivitySources<'a> {
     pub(super) load_errors: &'a [ManifestLoadIssue],
     pub(super) server_probes: &'a BTreeMap<String, Vec<ServerProbeObservation>>,
     pub(super) action_jobs: &'a [HostActionJob],
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ActivityQuery {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    workflow: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ActivityFocus {
+    All,
+    Workflow { host: String, workflow_id: String },
+    Unavailable,
+}
+
+pub(super) fn activity_focus(
+    query: &ActivityQuery,
+    authorized_action_jobs: &[HostActionJob],
+) -> ActivityFocus {
+    match (query.host.as_deref(), query.workflow.as_deref()) {
+        (None, None) => ActivityFocus::All,
+        (Some(host), Some(workflow_id))
+            if authorized_action_jobs
+                .iter()
+                .any(|job| job.host == host && job.id == workflow_id) =>
+        {
+            ActivityFocus::Workflow {
+                host: host.to_string(),
+                workflow_id: workflow_id.to_string(),
+            }
+        }
+        _ => ActivityFocus::Unavailable,
+    }
 }
 
 pub(super) fn search_box(placeholder: &str) -> String {
@@ -6259,11 +6385,15 @@ pub(super) fn activity_filter_bar(events: &[ActivityEvent]) -> String {
 }
 
 pub(super) fn render_activity_row(event: &ActivityEvent) -> String {
-    let (tag, href) = event.workflow_id.as_deref().map_or_else(
-        || ("article", String::new()),
+    let (tag, workflow_attributes, href) = event.workflow_id.as_deref().map_or_else(
+        || ("article", String::new(), String::new()),
         |workflow_id| {
             (
                 "a",
+                format!(
+                    r#" id="workflow-{workflow}" data-workflow-id="{workflow}""#,
+                    workflow = html_escape(workflow_id),
+                ),
                 format!(
                     r#" href="/?host={host}&amp;workflow={workflow}" aria-label="Open saved workflow for {host_label}" title="Open saved workflow""#,
                     host = html_escape(&url_query_escape(&event.host)),
@@ -6274,8 +6404,9 @@ pub(super) fn render_activity_row(event: &ActivityEvent) -> String {
         },
     );
     format!(
-        r#"<{tag} class="activity-row {level}" data-ops-row data-activity-kind="{kind}" data-activity-level="{level}" data-ops-kind="{kind}" data-ops-level="{level}" data-host-search="{host_search}"{href}><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></{tag}>"#,
+        r#"<{tag} class="activity-row {level}" data-ops-row data-activity-kind="{kind}" data-activity-level="{level}" data-ops-kind="{kind}" data-ops-level="{level}" data-host="{host}" data-host-search="{host_search}"{workflow_attributes}{href}><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></{tag}>"#,
         tag = tag,
+        workflow_attributes = workflow_attributes,
         href = href,
         level = html_escape(event.level),
         kind = html_escape(event.kind),
@@ -6300,6 +6431,33 @@ pub(super) fn activity_rows(events: &[ActivityEvent]) -> String {
         return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, backup changes, freshness changes, kernel posture, service observations, and config events here.</p></section>"#.to_string();
     }
     events.iter().take(80).map(render_activity_row).collect()
+}
+
+pub(super) fn focus_activity_events(
+    events: Vec<ActivityEvent>,
+    focus: &ActivityFocus,
+) -> Vec<ActivityEvent> {
+    match focus {
+        ActivityFocus::All => events,
+        ActivityFocus::Workflow { host, workflow_id } => events
+            .into_iter()
+            .filter(|event| {
+                event.host == *host && event.workflow_id.as_deref() == Some(workflow_id.as_str())
+            })
+            .collect(),
+        ActivityFocus::Unavailable => Vec::new(),
+    }
+}
+
+pub(super) fn activity_focus_path(focus: &ActivityFocus) -> String {
+    match focus {
+        ActivityFocus::All => String::new(),
+        ActivityFocus::Workflow { host, .. } => format!(
+            r#"<aside class="ops-note" data-activity-workflow-focus role="status"><strong>Saved workflow activity</strong><span>Showing the exact recorded workflow for {host}.</span><a class="ops-action" href="/activity">Show all activity</a></aside>"#,
+            host = html_escape(host),
+        ),
+        ActivityFocus::Unavailable => r#"<section class="ops-empty" data-activity-workflow-unavailable><h2>Workflow activity unavailable</h2><p>This workflow is unknown, belongs to another host, or is not available to your account.</p><a class="ops-action" href="/activity">Show all activity</a></section>"#.to_string(),
+    }
 }
 
 pub(super) fn activity_script() -> &'static str {
@@ -6330,6 +6488,7 @@ pub(super) fn render_activity(
     )
 }
 
+#[cfg(test)]
 pub(super) fn render_activity_with_actions(
     runtime: RuntimeSnapshot<'_>,
     self_name: &str,
@@ -6337,12 +6496,29 @@ pub(super) fn render_activity_with_actions(
     sources: ActivitySources<'_>,
     shell: ShellContext<'_>,
 ) -> String {
-    let events = activity_events(runtime, self_name, now, sources);
-    let rows = activity_rows(&events);
+    render_activity_with_focus(runtime, self_name, now, sources, shell, ActivityFocus::All)
+}
+
+pub(super) fn render_activity_with_focus(
+    runtime: RuntimeSnapshot<'_>,
+    self_name: &str,
+    now: i64,
+    sources: ActivitySources<'_>,
+    shell: ShellContext<'_>,
+    focus: ActivityFocus,
+) -> String {
+    let events = focus_activity_events(activity_events(runtime, self_name, now, sources), &focus);
+    let focus_path = activity_focus_path(&focus);
+    let rows = if focus == ActivityFocus::Unavailable {
+        String::new()
+    } else {
+        activity_rows(&events)
+    };
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{focus_path}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
         header = page_header("Activity", "Operational timeline", now),
+        focus_path = focus_path,
         summary = activity_summary_metrics(&events),
         toolbar = ops_toolbar(),
         count = events.len(),

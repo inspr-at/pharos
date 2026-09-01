@@ -6837,7 +6837,8 @@ mod tests {
         assert!(html.contains(
             r#"class="backup-row clear" data-ops-row data-ops-level="clear" data-host="athena""#
         ));
-        assert!(html.contains("new URLSearchParams(window.location.search).get('host')"));
+        assert!(html.contains("const params=new URLSearchParams(window.location.search)"));
+        assert!(html.contains("const requestedHost=params.get('host')"));
         assert!(html.contains("target.scrollIntoView({block:'center',behavior:'smooth'})"));
         assert!(html.contains("Last success"));
         assert!(html.contains("Schedule"));
