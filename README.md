@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.97-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.98-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -46,7 +46,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v0.1.97
+## What ships in v0.1.98
 
 | Area | Current capability |
 | --- | --- |
@@ -292,6 +292,15 @@ when the signed OIDC claims say `email_verified=true`. Literal
 the runtime configuration. Usernames and unprefixed emails are rejected at
 startup. `PHAROS_ACCESS_POLICY_FILE` uses the same identifier forms for scoped
 grants.
+
+Read-only people keep the observation surfaces they were granted. Guarded
+surfaces name the required **Fleet manager** role, identify the **Pharos
+administrator** as the access owner, and offer one GET-only access-request
+path. `PHAROS_ACCESS_REQUEST_URL` may send that click to a credential-free
+HTTPS help destination (or a local absolute path); when it is unset, Pharos
+offers a value-free request users can copy into their normal help channel.
+Viewer requests are still rejected by every mutation handler even if browser
+markup is bypassed.
 
 If OIDC variables are absent, startup fails unless `PHAROS_ALLOW_OPEN=true`
 is set and the effective public address is loopback. Containerized development
@@ -585,15 +594,21 @@ provenance stay in Pharos's durable job, events and summary.
 Each workflow persists:
 
 1. operator intent;
-2. target-local review and preflight;
-3. the exact review result;
-4. attended confirmation;
-5. a leased apply/restart phase;
-6. fresh system, kernel, service and heartbeat verification;
-7. typed failure or recovery evidence.
+2. start and last-evidence times, the next automatic check, and a rounded
+   expected range;
+3. deterministic overdue and escalation boundaries with an effect-bound,
+   same-run idempotency key;
+4. target-local review and preflight;
+5. the exact review result;
+6. attended confirmation;
+7. a leased apply/restart phase;
+8. fresh system, kernel, service and heartbeat verification;
+9. typed failure, recovery, cancellation, or terminal evidence.
 
 Review failures can be retried explicitly. Failures after confirmation require
-recovery; Pharos does not silently replay a switch or reboot.
+recovery; Pharos does not silently replay a switch or reboot. Automatic
+reconciliation resumes after a Pharos restart, while terminal and withdrawn
+runs retain their receipt and expose no next action to poll.
 
 ### Declarative settings and fleet proposals
 
@@ -688,6 +703,7 @@ promised third-party API. The important boundaries are:
 | `PHAROS_OIDC_REDIRECT_URI` | Exact callback URI |
 | `PHAROS_ALLOWED_OPERATORS` | Comma/space-separated `operator-ref:<sha256>`, `verified-email-ref:<sha256>`, or `email:<verified-address>` full-fleet identities |
 | `PHAROS_ACCESS_POLICY_FILE` | Optional scoped policy using the same strict OIDC authorization identifiers |
+| `PHAROS_ACCESS_REQUEST_URL` | Optional credential-free HTTPS help destination or local absolute path for the read-only user's GET-only **Request access** action |
 | `PHAROS_JANUS_PROJECTION_ROOT` | Capability-named Janus projection root; Pharos resolves `pharos-beacon-token` and `pharos-machine-operator` beneath it |
 | `PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR` | Migration-compatible direct root for the scoped machine-operator hash-dir v2 (`current` plus immutable `generation-{id}.json` documents using schema `inspr.pharos.machine-operator-token-generation.v2`); cannot be combined with the capability root |
 | `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for local registration; the file form wins and is preferred |
@@ -770,7 +786,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v0.1.97**. It is already used as a real
+Pharos is an active early release at **v0.1.98**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

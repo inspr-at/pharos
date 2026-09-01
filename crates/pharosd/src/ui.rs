@@ -144,6 +144,21 @@ mod module_tests {
         assert_eq!(html_escape("<&\"'>"), "&lt;&amp;&quot;&#39;&gt;");
     }
 
+    #[test]
+    fn viewer_access_path_names_role_owner_and_get_only_help_route() {
+        for scope in ["fleet", "settings", "provider", "managed-service"] {
+            let html = viewer_access_path(scope);
+            assert!(html.contains("Fleet manager access required"), "{html}");
+            assert!(html.contains("Pharos administrator"), "{html}");
+            assert!(
+                html.contains(&format!(r#"href="/access/request?scope={scope}""#)),
+                "{html}"
+            );
+            assert!(!html.contains("<form"), "{html}");
+            assert!(!html.contains("data-method"), "{html}");
+        }
+    }
+
     /// PHAROS-193: the fleet showed a reassuring `0d` while nixpkgs was frozen
     /// on an expired channel. The operator-visible signal must say so.
     #[test]
@@ -240,6 +255,32 @@ mod module_tests {
         ));
         assert!(!opener.contains("host_action"));
         assert!(!opener.contains("storedMatches"));
+    }
+
+    #[test]
+    fn host_quick_drawer_is_a_local_draft_with_an_explicit_workspace_exit() {
+        let drawer = host_quick_drawer(true);
+        assert!(drawer.contains(r#"role="dialog" aria-modal="true""#));
+        assert!(drawer.contains("data-host-drawer-workspace"));
+        assert!(drawer.contains("Prepare a local draft"));
+        assert!(drawer.contains("Closing or discarding removes the draft completely"));
+        assert!(drawer.contains("Review in host settings"));
+
+        let runtime = FOOT
+            .split("function initHostDrawer()")
+            .nth(1)
+            .and_then(|rest| rest.split("let openHostActionsRoot").next())
+            .expect("host drawer runtime");
+        assert!(runtime.contains("closeHostDrawer()"));
+        assert!(runtime.contains("reviewHostDrawerDraft()"));
+        assert!(
+            !runtime.contains("fetch("),
+            "drawer drafts must not dispatch"
+        );
+
+        let viewer = host_quick_drawer(false);
+        assert!(viewer.contains(r#"data-can-manage="false""#));
+        assert!(viewer.contains("Fleet operator access is required"));
     }
 
     #[test]
@@ -381,13 +422,71 @@ pub(super) fn render_no_access_page(
     shell: ShellContext<'_>,
     active: &str,
 ) -> String {
+    let scope = match active {
+        "settings" => "settings",
+        "platform-settings" => "provider",
+        "services" => "managed-service",
+        _ => "fleet",
+    };
+    let access_path = viewer_access_path(scope);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div><section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div>{access_path}<section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, active),
         title = html_escape(title),
         subtitle = html_escape(subtitle),
         as_of = clock_label(now_unix()),
     )
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct AccessRequestQuery {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+fn access_scope(value: Option<&str>) -> (&'static str, &'static str) {
+    match value {
+        Some("settings") => ("Host settings", "review and change host settings"),
+        Some("provider") => ("Provider connections", "connect or change a provider"),
+        Some("managed-service") => (
+            "Managed services",
+            "create, replace, or remove a managed secret",
+        ),
+        _ => ("Fleet operations", "run guarded fleet actions"),
+    }
+}
+
+/// One consistent, non-mutating access path for every guarded product surface.
+pub(super) fn viewer_access_path(scope: &str) -> String {
+    let (surface, task) = access_scope(Some(scope));
+    format!(
+        r#"<aside class="access-path" data-access-path data-scope="{scope}"><span class="access-path-icon" aria-hidden="true">{shield}</span><span class="access-path-copy"><strong>Fleet manager access required</strong><span>You can keep viewing {surface}. A Pharos administrator owns access for people who need to {task}.</span></span><a class="access-path-action" href="/access/request?scope={scope}">Request access</a></aside>"#,
+        scope = html_escape(scope),
+        surface = html_escape(surface),
+        task = html_escape(task),
+        shield = icons::SHIELD_CHECK,
+    )
+}
+
+pub(super) async fn access_request_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AccessRequestQuery>,
+) -> Response {
+    if let Some(target) = state.access_request.target.as_deref() {
+        return Redirect::temporary(target).into_response();
+    }
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    let (surface, task) = access_scope(query.scope.as_deref());
+    let request_text =
+        format!("Please ask a Pharos administrator for the Fleet manager role so I can {task}.");
+    no_store_html(format!(
+        r#"{HEAD}{sidebar}<main class="ops-main access-request-page"><div class="top"><div><div class="brand"><h1>Request access</h1></div><p class="fleet">{surface}</p></div></div><section class="ops-empty"><h2>Send this to your Pharos administrator</h2><p>The required role is <strong>Fleet manager</strong>. The responsible access owner is your <strong>Pharos administrator</strong>.</p><div class="access-request-copy"><code data-access-request-text>{request_text}</code><button class="access-path-action" type="button" data-copy-access-request>Copy access request</button></div><p class="access-request-status" role="status" aria-live="polite" data-access-request-status>Copy the request, send it through your normal help channel, then return here after access is granted.</p></section></main><script>document.querySelector('[data-copy-access-request]')?.addEventListener('click',async event=>{{const text=document.querySelector('[data-access-request-text]')?.textContent||'';const status=document.querySelector('[data-access-request-status]');try{{await navigator.clipboard.writeText(text);event.currentTarget.textContent='Copied';if(status)status.textContent='Access request copied. Send it to your Pharos administrator.'}}catch(error){{if(status)status.textContent='Copy was unavailable. Select the request text above and copy it manually.'}}}});</script></div></body></html>"#,
+        sidebar = sidebar(&user_label, state.auth.is_some(), ""),
+        surface = html_escape(surface),
+        request_text = html_escape(&request_text),
+    ))
+    .into_response()
 }
 
 pub(super) async fn provider_settings_page(
@@ -534,7 +633,6 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
             logout_enabled: state.auth.is_some(),
         },
         FleetCapabilities {
-            can_onboard: access.can_agora(),
             can_manage_fleet: access.can_manage_fleet(),
             system_update_available: state.nixcfg_dispatch.system_update_available(),
             host_removal_available: state.nixcfg_dispatch.host_removal_available()
@@ -1667,6 +1765,9 @@ pub(super) fn host_actions_markup(
     lifecycle: &HostLifecycle,
 ) -> String {
     let capabilities = context.capabilities;
+    if !capabilities.can_manage_fleet {
+        return String::new();
+    }
     let name = html_escape(&host.name);
     let role = html_escape(&host.role);
     let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
@@ -1843,6 +1944,17 @@ pub(super) fn host_actions_markup(
         file = icons::FILE_TEXT,
         trash = icons::TRASH_2,
         shield = icons::SHIELD_CHECK,
+    )
+}
+
+fn host_quick_drawer(can_manage_fleet: bool) -> String {
+    format!(
+        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="/">Open host workspace {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review in host settings</button></div><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form></div></aside></div>"#,
+        can_manage = can_manage_fleet,
+        server = icons::SERVER,
+        close = icons::X,
+        arrow = icons::ARROW_RIGHT,
+        viewer_hidden = if can_manage_fleet { " hidden" } else { "" },
     )
 }
 
@@ -2686,13 +2798,18 @@ pub(super) fn render_provider_connections_page(
     shell: ShellContext<'_>,
     can_manage: bool,
 ) -> String {
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("provider")
+    };
     let rows = providers
         .providers
         .iter()
         .map(|provider| render_provider_connection_row(provider, can_manage))
         .collect::<String>();
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main">{header}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main">{header}{access_path}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         header = page_header(
             "Settings",
@@ -2700,6 +2817,7 @@ pub(super) fn render_provider_connections_page(
             now_unix(),
         ),
         rows = rows,
+        access_path = access_path,
     )
 }
 
@@ -2730,6 +2848,11 @@ pub(super) fn render_guided_provider_page(
     can_manage: bool,
     return_path: Option<&str>,
 ) -> String {
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("provider")
+    };
     let (external_label, external_url) = provider_official_destination(provider.key)
         .unwrap_or(("Open provider", "https://pharos.barta.cm/"));
     let external_action = if can_manage {
@@ -2754,7 +2877,7 @@ pub(super) fn render_guided_provider_page(
     let back_href =
         safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a><header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a>{access_path}<header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         back_href = html_escape(&back_href),
         back = icons::ARROW_LEFT,
@@ -2764,6 +2887,7 @@ pub(super) fn render_guided_provider_page(
         note = html_escape(&provider.note),
         external_action = external_action,
         import_action = import_action,
+        access_path = access_path,
     )
 }
 
@@ -3148,8 +3272,13 @@ pub(super) fn render_hetzner_connection_page(
     } else {
         &readiness.message
     };
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("provider")
+    };
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a><header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a>{access_path}<header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         back_href = html_escape(&back_href),
         back = icons::ARROW_LEFT,
@@ -3180,6 +3309,7 @@ pub(super) fn render_hetzner_connection_page(
         menu = menu,
         details = details,
         setup_help = setup_help,
+        access_path = access_path,
         setup_note = html_escape(setup_note),
     )
 }
@@ -3207,7 +3337,6 @@ pub(super) struct RuntimeSnapshot<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FleetCapabilities {
-    pub(super) can_onboard: bool,
     pub(super) can_manage_fleet: bool,
     pub(super) system_update_available: bool,
     pub(super) host_removal_available: bool,
@@ -3594,7 +3723,7 @@ pub(super) fn reconcile_provisioning_jobs_with_runtime(
     }
 }
 
-pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
+pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64, can_manage_fleet: bool) -> String {
     let Some(raw_name) = provisioning_job_host_name(job) else {
         return String::new();
     };
@@ -3626,12 +3755,27 @@ pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
         provisioning_job_latest_message(job)
     };
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
+    let header_action = if can_manage_fleet {
+        format!(
+            r#"<div class="card-actions"><a class="header-chip settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div>"#,
+            job_id = html_escape(&job.id),
+            settings = icons::SLIDERS,
+        )
+    } else {
+        String::new()
+    };
+    let continue_action = if can_manage_fleet {
+        format!(
+            r#"<div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div>"#,
+            job_id = html_escape(&job.id),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="header-chip settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div></article>"#,
+        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div>{header_action}</header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div>{continue_action}</article>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
-        job_id = html_escape(&job.id),
-        settings = icons::SLIDERS,
         reason = html_escape(&reason),
         detail = html_escape(&detail),
         started = html_escape(&started),
@@ -3639,7 +3783,7 @@ pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
     )
 }
 
-pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
+pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64, can_manage_fleet: bool) -> String {
     let Some(raw_name) = provisioning_job_host_name(job) else {
         return String::new();
     };
@@ -3662,11 +3806,18 @@ pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
         setup_intent_search_text(&intent).to_lowercase()
     ));
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
+    let action = if can_manage_fleet {
+        format!(
+            r#"<a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a>"#,
+            job_id = html_escape(&job.id),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a></div></td></tr>"#,
+        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions">{action}</div></td></tr>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
-        job_id = html_escape(&job.id),
         reason = html_escape(&reason),
         backup = html_escape(intent.backup_label()),
         location = html_escape(intent.location_label()),
@@ -6459,7 +6610,6 @@ pub(super) fn render_home(
         manifests,
         shell,
         FleetCapabilities {
-            can_onboard,
             can_manage_fleet: can_onboard,
             system_update_available: true,
             host_removal_available: true,
@@ -6475,7 +6625,12 @@ pub(super) fn render_home_with_capabilities(
     shell: ShellContext<'_>,
     capabilities: FleetCapabilities,
 ) -> String {
-    let can_onboard = capabilities.can_onboard;
+    let can_onboard = capabilities.can_manage_fleet;
+    let access_path = if capabilities.can_manage_fleet {
+        String::new()
+    } else {
+        viewer_access_path("fleet")
+    };
     let hosts = runtime.hosts;
     let setup_jobs = pending_setup_jobs(runtime.hosts, runtime.jobs);
     if runtime.hosts.is_empty() && setup_jobs.is_empty() {
@@ -6485,10 +6640,11 @@ pub(super) fn render_home_with_capabilities(
             String::new()
         };
         return format!(
-            "{HEAD}{sidebar}<main>{header}{empty}</main>{assistant}{FOOT}",
+            "{HEAD}{sidebar}<main>{header}{access_path}{empty}</main>{assistant}{FOOT}",
             sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
             header = header(now),
             empty = empty_state(can_onboard),
+            access_path = access_path,
             assistant = assistant
         );
     }
@@ -6676,6 +6832,53 @@ pub(super) fn render_home_with_capabilities(
             format!(r#" style="{}""#, host_color_vars.join(";"))
         };
         let settings_state_key = settings_state.key();
+        let drawer_accent = settings_color.as_deref().unwrap_or("#1f7fb5");
+        let lifecycle_owner = if lifecycle.primary_action.is_some() {
+            "Operator"
+        } else if lifecycle
+            .blocked_by
+            .iter()
+            .any(|blocker| blocker == "host_report")
+        {
+            "Host agent"
+        } else if lifecycle.blocked_by.is_empty() {
+            "No action owner"
+        } else {
+            "Recorded dependency"
+        };
+        let drawer_next = lifecycle
+            .primary_action
+            .as_ref()
+            .map(|action| action.label.as_str())
+            .unwrap_or_else(|| match lifecycle.slot {
+                HostLifecycleSlot::Quiet => "Review host settings",
+                HostLifecycleSlot::PrefsDrift
+                    if lifecycle
+                        .blocked_by
+                        .iter()
+                        .any(|blocker| blocker == "host_report") =>
+                {
+                    "Wait for the next host report"
+                }
+                HostLifecycleSlot::Blocked => "Open the blocking workflow",
+                _ => "Open the host workspace",
+            });
+        let workspace_href = format!("/hosts/{}", url_query_escape(&h.name));
+        let drawer_attrs = format!(
+            r#" data-drawer-accent="{}" data-drawer-kind="{}" data-drawer-suppress-down="{}" data-drawer-suppress-backup="{}" data-drawer-suppress-nix="{}" data-drawer-settings-state="{}" data-drawer-lifecycle-label="{}" data-drawer-lifecycle-detail="{}" data-drawer-lifecycle-owner="{}" data-drawer-next-action="{}" data-drawer-workspace-href="{}" data-drawer-can-manage="{}""#,
+            html_escape(drawer_accent),
+            h.preferences.kind.label(),
+            h.preferences.alerts.suppress_down,
+            h.preferences.alerts.suppress_backup,
+            h.preferences.alerts.suppress_nix_freshness,
+            settings_state_key,
+            html_escape(&lifecycle.label),
+            html_escape(&lifecycle.detail),
+            lifecycle_owner,
+            html_escape(drawer_next),
+            html_escape(&workspace_href),
+            capabilities.can_manage_fleet,
+        );
         let settings_title = format!("Open host settings for {name}");
         let settings_action = format!(
             r#"<a class="header-chip settings-card" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"><span class="settings-icon">{settings_icon}</span><span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
@@ -6754,6 +6957,11 @@ pub(super) fn render_home_with_capabilities(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
         );
+        let drawer_title = html_escape(&format!("Open overview for {}", h.name));
+        let card_identity = format!(
+            r#"<button class="host host-drawer-trigger" type="button" data-host-drawer-trigger title="{drawer_title}" aria-label="{drawer_title}" aria-haspopup="dialog" aria-controls="host-quick-drawer" aria-expanded="false"><span class="nix">{nix_icon}</span><span><span class="name">{name}</span><span class="role">{role}</span></span></button>"#,
+        );
+        let row_identity = card_identity.clone();
         let card_heartbeat = heartbeat_card(
             h.last_seen,
             &h.heartbeat_log,
@@ -6785,17 +6993,17 @@ pub(super) fn render_home_with_capabilities(
         let signal = signal_markup(&heartbeat_signal);
         let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}>{beam}<header class="card-head"><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
+            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}>{beam}<header class="card-head">{card_identity}<div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}><td><div class="host"><span class="nix">{nix_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}><td>{row_identity}</td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
             live_key = live_key(live),
         ));
     }
     for job in setup_jobs {
-        cards.push_str(&render_setup_card(job, now));
-        rows.push_str(&render_setup_row(job, now));
+        cards.push_str(&render_setup_card(job, now, capabilities.can_manage_fleet));
+        rows.push_str(&render_setup_row(job, now, capabilities.can_manage_fleet));
     }
 
     let lone = if hosts.len() == 1 {
@@ -6817,14 +7025,17 @@ pub(super) fn render_home_with_capabilities(
     } else {
         String::new()
     };
+    let host_drawer = host_quick_drawer(capabilities.can_manage_fleet);
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{action_dialog}{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
+        access_path = access_path,
         toolbar = toolbar(),
         assistant = assistant,
+        host_drawer = host_drawer,
         action_dialog = action_dialog,
         now = now,
     )

@@ -472,7 +472,7 @@ pub(crate) async fn request_host_preferences(
     let access = access_for_headers(&state.auth, &headers);
     let host_name = request.host.trim();
     if host_name.is_empty()
-        || !access.can_agora()
+        || !access.can_manage_fleet()
         || !access_allows_host_request(&access, state.manifests.manifests(), host_name)
     {
         return (
@@ -922,10 +922,15 @@ fn render_page_with_access(
 
     let head = crate::head_with_extra(AGORA_CSS);
     let sidebar = crate::sidebar(user_label, logout_enabled, "settings");
+    let access_path = if can_manage_fleet {
+        String::new()
+    } else {
+        crate::viewer_access_path("settings")
+    };
 
     if hosts.is_empty() {
         return format!(
-            r#"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}<section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#,
+            r#"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{access_path}<section class="empty-settings"><h2>No hosts yet</h2><p>Once a host reports to Pharos, its settings will appear here.</p></section></main></div></body></html>"#,
             header = crate::page_header(
                 "Host settings",
                 "Color and alerts per host",
@@ -937,13 +942,13 @@ fn render_page_with_access(
     let selected = &hosts[selected_index];
     let host_table = render_host_table(&hosts, selected_index);
     let content = if selected.settings_ready {
-        render_ready_content(selected)
+        render_ready_content(selected, can_manage_fleet)
     } else {
-        render_setup_content(selected)
+        render_setup_content(selected, can_manage_fleet)
     };
 
     format!(
-        r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{host_table}{content}</main>{action_dialog}<script>
+        r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{access_path}{host_table}{content}</main>{action_dialog}<script>
 document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{{
   window.location.assign('/agora?host='+encodeURIComponent(event.target.value));
 }});
@@ -955,6 +960,17 @@ function settingsWorkflowRevision(data){{
   const workflow=job.workflow||{{}};
   const action=workflow.primary_action||{{}};
   return JSON.stringify([job.id,job.state,job.updated_at,workflow.updated_at,workflow.status_label,workflow.current_step,action.kind,action.target_run_id,data?.workflow_html||'']);
+}}
+function replaceSettingsWorkflowHtml(root,workflowHtml){{
+  if(!root)return;
+  const advanced=root.querySelector('.host-workflow-advanced');
+  const summary=advanced?.querySelector('summary');
+  const keepAdvancedOpen=advanced?.open===true;
+  const restoreSummaryFocus=document.activeElement===summary;
+  root.innerHTML=workflowHtml||'';
+  const nextAdvanced=root.querySelector('.host-workflow-advanced');
+  if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;
+  if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({{preventScroll:true}});
 }}
 function settingsApplyConfirmationReady(){{
   const dialog=document.querySelector('[data-host-action-dialog]');
@@ -1017,6 +1033,7 @@ function renderSettingsWorkflow(data){{
   const overlay=document.querySelector('[data-host-action-overlay]');
   const dialog=overlay?.querySelector('[data-host-action-dialog]');
   if(!overlay||!dialog)return;
+  const initialWorkflowOpen=overlay.hidden||settingsWorkflow.mode!=='workflow';
   dialog.dataset.workflow='true';
   dialog.dataset.action='settings-change';
   dialog.querySelectorAll('[data-action-icon]').forEach(icon=>{{icon.hidden=icon.dataset.actionIcon!=='settings-change'}});
@@ -1048,7 +1065,7 @@ function renderSettingsWorkflow(data){{
   if(info)info.hidden=true;
   if(facts)facts.hidden=true;
   if(technical)technical.hidden=true;
-  if(checklist){{checklist.hidden=false;checklist.innerHTML=data.workflow_html||''}}
+  if(checklist){{checklist.hidden=false;replaceSettingsWorkflowHtml(checklist,data.workflow_html)}}
   if(confirmation)confirmation.hidden=actionKind!=='confirm';
   if(confirmationName)confirmationName.textContent=root?.dataset.host||job.host||'';
   if(attended)attended.hidden=actionKind!=='confirm';
@@ -1089,7 +1106,7 @@ function renderSettingsWorkflow(data){{
     settingsWorkflow.timer=null;
     setSettingsWorkflowSuspended(false);
   }}else if(!actionRequired)scheduleSettingsWorkflowPoll(settingsWorkflow.id);
-  requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
+  if(initialWorkflowOpen)requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus());
 }}
 async function pollSettingsWorkflow(id){{
   settingsWorkflow.timer=null;
@@ -1406,6 +1423,26 @@ if(root){{
   setPicked(color?.value||'{accent}');
   syncDownAlertPolicy();
   savedPreferences=draftPreferences();
+  const incomingDraft=new URLSearchParams(window.location.search);
+  if(settingsCanManageFleet()&&incomingDraft.get('draft')==='fleet-drawer'&&incomingDraft.get('host')===root.dataset.host){{
+    const incomingAccent=incomingDraft.get('draft_accent')||'';
+    const incomingKind=incomingDraft.get('draft_kind')||'';
+    const boolValue=name=>incomingDraft.get(name)==='true';
+    if(/^#[0-9a-fA-F]{{6}}$/.test(incomingAccent)&&['server','workstation'].includes(incomingKind)){{
+      applyPreferences({{
+        accent:incomingAccent,
+        kind:incomingKind,
+        alerts:{{
+          suppress_down:boolValue('draft_suppress_down'),
+          suppress_backup:boolValue('draft_suppress_backup'),
+          suppress_nix_freshness:boolValue('draft_suppress_nix'),
+        }},
+      }});
+      const cleanUrl=new URL(window.location.href);
+      ['draft','draft_accent','draft_kind','draft_suppress_down','draft_suppress_backup','draft_suppress_nix'].forEach(key=>cleanUrl.searchParams.delete(key));
+      window.history.replaceState(null,'',cleanUrl.pathname+(cleanUrl.searchParams.size?'?'+cleanUrl.searchParams.toString():''));
+    }}
+  }}
   updateDraftState();
 }}
 </script></div></body></html>"##,
@@ -1415,18 +1452,19 @@ if(root){{
             crate::now_unix()
         ),
         host_table = host_table,
+        access_path = access_path,
         action_dialog = crate::host_action_dialog(),
         accent = html_escape(&selected.declared_accent),
         can_manage_fleet = can_manage_fleet,
     )
 }
 
-fn render_ready_content(host: &AgoraHostView) -> String {
-    render_color_panel(host, true)
+fn render_ready_content(host: &AgoraHostView, can_manage_fleet: bool) -> String {
+    render_color_panel(host, true, can_manage_fleet)
 }
 
-fn render_setup_content(host: &AgoraHostView) -> String {
-    render_color_panel(host, false)
+fn render_setup_content(host: &AgoraHostView, can_manage_fleet: bool) -> String {
+    render_color_panel(host, false, can_manage_fleet)
 }
 
 fn render_host_table(hosts: &[AgoraHostView], selected_index: usize) -> String {
@@ -1472,13 +1510,13 @@ fn displayed_preferences(host: &AgoraHostView) -> Option<&HostPreferences> {
         .or(Some(&host.preferences))
 }
 
-fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
+fn render_color_panel(host: &AgoraHostView, ready: bool, can_manage_fleet: bool) -> String {
     let shown_preferences = displayed_preferences(host).unwrap_or(&host.preferences);
     let accent = shown_preferences
         .accent
         .as_deref()
         .unwrap_or(&host.declared_accent);
-    let presets = preset_buttons(accent);
+    let presets = preset_buttons(accent, !can_manage_fleet);
     let setup_note = if ready {
         String::new()
     } else if host.has_reported {
@@ -1561,7 +1599,11 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         ready = if ready { "true" } else { "false" },
         has_reported = if host.has_reported { "true" } else { "false" },
         is_nix = if host.is_nix { "true" } else { "false" },
-        disabled = if host.has_reported { "" } else { " disabled" },
+        disabled = if host.has_reported && can_manage_fleet {
+            ""
+        } else {
+            " disabled"
+        },
         kind = shown_preferences.kind.label(),
         manual_down_suppressed = shown_preferences.alerts.suppress_down,
         role = html_escape(&role_copy),
@@ -1575,12 +1617,14 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
         enabled_alerts = enabled_alerts,
         chevron = crate::icons::CHEVRON_DOWN,
         down_checked = checked(!shown_preferences.suppresses_down_alerts()),
-        down_disabled =
-            if !host.has_reported || shown_preferences.kind == pharos_core::HostKind::Workstation {
-                " disabled"
-            } else {
-                ""
-            },
+        down_disabled = if !host.has_reported
+            || !can_manage_fleet
+            || shown_preferences.kind == pharos_core::HostKind::Workstation
+        {
+            " disabled"
+        } else {
+            ""
+        },
         down_copy = if shown_preferences.kind == pharos_core::HostKind::Workstation {
             "Off automatically for workstations."
         } else {
@@ -1602,7 +1646,7 @@ fn render_color_panel(host: &AgoraHostView, ready: bool) -> String {
     )
 }
 
-fn preset_buttons(current: &str) -> String {
+fn preset_buttons(current: &str, disabled: bool) -> String {
     let colors = vec![
         current.to_string(),
         "#1f7fb5".to_string(),
@@ -1624,8 +1668,9 @@ fn preset_buttons(current: &str) -> String {
             } else {
                 "false"
             };
+            let disabled = if disabled { " disabled" } else { "" };
             format!(
-                r#"<button class="preset" type="button" data-preset="{color}" title="Use {color}" aria-label="Use {color}" aria-pressed="{pressed}" style="--preset-color:{color}"></button>"#,
+                r#"<button class="preset" type="button" data-preset="{color}" title="Use {color}" aria-label="Use {color}" aria-pressed="{pressed}" style="--preset-color:{color}"{disabled}></button>"#,
                 color = html_escape(&color)
             )
         })
@@ -2390,6 +2435,14 @@ mod tests {
 
         assert!(html.contains("function pauseSettingsWorkflowPoll()"));
         assert!(html.contains("function stopSettingsWorkflowPoll()"));
+        assert!(html.contains("function replaceSettingsWorkflowHtml(root,workflowHtml)"));
+        assert!(html.contains("if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;"));
+        assert!(html.contains(
+            "if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({preventScroll:true});"
+        ));
+        assert!(html.contains(
+            "if(initialWorkflowOpen)requestAnimationFrame(()=>dialog.querySelector('[data-host-action-close]')?.focus())"
+        ));
         assert!(html.contains("function scheduleSettingsWorkflowPoll(id,delay=2000)"));
         assert!(html.contains("if(settingsWorkflow.terminal)return"));
         assert!(html.contains("settingsWorkflow.timer=null;\n    pollSettingsWorkflow(id);"));
@@ -2471,6 +2524,14 @@ mod tests {
         assert!(html.contains("Fleet operator access is required for this guarded action"));
         assert!(html.contains("if(guardedAction&&!settingsCanManageFleet())return"));
         assert!(html.contains("action==='recover'&&Boolean(targetRunId)"));
+        assert!(html.contains(r#"data-access-path data-scope="settings""#));
+        assert!(html.contains("Fleet manager access required"));
+        assert!(html.contains("Pharos administrator"));
+        assert!(html.contains(
+            r##"data-color type="color" value="#e09051" aria-label="Choose a custom host color" disabled"##
+        ));
+        assert!(html.contains(r##"data-preset="#1f7fb5""##));
+        assert!(html.contains(r##"style="--preset-color:#1f7fb5" disabled"##));
     }
 
     #[test]

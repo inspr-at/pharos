@@ -51,7 +51,7 @@ use std::os::unix::process::CommandExt;
 use axum::extract::{DefaultBodyLimit, FromRef, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
@@ -155,6 +155,66 @@ struct AppState {
     host_actions: Arc<HostActionStore>,
     retired_hosts: Arc<RetiredHostStore>,
     alert_health: AlertWorkerHealth,
+    access_request: AccessRequestConfig,
+}
+
+const ACCESS_REQUEST_URL_ENV: &str = "PHAROS_ACCESS_REQUEST_URL";
+
+/// Optional operator-configured help destination for read-only people.
+///
+/// The browser reaches it only through a protected GET route. The target is
+/// deliberately credential-free and cannot turn an access explanation into a
+/// mutation or an open redirect with embedded authority.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AccessRequestConfig {
+    target: Option<String>,
+}
+
+impl AccessRequestConfig {
+    fn from_env() -> Result<Self, String> {
+        Self::from_value(env_nonempty(ACCESS_REQUEST_URL_ENV).as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::default());
+        };
+        if value.len() > 2_048 || value.chars().any(char::is_control) {
+            return Err(format!(
+                "{ACCESS_REQUEST_URL_ENV} must be a bounded credential-free help URL"
+            ));
+        }
+        if value.starts_with('/') && !value.starts_with("//") && !value.contains('\\') {
+            if value.starts_with("/access/request") {
+                return Err(format!(
+                    "{ACCESS_REQUEST_URL_ENV} must not point back to the Pharos access-request route"
+                ));
+            }
+            return Ok(Self {
+                target: Some(value.to_string()),
+            });
+        }
+        let url = Url::parse(value).map_err(|_| {
+            format!("{ACCESS_REQUEST_URL_ENV} must be an HTTPS help URL or a local absolute path")
+        })?;
+        let local_http = url.scheme() == "http"
+            && url
+                .host_str()
+                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|address| address.is_loopback());
+        if (url.scheme() != "https" && !local_http)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(format!(
+                "{ACCESS_REQUEST_URL_ENV} must be credential-free HTTPS (or loopback HTTP) without a fragment"
+            ));
+        }
+        Ok(Self {
+            target: Some(url.into()),
+        })
+    }
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -824,13 +884,81 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
             )
         })
         .unwrap_or_default();
+    let (timing_state, timing) = workflow.next_action.as_ref().map_or_else(
+        || ("terminal", String::new()),
+        |action| {
+            let timing = &action.timing;
+            let expected = expected_range_label(
+                timing.expected_min_secs,
+                timing.expected_max_secs,
+            );
+            let next_check = timing.next_check_at.map_or_else(
+                || "Waiting for an operator".to_string(),
+                |at| format!("Automatic check by {}", clock_label(at)),
+            );
+            let recovery = match action.recovery_action.kind {
+                next_action::NextActionRecoveryActionKind::AutomaticRetry => {
+                    "retry this same saved action automatically"
+                }
+                next_action::NextActionRecoveryActionKind::Reconcile => {
+                    "reconcile recorded evidence before any retry"
+                }
+                next_action::NextActionRecoveryActionKind::RetrySameRun => {
+                    "retry only this same saved run"
+                }
+                next_action::NextActionRecoveryActionKind::Escalate => {
+                    "escalate to the recorded owner"
+                }
+            };
+            let attended = action.availability.execution
+                == next_action::NextActionExecution::OperatorConfirmation;
+            let state = if timing.overdue {
+                "overdue"
+            } else if attended {
+                "operator"
+            } else {
+                "on-schedule"
+            };
+            let heading = if timing.overdue {
+                "Taking longer than expected"
+            } else if attended {
+                "Waiting for your confirmation"
+            } else {
+                "Background progress is active"
+            };
+            let copy = if timing.overdue {
+                format!(
+                    "No new evidence arrived in the expected range. Pharos will {recovery}; it will not create a second run."
+                )
+            } else if attended {
+                format!(
+                    "No background action runs at this gate. You can {recovery} without creating a second run."
+                )
+            } else {
+                format!("Expected {expected}. Pharos will {recovery} if this becomes overdue.")
+            };
+            (
+                state,
+                format!(
+                    r#"<section class="host-workflow-timing" data-workflow-timing="{state}"><strong>{heading}</strong><p>{copy}</p><dl><dt>Last evidence</dt><dd><time>{last_update}</time></dd><dt>Next</dt><dd>{next_check}</dd><dt>Expected</dt><dd>{expected}</dd></dl></section>"#,
+                    state = state,
+                    heading = heading,
+                    copy = html_escape(&copy),
+                    last_update = html_escape(&clock_label(timing.last_update_at)),
+                    next_check = html_escape(&next_check),
+                    expected = html_escape(&expected),
+                ),
+            )
+        },
+    );
     let next = format!(
-        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p>{next_action}<dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>"#,
+        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p>{next_action}<dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>{timing}"#,
         title = html_escape(&workflow.next.title),
         consequence = html_escape(&workflow.next.consequence),
         next_action = next_action,
         location = html_escape(&workflow.next.location),
         boundary = html_escape(&workflow.next.boundary),
+        timing = timing,
     );
     let mut groups = String::new();
     let mut current_group = "";
@@ -956,14 +1084,36 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
         .map(|location| format!(" on {}", html_escape(&location)))
         .unwrap_or_default();
     format!(
-        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}"><ol class="host-workflow-ladder" aria-label="Run truth: observed, declared, requested, executed, verified">{ladder}</ol><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{next}{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
+        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}" data-workflow-timing-state="{timing_state}"><ol class="host-workflow-ladder" aria-label="Run truth: observed, declared, requested, executed, verified">{ladder}</ol><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{next}{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
         kind = workflow_kind_key(workflow.kind),
         status = html_escape(&workflow.status_label),
         ladder = ladder,
         created = html_escape(&clock_label(workflow.created_at)),
         current_status = html_escape(current_status),
+        timing_state = timing_state,
         next = next,
     )
+}
+
+fn expected_range_label(min_secs: u32, max_secs: u32) -> String {
+    fn rounded(seconds: u32) -> (u32, &'static str) {
+        if seconds <= 3600 {
+            (seconds.max(1).div_ceil(60), "min")
+        } else {
+            (seconds.div_ceil(3600), "h")
+        }
+    }
+
+    let (max, max_unit) = rounded(max_secs.max(min_secs));
+    if min_secs == 0 {
+        return format!("usually within {max} {max_unit}");
+    }
+    let (min, min_unit) = rounded(min_secs);
+    if min_unit == max_unit {
+        format!("usually {min}–{max} {max_unit}")
+    } else {
+        format!("usually {min} {min_unit}–{max} {max_unit}")
+    }
 }
 
 fn workflow_kind_key(kind: host_actions::HostWorkflowKind) -> &'static str {
@@ -1569,7 +1719,9 @@ async fn withdraw_settings_change(
         return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
     };
     let access = access_for_headers(&state.auth, &headers);
-    if !action_request_header(&headers) || !access.can_agora() || !access.allows_host(&preview.host)
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&preview.host)
     {
         return action_error(
             StatusCode::FORBIDDEN,
@@ -1801,7 +1953,7 @@ async fn acknowledge_dispatch_uncertainty(
     };
     let access = access_for_headers(&state.auth, &headers);
     let workflow_allowed = match existing.workflow_kind() {
-        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::SettingsChange => access.can_manage_fleet(),
         host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
         _ => false,
     };
@@ -1845,7 +1997,9 @@ async fn continue_legacy_settings_dispatch(
         return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
     };
     let access = access_for_headers(&state.auth, &headers);
-    if !action_request_header(&headers) || !access.can_agora() || !access.allows_host(&preview.host)
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&preview.host)
     {
         return action_error(
             StatusCode::FORBIDDEN,
@@ -2021,7 +2175,7 @@ async fn reconcile_accepted_dispatch(
     };
     let access = access_for_headers(&state.auth, &headers);
     let workflow_allowed = match preview.workflow_kind() {
-        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::SettingsChange => access.can_manage_fleet(),
         host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
         _ => false,
     };
@@ -2705,7 +2859,9 @@ async fn reconcile_saved_next_actions(state: &AppState, now: i64) -> usize {
 
 fn spawn_next_action_loop(state: AppState) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            next_action::NEXT_ACTION_RECONCILE_SECS as u64,
+        ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -3690,7 +3846,7 @@ async fn create_managed_setup_intent(
         return managed_intent_denial(IntentReason::InvalidRequest);
     }
     let access = access_for_headers(&state.auth, &headers);
-    if !access.can_agora() {
+    if !access.can_manage_fleet() {
         return managed_intent_denial(IntentReason::Forbidden);
     }
     let Some(user) = state.auth.human_user(&headers) else {
@@ -3743,6 +3899,9 @@ async fn cancel_managed_setup_intent(
     if !action_request_header(&headers) {
         return managed_intent_denial(IntentReason::InvalidRequest);
     }
+    if !access_for_headers(&state.auth, &headers).can_manage_fleet() {
+        return managed_intent_denial(IntentReason::Forbidden);
+    }
     let Some(user) = state.auth.human_user(&headers) else {
         return managed_intent_denial(IntentReason::AuthenticationRequired);
     };
@@ -3779,7 +3938,7 @@ async fn retry_managed_service_verification(
         );
     }
     let access = access_for_headers(&state.auth, &headers);
-    if !access.can_agora() {
+    if !access.can_manage_fleet() {
         return managed_verification_retry_denial(
             StatusCode::FORBIDDEN,
             "managed_verification_retry_forbidden",
@@ -4848,6 +5007,8 @@ async fn main() {
     let alert_notifier = AlertNotifier::from_env(alert_store)
         .unwrap_or_else(|error| panic!("alert notifier startup failed: {error}"));
     let alert_health = alert_notifier.health.clone();
+    let access_request = AccessRequestConfig::from_env()
+        .unwrap_or_else(|error| panic!("access-request startup failed: {error}"));
     let paimos_delivery = paimos_delivery::PaimosDeliveryAdapter::from_env(
         host_store_path.as_deref(),
         Arc::clone(&store),
@@ -4871,6 +5032,7 @@ async fn main() {
         host_actions,
         retired_hosts,
         alert_health,
+        access_request,
     };
     let _ = reconcile_saved_next_actions(&state, now_unix()).await;
     spawn_next_action_loop(state.clone());
@@ -6050,7 +6212,6 @@ mod tests {
             &[],
             shell("markus", true),
             FleetCapabilities {
-                can_onboard: true,
                 can_manage_fleet: true,
                 system_update_available: true,
                 host_removal_available: true,
@@ -6106,7 +6267,6 @@ mod tests {
             &manifests,
             shell("markus", true),
             FleetCapabilities {
-                can_onboard: true,
                 can_manage_fleet: true,
                 system_update_available: true,
                 host_removal_available: true,
@@ -6213,6 +6373,19 @@ mod tests {
         assert!(FOOT.contains("if(hostActionPoll.terminal)return;"));
         assert!(FOOT.contains("hostActionPoll.terminal=!active;"));
         assert!(FOOT.contains("Watching for recorded host evidence"));
+        assert!(FOOT.contains("function hostActionWorkflowRevision(job,workflowHtml)"));
+        assert!(FOOT.contains("timing.overdue===true"));
+        assert!(FOOT.contains("workflowHtml||''"));
+        assert!(FOOT.contains("function replaceHostWorkflowHtml(root,workflowHtml)"));
+        assert!(FOOT.contains("if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;"));
+        assert!(FOOT.contains(
+            "if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({preventScroll:true});"
+        ));
+        assert!(FOOT
+            .contains("hostActionPoll.lastRevision=hostActionWorkflowRevision(job,workflowHtml);"));
+        assert!(FOOT.contains(
+            "const revision=hostActionWorkflowRevision(payload.job,payload.workflow_html);"
+        ));
         assert!(FOOT.contains("function scheduleHostActionPoll(id,delay=2000)"));
         assert!(FOOT.contains("hostActionPoll.timer=null;\n    pollHostActionJob(id,false);"));
         assert!(FOOT.contains("if(document.hidden){pauseHostActionPoll();return}"));
@@ -6354,7 +6527,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: false,
                     system_update_available: true,
                     host_removal_available: true,
@@ -6365,11 +6537,7 @@ mod tests {
             &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
 
-        assert!(markup.contains(r#"data-can-manage="false""#));
-        assert!(markup.contains(r#"data-host-action="system-update" hidden"#));
-        assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
-        assert!(markup.contains(r#"data-host-action="remove" hidden"#));
-        assert!(markup.contains(r#"data-host-action="technical""#));
+        assert!(markup.is_empty());
 
         let runtime_only_markup = host_actions_markup(
             &host,
@@ -6382,7 +6550,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: false,
                     host_removal_available: false,
@@ -6409,7 +6576,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: false,
                     host_removal_available: false,
@@ -6437,7 +6603,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: false,
                     host_removal_available: true,
@@ -6474,7 +6639,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: true,
                     host_removal_available: true,
@@ -6503,7 +6667,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: true,
                     host_removal_available: true,
@@ -6576,7 +6739,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: true,
                     host_removal_available: true,
@@ -9207,7 +9369,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
 
         let html = render_home(
-            runtime(&[], &[job]),
+            runtime(&[], std::slice::from_ref(&job)),
             "csb1",
             1_120,
             &[],
@@ -9229,6 +9391,20 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"class="list-setup-intent""#));
         assert!(html.contains(r#"class="list-setup-state""#));
         assert!(html.contains(r#"colspan="6""#));
+
+        let viewer_html = render_home(
+            runtime(&[], std::slice::from_ref(&job)),
+            "csb1",
+            1_120,
+            &[],
+            shell("viewer", true),
+            false,
+        );
+        assert!(viewer_html.contains(r#"class="card setup-card""#));
+        assert!(viewer_html.contains("lab-01"));
+        assert!(!viewer_html.contains("Continue setup"));
+        assert!(!viewer_html.contains(r#"class="setup-action""#));
+        assert!(!viewer_html.contains(r#"setup=add-server&amp;setup_job="#));
     }
 
     #[test]
@@ -13784,6 +13960,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert_eq!(read_only.matches("Ask an administrator").count(), 5);
         assert!(!read_only.contains(r#"class="provider-action""#));
+        assert!(read_only.contains(r#"data-access-path data-scope="provider""#));
+        assert!(read_only.contains("Fleet manager access required"));
+        assert!(read_only.contains("Pharos administrator"));
     }
 
     #[test]
@@ -14188,7 +14367,191 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             host_actions: Arc::new(HostActionStore::new(None)),
             retired_hosts: Arc::new(RetiredHostStore::new(None)),
             alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
+            access_request: AccessRequestConfig::default(),
         }
+    }
+
+    #[test]
+    fn access_request_target_is_optional_bounded_and_credential_free() {
+        assert_eq!(
+            AccessRequestConfig::from_value(None).unwrap(),
+            AccessRequestConfig::default()
+        );
+        assert_eq!(
+            AccessRequestConfig::from_value(Some("/help/access?product=pharos"))
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("/help/access?product=pharos")
+        );
+        assert_eq!(
+            AccessRequestConfig::from_value(Some("https://help.example.test/pharos/access"))
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("https://help.example.test/pharos/access")
+        );
+        for unsafe_target in [
+            "//help.example.test/access",
+            "https://operator:credential@help.example.test/access",
+            "https://help.example.test/access#credential",
+            "http://help.example.test/access",
+            "/access/request?scope=fleet",
+        ] {
+            assert!(
+                AccessRequestConfig::from_value(Some(unsafe_target)).is_err(),
+                "unsafe access target accepted: {unsafe_target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_agora_viewers_get_fleet_access_path_without_mutation_controls() {
+        let mut state = report_test_state(false);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("viewer fleet fixture records");
+        state
+            .host_actions
+            .begin_settings_change("hsb8", "viewer-fixture", now_unix())
+            .expect("pending settings fixture starts");
+        state.auth = AuthState::for_test_access(AccessGrant::limited(["hsb8"], true));
+
+        let response = home(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("viewer fleet body reads");
+        let html = String::from_utf8(body.to_vec()).expect("viewer fleet body is utf8");
+
+        assert_eq!(
+            html.matches(r#"data-access-path data-scope="fleet""#)
+                .count(),
+            1
+        );
+        assert!(!html.contains(r#"<button class="onboard-primary""#));
+        assert!(!html.contains(r#"<button class="onboard-tile""#));
+        assert!(!html.contains(r#"<span class="host-actions" data-host-actions"#));
+        assert!(!html.contains(
+            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings""#
+        ));
+        assert!(!html.contains(r#"<section class="host-action-overlay""#));
+
+        state.auth = AuthState::for_test_access(AccessGrant::full());
+        let response = home(State(state), HeaderMap::new()).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("manager fleet body reads");
+        let html = String::from_utf8(body.to_vec()).expect("manager fleet body is utf8");
+
+        assert!(!html.contains(r#"data-access-path data-scope="fleet""#));
+        assert!(html.contains(r#"<button class="onboard-primary""#));
+        assert!(html.contains(r#"<span class="host-actions" data-host-actions"#));
+        assert!(html.contains(
+            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings""#
+        ));
+        assert!(html.contains(r#"<section class="host-action-overlay""#));
+    }
+
+    #[tokio::test]
+    async fn scoped_viewers_cannot_reach_settings_or_managed_service_mutations() {
+        let mut state = report_test_state(false);
+        state.auth = AuthState::for_test_access(AccessGrant::limited(["hsb8"], true));
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "viewer-fixture", now_unix())
+            .expect("settings fixture starts");
+
+        let (status, _) = withdraw_settings_change(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = continue_legacy_settings_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let response = create_managed_setup_intent(
+            State(state.clone()),
+            action_headers(),
+            Json(managed_setup_request()),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(payload["reason_code"], IntentReason::Forbidden.code());
+
+        let response = retry_managed_service_verification(
+            State(state.clone()),
+            AxumPath("op_viewer_retry".to_string()),
+            action_headers(),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            payload["reason_code"],
+            "managed_verification_retry_forbidden"
+        );
+
+        let response = cancel_managed_setup_intent(
+            State(state),
+            AxumPath("intent_viewer_cancel".to_string()),
+            action_headers(),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(payload["reason_code"], IntentReason::Forbidden.code());
+    }
+
+    #[tokio::test]
+    async fn scoped_viewers_can_read_provider_plans_but_cannot_start_provisioning() {
+        let mut state = report_test_state(false);
+        state.auth = AuthState::for_test_access(AccessGrant::limited(["hsb8"], true));
+
+        let query = serde_json::from_value(json!({
+            "provider": "manual-import",
+            "template": "manual-import"
+        }))
+        .expect("safe provider-plan query parses");
+        let read_response =
+            setup_provider_plan_json(State(state.clone()), HeaderMap::new(), Query(query))
+                .await
+                .into_response();
+        assert_eq!(read_response.status(), StatusCode::OK);
+
+        let request = serde_json::from_value(json!({
+            "provider": "existing-host",
+            "template": "native-systemd",
+            "apply": true,
+            "host_name": "viewer-denied",
+            "role": "server",
+            "is_nix": false,
+            "ssh": {
+                "route": "tailnet",
+                "user": "root",
+                "host": "viewer-denied"
+            }
+        }))
+        .expect("existing-host request parses");
+        let mutation_response =
+            create_provisioning_job(State(state.clone()), action_headers(), Json(request))
+                .await
+                .into_response();
+
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        assert!(state.provisioning_jobs.list().is_empty());
     }
 
     static JANUS_HASH_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);

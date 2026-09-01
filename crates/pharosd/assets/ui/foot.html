@@ -15,6 +15,178 @@ function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
 function cookie(name){return document.cookie.split('; ').find(v=>v.startsWith(name+'='))?.split('=').slice(1).join('=')||''}
 function setCookie(name,value){document.cookie=name+'='+encodeURIComponent(value)+'; path=/; max-age=31536000; SameSite=Lax'}
 function hostSurfaces(name){return Array.from(document.querySelectorAll('[data-host-surface="runtime"]')).filter(el=>el.dataset.host===name)}
+const hostDrawerContext={host:'',trigger:null,base:null,manualDownSuppressed:false};
+function hostDrawerLayer(){return document.querySelector('[data-host-drawer-layer]')}
+function hostDrawerPanel(){return document.querySelector('[data-host-drawer]')}
+function hostDrawerField(selector){return hostDrawerPanel()?.querySelector(selector)}
+function hostDrawerOwner(lifecycle,fallback){
+  if(lifecycle?.primary_action)return 'Operator';
+  const blockers=Array.isArray(lifecycle?.blocked_by)?lifecycle.blocked_by:[];
+  if(blockers.includes('host_report'))return 'Host agent';
+  if(blockers.length)return 'Recorded dependency';
+  return fallback||'No action owner';
+}
+function hostDrawerNext(lifecycle,fallback){
+  if(lifecycle?.primary_action?.label)return String(lifecycle.primary_action.label);
+  if(lifecycle?.slot==='prefs_drift'&&Array.isArray(lifecycle.blocked_by)&&lifecycle.blocked_by.includes('host_report'))return 'Wait for the next host report';
+  if(lifecycle?.slot==='blocked')return 'Open the blocking workflow';
+  if(lifecycle?.slot==='quiet')return 'Review host settings';
+  return fallback||'Open the host workspace';
+}
+function setHostDrawerText(selector,value){const node=hostDrawerField(selector);if(node)node.textContent=value||'Not recorded'}
+function hostDrawerSnapshot(surface){
+  return {
+    accent:surface.dataset.drawerAccent||'#1f7fb5',
+    kind:surface.dataset.drawerKind||'server',
+    suppress_down:surface.dataset.drawerSuppressDown==='true',
+    suppress_backup:surface.dataset.drawerSuppressBackup==='true',
+    suppress_nix_freshness:surface.dataset.drawerSuppressNix==='true',
+  };
+}
+function hostDrawerDraft(){
+  return {
+    accent:hostDrawerField('[data-host-drawer-color]')?.value||'#1f7fb5',
+    kind:hostDrawerField('[data-host-drawer-kind]')?.value||'server',
+    suppress_down:hostDrawerContext.manualDownSuppressed,
+    suppress_backup:hostDrawerField('[data-host-drawer-alert="backup"]')?.checked!==true,
+    suppress_nix_freshness:hostDrawerField('[data-host-drawer-alert="nix"]')?.checked!==true,
+  };
+}
+function syncHostDrawerDown(){
+  const kind=hostDrawerField('[data-host-drawer-kind]')?.value||'server';
+  const down=hostDrawerField('[data-host-drawer-alert="down"]');
+  if(!down)return;
+  down.disabled=kind==='workstation'||hostDrawerPanel()?.dataset.canManage!=='true';
+  down.checked=kind==='workstation'?false:!hostDrawerContext.manualDownSuppressed;
+}
+function applyHostDrawerDraft(preferences){
+  const color=hostDrawerField('[data-host-drawer-color]');
+  const kind=hostDrawerField('[data-host-drawer-kind]');
+  const backup=hostDrawerField('[data-host-drawer-alert="backup"]');
+  const nix=hostDrawerField('[data-host-drawer-alert="nix"]');
+  if(color)color.value=preferences.accent;
+  if(kind)kind.value=preferences.kind;
+  hostDrawerContext.manualDownSuppressed=preferences.suppress_down;
+  if(backup)backup.checked=!preferences.suppress_backup;
+  if(nix)nix.checked=!preferences.suppress_nix_freshness;
+  syncHostDrawerDown();
+}
+function updateHostDrawerDraftState(){
+  const canManage=hostDrawerPanel()?.dataset.canManage==='true';
+  const dirty=Boolean(hostDrawerContext.base)&&JSON.stringify(hostDrawerDraft())!==JSON.stringify(hostDrawerContext.base);
+  const status=hostDrawerField('[data-host-drawer-draft-status]');
+  const discard=hostDrawerField('[data-host-drawer-discard]');
+  const review=hostDrawerField('[data-host-drawer-review]');
+  if(status){status.dataset.dirty=dirty?'true':'false';status.textContent=dirty?'Local draft ready — no request sent.':'Change a setting to prepare a review.'}
+  if(discard)discard.disabled=!canManage||!dirty;
+  if(review)review.disabled=!canManage||!dirty;
+}
+function updateOpenHostDrawer(host){
+  if(!host||host.name!==hostDrawerContext.host)return;
+  const lifecycle=host.lifecycle||{};
+  setHostDrawerText('[data-host-drawer-state]',String(host.liveness||'unknown').replaceAll('_',' '));
+  const state=hostDrawerField('[data-host-drawer-state]');
+  if(state)state.dataset.level=String(lifecycle.level||host.liveness||'');
+  setHostDrawerText('[data-host-drawer-attention]',String(host.attention?.label||'all clear'));
+  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle.detail||'No host lifecycle work is waiting.'));
+  setHostDrawerText('[data-host-drawer-owner]',hostDrawerOwner(lifecycle,''));
+  setHostDrawerText('[data-host-drawer-next]',hostDrawerNext(lifecycle,''));
+  setHostDrawerText('[data-host-drawer-settings-state]',String(host.preferences_state||'applied').replaceAll('_',' '));
+}
+function populateHostDrawer(surface){
+  const host=surface.dataset.host||'';
+  const trigger=surface.querySelector('[data-host-drawer-trigger]');
+  const lifecycle=fleetHostsByName.get(host)?.lifecycle||null;
+  const attention=fleetHostsByName.get(host)?.attention?.label||surface.querySelector('[data-reason] span')?.textContent||'all clear';
+  hostDrawerContext.host=host;
+  hostDrawerContext.trigger=trigger;
+  hostDrawerContext.base=hostDrawerSnapshot(surface);
+  setHostDrawerText('[data-host-drawer-title]',host);
+  setHostDrawerText('[data-host-drawer-role]',surface.querySelector('.role')?.textContent||'host');
+  const mark=hostDrawerField('[data-host-drawer-mark]');
+  const sourceMark=surface.querySelector('[data-host-drawer-trigger] .nix');
+  if(mark&&sourceMark)mark.innerHTML=sourceMark.innerHTML;
+  setHostDrawerText('[data-host-drawer-state]',String(surface.dataset.live||'unknown').replaceAll('_',' '));
+  const state=hostDrawerField('[data-host-drawer-state]');
+  if(state)state.dataset.level=String(lifecycle?.level||surface.dataset.live||'');
+  setHostDrawerText('[data-host-drawer-attention]',attention);
+  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle?.detail||surface.dataset.drawerLifecycleDetail||'No host lifecycle work is waiting.'));
+  setHostDrawerText('[data-host-drawer-owner]',hostDrawerOwner(lifecycle,surface.dataset.drawerLifecycleOwner));
+  setHostDrawerText('[data-host-drawer-next]',hostDrawerNext(lifecycle,surface.dataset.drawerNextAction));
+  setHostDrawerText('[data-host-drawer-settings-state]',String(surface.dataset.drawerSettingsState||'applied').replaceAll('_',' '));
+  const workspace=hostDrawerField('[data-host-drawer-workspace]');
+  if(workspace)workspace.href=surface.dataset.drawerWorkspaceHref||('/hosts/'+encodeURIComponent(host));
+  applyHostDrawerDraft(hostDrawerContext.base);
+  updateHostDrawerDraftState();
+}
+function hostDrawerFocusables(){
+  return Array.from(hostDrawerPanel()?.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled])')||[]).filter(node=>!node.hidden&&node.getClientRects().length>0);
+}
+function openHostDrawer(surface){
+  const layer=hostDrawerLayer();
+  if(!layer||!surface)return;
+  closeHostActions(openHostActionsRoot);
+  populateHostDrawer(surface);
+  layer.hidden=false;
+  document.body.dataset.hostDrawerOpen='true';
+  hostSurfaces(hostDrawerContext.host).forEach(item=>item.querySelector('[data-host-drawer-trigger]')?.setAttribute('aria-expanded','true'));
+  requestAnimationFrame(()=>hostDrawerField('.host-drawer-close')?.focus());
+}
+function closeHostDrawer(restore=true){
+  const layer=hostDrawerLayer();
+  if(!layer||layer.hidden)return;
+  layer.hidden=true;
+  document.body.removeAttribute('data-host-drawer-open');
+  hostSurfaces(hostDrawerContext.host).forEach(item=>item.querySelector('[data-host-drawer-trigger]')?.setAttribute('aria-expanded','false'));
+  const returnFocus=hostDrawerContext.trigger;
+  hostDrawerContext.host='';
+  hostDrawerContext.trigger=null;
+  hostDrawerContext.base=null;
+  hostDrawerContext.manualDownSuppressed=false;
+  if(restore&&returnFocus?.isConnected)returnFocus.focus();
+}
+function reviewHostDrawerDraft(){
+  if(!hostDrawerContext.host||!hostDrawerContext.base||hostDrawerPanel()?.dataset.canManage!=='true')return;
+  const draft=hostDrawerDraft();
+  if(JSON.stringify(draft)===JSON.stringify(hostDrawerContext.base))return;
+  const params=new URLSearchParams({
+    host:hostDrawerContext.host,
+    draft:'fleet-drawer',
+    draft_accent:draft.accent,
+    draft_kind:draft.kind,
+    draft_suppress_down:String(draft.suppress_down),
+    draft_suppress_backup:String(draft.suppress_backup),
+    draft_suppress_nix:String(draft.suppress_nix_freshness),
+  });
+  window.location.assign('/agora?'+params.toString());
+}
+function initHostDrawer(){
+  if(!hostDrawerLayer())return;
+  document.addEventListener('click',event=>{
+    const trigger=event.target.closest('[data-host-drawer-trigger]');
+    if(trigger){event.preventDefault();openHostDrawer(trigger.closest('[data-host-surface="runtime"]'));return}
+    if(event.target.closest('[data-host-drawer-close]')){event.preventDefault();closeHostDrawer()}
+  });
+  hostDrawerField('[data-host-drawer-discard]')?.addEventListener('click',()=>{if(hostDrawerContext.base){applyHostDrawerDraft(hostDrawerContext.base);updateHostDrawerDraftState()}});
+  hostDrawerField('[data-host-drawer-color]')?.addEventListener('input',updateHostDrawerDraftState);
+  hostDrawerField('[data-host-drawer-kind]')?.addEventListener('change',()=>{syncHostDrawerDown();updateHostDrawerDraftState()});
+  hostDrawerPanel()?.querySelectorAll('[data-host-drawer-alert]').forEach(input=>input.addEventListener('change',()=>{
+    if(input.dataset.hostDrawerAlert==='down')hostDrawerContext.manualDownSuppressed=!input.checked;
+    updateHostDrawerDraftState();
+  }));
+  hostDrawerField('[data-host-drawer-draft]')?.addEventListener('submit',event=>{event.preventDefault();reviewHostDrawerDraft()});
+  document.addEventListener('keydown',event=>{
+    if(hostDrawerLayer()?.hidden!==false)return;
+    if(event.key==='Escape'){event.preventDefault();closeHostDrawer();return}
+    if(event.key!=='Tab')return;
+    const focusable=hostDrawerFocusables();
+    if(!focusable.length)return;
+    const first=focusable[0];
+    const last=focusable[focusable.length-1];
+    if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}
+    else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}
+  });
+}
 let openHostActionsRoot=null;
 let hostActionContext=null;
 let hostActionReturnFocus=null;
@@ -353,6 +525,27 @@ function hostActionPollDelay(job){
   if(kind==='remove_host')return 10000;
   return job?.state==='rebooting'?5000:2000;
 }
+function hostActionWorkflowRevision(job,workflowHtml){
+  const workflow=job?.workflow||{};
+  const timing=workflow.next_action?.timing||{};
+  return JSON.stringify([
+    job?.id,job?.state,job?.updated_at,
+    workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||'',
+    timing.as_of||'',timing.next_check_at||'',timing.overdue===true,timing.escalation_due===true,
+    workflowHtml||''
+  ]);
+}
+function replaceHostWorkflowHtml(root,workflowHtml){
+  if(!root)return;
+  const advanced=root.querySelector('.host-workflow-advanced');
+  const summary=advanced?.querySelector('summary');
+  const keepAdvancedOpen=advanced?.open===true;
+  const restoreSummaryFocus=document.activeElement===summary;
+  root.innerHTML=workflowHtml||'';
+  const nextAdvanced=root.querySelector('.host-workflow-advanced');
+  if(nextAdvanced&&keepAdvancedOpen)nextAdvanced.open=true;
+  if(restoreSummaryFocus)nextAdvanced?.querySelector('summary')?.focus({preventScroll:true});
+}
 function renderHostActionJob(job,message,workflowHtml){
   if(!hostActionContext||!job)return;
   const overlay=document.querySelector('[data-host-action-overlay]');
@@ -381,7 +574,7 @@ function renderHostActionJob(job,message,workflowHtml){
   hostActionContext.root.dataset.actionJobId=job.id;
   hostActionContext.root.dataset.actionKind=workflowKind;
   hostActionContext.root.dataset.actionState=job.state;
-  hostActionPoll.lastRevision=[job.id,job.state,job.updated_at,workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||''].join(':');
+  hostActionPoll.lastRevision=hostActionWorkflowRevision(job,workflowHtml);
   if(dialog){dialog.dataset.workflow='true';dialog.dataset.action=workflowKind.replaceAll('_','-')}
   dialog?.querySelectorAll('[data-action-icon]').forEach(icon=>{
     const iconKind=workflowKind==='settings_change'?'settings-change':workflowKind==='update_restart'?'update-restart':workflowKind==='remove_host'?'remove':'system-update';
@@ -391,7 +584,7 @@ function renderHostActionJob(job,message,workflowHtml){
   if(copy)copy.textContent=workflow.guidance||message||hostActionStateLabel(job.state)+'.';
   if(info)info.hidden=true;
   if(facts)facts.hidden=true;
-  if(workflowRoot){workflowRoot.hidden=false;workflowRoot.innerHTML=workflowHtml||''}
+  if(workflowRoot){workflowRoot.hidden=false;replaceHostWorkflowHtml(workflowRoot,workflowHtml)}
   const active=(workflowKind==='update_restart'&&['queued_review','reviewing','queued_apply','applying','rebooting'].includes(job.state))
     ||(workflowKind==='settings_change'&&!['succeeded','failed','cancelled'].includes(job.state))
     ||(workflowKind==='remove_host'&&job.state==='removal_pending');
@@ -458,8 +651,7 @@ async function pollHostActionJob(id,immediate=false){
     const payload=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(payload.error||'Could not refresh guarded action state.');
     hostActionPoll.failures=0;
-    const workflow=payload.job?.workflow||{};
-    const revision=[payload.job?.id,payload.job?.state,payload.job?.updated_at,workflow.linked_run_id||'',workflow.linked_run_state||'',workflow.linked_run_updated_at||''].join(':');
+    const revision=hostActionWorkflowRevision(payload.job,payload.workflow_html);
     if(immediate||revision!==hostActionPoll.lastRevision)renderHostActionJob(payload.job,payload.message,payload.workflow_html);
     else scheduleHostActionPoll(id,hostActionPollDelay(payload.job));
   }catch(error){
@@ -3767,6 +3959,7 @@ function applyFleetSnapshot(data){
         beat.dataset.nextAt=Number.isFinite(last)?String(last+interval):'';
       }
     }
+    updateOpenHostDrawer(h);
   }
   updateFleetSummary(hosts);
   applySort(document.querySelector('[data-sort]')?.value||'attention',false);
@@ -4016,6 +4209,7 @@ window.addEventListener('online',()=>recoverFleet('online'));
 document.querySelectorAll('[data-seen],[data-card-asof]').forEach(el=>{el.dataset.defaultText=el.textContent});
 document.querySelectorAll('.beat').forEach(beat=>{setBeatHistory(beat,parseBeats(beat.dataset.signalBeats||beat.dataset.beats),Number(beat.dataset.interval)||60);beat.dataset.ready='true'});
 initFreshnessChipScroll();
+initHostDrawer();
 initControls();
 initProviderConnection();
 initProviderSetupGuide();

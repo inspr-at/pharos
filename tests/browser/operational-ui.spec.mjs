@@ -75,6 +75,85 @@ test("sign-in recovery is accessible, no-store, and restarts with one safe actio
   await expect(page.locator("main")).toBeVisible();
 });
 
+test("read-only users get one access path and cannot call mutation endpoints", async ({
+  browser,
+}, testInfo) => {
+  await waitForHarnessTokens();
+  const context = await newAuthedContext(browser, "read");
+  const page = await context.newPage();
+
+  for (const [path, scope] of [
+    ["/", "fleet"],
+    ["/agora", "settings"],
+    ["/settings/providers", "provider"],
+    ["/services", "managed-service"],
+  ]) {
+    await page.goto(path);
+    const access = page.locator(`[data-access-path][data-scope="${scope}"]`).first();
+    await expect(access).toBeVisible();
+    await expect(access).toContainText("Fleet manager access required");
+    await expect(access).toContainText("Pharos administrator");
+    const cta = access.getByRole("link", { name: "Request access", exact: true });
+    await expect(cta).toHaveAttribute("href", `/access/request?scope=${scope}`);
+    if (scope === "fleet") {
+      await expect(page.locator("[data-onboard-open]")).toHaveCount(0);
+      await expect(page.locator("[data-onboard-tile]")).toHaveCount(0);
+      await expect(page.locator("[data-host-actions]")).toHaveCount(0);
+      await expect(page.locator('[data-host-action="withdraw-settings"]')).toHaveCount(0);
+      await expect(page.locator("[data-host-action-overlay]")).toHaveCount(0);
+      await expect(page.locator(".setup-action")).toHaveCount(0);
+    }
+    if (testInfo.project.name === "chromium-desktop") {
+      await page.screenshot({
+        path: testInfo.outputPath(`pharos-248-${scope}.png`),
+        fullPage: true,
+      });
+    }
+  }
+
+  await page.goto("/access/request?scope=managed-service");
+  await expect(page.getByRole("heading", { name: "Request access" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy access request" })).toBeVisible();
+  await expect(page.locator("[data-access-request-text]")).toContainText("Fleet manager role");
+
+  const settings = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host: "viewer-denied", preferences: { accent: "#48b8a8" } },
+  });
+  expect(settings.status()).toBe(403);
+
+  const managed = await page.request.post("/managed-service-setup-intents", {
+    headers: { "x-pharos-action": "1" },
+    data: {
+      operation_kind: "create",
+      host_ref: "host_58f36c72a91e",
+      service_ref: "svc_0bca8d31f7e2",
+      slot_ref: "slot_49c0e8a17d63",
+    },
+  });
+  expect(managed.status()).toBe(403);
+
+  const provider = await page.request.post(
+    "/settings/providers/hetzner-cloud/test",
+    { headers: { "x-pharos-action": "1" } },
+  );
+  expect(provider.status()).toBe(403);
+
+  const existingHost = await page.request.post("/setup/provisioning-jobs", {
+    data: {
+      provider: "existing-host",
+      template: "native-systemd",
+      apply: true,
+      host_name: "viewer-denied",
+      role: "server",
+      is_nix: false,
+      ssh: { route: "tailnet", user: "root", host: "viewer-denied" },
+    },
+  });
+  expect(existingHost.status()).toBe(403);
+
+  await context.close();
+});
+
 test("setup assistant traps focus, closes with Escape, and restores its trigger", async ({
   page,
 }) => {
@@ -1491,6 +1570,134 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "static");
 });
 
+test("fleet host drawer keeps context and hands a local draft to guarded settings review", async ({
+  page,
+}, testInfo) => {
+  const host = `host-drawer-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, {
+    preferences: {
+      accent: "#224466",
+      kind: "server",
+      alerts: {
+        suppress_down: false,
+        suppress_backup: false,
+        suppress_nix_freshness: false,
+      },
+    },
+  });
+
+  let settingsDispatches = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      new URL(request.url()).pathname === "/agora/requests/host-preferences.json"
+    ) {
+      settingsDispatches += 1;
+    }
+  });
+
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/");
+  await page.evaluate(() => {
+    clearRefreshTimer();
+    abandonRefresh();
+  });
+  const search = page.locator("input[data-search]");
+  await search.fill(host);
+  const card = page.locator(
+    `article[data-host="${host}"][data-host-surface="runtime"]`,
+  );
+  const trigger = card.locator("[data-host-drawer-trigger]");
+  await card.scrollIntoViewIfNeeded();
+  const beforeScroll = await page.evaluate(() => window.scrollY);
+  await trigger.click();
+
+  const layer = page.locator("[data-host-drawer-layer]");
+  const drawer = page.locator("[data-host-drawer]");
+  await expect(layer).toBeVisible();
+  await expect(drawer).toHaveAttribute("role", "dialog");
+  await expect(drawer.locator("[data-host-drawer-title]")).toHaveText(host);
+  await expect(drawer.locator("[data-host-drawer-owner]")).toHaveText(
+    "No action owner",
+  );
+  await expect(drawer.locator("[data-host-drawer-next]")).toHaveText(
+    "Review host settings",
+  );
+  await expect(drawer.locator("[data-host-drawer-workspace]")).toHaveAttribute(
+    "href",
+    `/hosts/${host}`,
+  );
+  await expect(drawer.locator(".host-drawer-close")).toBeFocused();
+  expect(await page.evaluate(() => window.scrollY)).toBe(beforeScroll);
+  await expect(search).toHaveValue(host);
+  const drawerA11y = await new AxeBuilder({ page })
+    .include("[data-host-drawer]")
+    .analyze();
+  expect(
+    drawerA11y.violations.filter(({ impact }) =>
+      ["serious", "critical"].includes(impact),
+    ),
+  ).toEqual([]);
+
+  const color = drawer.locator("[data-host-drawer-color]");
+  const review = drawer.locator("[data-host-drawer-review]");
+  const discard = drawer.locator("[data-host-drawer-discard]");
+  await expect(color).toHaveValue("#224466");
+  await expect(review).toBeDisabled();
+  await color.fill("#48b8a8");
+  await expect(drawer.locator("[data-host-drawer-draft-status]")).toContainText(
+    "no request sent",
+  );
+  await expect(review).toBeEnabled();
+  expect(settingsDispatches).toBe(0);
+  await drawer.locator(".host-drawer-close").focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(review).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(drawer.locator(".host-drawer-close")).toBeFocused();
+  await page.screenshot({
+    path: testInfo.outputPath("host-drawer-desktop.png"),
+  });
+  await discard.click();
+  await expect(color).toHaveValue("#224466");
+  await expect(review).toBeDisabled();
+  expect(settingsDispatches).toBe(0);
+
+  await page.keyboard.press("Escape");
+  await expect(layer).toBeHidden();
+  await expect(trigger).toBeFocused();
+  await expect(search).toHaveValue(host);
+  expect(await page.evaluate(() => window.scrollY)).toBe(beforeScroll);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await trigger.click();
+  const mobileGeometry = await drawer.evaluate((panel) => {
+    const rect = panel.getBoundingClientRect();
+    return {
+      bottomGap: Math.abs(window.innerHeight - rect.bottom),
+      width: rect.width,
+      viewportWidth: window.innerWidth,
+      horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth,
+    };
+  });
+  expect(mobileGeometry.bottomGap).toBeLessThanOrEqual(32);
+  expect(mobileGeometry.width).toBeLessThanOrEqual(mobileGeometry.viewportWidth);
+  expect(mobileGeometry.horizontalOverflow).toBe(false);
+  await page.screenshot({
+    path: testInfo.outputPath("host-drawer-mobile.png"),
+  });
+
+  await color.fill("#48b8a8");
+  await review.click();
+  await expect(page).toHaveURL(new RegExp(`/agora\\?host=${host}$`));
+  const settings = page.locator("[data-color-root]");
+  await expect(settings).toHaveAttribute("data-host", host);
+  await expect(settings.locator("[data-color]")).toHaveValue("#48b8a8");
+  await expect(settings.locator("[data-draft-summary]")).toContainText("unsent");
+  await expect(settings.locator("[data-review-settings]")).toBeEnabled();
+  expect(settingsDispatches).toBe(0);
+});
+
 async function applyServerFleetSnapshot(page) {
   const snapshot = await page.request.get("/hosts.json");
   expect(snapshot.ok()).toBe(true);
@@ -1796,6 +2003,78 @@ test("lifecycle chip opens persisted run sheet without agora navigation", async 
   expect(reonboard.ok()).toBe(true);
 });
 
+test("open Fleet workflow repaints a timing-only overdue transition", async ({ page }) => {
+  const host = "bl-workflow-timing-transition";
+  const runId = "action-settings-timing-transition-1";
+  const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
+  await reportRuntimeHost(page, host, { is_nix: true });
+
+  let polls = 0;
+  await page.route("**/host-actions/jobs/**", async (route) => {
+    const request = route.request();
+    if (request.method() !== "GET" || new URL(request.url()).pathname !== jobPath) {
+      await route.continue();
+      return;
+    }
+    polls += 1;
+    const overdue = polls >= 2;
+    const job = {
+      id: runId,
+      host,
+      kind: "system_update_proposal",
+      state: "proposal_requested",
+      updated_at: 1_700_000_100,
+      workflow: {
+        kind: "settings_change",
+        title: `Change ${host} settings`,
+        guidance: "Waiting for matching host evidence.",
+        status_label: "waiting for host",
+        primary_action: null,
+        can_cancel: false,
+        next_action: {
+          timing: {
+            as_of: overdue ? 1_700_000_401 : 1_700_000_399,
+            next_check_at: overdue ? 1_700_000_416 : 1_700_000_414,
+            overdue,
+            escalation_due: false,
+          },
+        },
+      },
+    };
+    const workflowHtml = `<section class="host-workflow-summary" data-workflow-timing-state="${overdue ? "overdue" : "on-schedule"}"><section class="host-workflow-timing" data-workflow-timing="${overdue ? "overdue" : "on-schedule"}"><strong>${overdue ? "Taking longer than expected" : "Background progress is active"}</strong></section><details class="host-workflow-advanced"><summary>Advanced details</summary><div>Evidence ${overdue ? "overdue" : "current"}</div></details></section>`;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        job,
+        message: job.workflow.guidance,
+        workflow_html: workflowHtml,
+      }),
+    });
+  });
+
+  await page.goto(`/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(runId)}`);
+  const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "Background progress is active",
+  );
+  const advanced = dialog.locator(".host-workflow-advanced");
+  const advancedSummary = advanced.locator("summary");
+  await advancedSummary.click();
+  await expect(advanced).toHaveAttribute("open", "");
+  await expect(advancedSummary).toBeFocused();
+  await expect(dialog.locator('[data-workflow-timing="overdue"]')).toContainText(
+    "Taking longer than expected",
+    { timeout: 4_000 },
+  );
+  await expect(advanced).toHaveAttribute("open", "");
+  await expect(advanced).toContainText("Evidence overdue");
+  await expect(advancedSummary).toBeFocused();
+  expect(polls).toBe(2);
+  await page.waitForTimeout(500);
+  expect(polls).toBe(2);
+});
+
 test("fleet refresh kernel chip follows server lifecycle transitions", async ({ page }) => {
   const host = "bl-kernel-lifecycle";
   await reportRuntimeHost(page, host, {
@@ -1863,6 +2142,11 @@ test("fleet refresh keeps workflow note inert without host actions root", async 
   const readContext = await newAuthedContext(browser, "read");
   const page = await readContext.newPage();
   await page.goto("/");
+
+  await expect(page.locator("[data-onboard-open]")).toHaveCount(0);
+  await expect(page.locator("[data-onboard-tile]")).toHaveCount(0);
+  await expect(page.locator('[data-host-action="withdraw-settings"]')).toHaveCount(0);
+  await expect(page.locator("[data-host-action-overlay]")).toHaveCount(0);
 
   const snapshot = await page.request.get("/hosts.json");
   const payload = await snapshot.json();
@@ -2976,7 +3260,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
   expect(requestPayload.job.workflow.primary_action).toBeNull();
   expect(nextAction).toMatchObject({
     schema: "inspr.pharos.next-action.v1",
-    version: 1,
+    version: 2,
     owner: {
       kind: "host_agent",
       key: `host-agent:${host}`,
@@ -2997,12 +3281,35 @@ test("settings sheet live wait advances only from host evidence and stops termin
       strategy: "automatic_retry",
       escalation_owner: "pharos",
     },
+    recovery_action: {
+      kind: "automatic_retry",
+      effect: "runtime_verification",
+      idempotency_key: `${runId}:runtime-verification:automatic-retry`,
+      available_when_overdue: true,
+    },
   });
+  expect(nextAction.timing).toMatchObject({
+    started_at: requestPayload.job.created_at,
+    last_update_at: requestPayload.job.updated_at,
+    since: requestPayload.job.updated_at,
+    overdue: false,
+  });
+  expect(nextAction.timing.next_check_at).toBeGreaterThan(nextAction.timing.as_of);
+  expect(nextAction.timing.overdue_at).toBeGreaterThan(nextAction.timing.as_of);
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
   const exactGuidance = `The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then ${host} must report the requested values; Pharos will not mark this run complete without that matching host evidence.`;
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
   await expect(dialog.locator('[data-step-state="waiting"]')).toContainText(
     "The nixcfg review, merge, and deployment must finish first",
+  );
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "Background progress is active",
+  );
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "Automatic check by",
+  );
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "usually within 5 min",
   );
   await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-primary]")).toBeHidden();
@@ -3023,6 +3330,11 @@ test("settings sheet live wait advances only from host evidence and stops termin
     "data-ladder-state",
     "complete",
   );
+  const liveAdvanced = dialog.locator(".host-workflow-advanced");
+  const liveAdvancedSummary = liveAdvanced.locator("summary");
+  await liveAdvancedSummary.click();
+  await expect(liveAdvanced).toHaveAttribute("open", "");
+  await expect(liveAdvancedSummary).toBeFocused();
 
   const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
   const exactJobRequests = [];
@@ -3039,6 +3351,8 @@ test("settings sheet live wait advances only from host evidence and stops termin
   expect(exactJobRequests).toHaveLength(readsBeforeAutomaticPoll + 1);
   expect(exactJobRequests.every((method) => method === "GET")).toBe(true);
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
+  await expect(liveAdvanced).toHaveAttribute("open", "");
+  await expect(liveAdvancedSummary).toBeFocused();
 
   const resumedResponsePromise = page.waitForResponse(
     (response) =>
@@ -3056,6 +3370,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
       operation: "poll_host_evidence",
     },
     idempotency: { key: nextAction.idempotency.key },
+    recovery_action: { idempotency_key: nextAction.recovery_action.idempotency_key },
   });
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
@@ -3103,6 +3418,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
       expect.objectContaining({ kind: "host_state_verified" }),
     ]),
   );
+  await expect(dialog.locator(".host-workflow-timing")).toHaveCount(0);
   const terminalPollCount = requestedUrls.filter((url) => url.includes(jobPath)).length;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.waitForTimeout(2_500);

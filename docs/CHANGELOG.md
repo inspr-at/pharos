@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.1.98 - 2026-09-01
+
+- Open a context-preserving host drawer directly from Fleet, summarize the
+  host's current posture and next step, keep quick-setting edits as an
+  explicitly unsent local draft, and hand that draft to the guarded host
+  settings review with one clear action (PHAROS-247).
+- Show truthful start, last-evidence, next-check, rounded expected-range,
+  overdue, and escalation facts on every saved host workflow; keep recovery
+  bound to the exact effect and same-run idempotency key, resume automatic
+  reconciliation after restart, and stop polling terminal or withdrawn runs
+  without discarding their receipt (PHAROS-249).
+- Give read-only users one consistent access-request path across Fleet, host
+  settings, provider connections and managed services; name the required Fleet
+  manager role and Pharos administrator owner while enforcing the same manager
+  boundary at settings, provisioning, and managed-service mutation endpoints
+  (PHAROS-248).
+
 ## 0.1.97 - 2026-09-01
 
 - Refresh the immutable Debian bookworm runtime base and snapshot so published images include the fixed `libexpat1` package for CVE-2026-56408; keep the release vulnerability, SBOM, provenance, and signature gates fail-closed (PHAROS-252).
