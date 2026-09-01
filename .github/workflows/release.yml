@@ -2,16 +2,15 @@ name: release
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: pharos-release-stable
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
 
@@ -30,8 +29,13 @@ jobs:
         with:
           fetch-depth: 0
       - name: fetch release tag object
-        if: github.ref_type == 'tag'
         run: git fetch --quiet --force --no-tags origin "+${GITHUB_REF}:${GITHUB_REF}"
+      - name: require an exact tag release
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" != tag ]]; then
+            echo 'error: stable publication requires an exact annotated tag ref' >&2
+            exit 1
+          fi
       - name: release consistency
         run: scripts/check-release-consistency.sh
       - name: pinned Paimos delivery contract
@@ -43,48 +47,208 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: version
-        run: echo "value=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
-      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0 (Node 24)
-        id: meta
-        with:
-          images: ghcr.io/inspr-at/pharos/pharosd
-          tags: |
-            type=ref,event=branch
-            type=sha
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-      - name: refuse semantic tag overwrite
-        if: github.ref_type == 'tag'
+        run: |
+          {
+            echo "value=$(jq -er '.version' RELEASE.json)"
+            echo "scheme=$(jq -er '.version_scheme' RELEASE.json)"
+            echo "channel=$(jq -er '.release_channel' RELEASE.json)"
+            echo "sequence=$(jq -er '.release_sequence' RELEASE.json)"
+            echo "cargo=$(jq -er '.ecosystem_versions.cargo_semver' RELEASE.json)"
+            echo 'image=ghcr.io/inspr-at/pharos/pharosd'
+            echo "sha_tag=sha-${GITHUB_SHA}"
+          } >> "$GITHUB_OUTPUT"
+      - name: discover immutable forge assets for recovery
+        id: forge
         env:
-          IMAGE: ghcr.io/inspr-at/pharos/pharosd
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          if output=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" 2>&1); then
-            echo "error: semantic image tag already exists and is immutable" >&2
+          if ! release=$(gh release view "${GITHUB_REF_NAME}" \
+            --json isDraft,tagName,name,assets 2>/dev/null); then
+            {
+              echo 'state=none'
+              echo 'release_set=false'
+              echo 'bundle=false'
+              echo 'sbom=false'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq -e --arg tag "${GITHUB_REF_NAME}" --arg title "Pharos ${VERSION}" \
+            '.tagName == $tag and .name == $title' <<<"${release}" >/dev/null || {
+            echo 'error: existing forge release has the wrong tag or title' >&2
+            exit 1
+          }
+          remote_tag_object=$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object.sha')
+          local_tag_object=$(git rev-parse "refs/tags/${GITHUB_REF_NAME}")
+          [[ "${remote_tag_object}" == "${local_tag_object}" ]] || {
+            echo 'error: forge release tag object does not match the checked-out tag' >&2
+            exit 1
+          }
+          state=$(jq -r 'if .isDraft then "draft" else "published" end' <<<"${release}")
+          mapfile -t assets < <(jq -r '.assets[].name' <<<"${release}")
+          for asset in "${assets[@]}"; do
+            case "${asset}" in
+              release-set.json|release-set.sigstore.json|pharos.spdx.json) ;;
+              *) echo "error: existing forge release has unexpected asset ${asset}" >&2; exit 1 ;;
+            esac
+          done
+          if [[ "${state}" == published && ${#assets[@]} -ne 3 ]]; then
+            echo 'error: published forge release does not contain the exact asset set' >&2
             exit 1
           fi
-          if ! grep -Eqi 'manifest unknown|not found|no such manifest' <<<"$output"; then
-            echo "error: could not prove that the semantic image tag is unused" >&2
+          mkdir recovered-release-assets
+          for asset in release-set.json release-set.sigstore.json pharos.spdx.json; do
+            if printf '%s\n' "${assets[@]}" | grep -Fxq "${asset}"; then
+              gh release download "${GITHUB_REF_NAME}" --dir recovered-release-assets \
+                --pattern "${asset}"
+              present=true
+            else
+              present=false
+            fi
+            case "${asset}" in
+              release-set.json) echo "release_set=${present}" >> "$GITHUB_OUTPUT" ;;
+              release-set.sigstore.json) echo "bundle=${present}" >> "$GITHUB_OUTPUT" ;;
+              pharos.spdx.json) echo "sbom=${present}" >> "$GITHUB_OUTPUT" ;;
+            esac
+          done
+          if [[ -f recovered-release-assets/release-set.json ]]; then
+            recovered_digest=$(jq -er '.digest' recovered-release-assets/release-set.json)
+            echo "digest=${recovered_digest}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "state=${state}" >> "$GITHUB_OUTPUT"
+      - name: resolve any partially admitted release
+        id: existing
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.value }}
+          SHA_TAG: ${{ steps.version.outputs.sha_tag }}
+          RELEASE_DIGEST: ${{ steps.forge.outputs.digest }}
+        run: |
+          inspect_coordinate() {
+            local coordinate=$1 output
+            if output=$(docker buildx imagetools inspect "${IMAGE}:${coordinate}" \
+              --format '{{json .Manifest}}' 2>&1); then
+              jq -er '.digest' <<<"${output}"
+              return
+            fi
+            if grep -Eqi 'manifest unknown|not found|no such manifest' <<<"${output}"; then
+              return
+            fi
+            echo "error: could not inspect immutable coordinate: ${coordinate}" >&2
             exit 1
+          }
+          version_digest=$(inspect_coordinate "${VERSION}")
+          sha_digest=$(inspect_coordinate "${SHA_TAG}")
+          if [[ -n "${version_digest}" && -n "${sha_digest}" && "${version_digest}" != "${sha_digest}" ]]; then
+            echo 'error: partially admitted immutable coordinates disagree' >&2
+            exit 1
+          fi
+          admitted_digest=${version_digest:-${sha_digest}}
+          if [[ -n "${RELEASE_DIGEST}" ]]; then
+            if [[ -n "${admitted_digest}" && "${admitted_digest}" != "${RELEASE_DIGEST}" ]]; then
+              echo 'error: forge release and immutable image coordinates disagree' >&2
+              exit 1
+            fi
+            admitted_digest=${RELEASE_DIGEST}
+          fi
+          echo "digest=${admitted_digest}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${admitted_digest}" ]]; then
+            echo "Recovering the release from already-admitted digest ${admitted_digest}."
           fi
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0 (Node 24)
+        if: steps.existing.outputs.digest == ''
         id: build
         with:
           context: .
           platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ steps.version.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            at.inspr.version.scheme=${{ steps.version.outputs.scheme }}
+            at.inspr.release.channel=${{ steps.version.outputs.channel }}
+            at.inspr.release.sequence=${{ steps.version.outputs.sequence }}
+            at.inspr.ecosystem.cargo-version=${{ steps.version.outputs.cargo }}
           provenance: mode=max
           sbom: true
           build-args: |
             GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: scan published image
+      - name: select exact candidate digest
+        id: candidate
+        env:
+          EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          digest=${EXISTING_DIGEST:-${BUILT_DIGEST}}
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo 'error: candidate digest is absent or malformed' >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - name: prove final coordinates are absent or recoverable
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.value }}
+          SHA_TAG: ${{ steps.version.outputs.sha_tag }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          for coordinate in "${VERSION}" "${SHA_TAG}"; do
+            if output=$(docker buildx imagetools inspect "${IMAGE}:${coordinate}" \
+              --format '{{json .Manifest}}' 2>&1); then
+              existing=$(jq -er '.digest' <<<"${output}")
+              if [[ "${existing}" != "${DIGEST}" ]]; then
+                echo "error: immutable coordinate ${coordinate} has a different digest" >&2
+                exit 1
+              fi
+              continue
+            fi
+            if ! grep -Eqi 'manifest unknown|not found|no such manifest' <<<"$output"; then
+              echo "error: could not prove image coordinate is unused: ${coordinate}" >&2
+              exit 1
+            fi
+          done
+      - name: verify candidate runtime identity
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.value }}
+          SEQUENCE: ${{ steps.version.outputs.sequence }}
+        run: |
+          container="pharos-release-${GITHUB_RUN_ID}"
+          cleanup() { docker rm -f "${container}" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --rm --name "${container}" \
+            -p 127.0.0.1:18088:8080 \
+            -e PHAROS_ADDR=0.0.0.0:8080 \
+            -e PHAROS_PUBLIC_ADDR=127.0.0.1:18088 \
+            -e PHAROS_ALLOW_OPEN=true \
+            "${IMAGE}@${DIGEST}" >/dev/null
+          for _ in {1..30}; do
+            response=$(curl -fsS http://127.0.0.1:18088/version 2>/dev/null) && break
+            sleep 1
+          done
+          jq -e \
+            --arg version "${VERSION}" \
+            --arg commit "${GITHUB_SHA}" \
+            --argjson sequence "${SEQUENCE}" \
+            '.version_scheme == "inspr-calendar-v1"
+              and .version == $version
+              and .release_channel == "stable"
+              and .release_sequence == $sequence
+              and .git_commit == $commit' <<<"${response}" >/dev/null
+          docker run --rm --network host \
+            -e PHAROS_URL=http://127.0.0.1:18088 \
+            --entrypoint /usr/local/bin/pharos \
+            "${IMAGE}@${DIGEST}" version | jq -e --arg version "${VERSION}" \
+            '.version_scheme == "inspr-calendar-v1" and .version == $version' >/dev/null
+      - name: scan candidate image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (composite; Node 24 nested actions)
         with:
-          image-ref: ghcr.io/inspr-at/pharos/pharosd@${{ steps.build.outputs.digest }}
+          image-ref: ghcr.io/inspr-at/pharos/pharosd@${{ steps.candidate.outputs.digest }}
           version: v0.72.0
           format: table
           exit-code: "1"
@@ -92,20 +256,10 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH
           scanners: vuln
-      - name: generate SPDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0 (Node 24)
-        with:
-          image: ghcr.io/inspr-at/pharos/pharosd@${{ steps.build.outputs.digest }}
-          format: spdx-json
-          output-file: pharos.spdx.json
-          artifact-name: pharos-${{ steps.version.outputs.value }}.spdx.json
-          syft-version: v1.49.0
-          upload-artifact: true
-          upload-release-assets: false
       - name: verify embedded OCI provenance and SBOM
         env:
           IMAGE: ghcr.io/inspr-at/pharos/pharosd
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           provenance=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{ json .Provenance.SLSA }}')
           sbom=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{ json .SBOM.SPDX }}')
@@ -119,20 +273,334 @@ jobs:
             and (.documentNamespace | type == "string" and length > 0)
             and (.packages | type == "array" and length > 0)
           ' <<<"${sbom}" >/dev/null
+          jq -S . <<<"${sbom}" > pharos.spdx.generated.json
+          if [[ -f recovered-release-assets/pharos.spdx.json ]]; then
+            cmp recovered-release-assets/pharos.spdx.json pharos.spdx.generated.json || {
+              echo 'error: existing forge SBOM differs from the exact candidate SBOM' >&2
+              exit 1
+            }
+            cp recovered-release-assets/pharos.spdx.json pharos.spdx.json
+          else
+            mv pharos.spdx.generated.json pharos.spdx.json
+          fi
       - name: install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1 (composite)
         with:
           cosign-release: v2.5.2
+      - name: verify frozen legacy rollback authority
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+        run: |
+          git fetch --quiet --no-tags origin refs/tags/v0.2.0:refs/tags/v0.2.0
+          [[ "$(git cat-file -t refs/tags/v0.2.0)" == tag ]] || {
+            echo 'error: legacy rollback tag is not annotated' >&2
+            exit 1
+          }
+          source_commit=$(jq -er '.legacy_rollback.source_commit' RELEASE.json)
+          digest=$(jq -er '.legacy_rollback.digest' RELEASE.json)
+          reference=$(jq -er '.legacy_rollback.reference' RELEASE.json)
+          [[ "$(git rev-parse 'refs/tags/v0.2.0^{}')" == "${source_commit}" ]] || {
+            echo 'error: legacy rollback tag does not peel to its frozen source commit' >&2
+            exit 1
+          }
+          tag_digest=$(docker buildx imagetools inspect "${IMAGE}:0.2.0" \
+            --format '{{json .Manifest}}' | jq -er '.digest')
+          reference_digest=$(docker buildx imagetools inspect "${reference}" \
+            --format '{{json .Manifest}}' | jq -er '.digest')
+          [[ "${tag_digest}" == "${digest}" && "${reference_digest}" == "${digest}" ]] || {
+            echo 'error: legacy rollback image coordinate does not resolve to its frozen digest' >&2
+            exit 1
+          }
+          labels=$(docker buildx imagetools inspect "${reference}" \
+            --format '{{json .Image.Config.Labels}}')
+          jq -e --arg commit "${source_commit}" '
+            .["org.opencontainers.image.version"] == "0.2.0"
+            and .["org.opencontainers.image.revision"] == $commit
+          ' <<<"${labels}" >/dev/null
+          cosign verify "${IMAGE}@${digest}" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v0.2.0" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" >/dev/null
       - name: sign image digest with GitHub OIDC
         env:
           IMAGE: ghcr.io/inspr-at/pharos/pharosd
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          signature_tag=$(cosign triangulate "${IMAGE}@${DIGEST}")
+          if output=$(docker buildx imagetools inspect "${signature_tag}" 2>&1); then
+            cosign verify "${IMAGE}@${DIGEST}" \
+              --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" >/dev/null
+            echo 'A matching immutable image signature already exists.'
+          elif grep -Eqi 'manifest unknown|not found|no such manifest' <<<"${output}"; then
+            cosign sign --yes "${IMAGE}@${DIGEST}"
+          else
+            echo 'error: could not prove that the image signature coordinate is unused' >&2
+            exit 1
+          fi
       - name: verify image signature
         env:
           IMAGE: ghcr.io/inspr-at/pharos/pharosd
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           cosign verify "${IMAGE}@${DIGEST}" \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" >/dev/null
+      - name: capture verifiable OCI signature and attestation references
+        id: oci_evidence
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          index=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw)
+          platform_digest=$(jq -er '
+            [
+              .manifests[]
+              | select(.platform.os == "linux" and .platform.architecture == "amd64")
+              | .digest
+            ]
+            | if length == 1 then .[0] else error("expected exactly one linux/amd64 image") end
+          ' <<<"${index}")
+          attestation_manifest_digest=$(jq -er --arg platform_digest "${platform_digest}" '
+            [
+              .manifests[]
+              | select(
+                  .annotations["vnd.docker.reference.type"] == "attestation-manifest"
+                  and .annotations["vnd.docker.reference.digest"] == $platform_digest
+                )
+              | .digest
+            ]
+            | if length == 1 then .[0] else error("expected exactly one attestation manifest") end
+          ' <<<"${index}")
+          attestation=$(docker buildx imagetools inspect \
+            "${IMAGE}@${attestation_manifest_digest}" --raw)
+          provenance_layer_digest=$(jq -er '
+            [
+              .layers[]
+              | select(.annotations["in-toto.io/predicate-type"] == "https://slsa.dev/provenance/v1")
+              | .digest
+            ]
+            | if length == 1 then .[0] else error("expected exactly one provenance layer") end
+          ' <<<"${attestation}")
+          sbom_layer_digest=$(jq -er '
+            [
+              .layers[]
+              | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")
+              | .digest
+            ]
+            | if length == 1 then .[0] else error("expected exactly one SBOM layer") end
+          ' <<<"${attestation}")
+          signature_tag=$(cosign triangulate "${IMAGE}@${DIGEST}")
+          signature_manifest_digest=$(docker buildx imagetools inspect "${signature_tag}" \
+            --format '{{json .Manifest}}' | jq -er '.digest')
+          {
+            echo "platform_digest=${platform_digest}"
+            echo "attestation_manifest_digest=${attestation_manifest_digest}"
+            echo "provenance_layer_digest=${provenance_layer_digest}"
+            echo "sbom_layer_digest=${sbom_layer_digest}"
+            echo "signature_tag=${signature_tag}"
+            echo "signature_manifest_digest=${signature_manifest_digest}"
+          } >> "$GITHUB_OUTPUT"
+      - name: generate immutable release set
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+          SHA_TAG: ${{ steps.version.outputs.sha_tag }}
+          PLATFORM_DIGEST: ${{ steps.oci_evidence.outputs.platform_digest }}
+          ATTESTATION_MANIFEST_DIGEST: ${{ steps.oci_evidence.outputs.attestation_manifest_digest }}
+          PROVENANCE_LAYER_DIGEST: ${{ steps.oci_evidence.outputs.provenance_layer_digest }}
+          SBOM_LAYER_DIGEST: ${{ steps.oci_evidence.outputs.sbom_layer_digest }}
+          SIGNATURE_TAG: ${{ steps.oci_evidence.outputs.signature_tag }}
+          SIGNATURE_MANIFEST_DIGEST: ${{ steps.oci_evidence.outputs.signature_manifest_digest }}
+        run: |
+          lock_digest=$(python3 scripts/release_version.py lock-digest)
+          sbom_digest="sha256:$(sha256sum pharos.spdx.json | cut -d' ' -f1)"
+          jq -n \
+            --slurpfile coordinate RELEASE.json \
+            --arg source_commit "${GITHUB_SHA}" \
+            --arg tag "${GITHUB_REF_NAME}" \
+            --arg image "${IMAGE}" \
+            --arg digest "${DIGEST}" \
+            --arg sha_tag "${SHA_TAG}" \
+            --arg platform_digest "${PLATFORM_DIGEST}" \
+            --arg lock_digest "${lock_digest}" \
+            --arg sbom_digest "${sbom_digest}" \
+            --arg attestation_manifest_digest "${ATTESTATION_MANIFEST_DIGEST}" \
+            --arg provenance_layer_digest "${PROVENANCE_LAYER_DIGEST}" \
+            --arg sbom_layer_digest "${SBOM_LAYER_DIGEST}" \
+            --arg signature_tag "${SIGNATURE_TAG}" \
+            --arg signature_manifest_digest "${SIGNATURE_MANIFEST_DIGEST}" \
+            '($coordinate[0]) as $release | {
+              schema: "inspr.pharos.release-set.v1",
+              schema_version: 1,
+              version_scheme: $release.version_scheme,
+              version: $release.version,
+              release_channel: $release.release_channel,
+              release_sequence: $release.release_sequence,
+              migration_anchor: $release.migration_anchor,
+              cargo_version: $release.ecosystem_versions.cargo_semver,
+              source_commit: $source_commit,
+              source_lock_digest: $lock_digest,
+              tag: $tag,
+              image: $image,
+              digest: $digest,
+              reference: ($image + ":" + $release.version + "@" + $digest),
+              sha_reference: ($image + ":" + $sha_tag + "@" + $digest),
+              legacy_rollback: $release.legacy_rollback,
+              artifacts: [{
+                coordinate: {
+                  class: "oci-index",
+                  version_reference: ($image + ":" + $release.version + "@" + $digest),
+                  source_reference: ($image + ":" + $sha_tag + "@" + $digest)
+                },
+                digest: $digest
+              }, {
+                coordinate: {class: "oci-image", platform: "linux/amd64"},
+                digest: $platform_digest
+              }, {
+                coordinate: {class: "spdx-sbom", filename: "pharos.spdx.json"},
+                digest: $sbom_digest
+              }],
+              attestations: {
+                signature: {
+                  coordinate: ($signature_tag + "@" + $signature_manifest_digest),
+                  digest: $signature_manifest_digest
+                },
+                provenance: {
+                  coordinate: ($image + "@" + $attestation_manifest_digest),
+                  manifest_digest: $attestation_manifest_digest,
+                  layer_digest: $provenance_layer_digest,
+                  predicate_type: "https://slsa.dev/provenance/v1"
+                },
+                sbom: {
+                  coordinate: ($image + "@" + $attestation_manifest_digest),
+                  manifest_digest: $attestation_manifest_digest,
+                  layer_digest: $sbom_layer_digest,
+                  predicate_type: "https://spdx.dev/Document"
+                }
+              }
+            }' > release-set.generated.json
+          if [[ -f recovered-release-assets/release-set.json ]]; then
+            cmp recovered-release-assets/release-set.json release-set.generated.json || {
+              echo 'error: existing forge release-set differs from regenerated evidence' >&2
+              exit 1
+            }
+            cp recovered-release-assets/release-set.json release-set.json
+          else
+            mv release-set.generated.json release-set.json
+          fi
+      - name: sign and verify release set
+        run: |
+          if [[ -f recovered-release-assets/release-set.sigstore.json ]]; then
+            cp recovered-release-assets/release-set.sigstore.json release-set.sigstore.json
+          else
+            cosign sign-blob --yes --bundle release-set.sigstore.json release-set.json
+          fi
+      - name: verify release-set contract, assets, and OCI evidence
+        env:
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+          ATTESTATION_MANIFEST_DIGEST: ${{ steps.oci_evidence.outputs.attestation_manifest_digest }}
+          PROVENANCE_LAYER_DIGEST: ${{ steps.oci_evidence.outputs.provenance_layer_digest }}
+          SBOM_LAYER_DIGEST: ${{ steps.oci_evidence.outputs.sbom_layer_digest }}
+          SIGNATURE_MANIFEST_DIGEST: ${{ steps.oci_evidence.outputs.signature_manifest_digest }}
+        run: |
+          python3 scripts/release_version.py check-set release-set.json
+          jq -e '.spdxVersion == "SPDX-2.3" and (.packages | type == "array" and length > 0)' \
+            pharos.spdx.json >/dev/null
+          sbom_digest="sha256:$(sha256sum pharos.spdx.json | cut -d' ' -f1)"
+          jq -e \
+            --arg digest "${DIGEST}" \
+            --arg sbom_digest "${sbom_digest}" \
+            --arg attestation_manifest_digest "${ATTESTATION_MANIFEST_DIGEST}" \
+            --arg provenance_layer_digest "${PROVENANCE_LAYER_DIGEST}" \
+            --arg sbom_layer_digest "${SBOM_LAYER_DIGEST}" \
+            --arg signature_manifest_digest "${SIGNATURE_MANIFEST_DIGEST}" \
+            '.digest == $digest
+              and .artifacts[2].digest == $sbom_digest
+              and .attestations.signature.digest == $signature_manifest_digest
+              and .attestations.provenance.manifest_digest == $attestation_manifest_digest
+              and .attestations.provenance.layer_digest == $provenance_layer_digest
+              and .attestations.sbom.manifest_digest == $attestation_manifest_digest
+              and .attestations.sbom.layer_digest == $sbom_layer_digest' \
+            release-set.json >/dev/null
+          cosign verify-blob \
+            --bundle release-set.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            release-set.json >/dev/null
+      - name: stage exact immutable forge assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+          RELEASE_STATE: ${{ steps.forge.outputs.state }}
+          HAS_RELEASE_SET: ${{ steps.forge.outputs.release_set }}
+          HAS_BUNDLE: ${{ steps.forge.outputs.bundle }}
+          HAS_SBOM: ${{ steps.forge.outputs.sbom }}
+        run: |
+          if [[ "${RELEASE_STATE}" == none ]]; then
+            gh release create "${GITHUB_REF_NAME}" \
+              release-set.json release-set.sigstore.json pharos.spdx.json \
+              --draft --verify-tag --title "Pharos ${VERSION}" --generate-notes
+          elif [[ "${RELEASE_STATE}" == draft ]]; then
+            [[ "${HAS_RELEASE_SET}" == true ]] || gh release upload "${GITHUB_REF_NAME}" release-set.json
+            [[ "${HAS_BUNDLE}" == true ]] || gh release upload "${GITHUB_REF_NAME}" release-set.sigstore.json
+            [[ "${HAS_SBOM}" == true ]] || gh release upload "${GITHUB_REF_NAME}" pharos.spdx.json
+          fi
+          mkdir verified-forge-assets
+          for asset in release-set.json release-set.sigstore.json pharos.spdx.json; do
+            gh release download "${GITHUB_REF_NAME}" --dir verified-forge-assets --pattern "${asset}"
+            cmp "${asset}" "verified-forge-assets/${asset}" || {
+              echo "error: staged forge asset differs: ${asset}" >&2
+              exit 1
+            }
+          done
+      - name: admit immutable version and source coordinates
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.value }}
+          SHA_TAG: ${{ steps.version.outputs.sha_tag }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          missing=()
+          for coordinate in "${VERSION}" "${SHA_TAG}"; do
+            if output=$(docker buildx imagetools inspect "${IMAGE}:${coordinate}" \
+              --format '{{json .Manifest}}' 2>&1); then
+              existing=$(jq -er '.digest' <<<"${output}")
+              if [[ "${existing}" != "${DIGEST}" ]]; then
+                echo "error: immutable coordinate ${coordinate} changed before admission" >&2
+                exit 1
+              fi
+            elif grep -Eqi 'manifest unknown|not found|no such manifest' <<<"${output}"; then
+              missing+=(--tag "${IMAGE}:${coordinate}")
+            else
+              echo "error: could not inspect immutable coordinate: ${coordinate}" >&2
+              exit 1
+            fi
+          done
+          if ((${#missing[@]})); then
+            docker buildx imagetools create --prefer-index=false \
+              "${missing[@]}" "${IMAGE}@${DIGEST}"
+          fi
+          for coordinate in "${VERSION}" "${SHA_TAG}"; do
+            admitted=$(docker buildx imagetools inspect "${IMAGE}:${coordinate}" \
+              --format '{{json .Manifest}}' | jq -er '.digest')
+            [[ "${admitted}" == "${DIGEST}" ]] || exit 1
+          done
+      - name: publish immutable forge release
+        if: steps.forge.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
+      - name: move mutable latest alias after admission
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          docker buildx imagetools create --prefer-index=false \
+            --tag "${IMAGE}:latest" "${IMAGE}@${DIGEST}"
+          latest=$(docker buildx imagetools inspect "${IMAGE}:latest" \
+            --format '{{json .Manifest}}' | jq -er '.digest')
+          [[ "${latest}" == "${DIGEST}" ]] || {
+            echo 'error: latest alias does not resolve to the admitted digest' >&2
+            exit 1
+          }

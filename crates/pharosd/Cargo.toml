@@ -34,6 +34,9 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # compiler, hence the non-slim build stage in the Dockerfile.
 openidconnect = "4"
 
+[build-dependencies]
+serde_json = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

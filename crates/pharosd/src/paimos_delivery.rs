@@ -37,9 +37,10 @@ pub(crate) const PAIMOS_CERTIFIED_COMMIT: &str = "e5f4c86bc061775c853d5847e8fb8b
 pub(crate) const PAIMOS_FIXTURE_DIGEST: &str =
     "sha256:0318f4025902c9d5dd790384950cc9daebb16e02e79a4a90ce7dddc673e68bed";
 
-const CONFIG_SCHEMA: &str = "inspr.pharos.paimos-delivery-adapter.v1";
+const CONFIG_SCHEMA: &str = "inspr.pharos.paimos-delivery-adapter.v2";
+const CONFIG_SCHEMA_VERSION: u16 = 2;
 const JOURNAL_SCHEMA: &str = "inspr.pharos.paimos-delivery-journal.v1";
-const INTENT_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-intent.v1";
+const INTENT_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-intent.v2";
 const CONTRACT_MEDIA_TYPE: &str = "application/vnd.paimos.external-stage.v1+json";
 const HANDOFF_SECRET_HEADER: &str = "X-PAIMOS-Handoff-Secret";
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
@@ -129,9 +130,16 @@ impl GuardedWorkflow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactVersionScheme {
+    Legacy,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ArtifactEvidence {
+    version_scheme: ArtifactVersionScheme,
     version: String,
     digest: String,
     commit_digest: String,
@@ -139,9 +147,63 @@ struct ArtifactEvidence {
 
 impl ArtifactEvidence {
     fn valid(&self) -> bool {
-        valid_version(&self.version)
+        self.version_scheme == ArtifactVersionScheme::Legacy
+            && valid_version(&self.version)
             && valid_sha256_digest(&self.digest)
             && valid_lower_hex(&self.commit_digest, &[40, 64])
+    }
+}
+
+mod legacy_wire_artifact {
+    use super::{ArtifactEvidence, ArtifactVersionScheme};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct WireArtifact<'a> {
+        version: &'a str,
+        digest: &'a str,
+        commit_digest: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OwnedWireArtifact {
+        version: String,
+        digest: String,
+        commit_digest: String,
+    }
+
+    pub(super) fn serialize<S>(
+        artifact: &ArtifactEvidence,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if artifact.version_scheme != ArtifactVersionScheme::Legacy {
+            return Err(serde::ser::Error::custom(
+                "external-stage v1 accepts only legacy artifact evidence",
+            ));
+        }
+        WireArtifact {
+            version: &artifact.version,
+            digest: &artifact.digest,
+            commit_digest: &artifact.commit_digest,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<ArtifactEvidence, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = OwnedWireArtifact::deserialize(deserializer)?;
+        Ok(ArtifactEvidence {
+            version_scheme: ArtifactVersionScheme::Legacy,
+            version: wire.version,
+            digest: wire.digest,
+            commit_digest: wire.commit_digest,
+        })
     }
 }
 
@@ -245,7 +307,7 @@ impl AdapterConfig {
         let document: ConfigDocument =
             serde_json::from_slice(&bytes).map_err(|_| AdapterError::Configuration)?;
         if document.schema != CONFIG_SCHEMA
-            || document.schema_version != PAIMOS_SCHEMA_MAJOR
+            || document.schema_version != CONFIG_SCHEMA_VERSION
             || !(5..=3600).contains(&document.poll_interval_secs)
             || !(30..=900).contains(&document.verification_freshness_secs)
             || document.intents.is_empty()
@@ -406,6 +468,7 @@ struct PharosEvidence {
     kind: EvidenceKind,
     workflow: String,
     environment: String,
+    #[serde(with = "legacy_wire_artifact")]
     artifact: ArtifactEvidence,
     result: EvidenceResult,
     observed_at: String,
@@ -1575,6 +1638,7 @@ mod tests {
 
     fn artifact() -> ArtifactEvidence {
         ArtifactEvidence {
+            version_scheme: ArtifactVersionScheme::Legacy,
             version: "1.2.3".to_string(),
             digest: format!("sha256:{}", "1".repeat(64)),
             commit_digest: "a".repeat(40),
@@ -2061,7 +2125,7 @@ mod tests {
             &config_path,
             &serde_json::to_vec(&json!({
                 "schema": CONFIG_SCHEMA,
-                "schema_version": 1,
+                "schema_version": CONFIG_SCHEMA_VERSION,
                 "paimos_origin": "https://paimos.example.test",
                 "api_key_file": api_path,
                 "poll_interval_secs": 5,
@@ -2225,6 +2289,16 @@ mod tests {
             bodies[1]["pharos_evidence"]["artifact"],
             bodies[3]["pharos_evidence"]["artifact"]
         );
+        for body in [&bodies[1], &bodies[3]] {
+            let artifact = body["pharos_evidence"]["artifact"]
+                .as_object()
+                .expect("frozen v1 artifact object");
+            assert_eq!(artifact.len(), 3);
+            assert!(artifact.contains_key("version"));
+            assert!(artifact.contains_key("digest"));
+            assert!(artifact.contains_key("commit_digest"));
+            assert!(!artifact.contains_key("version_scheme"));
+        }
         assert_eq!(
             bodies[1]["pharos_evidence"]["environment"],
             bodies[3]["pharos_evidence"]["environment"]
@@ -2655,7 +2729,7 @@ mod tests {
         write_private(&verification_secret, &[8; HANDOFF_SECRET_BYTES]);
         let mut document = json!({
             "schema": CONFIG_SCHEMA,
-            "schema_version": 1,
+            "schema_version": CONFIG_SCHEMA_VERSION,
             "paimos_origin": "https://paimos.example.test",
             "api_key_file": api_path.clone(),
             "poll_interval_secs": 5,
@@ -2702,6 +2776,14 @@ mod tests {
             .remove("callback");
         write_private(&config_path, &serde_json::to_vec(&document).unwrap());
         AdapterConfig::load(&config_path).expect("repaired document loads");
+
+        document["intents"][0]["artifact"]["version_scheme"] = json!("inspr-calendar-v1");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
+        document["intents"][0]["artifact"]["version_scheme"] = json!("legacy");
 
         // Defect class: cleartext delivery of the handoff secret. The loopback
         // forms the conformance harness uses must stay unreachable from the

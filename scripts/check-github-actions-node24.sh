@@ -8,10 +8,8 @@ readonly NODE24_ACTIONS=(
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"           # v7.0.1
   "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"         # v7.0.0
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"    # v7.0.1
-  "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610"        # v0.24.0
   "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"   # v7.3.0
   "docker/login-action@dbcb813823bdd20940b903addbd779551569679f"        # v4.6.0
-  "docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302"     # v6.2.0
   "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e" # v4.3.0
 )
 

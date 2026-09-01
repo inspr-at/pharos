@@ -8,6 +8,10 @@ import {
 } from "./harness.mjs";
 import { requireFixtureManifest } from "./harness-fixture.mjs";
 
+const releaseCoordinate = JSON.parse(
+  fs.readFileSync(new URL("../../RELEASE.json", import.meta.url), "utf8"),
+);
+
 const test = base.extend({
   page: async ({ browser }, use) => {
     await waitForHarnessTokens();
@@ -40,6 +44,22 @@ test("fleet has no serious accessibility violations and serves hardened headers"
     ["serious", "critical"].includes(impact),
   );
   expect(serious).toEqual([]);
+});
+
+test("release history exposes the complete immutable release identity", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const dialog = page.locator("[data-release-modal]");
+  await expect(dialog).toHaveCount(1);
+  const identity = dialog.locator("[data-release-identity]");
+  await expect(identity).toContainText("Calendar v1");
+  await expect(identity).toContainText(releaseCoordinate.release_channel);
+  await expect(identity).toContainText(`#${releaseCoordinate.release_sequence}`);
+  await expect(dialog.locator("[data-release-set]")).toHaveAttribute(
+    "href",
+    `https://github.com/inspr-at/pharos/releases/download/v${releaseCoordinate.version}/release-set.json`,
+  );
 });
 
 test("sign-in recovery is accessible, no-store, and restarts with one safe action", async ({
