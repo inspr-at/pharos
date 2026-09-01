@@ -1688,17 +1688,13 @@ impl HostActionJob {
             HostWorkflowReceiptStage::Requested,
             &[
                 HostActionEventKind::Requested,
-                HostActionEventKind::DispatchFailed,
+                HostActionEventKind::ReviewPassed,
             ],
         );
         self.push_receipt_evidence(
             &mut evidence,
             HostWorkflowReceiptStage::Declared,
-            &[
-                HostActionEventKind::RemovalDeclarationCompleted,
-                HostActionEventKind::ReviewPassed,
-                HostActionEventKind::ReviewFailed,
-            ],
+            &[HostActionEventKind::RemovalDeclarationCompleted],
         );
         self.push_receipt_evidence(
             &mut evidence,
@@ -1710,8 +1706,16 @@ impl HostActionJob {
                 HostActionEventKind::ApplyPassed,
                 HostActionEventKind::ApplyFailed,
                 HostActionEventKind::RecoveryFailed,
-                HostActionEventKind::SettingsFailed,
                 HostActionEventKind::RemovalCredentialFailed,
+            ],
+        );
+        self.push_receipt_failure_evidence(
+            &mut evidence,
+            &[
+                HostActionEventKind::DispatchFailed,
+                HostActionEventKind::DispatchOutcomeUncertain,
+                HostActionEventKind::ReviewFailed,
+                HostActionEventKind::SettingsFailed,
                 HostActionEventKind::RemovalFailed,
             ],
         );
@@ -1755,6 +1759,70 @@ impl HostActionJob {
             let Some(event) = self.latest_event(&[*kind]) else {
                 continue;
             };
+            receipt.push(HostWorkflowReceiptEvidence {
+                stage,
+                event: event.kind,
+                recorded_at: event.at,
+                owner: receipt_owner(&self.host, event),
+            });
+        }
+    }
+
+    /// Attach a terminal failure to the last lifecycle stage this run can
+    /// truthfully claim. A review or repository-dispatch failure does not make
+    /// an update "declared", and a settings/removal failure before host work
+    /// does not make it "executed". If earlier events prove that declaration
+    /// or execution really happened, retain that context without flattening
+    /// every occurrence of the failure kind into the same stage.
+    fn push_receipt_failure_evidence(
+        &self,
+        receipt: &mut Vec<HostWorkflowReceiptEvidence>,
+        kinds: &[HostActionEventKind],
+    ) {
+        for kind in kinds {
+            let Some((event_index, event)) = self
+                .events
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, event)| event.kind == *kind)
+            else {
+                continue;
+            };
+            let stage = self.events[..event_index].iter().fold(
+                HostWorkflowReceiptStage::Requested,
+                |stage, event| {
+                    let candidate = match event.kind {
+                        HostActionEventKind::RemovalDeclarationCompleted => {
+                            HostWorkflowReceiptStage::Declared
+                        }
+                        HostActionEventKind::ApplyClaimed
+                        | HostActionEventKind::ApplyRebooting
+                        | HostActionEventKind::ApplyPassed
+                        | HostActionEventKind::ApplyFailed
+                        | HostActionEventKind::RecoveryClaimed
+                        | HostActionEventKind::RecoveryRebooting
+                        | HostActionEventKind::RecoveryPassed
+                        | HostActionEventKind::RecoveryFailed
+                        | HostActionEventKind::RemovalAccessRevoked
+                        | HostActionEventKind::RemovalCredentialClaimed
+                        | HostActionEventKind::RemovalCredentialRetired
+                        | HostActionEventKind::RemovalCredentialFailed => {
+                            HostWorkflowReceiptStage::Executed
+                        }
+                        HostActionEventKind::SettingsApplied
+                        | HostActionEventKind::RemovalCompleted => {
+                            HostWorkflowReceiptStage::Verified
+                        }
+                        _ => stage,
+                    };
+                    if receipt_stage_order(candidate) > receipt_stage_order(stage) {
+                        candidate
+                    } else {
+                        stage
+                    }
+                },
+            );
             receipt.push(HostWorkflowReceiptEvidence {
                 stage,
                 event: event.kind,
@@ -8024,9 +8092,13 @@ mod tests {
         assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Recovery);
         assert_eq!(receipt.owner.source, HostActionEventSource::HostAgent);
         assert!(receipt.evidence.iter().any(|fact| {
-            fact.stage == HostWorkflowReceiptStage::Declared
+            fact.stage == HostWorkflowReceiptStage::Requested
                 && fact.event == HostActionEventKind::ReviewPassed
         }));
+        assert!(!receipt
+            .evidence
+            .iter()
+            .any(|fact| fact.stage == HostWorkflowReceiptStage::Declared));
         assert!(receipt.evidence.iter().any(|fact| {
             fact.stage == HostWorkflowReceiptStage::Executed
                 && fact.event == HostActionEventKind::RecoveryPassed
@@ -12473,12 +12545,54 @@ mod tests {
             assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Failure);
             assert_eq!(receipt.outcome, TerminalOutcome::Failed);
             assert!(receipt.evidence.iter().any(|fact| {
-                fact.stage == HostWorkflowReceiptStage::Executed && fact.event == event
+                fact.stage == HostWorkflowReceiptStage::Requested && fact.event == event
+            }));
+            assert!(!receipt.evidence.iter().any(|fact| {
+                matches!(
+                    fact.stage,
+                    HostWorkflowReceiptStage::Declared | HostWorkflowReceiptStage::Executed
+                )
             }));
             let serialized = serde_json::to_string(&receipt).expect("receipt serializes");
             assert!(!serialized.to_ascii_lowercase().contains("token"));
             assert!(!serialized.contains("https://"));
         }
+    }
+
+    #[test]
+    fn failed_update_review_projection_does_not_invent_declaration_or_execution() {
+        let store = HostActionStore::new(None);
+        let failed_review = store
+            .create_update_review("hsb8", "markus", 470)
+            .expect("guarded review");
+        store.claim("hsb8", 471).expect("claim").expect("lease");
+        let failed_review = store
+            .record_agent_result(
+                &failed_review.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                472,
+            )
+            .expect("review failure stored");
+        let mut evidence = Vec::new();
+        failed_review
+            .push_receipt_failure_evidence(&mut evidence, &[HostActionEventKind::ReviewFailed]);
+        assert!(evidence.iter().any(|fact| {
+            fact.stage == HostWorkflowReceiptStage::Requested
+                && fact.event == HostActionEventKind::ReviewFailed
+        }));
+        assert!(!evidence.iter().any(|fact| {
+            matches!(
+                fact.stage,
+                HostWorkflowReceiptStage::Declared | HostWorkflowReceiptStage::Executed
+            )
+        }));
     }
 
     #[test]
