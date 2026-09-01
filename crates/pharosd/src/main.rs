@@ -6212,7 +6212,6 @@ mod tests {
             &[],
             shell("markus", true),
             FleetCapabilities {
-                can_onboard: true,
                 can_manage_fleet: true,
                 system_update_available: true,
                 host_removal_available: true,
@@ -6268,7 +6267,6 @@ mod tests {
             &manifests,
             shell("markus", true),
             FleetCapabilities {
-                can_onboard: true,
                 can_manage_fleet: true,
                 system_update_available: true,
                 host_removal_available: true,
@@ -6524,7 +6522,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: false,
                     system_update_available: true,
                     host_removal_available: true,
@@ -6535,11 +6532,7 @@ mod tests {
             &host_lifecycle(&[], "hsb8", HostPreferencesState::Applied, true),
         );
 
-        assert!(markup.contains(r#"data-can-manage="false""#));
-        assert!(markup.contains(r#"data-host-action="system-update" hidden"#));
-        assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
-        assert!(markup.contains(r#"data-host-action="remove" hidden"#));
-        assert!(markup.contains(r#"data-host-action="technical""#));
+        assert!(markup.is_empty());
 
         let runtime_only_markup = host_actions_markup(
             &host,
@@ -6552,7 +6545,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: false,
                     host_removal_available: false,
@@ -6579,7 +6571,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: false,
                     host_removal_available: false,
@@ -6607,7 +6598,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: false,
                     host_removal_available: true,
@@ -6644,7 +6634,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: true,
                     host_removal_available: true,
@@ -6673,7 +6662,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: true,
                     host_removal_available: true,
@@ -6746,7 +6734,6 @@ mod tests {
                 backup: &backup,
                 surface: "card",
                 capabilities: FleetCapabilities {
-                    can_onboard: true,
                     can_manage_fleet: true,
                     system_update_available: true,
                     host_removal_available: true,
@@ -9377,7 +9364,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
 
         let html = render_home(
-            runtime(&[], &[job]),
+            runtime(&[], std::slice::from_ref(&job)),
             "csb1",
             1_120,
             &[],
@@ -9399,6 +9386,20 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"class="list-setup-intent""#));
         assert!(html.contains(r#"class="list-setup-state""#));
         assert!(html.contains(r#"colspan="6""#));
+
+        let viewer_html = render_home(
+            runtime(&[], std::slice::from_ref(&job)),
+            "csb1",
+            1_120,
+            &[],
+            shell("viewer", true),
+            false,
+        );
+        assert!(viewer_html.contains(r#"class="card setup-card""#));
+        assert!(viewer_html.contains("lab-01"));
+        assert!(!viewer_html.contains("Continue setup"));
+        assert!(!viewer_html.contains(r#"class="setup-action""#));
+        assert!(!viewer_html.contains(r#"setup=add-server&amp;setup_job="#));
     }
 
     #[test]
@@ -14397,6 +14398,57 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 "unsafe access target accepted: {unsafe_target}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_agora_viewers_get_fleet_access_path_without_mutation_controls() {
+        let mut state = report_test_state(false);
+        state
+            .store
+            .record(test_report("hsb8"), now_unix())
+            .expect("viewer fleet fixture records");
+        state
+            .host_actions
+            .begin_settings_change("hsb8", "viewer-fixture", now_unix())
+            .expect("pending settings fixture starts");
+        state.auth = AuthState::for_test_access(AccessGrant::limited(["hsb8"], true));
+
+        let response = home(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("viewer fleet body reads");
+        let html = String::from_utf8(body.to_vec()).expect("viewer fleet body is utf8");
+
+        assert_eq!(
+            html.matches(r#"data-access-path data-scope="fleet""#)
+                .count(),
+            1
+        );
+        assert!(!html.contains(r#"<button class="onboard-primary""#));
+        assert!(!html.contains(r#"<button class="onboard-tile""#));
+        assert!(!html.contains(r#"<span class="host-actions" data-host-actions"#));
+        assert!(!html.contains(
+            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings""#
+        ));
+        assert!(!html.contains(r#"<section class="host-action-overlay""#));
+
+        state.auth = AuthState::for_test_access(AccessGrant::full());
+        let response = home(State(state), HeaderMap::new()).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("manager fleet body reads");
+        let html = String::from_utf8(body.to_vec()).expect("manager fleet body is utf8");
+
+        assert!(!html.contains(r#"data-access-path data-scope="fleet""#));
+        assert!(html.contains(r#"<button class="onboard-primary""#));
+        assert!(html.contains(r#"<span class="host-actions" data-host-actions"#));
+        assert!(html.contains(
+            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings""#
+        ));
+        assert!(html.contains(r#"<section class="host-action-overlay""#));
     }
 
     #[tokio::test]

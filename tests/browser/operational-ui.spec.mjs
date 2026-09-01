@@ -95,6 +95,14 @@ test("read-only users get one access path and cannot call mutation endpoints", a
     await expect(access).toContainText("Pharos administrator");
     const cta = access.getByRole("link", { name: "Request access", exact: true });
     await expect(cta).toHaveAttribute("href", `/access/request?scope=${scope}`);
+    if (scope === "fleet") {
+      await expect(page.locator("[data-onboard-open]")).toHaveCount(0);
+      await expect(page.locator("[data-onboard-tile]")).toHaveCount(0);
+      await expect(page.locator("[data-host-actions]")).toHaveCount(0);
+      await expect(page.locator('[data-host-action="withdraw-settings"]')).toHaveCount(0);
+      await expect(page.locator("[data-host-action-overlay]")).toHaveCount(0);
+      await expect(page.locator(".setup-action")).toHaveCount(0);
+    }
     if (testInfo.project.name === "chromium-desktop") {
       await page.screenshot({
         path: testInfo.outputPath(`pharos-248-${scope}.png`),
@@ -2126,6 +2134,11 @@ test("fleet refresh keeps workflow note inert without host actions root", async 
   const readContext = await newAuthedContext(browser, "read");
   const page = await readContext.newPage();
   await page.goto("/");
+
+  await expect(page.locator("[data-onboard-open]")).toHaveCount(0);
+  await expect(page.locator("[data-onboard-tile]")).toHaveCount(0);
+  await expect(page.locator('[data-host-action="withdraw-settings"]')).toHaveCount(0);
+  await expect(page.locator("[data-host-action-overlay]")).toHaveCount(0);
 
   const snapshot = await page.request.get("/hosts.json");
   const payload = await snapshot.json();

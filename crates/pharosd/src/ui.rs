@@ -633,7 +633,6 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
             logout_enabled: state.auth.is_some(),
         },
         FleetCapabilities {
-            can_onboard: access.can_agora(),
             can_manage_fleet: access.can_manage_fleet(),
             system_update_available: state.nixcfg_dispatch.system_update_available(),
             host_removal_available: state.nixcfg_dispatch.host_removal_available()
@@ -1766,6 +1765,9 @@ pub(super) fn host_actions_markup(
     lifecycle: &HostLifecycle,
 ) -> String {
     let capabilities = context.capabilities;
+    if !capabilities.can_manage_fleet {
+        return String::new();
+    }
     let name = html_escape(&host.name);
     let role = html_escape(&host.role);
     let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
@@ -3335,7 +3337,6 @@ pub(super) struct RuntimeSnapshot<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FleetCapabilities {
-    pub(super) can_onboard: bool,
     pub(super) can_manage_fleet: bool,
     pub(super) system_update_available: bool,
     pub(super) host_removal_available: bool,
@@ -3722,7 +3723,7 @@ pub(super) fn reconcile_provisioning_jobs_with_runtime(
     }
 }
 
-pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
+pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64, can_manage_fleet: bool) -> String {
     let Some(raw_name) = provisioning_job_host_name(job) else {
         return String::new();
     };
@@ -3754,12 +3755,27 @@ pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
         provisioning_job_latest_message(job)
     };
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
+    let header_action = if can_manage_fleet {
+        format!(
+            r#"<div class="card-actions"><a class="header-chip settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div>"#,
+            job_id = html_escape(&job.id),
+            settings = icons::SLIDERS,
+        )
+    } else {
+        String::new()
+    };
+    let continue_action = if can_manage_fleet {
+        format!(
+            r#"<div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div>"#,
+            job_id = html_escape(&job.id),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div><div class="card-actions"><a class="header-chip settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div></header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div><div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div></article>"#,
+        r#"<article class="card setup-card" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><header class="card-head"><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div>{header_action}</header><div class="reason {reason_level}" data-reason><span>{reason}</span></div>{intent_markup}<div class="setup-detail">{detail}</div><div class="meta"><span>{started}</span><span>as of {as_of}</span></div>{continue_action}</article>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
-        job_id = html_escape(&job.id),
-        settings = icons::SLIDERS,
         reason = html_escape(&reason),
         detail = html_escape(&detail),
         started = html_escape(&started),
@@ -3767,7 +3783,7 @@ pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64) -> String {
     )
 }
 
-pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
+pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64, can_manage_fleet: bool) -> String {
     let Some(raw_name) = provisioning_job_host_name(job) else {
         return String::new();
     };
@@ -3790,11 +3806,18 @@ pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64) -> String {
         setup_intent_search_text(&intent).to_lowercase()
     ));
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
+    let action = if can_manage_fleet {
+        format!(
+            r#"<a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a>"#,
+            job_id = html_escape(&job.id),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a></div></td></tr>"#,
+        r#"<tr class="setup-row" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{updated_at}" data-search="{search}" data-host-surface="setup" data-setup-level="{level}"><td><div class="host"><span class="nix">{host_icon}</span><div><div class="name">{name}</div><div class="role">{role}</div></div></div></td><td><div class="list-attention"><div class="reason {reason_level}" data-reason><span>{reason}</span></div></div></td><td><div class="list-setup-intent"><span class="setup-chip backup">{backup}</span><span class="setup-chip location">{location}</span></div></td><td><div class="list-seen"><span>{started}</span></div></td><td><span class="list-setup-state">{job_state}</span></td><td><div class="list-actions">{action}</div></td></tr>"#,
         sort_name = html_escape(&raw_name.to_lowercase()),
         updated_at = job.updated_at,
-        job_id = html_escape(&job.id),
         reason = html_escape(&reason),
         backup = html_escape(intent.backup_label()),
         location = html_escape(intent.location_label()),
@@ -6587,7 +6610,6 @@ pub(super) fn render_home(
         manifests,
         shell,
         FleetCapabilities {
-            can_onboard,
             can_manage_fleet: can_onboard,
             system_update_available: true,
             host_removal_available: true,
@@ -6603,7 +6625,7 @@ pub(super) fn render_home_with_capabilities(
     shell: ShellContext<'_>,
     capabilities: FleetCapabilities,
 ) -> String {
-    let can_onboard = capabilities.can_onboard;
+    let can_onboard = capabilities.can_manage_fleet;
     let access_path = if capabilities.can_manage_fleet {
         String::new()
     } else {
@@ -6980,8 +7002,8 @@ pub(super) fn render_home_with_capabilities(
         ));
     }
     for job in setup_jobs {
-        cards.push_str(&render_setup_card(job, now));
-        rows.push_str(&render_setup_row(job, now));
+        cards.push_str(&render_setup_card(job, now, capabilities.can_manage_fleet));
+        rows.push_str(&render_setup_row(job, now, capabilities.can_manage_fleet));
     }
 
     let lone = if hosts.len() == 1 {
