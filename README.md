@@ -293,6 +293,15 @@ the runtime configuration. Usernames and unprefixed emails are rejected at
 startup. `PHAROS_ACCESS_POLICY_FILE` uses the same identifier forms for scoped
 grants.
 
+Read-only people keep the observation surfaces they were granted. Guarded
+surfaces name the required **Fleet manager** role, identify the **Pharos
+administrator** as the access owner, and offer one GET-only access-request
+path. `PHAROS_ACCESS_REQUEST_URL` may send that click to a credential-free
+HTTPS help destination (or a local absolute path); when it is unset, Pharos
+offers a value-free request users can copy into their normal help channel.
+Viewer requests are still rejected by every mutation handler even if browser
+markup is bypassed.
+
 If OIDC variables are absent, startup fails unless `PHAROS_ALLOW_OPEN=true`
 is set and the effective public address is loopback. Containerized development
 can declare its loopback-only published boundary with `PHAROS_PUBLIC_ADDR`;
@@ -694,6 +703,7 @@ promised third-party API. The important boundaries are:
 | `PHAROS_OIDC_REDIRECT_URI` | Exact callback URI |
 | `PHAROS_ALLOWED_OPERATORS` | Comma/space-separated `operator-ref:<sha256>`, `verified-email-ref:<sha256>`, or `email:<verified-address>` full-fleet identities |
 | `PHAROS_ACCESS_POLICY_FILE` | Optional scoped policy using the same strict OIDC authorization identifiers |
+| `PHAROS_ACCESS_REQUEST_URL` | Optional credential-free HTTPS help destination or local absolute path for the read-only user's GET-only **Request access** action |
 | `PHAROS_JANUS_PROJECTION_ROOT` | Capability-named Janus projection root; Pharos resolves `pharos-beacon-token` and `pharos-machine-operator` beneath it |
 | `PHAROS_MACHINE_OPERATOR_TOKEN_HASH_DIR` | Migration-compatible direct root for the scoped machine-operator hash-dir v2 (`current` plus immutable `generation-{id}.json` documents using schema `inspr.pharos.machine-operator-token-generation.v2`); cannot be combined with the capability root |
 | `PHAROS_REGISTRATION_TOKEN` / `PHAROS_REGISTRATION_TOKEN_FILE` | Bootstrap authorization for local registration; the file form wins and is preferred |

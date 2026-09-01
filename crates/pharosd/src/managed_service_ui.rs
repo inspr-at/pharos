@@ -223,12 +223,13 @@ pub(super) async fn services_page(
             "services",
         ));
     }
-    no_store_html(render_services_page(
+    no_store_html(render_services_page_with_access(
         state.manifests.managed_service_manifests(),
         state.manifests.managed_service_load_errors(),
         shell,
         &state.managed_service_operations,
         now_unix(),
+        access.can_manage_fleet(),
     ))
 }
 
@@ -285,17 +286,19 @@ pub(super) async fn service_detail_page(
         )
             .into_response();
     };
-    no_store_html(render_service_detail(
+    no_store_html(render_service_detail_with_access(
         manifest,
         service,
         shell,
         state.managed_setup_intents.is_some(),
         &state.managed_service_operations,
         now_unix(),
+        access.can_manage_fleet(),
     ))
     .into_response()
 }
 
+#[cfg(test)]
 fn render_services_page(
     manifests: &[ManagedServiceManifestV1],
     load_errors: &[ManifestLoadIssue],
@@ -303,10 +306,26 @@ fn render_services_page(
     operations: &ManagedServiceOperationStore,
     now: i64,
 ) -> String {
+    render_services_page_with_access(manifests, load_errors, shell, operations, now, true)
+}
+
+fn render_services_page_with_access(
+    manifests: &[ManagedServiceManifestV1],
+    load_errors: &[ManifestLoadIssue],
+    shell: ShellContext<'_>,
+    operations: &ManagedServiceOperationStore,
+    now: i64,
+    can_manage: bool,
+) -> String {
     if !load_errors.is_empty() {
         return render_services_error(shell);
     }
     let sidebar = sidebar(shell.user_label, shell.logout_enabled, "services");
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("managed-service")
+    };
     let header = page_header(
         "Services",
         "Add and maintain declared service secrets without exposing their values",
@@ -336,7 +355,7 @@ fn render_services_page(
         )
     };
     format!(
-        r#"{HEAD}{sidebar}<main class="managed-services-main">{header}{content}</main></div></body></html>"#
+        r#"{HEAD}{sidebar}<main class="managed-services-main">{header}{access_path}{content}</main></div></body></html>"#
     )
 }
 
@@ -406,6 +425,7 @@ fn render_services_error(shell: ShellContext<'_>) -> String {
     )
 }
 
+#[cfg(test)]
 fn render_service_detail(
     manifest: &ManagedServiceManifestV1,
     service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
@@ -414,7 +434,32 @@ fn render_service_detail(
     operations: &ManagedServiceOperationStore,
     now: i64,
 ) -> String {
+    render_service_detail_with_access(
+        manifest,
+        service,
+        shell,
+        setup_enabled,
+        operations,
+        now,
+        true,
+    )
+}
+
+fn render_service_detail_with_access(
+    manifest: &ManagedServiceManifestV1,
+    service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
+    shell: ShellContext<'_>,
+    setup_enabled: bool,
+    operations: &ManagedServiceOperationStore,
+    now: i64,
+    can_manage: bool,
+) -> String {
     let sidebar = sidebar(shell.user_label, shell.logout_enabled, "services");
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("managed-service")
+    };
     let mut slots = String::new();
     for slot in &service.slots {
         let operation = operations.latest_for_slot(
@@ -440,18 +485,21 @@ fn render_service_detail(
         {
             state = ManagedSecretSlotState::RemovalFinalizing;
         }
-        slots.push_str(&render_slot(
+        slots.push_str(&render_slot_with_access(
             manifest,
             service,
             slot,
             state,
             operation.as_ref(),
-            setup_enabled,
             now,
+            SlotRenderPolicy {
+                setup_enabled,
+                can_manage,
+            },
         ));
     }
     format!(
-        r#"{HEAD}{sidebar}<main class="managed-services-main managed-service-detail"><a class="managed-back" href="/services">{back} Services</a><div class="top managed-detail-top"><div><span class="managed-kicker">Managed service</span><div class="brand"><h1>{service_label}</h1></div><p class="fleet">{host_label} · {slot_count}</p></div><span class="managed-lock">{lock} Declared target</span></div><section class="managed-slot-list" aria-label="Secret slots">{slots}</section><details class="managed-service-details" id="managed-setup-configuration"><summary>Managed setup requirements</summary><p>Pharos never holds a secret value. A fleet operator must configure the reviewed Janus setup integration before create, replace, or removal requests can be issued.</p><p>After that configuration is present, refresh this declared service and use the enabled action for the current state.</p></details><details class="managed-service-details"><summary>Technical details</summary><dl><div><dt>Host reference</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service reference</dt><dd><code>{service_ref}</code></dd></div><div><dt>Runtime</dt><dd>Managed Compose service</dd></div></dl></details><script>{runtime}</script></main></div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="managed-services-main managed-service-detail"><a class="managed-back" href="/services">{back} Services</a>{access_path}<div class="top managed-detail-top"><div><span class="managed-kicker">Managed service</span><div class="brand"><h1>{service_label}</h1></div><p class="fleet">{host_label} · {slot_count}</p></div><span class="managed-lock">{lock} Declared target</span></div><section class="managed-slot-list" aria-label="Secret slots">{slots}</section><details class="managed-service-details" id="managed-setup-configuration"><summary>Managed setup requirements</summary><p>Pharos never holds a secret value. A fleet operator must configure the reviewed Janus setup integration before create, replace, or removal requests can be issued.</p><p>After that configuration is present, refresh this declared service and use the enabled action for the current state.</p></details><details class="managed-service-details"><summary>Technical details</summary><dl><div><dt>Host reference</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service reference</dt><dd><code>{service_ref}</code></dd></div><div><dt>Runtime</dt><dd>Managed Compose service</dd></div></dl></details><script>{runtime}</script></main></div></body></html>"#,
         back = icons::ARROW_LEFT,
         service_label = html_escape(&service.safe_label),
         host_label = html_escape(&managed_host_label(&manifest.host_ref)),
@@ -467,6 +515,7 @@ fn render_service_detail(
     )
 }
 
+#[cfg(test)]
 fn render_slot(
     manifest: &ManagedServiceManifestV1,
     service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
@@ -476,6 +525,40 @@ fn render_slot(
     setup_enabled: bool,
     now: i64,
 ) -> String {
+    render_slot_with_access(
+        manifest,
+        service,
+        slot,
+        state,
+        operation,
+        now,
+        SlotRenderPolicy {
+            setup_enabled,
+            can_manage: true,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SlotRenderPolicy {
+    setup_enabled: bool,
+    can_manage: bool,
+}
+
+fn render_slot_with_access(
+    manifest: &ManagedServiceManifestV1,
+    service: &pharos_core::managed_services::ManagedServiceDeclarationV1,
+    slot: &pharos_core::managed_services::ManagedSecretSlotDeclarationV1,
+    state: ManagedSecretSlotState,
+    operation: Option<&crate::managed_service_operations::ManagedOperationSummary>,
+    now: i64,
+    policy: SlotRenderPolicy,
+) -> String {
+    let SlotRenderPolicy {
+        setup_enabled,
+        can_manage,
+    } = policy;
+    let mutation_enabled = setup_enabled && can_manage;
     let state = if state == ManagedSecretSlotState::ActionNeeded
         && removal_recovery_required(operation, now)
     {
@@ -493,7 +576,7 @@ fn render_slot(
         .unwrap_or_else(|| {
             r##"<a class="managed-secondary" href="#managed-setup-configuration" data-managed-details-target="managed-setup-configuration">Check managed setup requirements</a>"##.to_string()
         });
-    let action = if state == ManagedSecretSlotState::Missing && setup_enabled {
+    let action = if state == ManagedSecretSlotState::Missing && mutation_enabled {
         format!(
             r#"<button class="managed-primary" type="button" data-managed-secret-action data-operation-kind="create" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Add missing secret</button>"#,
             host_ref = html_escape(&manifest.host_ref),
@@ -501,7 +584,7 @@ fn render_slot(
             slot_ref = html_escape(&slot.slot_ref),
         )
     } else if state == ManagedSecretSlotState::ActionNeeded
-        && setup_enabled
+        && mutation_enabled
         && operation.is_some_and(|operation| operation.verification_retryable)
     {
         format!(
@@ -513,6 +596,7 @@ fn render_slot(
             ),
         )
     } else if state == ManagedSecretSlotState::ActionNeeded
+        && can_manage
         && operation.is_some_and(|operation| removal_retry_available(operation, now))
     {
         format!(
@@ -533,7 +617,7 @@ fn render_slot(
             ),
         )
     } else if state == ManagedSecretSlotState::ActionNeeded
-        && setup_enabled
+        && mutation_enabled
         && operation.is_some_and(|operation| {
             operation.operation_kind
                 == pharos_core::managed_operations::ManagedOperationKind::Create
@@ -550,7 +634,7 @@ fn render_slot(
     } else if matches!(
         state,
         ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
-    ) && setup_enabled
+    ) && mutation_enabled
         && slot.binding_state == pharos_core::managed_services::ManagedBindingState::Detached
     {
         format!(
@@ -562,7 +646,7 @@ fn render_slot(
     } else if matches!(
         state,
         ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
-    ) && setup_enabled
+    ) && mutation_enabled
     {
         format!(
             r##"<button class="managed-secondary" type="button" data-managed-secret-action data-operation-kind="replace" data-host-ref="{host_ref}" data-service-ref="{service_ref}" data-slot-ref="{slot_ref}">Replace / rotate secret</button><a class="managed-link-danger" href="#managed-detach-{slot_ref}" data-managed-details-target="managed-detach-{slot_ref}">Prepare nixcfg detachment review</a>"##,
@@ -600,7 +684,9 @@ fn render_slot(
         detachment_task = detachment_task,
         removal_recovery_task = removal_recovery_task,
         action = action,
-        availability = if setup_enabled
+        availability = if !can_manage {
+            "Read-only access keeps declaration and operation evidence visible. A Fleet manager must request any managed-service change."
+        } else if setup_enabled
             && matches!(
                 state,
                 ManagedSecretSlotState::Active | ManagedSecretSlotState::RollbackRestored
@@ -1477,5 +1563,29 @@ mod tests {
         );
         assert!(failed.contains("Declarations need attention"));
         assert!(!failed.contains("/opaque/test"));
+    }
+
+    #[test]
+    fn managed_service_viewer_sees_access_path_without_mutation_controls() {
+        let manifest = fixture();
+        let service = &manifest.services[0];
+        let operations = ManagedServiceOperationStore::new(None).unwrap();
+        let html = render_service_detail_with_access(
+            &manifest,
+            service,
+            shell(),
+            true,
+            &operations,
+            1_800_000_000,
+            false,
+        );
+
+        assert!(html.contains(r#"data-access-path data-scope="managed-service""#));
+        assert!(html.contains("Fleet manager access required"));
+        assert!(html.contains("Pharos administrator"));
+        assert!(!html.contains(r#"type="button" data-managed-secret-action"#));
+        assert!(!html.contains(r#"type="button" data-managed-verification-retry"#));
+        assert!(!html.contains(r#"type="button" data-managed-removal-retry"#));
+        assert!(html.contains("Read-only access keeps declaration and operation evidence visible"));
     }
 }

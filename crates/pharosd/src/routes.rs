@@ -10,6 +10,7 @@ fn human_routes() -> Router<AppState> {
         .route("/alerts", get(alerts_page))
         .route("/backups", get(backups_page))
         .route("/activity", get(activity_page))
+        .route("/access/request", get(access_request_page))
         .route("/services", get(managed_service_ui::services_page))
         .route(
             "/services/{host_ref}/{service_ref}",

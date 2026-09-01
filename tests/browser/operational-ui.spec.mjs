@@ -75,6 +75,64 @@ test("sign-in recovery is accessible, no-store, and restarts with one safe actio
   await expect(page.locator("main")).toBeVisible();
 });
 
+test("read-only users get one access path and cannot call mutation endpoints", async ({
+  browser,
+}, testInfo) => {
+  await waitForHarnessTokens();
+  const context = await newAuthedContext(browser, "read");
+  const page = await context.newPage();
+
+  for (const [path, scope] of [
+    ["/", "fleet"],
+    ["/agora", "settings"],
+    ["/settings/providers", "provider"],
+    ["/services", "managed-service"],
+  ]) {
+    await page.goto(path);
+    const access = page.locator(`[data-access-path][data-scope="${scope}"]`).first();
+    await expect(access).toBeVisible();
+    await expect(access).toContainText("Fleet manager access required");
+    await expect(access).toContainText("Pharos administrator");
+    const cta = access.getByRole("link", { name: "Request access", exact: true });
+    await expect(cta).toHaveAttribute("href", `/access/request?scope=${scope}`);
+    if (testInfo.project.name === "chromium-desktop") {
+      await page.screenshot({
+        path: testInfo.outputPath(`pharos-248-${scope}.png`),
+        fullPage: true,
+      });
+    }
+  }
+
+  await page.goto("/access/request?scope=managed-service");
+  await expect(page.getByRole("heading", { name: "Request access" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy access request" })).toBeVisible();
+  await expect(page.locator("[data-access-request-text]")).toContainText("Fleet manager role");
+
+  const settings = await page.request.post("/agora/requests/host-preferences.json", {
+    data: { host: "viewer-denied", preferences: { accent: "#48b8a8" } },
+  });
+  expect(settings.status()).toBe(403);
+
+  const managed = await page.request.post("/managed-service-setup-intents", {
+    headers: { "x-pharos-action": "1" },
+    data: {
+      operation_kind: "create",
+      host_ref: "host_58f36c72a91e",
+      service_ref: "svc_0bca8d31f7e2",
+      slot_ref: "slot_49c0e8a17d63",
+    },
+  });
+  expect(managed.status()).toBe(403);
+
+  const provider = await page.request.post(
+    "/settings/providers/hetzner-cloud/test",
+    { headers: { "x-pharos-action": "1" } },
+  );
+  expect(provider.status()).toBe(403);
+
+  await context.close();
+});
+
 test("setup assistant traps focus, closes with Escape, and restores its trigger", async ({
   page,
 }) => {

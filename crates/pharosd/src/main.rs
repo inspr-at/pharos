@@ -51,7 +51,7 @@ use std::os::unix::process::CommandExt;
 use axum::extract::{DefaultBodyLimit, FromRef, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pharos_core::{
@@ -155,6 +155,66 @@ struct AppState {
     host_actions: Arc<HostActionStore>,
     retired_hosts: Arc<RetiredHostStore>,
     alert_health: AlertWorkerHealth,
+    access_request: AccessRequestConfig,
+}
+
+const ACCESS_REQUEST_URL_ENV: &str = "PHAROS_ACCESS_REQUEST_URL";
+
+/// Optional operator-configured help destination for read-only people.
+///
+/// The browser reaches it only through a protected GET route. The target is
+/// deliberately credential-free and cannot turn an access explanation into a
+/// mutation or an open redirect with embedded authority.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AccessRequestConfig {
+    target: Option<String>,
+}
+
+impl AccessRequestConfig {
+    fn from_env() -> Result<Self, String> {
+        Self::from_value(env_nonempty(ACCESS_REQUEST_URL_ENV).as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::default());
+        };
+        if value.len() > 2_048 || value.chars().any(char::is_control) {
+            return Err(format!(
+                "{ACCESS_REQUEST_URL_ENV} must be a bounded credential-free help URL"
+            ));
+        }
+        if value.starts_with('/') && !value.starts_with("//") && !value.contains('\\') {
+            if value.starts_with("/access/request") {
+                return Err(format!(
+                    "{ACCESS_REQUEST_URL_ENV} must not point back to the Pharos access-request route"
+                ));
+            }
+            return Ok(Self {
+                target: Some(value.to_string()),
+            });
+        }
+        let url = Url::parse(value).map_err(|_| {
+            format!("{ACCESS_REQUEST_URL_ENV} must be an HTTPS help URL or a local absolute path")
+        })?;
+        let local_http = url.scheme() == "http"
+            && url
+                .host_str()
+                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|address| address.is_loopback());
+        if (url.scheme() != "https" && !local_http)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(format!(
+                "{ACCESS_REQUEST_URL_ENV} must be credential-free HTTPS (or loopback HTTP) without a fragment"
+            ));
+        }
+        Ok(Self {
+            target: Some(url.into()),
+        })
+    }
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -1659,7 +1719,9 @@ async fn withdraw_settings_change(
         return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
     };
     let access = access_for_headers(&state.auth, &headers);
-    if !action_request_header(&headers) || !access.can_agora() || !access.allows_host(&preview.host)
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&preview.host)
     {
         return action_error(
             StatusCode::FORBIDDEN,
@@ -1891,7 +1953,7 @@ async fn acknowledge_dispatch_uncertainty(
     };
     let access = access_for_headers(&state.auth, &headers);
     let workflow_allowed = match existing.workflow_kind() {
-        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::SettingsChange => access.can_manage_fleet(),
         host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
         _ => false,
     };
@@ -1935,7 +1997,9 @@ async fn continue_legacy_settings_dispatch(
         return action_error(StatusCode::NOT_FOUND, "Settings change was not found");
     };
     let access = access_for_headers(&state.auth, &headers);
-    if !action_request_header(&headers) || !access.can_agora() || !access.allows_host(&preview.host)
+    if !action_request_header(&headers)
+        || !access.can_manage_fleet()
+        || !access.allows_host(&preview.host)
     {
         return action_error(
             StatusCode::FORBIDDEN,
@@ -2111,7 +2175,7 @@ async fn reconcile_accepted_dispatch(
     };
     let access = access_for_headers(&state.auth, &headers);
     let workflow_allowed = match preview.workflow_kind() {
-        host_actions::HostWorkflowKind::SettingsChange => access.can_agora(),
+        host_actions::HostWorkflowKind::SettingsChange => access.can_manage_fleet(),
         host_actions::HostWorkflowKind::RemoveHost => access.can_manage_fleet(),
         _ => false,
     };
@@ -3782,7 +3846,7 @@ async fn create_managed_setup_intent(
         return managed_intent_denial(IntentReason::InvalidRequest);
     }
     let access = access_for_headers(&state.auth, &headers);
-    if !access.can_agora() {
+    if !access.can_manage_fleet() {
         return managed_intent_denial(IntentReason::Forbidden);
     }
     let Some(user) = state.auth.human_user(&headers) else {
@@ -3835,6 +3899,9 @@ async fn cancel_managed_setup_intent(
     if !action_request_header(&headers) {
         return managed_intent_denial(IntentReason::InvalidRequest);
     }
+    if !access_for_headers(&state.auth, &headers).can_manage_fleet() {
+        return managed_intent_denial(IntentReason::Forbidden);
+    }
     let Some(user) = state.auth.human_user(&headers) else {
         return managed_intent_denial(IntentReason::AuthenticationRequired);
     };
@@ -3871,7 +3938,7 @@ async fn retry_managed_service_verification(
         );
     }
     let access = access_for_headers(&state.auth, &headers);
-    if !access.can_agora() {
+    if !access.can_manage_fleet() {
         return managed_verification_retry_denial(
             StatusCode::FORBIDDEN,
             "managed_verification_retry_forbidden",
@@ -4940,6 +5007,8 @@ async fn main() {
     let alert_notifier = AlertNotifier::from_env(alert_store)
         .unwrap_or_else(|error| panic!("alert notifier startup failed: {error}"));
     let alert_health = alert_notifier.health.clone();
+    let access_request = AccessRequestConfig::from_env()
+        .unwrap_or_else(|error| panic!("access-request startup failed: {error}"));
     let paimos_delivery = paimos_delivery::PaimosDeliveryAdapter::from_env(
         host_store_path.as_deref(),
         Arc::clone(&store),
@@ -4963,6 +5032,7 @@ async fn main() {
         host_actions,
         retired_hosts,
         alert_health,
+        access_request,
     };
     let _ = reconcile_saved_next_actions(&state, now_unix()).await;
     spawn_next_action_loop(state.clone());
@@ -13876,6 +13946,9 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         );
         assert_eq!(read_only.matches("Ask an administrator").count(), 5);
         assert!(!read_only.contains(r#"class="provider-action""#));
+        assert!(read_only.contains(r#"data-access-path data-scope="provider""#));
+        assert!(read_only.contains("Fleet manager access required"));
+        assert!(read_only.contains("Pharos administrator"));
     }
 
     #[test]
@@ -14280,7 +14353,101 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             host_actions: Arc::new(HostActionStore::new(None)),
             retired_hosts: Arc::new(RetiredHostStore::new(None)),
             alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
+            access_request: AccessRequestConfig::default(),
         }
+    }
+
+    #[test]
+    fn access_request_target_is_optional_bounded_and_credential_free() {
+        assert_eq!(
+            AccessRequestConfig::from_value(None).unwrap(),
+            AccessRequestConfig::default()
+        );
+        assert_eq!(
+            AccessRequestConfig::from_value(Some("/help/access?product=pharos"))
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("/help/access?product=pharos")
+        );
+        assert_eq!(
+            AccessRequestConfig::from_value(Some("https://help.example.test/pharos/access"))
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("https://help.example.test/pharos/access")
+        );
+        for unsafe_target in [
+            "//help.example.test/access",
+            "https://operator:credential@help.example.test/access",
+            "https://help.example.test/access#credential",
+            "http://help.example.test/access",
+            "/access/request?scope=fleet",
+        ] {
+            assert!(
+                AccessRequestConfig::from_value(Some(unsafe_target)).is_err(),
+                "unsafe access target accepted: {unsafe_target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_viewers_cannot_reach_settings_or_managed_service_mutations() {
+        let mut state = report_test_state(false);
+        state.auth = AuthState::for_test_access(AccessGrant::limited(["hsb8"], true));
+        let settings = state
+            .host_actions
+            .begin_settings_change("hsb8", "viewer-fixture", now_unix())
+            .expect("settings fixture starts");
+
+        let (status, _) = withdraw_settings_change(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = continue_legacy_settings_dispatch(
+            State(state.clone()),
+            action_headers(),
+            AxumPath(settings.id.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let response = create_managed_setup_intent(
+            State(state.clone()),
+            action_headers(),
+            Json(managed_setup_request()),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(payload["reason_code"], IntentReason::Forbidden.code());
+
+        let response = retry_managed_service_verification(
+            State(state.clone()),
+            AxumPath("op_viewer_retry".to_string()),
+            action_headers(),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            payload["reason_code"],
+            "managed_verification_retry_forbidden"
+        );
+
+        let response = cancel_managed_setup_intent(
+            State(state),
+            AxumPath("intent_viewer_cancel".to_string()),
+            action_headers(),
+        )
+        .await;
+        let (status, _, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(payload["reason_code"], IntentReason::Forbidden.code());
     }
 
     static JANUS_HASH_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);

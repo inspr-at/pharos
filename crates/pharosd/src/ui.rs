@@ -144,6 +144,21 @@ mod module_tests {
         assert_eq!(html_escape("<&\"'>"), "&lt;&amp;&quot;&#39;&gt;");
     }
 
+    #[test]
+    fn viewer_access_path_names_role_owner_and_get_only_help_route() {
+        for scope in ["fleet", "settings", "provider", "managed-service"] {
+            let html = viewer_access_path(scope);
+            assert!(html.contains("Fleet manager access required"), "{html}");
+            assert!(html.contains("Pharos administrator"), "{html}");
+            assert!(
+                html.contains(&format!(r#"href="/access/request?scope={scope}""#)),
+                "{html}"
+            );
+            assert!(!html.contains("<form"), "{html}");
+            assert!(!html.contains("data-method"), "{html}");
+        }
+    }
+
     /// PHAROS-193: the fleet showed a reassuring `0d` while nixpkgs was frozen
     /// on an expired channel. The operator-visible signal must say so.
     #[test]
@@ -407,13 +422,71 @@ pub(super) fn render_no_access_page(
     shell: ShellContext<'_>,
     active: &str,
 ) -> String {
+    let scope = match active {
+        "settings" => "settings",
+        "platform-settings" => "provider",
+        "services" => "managed-service",
+        _ => "fleet",
+    };
+    let access_path = viewer_access_path(scope);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div><section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div>{access_path}<section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, active),
         title = html_escape(title),
         subtitle = html_escape(subtitle),
         as_of = clock_label(now_unix()),
     )
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct AccessRequestQuery {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+fn access_scope(value: Option<&str>) -> (&'static str, &'static str) {
+    match value {
+        Some("settings") => ("Host settings", "review and change host settings"),
+        Some("provider") => ("Provider connections", "connect or change a provider"),
+        Some("managed-service") => (
+            "Managed services",
+            "create, replace, or remove a managed secret",
+        ),
+        _ => ("Fleet operations", "run guarded fleet actions"),
+    }
+}
+
+/// One consistent, non-mutating access path for every guarded product surface.
+pub(super) fn viewer_access_path(scope: &str) -> String {
+    let (surface, task) = access_scope(Some(scope));
+    format!(
+        r#"<aside class="access-path" data-access-path data-scope="{scope}"><span class="access-path-icon" aria-hidden="true">{shield}</span><span class="access-path-copy"><strong>Fleet manager access required</strong><span>You can keep viewing {surface}. A Pharos administrator owns access for people who need to {task}.</span></span><a class="access-path-action" href="/access/request?scope={scope}">Request access</a></aside>"#,
+        scope = html_escape(scope),
+        surface = html_escape(surface),
+        task = html_escape(task),
+        shield = icons::SHIELD_CHECK,
+    )
+}
+
+pub(super) async fn access_request_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AccessRequestQuery>,
+) -> Response {
+    if let Some(target) = state.access_request.target.as_deref() {
+        return Redirect::temporary(target).into_response();
+    }
+    let user_label = sidebar_user_label(&state.auth, &headers);
+    let (surface, task) = access_scope(query.scope.as_deref());
+    let request_text =
+        format!("Please ask a Pharos administrator for the Fleet manager role so I can {task}.");
+    no_store_html(format!(
+        r#"{HEAD}{sidebar}<main class="ops-main access-request-page"><div class="top"><div><div class="brand"><h1>Request access</h1></div><p class="fleet">{surface}</p></div></div><section class="ops-empty"><h2>Send this to your Pharos administrator</h2><p>The required role is <strong>Fleet manager</strong>. The responsible access owner is your <strong>Pharos administrator</strong>.</p><div class="access-request-copy"><code data-access-request-text>{request_text}</code><button class="access-path-action" type="button" data-copy-access-request>Copy access request</button></div><p class="access-request-status" role="status" aria-live="polite" data-access-request-status>Copy the request, send it through your normal help channel, then return here after access is granted.</p></section></main><script>document.querySelector('[data-copy-access-request]')?.addEventListener('click',async event=>{{const text=document.querySelector('[data-access-request-text]')?.textContent||'';const status=document.querySelector('[data-access-request-status]');try{{await navigator.clipboard.writeText(text);event.currentTarget.textContent='Copied';if(status)status.textContent='Access request copied. Send it to your Pharos administrator.'}}catch(error){{if(status)status.textContent='Copy was unavailable. Select the request text above and copy it manually.'}}}});</script></div></body></html>"#,
+        sidebar = sidebar(&user_label, state.auth.is_some(), ""),
+        surface = html_escape(surface),
+        request_text = html_escape(&request_text),
+    ))
+    .into_response()
 }
 
 pub(super) async fn provider_settings_page(
@@ -2723,13 +2796,18 @@ pub(super) fn render_provider_connections_page(
     shell: ShellContext<'_>,
     can_manage: bool,
 ) -> String {
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("provider")
+    };
     let rows = providers
         .providers
         .iter()
         .map(|provider| render_provider_connection_row(provider, can_manage))
         .collect::<String>();
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main">{header}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main">{header}{access_path}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         header = page_header(
             "Settings",
@@ -2737,6 +2815,7 @@ pub(super) fn render_provider_connections_page(
             now_unix(),
         ),
         rows = rows,
+        access_path = access_path,
     )
 }
 
@@ -2767,6 +2846,11 @@ pub(super) fn render_guided_provider_page(
     can_manage: bool,
     return_path: Option<&str>,
 ) -> String {
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("provider")
+    };
     let (external_label, external_url) = provider_official_destination(provider.key)
         .unwrap_or(("Open provider", "https://pharos.barta.cm/"));
     let external_action = if can_manage {
@@ -2791,7 +2875,7 @@ pub(super) fn render_guided_provider_page(
     let back_href =
         safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a><header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a>{access_path}<header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         back_href = html_escape(&back_href),
         back = icons::ARROW_LEFT,
@@ -2801,6 +2885,7 @@ pub(super) fn render_guided_provider_page(
         note = html_escape(&provider.note),
         external_action = external_action,
         import_action = import_action,
+        access_path = access_path,
     )
 }
 
@@ -3185,8 +3270,13 @@ pub(super) fn render_hetzner_connection_page(
     } else {
         &readiness.message
     };
+    let access_path = if can_manage {
+        String::new()
+    } else {
+        viewer_access_path("provider")
+    };
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a><header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
+        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a>{access_path}<header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
         back_href = html_escape(&back_href),
         back = icons::ARROW_LEFT,
@@ -3217,6 +3307,7 @@ pub(super) fn render_hetzner_connection_page(
         menu = menu,
         details = details,
         setup_help = setup_help,
+        access_path = access_path,
         setup_note = html_escape(setup_note),
     )
 }
@@ -6513,6 +6604,11 @@ pub(super) fn render_home_with_capabilities(
     capabilities: FleetCapabilities,
 ) -> String {
     let can_onboard = capabilities.can_onboard;
+    let access_path = if capabilities.can_manage_fleet {
+        String::new()
+    } else {
+        viewer_access_path("fleet")
+    };
     let hosts = runtime.hosts;
     let setup_jobs = pending_setup_jobs(runtime.hosts, runtime.jobs);
     if runtime.hosts.is_empty() && setup_jobs.is_empty() {
@@ -6522,10 +6618,11 @@ pub(super) fn render_home_with_capabilities(
             String::new()
         };
         return format!(
-            "{HEAD}{sidebar}<main>{header}{empty}</main>{assistant}{FOOT}",
+            "{HEAD}{sidebar}<main>{header}{access_path}{empty}</main>{assistant}{FOOT}",
             sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
             header = header(now),
             empty = empty_state(can_onboard),
+            access_path = access_path,
             assistant = assistant
         );
     }
@@ -6909,10 +7006,11 @@ pub(super) fn render_home_with_capabilities(
     let host_drawer = host_quick_drawer(capabilities.can_manage_fleet);
 
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
+        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
+        access_path = access_path,
         toolbar = toolbar(),
         assistant = assistant,
         host_drawer = host_drawer,

@@ -7,6 +7,7 @@
   bound to the exact effect and same-run idempotency key, resume automatic
   reconciliation after restart, and stop polling terminal or withdrawn runs
   without discarding their receipt (PHAROS-249).
+- Give read-only users one consistent access-request path across Fleet, host settings, provider connections and managed services; name the required Fleet manager role and Pharos administrator owner while enforcing the same manager boundary at every settings and managed-service mutation endpoint (PHAROS-248).
 
 ## 0.1.97 - 2026-09-01
 
