@@ -400,9 +400,60 @@ test("managed service secrets stay value-free, accessible, and narrow-screen saf
   await expect(page.getByText("Service secret", { exact: true })).toBeVisible();
   await expect(page.getByText("Reveal", { exact: true })).toBeVisible();
   await expect(page.getByText("Never", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Setup unavailable" })).toBeDisabled();
+  const setupRequirements = page.getByRole("link", {
+    name: "Check managed setup requirements",
+  });
+  await expect(setupRequirements).toBeVisible();
+  await expect(setupRequirements).toHaveAttribute("href", "#managed-setup-configuration");
+  await setupRequirements.click();
+  await expect(page.locator("#managed-setup-configuration")).toHaveAttribute("open", "");
+  await expect(page.getByText("Pharos never holds a secret value.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Setup unavailable" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /reveal|show|copy/i })).toHaveCount(0);
   await expect(page.getByRole("link", { name: /reveal|show|copy/i })).toHaveCount(0);
+
+  const managedRuntime = await page.locator("main script").textContent();
+  await page.evaluate((runtime) => {
+    const card = document.createElement("article");
+    card.className = "managed-slot-card";
+    card.innerHTML = [
+      '<button type="button" data-managed-removal-retry data-operation-ref="op_retryremove_browser">Retry safe removal</button>',
+      '<p data-managed-action-status></p>',
+    ].join("");
+    document.body.append(card);
+    const recovery = document.createElement("article");
+    recovery.setAttribute("data-managed-removal-recovery-fixture", "");
+    recovery.innerHTML = [
+      '<a href="#managed-removal-recovery-op_retrydeadline_browser" data-managed-details-target="managed-removal-recovery-op_retrydeadline_browser">Open nixcfg recovery review</a>',
+      '<details id="managed-removal-recovery-op_retrydeadline_browser"><summary>Removal recovery task</summary><p>Pharos will not requeue destructive work.</p></details>',
+    ].join("");
+    document.body.append(recovery);
+    new Function(runtime)();
+  }, managedRuntime);
+  const removalRetry = page.getByRole("button", { name: "Retry safe removal" });
+  await expect(removalRetry).toBeVisible();
+  const retryRequest = page.waitForRequest(
+    (request) =>
+      new URL(request.url()).pathname ===
+        "/managed-service-operations/op_retryremove_browser/retry-verification" &&
+      request.method() === "POST",
+  );
+  await removalRetry.click();
+  const retry = await retryRequest;
+  expect(retry.headers()["x-pharos-action"]).toBe("1");
+  expect(retry.postData()).toBeNull();
+  await expect(page.getByText("Safe removal could not be requested.")).toBeVisible();
+
+  const removalRecovery = page.locator("[data-managed-removal-recovery-fixture]");
+  await expect(removalRecovery.getByRole("button", { name: "Retry safe removal" })).toHaveCount(0);
+  const recoveryReview = removalRecovery.getByRole("link", {
+    name: "Open nixcfg recovery review",
+  });
+  await recoveryReview.click();
+  await expect(
+    removalRecovery.locator("#managed-removal-recovery-op_retrydeadline_browser"),
+  ).toHaveAttribute("open", "");
+  await expect(removalRecovery).toContainText("Pharos will not requeue destructive work.");
 
   const html = await page.content();
   for (const forbidden of [
@@ -1383,6 +1434,62 @@ async function reportRuntimeHost(page, name, extra = {}) {
   });
   expect(response.status()).toBe(204);
 }
+
+test("host workspace is a durable manager task rail that becomes in-flow on mobile", async ({
+  page,
+}, testInfo) => {
+  const host = `host-workspace-${testInfo.project.name}`;
+  await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
+
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/");
+  await page.evaluate(() => {
+    clearRefreshTimer();
+    abandonRefresh();
+  });
+  const card = page.locator(
+    `article[data-host="${host}"][data-host-surface="runtime"]`,
+  );
+  await card.scrollIntoViewIfNeeded();
+  await card.locator("[data-host-actions-trigger]").click();
+  const fleetLink = card.locator(
+    `[data-host-actions-menu]:not([hidden]) [data-host-action="host-settings"]`,
+  );
+  await expect(fleetLink).toHaveAttribute("href", `/hosts/${host}`);
+  await fleetLink.click();
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page.locator("[data-host-workspace]")).toHaveAttribute(
+    "data-can-manage-fleet",
+    "true",
+  );
+  await expect(page.locator("[data-host-task-rail]")).toContainText("Up to date");
+  await expect(page.locator("[data-host-workspace-primary]")).toHaveAttribute(
+    "href",
+    `/agora?host=${host}`,
+  );
+  await expect(page.locator("[data-host-workspace-settings]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-protection]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-services]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-activity]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-technical]")).toBeVisible();
+  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "sticky");
+  const desktopGeometry = await page.locator("[data-host-workspace]").evaluate((workspace) => {
+    const rail = workspace.querySelector("[data-host-task-rail]");
+    const main = workspace.querySelector(".host-workspace-main");
+    return {
+      railWidth: rail?.getBoundingClientRect().width ?? 0,
+      mainWidth: main?.getBoundingClientRect().width ?? 0,
+    };
+  });
+  expect(desktopGeometry.railWidth).toBeGreaterThanOrEqual(300);
+  expect(desktopGeometry.railWidth).toBeLessThanOrEqual(312);
+  expect(desktopGeometry.mainWidth).toBeGreaterThan(desktopGeometry.railWidth * 2);
+
+  await page.reload();
+  await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
+  await page.setViewportSize({ width: 640, height: 900 });
+  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "static");
+});
 
 async function applyServerFleetSnapshot(page) {
   const snapshot = await page.request.get("/hosts.json");
@@ -2865,16 +2972,41 @@ test("settings sheet live wait advances only from host evidence and stops termin
   await page.getByRole("button", { name: "Confirm change request" }).click();
   const requestPayload = await (await responsePromise).json();
   const runId = requestPayload.job.id;
+  const nextAction = requestPayload.job.workflow.next_action;
+  expect(requestPayload.job.workflow.primary_action).toBeNull();
+  expect(nextAction).toMatchObject({
+    schema: "inspr.pharos.next-action.v1",
+    version: 1,
+    owner: {
+      kind: "host_agent",
+      key: `host-agent:${host}`,
+    },
+    effect: "runtime_verification",
+    availability: {
+      executable: true,
+      execution: "automatic",
+      state: "scheduled",
+      operation: "poll_host_evidence",
+    },
+    idempotency: {
+      key: `${runId}:poll-host-evidence`,
+      duplicate: "return_same_run",
+      uncertain_response: "reconcile_before_retry",
+    },
+    recovery: {
+      strategy: "automatic_retry",
+      escalation_owner: "pharos",
+    },
+  });
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
   const exactGuidance = `The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then ${host} must report the requested values; Pharos will not mark this run complete without that matching host evidence.`;
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
   await expect(dialog.locator('[data-step-state="waiting"]')).toContainText(
     "The nixcfg review, merge, and deployment must finish first",
   );
-  const checkHost = dialog.getByRole("button", { name: "Check host now" });
-  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(1);
+  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-primary]")).toBeHidden();
-  await expect(checkHost).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Check host now" })).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-safe-note]")).toHaveAttribute(
     "data-workflow-live",
     "true",
@@ -2894,53 +3026,19 @@ test("settings sheet live wait advances only from host evidence and stops termin
 
   const jobPath = `/host-actions/jobs/${encodeURIComponent(runId)}`;
   const exactJobRequests = [];
-  const manualCheckRequests = [];
-  let recordingManualCheck = false;
   page.on("request", (request) => {
-    if (recordingManualCheck) {
-      manualCheckRequests.push({
-        method: request.method(),
-        path: new URL(request.url()).pathname,
-      });
-    }
     if (new URL(request.url()).pathname === jobPath) {
       exactJobRequests.push(request.method());
     }
   });
-  const checkResponsePromise = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === jobPath &&
-      response.request().method() === "GET",
-  );
-  recordingManualCheck = true;
-  await checkHost.click();
-  expect((await checkResponsePromise).ok()).toBe(true);
-  recordingManualCheck = false;
-  expect(exactJobRequests.length).toBeGreaterThan(0);
-  expect(exactJobRequests.every((method) => method === "GET")).toBe(true);
-  expect(manualCheckRequests.some((request) => request.path === jobPath)).toBe(true);
-  expect(manualCheckRequests.filter((request) => request.method === "POST")).toEqual([]);
-  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
-  await expect(checkHost).toBeEnabled();
-
-  const secondCheckResponsePromise = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === jobPath &&
-      response.request().method() === "GET",
-  );
-  recordingManualCheck = true;
-  await checkHost.click();
-  expect((await secondCheckResponsePromise).ok()).toBe(true);
-  recordingManualCheck = false;
-  await expect(checkHost).toBeEnabled();
-  expect(manualCheckRequests.filter((request) => request.method === "POST")).toEqual([]);
-
-  const readsAfterManualChecks = exactJobRequests.length;
+  const readsBeforeAutomaticPoll = exactJobRequests.length;
   await expect
     .poll(() => exactJobRequests.length, { timeout: 3_500 })
-    .toBe(readsAfterManualChecks + 1);
+    .toBe(readsBeforeAutomaticPoll + 1);
   await page.waitForTimeout(500);
-  expect(exactJobRequests).toHaveLength(readsAfterManualChecks + 1);
+  expect(exactJobRequests).toHaveLength(readsBeforeAutomaticPoll + 1);
+  expect(exactJobRequests.every((method) => method === "GET")).toBe(true);
+  await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
 
   const resumedResponsePromise = page.waitForResponse(
     (response) =>
@@ -2950,9 +3048,19 @@ test("settings sheet live wait advances only from host evidence and stops termin
   await page.goto(`/?host=${encodeURIComponent(host)}&workflow=${encodeURIComponent(runId)}`);
   const resumedPayload = await (await resumedResponsePromise).json();
   expect(resumedPayload.job.id).toBe(runId);
+  expect(resumedPayload.job.workflow.next_action).toMatchObject({
+    owner: { kind: "host_agent", key: `host-agent:${host}` },
+    availability: {
+      executable: true,
+      execution: "automatic",
+      operation: "poll_host_evidence",
+    },
+    idempotency: { key: nextAction.idempotency.key },
+  });
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
-  await expect(dialog.getByRole("button", { name: "Check host now" })).toBeVisible();
+  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Check host now" })).toHaveCount(0);
   await expect(dialog.locator(".host-workflow-meta")).toContainText("Started");
 
   await reportRuntimeHost(page, host, { is_nix: true, preferences: desired });
@@ -2969,7 +3077,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
     "data-workflow-live",
     "false",
   );
-  await expect(dialog.getByRole("button", { name: "Check host now" })).toBeHidden();
+  await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(
     "The host reported the requested settings. The saved workflow is complete.",
   );
@@ -2977,6 +3085,23 @@ test("settings sheet live wait advances only from host evidence and stops termin
   await expect(dialog.locator(".host-workflow-advanced")).toContainText("Last update");
   await expect(dialog.locator(".host-workflow-advanced")).toContainText(
     "Host reported the requested settings",
+  );
+  const terminalPayload = await page.request
+    .get(jobPath)
+    .then((response) => response.json());
+  expect(terminalPayload.job.workflow.next_action).toBeUndefined();
+  expect(terminalPayload.job.workflow.primary_action).toBeNull();
+  expect(terminalPayload.job.workflow.terminal_receipt).toMatchObject({
+    schema: "inspr.pharos.terminal-receipt.v1",
+    version: 1,
+    run_id: runId,
+    outcome: "succeeded",
+  });
+  expect(terminalPayload.job.workflow.terminal_receipt.evidence).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ kind: "repository_accepted" }),
+      expect.objectContaining({ kind: "host_state_verified" }),
+    ]),
   );
   const terminalPollCount = requestedUrls.filter((url) => url.includes(jobPath)).length;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));

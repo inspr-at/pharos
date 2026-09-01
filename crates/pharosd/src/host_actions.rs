@@ -14,6 +14,13 @@ use std::sync::{Mutex, RwLock};
 use pharos_core::HostPreferences;
 use serde::{Deserialize, Serialize};
 
+use crate::next_action::{
+    NextActionAvailabilityState, NextActionDefinition, NextActionDescriptor, NextActionEffect,
+    NextActionExecution, NextActionOperation, NextActionOwner, NextActionOwnerKind,
+    NextActionRecovery, NextActionRecoveryStrategy, TerminalEvidence, TerminalEvidenceKind,
+    TerminalOutcome, TerminalReceipt,
+};
+
 const ACTION_SCHEMA: &str = "inspr.pharos.host-action.v1";
 const ACTION_VERSION: u16 = 1;
 const HOST_LIFECYCLE_SCHEMA: &str = "inspr.pharos.host-lifecycle.v1";
@@ -596,6 +603,10 @@ pub(crate) struct HostWorkflowSummary {
     pub(crate) can_withdraw: bool,
     pub(crate) persisted: bool,
     pub(crate) primary_action: Option<HostWorkflowAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_action: Option<NextActionDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_receipt: Option<TerminalReceipt>,
     pub(crate) ladder: Vec<HostWorkflowLadderFact>,
     pub(crate) next: HostWorkflowNext,
     pub(crate) steps: Vec<HostWorkflowStep>,
@@ -836,6 +847,11 @@ impl HostActionJob {
 
     pub(crate) fn requested_preferences(&self) -> Option<&HostPreferences> {
         self.requested_preferences.as_ref()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn repository_request_id(&self) -> Option<&str> {
+        self.repository_request_id.as_deref()
     }
 
     pub(crate) fn settings_change_id(&self) -> Option<&str> {
@@ -1115,12 +1131,471 @@ impl HostActionJob {
             can_withdraw: self.can_withdraw() && settings.linked_apply.is_none(),
             persisted: true,
             primary_action,
+            next_action: self
+                .projected_next_action_contract_at(system_time_unix(), legacy_settings_resolution),
+            terminal_receipt: self.terminal_receipt(),
             ladder,
             next,
             steps,
             evidence,
             events,
         }
+    }
+
+    fn owner(
+        kind: NextActionOwnerKind,
+        key: impl Into<String>,
+        label: impl Into<String>,
+    ) -> NextActionOwner {
+        NextActionOwner {
+            kind,
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+
+    fn next_action_contract_at(&self, as_of: i64) -> Option<NextActionDescriptor> {
+        let uncertain = self.has_event(HostActionEventKind::DispatchOutcomeUncertain)
+            && !self.has_event(HostActionEventKind::DispatchUncertaintyAcknowledged);
+        let settings_accepted = self.has_event(HostActionEventKind::SettingsRequestAccepted);
+        let submitted = self.has_event(HostActionEventKind::DispatchSubmitted);
+        let credential_retry = self.credential_retry_required();
+        let automatic = NextActionExecution::Automatic;
+        let scheduled = NextActionAvailabilityState::Scheduled;
+        let running = NextActionAvailabilityState::Running;
+        let ready = NextActionAvailabilityState::Ready;
+        let reconcile = |owner| NextActionRecovery {
+            strategy: NextActionRecoveryStrategy::ReconcileBeforeRetry,
+            escalation_after_secs: 900,
+            escalation_owner: owner,
+        };
+        let automatic_retry = |owner| NextActionRecovery {
+            strategy: NextActionRecoveryStrategy::AutomaticRetry,
+            escalation_after_secs: 900,
+            escalation_owner: owner,
+        };
+        let same_run = |owner| NextActionRecovery {
+            strategy: NextActionRecoveryStrategy::RetrySameRun,
+            escalation_after_secs: 1800,
+            escalation_owner: owner,
+        };
+        let escalation = |owner| NextActionRecovery {
+            strategy: NextActionRecoveryStrategy::EscalateToOwner,
+            escalation_after_secs: 86_400,
+            escalation_owner: owner,
+        };
+        let descriptor = match self.workflow_kind() {
+            HostWorkflowKind::SettingsChange if uncertain => (
+                Self::owner(
+                    NextActionOwnerKind::PharosDaemon,
+                    "pharos-daemon:repository-reconciliation",
+                    "Pharos repository reconciler",
+                ),
+                NextActionEffect::ReconcileHandoff,
+                NextActionOperation::ReconcileRepositoryReceipt,
+                automatic,
+                scheduled,
+                (0, 900),
+                reconcile(NextActionOwnerKind::Pharos),
+            ),
+            HostWorkflowKind::SettingsChange if self.can_continue_legacy_settings() => (
+                Self::owner(
+                    NextActionOwnerKind::Operator,
+                    "operator:settings-restart",
+                    "Settings operator",
+                ),
+                NextActionEffect::RecordRequest,
+                NextActionOperation::RestartSettingsRequest,
+                NextActionExecution::OperatorConfirmation,
+                ready,
+                (0, 86_400),
+                escalation(NextActionOwnerKind::Operator),
+            ),
+            HostWorkflowKind::SettingsChange
+                if self.state == HostActionState::ProposalRequested && !submitted =>
+            {
+                (
+                    Self::owner(
+                        NextActionOwnerKind::Pharos,
+                        "pharos:settings-dispatch",
+                        "Pharos",
+                    ),
+                    NextActionEffect::RepositoryHandoff,
+                    NextActionOperation::DispatchSettingsRequest,
+                    automatic,
+                    ready,
+                    (0, 120),
+                    reconcile(NextActionOwnerKind::Pharos),
+                )
+            }
+            HostWorkflowKind::SettingsChange if submitted && !settings_accepted => (
+                Self::owner(
+                    NextActionOwnerKind::PharosDaemon,
+                    "pharos-daemon:local-receipt",
+                    "Pharos local reconciler",
+                ),
+                NextActionEffect::ReconcileHandoff,
+                NextActionOperation::ReconcileRepositoryReceipt,
+                automatic,
+                scheduled,
+                (0, 30),
+                automatic_retry(NextActionOwnerKind::Pharos),
+            ),
+            HostWorkflowKind::SettingsChange if !self.state.is_terminal() => (
+                Self::owner(
+                    NextActionOwnerKind::HostAgent,
+                    format!("host-agent:{}", self.host),
+                    format!("{} host agent", self.host),
+                ),
+                NextActionEffect::RuntimeVerification,
+                NextActionOperation::PollHostEvidence,
+                automatic,
+                scheduled,
+                (0, 300),
+                automatic_retry(NextActionOwnerKind::Pharos),
+            ),
+            HostWorkflowKind::SystemUpdateProposal if uncertain => (
+                Self::owner(
+                    NextActionOwnerKind::PharosDaemon,
+                    "pharos-daemon:repository-reconciliation",
+                    "Pharos repository reconciler",
+                ),
+                NextActionEffect::ReconcileHandoff,
+                NextActionOperation::ReconcileRepositoryReceipt,
+                automatic,
+                scheduled,
+                (0, 900),
+                reconcile(NextActionOwnerKind::Pharos),
+            ),
+            HostWorkflowKind::SystemUpdateProposal if !self.state.is_terminal() => (
+                Self::owner(
+                    NextActionOwnerKind::Nixcfg,
+                    "nixcfg:update-review",
+                    "nixcfg",
+                ),
+                NextActionEffect::RepositoryHandoff,
+                if submitted {
+                    NextActionOperation::AdvanceRepositoryWorkflow
+                } else {
+                    NextActionOperation::DispatchSystemUpdateProposal
+                },
+                automatic,
+                if submitted { scheduled } else { ready },
+                (0, 3600),
+                reconcile(NextActionOwnerKind::Nixcfg),
+            ),
+            HostWorkflowKind::UpdateRestart => match self.state {
+                HostActionState::QueuedReview | HostActionState::Reviewing => (
+                    Self::owner(
+                        NextActionOwnerKind::HostAgent,
+                        format!("host-agent:{}", self.host),
+                        format!("{} host agent", self.host),
+                    ),
+                    NextActionEffect::GuardedReview,
+                    NextActionOperation::ClaimHostReview,
+                    automatic,
+                    if self.state == HostActionState::Reviewing {
+                        running
+                    } else {
+                        scheduled
+                    },
+                    (0, 180),
+                    automatic_retry(NextActionOwnerKind::Pharos),
+                ),
+                HostActionState::AwaitingConfirmation => (
+                    Self::owner(
+                        NextActionOwnerKind::Operator,
+                        "operator:attended-confirmation",
+                        "Attending operator",
+                    ),
+                    NextActionEffect::GuardedConfirmation,
+                    NextActionOperation::ConfirmHostChange,
+                    NextActionExecution::OperatorConfirmation,
+                    ready,
+                    (0, 86_400),
+                    escalation(NextActionOwnerKind::Operator),
+                ),
+                HostActionState::QueuedApply | HostActionState::Applying => (
+                    Self::owner(
+                        NextActionOwnerKind::HostAgent,
+                        format!("host-agent:{}", self.host),
+                        format!("{} host agent", self.host),
+                    ),
+                    NextActionEffect::GuardedApply,
+                    NextActionOperation::ClaimHostApply,
+                    automatic,
+                    if self.state == HostActionState::Applying {
+                        running
+                    } else {
+                        scheduled
+                    },
+                    (0, 1800),
+                    same_run(NextActionOwnerKind::Pharos),
+                ),
+                HostActionState::Rebooting => (
+                    Self::owner(
+                        NextActionOwnerKind::PharosDaemon,
+                        "pharos-daemon:host-evidence",
+                        "Pharos host evidence poller",
+                    ),
+                    NextActionEffect::RuntimeVerification,
+                    NextActionOperation::PollHostEvidence,
+                    automatic,
+                    scheduled,
+                    (60, 900),
+                    reconcile(NextActionOwnerKind::Pharos),
+                ),
+                HostActionState::Failed if self.review_retryable() => (
+                    Self::owner(
+                        NextActionOwnerKind::HostAgent,
+                        format!("host-agent:{}", self.host),
+                        format!("{} host agent", self.host),
+                    ),
+                    NextActionEffect::GuardedReview,
+                    NextActionOperation::RetryHostReview,
+                    automatic,
+                    ready,
+                    (0, 180),
+                    same_run(NextActionOwnerKind::Pharos),
+                ),
+                HostActionState::Failed if self.recoverable() => (
+                    Self::owner(
+                        NextActionOwnerKind::HostAgent,
+                        format!("host-agent:{}", self.host),
+                        format!("{} host agent", self.host),
+                    ),
+                    NextActionEffect::RuntimeVerification,
+                    NextActionOperation::ReconcileHostEvidence,
+                    automatic,
+                    ready,
+                    (0, 900),
+                    same_run(NextActionOwnerKind::Pharos),
+                ),
+                _ => return None,
+            },
+            HostWorkflowKind::RemoveHost if uncertain => (
+                Self::owner(
+                    NextActionOwnerKind::PharosDaemon,
+                    "pharos-daemon:repository-reconciliation",
+                    "Pharos repository reconciler",
+                ),
+                NextActionEffect::ReconcileHandoff,
+                NextActionOperation::ReconcileRepositoryReceipt,
+                automatic,
+                scheduled,
+                (0, 900),
+                reconcile(NextActionOwnerKind::Pharos),
+            ),
+            HostWorkflowKind::RemoveHost if credential_retry => (
+                Self::owner(
+                    NextActionOwnerKind::RetirementOwner,
+                    "retirement-owner:credential-retirement",
+                    "Retirement owner",
+                ),
+                NextActionEffect::Retirement,
+                NextActionOperation::RetryCredentialRetirement,
+                automatic,
+                ready,
+                (0, 1800),
+                same_run(NextActionOwnerKind::Janus),
+            ),
+            HostWorkflowKind::RemoveHost if !self.state.is_terminal() => (
+                Self::owner(
+                    NextActionOwnerKind::PharosDaemon,
+                    "pharos-daemon:retirement-reconciliation",
+                    "Pharos retirement reconciler",
+                ),
+                NextActionEffect::Retirement,
+                if submitted {
+                    NextActionOperation::ReconcileRetirement
+                } else {
+                    NextActionOperation::DispatchHostRemoval
+                },
+                automatic,
+                scheduled,
+                (0, 1800),
+                automatic_retry(NextActionOwnerKind::RetirementOwner),
+            ),
+            _ => return None,
+        };
+        Some(NextActionDescriptor::new(
+            &self.id,
+            self.updated_at,
+            as_of,
+            NextActionDefinition {
+                owner: descriptor.0,
+                effect: descriptor.1,
+                operation: descriptor.2,
+                execution: descriptor.3,
+                state: descriptor.4,
+                expected: descriptor.5,
+                recovery: descriptor.6,
+            },
+        ))
+    }
+
+    fn projected_next_action_contract_at(
+        &self,
+        as_of: i64,
+        legacy_settings_resolution: Option<LegacySettingsResolution>,
+    ) -> Option<NextActionDescriptor> {
+        let operation = match legacy_settings_resolution {
+            Some(LegacySettingsResolution::Continue) => {
+                Some(NextActionOperation::ContinueSettingsRequest)
+            }
+            Some(LegacySettingsResolution::Restart) => {
+                Some(NextActionOperation::RestartSettingsRequest)
+            }
+            Some(LegacySettingsResolution::Verify) => Some(NextActionOperation::PollHostEvidence),
+            None => None,
+        };
+        let Some(operation) = operation else {
+            return self.next_action_contract_at(as_of);
+        };
+        let (owner, effect, execution, state, expected, recovery) = match operation {
+            NextActionOperation::ContinueSettingsRequest => (
+                Self::owner(
+                    NextActionOwnerKind::Operator,
+                    "operator:settings-continuation",
+                    "Settings operator",
+                ),
+                NextActionEffect::RepositoryHandoff,
+                NextActionExecution::OperatorConfirmation,
+                NextActionAvailabilityState::Ready,
+                (0, 86_400),
+                NextActionRecovery {
+                    strategy: NextActionRecoveryStrategy::ReconcileBeforeRetry,
+                    escalation_after_secs: 900,
+                    escalation_owner: NextActionOwnerKind::Pharos,
+                },
+            ),
+            NextActionOperation::RestartSettingsRequest => (
+                Self::owner(
+                    NextActionOwnerKind::Operator,
+                    "operator:settings-restart",
+                    "Settings operator",
+                ),
+                NextActionEffect::RecordRequest,
+                NextActionExecution::OperatorConfirmation,
+                NextActionAvailabilityState::Ready,
+                (0, 86_400),
+                NextActionRecovery {
+                    strategy: NextActionRecoveryStrategy::RetrySameRun,
+                    escalation_after_secs: 86_400,
+                    escalation_owner: NextActionOwnerKind::Operator,
+                },
+            ),
+            NextActionOperation::PollHostEvidence => (
+                Self::owner(
+                    NextActionOwnerKind::HostAgent,
+                    format!("host-agent:{}", self.host),
+                    format!("{} host agent", self.host),
+                ),
+                NextActionEffect::RuntimeVerification,
+                NextActionExecution::Automatic,
+                NextActionAvailabilityState::Scheduled,
+                (0, 300),
+                NextActionRecovery {
+                    strategy: NextActionRecoveryStrategy::AutomaticRetry,
+                    escalation_after_secs: 900,
+                    escalation_owner: NextActionOwnerKind::Pharos,
+                },
+            ),
+            _ => unreachable!("legacy settings projection has a fixed operation set"),
+        };
+        Some(NextActionDescriptor::new(
+            &self.id,
+            self.updated_at,
+            as_of,
+            NextActionDefinition {
+                owner,
+                effect,
+                operation,
+                execution,
+                state,
+                expected,
+                recovery,
+            },
+        ))
+    }
+
+    fn terminal_receipt(&self) -> Option<TerminalReceipt> {
+        if self.next_action_contract_at(self.updated_at).is_some() {
+            return None;
+        }
+        let outcome = match self.state {
+            HostActionState::Succeeded => TerminalOutcome::Succeeded,
+            HostActionState::Failed => TerminalOutcome::Failed,
+            HostActionState::Cancelled => TerminalOutcome::Cancelled,
+            _ => return None,
+        };
+        let mut evidence = vec![TerminalEvidence {
+            kind: TerminalEvidenceKind::RequestRecorded,
+            recorded_at: self.created_at,
+        }];
+        if let Some(event) = self.latest_event(&[
+            HostActionEventKind::DispatchSubmitted,
+            HostActionEventKind::DispatchAccepted,
+        ]) {
+            evidence.push(TerminalEvidence {
+                kind: TerminalEvidenceKind::RepositoryAccepted,
+                recorded_at: event.at,
+            });
+        }
+        let mut record = |kind, event_kind| {
+            if let Some(event) = self.latest_event(&[event_kind]) {
+                evidence.push(TerminalEvidence {
+                    kind,
+                    recorded_at: event.at,
+                });
+            }
+        };
+        record(
+            TerminalEvidenceKind::ReviewPassed,
+            HostActionEventKind::ReviewPassed,
+        );
+        record(
+            TerminalEvidenceKind::ConfirmationRecorded,
+            HostActionEventKind::Confirmed,
+        );
+        record(
+            TerminalEvidenceKind::HostStateVerified,
+            match self.workflow_kind() {
+                HostWorkflowKind::SettingsChange => HostActionEventKind::SettingsApplied,
+                _ => HostActionEventKind::ApplyPassed,
+            },
+        );
+        record(
+            TerminalEvidenceKind::ReportingAccessRevoked,
+            HostActionEventKind::RemovalAccessRevoked,
+        );
+        record(
+            TerminalEvidenceKind::DeclarationRemoved,
+            HostActionEventKind::RemovalDeclarationCompleted,
+        );
+        record(
+            TerminalEvidenceKind::CredentialRetired,
+            HostActionEventKind::RemovalCredentialRetired,
+        );
+        if outcome == TerminalOutcome::Failed {
+            evidence.push(TerminalEvidence {
+                kind: TerminalEvidenceKind::FailureRecorded,
+                recorded_at: self.updated_at,
+            });
+        } else if outcome == TerminalOutcome::Cancelled {
+            evidence.push(TerminalEvidence {
+                kind: TerminalEvidenceKind::CancellationRecorded,
+                recorded_at: self.updated_at,
+            });
+        }
+        evidence.sort_by_key(|fact| fact.recorded_at);
+        evidence.dedup_by_key(|fact| (fact.kind, fact.recorded_at));
+        Some(TerminalReceipt::new(
+            &self.id,
+            outcome,
+            self.updated_at,
+            evidence,
+        ))
     }
 
     pub(crate) fn can_continue_legacy_settings(&self) -> bool {
@@ -2162,11 +2637,9 @@ impl HostActionJob {
                         label: "Run guarded recovery".to_string(),
                         target_run_id: Some(apply.id.clone()),
                     }),
-                    HostActionState::Succeeded => Some(HostWorkflowAction {
-                        kind: HostWorkflowActionKind::Refresh,
-                        label: "Check host now".to_string(),
-                        target_run_id: None,
-                    }),
+                    // Host evidence polling is an automatic next action in the
+                    // durable contract, never a primary progress button.
+                    HostActionState::Succeeded => None,
                     HostActionState::Cancelled if ready_to_apply && apply_blocked_by.is_none() => {
                         Some(HostWorkflowAction {
                             kind: HostWorkflowActionKind::ApplyDeclared,
@@ -2211,11 +2684,8 @@ impl HostActionJob {
             } else if legacy_settings_resolution == Some(LegacySettingsResolution::Verify)
                 || (accepted && submitted)
             {
-                Some(HostWorkflowAction {
-                    kind: HostWorkflowActionKind::Refresh,
-                    label: "Check host now".to_string(),
-                    target_run_id: None,
-                })
+                // The background host-evidence poll owns progress from here.
+                None
             } else {
                 handoff_needs_reconciliation.then(|| HostWorkflowAction {
                     kind: HostWorkflowActionKind::Recover,
@@ -3744,6 +4214,14 @@ pub(crate) struct HostActionStore {
     pending_durable_repair: Mutex<BTreeSet<String>>,
 }
 
+#[derive(Serialize)]
+struct PersistedHostActionJob<'a> {
+    #[serde(flatten)]
+    job: &'a HostActionJob,
+    next_action: Option<NextActionDescriptor>,
+    terminal_receipt: Option<TerminalReceipt>,
+}
+
 struct NewHostAction<'a> {
     id: String,
     host: &'a str,
@@ -3762,9 +4240,20 @@ impl HostActionStore {
             .as_ref()
             .and_then(|path| read_persisted_state(path, "guarded host action"))
             .map(|jobs| {
+                let contract_migration_needed = serde_json::from_slice::<serde_json::Value>(&jobs)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.as_object().is_none_or(|object| {
+                                !object.contains_key("next_action")
+                                    || !object.contains_key("terminal_receipt")
+                            })
+                        })
+                    });
                 let mut jobs: Vec<HostActionJob> = serde_json::from_slice(&jobs)
                     .unwrap_or_else(|_| panic!("guarded host action state is malformed"));
-                let mut migrated = false;
+                let mut migrated = contract_migration_needed;
                 for job in &mut jobs {
                     if job.kind == HostActionKind::RemoveHost && job.removal_plan.is_none() {
                         job.removal_plan = Some(HostRemovalPlan {
@@ -4394,6 +4883,7 @@ impl HostActionStore {
         Ok(updated)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark_dispatch_submitted(
         &self,
         id: &str,
@@ -4402,7 +4892,65 @@ impl HostActionStore {
         self.mark_dispatch_submitted_inner(id, None, now)
     }
 
+    /// Persist the run-scoped repository coordinate before making the remote
+    /// request. An ambiguous HTTP result can then be reconciled against the
+    /// same durable run instead of inventing a second dispatch identity.
+    pub(crate) fn prepare_repository_dispatch(
+        &self,
+        id: &str,
+        request_id: &str,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if !safe_action_id(request_id) {
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if !matches!(
+                job.workflow_kind(),
+                HostWorkflowKind::SettingsChange | HostWorkflowKind::RemoveHost
+            ) || job.state != HostActionState::ProposalRequested
+                || job.dispatch_submitted()
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            if job
+                .repository_request_id
+                .as_deref()
+                .is_some_and(|existing| existing != request_id)
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            if job.repository_request_id.as_deref() == Some(request_id) {
+                return Ok(job.clone());
+            }
+            let previous = job.clone();
+            job.repository_request_id = Some(request_id.to_string());
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            if !error.persistence_committed() {
+                jobs.insert(id.to_string(), previous);
+            }
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
     pub(crate) fn mark_settings_dispatch_submitted(
+        &self,
+        id: &str,
+        request_id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.mark_dispatch_submitted_with_request_id(id, request_id, now)
+    }
+
+    pub(crate) fn mark_dispatch_submitted_with_request_id(
         &self,
         id: &str,
         request_id: &str,
@@ -4430,9 +4978,6 @@ impl HostActionStore {
                     | HostWorkflowKind::RemoveHost
             ) || job.state != HostActionState::ProposalRequested
             {
-                return Err(HostActionStoreError::InvalidTransition);
-            }
-            if request_id.is_some() && job.workflow_kind() != HostWorkflowKind::SettingsChange {
                 return Err(HostActionStoreError::InvalidTransition);
             }
             let previous = job.clone();
@@ -5073,8 +5618,32 @@ impl HostActionStore {
         else {
             return Ok(None);
         };
+        self.complete_settings_change_locked(&mut jobs, &id, now)
+            .map(Some)
+    }
+
+    pub(crate) fn complete_settings_change_run(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        self.complete_settings_change_locked(&mut jobs, id, now)
+    }
+
+    fn complete_settings_change_locked(
+        &self,
+        jobs: &mut BTreeMap<String, HostActionJob>,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
         let (previous, updated) = {
-            let job = jobs.get_mut(&id).expect("selected settings workflow");
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.workflow_kind() != HostWorkflowKind::SettingsChange
+                || job.state != HostActionState::ProposalRequested
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
             let previous = job.clone();
             let event_at = now.max(job.updated_at);
             job.state = HostActionState::Succeeded;
@@ -5087,13 +5656,13 @@ impl HostActionStore {
             );
             (previous, job.clone())
         };
-        if let Err(error) = self.persist_jobs(&jobs) {
+        if let Err(error) = self.persist_jobs(jobs) {
             if !error.persistence_committed() {
-                jobs.insert(id, previous);
+                jobs.insert(id.to_string(), previous);
             }
             return Err(error);
         }
-        Ok(Some(updated))
+        Ok(updated)
     }
 
     fn update_settings_change(
@@ -5810,7 +6379,15 @@ impl HostActionStore {
             return Ok(());
         };
         let snapshot_ids: BTreeSet<String> = jobs.keys().cloned().collect();
-        let snapshot: Vec<_> = jobs.values().cloned().collect();
+        let as_of = system_time_unix();
+        let snapshot: Vec<_> = jobs
+            .values()
+            .map(|job| PersistedHostActionJob {
+                job,
+                next_action: job.next_action_contract_at(as_of),
+                terminal_receipt: job.terminal_receipt(),
+            })
+            .collect();
         let result = persist_json(path, &snapshot);
         if matches!(
             result,
@@ -7388,7 +7965,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_settings_handoff_names_missing_evidence_and_only_offers_refresh() {
+    fn accepted_settings_handoff_names_missing_evidence_and_polls_automatically() {
         let store = HostActionStore::new(None);
         let job = store
             .begin_settings_change("csb0", "markus", 420)
@@ -7406,23 +7983,18 @@ mod tests {
             "The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then csb0 must report the requested values; Pharos will not mark this run complete without that matching host evidence."
         );
         assert_eq!(workflow.current_step.as_deref(), Some("host"));
+        assert!(workflow.primary_action.is_none());
+        let next_action = workflow
+            .next_action
+            .as_ref()
+            .expect("background poll action");
+        assert_eq!(next_action.owner.kind, NextActionOwnerKind::HostAgent);
         assert_eq!(
-            workflow.primary_action,
-            Some(HostWorkflowAction {
-                kind: HostWorkflowActionKind::Refresh,
-                label: "Check host now".to_string(),
-                target_run_id: None,
-            })
+            next_action.availability.operation,
+            NextActionOperation::PollHostEvidence
         );
-        assert_eq!(workflow.next.location, "Pharos");
-        assert!(workflow
-            .next
-            .consequence
-            .contains("Reads this saved run again"));
-        assert!(workflow
-            .next
-            .consequence
-            .contains("completion still requires csb0 to report the requested values"));
+        assert_eq!(workflow.next.location, "csb0");
+        assert!(workflow.next.consequence.contains("keeps this run saved"));
         assert_eq!(
             workflow.next.boundary,
             "nixcfg owns proposal validation and merge; this action does not deploy the host."
@@ -9837,7 +10409,10 @@ mod tests {
             .record_settings_request(&settings.id, &requested, 521)
             .expect("settings recovery payload recorded");
         let settings = store
-            .mark_dispatch_submitted(&settings.id, 522)
+            .prepare_repository_dispatch(&settings.id, &settings.id)
+            .expect("settings dispatch coordinate persisted");
+        let settings = store
+            .mark_dispatch_submitted_with_request_id(&settings.id, &settings.id, 522)
             .expect("settings dispatch submission recorded");
         let settings_summary = settings.summary().workflow;
         assert_eq!(settings_summary.status_label, "dispatch accepted");
@@ -9873,7 +10448,10 @@ mod tests {
             )
             .expect("removal workflow created");
         let removal = store
-            .mark_dispatch_submitted(&removal.id, 524)
+            .prepare_repository_dispatch(&removal.id, &removal.id)
+            .expect("removal dispatch coordinate persisted");
+        let removal = store
+            .mark_dispatch_submitted_with_request_id(&removal.id, &removal.id, 524)
             .expect("removal dispatch submission recorded");
         let removal_summary = removal.summary().workflow;
         assert_eq!(removal_summary.status_label, "dispatch accepted");
@@ -9922,13 +10500,108 @@ mod tests {
             .workflow
             .guidance
             .contains("do not resend"));
-        assert!(reloaded
-            .get(&removal.id)
-            .expect("removal handoff reloaded")
+        assert_eq!(
+            reloaded
+                .get(&settings.id)
+                .expect("settings handoff reloaded")
+                .repository_request_id(),
+            Some(settings.id.as_str())
+        );
+        let reloaded_removal = reloaded.get(&removal.id).expect("removal handoff reloaded");
+        assert!(reloaded_removal
             .summary()
             .workflow
             .guidance
             .contains("do not resend"));
+        assert_eq!(
+            reloaded_removal.repository_request_id(),
+            Some(removal.id.as_str())
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exact_settings_completion_cannot_terminalize_a_replacement_run() {
+        let store = HostActionStore::new(None);
+        let old = store
+            .begin_settings_change("hsb8", "markus", 530)
+            .expect("old settings run created");
+        store
+            .withdraw_settings_change(&old.id, "hsb8", "markus", 531)
+            .expect("old settings run withdrawn");
+        let replacement = store
+            .begin_settings_change("hsb8", "markus", 532)
+            .expect("replacement settings run created");
+
+        assert_eq!(
+            store.complete_settings_change_run(&old.id, 533),
+            Err(HostActionStoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store
+                .get(&replacement.id)
+                .expect("replacement retained")
+                .state,
+            HostActionState::ProposalRequested
+        );
+    }
+
+    #[test]
+    fn uncertain_settings_and_removal_keep_run_scoped_dispatch_ids_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-run-scoped-dispatch-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 540)
+            .expect("settings run created");
+        store
+            .record_settings_request(
+                &settings.id,
+                &HostPreferences {
+                    accent: Some("#1f7fb5".to_string()),
+                    ..HostPreferences::default()
+                },
+                541,
+            )
+            .expect("settings payload persisted");
+        store
+            .prepare_repository_dispatch(&settings.id, &settings.id)
+            .expect("settings coordinate persisted before dispatch");
+        store
+            .fail_settings_change_uncertain(&settings.id, 542)
+            .expect("settings uncertainty recorded");
+
+        let removal = store
+            .begin_removal(
+                "gpc0",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Destroyed,
+                    successor: None,
+                    declaration_pending: true,
+                    credential_retirement_required: true,
+                },
+                543,
+            )
+            .expect("removal run created");
+        store
+            .prepare_repository_dispatch(&removal.id, &removal.id)
+            .expect("removal coordinate persisted before dispatch");
+        store
+            .fail_removal_uncertain(&removal.id, 544)
+            .expect("removal uncertainty recorded");
+
+        drop(store);
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        for id in [&settings.id, &removal.id] {
+            let job = reloaded.get(id).expect("uncertain run reloaded");
+            assert_eq!(job.repository_request_id(), Some(id.as_str()));
+            assert_eq!(job.state, HostActionState::Failed);
+            assert!(job.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        }
         let _ = std::fs::remove_file(path);
     }
 
@@ -10765,13 +11438,14 @@ mod tests {
 
         let already_declared =
             waiting.summary_with_settings_context(Some(&requested), Some(&requested), true);
+        assert!(already_declared.workflow.primary_action.is_none());
         assert_eq!(
             already_declared
                 .workflow
-                .primary_action
+                .next_action
                 .as_ref()
-                .map(|action| action.kind),
-            Some(HostWorkflowActionKind::Refresh)
+                .map(|action| action.availability.operation),
+            Some(NextActionOperation::PollHostEvidence)
         );
         assert_eq!(
             already_declared.workflow.current_step.as_deref(),
@@ -11301,5 +11975,123 @@ mod tests {
         assert!(std::panic::catch_unwind(|| RetiredHostStore::new(Some(path.clone()))).is_err());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_saved_run_is_backfilled_with_durable_next_action_contract() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-next-action-legacy-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy = HostActionStore::new(None)
+            .begin_settings_change("hsb8", "markus", 100)
+            .expect("legacy settings run");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&vec![legacy]).expect("legacy state JSON"),
+        )
+        .expect("legacy state written");
+
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        assert!(reloaded.latest_settings_change_for_host("hsb8").is_some());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("migrated state readable"))
+                .expect("migrated state JSON");
+        let saved = &persisted[0];
+        assert_eq!(
+            saved["next_action"]["schema"],
+            crate::next_action::NEXT_ACTION_SCHEMA
+        );
+        assert_eq!(saved["next_action"]["owner"]["kind"], "pharos");
+        assert_eq!(saved["next_action"]["availability"]["executable"], true);
+        assert!(saved["terminal_receipt"].is_null());
+        assert!(!persisted.to_string().contains("https://"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepted_settings_projection_uses_background_evidence_not_refresh() {
+        let store = HostActionStore::new(None);
+        let preferences = checkpoint_preferences();
+        let job = store
+            .begin_settings_change("hsb8", "markus", 200)
+            .expect("settings run");
+        store
+            .record_settings_request(&job.id, &preferences, 201)
+            .expect("settings payload recorded");
+        store
+            .mark_settings_dispatch_submitted(&job.id, &job.id, 202)
+            .expect("repository receipt recorded");
+        let accepted = store
+            .accept_settings_change(&job.id, 203)
+            .expect("local handoff accepted");
+
+        let summary = accepted.summary();
+        assert!(summary.workflow.primary_action.is_none());
+        let next = summary.workflow.next_action.expect("automatic next action");
+        assert_eq!(next.owner.kind, NextActionOwnerKind::HostAgent);
+        assert_eq!(
+            next.availability.operation,
+            NextActionOperation::PollHostEvidence
+        );
+        assert_eq!(next.availability.execution, NextActionExecution::Automatic);
+        assert!(next.availability.executable);
+        assert!(summary.workflow.terminal_receipt.is_none());
+    }
+
+    #[test]
+    fn duplicate_next_action_projection_keeps_one_idempotency_key() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "markus", 300)
+            .expect("guarded review");
+        let first = job
+            .next_action_contract_at(310)
+            .expect("queued review action");
+        let second = store
+            .get(&job.id)
+            .expect("same saved run")
+            .next_action_contract_at(320)
+            .expect("same queued review action");
+
+        assert_eq!(first.idempotency.key, second.idempotency.key);
+        assert_eq!(first.availability.operation, second.availability.operation);
+        assert!(second.timing.age_secs > first.timing.age_secs);
+    }
+
+    #[test]
+    fn completed_settings_run_has_typed_terminal_evidence() {
+        let store = HostActionStore::new(None);
+        let preferences = checkpoint_preferences();
+        let job = store
+            .begin_settings_change("hsb8", "markus", 400)
+            .expect("settings run");
+        store
+            .record_settings_request(&job.id, &preferences, 401)
+            .expect("payload recorded");
+        store
+            .mark_settings_dispatch_submitted(&job.id, &job.id, 402)
+            .expect("dispatch receipt");
+        store
+            .accept_settings_change(&job.id, 403)
+            .expect("handoff accepted");
+        let completed = store
+            .complete_settings_change("hsb8", 404)
+            .expect("completion persists")
+            .expect("settings run completes");
+
+        let summary = completed.summary();
+        assert!(summary.workflow.next_action.is_none());
+        let receipt = summary.workflow.terminal_receipt.expect("terminal receipt");
+        assert_eq!(receipt.outcome, TerminalOutcome::Succeeded);
+        assert!(receipt
+            .evidence
+            .iter()
+            .any(|fact| fact.kind == TerminalEvidenceKind::RepositoryAccepted));
+        assert!(receipt
+            .evidence
+            .iter()
+            .any(|fact| fact.kind == TerminalEvidenceKind::HostStateVerified));
     }
 }

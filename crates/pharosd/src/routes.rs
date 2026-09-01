@@ -34,6 +34,7 @@ fn human_routes() -> Router<AppState> {
             post(disconnect_hetzner_provider),
         )
         .route("/agora", get(agora::page))
+        .route("/hosts/{host}", get(agora::host_workspace_page))
         .route(
             "/agora/proposals/host-palette.json",
             get(agora::palette_proposal),
