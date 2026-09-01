@@ -1033,6 +1033,10 @@ fn reconcile(document: &mut ManagedOperationDocument, now: i64) {
         if !operation.phase.terminal()
             && operation.operation_kind == ManagedOperationKind::Remove
             && !removal_window_open(operation, now)
+            && operation
+                .active_lease
+                .as_ref()
+                .is_none_or(|lease| lease.expires_at_unix_secs <= now)
         {
             operation.phase = ManagedOperationPhase::Failed;
             operation.reason_code = Some(ManagedOperationReason::RemovalUncertain);
@@ -1440,6 +1444,33 @@ mod tests {
         );
     }
 
+    fn refresh_active_health(
+        store: &ManagedServiceOperationStore,
+        manifest: &ManagedServiceManifestV1,
+        now: i64,
+    ) {
+        let lease = store.claim(&manifest.host_ref, now).unwrap().unwrap();
+        assert_eq!(lease.phase, ManagedOperationAgentPhase::Verify);
+        let mut verified = result(
+            &lease,
+            ManagedOperationAgentOutcome::Succeeded,
+            ManagedOperationReason::PhaseSucceeded,
+        );
+        verified.health_evidence = Some(ManagedHealthEvidenceV1 {
+            generation: lease.generation,
+            materialized: true,
+            process_state: ManagedProcessState::Running,
+            probe_state: ManagedProbeState::Healthy,
+            heartbeat_observed_at_unix_secs: now,
+            process_observed_at_unix_secs: now,
+            probe_observed_at_unix_secs: now,
+        });
+        assert_eq!(
+            store.record_result(&verified, now + 1).unwrap().phase,
+            ManagedOperationPhase::Active
+        );
+    }
+
     #[test]
     fn removal_requires_reviewed_detach_and_fresh_exact_absence_evidence() {
         let store = ManagedServiceOperationStore::new(None).unwrap();
@@ -1654,6 +1685,129 @@ mod tests {
         );
         assert_eq!(
             store.retry(&removal.operation_ref, recovery_deadline + 1),
+            Err(ManagedOperationStoreError::Conflict)
+        );
+    }
+
+    #[test]
+    fn removal_lease_started_before_cutoff_survives_status_reads_and_accepts_timely_proof() {
+        let store = ManagedServiceOperationStore::new(None).unwrap();
+        let manifest = fixture();
+        activate(&store, &manifest, "op_create_retryrace", 1, NOW);
+
+        let mut detached = manifest.services[0].slots[0].clone();
+        detached.binding_state = ManagedBindingState::Detached;
+        let mut removal = ready("op_retryrace01", 1);
+        removal.operation_kind = ManagedOperationKind::Remove;
+        let recovery_deadline = NOW + 10 + MIN_REMOVAL_RECOVERY_SECONDS;
+        removal.purge_not_before_unix_secs = Some(recovery_deadline);
+        store.register(&removal, &detached, NOW + 10).unwrap();
+        let first_lease = store.claim(&manifest.host_ref, NOW + 11).unwrap().unwrap();
+        store
+            .record_result(
+                &result(
+                    &first_lease,
+                    ManagedOperationAgentOutcome::Failed,
+                    ManagedOperationReason::RemovalFailed,
+                ),
+                NOW + 12,
+            )
+            .unwrap();
+
+        refresh_active_health(&store, &manifest, NOW + HEALTH_EVIDENCE_MAX_AGE_SECONDS + 7);
+        let cutoff = recovery_deadline - REMOVAL_RETRY_WINDOW_SECONDS;
+        store.retry(&removal.operation_ref, cutoff - 2).unwrap();
+        let retry_lease = store
+            .claim(&manifest.host_ref, cutoff - 1)
+            .unwrap()
+            .unwrap();
+        assert!(retry_lease.expires_at_unix_secs > cutoff);
+
+        let in_flight = store.get(&removal.operation_ref, cutoff + 1).unwrap();
+        assert_eq!(in_flight.phase, ManagedOperationPhase::Removing);
+        assert!(in_flight.removal.is_none());
+
+        let proof_at = cutoff + 2;
+        let mut removed = result(
+            &retry_lease,
+            ManagedOperationAgentOutcome::Succeeded,
+            ManagedOperationReason::PhaseSucceeded,
+        );
+        removed.removal_evidence = Some(ManagedRemovalEvidenceV1 {
+            generation: 1,
+            runtime_absent: true,
+            process_state: ManagedProcessState::Stopped,
+            cache_state: ManagedCacheState::Quarantined,
+            heartbeat_observed_at_unix_secs: proof_at,
+            process_observed_at_unix_secs: proof_at,
+            cache_observed_at_unix_secs: proof_at,
+        });
+        let terminal = store.record_result(&removed, proof_at).unwrap();
+        assert_eq!(terminal.phase, ManagedOperationPhase::Removed);
+        assert_eq!(
+            terminal.removal.as_ref().map(|proof| proof.generation),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn expired_removal_lease_after_cutoff_becomes_recovery_terminal() {
+        let store = ManagedServiceOperationStore::new(None).unwrap();
+        let manifest = fixture();
+        activate(&store, &manifest, "op_create_retryexpired", 1, NOW);
+
+        let mut detached = manifest.services[0].slots[0].clone();
+        detached.binding_state = ManagedBindingState::Detached;
+        let mut removal = ready("op_retryexpired01", 1);
+        removal.operation_kind = ManagedOperationKind::Remove;
+        let recovery_deadline = NOW + 10 + MIN_REMOVAL_RECOVERY_SECONDS;
+        removal.purge_not_before_unix_secs = Some(recovery_deadline);
+        store.register(&removal, &detached, NOW + 10).unwrap();
+        let first_lease = store.claim(&manifest.host_ref, NOW + 11).unwrap().unwrap();
+        store
+            .record_result(
+                &result(
+                    &first_lease,
+                    ManagedOperationAgentOutcome::Failed,
+                    ManagedOperationReason::RemovalFailed,
+                ),
+                NOW + 12,
+            )
+            .unwrap();
+
+        refresh_active_health(&store, &manifest, NOW + HEALTH_EVIDENCE_MAX_AGE_SECONDS + 7);
+        let cutoff = recovery_deadline - REMOVAL_RETRY_WINDOW_SECONDS;
+        store.retry(&removal.operation_ref, cutoff - 2).unwrap();
+        let retry_lease = store
+            .claim(&manifest.host_ref, cutoff - 1)
+            .unwrap()
+            .unwrap();
+        let expired = store
+            .get(&removal.operation_ref, retry_lease.expires_at_unix_secs)
+            .unwrap();
+        assert_eq!(expired.phase, ManagedOperationPhase::Failed);
+        assert_eq!(
+            expired.reason_code,
+            Some(ManagedOperationReason::RemovalUncertain)
+        );
+        assert!(expired.removal.is_none());
+
+        let mut late = result(
+            &retry_lease,
+            ManagedOperationAgentOutcome::Succeeded,
+            ManagedOperationReason::PhaseSucceeded,
+        );
+        late.removal_evidence = Some(ManagedRemovalEvidenceV1 {
+            generation: 1,
+            runtime_absent: true,
+            process_state: ManagedProcessState::Stopped,
+            cache_state: ManagedCacheState::Quarantined,
+            heartbeat_observed_at_unix_secs: retry_lease.expires_at_unix_secs - 1,
+            process_observed_at_unix_secs: retry_lease.expires_at_unix_secs - 1,
+            cache_observed_at_unix_secs: retry_lease.expires_at_unix_secs - 1,
+        });
+        assert_eq!(
+            store.record_result(&late, retry_lease.expires_at_unix_secs),
             Err(ManagedOperationStoreError::Conflict)
         );
     }
