@@ -504,4 +504,17 @@ body[data-assistant-open="true"]{overflow:hidden}
 .managed-danger{border-color:rgba(190,78,69,.42);background:rgba(255,247,246,.94);color:#8b2f2a}.managed-danger:hover,.managed-danger:focus-visible{border-color:rgba(190,78,69,.68);background:#fff2f0;color:#6f231f}.managed-link-danger{color:#9b352f}.managed-link-danger:hover,.managed-link-danger:focus-visible{color:#70231f}.managed-detach-note{display:grid;gap:5px;margin-top:12px;padding:12px 14px;border-left:3px solid rgba(214,155,49,.7);border-radius:0 7px 7px 0;background:rgba(255,250,239,.82);color:#5e5038;font-size:12px;line-height:1.55}.managed-detach-note strong{color:#453821}
 .managed-slot-facts dt,.managed-service-details dt,.managed-operation-lanes dt{color:#526d82}
 .host-drawer-facts dt{color:#294761}
-</style></head><body><div class="app-shell">
+</style><script>
+const ACTION_TAXONOMY=Object.freeze({
+  continue:Object.freeze({effect:'Advance this saved workflow at its recorded next step.',idempotency:'The server accepts this saved run only once.',owner:'Operator',outcome:'The same workflow records the result.'}),
+  retry:Object.freeze({effect:'Repeat only the named bounded and idempotent step.',idempotency:'The existing run and operation key are reused.',owner:'Operator',outcome:'The retry result is appended to the same workflow.'}),
+  reconcile:Object.freeze({effect:'Read external evidence without replaying the original mutation.',idempotency:'Observation only; the mutation is never repeated.',owner:'Pharos',outcome:'The saved workflow records the observed result.'}),
+  recover:Object.freeze({effect:'Run the named target-local recovery checks.',idempotency:'Recovery is bounded by the existing run.',owner:'Operator',outcome:'The same workflow records recovery evidence.'}),
+  recheck:Object.freeze({effect:'Read the latest recorded evidence now.',idempotency:'Observation only; no request is sent.',owner:'Pharos',outcome:'The visible status is updated from evidence.'}),
+  refresh:Object.freeze({effect:'Reload the latest recorded state.',idempotency:'Observation only; no workflow advances.',owner:'Pharos',outcome:'The current view is refreshed.'}),
+  withdraw:Object.freeze({effect:'Stop this Pharos run before its next step.',idempotency:'Repeating withdrawal leaves the run stopped.',owner:'Operator',outcome:'External proposals remain owned by their repository.'}),
+  cancel:Object.freeze({effect:'Cancel a review that has not authorised live work.',idempotency:'Repeating cancellation leaves the review cancelled.',owner:'Operator',outcome:'No live change is authorised.'}),
+  escalate:Object.freeze({effect:'Open the recorded owner handoff with the evidence needed to proceed.',idempotency:'No workflow or host state changes.',owner:'Operator',outcome:'The responsible owner receives an actionable handoff.'}),
+});
+function actionContract(kind){return ACTION_TAXONOMY[String(kind||'').toLowerCase()]||null}
+</script></head><body><div class="app-shell">

@@ -100,13 +100,13 @@ use crate::auth::{access_for_headers, AccessGrant, Auth, AuthConfig, AuthState};
 use crate::host_actions::host_lifecycle;
 use crate::host_actions::{
     active_update_restart_for_host, blocking_update_for_host, host_lifecycle_with_apply,
-    host_preferences_state, linked_settings_apply, most_relevant_host_action,
-    withdrawable_settings_change_for_host, AgentActionOutcome, AgentActionResultRequest,
-    HostActionEventSource, HostActionJob, HostActionState, HostActionStore, HostActionStoreError,
-    HostLifecycle, HostLifecycleSlot, HostPreferencesState, HostRemovalPlan,
-    HostRetirementDisposition, HostSettingsContext, HostWorkflowKind, HostWorkflowSummary,
-    RetiredHost, RetiredHostStore, RetirementAgentResultRequest, SystemUpdateProposalBegin,
-    UpdateRestartIntent,
+    host_preferences_state, host_terminal_receipts, linked_settings_apply,
+    most_relevant_host_action, withdrawable_settings_change_for_host, AgentActionOutcome,
+    AgentActionResultRequest, HostActionEventSource, HostActionJob, HostActionState,
+    HostActionStore, HostActionStoreError, HostLifecycle, HostLifecycleSlot, HostPreferencesState,
+    HostRemovalPlan, HostRetirementDisposition, HostSettingsContext, HostWorkflowKind,
+    HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
+    SystemUpdateProposalBegin, UpdateRestartIntent, HOST_WORKFLOW_RECEIPT_RETENTION,
 };
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
@@ -1943,6 +1943,33 @@ async fn host_action_job_json(
     )
 }
 
+async fn host_workflow_receipts_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(host): AxumPath<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(receipts) = state.host_actions.recent_terminal_receipts_for_host(&host) else {
+        return action_error(StatusCode::BAD_REQUEST, "Host reference is invalid");
+    };
+    let access = access_for_headers(&state.auth, &headers);
+    if !access.allows_host(&host) {
+        return action_error(
+            StatusCode::FORBIDDEN,
+            "Workflow receipt access is not granted",
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "schema": "inspr.pharos.host-workflow-receipts.v1",
+            "version": 1,
+            "host": host,
+            "retention_limit": HOST_WORKFLOW_RECEIPT_RETENTION,
+            "receipts": receipts,
+        })),
+    )
+}
+
 async fn acknowledge_dispatch_uncertainty(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3667,6 +3694,7 @@ fn hosts_payload(
                 &h.name,
                 now,
             );
+            let workflow_receipts = host_terminal_receipts(action_jobs, &h.name);
             let mut host = json!({
                 "name": h.name,
                 "role": h.role,
@@ -3690,6 +3718,7 @@ fn hosts_payload(
                 "backup_observations": h.backup_observations,
                 "backup_observations_summary": backup_observations_summary(&h.backup_observations),
                 "lifecycle": lifecycle,
+                "workflow_receipts": workflow_receipts,
                 "update_restart_active": active_update_restart_for_host(action_jobs, &h.name).is_some(),
                 "settings_change_withdraw_run_id": withdrawable_settings_change.map(|job| &job.id),
                 "attention": {
@@ -6352,13 +6381,11 @@ mod tests {
             "openHostActionDialog('workflow',root,root.querySelector('[data-host-actions-trigger]'));"
         ));
         assert!(!html.contains("openHostActionDialog('workflow',root,actionItem,runId)"));
-        assert!(html.contains("Withdraw change request"));
-        assert!(
-            html.contains("Clears the pending request. An open nixcfg proposal stays open there.")
-        );
+        assert!(html.contains("Withdraw settings request"));
+        assert!(html.contains("Stops this Pharos run; it does not close an open nixcfg proposal."));
         assert!(html.contains(r#"data-host-action-cancel hidden"#));
         assert!(html.contains(
-            r#"data-host-action-primary>Continue</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button>"#
+            r#"data-host-action-primary>Review action</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Withdraw run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button>"#
         ));
         assert!(html.contains("openRequestedWorkflow()"));
         assert!(html.contains(
@@ -6751,7 +6778,7 @@ mod tests {
         assert!(markup.contains(r#"data-update-restart-active="true""#));
         assert!(markup.contains(r#"data-host-action="update-restart" hidden"#));
         assert!(markup.contains(&format!(r#"data-lifecycle-run-id="{}""#, settings_job.id)));
-        assert!(markup.contains("Withdraw change request"));
+        assert!(markup.contains("Withdraw settings request"));
         assert!(!markup.contains("Continue update workflow"));
 
         let payload = hosts_payload(
@@ -6810,7 +6837,8 @@ mod tests {
         assert!(html.contains(
             r#"class="backup-row clear" data-ops-row data-ops-level="clear" data-host="athena""#
         ));
-        assert!(html.contains("new URLSearchParams(window.location.search).get('host')"));
+        assert!(html.contains("const params=new URLSearchParams(window.location.search)"));
+        assert!(html.contains("const requestedHost=params.get('host')"));
         assert!(html.contains("target.scrollIntoView({block:'center',behavior:'smooth'})"));
         assert!(html.contains("Last success"));
         assert!(html.contains("Schedule"));
@@ -14725,6 +14753,82 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let (status, _) =
             host_action_job_json(State(state), HeaderMap::new(), AxumPath(job.id)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn host_receipts_are_viewer_safe_host_scoped_and_cover_empty_and_error_states() {
+        let mut state = report_test_state(false);
+        let job = state
+            .host_actions
+            .create_update_review("hsb8", "fixture-operator", 1_000)
+            .expect("host-action fixture starts");
+        state
+            .host_actions
+            .cancel_update_review(&job.id, "hsb8", "fixture-operator", 1_001)
+            .expect("terminal fixture persists");
+        state
+            .store
+            .record(test_report("hsb8"), 1_002)
+            .expect("host fixture persists");
+        let host = state.store.get("hsb8").expect("host fixture reloads");
+        let fleet_payload = hosts_payload(
+            vec![host],
+            &[],
+            &BTreeMap::new(),
+            &state.host_actions.list(),
+            None,
+            1_002,
+        );
+        assert_eq!(
+            fleet_payload["hosts"][0]["workflow_receipts"][0]["workflow_id"],
+            job.id
+        );
+        state.auth =
+            AuthState::for_test_access(AccessGrant::limited(["hsb8", "empty-host"], false));
+
+        let (status, Json(payload)) = host_workflow_receipts_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath("hsb8".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["schema"], "inspr.pharos.host-workflow-receipts.v1");
+        assert_eq!(payload["retention_limit"], HOST_WORKFLOW_RECEIPT_RETENTION);
+        assert_eq!(payload["receipts"][0]["workflow_id"], job.id);
+        assert_eq!(payload["receipts"][0]["receipt_kind"], "cancellation");
+        assert_eq!(
+            payload["receipts"][0]["activity_href"],
+            format!(
+                "/activity?host=hsb8&workflow={}#workflow-{}",
+                job.id, job.id
+            )
+        );
+
+        let (empty_status, Json(empty_payload)) = host_workflow_receipts_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath("empty-host".to_string()),
+        )
+        .await;
+        assert_eq!(empty_status, StatusCode::OK);
+        assert_eq!(empty_payload["receipts"], json!([]));
+
+        let (forbidden_status, _) = host_workflow_receipts_json(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath("athena".to_string()),
+        )
+        .await;
+        assert_eq!(forbidden_status, StatusCode::FORBIDDEN);
+
+        let (invalid_status, _) = host_workflow_receipts_json(
+            State(state),
+            HeaderMap::new(),
+            AxumPath("not a host".to_string()),
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Html;
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Json;
 use pharos_core::{
     Host, HostLocation, HostLocationSource, HostManifest, HostPreferences, ManifestLocationMode,
@@ -192,7 +192,7 @@ pub(crate) async fn page(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AgoraPageQuery>,
-) -> Html<String> {
+) -> Response {
     let user_label = crate::sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if !access.can_agora()
@@ -208,47 +208,26 @@ pub(crate) async fn page(
                 logout_enabled: state.auth.is_some(),
             },
             "settings",
-        ));
+        ))
+        .into_response();
     }
-    let manifests: Vec<_> = state
-        .manifests
-        .manifests()
-        .iter()
-        .filter(|manifest| {
-            access.allows_host(&manifest.host.name) || access.allows_host(&manifest.slug)
-        })
-        .cloned()
-        .collect();
-    let declared_preferences: BTreeMap<_, _> = state
-        .manifests
-        .declared_preferences()
-        .iter()
-        .filter(|(host, _)| access.allows_host(host))
-        .map(|(host, preferences)| (host.clone(), preferences.clone()))
-        .collect();
-    let runtime_hosts: Vec<_> = state
-        .store
-        .list()
-        .into_iter()
-        .filter(|host| access.allows_host(&host.name))
-        .collect();
-    Html(render_page_with_access(
-        &manifests,
-        &declared_preferences,
-        &runtime_hosts,
-        query.host.as_deref(),
-        &user_label,
-        state.auth.is_some(),
-        access.can_manage_fleet(),
-    ))
+    match query
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        Some(host) => Redirect::temporary(&format!("/hosts/{}", crate::url_query_escape(host)))
+            .into_response(),
+        None => Redirect::temporary("/").into_response(),
+    }
 }
 
 /// Stable, host-scoped entry point for the durable operator workspace.
 ///
-/// The settings editor remains on Agora because it owns the existing draft,
-/// review, and guarded-apply contract. This page deliberately links to that
-/// concrete task (or a saved workflow) instead of implying that refreshing an
-/// observation will advance host work.
+/// This is the single host-scoped home for observation, settings drafts,
+/// guarded workflows, and durable receipts. Compatibility links into Agora
+/// redirect here without discarding the selected host.
 pub(crate) async fn host_workspace_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -311,15 +290,38 @@ pub(crate) async fn host_workspace_page(
         .collect();
     let lifecycle = host_lifecycle(&action_jobs, &selected.name, settings_state, false);
 
-    Html(render_host_workspace(
-        selected,
-        runtime,
-        &lifecycle,
-        settings_state,
-        &user_label,
-        state.auth.is_some(),
-        access.can_manage_fleet(),
+    Html(render_page_with_access(
+        &manifests,
+        &declared_preferences,
+        &runtime_hosts,
+        PageContext {
+            requested_host: Some(&selected.name),
+            user_label: &user_label,
+            logout_enabled: state.auth.is_some(),
+            can_manage_fleet: access.can_manage_fleet(),
+            workspace: Some(HostWorkspaceContext {
+                runtime,
+                lifecycle: &lifecycle,
+                settings_state,
+            }),
+        },
     ))
+}
+
+#[derive(Clone, Copy)]
+struct HostWorkspaceContext<'a> {
+    runtime: Option<&'a Host>,
+    lifecycle: &'a crate::HostLifecycle,
+    settings_state: crate::HostPreferencesState,
+}
+
+#[derive(Clone, Copy)]
+struct PageContext<'a> {
+    requested_host: Option<&'a str>,
+    user_label: &'a str,
+    logout_enabled: bool,
+    can_manage_fleet: bool,
+    workspace: Option<HostWorkspaceContext<'a>>,
 }
 
 fn render_host_workspace(
@@ -327,49 +329,58 @@ fn render_host_workspace(
     runtime: Option<&Host>,
     lifecycle: &crate::HostLifecycle,
     settings_state: crate::HostPreferencesState,
-    user_label: &str,
-    logout_enabled: bool,
     can_manage_fleet: bool,
+    settings_editor: &str,
 ) -> String {
     let extra_css = format!(
-        r#"{AGORA_CSS}<style>
-.host-workspace{{width:min(1320px,100%);display:grid;grid-template-columns:310px minmax(0,1fr);gap:22px;align-items:start}}
+        r#"<style>
+.host-workspace{{width:100%;display:grid;grid-template-columns:310px minmax(0,1fr);gap:22px;align-items:start}}
 .host-workspace-main{{display:grid;gap:16px}}.host-workspace-identity,.host-workspace-section,.host-task-rail{{border:1px solid rgba(210,226,234,.92);border-radius:10px;background:rgba(255,255,255,.9);box-shadow:0 10px 30px rgba(45,75,95,.05)}}
 .host-workspace-identity{{padding:22px;display:flex;gap:15px;align-items:center}}.host-workspace-identity h2,.host-workspace-section h2,.host-task-rail h2{{margin:0;font-family:Georgia,"Times New Roman",serif;font-weight:500}}.host-workspace-identity p,.host-workspace-section p,.host-task-rail p{{margin:5px 0 0;color:var(--muted)}}
 .host-workspace-mark{{display:grid;place-items:center;width:48px;height:48px;border:3px solid {accent};border-radius:50%;color:var(--accent);background:#fff;box-shadow:0 0 0 7px color-mix(in srgb,{accent} 13%,transparent)}}
-.host-workspace-section{{padding:18px}}.host-workspace-section h2{{font-size:18px}}.host-workspace-facts{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:14px}}.host-workspace-facts div{{padding:10px;border-radius:7px;background:#f7fcfd}}.host-workspace-facts span,.host-workspace-facts strong{{display:block}}.host-workspace-facts span{{font-size:11px;color:var(--muted)}}.host-workspace-facts strong{{margin-top:3px;font-size:13px;overflow-wrap:anywhere}}
-.host-task-rail{{position:sticky;top:18px;padding:18px}}.host-task-rail[data-manager="false"]{{border-style:dashed}}.host-task-rail .primary-action{{display:flex;align-items:center;justify-content:center;text-decoration:none;margin-top:16px}}.host-task-rail .task-kind{{display:inline-block;margin-top:11px;color:var(--muted);font-size:12px}}.host-task-rail .task-note{{font-size:12px;line-height:1.45}}.host-workspace-link{{color:#1e668f;font-weight:700}}
+.host-workspace-section{{padding:18px}}.host-workspace-section h2{{font-size:18px}}.host-workspace-facts{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:14px}}.host-workspace-facts div{{padding:10px;border-radius:7px;background:#f7fcfd}}.host-workspace-facts span,.host-workspace-facts strong{{display:block}}.host-workspace-facts span{{font-size:11px;color:#526d82}}.host-workspace-facts strong{{margin-top:3px;font-size:13px;overflow-wrap:anywhere}}
+.host-task-rail{{position:sticky;top:18px;padding:18px}}.host-task-rail[data-manager="false"]{{border-style:dashed}}.host-task-rail .primary-action{{display:flex;align-items:center;justify-content:center;text-decoration:none;margin-top:16px;text-align:center}}.host-task-rail .task-kind{{display:inline-block;margin-top:11px;color:var(--muted);font-size:12px}}.host-task-rail .task-note{{font-size:12px;line-height:1.45}}.host-workspace-link{{color:#1e668f;font-weight:700}}.host-workspace-settings{{padding:0;overflow:hidden}}.host-workspace-settings>.host-workspace-section-head{{padding:18px 18px 0}}.host-workspace-settings .host-settings-surface{{width:100%;margin:14px 0 0}}.host-workspace-settings .host-settings-identity{{display:none}}.host-receipt-slot{{margin-top:16px;padding-top:14px;border-top:1px solid rgba(210,226,234,.86)}}.host-receipt-slot>strong,.host-receipt-empty{{display:block}}.host-receipt-empty{{margin-top:3px;color:#526d82;font-size:11px;line-height:1.45}}.host-receipt-list{{display:grid;gap:8px;margin:10px 0 0;padding:0;list-style:none}}.host-receipt{{padding:9px;border:1px solid rgba(210,226,234,.82);border-radius:7px;background:#f7fcfd}}.host-receipt strong,.host-receipt span{{display:block}}.host-receipt strong{{font-size:11px}}.host-receipt span{{margin-top:2px;color:#526d82;font-size:10px;line-height:1.35}}.host-receipt-links{{display:flex;gap:8px;flex-wrap:wrap;margin-top:7px}}.host-receipt-links a{{color:#1e668f;font-size:10px;font-weight:720}}
 @media(max-width:780px){{.host-workspace{{grid-template-columns:1fr}}.host-task-rail{{position:static;order:0}}.host-workspace-main{{order:1}}.host-workspace-facts{{grid-template-columns:1fr}}}}
 </style>"#,
         accent = html_escape(&host.declared_accent),
     );
     let host_path = crate::url_query_escape(&host.name);
-    let settings_href = format!("/agora?host={host_path}");
-    let (primary_href, primary_label, task_kind) = if let Some(run_id) = lifecycle.run_id.as_deref()
-    {
-        (
-            format!(
-                "/?host={host_path}&workflow={}",
-                crate::url_query_escape(run_id)
-            ),
-            lifecycle
-                .primary_action
-                .as_ref()
-                .map(|action| action.label.as_str())
-                .unwrap_or("Open saved workflow"),
-            "Saved workflow",
-        )
-    } else {
-        (
-            settings_href.clone(),
-            if settings_state == crate::HostPreferencesState::Applied {
-                "Open settings task"
-            } else {
-                "Continue settings task"
-            },
-            "Settings task",
-        )
-    };
+    let settings_href = "#host-settings-editor".to_string();
+    let (primary_href, primary_label, task_kind, workflow_handler) =
+        if let Some(run_id) = lifecycle.run_id.as_deref() {
+            let settings_workflow = lifecycle.slot == crate::HostLifecycleSlot::SettingsChange;
+            (
+                if settings_workflow {
+                    format!(
+                        "/hosts/{host_path}?workflow={}",
+                        crate::url_query_escape(run_id)
+                    )
+                } else {
+                    format!(
+                        "/?host={host_path}&workflow={}",
+                        crate::url_query_escape(run_id)
+                    )
+                },
+                lifecycle
+                    .primary_action
+                    .as_ref()
+                    .map(|action| action.label.as_str())
+                    .unwrap_or("Open saved workflow"),
+                "Saved workflow",
+                if settings_workflow {
+                    "settings"
+                } else {
+                    "host-actions"
+                },
+            )
+        } else {
+            (
+                settings_href.clone(),
+                "Review host settings",
+                "Settings task",
+                "settings",
+            )
+        };
     let report = runtime
         .and_then(|host| host.last_seen)
         .map(|seen| seen.to_string())
@@ -381,9 +392,9 @@ fn render_host_workspace(
         .map(|host| host.backup_observations.len().to_string())
         .unwrap_or_else(|| "No protection observation yet".to_string());
     let manager_note = if can_manage_fleet {
-        "You can make guarded changes after the existing review and confirmation gates."
+        "Review opens an unsent draft. Nothing applies until confirmation and matching host evidence."
     } else {
-        "Viewer access: this workspace is read-only; open the owner task to inspect the saved state."
+        "Viewer access: settings and receipts stay visible, while guarded actions remain with a fleet manager."
     };
     let blocked_by = if lifecycle.blocked_by.is_empty() {
         "Nothing recorded".to_string()
@@ -391,10 +402,8 @@ fn render_host_workspace(
         lifecycle.blocked_by.join(", ")
     };
     format!(
-        r#"{head}{sidebar}<main class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}"><aside class="host-task-rail" data-host-task-rail data-manager="{can_manage}" aria-label="Next safe action"><span class="task-kind">{task_kind}</span><h2>{lifecycle_label}</h2><p>{lifecycle_detail}</p><a class="primary-action" data-host-workspace-primary href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><a class="host-workspace-link" href="{settings_href}">Open full settings and review</a></aside><div class="host-workspace-main"><header class="host-workspace-identity"><span class="host-workspace-mark">{badge}</span><div><h1>{host_name}</h1><p>{role} · stable workspace</p></div></header><section class="host-workspace-section" data-host-workspace-lifecycle><h2>Lifecycle</h2><p>{lifecycle_detail}</p><div class="host-workspace-facts"><div><span>State</span><strong>{lifecycle_label}</strong></div><div><span>Blocked by</span><strong>{blocked_by}</strong></div></div></section><section class="host-workspace-section" data-host-workspace-settings><h2>Settings</h2><p>Observed, declared, and requested settings continue through the existing Agora review and guarded-apply workflow.</p><div class="host-workspace-facts"><div><span>Settings state</span><strong>{settings_state}</strong></div><div><span>Target</span><strong>{target}</strong></div></div></section><section class="host-workspace-section" data-host-workspace-protection><h2>Protection</h2><p>Backup evidence remains host-reported; Pharos does not claim progress from a refresh.</p><div class="host-workspace-facts"><div><span>Backup observations</span><strong>{protection}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/backups?host={host_path}">Open backup evidence</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-services><h2>Services</h2><p>Non-secret service observations stay linked to this host.</p><div class="host-workspace-facts"><div><span>Observed services</span><strong>{services}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/services">Open services</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-activity><h2>Activity</h2><p>The recorded host report is evidence, not an action.</p><div class="host-workspace-facts"><div><span>Last report</span><strong>{report}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/activity">Open activity</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-technical><h2>Technical context</h2><div class="host-workspace-facts"><div><span>Host reference</span><strong>{host_name}</strong></div><div><span>Configuration target</span><strong>{target}</strong></div></div></section></div></main>{foot}"#,
-        head = crate::head_with_extra(&extra_css),
-        sidebar = crate::sidebar(user_label, logout_enabled, "fleet"),
-        foot = crate::FOOT,
+        r#"{extra_css}<div class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}"><aside class="host-task-rail" data-host-task-rail data-manager="{can_manage}" aria-label="Next safe action"><span class="task-kind">{task_kind}</span><h2>{lifecycle_label}</h2><p>{lifecycle_detail}</p><a class="primary-action" data-host-workspace-primary data-workflow-handler="{workflow_handler}" href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><a class="host-workspace-link" href="{settings_href}">Edit settings in this workspace</a><div class="host-receipt-slot" data-host-workspace-receipts><strong>Workflow receipts</strong><span class="host-receipt-empty" data-host-receipt-empty>Loading saved receipts…</span><ol class="host-receipt-list" data-host-receipt-list></ol></div></aside><div class="host-workspace-main"><header class="host-workspace-identity"><span class="host-workspace-mark">{badge}</span><div><h1>{host_name}</h1><p>{role} · host workspace</p></div></header><section class="host-workspace-section" data-host-workspace-lifecycle><h2>Lifecycle</h2><p>{lifecycle_detail}</p><div class="host-workspace-facts"><div><span>State</span><strong>{lifecycle_label}</strong></div><div><span>Blocked by</span><strong>{blocked_by}</strong></div></div></section><section class="host-workspace-section host-workspace-settings" id="host-settings-editor" data-host-workspace-settings><div class="host-workspace-section-head"><h2>Settings</h2><p>Color, host type, alerts, declarative details, review, execution, and evidence stay attached to this host.</p><div class="host-workspace-facts"><div><span>Settings state</span><strong>{settings_state}</strong></div><div><span>Target</span><strong>{target}</strong></div></div></div>{settings_editor}</section><section class="host-workspace-section" data-host-workspace-protection><h2>Protection</h2><p>Backup evidence remains host-reported; observation does not claim progress.</p><div class="host-workspace-facts"><div><span>Backup observations</span><strong>{protection}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/backups?host={host_path}">Open backup evidence</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-services><h2>Services</h2><p>Non-secret service observations stay linked to this host.</p><div class="host-workspace-facts"><div><span>Observed services</span><strong>{services}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/services">Open services</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-activity><h2>Activity</h2><p>The recorded host report is evidence, not an action.</p><div class="host-workspace-facts"><div><span>Last report</span><strong>{report}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/activity">Open activity</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-technical><h2>Technical context</h2><div class="host-workspace-facts"><div><span>Host reference</span><strong>{host_name}</strong></div><div><span>Configuration target</span><strong>{target}</strong></div></div></section></div></div>"#,
+        extra_css = extra_css,
         host_name = html_escape(&host.name),
         role = html_escape(&host.role),
         badge = if host.is_nix {
@@ -408,6 +417,7 @@ fn render_host_workspace(
         lifecycle_detail = html_escape(&lifecycle.detail),
         primary_href = html_escape(&primary_href),
         primary_label = html_escape(primary_label),
+        workflow_handler = workflow_handler,
         manager_note = html_escape(manager_note),
         settings_href = html_escape(&settings_href),
         blocked_by = html_escape(&blocked_by),
@@ -417,6 +427,7 @@ fn render_host_workspace(
         protection = html_escape(&protection),
         services = html_escape(&services),
         report = html_escape(&report),
+        settings_editor = settings_editor,
     )
 }
 
@@ -876,10 +887,13 @@ fn render_page(
         manifests,
         declared_preferences,
         runtime_hosts,
-        requested_host,
-        user_label,
-        logout_enabled,
-        true,
+        PageContext {
+            requested_host,
+            user_label,
+            logout_enabled,
+            can_manage_fleet: true,
+            workspace: None,
+        },
     )
 }
 
@@ -887,11 +901,15 @@ fn render_page_with_access(
     manifests: &[HostManifest],
     declared_preferences: &BTreeMap<String, HostPreferences>,
     runtime_hosts: &[Host],
-    requested_host: Option<&str>,
-    user_label: &str,
-    logout_enabled: bool,
-    can_manage_fleet: bool,
+    page: PageContext<'_>,
 ) -> String {
+    let PageContext {
+        requested_host,
+        user_label,
+        logout_enabled,
+        can_manage_fleet,
+        workspace,
+    } = page;
     let mut hosts = host_views(manifests, declared_preferences, runtime_hosts);
     let requested_host = requested_host
         .map(str::trim)
@@ -921,7 +939,15 @@ fn render_page_with_access(
     };
 
     let head = crate::head_with_extra(AGORA_CSS);
-    let sidebar = crate::sidebar(user_label, logout_enabled, "settings");
+    let sidebar = crate::sidebar(
+        user_label,
+        logout_enabled,
+        if workspace.is_some() {
+            "fleet"
+        } else {
+            "settings"
+        },
+    );
     let access_path = if can_manage_fleet {
         String::new()
     } else {
@@ -940,17 +966,44 @@ fn render_page_with_access(
     }
 
     let selected = &hosts[selected_index];
-    let host_table = render_host_table(&hosts, selected_index);
-    let content = if selected.settings_ready {
+    let editor = if selected.settings_ready {
         render_ready_content(selected, can_manage_fleet)
     } else {
         render_setup_content(selected, can_manage_fleet)
+    };
+    let (header, host_table, content) = if let Some(workspace) = workspace {
+        (
+            crate::page_header(
+                "Host workspace",
+                "One host, its next action, settings, and evidence",
+                crate::now_unix(),
+            ),
+            String::new(),
+            render_host_workspace(
+                selected,
+                workspace.runtime,
+                workspace.lifecycle,
+                workspace.settings_state,
+                can_manage_fleet,
+                &editor,
+            ),
+        )
+    } else {
+        (
+            crate::page_header(
+                "Host settings",
+                "Color and alerts per host",
+                crate::now_unix(),
+            ),
+            render_host_table(&hosts, selected_index),
+            editor,
+        )
     };
 
     format!(
         r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{access_path}{host_table}{content}</main>{action_dialog}<script>
 document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{{
-  window.location.assign('/agora?host='+encodeURIComponent(event.target.value));
+  window.location.assign('/hosts/'+encodeURIComponent(event.target.value));
 }});
 const root=document.querySelector('[data-color-root]');
 const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:'',failures:0,terminal:false,mode:null,confirming:false}};
@@ -1080,14 +1133,16 @@ function renderSettingsWorkflow(data){{
       :actionKind==='confirm'?!settingsApplyConfirmationReady():false;
     primary.dataset.workflowAction=actionKind;
     primary.dataset.workflowTargetRunId=primaryAction?.target_run_id||'';
-    primary.textContent=primaryAction?.label||'Continue';
+    primary.textContent=primaryAction?.label||'Open next action';
   }}
   if(cancelRequest){{cancelRequest.hidden=true;cancelRequest.disabled=false}}
   if(cancel)cancel.textContent='Close';
   if(status)status.textContent=data.message||'';
   if(safe){{
     safe.dataset.workflowLive=terminal||actionRequired?'false':'true';
+    const contract=actionContract(primaryAction?.kind);
     safe.textContent=guardedAction&&!settingsCanManageFleet()?'Fleet operator access is required for this guarded action'
+      :contract?contract.effect
       :terminal?'Run complete and saved'
       :primaryAction?.kind==='continue'?'Ready to continue the saved request'
       :primaryAction?.kind==='restart'?'Operator action required'
@@ -1342,10 +1397,10 @@ if(root){{
     if(confirmationInput)confirmationInput.value='';
     if(attended)attended.hidden=true;
     if(attendedInput)attendedInput.checked=false;
-    if(primary){{primary.hidden=false;primary.disabled=false;primary.dataset.workflowAction='confirm-settings';primary.textContent='Confirm change request'}}
+    if(primary){{primary.hidden=false;primary.disabled=false;primary.dataset.workflowAction='confirm-settings';primary.textContent='Send settings request'}}
     if(discard){{discard.hidden=false;discard.disabled=false;discard.textContent='Discard draft'}}
     if(close)close.textContent='Keep editing';
-    if(sheetStatus)sheetStatus.textContent='No request has been sent.';
+    if(sheetStatus)sheetStatus.textContent='Send creates one saved request; applying still requires the recorded workflow and host evidence.';
     if(safe){{safe.dataset.workflowLive='false';safe.textContent='Draft only — confirmation required'}}
     overlay.hidden=false;
     document.body.dataset.hostActionDialogOpen='true';
@@ -1393,7 +1448,7 @@ if(root){{
       persistedStatusState=data.status==='applied'?'applied':'pending';
       setStatus(persistedStatusState,persistedStatusText);
       const summary=root.querySelector('[data-draft-summary]');
-      if(summary)summary.textContent='Request confirmed. Continue in the workflow sheet.';
+      if(summary)summary.textContent='Request sent. Follow the named next action in the workflow sheet.';
       root.querySelector('[data-review-settings]')?.setAttribute('disabled','');
       root.querySelector('[data-discard-settings]')?.setAttribute('disabled','');
       await loadReview();
@@ -1424,7 +1479,7 @@ if(root){{
   syncDownAlertPolicy();
   savedPreferences=draftPreferences();
   const incomingDraft=new URLSearchParams(window.location.search);
-  if(settingsCanManageFleet()&&incomingDraft.get('draft')==='fleet-drawer'&&incomingDraft.get('host')===root.dataset.host){{
+  if(settingsCanManageFleet()&&incomingDraft.get('draft')==='fleet-drawer'){{
     const incomingAccent=incomingDraft.get('draft_accent')||'';
     const incomingKind=incomingDraft.get('draft_kind')||'';
     const boolValue=name=>incomingDraft.get(name)==='true';
@@ -1444,13 +1499,80 @@ if(root){{
     }}
   }}
   updateDraftState();
+  const initialWorkflowId=incomingDraft.get('workflow')||'';
+  if(initialWorkflowId){{
+    fetch('/host-actions/jobs/'+encodeURIComponent(initialWorkflowId),{{credentials:'same-origin',cache:'no-store'}})
+      .then(async response=>{{
+        const data=await response.json().catch(()=>({{}}));
+        if(!response.ok)throw new Error(data.error||'Could not open the saved workflow.');
+        const workflowKind=String(data?.job?.workflow?.kind||data?.job?.kind||'');
+        if(workflowKind&&workflowKind!=='settings_change'){{
+          const genericWorkflow=new URL('/',window.location.origin);
+          genericWorkflow.searchParams.set('host',root.dataset.host);
+          genericWorkflow.searchParams.set('workflow',initialWorkflowId);
+          window.location.replace(genericWorkflow.pathname+genericWorkflow.search);
+          return;
+        }}
+        renderSettingsWorkflow(data);
+      }})
+      .catch(error=>{{setStatus('error',error.message||'Could not open the saved workflow.')}});
+  }}
+}}
+const receiptSlot=document.querySelector('[data-host-workspace-receipts]');
+if(receiptSlot&&root){{
+  const empty=receiptSlot.querySelector('[data-host-receipt-empty]');
+  const list=receiptSlot.querySelector('[data-host-receipt-list]');
+  const receiptLink=(href,label)=>{{
+    if(typeof href!=='string'||!href.startsWith('/')||href.startsWith('//')||href.includes('\\'))return null;
+    const link=document.createElement('a');link.href=href;link.textContent=label;return link;
+  }};
+  const receiptTime=value=>{{
+    const numeric=Number(value);
+    const date=Number.isFinite(numeric)&&numeric>0?new Date(numeric*1000):new Date(String(value||''));
+    return Number.isNaN(date.getTime())?'Completion time not recorded':date.toLocaleString();
+  }};
+  const receiptOwner=owner=>{{
+    if(typeof owner==='string'&&owner.trim())return owner.trim();
+    if(owner&&typeof owner==='object'){{
+      if(typeof owner.label==='string'&&owner.label.trim())return owner.label.trim();
+      if(typeof owner.key==='string'&&owner.key.trim())return owner.key.trim();
+    }}
+    return 'Recorded owner';
+  }};
+  const receiptEvidenceStages=receipt=>{{
+    const stageOrder=['requested','declared','executed','verified'];
+    const recordedStages=new Set(
+      (Array.isArray(receipt?.evidence)?receipt.evidence:[])
+        .map(fact=>fact&&typeof fact==='object'?fact.stage:null)
+        .filter(stage=>stageOrder.includes(stage)),
+    );
+    return stageOrder.filter(stage=>recordedStages.has(stage));
+  }};
+  fetch('/hosts/'+encodeURIComponent(root.dataset.host)+'/workflow-receipts.json',{{credentials:'same-origin',cache:'no-store'}})
+    .then(async response=>{{
+      if(!response.ok)throw new Error('Receipts are not available yet.');
+      const payload=await response.json().catch(()=>({{}}));
+      const receipts=Array.isArray(payload)?payload:Array.isArray(payload.receipts)?payload.receipts:[];
+      if(!receipts.length){{if(empty)empty.textContent='No completed workflows yet.';return}}
+      if(empty)empty.hidden=true;
+      receipts.slice(0,12).forEach(receipt=>{{
+        const item=document.createElement('li');item.className='host-receipt';item.dataset.workflowReceipt=String(receipt.workflow_id||'');
+        const title=document.createElement('strong');title.textContent=String(receipt.receipt_kind||receipt.workflow_kind||'Completed workflow').replaceAll('_',' ');
+        const meta=document.createElement('span');meta.textContent=receiptTime(receipt.completed_at)+' · '+receiptOwner(receipt.owner);
+        const evidence=document.createElement('span');
+        const phases=receiptEvidenceStages(receipt);
+        evidence.textContent=phases.length?'Evidence: '+phases.join(' · '):'Terminal evidence is recorded with this workflow.';
+        const links=document.createElement('div');links.className='host-receipt-links';
+        const workflowLink=receiptLink(receipt.workflow_href,'Open workflow');
+        const activityLink=receiptLink(receipt.activity_href,'Open in Activity');
+        if(workflowLink)links.append(workflowLink);if(activityLink)links.append(activityLink);
+        item.append(title,meta,evidence,links);list?.append(item);
+      }});
+    }})
+    .catch(error=>{{if(empty)empty.textContent=error.message||'Receipts are not available yet.'}});
 }}
 </script></div></body></html>"##,
-        header = crate::page_header(
-            "Host settings",
-            "Color and alerts per host",
-            crate::now_unix()
-        ),
+        header = header,
         host_table = host_table,
         access_path = access_path,
         action_dialog = crate::host_action_dialog(),
@@ -2134,6 +2256,7 @@ fn escape_nix_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_actions::{HostLifecycleInvoke, HostWorkflowAction, HostWorkflowActionKind};
     use pharos_core::{
         Host, HostAlertPreferences, HostKind, ManifestHost, ManifestLocationMode, ManifestPalette,
         ManifestPolicy, NixFreshness, PrivilegedActionMode, PrivilegedActions, RuntimeStateOwner,
@@ -2341,7 +2464,7 @@ mod tests {
 
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
         assert!(html.contains(r#"<aside class="sidebar" aria-label="primary navigation""#));
-        assert!(html.contains(r#"href="/agora" aria-current="page""#));
+        assert!(!html.contains(r#">Host settings</span></a>"#));
         assert!(html.contains(r#"<div class="top">"#));
         assert!(html.contains(r#"<div class="brand"><h1>Host settings</h1>"#));
         assert!(html.contains("Color and alerts per host"));
@@ -2379,6 +2502,153 @@ mod tests {
         assert!(!html.contains("Services</button>"));
         assert!(!html.contains("Access</button>"));
         assert!(!html.contains("stored-token-hash"));
+    }
+
+    #[test]
+    fn host_workspace_owns_the_complete_settings_editor_and_receipt_slot() {
+        let runtime = runtime_host("hsb8");
+        let manifests = [manifest()];
+        let runtime_hosts = [runtime];
+        let views = host_views(&manifests, &BTreeMap::new(), &runtime_hosts);
+        let host = &views[0];
+        let settings_state = crate::HostPreferencesState::Applied;
+        let lifecycle = host_lifecycle(&[], &host.name, settings_state, false);
+        let editor = render_ready_content(host, true);
+        let html = render_host_workspace(
+            host,
+            Some(&runtime_hosts[0]),
+            &lifecycle,
+            settings_state,
+            true,
+            &editor,
+        );
+
+        assert!(html.contains(r#"data-host-workspace data-host="hsb8""#));
+        assert!(html.contains(r#"id="host-settings-editor""#));
+        assert!(html.contains(r#"data-color-root data-host="hsb8""#));
+        assert!(html.contains("Alert preferences"));
+        assert!(html.contains("Host type"));
+        assert!(html.contains("Declarative details"));
+        assert!(html.contains("Review changes"));
+        assert!(html.contains(r#"data-host-workspace-receipts"#));
+        assert!(!html.contains("/agora?host="));
+
+        let viewer_editor = render_ready_content(host, false);
+        let viewer_html = render_host_workspace(
+            host,
+            Some(&runtime_hosts[0]),
+            &lifecycle,
+            settings_state,
+            false,
+            &viewer_editor,
+        );
+        assert!(viewer_html.contains(r#"data-manager="false""#));
+        assert!(viewer_html.contains("Viewer access: settings and receipts stay visible"));
+        assert!(viewer_html.contains(r#"data-review-settings disabled"#));
+        assert!(viewer_html.contains(r#"data-host-workspace-receipts"#));
+    }
+
+    #[test]
+    fn host_workspace_routes_each_saved_workflow_to_its_own_handler() {
+        let runtime = runtime_host("hsb8");
+        let manifests = [manifest()];
+        let runtime_hosts = [runtime];
+        let views = host_views(&manifests, &BTreeMap::new(), &runtime_hosts);
+        let host = &views[0];
+        let editor = render_ready_content(host, true);
+        let action = |kind, label: &str| HostWorkflowAction {
+            kind,
+            label: label.to_string(),
+            target_run_id: None,
+        };
+        let lifecycle = |slot, invoke, run_id: &str, primary_action| crate::HostLifecycle {
+            schema: "inspr.pharos.host-lifecycle.v1",
+            version: 1,
+            slot,
+            label: "Action required".to_string(),
+            level: "warning",
+            invoke,
+            run_id: Some(run_id.to_string()),
+            update_restart_intent: None,
+            detail: "Open the saved workflow and take its recorded next action.".to_string(),
+            blocked_by: vec![],
+            primary_action: Some(primary_action),
+        };
+
+        let settings = lifecycle(
+            crate::HostLifecycleSlot::SettingsChange,
+            HostLifecycleInvoke::Workflow,
+            "action-settings-change-hsb8-1",
+            action(HostWorkflowActionKind::Continue, "Continue request"),
+        );
+        let settings_html = render_host_workspace(
+            host,
+            Some(&runtime_hosts[0]),
+            &settings,
+            crate::HostPreferencesState::RequestPending,
+            true,
+            &editor,
+        );
+        assert!(settings_html.contains(
+            r#"data-workflow-handler="settings" href="/hosts/hsb8?workflow=action-settings-change-hsb8-1""#
+        ));
+
+        let update = lifecycle(
+            crate::HostLifecycleSlot::UpdateRestart,
+            HostLifecycleInvoke::UpdateRestart,
+            "action-update-restart-hsb8-2",
+            action(
+                HostWorkflowActionKind::Confirm,
+                "Confirm update and restart",
+            ),
+        );
+        let update_html = render_host_workspace(
+            host,
+            Some(&runtime_hosts[0]),
+            &update,
+            crate::HostPreferencesState::Applied,
+            true,
+            &editor,
+        );
+        assert!(update_html.contains(
+            r#"data-workflow-handler="host-actions" href="/?host=hsb8&amp;workflow=action-update-restart-hsb8-2""#
+        ));
+
+        let removal = lifecycle(
+            crate::HostLifecycleSlot::RemoveHost,
+            HostLifecycleInvoke::Workflow,
+            "action-remove-host-hsb8-3",
+            action(HostWorkflowActionKind::Retry, "Retry credential retirement"),
+        );
+        let removal_html = render_host_workspace(
+            host,
+            Some(&runtime_hosts[0]),
+            &removal,
+            crate::HostPreferencesState::Applied,
+            true,
+            &editor,
+        );
+        assert!(removal_html.contains(
+            r#"data-workflow-handler="host-actions" href="/?host=hsb8&amp;workflow=action-remove-host-hsb8-3""#
+        ));
+    }
+
+    #[test]
+    fn legacy_workspace_links_redirect_non_settings_runs_to_generic_workflows() {
+        let html = render_page(
+            &[manifest()],
+            &BTreeMap::new(),
+            &[runtime_host("hsb8")],
+            Some("hsb8"),
+            "markus",
+            true,
+        );
+
+        assert!(html.contains("if(workflowKind&&workflowKind!=='settings_change')"));
+        assert!(html.contains("genericWorkflow.searchParams.set('host',root.dataset.host)"));
+        assert!(html.contains("genericWorkflow.searchParams.set('workflow',initialWorkflowId)"));
+        assert!(html
+            .contains("window.location.replace(genericWorkflow.pathname+genericWorkflow.search)"));
     }
 
     #[test]
@@ -2514,10 +2784,13 @@ mod tests {
             &[manifest()],
             &BTreeMap::new(),
             &[runtime_host("hsb8")],
-            Some("hsb8"),
-            "viewer",
-            true,
-            false,
+            PageContext {
+                requested_host: Some("hsb8"),
+                user_label: "viewer",
+                logout_enabled: true,
+                can_manage_fleet: false,
+                workspace: None,
+            },
         );
 
         assert!(html.contains(r#"data-can-manage-fleet="false""#));
@@ -2568,7 +2841,7 @@ mod tests {
         let html = render_page(&[], &BTreeMap::new(), &[], None, "markus", true);
 
         assert!(html.contains(r#"<div class="brand"><h1>Host settings</h1>"#));
-        assert!(html.contains(r#"href="/agora" aria-current="page""#));
+        assert!(!html.contains(r#">Host settings</span></a>"#));
         assert!(html.contains(r#"<section class="empty-settings">"#));
         assert!(html.contains("No hosts yet"));
         assert!(html.contains("Once a host reports to Pharos"));

@@ -37,6 +37,10 @@ fn human_routes() -> Router<AppState> {
         .route("/agora", get(agora::page))
         .route("/hosts/{host}", get(agora::host_workspace_page))
         .route(
+            "/hosts/{host}/workflow-receipts.json",
+            get(host_workflow_receipts_json),
+        )
+        .route(
             "/agora/proposals/host-palette.json",
             get(agora::palette_proposal),
         )

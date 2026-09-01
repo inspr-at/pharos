@@ -158,7 +158,8 @@ function reviewHostDrawerDraft(){
     draft_suppress_backup:String(draft.suppress_backup),
     draft_suppress_nix:String(draft.suppress_nix_freshness),
   });
-  window.location.assign('/agora?'+params.toString());
+  params.delete('host');
+  window.location.assign('/hosts/'+encodeURIComponent(hostDrawerContext.host)+'?'+params.toString());
 }
 function initHostDrawer(){
   if(!hostDrawerLayer())return;
@@ -591,8 +592,9 @@ function renderHostActionJob(job,message,workflowHtml){
   hostActionPoll.terminal=!active;
   if(safeNote){
     const liveSettings=workflowKind==='settings_change'&&active&&!actionRequired;
+    const contract=actionContract(primaryAction?.kind);
     safeNote.dataset.workflowLive=liveSettings?'true':'false';
-    safeNote.textContent=primaryAction?.kind==='continue'?'Ready to continue the saved request'
+    safeNote.textContent=contract?contract.effect
       :primaryAction?.kind==='restart'?'Operator action required'
       :liveSettings?'Watching for recorded host evidence'
       :active?'Persisted and reviewable':'Run complete and saved';
@@ -623,7 +625,7 @@ function renderHostActionJob(job,message,workflowHtml){
     const fleetAction=['apply_declared','confirm','retry'].includes(primaryAction.kind)||(primaryAction.kind==='recover'&&Boolean(primaryAction.target_run_id));
     primary.hidden=false;
     primary.classList.remove('danger');
-    primary.textContent=primaryAction.label||'Continue';
+    primary.textContent=primaryAction.label||'Open next action';
     primary.disabled=fleetAction&&hostActionContext.root.dataset.canManage!=='true'
       ?true
       :primaryAction.kind==='confirm'?!hostActionConfirmationReady():false;
@@ -832,7 +834,7 @@ function updateHostActionState(surface,host,backup){
   if(restart){
     restart.hidden=retired||updateJobActive||lifecycle.slot==='blocked'||!(root.dataset.isNix==='true'&&canManage&&root.dataset.janusReady==='true'&&updatePending);
     const strong=restart.querySelector('strong');
-    if(strong)strong.textContent='Apply update and restart';
+    if(strong)strong.textContent='Review update and restart';
   }
   if(remove)remove.hidden=!removalReady||!canManage||retired;
   const continueBtn=root.querySelector('[data-host-action="lifecycle-continue"]');
@@ -845,7 +847,7 @@ function updateHostActionState(surface,host,backup){
       continueBtn.dataset.lifecycleRunId=lifecycleRunId;
       continueBtn.dataset.lifecycleInvoke=String(lifecycle.invoke||'workflow');
       const strong=continueBtn.querySelector('strong');
-      if(strong)strong.textContent='Continue: '+String(lifecycleAction.label);
+      if(strong)strong.textContent=String(lifecycleAction.label);
     }
   }
   if(primarySeparator)primarySeparator.hidden=[continueBtn,withdraw,update,restart].every(item=>!item||item.hidden);
@@ -1423,7 +1425,7 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
 }
 function updateSettingsLinkSurfaces(surface,host){
   const state=String(host.preferences_state||'applied');
-  const title='Open host settings for '+(surface.dataset.host||'host');
+  const title='Open host workspace for '+(surface.dataset.host||'host');
   surface.querySelectorAll('a[data-settings-state],a[data-host-action="host-settings"]').forEach(link=>{
     link.dataset.settingsState=state;
     link.title=title;

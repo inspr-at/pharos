@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-01
+
+- Replace generic workflow buttons with state-specific, consequence-aware next
+  actions so settings, updates, restarts, removals, onboarding, and recovery
+  always tell the operator what one safe click will do next (PHAROS-250).
+- Publish host-scoped terminal workflow receipts with truthful requested,
+  declared, executed, and verified evidence; make every receipt reachable from
+  its exact Activity row and recover safely from stale or unauthorized links
+  (PHAROS-251).
+- Classify beacon report rejection as actionable terminal or retryable failure,
+  keep diagnostics value-free, and surface the safe recovery boundary instead
+  of leaving a host silently retrying an impossible request (PHAROS-253).
+- Move host settings into the durable host workspace, preserve quick edits as
+  an explicit local draft, route every saved workflow to its real handler, and
+  retire the stale top-level settings path without creating a dead end
+  (PHAROS-254).
+
 ## 0.1.98 - 2026-09-01
 
 - Open a context-preserving host drawer directly from Fleet, summarize the

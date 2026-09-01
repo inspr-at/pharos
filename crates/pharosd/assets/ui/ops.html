@@ -3,7 +3,9 @@ document.querySelectorAll('[data-ops-page]').forEach(root=>{
   const search=root.querySelector('[data-search]');
   const rows=[...root.querySelectorAll('[data-ops-row]')];
   const empty=root.querySelector('[data-ops-empty]');
-  const requestedHost=new URLSearchParams(window.location.search).get('host')?.trim()||'';
+  const params=new URLSearchParams(window.location.search);
+  const requestedHost=params.get('host')?.trim()||'';
+  const requestedWorkflow=params.get('workflow')?.trim()||'';
   let active='all';
   function setFilter(filter){
     active=filter||'all';
@@ -31,7 +33,22 @@ document.querySelectorAll('[data-ops-page]').forEach(root=>{
   search?.addEventListener('input',apply);
   if(requestedHost&&search)search.value=requestedHost;
   setFilter('all');
-  if(requestedHost){
+  if(requestedHost&&requestedWorkflow){
+    const fragment=window.location.hash.slice(1);
+    const target=rows.find(row=>
+      row.id===fragment&&
+      row.dataset.workflowId===requestedWorkflow&&
+      row.dataset.host===requestedHost
+    );
+    if(target){
+      target.dataset.deepLinked='true';
+      target.setAttribute('aria-current','location');
+      requestAnimationFrame(()=>{
+        target.focus({preventScroll:true});
+        target.scrollIntoView({block:'center',behavior:'smooth'});
+      });
+    }
+  }else if(requestedHost){
     const normalized=requestedHost.toLowerCase();
     const target=rows.find(row=>(row.dataset.host||'').toLowerCase()===normalized);
     if(target){

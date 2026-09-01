@@ -137,11 +137,121 @@ mod module_tests {
     #[test]
     fn external_ui_assets_are_embedded_and_html_escaping_is_safe() {
         assert!(HEAD.contains("<style"));
+        for action in [
+            "continue",
+            "retry",
+            "reconcile",
+            "recover",
+            "recheck",
+            "refresh",
+            "withdraw",
+            "cancel",
+            "escalate",
+        ] {
+            assert!(
+                HEAD.contains(&format!("{action}:Object.freeze({{")),
+                "missing action taxonomy entry for {action}"
+            );
+        }
+        for field in ["effect:", "idempotency:", "owner:", "outcome:"] {
+            assert!(
+                HEAD.contains(field),
+                "missing action taxonomy field {field}"
+            );
+        }
         assert!(FOOT.contains("<script"));
         assert!(FAVICON_SVG.starts_with("<svg"));
         assert!(RELEASE_HISTORY_PORTAL.contains("data-release"));
         assert!(SETUP_ASSISTANT_TEMPLATE.contains("data-setup-assistant"));
         assert_eq!(html_escape("<&\"'>"), "&lt;&amp;&quot;&#39;&gt;");
+    }
+
+    #[test]
+    fn activity_focus_resolves_only_an_exact_authorized_host_and_workflow() {
+        let job = HostActionStore::new(None)
+            .create_system_update_proposal(
+                "activity-workflow-known".to_string(),
+                "athena",
+                "markus",
+                1_000,
+            )
+            .expect("action fixture");
+        let exact: ActivityQuery = serde_json::from_value(serde_json::json!({
+            "host": "athena",
+            "workflow": "activity-workflow-known"
+        }))
+        .expect("activity query");
+        assert_eq!(
+            activity_focus(&exact, std::slice::from_ref(&job)),
+            ActivityFocus::Workflow {
+                host: "athena".to_string(),
+                workflow_id: "activity-workflow-known".to_string(),
+            }
+        );
+
+        for unavailable in [
+            serde_json::json!({
+                "host": "other-host",
+                "workflow": "activity-workflow-known"
+            }),
+            serde_json::json!({
+                "host": "athena",
+                "workflow": "activity-workflow-unknown"
+            }),
+            serde_json::json!({"workflow": "activity-workflow-known"}),
+        ] {
+            let query: ActivityQuery = serde_json::from_value(unavailable).expect("activity query");
+            assert_eq!(
+                activity_focus(&query, std::slice::from_ref(&job)),
+                ActivityFocus::Unavailable
+            );
+        }
+
+        let recovery = activity_focus_path(&ActivityFocus::Unavailable);
+        assert!(recovery.contains("Workflow activity unavailable"));
+        assert!(recovery.contains(r#"href="/activity""#));
+        assert!(!recovery.contains("activity-workflow-known"));
+    }
+
+    #[test]
+    fn focused_activity_renders_the_exact_anchored_row_beyond_the_history_limit() {
+        let mut events: Vec<_> = (0..80)
+            .map(|index| {
+                ActivityEvent::new(
+                    2_000 - index,
+                    format!("host-{index}"),
+                    "info",
+                    "heartbeat",
+                    "Heartbeat received",
+                    "Host checked in.",
+                    "heartbeat",
+                )
+            })
+            .collect();
+        events.push(
+            ActivityEvent::new(
+                1,
+                "athena",
+                "recovery",
+                "action",
+                "Guarded host update completed",
+                "PHAROS-251 · requested by operator.",
+                "guarded action",
+            )
+            .with_workflow("activity-workflow-oldest"),
+        );
+
+        assert!(!activity_rows(&events).contains("activity-workflow-oldest"));
+        let focus = ActivityFocus::Workflow {
+            host: "athena".to_string(),
+            workflow_id: "activity-workflow-oldest".to_string(),
+        };
+        let focused = focus_activity_events(events, &focus);
+        assert_eq!(focused.len(), 1);
+        let rows = activity_rows(&focused);
+        assert!(rows.contains(r#"id="workflow-activity-workflow-oldest""#));
+        assert!(rows.contains(r#"data-workflow-id="activity-workflow-oldest""#));
+        assert!(rows.contains(r#"data-host="athena""#));
     }
 
     #[test]
@@ -264,7 +374,8 @@ mod module_tests {
         assert!(drawer.contains("data-host-drawer-workspace"));
         assert!(drawer.contains("Prepare a local draft"));
         assert!(drawer.contains("Closing or discarding removes the draft completely"));
-        assert!(drawer.contains("Review in host settings"));
+        assert!(drawer.contains("Review settings"));
+        assert!(drawer.contains("it does not send or apply changes"));
 
         let runtime = FOOT
             .split("function initHostDrawer()")
@@ -734,6 +845,7 @@ pub(super) async fn alerts_page(
 pub(super) async fn activity_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ActivityQuery>,
 ) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
@@ -766,7 +878,8 @@ pub(super) async fn activity_page(
         .into_iter()
         .filter(|job| access.allows_host(&job.host))
         .collect();
-    no_store_html(render_activity_with_actions(
+    let focus = activity_focus(&query, &action_jobs);
+    no_store_html(render_activity_with_focus(
         RuntimeSnapshot {
             hosts: &hosts,
             jobs: &jobs,
@@ -786,6 +899,7 @@ pub(super) async fn activity_page(
             user_label: &user_label,
             logout_enabled: state.auth.is_some(),
         },
+        focus,
     ))
 }
 
@@ -1773,11 +1887,11 @@ pub(super) fn host_actions_markup(
     let menu_id = html_escape(&format!("host-actions-{}-{}", host.name, context.surface));
     let title = html_escape(&format!("Actions for {}", host.name));
     let settings_href = html_escape(context.settings_href);
-    let settings_link_title = html_escape(&format!("Open host settings for {}", host.name));
+    let settings_link_title = html_escape(&format!("Open host workspace for {}", host.name));
     let settings_state_key = context.settings_state.key();
     let settings_menu_item = if context.surface == "card" {
         format!(
-            r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="host-settings" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_link_title}" aria-label="{settings_link_title}">{icon}<span><strong>Host settings</strong><span>Color, alerts, and host type</span></span></a>"#,
+            r#"<a class="host-action-item" role="menuitem" tabindex="-1" data-host-action="host-settings" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_link_title}" aria-label="{settings_link_title}">{icon}<span><strong>Open host workspace</strong><span>Settings, next action, and saved evidence</span></span></a>"#,
             icon = icons::SLIDERS,
         )
     } else {
@@ -1790,13 +1904,13 @@ pub(super) fn host_actions_markup(
         .map_or_else(
             || {
                 format!(
-                    r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" hidden>{history}<span><strong>Withdraw change request</strong><span>Clears the pending request. An open nixcfg proposal stays open there.</span></span></button>"#,
+                    r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" hidden>{history}<span><strong>Withdraw settings request</strong><span>Stops this Pharos run; it does not close an open nixcfg proposal.</span></span></button>"#,
                     history = icons::HISTORY,
                 )
             },
             |job| {
                 format!(
-                    r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" data-lifecycle-run-id="{run_id}">{history}<span><strong>Withdraw change request</strong><span>Clears the pending request. An open nixcfg proposal stays open there.</span></span></button>"#,
+                    r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="withdraw-settings" data-lifecycle-run-id="{run_id}">{history}<span><strong>Withdraw settings request</strong><span>Stops this Pharos run; it does not close an open nixcfg proposal.</span></span></button>"#,
                     run_id = html_escape(&job.id),
                     history = icons::HISTORY,
                 )
@@ -1845,14 +1959,14 @@ pub(super) fn host_actions_markup(
         .zip(lifecycle.run_id.as_ref())
     {
         format!(
-            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" data-lifecycle-run-id="{run_id}" data-lifecycle-invoke="{invoke}">{history}<span><strong>Continue: {label}</strong><span>Open the saved workflow at this step</span></span></button>"#,
+            r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" data-lifecycle-run-id="{run_id}" data-lifecycle-invoke="{invoke}">{history}<span><strong>{label}</strong><span>Opens the saved workflow; only the named action advances it.</span></span></button>"#,
             run_id = html_escape(run_id),
             invoke = lifecycle.invoke.key(),
             label = html_escape(&action.label),
             history = icons::HISTORY,
         )
     } else {
-        r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" hidden><span><strong>Continue</strong><span>Open the saved workflow at this step</span></span></button>"#.to_string()
+        r#"<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="lifecycle-continue" hidden><span><strong>Open saved workflow</strong><span>Shows the recorded next action and its exact effect.</span></span></button>"#.to_string()
     };
     let primary_separator_hidden = if !settings_menu_item.is_empty()
         || lifecycle.primary_action.is_some() && lifecycle.run_id.is_some()
@@ -1917,7 +2031,7 @@ pub(super) fn host_actions_markup(
         .unwrap_or("");
 
     format!(
-        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-update-restart-active="{update_restart_active}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}" data-deployed-revision="{deployed_revision}" data-nixcfg-revision="{nixcfg_revision}" data-nixpkgs-revision="{nixpkgs_revision}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}{withdraw_settings_item}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Check for system updates</strong><span>Create a fleet-wide review only</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Apply update and restart</strong><span>Back up, validate, then confirm</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Safe runtime and configuration facts</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Remove host</strong><span>Stop managing; never delete the server</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
+        r#"<span class="host-actions" data-host-actions data-host="{name}" data-role="{role}" data-is-nix="{is_nix}" data-declared="{declared}" data-credential-retirement="{credential_retirement}" data-janus-ready="{janus_ready}" data-can-manage="{can_manage_fleet}" data-system-update-available="{system_update_available}" data-host-removal-available="{host_removal_available}" data-update-pending="{update_pending}" data-update-restart-active="{update_restart_active}" data-settings-state="{settings_state}" data-backup-state="{backup_state}" data-backup-label="{backup_label}" data-kernel-state="{kernel_state}" data-kernel-running="{running_kernel}" data-kernel-expected="{expected_kernel}" data-deployed-revision="{deployed_revision}" data-nixcfg-revision="{nixcfg_revision}" data-nixpkgs-revision="{nixpkgs_revision}"{action_attributes}><button class="header-chip host-actions-trigger" type="button" data-host-actions-trigger aria-haspopup="menu" aria-expanded="false" aria-controls="{menu_id}" title="{title}" aria-label="{title}">{ellipsis}<span class="header-chip-label" aria-hidden="true">Actions</span><span class="host-action-dot" data-host-action-dot aria-hidden="true"{dot_hidden}></span></button><span class="host-actions-menu" id="{menu_id}" role="menu" aria-label="{title}" data-host-actions-menu hidden><strong class="host-actions-title">{name}</strong>{settings_menu_item}{lifecycle_continue}{withdraw_settings_item}<button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="system-update"{update_hidden}>{package}<span><strong>Review system updates</strong><span>Builds a fleet-wide review; it does not apply or restart.</span></span></button><button class="host-action-item restart" type="button" role="menuitem" tabindex="-1" data-host-action="update-restart"{restart_hidden}>{power}<span><strong>Review update and restart</strong><span>Opens backup and validation gates before confirmation.</span></span></button><span class="host-actions-separator" data-primary-separator aria-hidden="true"{primary_separator_hidden}></span><button class="host-action-item" type="button" role="menuitem" tabindex="-1" data-host-action="technical">{file}<span><strong>View technical details</strong><span>Reads safe runtime and configuration facts only.</span></span></button><span class="host-actions-separator" data-remove-separator aria-hidden="true"{remove_hidden}></span><button class="host-action-item remove" type="button" role="menuitem" tabindex="-1" data-host-action="remove"{remove_hidden}>{trash}<span><strong>Review host removal</strong><span>Stops Pharos management; it never deletes the server.</span></span></button><span class="host-actions-safety">{shield}<span>Privileged changes always open a review first</span></span></span></span>"#,
         is_nix = host.is_nix,
         declared = context.declared,
         credential_retirement = context.credential_retirement_required,
@@ -1949,7 +2063,7 @@ pub(super) fn host_actions_markup(
 
 fn host_quick_drawer(can_manage_fleet: bool) -> String {
     format!(
-        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="/">Open host workspace {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review in host settings</button></div><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form></div></aside></div>"#,
+        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="/">Open host workspace {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form></div></aside></div>"#,
         can_manage = can_manage_fleet,
         server = icons::SERVER,
         close = icons::X,
@@ -1960,7 +2074,7 @@ fn host_quick_drawer(can_manage_fleet: bool) -> String {
 
 pub(crate) fn host_action_dialog() -> String {
     format!(
-        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="settings-change" hidden>{sliders}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="declared"><span>Declared</span><strong data-host-action-fact="declared"></strong></div><div class="host-action-fact" data-host-action-fact-row="observed"><span>Observed</span><strong data-host-action-fact="observed"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><div class="host-workflow" data-host-workflow hidden></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Continue</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Cancel run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button></span></footer></section></section>"#,
+        r#"<section class="host-action-overlay" data-host-action-overlay hidden><span class="host-action-backdrop" data-host-action-close aria-hidden="true"></span><section class="host-action-dialog" data-host-action-dialog role="dialog" aria-modal="true" aria-labelledby="host-action-title" aria-describedby="host-action-copy"><header class="host-action-dialog-head"><div class="host-action-heading"><span data-action-icon="system-update">{package}</span><span data-action-icon="update-restart" hidden>{power}</span><span data-action-icon="settings-change" hidden>{sliders}</span><span data-action-icon="technical" hidden>{file}</span><span data-action-icon="remove" hidden>{trash}</span><div><h2 id="host-action-title" data-host-action-title>Host action</h2></div></div><button class="host-action-dialog-close" type="button" data-host-action-close aria-label="Close host action">{close}</button></header><div class="host-action-dialog-body"><p id="host-action-copy" data-host-action-copy></p><div class="host-action-info" data-host-action-info>{shield}<strong data-host-action-info-title>Review first</strong><span data-host-action-info-copy>No privileged or destructive work happens from the menu click.</span></div><div class="host-action-facts" data-host-action-facts><div class="host-action-fact"><span>Host</span><strong data-host-action-fact="host"></strong></div><div class="host-action-fact" data-host-action-fact-row="state"><span>Status</span><strong data-host-action-fact="state"></strong></div><div class="host-action-fact" data-host-action-fact-row="declared"><span>Declared</span><strong data-host-action-fact="declared"></strong></div><div class="host-action-fact" data-host-action-fact-row="observed"><span>Observed</span><strong data-host-action-fact="observed"></strong></div><div class="host-action-fact" data-host-action-fact-row="backup"><span>Backup</span><strong data-host-action-fact="backup"></strong></div><div class="host-action-fact" data-host-action-fact-row="kernel"><span>Kernel</span><strong data-host-action-fact="kernel"></strong></div><div class="host-action-fact" data-host-action-fact-row="scope"><span>Scope</span><strong data-host-action-fact="scope"></strong></div></div><div class="host-workflow" data-host-workflow hidden></div><pre class="host-action-technical" data-host-action-technical hidden></pre><label class="host-remove-disposition" data-host-remove-disposition-field hidden><span>What happened to this host?</span><select data-host-remove-disposition><option value="">Choose one</option><option value="destroyed">It no longer exists</option><option value="unmanaged">It still exists; stop managing it</option><option value="rebuilt">It was replaced by another host</option></select></label><label class="host-remove-successor" data-host-remove-successor hidden><span>Successor host name</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-successor-input><small>Onboard the successor in Pharos first.</small></label><label class="host-remove-confirm" data-host-remove-confirm hidden><span data-host-confirm-copy>Type <strong data-host-remove-name></strong> to confirm</span><input type="text" autocomplete="off" spellcheck="false" data-host-remove-input></label><label class="host-attended-confirm" data-host-attended-confirm hidden><input type="checkbox" data-host-attended-input><span>I am near this host or its recovery console and can intervene if it does not return.</span></label><p class="host-action-status" data-host-action-status role="status" aria-live="polite"></p></div><footer class="host-action-dialog-foot"><span class="host-action-safe-note">{shield}<span data-host-action-safe-note>Reviewable and recorded</span></span><span class="host-action-dialog-buttons"><button class="host-action-dialog-button primary" type="button" data-host-action-primary>Review action</button><button class="host-action-dialog-button" type="button" data-host-action-cancel hidden>Withdraw run</button><button class="host-action-dialog-button" type="button" data-host-action-close>Close</button></span></footer></section></section>"#,
         package = icons::PACKAGE_SEARCH,
         power = icons::POWER,
         sliders = icons::SLIDERS,
@@ -2700,18 +2814,13 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
     } else {
         ""
     };
-    let host_settings_current = if active == "settings" {
-        r#" aria-current="page""#
-    } else {
-        ""
-    };
     let platform_settings_current = if active == "platform-settings" {
         r#" aria-current="page""#
     } else {
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="/assets/sidebar-lighthouse-motion-v1.mp4" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/services"{services_current}>{services}<span>Services</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/agora"{host_settings_current}>{host_settings}<span>Host settings</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{logout_csrf}{sidebar_motion}"##,
+        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="/assets/sidebar-lighthouse-motion-v1.mp4" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/services"{services_current}>{services}<span>Services</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{logout_csrf}{sidebar_motion}"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
@@ -2719,7 +2828,6 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
         backups = icons::SHIELD_CHECK,
         services = icons::KEY_ROUND,
         activity = icons::LIST,
-        host_settings = icons::SLIDERS,
         platform_settings = icons::SETTINGS,
         history = icons::HISTORY,
         version = html_escape(&release_label()),
@@ -2733,7 +2841,6 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
         backups_current = backups_current,
         services_current = services_current,
         activity_current = activity_current,
-        host_settings_current = host_settings_current,
         platform_settings_current = platform_settings_current,
         user_label = html_escape(user_label),
         user_title = html_escape(user_label),
@@ -3362,6 +3469,41 @@ pub(super) struct ActivitySources<'a> {
     pub(super) action_jobs: &'a [HostActionJob],
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ActivityQuery {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    workflow: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ActivityFocus {
+    All,
+    Workflow { host: String, workflow_id: String },
+    Unavailable,
+}
+
+pub(super) fn activity_focus(
+    query: &ActivityQuery,
+    authorized_action_jobs: &[HostActionJob],
+) -> ActivityFocus {
+    match (query.host.as_deref(), query.workflow.as_deref()) {
+        (None, None) => ActivityFocus::All,
+        (Some(host), Some(workflow_id))
+            if authorized_action_jobs
+                .iter()
+                .any(|job| job.host == host && job.id == workflow_id) =>
+        {
+            ActivityFocus::Workflow {
+                host: host.to_string(),
+                workflow_id: workflow_id.to_string(),
+            }
+        }
+        _ => ActivityFocus::Unavailable,
+    }
+}
+
 pub(super) fn search_box(placeholder: &str) -> String {
     format!(
         r#"<label class="search">{search}<input data-search type="search" autocomplete="off" placeholder="{placeholder}"></label>"#,
@@ -3808,7 +3950,7 @@ pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64, can_manage_fleet
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
     let action = if can_manage_fleet {
         format!(
-            r#"<a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue</a>"#,
+            r#"<a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a>"#,
             job_id = html_escape(&job.id),
         )
     } else {
@@ -6243,11 +6385,15 @@ pub(super) fn activity_filter_bar(events: &[ActivityEvent]) -> String {
 }
 
 pub(super) fn render_activity_row(event: &ActivityEvent) -> String {
-    let (tag, href) = event.workflow_id.as_deref().map_or_else(
-        || ("article", String::new()),
+    let (tag, workflow_attributes, href) = event.workflow_id.as_deref().map_or_else(
+        || ("article", String::new(), String::new()),
         |workflow_id| {
             (
                 "a",
+                format!(
+                    r#" id="workflow-{workflow}" data-workflow-id="{workflow}""#,
+                    workflow = html_escape(workflow_id),
+                ),
                 format!(
                     r#" href="/?host={host}&amp;workflow={workflow}" aria-label="Open saved workflow for {host_label}" title="Open saved workflow""#,
                     host = html_escape(&url_query_escape(&event.host)),
@@ -6258,8 +6404,9 @@ pub(super) fn render_activity_row(event: &ActivityEvent) -> String {
         },
     );
     format!(
-        r#"<{tag} class="activity-row {level}" data-ops-row data-activity-kind="{kind}" data-activity-level="{level}" data-ops-kind="{kind}" data-ops-level="{level}" data-host-search="{host_search}"{href}><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></{tag}>"#,
+        r#"<{tag} class="activity-row {level}" data-ops-row data-activity-kind="{kind}" data-activity-level="{level}" data-ops-kind="{kind}" data-ops-level="{level}" data-host="{host}" data-host-search="{host_search}"{workflow_attributes}{href}><span class="ops-time">{time}</span><div class="activity-host"><span class="activity-dot" aria-hidden="true"></span><div><strong>{host}</strong><span>{kind}</span></div></div><span class="severity">{level_label}</span><div class="activity-copy"><strong>{title}</strong><p>{detail}</p></div><span class="ops-source">{source}</span></{tag}>"#,
         tag = tag,
+        workflow_attributes = workflow_attributes,
         href = href,
         level = html_escape(event.level),
         kind = html_escape(event.kind),
@@ -6284,6 +6431,33 @@ pub(super) fn activity_rows(events: &[ActivityEvent]) -> String {
         return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, backup changes, freshness changes, kernel posture, service observations, and config events here.</p></section>"#.to_string();
     }
     events.iter().take(80).map(render_activity_row).collect()
+}
+
+pub(super) fn focus_activity_events(
+    events: Vec<ActivityEvent>,
+    focus: &ActivityFocus,
+) -> Vec<ActivityEvent> {
+    match focus {
+        ActivityFocus::All => events,
+        ActivityFocus::Workflow { host, workflow_id } => events
+            .into_iter()
+            .filter(|event| {
+                event.host == *host && event.workflow_id.as_deref() == Some(workflow_id.as_str())
+            })
+            .collect(),
+        ActivityFocus::Unavailable => Vec::new(),
+    }
+}
+
+pub(super) fn activity_focus_path(focus: &ActivityFocus) -> String {
+    match focus {
+        ActivityFocus::All => String::new(),
+        ActivityFocus::Workflow { host, .. } => format!(
+            r#"<aside class="ops-note" data-activity-workflow-focus role="status"><strong>Saved workflow activity</strong><span>Showing the exact recorded workflow for {host}.</span><a class="ops-action" href="/activity">Show all activity</a></aside>"#,
+            host = html_escape(host),
+        ),
+        ActivityFocus::Unavailable => r#"<section class="ops-empty" data-activity-workflow-unavailable><h2>Workflow activity unavailable</h2><p>This workflow is unknown, belongs to another host, or is not available to your account.</p><a class="ops-action" href="/activity">Show all activity</a></section>"#.to_string(),
+    }
 }
 
 pub(super) fn activity_script() -> &'static str {
@@ -6314,6 +6488,7 @@ pub(super) fn render_activity(
     )
 }
 
+#[cfg(test)]
 pub(super) fn render_activity_with_actions(
     runtime: RuntimeSnapshot<'_>,
     self_name: &str,
@@ -6321,12 +6496,29 @@ pub(super) fn render_activity_with_actions(
     sources: ActivitySources<'_>,
     shell: ShellContext<'_>,
 ) -> String {
-    let events = activity_events(runtime, self_name, now, sources);
-    let rows = activity_rows(&events);
+    render_activity_with_focus(runtime, self_name, now, sources, shell, ActivityFocus::All)
+}
+
+pub(super) fn render_activity_with_focus(
+    runtime: RuntimeSnapshot<'_>,
+    self_name: &str,
+    now: i64,
+    sources: ActivitySources<'_>,
+    shell: ShellContext<'_>,
+    focus: ActivityFocus,
+) -> String {
+    let events = focus_activity_events(activity_events(runtime, self_name, now, sources), &focus);
+    let focus_path = activity_focus_path(&focus);
+    let rows = if focus == ActivityFocus::Unavailable {
+        String::new()
+    } else {
+        activity_rows(&events)
+    };
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
+        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{focus_path}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
         sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
         header = page_header("Activity", "Operational timeline", now),
+        focus_path = focus_path,
         summary = activity_summary_metrics(&events),
         toolbar = ops_toolbar(),
         count = events.len(),
@@ -6879,7 +7071,7 @@ pub(super) fn render_home_with_capabilities(
             html_escape(&workspace_href),
             capabilities.can_manage_fleet,
         );
-        let settings_title = format!("Open host settings for {name}");
+        let settings_title = format!("Open host workspace for {name}");
         let settings_action = format!(
             r#"<a class="header-chip settings-card" data-settings-state="{settings_state_key}" href="{settings_href}" title="{settings_title}" aria-label="{settings_title}"><span class="settings-icon">{settings_icon}</span><span class="header-chip-label" aria-hidden="true">Settings</span><span class="settings-swatch" aria-hidden="true"></span></a>"#,
             settings_icon = icons::SLIDERS,

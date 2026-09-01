@@ -31,6 +31,9 @@ const LEASE_SECS: i64 = 180;
 const RETIREMENT_LEASE_SECS: i64 = 1800;
 const WORKFLOW_SCHEMA: &str = "inspr.pharos.host-workflow.v1";
 const WORKFLOW_VERSION: u16 = 2;
+const HOST_WORKFLOW_RECEIPT_SCHEMA: &str = "inspr.pharos.host-workflow-receipt.v1";
+const HOST_WORKFLOW_RECEIPT_VERSION: u16 = 1;
+pub(crate) const HOST_WORKFLOW_RECEIPT_RETENTION: usize = 12;
 const SYSTEM_UPDATE_DISPATCH_STALL_SECS: i64 = 120;
 static ACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -558,6 +561,62 @@ pub(crate) struct HostWorkflowEvent {
 pub(crate) struct HostWorkflowEvidence {
     pub(crate) label: String,
     pub(crate) value: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostWorkflowReceiptKind {
+    Completion,
+    Failure,
+    Cancellation,
+    Withdrawal,
+    Recovery,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostWorkflowReceiptStage {
+    Requested,
+    Declared,
+    Executed,
+    Verified,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowReceiptOwner {
+    pub(crate) source: HostActionEventSource,
+    pub(crate) key: String,
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowReceiptEvidence {
+    pub(crate) stage: HostWorkflowReceiptStage,
+    pub(crate) event: HostActionEventKind,
+    pub(crate) recorded_at: i64,
+    pub(crate) owner: HostWorkflowReceiptOwner,
+}
+
+/// A bounded, value-free projection of one terminal workflow pinned to a host.
+///
+/// The underlying action job remains the durable source of truth. This receipt
+/// deliberately carries only validated coordinates, typed event facts, local
+/// deep-links, and stable owner labels; it cannot carry preference values,
+/// credentials, paths, hashes, or command output.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HostWorkflowReceipt {
+    pub(crate) schema: &'static str,
+    pub(crate) version: u16,
+    pub(crate) host: String,
+    pub(crate) workflow_id: String,
+    pub(crate) workflow_kind: HostWorkflowKind,
+    pub(crate) receipt_kind: HostWorkflowReceiptKind,
+    pub(crate) outcome: TerminalOutcome,
+    pub(crate) completed_at: i64,
+    pub(crate) owner: HostWorkflowReceiptOwner,
+    pub(crate) evidence: Vec<HostWorkflowReceiptEvidence>,
+    pub(crate) workflow_href: String,
+    pub(crate) activity_href: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1598,6 +1657,179 @@ impl HostActionJob {
             self.updated_at,
             evidence,
         ))
+    }
+
+    fn host_workflow_receipt(&self) -> Option<HostWorkflowReceipt> {
+        let terminal = self.terminal_receipt()?;
+        let receipt_kind = match (self.workflow_kind(), terminal.outcome) {
+            (HostWorkflowKind::SettingsChange, TerminalOutcome::Cancelled) => {
+                HostWorkflowReceiptKind::Withdrawal
+            }
+            (_, TerminalOutcome::Cancelled) => HostWorkflowReceiptKind::Cancellation,
+            (_, TerminalOutcome::Failed) => HostWorkflowReceiptKind::Failure,
+            (HostWorkflowKind::UpdateRestart, TerminalOutcome::Succeeded)
+                if self.recovery_started_at.is_some()
+                    || self
+                        .events
+                        .iter()
+                        .any(|event| event.kind == HostActionEventKind::RecoveryPassed) =>
+            {
+                HostWorkflowReceiptKind::Recovery
+            }
+            (_, TerminalOutcome::Succeeded) => HostWorkflowReceiptKind::Completion,
+        };
+        let terminal_event = self
+            .events
+            .last()
+            .expect("validated host action has at least one event");
+        let mut evidence = Vec::new();
+        self.push_receipt_evidence(
+            &mut evidence,
+            HostWorkflowReceiptStage::Requested,
+            &[
+                HostActionEventKind::Requested,
+                HostActionEventKind::ReviewPassed,
+            ],
+        );
+        self.push_receipt_evidence(
+            &mut evidence,
+            HostWorkflowReceiptStage::Declared,
+            &[HostActionEventKind::RemovalDeclarationCompleted],
+        );
+        self.push_receipt_evidence(
+            &mut evidence,
+            HostWorkflowReceiptStage::Executed,
+            &[
+                HostActionEventKind::RemovalAccessRevoked,
+                HostActionEventKind::RemovalCredentialRetired,
+                HostActionEventKind::RecoveryPassed,
+                HostActionEventKind::ApplyPassed,
+                HostActionEventKind::ApplyFailed,
+                HostActionEventKind::RecoveryFailed,
+                HostActionEventKind::RemovalCredentialFailed,
+            ],
+        );
+        self.push_receipt_failure_evidence(
+            &mut evidence,
+            &[
+                HostActionEventKind::DispatchFailed,
+                HostActionEventKind::DispatchOutcomeUncertain,
+                HostActionEventKind::ReviewFailed,
+                HostActionEventKind::SettingsFailed,
+                HostActionEventKind::RemovalFailed,
+            ],
+        );
+        self.push_receipt_evidence(
+            &mut evidence,
+            HostWorkflowReceiptStage::Verified,
+            &[
+                HostActionEventKind::RecoveryPassed,
+                HostActionEventKind::ApplyPassed,
+                HostActionEventKind::SettingsApplied,
+                HostActionEventKind::RemovalCompleted,
+            ],
+        );
+        evidence.sort_by_key(|fact| (fact.recorded_at, receipt_stage_order(fact.stage)));
+        Some(HostWorkflowReceipt {
+            schema: HOST_WORKFLOW_RECEIPT_SCHEMA,
+            version: HOST_WORKFLOW_RECEIPT_VERSION,
+            host: self.host.clone(),
+            workflow_id: self.id.clone(),
+            workflow_kind: self.workflow_kind(),
+            receipt_kind,
+            outcome: terminal.outcome,
+            completed_at: terminal.completed_at,
+            owner: receipt_owner(&self.host, terminal_event),
+            evidence,
+            workflow_href: format!("/?host={}&workflow={}", self.host, self.id),
+            activity_href: format!(
+                "/activity?host={}&workflow={}#workflow-{}",
+                self.host, self.id, self.id
+            ),
+        })
+    }
+
+    fn push_receipt_evidence(
+        &self,
+        receipt: &mut Vec<HostWorkflowReceiptEvidence>,
+        stage: HostWorkflowReceiptStage,
+        kinds: &[HostActionEventKind],
+    ) {
+        for kind in kinds {
+            let Some(event) = self.latest_event(&[*kind]) else {
+                continue;
+            };
+            receipt.push(HostWorkflowReceiptEvidence {
+                stage,
+                event: event.kind,
+                recorded_at: event.at,
+                owner: receipt_owner(&self.host, event),
+            });
+        }
+    }
+
+    /// Attach a terminal failure to the last lifecycle stage this run can
+    /// truthfully claim. A review or repository-dispatch failure does not make
+    /// an update "declared", and a settings/removal failure before host work
+    /// does not make it "executed". If earlier events prove that declaration
+    /// or execution really happened, retain that context without flattening
+    /// every occurrence of the failure kind into the same stage.
+    fn push_receipt_failure_evidence(
+        &self,
+        receipt: &mut Vec<HostWorkflowReceiptEvidence>,
+        kinds: &[HostActionEventKind],
+    ) {
+        for kind in kinds {
+            let Some((event_index, event)) = self
+                .events
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, event)| event.kind == *kind)
+            else {
+                continue;
+            };
+            let stage = self.events[..event_index].iter().fold(
+                HostWorkflowReceiptStage::Requested,
+                |stage, event| {
+                    let candidate = match event.kind {
+                        HostActionEventKind::RemovalDeclarationCompleted => {
+                            HostWorkflowReceiptStage::Declared
+                        }
+                        HostActionEventKind::ApplyClaimed
+                        | HostActionEventKind::ApplyRebooting
+                        | HostActionEventKind::ApplyPassed
+                        | HostActionEventKind::ApplyFailed
+                        | HostActionEventKind::RecoveryClaimed
+                        | HostActionEventKind::RecoveryRebooting
+                        | HostActionEventKind::RecoveryPassed
+                        | HostActionEventKind::RecoveryFailed
+                        | HostActionEventKind::RemovalAccessRevoked
+                        | HostActionEventKind::RemovalCredentialClaimed
+                        | HostActionEventKind::RemovalCredentialRetired
+                        | HostActionEventKind::RemovalCredentialFailed => {
+                            HostWorkflowReceiptStage::Executed
+                        }
+                        HostActionEventKind::SettingsApplied
+                        | HostActionEventKind::RemovalCompleted => {
+                            HostWorkflowReceiptStage::Verified
+                        }
+                        _ => stage,
+                    };
+                    if receipt_stage_order(candidate) > receipt_stage_order(stage) {
+                        candidate
+                    } else {
+                        stage
+                    }
+                },
+            );
+            receipt.push(HostWorkflowReceiptEvidence {
+                stage,
+                event: event.kind,
+                recorded_at: event.at,
+                owner: receipt_owner(&self.host, event),
+            });
+        }
     }
 
     pub(crate) fn can_continue_legacy_settings(&self) -> bool {
@@ -3635,6 +3867,35 @@ fn event_label(event: &HostActionEvent) -> String {
     label
 }
 
+fn receipt_stage_order(stage: HostWorkflowReceiptStage) -> u8 {
+    match stage {
+        HostWorkflowReceiptStage::Requested => 0,
+        HostWorkflowReceiptStage::Declared => 1,
+        HostWorkflowReceiptStage::Executed => 2,
+        HostWorkflowReceiptStage::Verified => 3,
+    }
+}
+
+fn receipt_owner(host: &str, event: &HostActionEvent) -> HostWorkflowReceiptOwner {
+    let (key, label) = match event.source {
+        HostActionEventSource::Operator => ("operator".to_string(), "operator".to_string()),
+        HostActionEventSource::HostAgent => {
+            (format!("host-agent:{host}"), format!("{host} host agent"))
+        }
+        HostActionEventSource::RetirementAgent => (
+            "retirement-owner".to_string(),
+            "retirement owner".to_string(),
+        ),
+        HostActionEventSource::Beacon => (format!("host-beacon:{host}"), format!("{host} beacon")),
+        HostActionEventSource::Pharos => ("pharos-daemon".to_string(), "Pharos daemon".to_string()),
+    };
+    HostWorkflowReceiptOwner {
+        source: event.source,
+        key,
+        label,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct HostActionSummary {
     pub(crate) id: String,
@@ -3757,6 +4018,30 @@ pub(crate) fn most_relevant_host_action<'a>(
     host: &str,
 ) -> Option<&'a HostActionJob> {
     most_relevant_action(jobs, host)
+}
+
+pub(crate) fn host_terminal_receipts(
+    jobs: &[HostActionJob],
+    host: &str,
+) -> Vec<HostWorkflowReceipt> {
+    recent_terminal_receipts(jobs.iter(), host, HOST_WORKFLOW_RECEIPT_RETENTION)
+}
+
+fn recent_terminal_receipts<'a>(
+    jobs: impl IntoIterator<Item = &'a HostActionJob>,
+    host: &str,
+    limit: usize,
+) -> Vec<HostWorkflowReceipt> {
+    let mut receipts: Vec<_> = jobs
+        .into_iter()
+        .filter(|job| job.host == host)
+        .filter_map(HostActionJob::host_workflow_receipt)
+        .collect();
+    receipts.sort_by(|left, right| {
+        (right.completed_at, &right.workflow_id).cmp(&(left.completed_at, &left.workflow_id))
+    });
+    receipts.truncate(limit);
+    receipts
 }
 
 pub(crate) fn active_update_restart_for_host<'a>(
@@ -4321,6 +4606,25 @@ impl HostActionStore {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Returns a reverse-chronological, bounded receipt window for one
+    /// validated host coordinate. `None` means the coordinate itself is
+    /// invalid; a known or not-yet-observed host with no terminal runs returns
+    /// an empty collection.
+    pub(crate) fn recent_terminal_receipts_for_host(
+        &self,
+        host: &str,
+    ) -> Option<Vec<HostWorkflowReceipt>> {
+        if !valid_host_name(host) {
+            return None;
+        }
+        let jobs = self.jobs.read().expect("host action store lock");
+        Some(recent_terminal_receipts(
+            jobs.values(),
+            host,
+            HOST_WORKFLOW_RECEIPT_RETENTION,
+        ))
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<HostActionJob> {
@@ -7779,6 +8083,30 @@ mod tests {
             .steps
             .iter()
             .any(|step| { step.key == "recovery" && step.state == WorkflowStepState::Recovered }));
+        let receipt = store
+            .recent_terminal_receipts_for_host("hsb8")
+            .expect("valid host")
+            .into_iter()
+            .next()
+            .expect("recovery receipt");
+        assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Recovery);
+        assert_eq!(receipt.owner.source, HostActionEventSource::HostAgent);
+        assert!(receipt.evidence.iter().any(|fact| {
+            fact.stage == HostWorkflowReceiptStage::Requested
+                && fact.event == HostActionEventKind::ReviewPassed
+        }));
+        assert!(!receipt
+            .evidence
+            .iter()
+            .any(|fact| fact.stage == HostWorkflowReceiptStage::Declared));
+        assert!(receipt.evidence.iter().any(|fact| {
+            fact.stage == HostWorkflowReceiptStage::Executed
+                && fact.event == HostActionEventKind::RecoveryPassed
+        }));
+        assert!(receipt.evidence.iter().any(|fact| {
+            fact.stage == HostWorkflowReceiptStage::Verified
+                && fact.event == HostActionEventKind::RecoveryPassed
+        }));
         assert!(store.create_update_review("csb0", "markus", 309).is_ok());
     }
 
@@ -7885,6 +8213,48 @@ mod tests {
                 .state,
             WorkflowStepState::ActionRequired
         );
+
+        store
+            .queue_recovery(&job.id, "hsb8", "markus", 329)
+            .expect("second recovery queued");
+        store.claim("hsb8", 330).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Resume,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: None,
+                    result: Some(HostActionResult {
+                        backup_validated: true,
+                        switch_passed: true,
+                        reboot_observed: true,
+                        kernel_verified: true,
+                        rollback_available: true,
+                        failure_gate: None,
+                        recovery_mode: Some(HostActionRecoveryMode::TrustedDescendant),
+                    }),
+                },
+                331,
+            )
+            .expect("second recovery succeeds");
+        let receipt = store
+            .recent_terminal_receipts_for_host("hsb8")
+            .expect("valid host")
+            .into_iter()
+            .next()
+            .expect("terminal recovery receipt");
+        for event in [
+            HostActionEventKind::ApplyFailed,
+            HostActionEventKind::RecoveryFailed,
+            HostActionEventKind::RecoveryPassed,
+        ] {
+            assert!(receipt.evidence.iter().any(|fact| {
+                fact.stage == HostWorkflowReceiptStage::Executed && fact.event == event
+            }));
+        }
     }
 
     #[test]
@@ -11696,6 +12066,45 @@ mod tests {
             None,
             "all removal gates are complete"
         );
+        let receipt = store
+            .recent_terminal_receipts_for_host("hsb8")
+            .expect("valid host")
+            .into_iter()
+            .next()
+            .expect("removal receipt");
+        assert_eq!(receipt.workflow_kind, HostWorkflowKind::RemoveHost);
+        assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Completion);
+        for event in [
+            HostActionEventKind::RemovalAccessRevoked,
+            HostActionEventKind::RemovalCredentialFailed,
+            HostActionEventKind::RemovalCredentialRetired,
+            HostActionEventKind::RemovalCompleted,
+        ] {
+            assert!(
+                receipt.evidence.iter().any(|fact| fact.event == event),
+                "receipt omits {event:?}"
+            );
+        }
+        assert_eq!(
+            receipt
+                .evidence
+                .iter()
+                .find(|fact| fact.event == HostActionEventKind::RemovalAccessRevoked)
+                .expect("access fact")
+                .owner
+                .source,
+            HostActionEventSource::Pharos
+        );
+        assert_eq!(
+            receipt
+                .evidence
+                .iter()
+                .find(|fact| fact.event == HostActionEventKind::RemovalCredentialRetired)
+                .expect("credential fact")
+                .owner
+                .source,
+            HostActionEventSource::RetirementAgent
+        );
     }
 
     #[test]
@@ -12095,5 +12504,219 @@ mod tests {
             .evidence
             .iter()
             .any(|fact| fact.kind == TerminalEvidenceKind::HostStateVerified));
+    }
+
+    #[test]
+    fn failed_host_receipts_retain_typed_value_free_failure_evidence() {
+        let store = HostActionStore::new(None);
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 450)
+            .expect("settings run");
+        store
+            .fail_settings_change(&settings.id, 451)
+            .expect("settings failure persists");
+        let removal = store
+            .begin_removal(
+                "gpc0",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Destroyed,
+                    successor: None,
+                    declaration_pending: true,
+                    credential_retirement_required: true,
+                },
+                452,
+            )
+            .expect("removal run");
+        store
+            .fail_removal(&removal.id, 453)
+            .expect("removal failure persists");
+
+        for (host, event) in [
+            ("hsb8", HostActionEventKind::SettingsFailed),
+            ("gpc0", HostActionEventKind::RemovalFailed),
+        ] {
+            let receipt = store
+                .recent_terminal_receipts_for_host(host)
+                .expect("valid host")
+                .into_iter()
+                .next()
+                .expect("failure receipt");
+            assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Failure);
+            assert_eq!(receipt.outcome, TerminalOutcome::Failed);
+            assert!(receipt.evidence.iter().any(|fact| {
+                fact.stage == HostWorkflowReceiptStage::Requested && fact.event == event
+            }));
+            assert!(!receipt.evidence.iter().any(|fact| {
+                matches!(
+                    fact.stage,
+                    HostWorkflowReceiptStage::Declared | HostWorkflowReceiptStage::Executed
+                )
+            }));
+            let serialized = serde_json::to_string(&receipt).expect("receipt serializes");
+            assert!(!serialized.to_ascii_lowercase().contains("token"));
+            assert!(!serialized.contains("https://"));
+        }
+    }
+
+    #[test]
+    fn failed_update_review_projection_does_not_invent_declaration_or_execution() {
+        let store = HostActionStore::new(None);
+        let failed_review = store
+            .create_update_review("hsb8", "markus", 470)
+            .expect("guarded review");
+        store.claim("hsb8", 471).expect("claim").expect("lease");
+        let failed_review = store
+            .record_agent_result(
+                &failed_review.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                472,
+            )
+            .expect("review failure stored");
+        let mut evidence = Vec::new();
+        failed_review
+            .push_receipt_failure_evidence(&mut evidence, &[HostActionEventKind::ReviewFailed]);
+        assert!(evidence.iter().any(|fact| {
+            fact.stage == HostWorkflowReceiptStage::Requested
+                && fact.event == HostActionEventKind::ReviewFailed
+        }));
+        assert!(!evidence.iter().any(|fact| {
+            matches!(
+                fact.stage,
+                HostWorkflowReceiptStage::Declared | HostWorkflowReceiptStage::Executed
+            )
+        }));
+    }
+
+    #[test]
+    fn host_receipt_pins_exact_workflow_evidence_and_value_free_links() {
+        let store = HostActionStore::new(None);
+        let preferences = checkpoint_preferences();
+        let job = store
+            .begin_settings_change("hsb8", "markus", 500)
+            .expect("settings run");
+        store
+            .record_settings_request(&job.id, &preferences, 501)
+            .expect("payload recorded");
+        store
+            .mark_settings_dispatch_submitted(&job.id, &job.id, 502)
+            .expect("dispatch receipt");
+        store
+            .accept_settings_change(&job.id, 503)
+            .expect("handoff accepted");
+        store
+            .complete_settings_change_run(&job.id, 504)
+            .expect("settings run completes");
+
+        let receipts = store
+            .recent_terminal_receipts_for_host("hsb8")
+            .expect("valid host coordinate");
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert_eq!(receipt.workflow_id, job.id);
+        assert_eq!(receipt.workflow_kind, HostWorkflowKind::SettingsChange);
+        assert_eq!(receipt.receipt_kind, HostWorkflowReceiptKind::Completion);
+        assert_eq!(receipt.owner.source, HostActionEventSource::Beacon);
+        assert_eq!(
+            receipt.workflow_href,
+            format!("/?host=hsb8&workflow={}", job.id)
+        );
+        assert_eq!(
+            receipt.activity_href,
+            format!(
+                "/activity?host=hsb8&workflow={}#workflow-{}",
+                job.id, job.id
+            )
+        );
+        assert_eq!(
+            receipt
+                .evidence
+                .iter()
+                .map(|fact| fact.stage)
+                .collect::<Vec<_>>(),
+            vec![
+                HostWorkflowReceiptStage::Requested,
+                HostWorkflowReceiptStage::Verified,
+            ]
+        );
+        assert_eq!(
+            receipt.evidence[1].event,
+            HostActionEventKind::SettingsApplied
+        );
+        let serialized = serde_json::to_string(receipt).expect("receipt serializes");
+        assert!(!serialized.contains("#48b8a8"));
+        assert!(!serialized.to_ascii_lowercase().contains("token"));
+        assert!(!serialized.contains("https://"));
+    }
+
+    #[test]
+    fn host_receipts_are_bounded_reverse_chronological_and_survive_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-host-receipts-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let total = HOST_WORKFLOW_RECEIPT_RETENTION + 3;
+        let mut latest_id = String::new();
+        for index in 0..total {
+            let started_at = 600 + (index as i64 * 2);
+            let job = store
+                .create_update_review("hsb8", "markus", started_at)
+                .expect("review starts");
+            latest_id = job.id.clone();
+            store
+                .cancel_update_review(&job.id, "hsb8", "markus", started_at + 1)
+                .expect("review cancellation persists");
+        }
+        let withdrawal = store
+            .begin_settings_change("athena", "markus", 900)
+            .expect("settings change starts");
+        store
+            .withdraw_settings_change(&withdrawal.id, "athena", "markus", 901)
+            .expect("settings withdrawal persists");
+
+        assert!(store
+            .recent_terminal_receipts_for_host("not a host")
+            .is_none());
+        assert!(store
+            .recent_terminal_receipts_for_host("empty-host")
+            .expect("valid empty host")
+            .is_empty());
+        let receipts = store
+            .recent_terminal_receipts_for_host("hsb8")
+            .expect("valid host");
+        assert_eq!(receipts.len(), HOST_WORKFLOW_RECEIPT_RETENTION);
+        assert_eq!(receipts[0].workflow_id, latest_id);
+        assert!(receipts
+            .windows(2)
+            .all(|pair| pair[0].completed_at >= pair[1].completed_at));
+        assert!(receipts
+            .iter()
+            .all(|receipt| { receipt.receipt_kind == HostWorkflowReceiptKind::Cancellation }));
+        assert_eq!(
+            store
+                .recent_terminal_receipts_for_host("athena")
+                .expect("withdrawal host")[0]
+                .receipt_kind,
+            HostWorkflowReceiptKind::Withdrawal
+        );
+
+        drop(store);
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        assert_eq!(
+            reloaded
+                .recent_terminal_receipts_for_host("hsb8")
+                .expect("receipts reload"),
+            receipts
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
