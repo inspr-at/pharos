@@ -606,10 +606,40 @@ pub(crate) async fn request_host_preferences(
         workflow
     };
 
+    let workflow = if runtime_host.is_nix {
+        match state
+            .host_actions
+            .prepare_repository_dispatch(&workflow.id, &workflow.id)
+        {
+            Ok(job) => job,
+            Err(HostActionStoreError::PersistenceCommitted) => state
+                .host_actions
+                .get(&workflow.id)
+                .unwrap_or_else(|| workflow.clone()),
+            Err(_) => {
+                let failed = state
+                    .host_actions
+                    .fail_settings_change(&workflow.id, crate::now_unix())
+                    .ok()
+                    .unwrap_or(workflow);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "The settings dispatch coordinate could not be saved before repository dispatch",
+                        "job": failed.summary(),
+                        "workflow_html": crate::host_workflow_markup(&failed.summary().workflow),
+                    })),
+                );
+            }
+        }
+    } else {
+        workflow
+    };
+
     let dispatch_request_id = if runtime_host.is_nix {
         match state
             .nixcfg_dispatch
-            .dispatch(canonical_host, &request.preferences)
+            .dispatch_settings_with_key(canonical_host, &request.preferences, &workflow.id)
             .await
         {
             Ok(request_id) => {

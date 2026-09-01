@@ -849,6 +849,11 @@ impl HostActionJob {
         self.requested_preferences.as_ref()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn repository_request_id(&self) -> Option<&str> {
+        self.repository_request_id.as_deref()
+    }
+
     pub(crate) fn settings_change_id(&self) -> Option<&str> {
         self.settings_change_id.as_deref()
     }
@@ -4878,12 +4883,62 @@ impl HostActionStore {
         Ok(updated)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark_dispatch_submitted(
         &self,
         id: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         self.mark_dispatch_submitted_inner(id, None, now)
+    }
+
+    /// Persist the run-scoped repository coordinate before making the remote
+    /// request. An ambiguous HTTP result can then be reconciled against the
+    /// same durable run instead of inventing a second dispatch identity.
+    pub(crate) fn prepare_repository_dispatch(
+        &self,
+        id: &str,
+        request_id: &str,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if !safe_action_id(request_id) {
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        let (previous, updated) = {
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if !matches!(
+                job.workflow_kind(),
+                HostWorkflowKind::SettingsChange | HostWorkflowKind::RemoveHost
+            ) || job.state != HostActionState::ProposalRequested
+                || job.dispatch_submitted()
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            if job
+                .repository_request_id
+                .as_deref()
+                .is_some_and(|existing| existing != request_id)
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
+            if job.repository_request_id.as_deref() == Some(request_id) {
+                return Ok(job.clone());
+            }
+            let previous = job.clone();
+            job.repository_request_id = Some(request_id.to_string());
+            (previous, job.clone())
+        };
+        if !updated.validate() {
+            jobs.insert(id.to_string(), previous);
+            return Err(HostActionStoreError::InvalidJob);
+        }
+        if let Err(error) = self.persist_jobs(&jobs) {
+            if !error.persistence_committed() {
+                jobs.insert(id.to_string(), previous);
+            }
+            return Err(error);
+        }
+        Ok(updated)
     }
 
     pub(crate) fn mark_settings_dispatch_submitted(
@@ -5563,8 +5618,32 @@ impl HostActionStore {
         else {
             return Ok(None);
         };
+        self.complete_settings_change_locked(&mut jobs, &id, now)
+            .map(Some)
+    }
+
+    pub(crate) fn complete_settings_change_run(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        self.complete_settings_change_locked(&mut jobs, id, now)
+    }
+
+    fn complete_settings_change_locked(
+        &self,
+        jobs: &mut BTreeMap<String, HostActionJob>,
+        id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
         let (previous, updated) = {
-            let job = jobs.get_mut(&id).expect("selected settings workflow");
+            let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
+            if job.workflow_kind() != HostWorkflowKind::SettingsChange
+                || job.state != HostActionState::ProposalRequested
+            {
+                return Err(HostActionStoreError::InvalidTransition);
+            }
             let previous = job.clone();
             let event_at = now.max(job.updated_at);
             job.state = HostActionState::Succeeded;
@@ -5577,13 +5656,13 @@ impl HostActionStore {
             );
             (previous, job.clone())
         };
-        if let Err(error) = self.persist_jobs(&jobs) {
+        if let Err(error) = self.persist_jobs(jobs) {
             if !error.persistence_committed() {
-                jobs.insert(id, previous);
+                jobs.insert(id.to_string(), previous);
             }
             return Err(error);
         }
-        Ok(Some(updated))
+        Ok(updated)
     }
 
     fn update_settings_change(
@@ -10330,7 +10409,10 @@ mod tests {
             .record_settings_request(&settings.id, &requested, 521)
             .expect("settings recovery payload recorded");
         let settings = store
-            .mark_dispatch_submitted(&settings.id, 522)
+            .prepare_repository_dispatch(&settings.id, &settings.id)
+            .expect("settings dispatch coordinate persisted");
+        let settings = store
+            .mark_dispatch_submitted_with_request_id(&settings.id, &settings.id, 522)
             .expect("settings dispatch submission recorded");
         let settings_summary = settings.summary().workflow;
         assert_eq!(settings_summary.status_label, "dispatch accepted");
@@ -10366,7 +10448,10 @@ mod tests {
             )
             .expect("removal workflow created");
         let removal = store
-            .mark_dispatch_submitted(&removal.id, 524)
+            .prepare_repository_dispatch(&removal.id, &removal.id)
+            .expect("removal dispatch coordinate persisted");
+        let removal = store
+            .mark_dispatch_submitted_with_request_id(&removal.id, &removal.id, 524)
             .expect("removal dispatch submission recorded");
         let removal_summary = removal.summary().workflow;
         assert_eq!(removal_summary.status_label, "dispatch accepted");
@@ -10415,13 +10500,108 @@ mod tests {
             .workflow
             .guidance
             .contains("do not resend"));
-        assert!(reloaded
-            .get(&removal.id)
-            .expect("removal handoff reloaded")
+        assert_eq!(
+            reloaded
+                .get(&settings.id)
+                .expect("settings handoff reloaded")
+                .repository_request_id(),
+            Some(settings.id.as_str())
+        );
+        let reloaded_removal = reloaded.get(&removal.id).expect("removal handoff reloaded");
+        assert!(reloaded_removal
             .summary()
             .workflow
             .guidance
             .contains("do not resend"));
+        assert_eq!(
+            reloaded_removal.repository_request_id(),
+            Some(removal.id.as_str())
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exact_settings_completion_cannot_terminalize_a_replacement_run() {
+        let store = HostActionStore::new(None);
+        let old = store
+            .begin_settings_change("hsb8", "markus", 530)
+            .expect("old settings run created");
+        store
+            .withdraw_settings_change(&old.id, "hsb8", "markus", 531)
+            .expect("old settings run withdrawn");
+        let replacement = store
+            .begin_settings_change("hsb8", "markus", 532)
+            .expect("replacement settings run created");
+
+        assert_eq!(
+            store.complete_settings_change_run(&old.id, 533),
+            Err(HostActionStoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store
+                .get(&replacement.id)
+                .expect("replacement retained")
+                .state,
+            HostActionState::ProposalRequested
+        );
+    }
+
+    #[test]
+    fn uncertain_settings_and_removal_keep_run_scoped_dispatch_ids_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "pharos-run-scoped-dispatch-{}-{}.json",
+            std::process::id(),
+            ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = HostActionStore::new(Some(path.clone()));
+        let settings = store
+            .begin_settings_change("hsb8", "markus", 540)
+            .expect("settings run created");
+        store
+            .record_settings_request(
+                &settings.id,
+                &HostPreferences {
+                    accent: Some("#1f7fb5".to_string()),
+                    ..HostPreferences::default()
+                },
+                541,
+            )
+            .expect("settings payload persisted");
+        store
+            .prepare_repository_dispatch(&settings.id, &settings.id)
+            .expect("settings coordinate persisted before dispatch");
+        store
+            .fail_settings_change_uncertain(&settings.id, 542)
+            .expect("settings uncertainty recorded");
+
+        let removal = store
+            .begin_removal(
+                "gpc0",
+                "markus",
+                HostRemovalPlan {
+                    disposition: HostRetirementDisposition::Destroyed,
+                    successor: None,
+                    declaration_pending: true,
+                    credential_retirement_required: true,
+                },
+                543,
+            )
+            .expect("removal run created");
+        store
+            .prepare_repository_dispatch(&removal.id, &removal.id)
+            .expect("removal coordinate persisted before dispatch");
+        store
+            .fail_removal_uncertain(&removal.id, 544)
+            .expect("removal uncertainty recorded");
+
+        drop(store);
+        let reloaded = HostActionStore::new(Some(path.clone()));
+        for id in [&settings.id, &removal.id] {
+            let job = reloaded.get(id).expect("uncertain run reloaded");
+            assert_eq!(job.repository_request_id(), Some(id.as_str()));
+            assert_eq!(job.state, HostActionState::Failed);
+            assert!(job.has_event(HostActionEventKind::DispatchOutcomeUncertain));
+        }
         let _ = std::fs::remove_file(path);
     }
 

@@ -1921,6 +1921,23 @@ async fn continue_legacy_settings_dispatch(
         }
     };
 
+    let recorded = match state
+        .host_actions
+        .prepare_repository_dispatch(&existing.id, &existing.id)
+    {
+        Ok(job) => job,
+        Err(HostActionStoreError::PersistenceCommitted) => {
+            state.host_actions.get(&existing.id).unwrap_or(recorded)
+        }
+        Err(_) => {
+            return action_response_with_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &recorded,
+                "The recovered dispatch coordinate could not be saved before repository handoff",
+            );
+        }
+    };
+
     let request_id = match state
         .nixcfg_dispatch
         .dispatch_settings_with_key(&existing.host, &preferences, &existing.id)
@@ -2336,13 +2353,36 @@ async fn request_host_removal(
     // credential retirement on every attempt with its credential still live.
     let repository_dispatch_required = declaration_pending || credential_retirement_required;
     if repository_dispatch_required {
+        workflow = match state
+            .host_actions
+            .prepare_repository_dispatch(&workflow.id, &workflow.id)
+        {
+            Ok(job) => job,
+            Err(HostActionStoreError::PersistenceCommitted) => state
+                .host_actions
+                .get(&workflow.id)
+                .unwrap_or_else(|| workflow.clone()),
+            Err(_) => {
+                let failed = state
+                    .host_actions
+                    .fail_removal(&workflow.id, now_unix())
+                    .ok()
+                    .unwrap_or(workflow);
+                return action_response_with_message(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &failed,
+                    "The removal dispatch coordinate could not be saved before repository dispatch",
+                );
+            }
+        };
         if let Err(error) = state
             .nixcfg_dispatch
-            .dispatch_host_removal(
+            .dispatch_host_removal_with_key(
                 &host,
                 removal_plan.disposition.key(),
                 removal_plan.successor.as_deref(),
                 credential_retirement_required,
+                &workflow.id,
             )
             .await
         {
@@ -2366,10 +2406,11 @@ async fn request_host_removal(
                 error.host_removal_message(),
             );
         }
-        workflow = match state
-            .host_actions
-            .mark_dispatch_submitted(&workflow.id, now_unix())
-        {
+        workflow = match state.host_actions.mark_dispatch_submitted_with_request_id(
+            &workflow.id,
+            &workflow.id,
+            now_unix(),
+        ) {
             Ok(job) => job,
             Err(HostActionStoreError::PersistenceCommitted) => state
                 .host_actions
@@ -2603,41 +2644,60 @@ fn reconcile_completed_removals(state: &AppState, now: i64) -> usize {
 /// workflow or replays a live host action. It repairs accepted local receipts,
 /// observes already-matching host state, and lets the existing removal
 /// reconciler finish recorded retirement gates.
-fn reconcile_saved_next_actions(state: &AppState, now: i64) -> usize {
+async fn reconcile_saved_next_actions(state: &AppState, now: i64) -> usize {
     let mut transitions = 0usize;
-    let _ = state.host_actions.reconcile_orphaned_host_dispatches(now);
-    for job in state.host_actions.list() {
-        if job.workflow_kind() != HostWorkflowKind::SettingsChange || job.state.is_terminal() {
-            continue;
-        }
-        let Some(requested) = job.requested_preferences().cloned() else {
-            continue;
-        };
-        let Some(host) = state.store.get(&job.host) else {
-            continue;
-        };
-        if job.dispatch_submitted()
-            && !job.accepted_dispatch_reconciled()
-            && state
-                .store
-                .request_preferences(&job.host, requested.clone())
-                .is_ok()
-            && state
-                .host_actions
-                .accept_settings_change(&job.id, now)
-                .is_ok()
-        {
-            transitions += 1;
-        }
-        if host.preferences == requested
-            && state
-                .host_actions
-                .complete_settings_change(&job.host, now)
-                .ok()
-                .flatten()
-                .is_some()
-        {
-            transitions += 1;
+    {
+        // This is the same transaction boundary used by fresh submissions,
+        // continuations, and withdrawals. Candidate IDs are only hints; every
+        // decision below reloads the exact run while the boundary is held.
+        let _settings_change_guard = state.settings_change_lock.lock().await;
+        let _ = state.host_actions.reconcile_orphaned_host_dispatches(now);
+        let candidate_ids: Vec<_> = state
+            .host_actions
+            .list()
+            .into_iter()
+            .filter(|job| job.workflow_kind() == HostWorkflowKind::SettingsChange)
+            .map(|job| job.id)
+            .collect();
+        for id in candidate_ids {
+            let Some(job) = state.host_actions.get(&id).filter(|job| {
+                job.workflow_kind() == HostWorkflowKind::SettingsChange && !job.state.is_terminal()
+            }) else {
+                continue;
+            };
+            let Some(requested) = job.requested_preferences().cloned() else {
+                continue;
+            };
+            if job.dispatch_submitted()
+                && !job.accepted_dispatch_reconciled()
+                && state
+                    .store
+                    .request_preferences(&job.host, requested)
+                    .is_ok()
+                && state.host_actions.accept_settings_change(&id, now).is_ok()
+            {
+                transitions += 1;
+            }
+
+            let Some(current) = state.host_actions.get(&id).filter(|job| {
+                job.workflow_kind() == HostWorkflowKind::SettingsChange && !job.state.is_terminal()
+            }) else {
+                continue;
+            };
+            let Some(requested) = current.requested_preferences() else {
+                continue;
+            };
+            let Some(host) = state.store.get(&current.host) else {
+                continue;
+            };
+            if host.preferences == *requested
+                && state
+                    .host_actions
+                    .complete_settings_change_run(&id, now)
+                    .is_ok()
+            {
+                transitions += 1;
+            }
         }
     }
     transitions + reconcile_completed_removals(state, now)
@@ -2649,7 +2709,7 @@ fn spawn_next_action_loop(state: AppState) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let advanced = reconcile_saved_next_actions(&state, now_unix());
+            let advanced = reconcile_saved_next_actions(&state, now_unix()).await;
             if advanced > 0 {
                 tracing::info!(
                     advanced,
@@ -4812,7 +4872,7 @@ async fn main() {
         retired_hosts,
         alert_health,
     };
-    let _ = reconcile_saved_next_actions(&state, now_unix());
+    let _ = reconcile_saved_next_actions(&state, now_unix()).await;
     spawn_next_action_loop(state.clone());
     spawn_alert_loop(state.clone(), alert_notifier);
     if let Some(runtime) = appliance_probes {
@@ -16090,7 +16150,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
 
     #[tokio::test]
     async fn accepted_settings_and_removal_dispatches_reconcile_locally_without_redispatch() {
-        let state = report_test_state(true);
+        let actions_path = std::env::temp_dir().join(format!(
+            "pharos-next-action-restart-{}-{}.json",
+            std::process::id(),
+            TEST_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut state = report_test_state(true);
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
         state
             .store
             .record(test_report("hsb8"), now_unix())
@@ -16110,8 +16176,49 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .expect("settings recovery payload recorded");
         state
             .host_actions
-            .mark_dispatch_submitted(&settings.id, 912)
+            .prepare_repository_dispatch(&settings.id, &settings.id)
+            .expect("settings dispatch coordinate saved");
+        state
+            .host_actions
+            .mark_settings_dispatch_submitted(&settings.id, &settings.id, 912)
             .expect("settings dispatch accepted");
+
+        let plan = HostRemovalPlan {
+            disposition: HostRetirementDisposition::Destroyed,
+            successor: None,
+            declaration_pending: true,
+            credential_retirement_required: true,
+        };
+        let removal = state
+            .host_actions
+            .begin_removal("gpc0", "markus", plan, 913)
+            .expect("removal workflow created");
+        state
+            .host_actions
+            .prepare_repository_dispatch(&removal.id, &removal.id)
+            .expect("removal dispatch coordinate saved");
+        state
+            .host_actions
+            .mark_dispatch_submitted_with_request_id(&removal.id, &removal.id, 914)
+            .expect("removal dispatch accepted");
+
+        state.host_actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        assert_eq!(
+            state
+                .host_actions
+                .get(&settings.id)
+                .expect("settings run reloaded")
+                .repository_request_id(),
+            Some(settings.id.as_str())
+        );
+        assert_eq!(
+            state
+                .host_actions
+                .get(&removal.id)
+                .expect("removal run reloaded")
+                .repository_request_id(),
+            Some(removal.id.as_str())
+        );
         let (status, Json(payload)) = reconcile_accepted_dispatch(
             State(state.clone()),
             action_headers(),
@@ -16148,20 +16255,6 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         .await;
         assert_eq!(second_status, StatusCode::CONFLICT);
 
-        let plan = HostRemovalPlan {
-            disposition: HostRetirementDisposition::Destroyed,
-            successor: None,
-            declaration_pending: true,
-            credential_retirement_required: true,
-        };
-        let removal = state
-            .host_actions
-            .begin_removal("gpc0", "markus", plan, 913)
-            .expect("removal workflow created");
-        state
-            .host_actions
-            .mark_dispatch_submitted(&removal.id, 914)
-            .expect("removal dispatch accepted");
         let (status, Json(payload)) = reconcile_accepted_dispatch(
             State(state.clone()),
             action_headers(),
@@ -16181,6 +16274,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .as_str()
             .expect("safe reconciliation error")
             .contains("Only a saved"));
+        let _ = std::fs::remove_file(actions_path);
     }
 
     #[tokio::test]
@@ -16468,6 +16562,99 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[tokio::test]
+    async fn background_reconciliation_cannot_resurrect_withdrawn_or_complete_replacement_run() {
+        let state = report_test_state(true);
+        let old_preferences = HostPreferences {
+            accent: Some("#48b8a8".to_string()),
+            ..Default::default()
+        };
+        let replacement_preferences = HostPreferences {
+            accent: Some("#1f7fb5".to_string()),
+            ..Default::default()
+        };
+        let mut report = test_report("hsb8");
+        report.preferences = old_preferences.clone();
+        state
+            .store
+            .record(report, now_unix())
+            .expect("settings host recorded");
+        let old = state
+            .host_actions
+            .begin_settings_change("hsb8", "markus", 924)
+            .expect("old settings workflow created");
+        state
+            .host_actions
+            .record_settings_request(&old.id, &old_preferences, 925)
+            .expect("old settings payload recorded");
+        state
+            .host_actions
+            .mark_settings_dispatch_submitted(&old.id, &old.id, 926)
+            .expect("old repository receipt recorded");
+
+        let held = state.settings_change_lock.lock().await;
+        let withdraw_state = state.clone();
+        let old_id = old.id.clone();
+        let withdrawal = tokio::spawn(async move {
+            withdraw_settings_change(State(withdraw_state), action_headers(), AxumPath(old_id))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let replacement_state = state.clone();
+        let replacement = tokio::spawn(async move {
+            let _guard = replacement_state.settings_change_lock.lock().await;
+            let job = replacement_state
+                .host_actions
+                .begin_settings_change("hsb8", "markus", 927)
+                .expect("replacement settings workflow created");
+            replacement_state
+                .host_actions
+                .record_settings_request(&job.id, &replacement_preferences, 928)
+                .expect("replacement settings payload recorded");
+            job.id
+        });
+        tokio::task::yield_now().await;
+
+        let reconcile_state = state.clone();
+        let mut reconciliation =
+            tokio::spawn(async move { reconcile_saved_next_actions(&reconcile_state, 929).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut reconciliation)
+                .await
+                .is_err(),
+            "background reconciliation must wait for the settings transaction"
+        );
+        drop(held);
+
+        let (withdraw_status, _) = withdrawal.await.expect("withdrawal joins");
+        assert_eq!(withdraw_status, StatusCode::OK);
+        let replacement_id = replacement.await.expect("replacement joins");
+        assert_eq!(reconciliation.await.expect("reconciliation joins"), 0);
+        assert_eq!(
+            state
+                .host_actions
+                .get(&old.id)
+                .expect("old run retained")
+                .state,
+            HostActionState::Cancelled
+        );
+        assert_eq!(
+            state
+                .host_actions
+                .get(&replacement_id)
+                .expect("replacement retained")
+                .state,
+            HostActionState::ProposalRequested
+        );
+        assert!(state
+            .store
+            .get("hsb8")
+            .expect("host retained")
+            .requested_preferences
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn settings_withdrawal_clears_pending_preferences_without_repository_dispatch() {
         let mut state = report_test_state(true);
         state
@@ -16653,6 +16840,15 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(payload["status"], "dispatch_accepted");
         assert_eq!(payload["job"]["workflow"]["status_label"], "change waiting");
         assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        let settings_id = payload["job"]["id"].as_str().expect("settings run id");
+        assert_eq!(
+            state
+                .host_actions
+                .get(settings_id)
+                .expect("settings run persisted")
+                .repository_request_id(),
+            Some(settings_id)
+        );
         assert_eq!(
             state
                 .host_actions
@@ -16708,6 +16904,15 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(payload["job"]["state"], "removal_pending");
         assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+        let removal_id = payload["job"]["id"].as_str().expect("removal run id");
+        assert_eq!(
+            state
+                .host_actions
+                .get(removal_id)
+                .expect("removal run persisted")
+                .repository_request_id(),
+            Some(removal_id)
+        );
         assert_eq!(
             state
                 .host_actions
@@ -17656,8 +17861,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert_eq!(observation.kind, "tcp-connect");
     }
 
-    #[test]
-    fn background_next_action_reconciles_saved_settings_receipt_once() {
+    #[tokio::test]
+    async fn background_next_action_reconciles_saved_settings_receipt_once() {
         let state = report_test_state(true);
         state
             .store
@@ -17680,8 +17885,8 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             .mark_settings_dispatch_submitted(&settings.id, &settings.id, 1_003)
             .expect("repository receipt recorded");
 
-        assert_eq!(reconcile_saved_next_actions(&state, 1_004), 1);
-        assert_eq!(reconcile_saved_next_actions(&state, 1_005), 0);
+        assert_eq!(reconcile_saved_next_actions(&state, 1_004).await, 1);
+        assert_eq!(reconcile_saved_next_actions(&state, 1_005).await, 0);
         let reconciled = state
             .host_actions
             .get(&settings.id)

@@ -91,6 +91,7 @@ impl NixcfgDispatch {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn dispatch(
         &self,
         host: &str,
@@ -168,6 +169,7 @@ impl NixcfgDispatch {
         Ok(request_id.to_string())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn dispatch_host_removal(
         &self,
         host: &str,
@@ -175,23 +177,41 @@ impl NixcfgDispatch {
         successor: Option<&str>,
         credential_retirement_required: bool,
     ) -> Result<String, NixcfgDispatchError> {
+        let request_id = request_id("host-removal", host);
+        self.dispatch_host_removal_with_key(
+            host,
+            disposition,
+            successor,
+            credential_retirement_required,
+            &request_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_host_removal_with_key(
+        &self,
+        host: &str,
+        disposition: &str,
+        successor: Option<&str>,
+        credential_retirement_required: bool,
+        request_id: &str,
+    ) -> Result<String, NixcfgDispatchError> {
         if !self.host_removal_available() {
             return Err(NixcfgDispatchError::Disabled);
         }
-        if !valid_host_name(host) {
+        if !valid_host_name(host) || !valid_request_id(request_id) {
             return Err(NixcfgDispatchError::InvalidHost);
         }
         if !valid_removal_intent(host, disposition, successor) {
             return Err(NixcfgDispatchError::InvalidRemovalIntent);
         }
-        let request_id = request_id("host-removal", host);
         let request = HostRemovalDispatchRequest {
             git_ref: WORKFLOW_REF,
             inputs: HostRemovalDispatchInputs {
                 host,
                 disposition,
                 successor: successor.unwrap_or_default(),
-                request_id: &request_id,
+                request_id,
                 credential_retirement_required: if credential_retirement_required {
                     "true"
                 } else {
@@ -200,7 +220,7 @@ impl NixcfgDispatch {
             },
         };
         self.send(HOST_REMOVAL_DISPATCH_PATH, &request).await?;
-        Ok(request_id)
+        Ok(request_id.to_string())
     }
 
     async fn send<T: Serialize>(&self, path: &str, request: &T) -> Result<(), NixcfgDispatchError> {
@@ -754,6 +774,37 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
             assert_eq!(returned, run_id);
             assert_eq!(payload["inputs"]["request_id"], run_id);
+        }
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[tokio::test]
+    async fn settings_and_removal_reuse_saved_run_ids_across_dispatch_clients() {
+        let token_path = token_file();
+        let settings_run = "action-settings-change-hsb8-1700000000-1";
+        let removal_run = "action-remove-host-gpc0-1700000001-1";
+        for _ in 0..2 {
+            let (base, request) = mock_github(204);
+            let returned = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+                .dispatch_settings_with_key("hsb8", &preferences(), settings_run)
+                .await
+                .expect("settings dispatch accepted");
+            let raw = request.recv().expect("settings request captured");
+            let (_, body) = raw.split_once("\r\n\r\n").expect("settings body");
+            let payload: serde_json::Value = serde_json::from_str(body).expect("settings JSON");
+            assert_eq!(returned, settings_run);
+            assert_eq!(payload["inputs"]["request_id"], settings_run);
+
+            let (base, request) = mock_github(204);
+            let returned = NixcfgDispatch::for_test(Some(token_path.clone()), base)
+                .dispatch_host_removal_with_key("gpc0", "destroyed", None, true, removal_run)
+                .await
+                .expect("removal dispatch accepted");
+            let raw = request.recv().expect("removal request captured");
+            let (_, body) = raw.split_once("\r\n\r\n").expect("removal body");
+            let payload: serde_json::Value = serde_json::from_str(body).expect("removal JSON");
+            assert_eq!(returned, removal_run);
+            assert_eq!(payload["inputs"]["request_id"], removal_run);
         }
         let _ = std::fs::remove_file(token_path);
     }
