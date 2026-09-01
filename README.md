@@ -585,15 +585,21 @@ provenance stay in Pharos's durable job, events and summary.
 Each workflow persists:
 
 1. operator intent;
-2. target-local review and preflight;
-3. the exact review result;
-4. attended confirmation;
-5. a leased apply/restart phase;
-6. fresh system, kernel, service and heartbeat verification;
-7. typed failure or recovery evidence.
+2. start and last-evidence times, the next automatic check, and a rounded
+   expected range;
+3. deterministic overdue and escalation boundaries with an effect-bound,
+   same-run idempotency key;
+4. target-local review and preflight;
+5. the exact review result;
+6. attended confirmation;
+7. a leased apply/restart phase;
+8. fresh system, kernel, service and heartbeat verification;
+9. typed failure, recovery, cancellation, or terminal evidence.
 
 Review failures can be retried explicitly. Failures after confirmation require
-recovery; Pharos does not silently replay a switch or reboot.
+recovery; Pharos does not silently replay a switch or reboot. Automatic
+reconciliation resumes after a Pharos restart, while terminal and withdrawn
+runs retain their receipt and expose no next action to poll.
 
 ### Declarative settings and fleet proposals
 

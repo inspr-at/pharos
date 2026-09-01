@@ -1420,6 +1420,7 @@ impl HostActionJob {
         };
         Some(NextActionDescriptor::new(
             &self.id,
+            self.created_at,
             self.updated_at,
             as_of,
             NextActionDefinition {
@@ -1505,6 +1506,7 @@ impl HostActionJob {
         };
         Some(NextActionDescriptor::new(
             &self.id,
+            self.created_at,
             self.updated_at,
             as_of,
             NextActionDefinition {

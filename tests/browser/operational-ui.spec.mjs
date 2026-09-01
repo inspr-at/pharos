@@ -2976,7 +2976,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
   expect(requestPayload.job.workflow.primary_action).toBeNull();
   expect(nextAction).toMatchObject({
     schema: "inspr.pharos.next-action.v1",
-    version: 1,
+    version: 2,
     owner: {
       kind: "host_agent",
       key: `host-agent:${host}`,
@@ -2997,12 +2997,35 @@ test("settings sheet live wait advances only from host evidence and stops termin
       strategy: "automatic_retry",
       escalation_owner: "pharos",
     },
+    recovery_action: {
+      kind: "automatic_retry",
+      effect: "runtime_verification",
+      idempotency_key: `${runId}:runtime-verification:automatic-retry`,
+      available_when_overdue: true,
+    },
   });
+  expect(nextAction.timing).toMatchObject({
+    started_at: requestPayload.job.created_at,
+    last_update_at: requestPayload.job.updated_at,
+    since: requestPayload.job.updated_at,
+    overdue: false,
+  });
+  expect(nextAction.timing.next_check_at).toBeGreaterThan(nextAction.timing.as_of);
+  expect(nextAction.timing.overdue_at).toBeGreaterThan(nextAction.timing.as_of);
   const dialog = page.getByRole("dialog", { name: `Change ${host} settings` });
   const exactGuidance = `The repository handoff is accepted, but no matching host report is recorded. Finish the nixcfg review, merge, and deployment first. Then ${host} must report the requested values; Pharos will not mark this run complete without that matching host evidence.`;
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
   await expect(dialog.locator('[data-step-state="waiting"]')).toContainText(
     "The nixcfg review, merge, and deployment must finish first",
+  );
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "Background progress is active",
+  );
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "Automatic check by",
+  );
+  await expect(dialog.locator('[data-workflow-timing="on-schedule"]')).toContainText(
+    "usually within 5 min",
   );
   await expect(dialog.locator("[data-host-action-refresh]")).toHaveCount(0);
   await expect(dialog.locator("[data-host-action-primary]")).toBeHidden();
@@ -3056,6 +3079,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
       operation: "poll_host_evidence",
     },
     idempotency: { key: nextAction.idempotency.key },
+    recovery_action: { idempotency_key: nextAction.recovery_action.idempotency_key },
   });
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("[data-host-action-copy]")).toHaveText(exactGuidance);
@@ -3103,6 +3127,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
       expect.objectContaining({ kind: "host_state_verified" }),
     ]),
   );
+  await expect(dialog.locator(".host-workflow-timing")).toHaveCount(0);
   const terminalPollCount = requestedUrls.filter((url) => url.includes(jobPath)).length;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.waitForTimeout(2_500);

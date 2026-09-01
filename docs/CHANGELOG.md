@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Show truthful start, last-evidence, next-check, rounded expected-range,
+  overdue, and escalation facts on every saved host workflow; keep recovery
+  bound to the exact effect and same-run idempotency key, resume automatic
+  reconciliation after restart, and stop polling terminal or withdrawn runs
+  without discarding their receipt (PHAROS-249).
+
 ## 0.1.97 - 2026-09-01
 
 - Refresh the immutable Debian bookworm runtime base and snapshot so published images include the fixed `libexpat1` package for CVE-2026-56408; keep the release vulnerability, SBOM, provenance, and signature gates fail-closed (PHAROS-252).

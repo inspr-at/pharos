@@ -7,9 +7,10 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) const NEXT_ACTION_SCHEMA: &str = "inspr.pharos.next-action.v1";
-pub(crate) const NEXT_ACTION_VERSION: u16 = 1;
+pub(crate) const NEXT_ACTION_VERSION: u16 = 2;
 pub(crate) const TERMINAL_RECEIPT_SCHEMA: &str = "inspr.pharos.terminal-receipt.v1";
 pub(crate) const TERMINAL_RECEIPT_VERSION: u16 = 1;
+pub(crate) const NEXT_ACTION_RECONCILE_SECS: i64 = 15;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +45,21 @@ pub(crate) enum NextActionEffect {
     GuardedApply,
     RuntimeVerification,
     Retirement,
+}
+
+impl NextActionEffect {
+    fn key(self) -> &'static str {
+        match self {
+            Self::RecordRequest => "record-request",
+            Self::RepositoryHandoff => "repository-handoff",
+            Self::ReconcileHandoff => "reconcile-handoff",
+            Self::GuardedReview => "guarded-review",
+            Self::GuardedConfirmation => "guarded-confirmation",
+            Self::GuardedApply => "guarded-apply",
+            Self::RuntimeVerification => "runtime-verification",
+            Self::Retirement => "retirement",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -101,6 +117,7 @@ pub(crate) enum NextActionAvailabilityState {
     Ready,
     Running,
     Scheduled,
+    Overdue,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -135,11 +152,19 @@ pub(crate) struct NextActionIdempotency {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NextActionTiming {
+    pub(crate) started_at: i64,
+    pub(crate) last_update_at: i64,
     pub(crate) since: i64,
     pub(crate) as_of: i64,
     pub(crate) age_secs: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_check_at: Option<i64>,
     pub(crate) expected_min_secs: u32,
     pub(crate) expected_max_secs: u32,
+    pub(crate) overdue_at: i64,
+    pub(crate) overdue: bool,
+    pub(crate) escalation_at: i64,
+    pub(crate) escalation_due: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -149,6 +174,51 @@ pub(crate) enum NextActionRecoveryStrategy {
     ReconcileBeforeRetry,
     RetrySameRun,
     EscalateToOwner,
+}
+
+impl NextActionRecoveryStrategy {
+    fn action(self) -> NextActionRecoveryActionKind {
+        match self {
+            Self::AutomaticRetry => NextActionRecoveryActionKind::AutomaticRetry,
+            Self::ReconcileBeforeRetry => NextActionRecoveryActionKind::Reconcile,
+            Self::RetrySameRun => NextActionRecoveryActionKind::RetrySameRun,
+            Self::EscalateToOwner => NextActionRecoveryActionKind::Escalate,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NextActionRecoveryActionKind {
+    AutomaticRetry,
+    Reconcile,
+    RetrySameRun,
+    Escalate,
+}
+
+impl NextActionRecoveryActionKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::AutomaticRetry => "automatic-retry",
+            Self::Reconcile => "reconcile",
+            Self::RetrySameRun => "retry-same-run",
+            Self::Escalate => "escalate",
+        }
+    }
+}
+
+/// One effect-bound recovery choice for an overdue next action.
+///
+/// The key is stable for the saved run, effect, and recovery kind. It does not
+/// contain a transient attempt number, so duplicate clicks or daemon retries
+/// can only refer back to the same durable workflow.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NextActionRecoveryAction {
+    pub(crate) kind: NextActionRecoveryActionKind,
+    pub(crate) effect: NextActionEffect,
+    pub(crate) idempotency_key: String,
+    pub(crate) available_when_overdue: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -170,6 +240,7 @@ pub(crate) struct NextActionDescriptor {
     pub(crate) idempotency: NextActionIdempotency,
     pub(crate) timing: NextActionTiming,
     pub(crate) recovery: NextActionRecovery,
+    pub(crate) recovery_action: NextActionRecoveryAction,
 }
 
 pub(crate) struct NextActionDefinition {
@@ -185,10 +256,39 @@ pub(crate) struct NextActionDefinition {
 impl NextActionDescriptor {
     pub(crate) fn new(
         run_id: &str,
-        since: i64,
+        started_at: i64,
+        last_update_at: i64,
         as_of: i64,
         definition: NextActionDefinition,
     ) -> Self {
+        let last_update_at = last_update_at.max(started_at);
+        let as_of = as_of.max(last_update_at);
+        let age_secs = as_of.saturating_sub(last_update_at);
+        let expected_min_secs = definition.expected.0;
+        let expected_max_secs = definition.expected.1.max(expected_min_secs);
+        let overdue_at = last_update_at.saturating_add(i64::from(expected_max_secs));
+        let escalation_at =
+            last_update_at.saturating_add(i64::from(definition.recovery.escalation_after_secs));
+        let automatic = definition.execution == NextActionExecution::Automatic;
+        let overdue = automatic && as_of >= overdue_at;
+        let escalation_due = automatic && as_of >= escalation_at;
+        let availability_state = if overdue {
+            NextActionAvailabilityState::Overdue
+        } else {
+            definition.state
+        };
+        let next_check_at = automatic.then(|| next_check_at(as_of));
+        let recovery_kind = definition.recovery.strategy.action();
+        let recovery_action = NextActionRecoveryAction {
+            kind: recovery_kind,
+            effect: definition.effect,
+            idempotency_key: format!(
+                "{run_id}:{}:{}",
+                definition.effect.key(),
+                recovery_kind.key()
+            ),
+            available_when_overdue: true,
+        };
         Self {
             schema: NEXT_ACTION_SCHEMA.to_string(),
             version: NEXT_ACTION_VERSION,
@@ -197,7 +297,7 @@ impl NextActionDescriptor {
             availability: NextActionAvailability {
                 executable: true,
                 execution: definition.execution,
-                state: definition.state,
+                state: availability_state,
                 operation: definition.operation,
             },
             idempotency: NextActionIdempotency {
@@ -206,15 +306,27 @@ impl NextActionDescriptor {
                 uncertain_response: UncertainResponseBehavior::ReconcileBeforeRetry,
             },
             timing: NextActionTiming {
-                since,
-                as_of: as_of.max(since),
-                age_secs: as_of.saturating_sub(since).max(0),
-                expected_min_secs: definition.expected.0,
-                expected_max_secs: definition.expected.1.max(definition.expected.0),
+                started_at,
+                last_update_at,
+                since: last_update_at,
+                as_of,
+                age_secs,
+                next_check_at,
+                expected_min_secs,
+                expected_max_secs,
+                overdue_at,
+                overdue,
+                escalation_at,
+                escalation_due,
             },
             recovery: definition.recovery,
+            recovery_action,
         }
     }
+}
+
+fn next_check_at(as_of: i64) -> i64 {
+    as_of.saturating_add(NEXT_ACTION_RECONCILE_SECS)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -284,8 +396,9 @@ mod tests {
     fn descriptor_has_stable_idempotency_and_bounded_age() {
         let descriptor = NextActionDescriptor::new(
             "action-settings-hsb8-100-1",
+            90,
             100,
-            145,
+            125,
             NextActionDefinition {
                 owner: NextActionOwner {
                     kind: NextActionOwnerKind::PharosDaemon,
@@ -305,9 +418,16 @@ mod tests {
             },
         );
 
-        assert_eq!(descriptor.timing.age_secs, 45);
+        assert_eq!(descriptor.timing.age_secs, 25);
+        assert_eq!(descriptor.timing.started_at, 90);
+        assert_eq!(descriptor.timing.last_update_at, 100);
+        assert_eq!(descriptor.timing.next_check_at, Some(140));
         assert_eq!(descriptor.timing.expected_min_secs, 10);
         assert_eq!(descriptor.timing.expected_max_secs, 30);
+        assert_eq!(descriptor.timing.overdue_at, 130);
+        assert_eq!(descriptor.timing.escalation_at, 160);
+        assert!(!descriptor.timing.overdue);
+        assert!(!descriptor.timing.escalation_due);
         assert_eq!(
             descriptor.idempotency.key,
             "action-settings-hsb8-100-1:poll-host-evidence"
@@ -316,6 +436,99 @@ mod tests {
         assert_eq!(
             descriptor.idempotency.uncertain_response,
             UncertainResponseBehavior::ReconcileBeforeRetry
+        );
+        assert_eq!(
+            descriptor.recovery_action.kind,
+            NextActionRecoveryActionKind::AutomaticRetry
+        );
+        assert_eq!(
+            descriptor.recovery_action.idempotency_key,
+            "action-settings-hsb8-100-1:runtime-verification:automatic-retry"
+        );
+    }
+
+    #[test]
+    fn automatic_action_transitions_to_overdue_at_the_clock_boundary() {
+        let definition = || NextActionDefinition {
+            owner: NextActionOwner {
+                kind: NextActionOwnerKind::HostAgent,
+                key: "host-agent:hsb8".to_string(),
+                label: "hsb8 host agent".to_string(),
+            },
+            effect: NextActionEffect::RuntimeVerification,
+            operation: NextActionOperation::PollHostEvidence,
+            execution: NextActionExecution::Automatic,
+            state: NextActionAvailabilityState::Scheduled,
+            expected: (0, 300),
+            recovery: NextActionRecovery {
+                strategy: NextActionRecoveryStrategy::ReconcileBeforeRetry,
+                escalation_after_secs: 900,
+                escalation_owner: NextActionOwnerKind::Pharos,
+            },
+        };
+
+        let before = NextActionDescriptor::new("run-1", 50, 100, 399, definition());
+        let at_boundary = NextActionDescriptor::new("run-1", 50, 100, 400, definition());
+        let after_restart = NextActionDescriptor::new("run-1", 50, 100, 1016, definition());
+
+        assert!(!before.timing.overdue);
+        assert_eq!(
+            before.availability.state,
+            NextActionAvailabilityState::Scheduled
+        );
+        assert!(at_boundary.timing.overdue);
+        assert_eq!(
+            at_boundary.availability.state,
+            NextActionAvailabilityState::Overdue
+        );
+        assert_eq!(at_boundary.timing.next_check_at, Some(415));
+        assert!(!at_boundary.timing.escalation_due);
+        assert!(after_restart.timing.escalation_due);
+        assert_eq!(
+            after_restart.timing.overdue_at,
+            at_boundary.timing.overdue_at
+        );
+        assert_eq!(
+            after_restart.recovery_action.idempotency_key,
+            at_boundary.recovery_action.idempotency_key
+        );
+    }
+
+    #[test]
+    fn attended_action_never_claims_an_automatic_check_or_overdue_transition() {
+        let descriptor = NextActionDescriptor::new(
+            "run-confirm",
+            100,
+            110,
+            90_000,
+            NextActionDefinition {
+                owner: NextActionOwner {
+                    kind: NextActionOwnerKind::Operator,
+                    key: "operator:confirmation".to_string(),
+                    label: "Attending operator".to_string(),
+                },
+                effect: NextActionEffect::GuardedConfirmation,
+                operation: NextActionOperation::ConfirmHostChange,
+                execution: NextActionExecution::OperatorConfirmation,
+                state: NextActionAvailabilityState::Ready,
+                expected: (0, 86_400),
+                recovery: NextActionRecovery {
+                    strategy: NextActionRecoveryStrategy::EscalateToOwner,
+                    escalation_after_secs: 86_400,
+                    escalation_owner: NextActionOwnerKind::Operator,
+                },
+            },
+        );
+
+        assert!(!descriptor.timing.overdue);
+        assert_eq!(descriptor.timing.next_check_at, None);
+        assert_eq!(
+            descriptor.availability.state,
+            NextActionAvailabilityState::Ready
+        );
+        assert_eq!(
+            descriptor.recovery_action.kind,
+            NextActionRecoveryActionKind::Escalate
         );
     }
 }

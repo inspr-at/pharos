@@ -824,13 +824,81 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
             )
         })
         .unwrap_or_default();
+    let (timing_state, timing) = workflow.next_action.as_ref().map_or_else(
+        || ("terminal", String::new()),
+        |action| {
+            let timing = &action.timing;
+            let expected = expected_range_label(
+                timing.expected_min_secs,
+                timing.expected_max_secs,
+            );
+            let next_check = timing.next_check_at.map_or_else(
+                || "Waiting for an operator".to_string(),
+                |at| format!("Automatic check by {}", clock_label(at)),
+            );
+            let recovery = match action.recovery_action.kind {
+                next_action::NextActionRecoveryActionKind::AutomaticRetry => {
+                    "retry this same saved action automatically"
+                }
+                next_action::NextActionRecoveryActionKind::Reconcile => {
+                    "reconcile recorded evidence before any retry"
+                }
+                next_action::NextActionRecoveryActionKind::RetrySameRun => {
+                    "retry only this same saved run"
+                }
+                next_action::NextActionRecoveryActionKind::Escalate => {
+                    "escalate to the recorded owner"
+                }
+            };
+            let attended = action.availability.execution
+                == next_action::NextActionExecution::OperatorConfirmation;
+            let state = if timing.overdue {
+                "overdue"
+            } else if attended {
+                "operator"
+            } else {
+                "on-schedule"
+            };
+            let heading = if timing.overdue {
+                "Taking longer than expected"
+            } else if attended {
+                "Waiting for your confirmation"
+            } else {
+                "Background progress is active"
+            };
+            let copy = if timing.overdue {
+                format!(
+                    "No new evidence arrived in the expected range. Pharos will {recovery}; it will not create a second run."
+                )
+            } else if attended {
+                format!(
+                    "No background action runs at this gate. You can {recovery} without creating a second run."
+                )
+            } else {
+                format!("Expected {expected}. Pharos will {recovery} if this becomes overdue.")
+            };
+            (
+                state,
+                format!(
+                    r#"<section class="host-workflow-timing" data-workflow-timing="{state}"><strong>{heading}</strong><p>{copy}</p><dl><dt>Last evidence</dt><dd><time>{last_update}</time></dd><dt>Next</dt><dd>{next_check}</dd><dt>Expected</dt><dd>{expected}</dd></dl></section>"#,
+                    state = state,
+                    heading = heading,
+                    copy = html_escape(&copy),
+                    last_update = html_escape(&clock_label(timing.last_update_at)),
+                    next_check = html_escape(&next_check),
+                    expected = html_escape(&expected),
+                ),
+            )
+        },
+    );
     let next = format!(
-        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p>{next_action}<dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>"#,
+        r#"<section class="host-workflow-next" aria-labelledby="host-workflow-next-title"><span>Next</span><div><h3 id="host-workflow-next-title">{title}</h3><p>{consequence}</p>{next_action}<dl><dt>Where</dt><dd>{location}</dd><dt>Will not</dt><dd>{boundary}</dd></dl></div></section>{timing}"#,
         title = html_escape(&workflow.next.title),
         consequence = html_escape(&workflow.next.consequence),
         next_action = next_action,
         location = html_escape(&workflow.next.location),
         boundary = html_escape(&workflow.next.boundary),
+        timing = timing,
     );
     let mut groups = String::new();
     let mut current_group = "";
@@ -956,14 +1024,36 @@ pub(crate) fn host_workflow_markup(workflow: &HostWorkflowSummary) -> String {
         .map(|location| format!(" on {}", html_escape(&location)))
         .unwrap_or_default();
     format!(
-        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}"><ol class="host-workflow-ladder" aria-label="Run truth: observed, declared, requested, executed, verified">{ladder}</ol><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{next}{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
+        r#"<section class="host-workflow-summary" data-workflow-kind="{kind}" data-workflow-status="{status}" data-workflow-timing-state="{timing_state}"><ol class="host-workflow-ladder" aria-label="Run truth: observed, declared, requested, executed, verified">{ladder}</ol><div class="host-workflow-meta"><span>Started <time>{created}</time></span><span><strong>{current_status}</strong>{current_location}</span></div>{next}{groups}<details class="host-workflow-advanced"><summary>Advanced details</summary><div><p>Sanitized plan evidence and workflow history. Credentials, secret values, paths, hashes, and command output are excluded.</p><dl class="host-workflow-evidence" aria-label="Sanitized workflow evidence">{evidence}</dl><ol>{events}</ol></div></details><p class="host-workflow-persisted">This run is saved and resumes after refresh or restart.</p></section>"#,
         kind = workflow_kind_key(workflow.kind),
         status = html_escape(&workflow.status_label),
         ladder = ladder,
         created = html_escape(&clock_label(workflow.created_at)),
         current_status = html_escape(current_status),
+        timing_state = timing_state,
         next = next,
     )
+}
+
+fn expected_range_label(min_secs: u32, max_secs: u32) -> String {
+    fn rounded(seconds: u32) -> (u32, &'static str) {
+        if seconds <= 3600 {
+            (seconds.max(1).div_ceil(60), "min")
+        } else {
+            (seconds.div_ceil(3600), "h")
+        }
+    }
+
+    let (max, max_unit) = rounded(max_secs.max(min_secs));
+    if min_secs == 0 {
+        return format!("usually within {max} {max_unit}");
+    }
+    let (min, min_unit) = rounded(min_secs);
+    if min_unit == max_unit {
+        format!("usually {min}–{max} {max_unit}")
+    } else {
+        format!("usually {min} {min_unit}–{max} {max_unit}")
+    }
 }
 
 fn workflow_kind_key(kind: host_actions::HostWorkflowKind) -> &'static str {
@@ -2705,7 +2795,9 @@ async fn reconcile_saved_next_actions(state: &AppState, now: i64) -> usize {
 
 fn spawn_next_action_loop(state: AppState) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            next_action::NEXT_ACTION_RECONCILE_SECS as u64,
+        ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
