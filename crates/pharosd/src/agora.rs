@@ -333,7 +333,7 @@ fn render_host_workspace(
 ) -> String {
     let extra_css = format!(
         r#"{AGORA_CSS}<style>
-.host-workspace{{width:min(1320px,100%);display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:22px;align-items:start}}
+.host-workspace{{width:min(1320px,100%);display:grid;grid-template-columns:310px minmax(0,1fr);gap:22px;align-items:start}}
 .host-workspace-main{{display:grid;gap:16px}}.host-workspace-identity,.host-workspace-section,.host-task-rail{{border:1px solid rgba(210,226,234,.92);border-radius:10px;background:rgba(255,255,255,.9);box-shadow:0 10px 30px rgba(45,75,95,.05)}}
 .host-workspace-identity{{padding:22px;display:flex;gap:15px;align-items:center}}.host-workspace-identity h2,.host-workspace-section h2,.host-task-rail h2{{margin:0;font-family:Georgia,"Times New Roman",serif;font-weight:500}}.host-workspace-identity p,.host-workspace-section p,.host-task-rail p{{margin:5px 0 0;color:var(--muted)}}
 .host-workspace-mark{{display:grid;place-items:center;width:48px;height:48px;border:3px solid {accent};border-radius:50%;color:var(--accent);background:#fff;box-shadow:0 0 0 7px color-mix(in srgb,{accent} 13%,transparent)}}

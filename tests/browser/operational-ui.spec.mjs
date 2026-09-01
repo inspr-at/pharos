@@ -1398,6 +1398,7 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   const host = `host-workspace-${testInfo.project.name}`;
   await reportRuntimeHost(page, host, { preferences: { accent: "#224466" } });
 
+  await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/");
   await page.evaluate(() => {
     clearRefreshTimer();
@@ -1428,6 +1429,18 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-host-workspace-services]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-activity]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-technical]")).toBeVisible();
+  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "sticky");
+  const desktopGeometry = await page.locator("[data-host-workspace]").evaluate((workspace) => {
+    const rail = workspace.querySelector("[data-host-task-rail]");
+    const main = workspace.querySelector(".host-workspace-main");
+    return {
+      railWidth: rail?.getBoundingClientRect().width ?? 0,
+      mainWidth: main?.getBoundingClientRect().width ?? 0,
+    };
+  });
+  expect(desktopGeometry.railWidth).toBeGreaterThanOrEqual(300);
+  expect(desktopGeometry.railWidth).toBeLessThanOrEqual(312);
+  expect(desktopGeometry.mainWidth).toBeGreaterThan(desktopGeometry.railWidth * 2);
 
   await page.reload();
   await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
