@@ -20,8 +20,9 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # openssh-client: pharosd can run read-only existing-host preflight and
 # convergence-marker probes when the runtime has non-interactive SSH access.
 # iputils-ping: the fixed appliance-presence signal used before testing SSH.
-# The Debian image digest and package indexes share one immutable snapshot
-# date. 20260907T180056Z is the debian-security snapshot that indexes
+# The runtime base image is pinned by digest. Package indexes are pinned to a
+# separate immutable snapshot; those pins need not share a date.
+# 20260907T180056Z is the debian-security snapshot that indexes
 # libssh2-1 1.10.0-3+deb12u1; the 20260901T000000Z pin still selected
 # 1.10.0-3+b1. HTTP transport is safe here because apt verifies Debian's
 # signed Release metadata and package hashes.

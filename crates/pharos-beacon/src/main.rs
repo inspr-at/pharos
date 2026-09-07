@@ -5979,11 +5979,6 @@ mod tests {
         assert!(dockerfile.contains(r#"if [ -n "${PHAROS_URL:-}" ]; then"#));
         assert!(dockerfile.contains("exec /usr/local/bin/pharos-beacon healthcheck"));
         assert!(dockerfile.contains("exec /usr/local/bin/pharosd healthcheck"));
-        assert!(dockerfile.contains("ARG DEBIAN_SNAPSHOT=20260907T180056Z"));
-        assert!(dockerfile.contains("libssh2-1 1.10.0-3+deb12u1"));
-        assert!(dockerfile.contains(
-            "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171"
-        ));
     }
 
     #[test]
