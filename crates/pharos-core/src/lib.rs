@@ -3438,13 +3438,19 @@ pub fn liveness(
 // artifact identity, distinct from Nix generation / flake.lock evidence.
 // `deny_unknown_fields` makes any addition breaking for an older consumer, so
 // the version moves with it and the rollout order in README applies: control
-// plane first, then beacons.
+// plane first, then beacons. Known browser clients still emit v4, so the
+// control plane keeps accepting v4 and v5 as supported predecessors.
 pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v6";
 pub const HOST_REPORT_VERSION: u16 = 6;
-pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v5";
-pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 5;
-pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 2] = [
-    (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
+pub const HOST_REPORT_V4_SCHEMA: &str = "inspr.pharos.host-report.v4";
+pub const HOST_REPORT_V4_VERSION: u16 = 4;
+pub const HOST_REPORT_V5_SCHEMA: &str = "inspr.pharos.host-report.v5";
+pub const HOST_REPORT_V5_VERSION: u16 = 5;
+pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = HOST_REPORT_V5_SCHEMA;
+pub const PREVIOUS_HOST_REPORT_VERSION: u16 = HOST_REPORT_V5_VERSION;
+pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 3] = [
+    (HOST_REPORT_V4_SCHEMA, HOST_REPORT_V4_VERSION),
+    (HOST_REPORT_V5_SCHEMA, HOST_REPORT_V5_VERSION),
     (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
 ];
 
@@ -3482,7 +3488,7 @@ pub struct HostReport {
     #[serde(default)]
     pub preferences: HostPreferences,
     /// Optional measured deployed-release identity. Missing means unknown, not
-    /// that the configured artifact is running. v5 reports must omit this.
+    /// that the configured artifact is running. v4 and v5 reports must omit this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployed_artifact: Option<DeployedArtifactEvidence>,
 }
@@ -3495,7 +3501,15 @@ impl HostReport {
         {
             return Err("unsupported report schema/version pair".to_string());
         }
-        if self.version == PREVIOUS_HOST_REPORT_VERSION && self.deployed_artifact.is_some() {
+        if self.version == HOST_REPORT_V4_VERSION {
+            if freshness_carries_v5_proof(&self.freshness) {
+                return Err("report v4 must not carry v5 freshness evidence".to_string());
+            }
+            if self.deployed_artifact.is_some() {
+                return Err("report v4 must not carry v6 deployed artifact evidence".to_string());
+            }
+        }
+        if self.version == HOST_REPORT_V5_VERSION && self.deployed_artifact.is_some() {
             return Err("report v5 must not carry v6 deployed artifact evidence".to_string());
         }
         validate_report_identity(&self.name, &self.role)?;
@@ -3557,6 +3571,12 @@ impl HostReport {
         }
         Ok(())
     }
+}
+
+fn freshness_carries_v5_proof(freshness: &NixFreshness) -> bool {
+    freshness.deployment_evidence.is_some()
+        || freshness.nixcfg_comparison.is_some()
+        || freshness.nixpkgs_comparison.is_some()
 }
 
 fn validate_report_identity(name: &str, role: &str) -> Result<(), String> {
@@ -4599,6 +4619,13 @@ mod tests {
         report.schema = HOST_REPORT_SCHEMA.to_string();
         report.version = HOST_REPORT_VERSION;
         report.validate_contract().unwrap();
+
+        let mut v4 = report.clone();
+        v4.schema = HOST_REPORT_V4_SCHEMA.to_string();
+        v4.version = HOST_REPORT_V4_VERSION;
+        assert!(v4.validate_contract().is_err());
+        v4.deployed_artifact = None;
+        v4.validate_contract().unwrap();
     }
 
     fn proven_current_freshness(channel: &str) -> NixFreshness {
@@ -6482,8 +6509,8 @@ mod tests {
         // A v4 beacon that has not rolled yet must keep reporting. PHAROS-202
         // added exact evidence, and the rollout order is control plane first.
         let report: HostReport = serde_json::from_value(serde_json::json!({
-            "schema": PREVIOUS_HOST_REPORT_SCHEMA,
-            "version": PREVIOUS_HOST_REPORT_VERSION,
+            "schema": HOST_REPORT_V4_SCHEMA,
+            "version": HOST_REPORT_V4_VERSION,
             "name": "hsb8",
             "role": "server",
             "is_nix": true,
@@ -6541,8 +6568,8 @@ mod tests {
         assert!(secondary_without_primary.validate_contract().is_err());
 
         let previous: HostReport = serde_json::from_value(serde_json::json!({
-            "schema": PREVIOUS_HOST_REPORT_SCHEMA,
-            "version": PREVIOUS_HOST_REPORT_VERSION,
+            "schema": HOST_REPORT_V4_SCHEMA,
+            "version": HOST_REPORT_V4_VERSION,
             "name": "hsb8",
             "role": "server",
             "is_nix": true,
@@ -6564,6 +6591,20 @@ mod tests {
         let mut forged = previous;
         forged.freshness = proven_current_freshness("nixos-unstable");
         assert!(forged.validate_contract().is_err());
+
+        let mut v5 = forged.clone();
+        v5.schema = HOST_REPORT_V5_SCHEMA.to_string();
+        v5.version = HOST_REPORT_V5_VERSION;
+        v5.validate_contract()
+            .expect("v5 may carry current generation freshness");
+        v5.deployed_artifact = Some(measured_artifact());
+        assert!(v5.validate_contract().is_err());
+
+        let mut v6 = v5.clone();
+        v6.schema = HOST_REPORT_SCHEMA.to_string();
+        v6.version = HOST_REPORT_VERSION;
+        v6.validate_contract()
+            .expect("v6 accepts valid current freshness and deployed-artifact evidence");
 
         let v2: HostReport = serde_json::from_value(serde_json::json!({
             "schema": "inspr.pharos.host-report.v2",

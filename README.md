@@ -100,7 +100,8 @@ layer. There is no separate frontend build or client framework.
 
 The shared Rust contracts matter: server and beacon cannot silently drift onto
 different report schemas. The current report contract is
-`inspr.pharos.host-report.v5`; the local onboarding envelope is
+`inspr.pharos.host-report.v6`; the control plane still accepts predecessor
+`v5` and `v4` reports. The local onboarding envelope is
 `inspr.pharos.host-registration.v1`. Both require explicit schema/version
 fields and reject extensions. Reports are limited to 64 KiB, heartbeat cadence
 is 10–3600 seconds, and all identities, freshness values, and observation text
@@ -699,7 +700,7 @@ promised third-party API. The important boundaries are:
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
 | `GET /healthz`, `GET /version`                                     | Public health and build metadata                                                                                          |
 | `POST /register`                                                   | Strict versioned registration contract plus deployment bootstrap token; issues one per-host token                         |
-| `POST /report`                                                     | Strict 64 KiB beacon v5/v4 contract and per-host bearer token                                                             |
+| `POST /report`                                                     | Strict 64 KiB beacon v6/v5/v4 contract and per-host bearer token                                                          |
 | `GET /hosts.json`, `GET /declared-hosts.json`, `GET /proof/{host}` | OIDC/access-policy or scoped machine-operator guarded fleet views                                                         |
 | `POST /host-need-intents`                                          | Stores a typed need and creates only the existing immutable Hetzner plan review; authorization and create remain separate |
 | `POST /setup/existing-host/preflight`                              | Guarded read-only onboarding facts                                                                                        |

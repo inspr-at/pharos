@@ -1,7 +1,8 @@
 use pharos_core::{
     GitRevisionRelation, HostPreferences, HostRegistration, HostReport, NixFreshness,
     NixcfgGitComparison, NixpkgsGitComparison, NixpkgsRevisionRelation, HOST_REGISTRATION_SCHEMA,
-    HOST_REGISTRATION_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION, MAX_HOST_REPORT_BYTES,
+    HOST_REGISTRATION_VERSION, HOST_REPORT_SCHEMA, HOST_REPORT_V4_SCHEMA, HOST_REPORT_V4_VERSION,
+    HOST_REPORT_V5_SCHEMA, HOST_REPORT_V5_VERSION, HOST_REPORT_VERSION, MAX_HOST_REPORT_BYTES,
     PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION, SUPPORTED_HOST_REPORT_CONTRACTS,
 };
 use proptest::prelude::*;
@@ -33,10 +34,14 @@ fn control_plane_accepts_current_and_previous_reports_for_ordered_rollouts() {
     assert_eq!(
         SUPPORTED_HOST_REPORT_CONTRACTS,
         [
-            (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
+            (HOST_REPORT_V4_SCHEMA, HOST_REPORT_V4_VERSION),
+            (HOST_REPORT_V5_SCHEMA, HOST_REPORT_V5_VERSION),
             (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
         ]
     );
+    assert_eq!(PREVIOUS_HOST_REPORT_SCHEMA, HOST_REPORT_V5_SCHEMA);
+    assert_eq!(PREVIOUS_HOST_REPORT_VERSION, HOST_REPORT_V5_VERSION);
+    assert_eq!(HOST_REPORT_V4_VERSION + 1, HOST_REPORT_V5_VERSION);
     assert_eq!(PREVIOUS_HOST_REPORT_VERSION + 1, HOST_REPORT_VERSION);
 
     let current = report("current.example".to_string(), "server".to_string(), 60);
@@ -46,9 +51,17 @@ fn control_plane_accepts_current_and_previous_reports_for_ordered_rollouts() {
         schema: PREVIOUS_HOST_REPORT_SCHEMA.to_string(),
         version: PREVIOUS_HOST_REPORT_VERSION,
         name: "previous.example".to_string(),
-        ..current
+        ..current.clone()
     };
     previous.validate_contract().unwrap();
+
+    let v4 = HostReport {
+        schema: HOST_REPORT_V4_SCHEMA.to_string(),
+        version: HOST_REPORT_V4_VERSION,
+        name: "v4.example".to_string(),
+        ..current.clone()
+    };
+    v4.validate_contract().unwrap();
 
     let mismatched = HostReport {
         version: HOST_REPORT_VERSION,

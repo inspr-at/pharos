@@ -32,17 +32,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
-    collect_deployed_artifact_from_metadata_file, configured_container_matches_measurement,
-    evidence_from_running_container, parse_approved_release_envelope,
-    parse_running_container_format, valid_allowlisted_container_ref, BackupConfiguredState,
-    BackupEngine, BackupObservation, BackupPostureState, BackupRunState, DeployedArtifactEvidence,
-    GitRevisionRelation, HostLocation, HostLocationSource, HostPreferences,
-    HostPreferencesRegistry, HostReport, HostReportResponse, KernelPosture, NixDeploymentEvidence,
-    NixFreshness, NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness,
-    NixpkgsRevisionRelation, ServiceObservation, ServiceObservationState, HOST_REPORT_SCHEMA,
-    HOST_REPORT_VERSION, MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES, MAX_HEARTBEAT_INTERVAL_SECS,
-    MAX_INBOUND_RTT_MS, MAX_SERVICE_OBSERVATIONS, MIN_HEARTBEAT_INTERVAL_SECS,
-    RUNNING_CONTAINER_DOCKER_FORMAT,
+    configured_container_matches_measurement, evidence_from_running_container,
+    parse_approved_release_envelope, parse_running_container_format,
+    valid_allowlisted_container_ref, BackupConfiguredState, BackupEngine, BackupObservation,
+    BackupPostureState, BackupRunState, DeployedArtifactEvidence, GitRevisionRelation,
+    HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
+    HostReportResponse, KernelPosture, NixDeploymentEvidence, NixFreshness, NixcfgGitComparison,
+    NixpkgsGitComparison, NixpkgsInputFreshness, NixpkgsRevisionRelation, ServiceObservation,
+    ServiceObservationState, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+    MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS,
+    MAX_SERVICE_OBSERVATIONS, MIN_HEARTBEAT_INTERVAL_SECS, RUNNING_CONTAINER_DOCKER_FORMAT,
 };
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -3779,6 +3778,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pharos_core::collect_deployed_artifact_from_metadata_file;
 
     fn generation() -> ProcessGeneration {
         ProcessGeneration::current().expect("current process generation")

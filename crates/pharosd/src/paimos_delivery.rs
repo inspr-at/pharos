@@ -42,6 +42,7 @@ pub(crate) const PAIMOS_RELEASE: &str = "v26.09.05";
 pub(crate) const PAIMOS_CERTIFIED_COMMIT: &str = "bb3b874f22a14fbe3879b1b575f33d55a001312d";
 pub(crate) const PAIMOS_FIXTURE_DIGEST: &str =
     "sha256:6bba9613230c6ea728db58ffea5533399caed19e6d56a8d78ef19d0fde20be8a";
+#[cfg(test)]
 pub(crate) const PAIMOS_JANUS_DEPENDENCY_SHA256: &str =
     "52a647abd52e229fcdef8461eeb9f7d31f07632501ad33f594cdfbc155c23d4b";
 
@@ -1253,10 +1254,12 @@ impl PaimosDeliveryAdapter {
                 Ok(job) => {
                     if job.host != intent.host
                         || job.workflow_kind() != HostWorkflowKind::UpdateRestart
-                        || job.confirmed_at.is_some()
                     {
                         return Err(AdapterError::LocalBinding);
                     }
+                    // Exact owned job may already be confirmed if the operator
+                    // acted after insert and before journal persist. Bind that
+                    // job only; never confirm, claim, dispatch, or adopt another.
                     job.id
                 }
                 Err(
@@ -2027,6 +2030,39 @@ mod tests {
             )
             .expect("record guarded update result");
         job.id
+    }
+
+    fn operator_confirm_existing_update(store: &HostActionStore, job_id: &str, now: i64) {
+        let review = store
+            .claim("hsb8", now)
+            .expect("claim review")
+            .expect("review lease");
+        store
+            .record_agent_result(
+                job_id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: review.phase,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(HostActionPlan {
+                        changed_file_count: 2,
+                        changed_areas: vec!["flake.lock".to_string()],
+                        all_host_eval_passed: true,
+                        target_build_passed: true,
+                        backup_ready: true,
+                        running_kernel: Some("6.18.1".to_string()),
+                        expected_kernel: Some("6.18.2".to_string()),
+                        restart_required: true,
+                    }),
+                    result: None,
+                },
+                now + 1,
+            )
+            .expect("record review");
+        store
+            .confirm_update(job_id, "hsb8", "operator", now + 2)
+            .expect("operator confirm");
     }
 
     fn record_nix_only_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
@@ -3288,6 +3324,78 @@ mod tests {
             .collect();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, job_id);
+        assert_eq!(
+            restarted
+                .journal
+                .operation(DEPLOYMENT_HANDOFF)
+                .unwrap()
+                .job_id,
+            job_id
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn crash_after_create_then_operator_confirm_still_binds_the_same_job() {
+        let now = now_unix();
+        let directory = temporary_directory("crash-after-confirm");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let fake = FakePaimos::new(now);
+        let (origin, server) = serve_fake(fake).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        let adapter = test_adapter(
+            config(origin.clone(), api_path.clone(), vec![deployment.clone()]),
+            directory.join("journal.json"),
+            hosts.clone(),
+            actions.clone(),
+        );
+        let journal_path = directory.join("journal.json");
+        adapter.process_intent(&deployment).await.unwrap();
+        let job_id = adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("created job")
+            .job_id;
+        operator_confirm_existing_update(&actions, &job_id, now_unix());
+        let confirmed = actions.get(&job_id).expect("confirmed owned job");
+        assert_eq!(confirmed.state, HostActionState::QueuedApply);
+        assert!(confirmed.confirmed_at.is_some());
+        let confirmed_at = confirmed.confirmed_at;
+        let event_count = confirmed.events.len();
+        assert!(confirmed
+            .events
+            .iter()
+            .any(|event| event.kind == HostActionEventKind::Confirmed));
+        {
+            let mut document = adapter.journal.document.lock().expect("journal");
+            document.operations.clear();
+            crate::durable_file::atomic_write_json(&journal_path, &*document)
+                .expect("drop operation binding from durable journal");
+        }
+
+        let restarted = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            journal_path,
+            hosts,
+            actions.clone(),
+        );
+        restarted.process_intent(&deployment).await.unwrap();
+        let jobs: Vec<_> = actions
+            .list()
+            .into_iter()
+            .filter(|job| job.kind == HostActionKind::UpdateRestart)
+            .collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert_eq!(jobs[0].state, HostActionState::QueuedApply);
+        assert_eq!(jobs[0].confirmed_at, confirmed_at);
+        assert_eq!(jobs[0].events.len(), event_count);
+        assert_eq!(jobs[0].requested_by, GUARDED_ACTOR);
         assert_eq!(
             restarted
                 .journal
