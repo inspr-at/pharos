@@ -1,12 +1,12 @@
 # Pharos Changelog
 
+## Unreleased
+
 ## 26.09.07.20.52.53 - 2026-09-07
 
 - Add guarded Paimos deployment and verification handoffs with durable, idempotent job ownership. Operator confirmation remains required before host actions.
 - Bind success to later measured container artifacts and preserve host-report v4/v5 compatibility alongside v6 evidence.
 - Keep Janus dependency evidence distinct from Pharos ownership. Roll out the control plane before v6 beacons; configure artifact observation explicitly.
-
-## Unreleased
 
 ## 26.09.01.13.29.31 - 2026-09-01
 

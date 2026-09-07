@@ -5281,7 +5281,12 @@ mod tests {
         assert_eq!(payload["version"], APP_VERSION);
         assert_eq!(payload["version_scheme"], VERSION_SCHEME);
         assert_eq!(payload["release_channel"], RELEASE_CHANNEL);
-        assert_eq!(payload["release_sequence"], 1);
+        assert_eq!(
+            payload["release_sequence"],
+            RELEASE_SEQUENCE
+                .parse::<u64>()
+                .expect("embedded release sequence")
+        );
         assert_eq!(
             payload["ecosystem_versions"]["cargo_semver"],
             env!("CARGO_PKG_VERSION")
