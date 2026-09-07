@@ -15,6 +15,14 @@ release_version = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = release_version
 SPEC.loader.exec_module(release_version)
 
+# Immutable first-calendar history. These stay fixed when the live document
+# advances; live RELEASE.json is only the current successor under test.
+FIRST_CALENDAR_VERSION = "26.09.01.13.29.31"
+FIRST_CALENDAR_SEQUENCE = 1
+NEXT_CALENDAR_VERSION = "26.09.01.13.29.32"
+NEXT_CALENDAR_SEQUENCE = 2
+LATER_CALENDAR_VERSION = "26.09.01.13.29.33"
+
 
 class CalendarVersionTests(unittest.TestCase):
     @staticmethod
@@ -22,6 +30,22 @@ class CalendarVersionTests(unittest.TestCase):
         return json.loads(
             (Path(__file__).resolve().parents[1] / "RELEASE.json").read_text(encoding="utf-8")
         )
+
+    @classmethod
+    def calendar_release(cls, version, sequence, *, first=None):
+        document = copy.deepcopy(cls.release_document())
+        document["version"] = version
+        document["release_sequence"] = sequence
+        document["ecosystem_versions"]["cargo_semver"] = release_version.calendar_to_cargo(
+            version
+        )
+        if first is not None:
+            document["migration_anchor"]["first_calendar_version"] = first
+        return document
+
+    @classmethod
+    def first_calendar_release(cls):
+        return cls.calendar_release(FIRST_CALENDAR_VERSION, FIRST_CALENDAR_SEQUENCE)
 
     @classmethod
     def release_set_document(cls):
@@ -156,58 +180,90 @@ class CalendarVersionTests(unittest.TestCase):
             release_version.compare_releases(legacy, duplicate)
 
     def test_subsequent_release_preserves_first_calendar_anchor(self):
-        release = self.release_document()
-        subsequent = copy.deepcopy(release)
-        subsequent["version"] = "26.09.01.13.29.32"
-        subsequent["release_sequence"] = 2
-        subsequent["ecosystem_versions"]["cargo_semver"] = "2026.901.132932"
+        first = self.first_calendar_release()
+        subsequent = self.calendar_release(NEXT_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE)
         release_version.validate_release(subsequent)
-        release_version.validate_reservation_history(subsequent, (release,), ())
-        self.assertEqual(subsequent["migration_anchor"], release["migration_anchor"])
+        release_version.validate_reservation_history(subsequent, (first,), ())
+        self.assertEqual(subsequent["migration_anchor"], first["migration_anchor"])
+        self.assertEqual(
+            subsequent["migration_anchor"]["first_calendar_version"], FIRST_CALENDAR_VERSION
+        )
+        self.assertEqual(
+            subsequent["migration_anchor"]["first_calendar_release_sequence"],
+            FIRST_CALENDAR_SEQUENCE,
+        )
+
+    def test_current_release_is_valid_sequence_two_successor(self):
+        first = self.first_calendar_release()
+        current = self.release_document()
+        self.assertEqual(current["release_sequence"], NEXT_CALENDAR_SEQUENCE)
+        self.assertEqual(
+            current["migration_anchor"]["first_calendar_version"], FIRST_CALENDAR_VERSION
+        )
+        self.assertEqual(current["migration_anchor"], first["migration_anchor"])
+        self.assertNotEqual(current["version"], FIRST_CALENDAR_VERSION)
+        first_identity = release_version.ReleaseIdentity(
+            release_version.CALENDAR_SCHEME, FIRST_CALENDAR_VERSION, FIRST_CALENDAR_SEQUENCE
+        )
+        current_identity = release_version.ReleaseIdentity(
+            release_version.CALENDAR_SCHEME,
+            current["version"],
+            current["release_sequence"],
+        )
+        self.assertLess(release_version.compare_releases(first_identity, current_identity), 0)
+        release_version.validate_release(current)
+        release_version.validate_reservation_history(current, (first,), ())
 
     def test_repository_reservation_must_advance_coordinate_and_sequence(self):
-        release = self.release_document()
+        first = self.first_calendar_release()
         for version, sequence, tags in (
-            ("26.09.01.13.29.31", 2, ()),
-            ("26.09.01.13.29.32", 3, ()),
-            ("26.09.01.13.29.32", 2, ("26.09.01.13.29.31",)),
-            ("26.09.01.13.29.32", 2, ("26.09.01.13.29.33",)),
+            (FIRST_CALENDAR_VERSION, 2, ()),
+            (NEXT_CALENDAR_VERSION, 3, ()),
+            (NEXT_CALENDAR_VERSION, 2, (FIRST_CALENDAR_VERSION,)),
+            (NEXT_CALENDAR_VERSION, 2, (LATER_CALENDAR_VERSION,)),
         ):
-            candidate = copy.deepcopy(release)
-            candidate["version"] = version
-            candidate["release_sequence"] = sequence
-            candidate["ecosystem_versions"]["cargo_semver"] = release_version.calendar_to_cargo(
-                version
-            )
+            candidate = self.calendar_release(version, sequence)
             with self.subTest(version=version, sequence=sequence, tags=tags), self.assertRaises(
                 release_version.ReleaseVersionError
             ):
-                tagged = tuple(
-                    {
-                        **release,
-                        "version": tag,
-                        "release_sequence": 2,
-                        "ecosystem_versions": {
-                            "cargo_semver": release_version.calendar_to_cargo(tag)
-                        },
-                    }
-                    for tag in tags
-                )
-                release_version.validate_reservation_history(candidate, (release,), tagged)
+                tagged = tuple(self.calendar_release(tag, 2) for tag in tags)
+                release_version.validate_reservation_history(candidate, (first,), tagged)
+
+    def test_reservation_history_rejects_gap_regression_and_collision(self):
+        first = self.first_calendar_release()
+        next_release = self.calendar_release(NEXT_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE)
+        later = self.calendar_release(LATER_CALENDAR_VERSION, 3)
+        collision = self.calendar_release(LATER_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE)
+        regressed_anchor = self.calendar_release(
+            NEXT_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE, first="26.09.01.13.29.30"
+        )
+
+        with self.subTest("sequence gap"), self.assertRaises(release_version.ReleaseVersionError):
+            release_version.validate_reservation_history(later, (first,), ())
+        with self.subTest("history regression"), self.assertRaises(
+            release_version.ReleaseVersionError
+        ):
+            release_version.validate_reservation_history(first, (next_release,), ())
+        with self.subTest("sequence collision"), self.assertRaises(
+            release_version.ReleaseVersionError
+        ):
+            release_version.validate_reservation_history(collision, (first, next_release), ())
+        with self.subTest("coordinate reuse"), self.assertRaises(
+            release_version.ReleaseVersionError
+        ):
+            release_version.validate_reservation_history(
+                self.calendar_release(FIRST_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE),
+                (first,),
+                (),
+            )
+        with self.subTest("regressed migration anchor"), self.assertRaises(
+            release_version.ReleaseVersionError
+        ):
+            release_version.validate_reservation_history(regressed_anchor, (first,), ())
 
     def test_repository_history_includes_annotated_off_branch_calendar_tags(self):
-        template = self.release_document()
-
         def coordinate(version, sequence, *, first=None):
-            document = copy.deepcopy(template)
-            document["version"] = version
-            document["release_sequence"] = sequence
-            document["ecosystem_versions"]["cargo_semver"] = release_version.calendar_to_cargo(
-                version
-            )
-            if first is not None:
-                document["migration_anchor"]["first_calendar_version"] = first
-            return document
+            return self.calendar_release(version, sequence, first=first)
 
         with tempfile.TemporaryDirectory() as raw_directory:
             repo = Path(raw_directory)
@@ -230,15 +286,15 @@ class CalendarVersionTests(unittest.TestCase):
             (repo / "README").write_text("fixture\n", encoding="utf-8")
             git("add", "README")
             git("commit", "-m", "base")
-            first = coordinate("26.09.01.13.29.31", 1)
+            first = coordinate(FIRST_CALENDAR_VERSION, FIRST_CALENDAR_SEQUENCE)
             commit_release(first, "first")
-            git("tag", "-a", "v26.09.01.13.29.31", "-m", "first")
+            git("tag", "-a", f"v{FIRST_CALENDAR_VERSION}", "-m", "first")
             git("checkout", "-b", "off-branch")
-            second = coordinate("26.09.01.13.29.32", 2)
+            second = coordinate(NEXT_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE)
             commit_release(second, "second off branch")
-            git("tag", "-a", "v26.09.01.13.29.32", "-m", "second")
+            git("tag", "-a", f"v{NEXT_CALENDAR_VERSION}", "-m", "second")
             git("checkout", "main")
-            current = coordinate("26.09.01.13.29.33", 3)
+            current = coordinate(LATER_CALENDAR_VERSION, 3)
             commit_release(current, "third on main")
 
             release_version.validate_reservation_history(
@@ -247,7 +303,7 @@ class CalendarVersionTests(unittest.TestCase):
                 release_version._tagged_calendar_releases(repo),
             )
 
-            git("checkout", "-b", "collision", "v26.09.01.13.29.31^{}")
+            git("checkout", "-b", "collision", f"v{FIRST_CALENDAR_VERSION}^{{}}")
             collision = coordinate("26.09.01.13.29.34", 2)
             commit_release(collision, "colliding off branch")
             git("tag", "-a", "v26.09.01.13.29.34", "-m", "collision")
