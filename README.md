@@ -405,17 +405,22 @@ identity. The adapter emits only sequence 1 `accepted` followed by sequence 2
 `succeeded` or `failed`—never `active` or a heartbeat.
 
 Deployment success requires an operator-confirmed owned `UpdateRestart` to
-finish and a newer fresh beacon to report a measured deployed-release identity
-that matches the locally configured environment and artifact tuple. Nix
-generation evidence and `flake.lock` digest are not that identity. Missing,
-stale, mismatched, predated, wrong-environment or wrong-digest-class
+finish and a newer fresh beacon to report a measured running-container identity
+whose immutable image **config ID** matches the locally configured artifact
+digest. This collector does not measure OCI index or manifest digests; those
+expectations fail closed instead of being coerced. Nix generation evidence and
+`flake.lock` digest are not that identity. An operator JSON file is not a
+measurement: a digest-bound release envelope may supply the release tuple only
+when it names the same config ID the running container actually has, and the
+observation time is taken from the measurement clock. Missing, stopped,
+replaced, stale, mismatched, predated, wrong-environment or wrong-digest-class
 observations fail closed. Verification uses a separate handoff and remains
 unreported until Paimos received deployment and a later observation of the same
 host, environment, artifact and lineage arrives. Human attended confirmation
 remains the first-slice go-live; this adapter does not grant hidden automatic
-authority. Live host proof still requires operator-configured measurement and
-a completed guarded apply—this repository does not claim that proof from
-fixtures.
+authority. Live host proof still requires operator-configured container
+allowlisting plus a completed guarded apply—this repository does not claim that
+proof from fixtures.
 
 ### 5. Requested is never presented as applied
 
@@ -745,7 +750,8 @@ promised third-party API. The important boundaries are:
 | `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE`       | Per-host bearer credential; the file form wins and is preferred                                                                                                                          |
 | `NIXCFG_DIR`                               | Read-only checkout used as a Git object source; lock context is accepted only when its digest matches the active generation                                                              |
 | `PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE`      | Strict generation-owned Nix evidence; missing or malformed evidence renders freshness unverified. This is not a released-software digest.                                                 |
-| `PHAROS_DEPLOYED_ARTIFACT_EVIDENCE_FILE`   | Optional locally allowlisted measured release identity (`allowlisted-metadata-file`); missing, oversized or untyped files omit the field and deployment matching fails closed             |
+| `PHAROS_DEPLOYED_ARTIFACT_CONTAINER`       | Exact locally allowlisted running container name or id for collector `allowlisted-running-container`; missing, stopped, replaced or invalid identifiers omit deployed-artifact evidence |
+| `PHAROS_DEPLOYED_ARTIFACT_RELEASE_ENVELOPE_FILE` | Optional regular, non-symlink, non-world-writable envelope bound to the measured OCI config digest; it cannot supply observation time or prove a different running image            |
 | `PHAROS_NIXCFG_REMOTE_URL`                 | Credential-free HTTPS Git repository used as authoritative nixcfg source                                                                                                                 |
 | `PHAROS_NIXCFG_REMOTE_REF`                 | Exact `refs/heads/*` authoritative nixcfg branch                                                                                                                                         |
 | `PHAROS_NIXPKGS_REMOTE_URL`                | Credential-free HTTPS nixpkgs Git repository; the official NixOS/nixpkgs remote uses the bounded official channel publication, while custom remotes use exact fail-closed Git comparison |

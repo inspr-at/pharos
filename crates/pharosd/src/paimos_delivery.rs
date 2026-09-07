@@ -1386,12 +1386,12 @@ impl PaimosDeliveryAdapter {
         let Some(host) = self.hosts.get(&intent.host) else {
             return Ok(None);
         };
-        let Some(observed_at) = host.last_seen else {
-            return Ok(None);
-        };
         let Some(evidence) = host.deployed_artifact.as_ref() else {
             return Ok(None);
         };
+        if !evidence.is_config_class_measurement() {
+            return Err(AdapterError::LocalBinding);
+        }
         if !evidence.matches_expected(
             &intent.environment,
             intent.artifact.version_scheme,
@@ -1405,6 +1405,7 @@ impl PaimosDeliveryAdapter {
         ) {
             return Err(AdapterError::LocalBinding);
         }
+        let observed_at = evidence.observed_at;
         if observed_at <= strictly_after
             || observed_at > now.saturating_add(120)
             || now.saturating_sub(observed_at) > self.config.verification_freshness_secs
@@ -1823,8 +1824,10 @@ mod tests {
     use axum::http::{Request, Response};
     use axum::Router;
     use pharos_core::{
-        collect_deployed_artifact_from_metadata_file, ArtifactDigestClass, ArtifactVersionScheme,
+        evidence_from_running_container, parse_approved_release_envelope,
+        parse_running_container_format, ArtifactDigestClass, ArtifactVersionScheme,
         DeployedArtifactEvidence, HostReport, NixDeploymentEvidence, NixFreshness,
+        APPROVED_RELEASE_ENVELOPE_SCHEMA, APPROVED_RELEASE_ENVELOPE_VERSION,
         DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA, DEPLOYED_ARTIFACT_EVIDENCE_VERSION, HOST_REPORT_SCHEMA,
         HOST_REPORT_VERSION, NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
@@ -1889,7 +1892,31 @@ mod tests {
         }
     }
 
-    fn measured_from(artifact: &ArtifactEvidence) -> DeployedArtifactEvidence {
+    fn measured_from(artifact: &ArtifactEvidence, observed_at: i64) -> DeployedArtifactEvidence {
+        DeployedArtifactEvidence {
+            schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
+            version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
+            environment: "production-eu1".to_string(),
+            version_scheme: artifact.version_scheme,
+            artifact_version: artifact.version.clone(),
+            release_channel: artifact.release_channel.clone(),
+            release_sequence: artifact.release_sequence,
+            digest: artifact.digest.clone(),
+            digest_class: ArtifactDigestClass::OciConfig,
+            commit_digest: artifact.commit_digest.clone(),
+            release_manifest_coordinate: artifact.release_manifest_coordinate.clone(),
+            release_manifest_digest: artifact.release_manifest_digest.clone(),
+            oci_index_digest: None,
+            oci_manifest_digest: None,
+            oci_config_digest: Some(artifact.digest.clone()),
+            observed_at,
+        }
+    }
+
+    fn manifest_class_evidence(
+        artifact: &ArtifactEvidence,
+        observed_at: i64,
+    ) -> DeployedArtifactEvidence {
         DeployedArtifactEvidence {
             schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
             version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
@@ -1906,6 +1933,7 @@ mod tests {
             oci_index_digest: Some(format!("sha256:{}", "5".repeat(64))),
             oci_manifest_digest: Some(artifact.digest.clone()),
             oci_config_digest: Some(format!("sha256:{}", "6".repeat(64))),
+            observed_at,
         }
     }
 
@@ -2050,7 +2078,8 @@ mod tests {
                     inbound_rtt_ms: None,
                     location: None,
                     preferences: Default::default(),
-                    deployed_artifact: include_measured.then(|| measured_from(artifact)),
+                    deployed_artifact: include_measured
+                        .then(|| measured_from(artifact, observed_at)),
                 },
                 observed_at,
             )
@@ -3485,7 +3514,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let mut wrong_env = measured_from(&artifact());
+        let mut wrong_env = measured_from(&artifact(), now - 5);
         wrong_env.environment = "production-us1".to_string();
         record_beacon(&hosts, now - 10, &artifact());
         let report = {
@@ -3518,12 +3547,34 @@ mod tests {
     #[test]
     fn real_producer_measurement_fixture_preserves_oci_classes() {
         let artifact = calendar_artifact();
-        let evidence = measured_from(&artifact);
-        let encoded = serde_json::to_vec(&evidence).unwrap();
-        let parsed = collect_deployed_artifact_from_metadata_file(&encoded).unwrap();
-        assert_eq!(parsed.digest_class, ArtifactDigestClass::OciManifest);
-        assert_ne!(parsed.oci_index_digest, parsed.oci_manifest_digest);
-        assert_ne!(parsed.oci_manifest_digest, parsed.oci_config_digest);
+        let envelope = pharos_core::ApprovedReleaseEnvelope {
+            schema: APPROVED_RELEASE_ENVELOPE_SCHEMA.to_string(),
+            version: APPROVED_RELEASE_ENVELOPE_VERSION,
+            environment: "production-eu1".to_string(),
+            version_scheme: artifact.version_scheme,
+            artifact_version: artifact.version.clone(),
+            release_channel: artifact.release_channel.clone(),
+            release_sequence: artifact.release_sequence,
+            commit_digest: artifact.commit_digest.clone(),
+            release_manifest_coordinate: artifact.release_manifest_coordinate.clone(),
+            release_manifest_digest: artifact.release_manifest_digest.clone(),
+            oci_config_digest: artifact.digest.clone(),
+        };
+        parse_approved_release_envelope(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let mut fields = vec![
+            "true".to_string(),
+            format!("sha256:{}", "a".repeat(64)),
+            artifact.digest.clone(),
+        ];
+        fields.resize(11, String::new());
+        let line = fields.join("\t");
+        let observation = parse_running_container_format(&line).unwrap();
+        let parsed =
+            evidence_from_running_container(&observation, Some(&envelope), 1_700_000_100).unwrap();
+        assert_eq!(parsed.digest_class, ArtifactDigestClass::OciConfig);
+        assert!(parsed.oci_index_digest.is_none());
+        assert!(parsed.oci_manifest_digest.is_none());
+        assert_eq!(parsed.observed_at, 1_700_000_100);
         assert!(parsed.matches_expected(
             "production-eu1",
             artifact.version_scheme,
@@ -3535,17 +3586,130 @@ mod tests {
             &artifact.release_manifest_coordinate,
             &artifact.release_manifest_digest,
         ));
+        let index_digest = format!("sha256:{}", "5".repeat(64));
         assert!(!parsed.matches_expected(
             "production-eu1",
             artifact.version_scheme,
             &artifact.version,
             &artifact.release_channel,
             artifact.release_sequence,
-            parsed.oci_index_digest.as_deref().unwrap(),
+            &index_digest,
             &artifact.commit_digest,
             &artifact.release_manifest_coordinate,
             &artifact.release_manifest_digest,
         ));
+        let mut replaced_fields = vec![
+            "true".to_string(),
+            format!("sha256:{}", "a".repeat(64)),
+            format!("sha256:{}", "9".repeat(64)),
+        ];
+        replaced_fields.resize(11, String::new());
+        let replaced = replaced_fields.join("\t");
+        assert!(evidence_from_running_container(
+            &parse_running_container_format(&replaced).unwrap(),
+            Some(&envelope),
+            1_700_000_100
+        )
+        .is_err());
+        assert_eq!(envelope.oci_config_digest, artifact.digest);
+    }
+
+    #[test]
+    fn manifest_or_index_class_evidence_is_not_config_proof() {
+        let now = now_unix();
+        let directory = temporary_directory("manifest-class");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_beacon(&hosts, now - 20, &artifact());
+        let mut deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        deployment.update_restart_job_id = Some(job_id);
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![deployment.clone()],
+            ),
+            directory.join("journal.json"),
+            hosts.clone(),
+            actions,
+        );
+        let host = hosts.get("hsb8").unwrap();
+        let report = HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
+            name: host.name.clone(),
+            role: host.role.clone(),
+            is_nix: host.is_nix,
+            heartbeat_interval_secs: host.heartbeat_interval_secs.unwrap_or(60),
+            freshness: host.freshness.clone(),
+            kernel: host.kernel.clone(),
+            service_observations: host.service_observations.clone(),
+            backup_observations: host.backup_observations.clone(),
+            inbound_rtt_ms: None,
+            location: None,
+            preferences: host.preferences.clone(),
+            deployed_artifact: Some(manifest_class_evidence(&artifact(), now - 20)),
+        };
+        hosts.record(report, now - 5).unwrap();
+        assert!(matches!(
+            adapter.deployment_report(&deployment, now),
+            Err(AdapterError::LocalBinding)
+        ));
+    }
+
+    #[test]
+    fn measurement_time_not_report_receive_time_gates_freshness() {
+        let now = now_unix();
+        let directory = temporary_directory("measurement-clock");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_beacon(&hosts, now - 5, &artifact());
+        let mut deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        deployment.update_restart_job_id = Some(job_id);
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![deployment.clone()],
+            ),
+            directory.join("journal.json"),
+            hosts.clone(),
+            actions,
+        );
+        let host = hosts.get("hsb8").unwrap();
+        let mut evidence = measured_from(&artifact(), now - 400);
+        evidence.observed_at = now - 400;
+        let report = HostReport {
+            schema: HOST_REPORT_SCHEMA.to_string(),
+            version: HOST_REPORT_VERSION,
+            name: host.name.clone(),
+            role: host.role.clone(),
+            is_nix: host.is_nix,
+            heartbeat_interval_secs: host.heartbeat_interval_secs.unwrap_or(60),
+            freshness: host.freshness.clone(),
+            kernel: host.kernel.clone(),
+            service_observations: host.service_observations.clone(),
+            backup_observations: host.backup_observations.clone(),
+            inbound_rtt_ms: None,
+            location: None,
+            preferences: host.preferences.clone(),
+            deployed_artifact: Some(evidence),
+        };
+        hosts.record(report, now - 5).unwrap();
+        assert!(adapter
+            .deployment_report(&deployment, now)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

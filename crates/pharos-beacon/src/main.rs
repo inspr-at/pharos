@@ -9,7 +9,8 @@
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
 //!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
 //!      PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE (active-generation evidence),
-//!      PHAROS_DEPLOYED_ARTIFACT_EVIDENCE_FILE (optional measured release identity),
+//!      PHAROS_DEPLOYED_ARTIFACT_CONTAINER (allowlisted running container),
+//!      PHAROS_DEPLOYED_ARTIFACT_RELEASE_ENVELOPE_FILE (digest-bound release tuple),
 //!      PHAROS_NIXCFG_REMOTE_URL / PHAROS_NIXCFG_REMOTE_REF (authoritative Git),
 //!      PHAROS_NIXPKGS_CHANNEL_BASE_URL (authoritative channel publication),
 //!      PHAROS_NIXPKGS_REMOTE_URL (legacy/custom authoritative Git fallback),
@@ -22,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(all(unix, test))]
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -31,14 +32,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
-    collect_deployed_artifact_from_metadata_file, BackupConfiguredState, BackupEngine,
-    BackupObservation, BackupPostureState, BackupRunState, DeployedArtifactEvidence,
+    collect_deployed_artifact_from_metadata_file, configured_container_matches_measurement,
+    evidence_from_running_container, parse_approved_release_envelope,
+    parse_running_container_format, valid_allowlisted_container_ref, BackupConfiguredState,
+    BackupEngine, BackupObservation, BackupPostureState, BackupRunState, DeployedArtifactEvidence,
     GitRevisionRelation, HostLocation, HostLocationSource, HostPreferences,
     HostPreferencesRegistry, HostReport, HostReportResponse, KernelPosture, NixDeploymentEvidence,
     NixFreshness, NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness,
     NixpkgsRevisionRelation, ServiceObservation, ServiceObservationState, HOST_REPORT_SCHEMA,
     HOST_REPORT_VERSION, MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES, MAX_HEARTBEAT_INTERVAL_SECS,
     MAX_INBOUND_RTT_MS, MAX_SERVICE_OBSERVATIONS, MIN_HEARTBEAT_INTERVAL_SECS,
+    RUNNING_CONTAINER_DOCKER_FORMAT,
 };
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -57,6 +61,8 @@ const BEACON_HEALTH_PATH_ENV: &str = "PHAROS_BEACON_HEALTH_FILE";
 const BEACON_HEALTH_STALE_INTERVALS: u64 = 3;
 const COMPOSE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const COMPOSE_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
+const DEPLOYED_ARTIFACT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const DEPLOYED_ARTIFACT_COMMAND_OUTPUT_LIMIT_BYTES: usize = 4 * 1024;
 const DEFAULT_SERVICE_OBSERVATION_INTERVAL_SECS: u64 = 300;
 const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
 const COMPOSE_DOCKER_FORMAT: &str = "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.Status}}";
@@ -1504,17 +1510,141 @@ fn read_deployment_evidence(path: &Path) -> Option<NixDeploymentEvidence> {
     Some(evidence)
 }
 
-fn deployed_artifact_evidence_path() -> Option<PathBuf> {
-    env_value("PHAROS_DEPLOYED_ARTIFACT_EVIDENCE_FILE").map(PathBuf::from)
+fn deployed_artifact_container_ref() -> Option<String> {
+    env_value("PHAROS_DEPLOYED_ARTIFACT_CONTAINER")
+        .filter(|value| valid_allowlisted_container_ref(value))
 }
 
-fn read_deployed_artifact_evidence(path: &Path) -> Option<DeployedArtifactEvidence> {
-    let file = File::open(path).ok()?;
+fn deployed_artifact_envelope_path() -> Result<Option<PathBuf>, &'static str> {
+    let Some(path) = env_value("PHAROS_DEPLOYED_ARTIFACT_RELEASE_ENVELOPE_FILE") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if !path.is_absolute()
+        || path.as_os_str().len() > 4_096
+        || path.to_str().is_none()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("deployed artifact envelope path is invalid");
+    }
+    Ok(Some(path))
+}
+
+fn read_approved_release_envelope(
+    path: &Path,
+) -> Result<pharos_core::ApprovedReleaseEnvelope, &'static str> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| "deployed artifact envelope unavailable")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("deployed artifact envelope must be a regular file");
+    }
+    #[cfg(unix)]
+    {
+        if metadata.permissions().mode() & 0o002 != 0 {
+            return Err("deployed artifact envelope is world-writable");
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(|_| "deployed artifact envelope unavailable")?;
     let mut raw = Vec::new();
     file.take(MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES + 1)
         .read_to_end(&mut raw)
-        .ok()?;
-    collect_deployed_artifact_from_metadata_file(&raw).ok()
+        .map_err(|_| "deployed artifact envelope unavailable")?;
+    parse_approved_release_envelope(&raw).map_err(|_| "deployed artifact envelope is invalid")
+}
+
+fn run_running_container_command(
+    command: &str,
+    socket: &Path,
+    container: &str,
+) -> Result<String, &'static str> {
+    if !valid_allowlisted_container_ref(container) {
+        return Err("deployed artifact container is not allowlisted");
+    }
+    let socket = socket
+        .to_str()
+        .ok_or("Compose discovery configuration is invalid")?;
+    let mut command = Command::new(command);
+    command
+        .args([
+            "--host",
+            &format!("unix://{socket}"),
+            "inspect",
+            "--type",
+            "container",
+            "--format",
+            RUNNING_CONTAINER_DOCKER_FORMAT,
+            container,
+        ])
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("DOCKER_TLS_VERIFY")
+        .env_remove("DOCKER_CERT_PATH")
+        .env_remove("DOCKER_API_VERSION")
+        .env_remove("DOCKER_CUSTOM_HEADERS")
+        .env_remove("DOCKER_AUTH_CONFIG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    isolate_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "deployed artifact command failed")?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| drain_bounded(pipe, DEPLOYED_ARTIFACT_COMMAND_OUTPUT_LIMIT_BYTES))
+        .ok_or("deployed artifact output unavailable")?;
+    let deadline = Instant::now() + DEPLOYED_ARTIFACT_COMMAND_TIMEOUT;
+    let status = wait_for_child(&mut child, deadline).map_err(|reason| match reason {
+        "timeout" => "deployed artifact command timed out",
+        _ => "deployed artifact command failed",
+    })?;
+    let stdout = collect_bounded(&stdout, deadline)
+        .and_then(output_string)
+        .map_err(|reason| match reason {
+            "output_limit" => "deployed artifact output exceeded the limit",
+            _ => "deployed artifact output unavailable",
+        })?;
+    if !status.success() {
+        return Err("deployed artifact command failed");
+    }
+    Ok(stdout)
+}
+
+fn collect_measured_deployed_artifact_at(
+    command: &str,
+    socket: &Path,
+    container: &str,
+    envelope: Option<&pharos_core::ApprovedReleaseEnvelope>,
+    now: i64,
+) -> Option<DeployedArtifactEvidence> {
+    let raw = run_running_container_command(command, socket, container).ok()?;
+    let observation = parse_running_container_format(&raw).ok()?;
+    if !configured_container_matches_measurement(container, &observation.container_id) {
+        return None;
+    }
+    evidence_from_running_container(&observation, envelope, now).ok()
+}
+
+fn collect_measured_deployed_artifact(now: i64) -> Option<DeployedArtifactEvidence> {
+    let container = deployed_artifact_container_ref()?;
+    let socket = docker_socket_path().ok()?;
+    let envelope = match deployed_artifact_envelope_path() {
+        Ok(Some(path)) => Some(read_approved_release_envelope(&path).ok()?),
+        Ok(None) => None,
+        Err(_) => return None,
+    };
+    collect_measured_deployed_artifact_at("docker", &socket, &container, envelope.as_ref(), now)
 }
 
 fn sha256_hex(raw: &[u8]) -> String {
@@ -3534,8 +3664,7 @@ fn main() {
         let kernel = collect_kernel_posture(is_nix, observed_at);
         let location = collect_location(observed_at);
         let backup_observations = collect_backup_observations(observed_at);
-        let deployed_artifact = deployed_artifact_evidence_path()
-            .and_then(|path| read_deployed_artifact_evidence(&path));
+        let deployed_artifact = collect_measured_deployed_artifact(observed_at);
         let report = HostReport {
             schema: HOST_REPORT_SCHEMA.to_string(),
             version: HOST_REPORT_VERSION,
@@ -6388,58 +6517,175 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn measured_release_artifact() -> DeployedArtifactEvidence {
-        DeployedArtifactEvidence {
-            schema: pharos_core::DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
-            version: pharos_core::DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
+    fn approved_release_envelope(config: &str) -> pharos_core::ApprovedReleaseEnvelope {
+        pharos_core::ApprovedReleaseEnvelope {
+            schema: pharos_core::APPROVED_RELEASE_ENVELOPE_SCHEMA.to_string(),
+            version: pharos_core::APPROVED_RELEASE_ENVELOPE_VERSION,
             environment: "production-eu1".to_string(),
             version_scheme: pharos_core::ArtifactVersionScheme::InsprCalendarV1,
             artifact_version: "26.09.05.09.00.00".to_string(),
             release_channel: "stable".to_string(),
             release_sequence: 260_905_090_000,
-            digest: format!("sha256:{}", "3".repeat(64)),
-            digest_class: pharos_core::ArtifactDigestClass::OciManifest,
             commit_digest: "b".repeat(40),
             release_manifest_coordinate: "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00"
                 .to_string(),
             release_manifest_digest: format!("sha256:{}", "4".repeat(64)),
-            oci_index_digest: Some(format!("sha256:{}", "5".repeat(64))),
-            oci_manifest_digest: Some(format!("sha256:{}", "3".repeat(64))),
-            oci_config_digest: Some(format!("sha256:{}", "6".repeat(64))),
+            oci_config_digest: config.to_string(),
         }
     }
 
+    fn filtered_container_stdout(image: &str) -> String {
+        let mut fields = vec![
+            "true".to_string(),
+            format!("sha256:{}", "a".repeat(64)),
+            image.to_string(),
+        ];
+        fields.resize(11, String::new());
+        format!("{}\n", fields.join("\t"))
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn allowlisted_metadata_file_collects_measured_release_artifact() {
-        let dir = std::env::temp_dir().join(format!(
-            "pharos-beacon-artifact-{}-{}",
-            std::process::id(),
-            now_unix()
-        ));
-        std::fs::create_dir(&dir).expect("artifact fixture directory");
-        let path = dir.join("deployed-artifact.json");
-        let evidence = measured_release_artifact();
-        std::fs::write(&path, serde_json::to_vec(&evidence).unwrap()).expect("write measurement");
-        let parsed = read_deployed_artifact_evidence(&path).expect("bounded collector");
+    fn allowlisted_running_container_measures_config_id_not_metadata_file() {
+        let root = kernel_fixture("deployed-artifact-command");
+        std::fs::create_dir_all(&root).expect("create command fixture");
+        let config = format!("sha256:{}", "3".repeat(64));
+        let envelope = approved_release_envelope(&config);
+        let envelope_path = root.join("envelope.json");
+        std::fs::write(&envelope_path, serde_json::to_vec(&envelope).unwrap()).expect("envelope");
+        std::fs::set_permissions(&envelope_path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure envelope");
+        let loaded = read_approved_release_envelope(&envelope_path).expect("envelope loads");
+        let command = root.join("docker-fixture");
+        let stdout = filtered_container_stdout(&config);
+        std::fs::write(command.with_extension("out"), stdout).expect("write filtered stdout");
+        std::fs::write(
+            &command,
+            concat!(
+                "#!/bin/sh\n",
+                "test \"$#\" -eq 8 || exit 10\n",
+                "test \"$1\" = --host || exit 11\n",
+                "test \"$2\" = unix:///tmp/pharos-docker.sock || exit 12\n",
+                "test \"$3\" = inspect || exit 13\n",
+                "test \"$4\" = --type || exit 14\n",
+                "test \"$5\" = container || exit 15\n",
+                "test \"$6\" = --format || exit 16\n",
+                "test \"$8\" = pharos-prod || exit 18\n",
+                "case \"$7\" in\n",
+                "  *'{{.State.Running}}'*'{{.Id}}'*'{{.Image}}'*) ;;\n",
+                "  *) exit 17 ;;\n",
+                "esac\n",
+                "cat \"$0.out\"\n"
+            ),
+        )
+        .expect("write command fixture");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
+            .expect("make command fixture executable");
+
+        let evidence = collect_measured_deployed_artifact_at(
+            &command.to_string_lossy(),
+            Path::new("/tmp/pharos-docker.sock"),
+            "pharos-prod",
+            Some(&loaded),
+            1_700_000_100,
+        )
+        .expect("running container measurement");
         assert_eq!(
-            parsed.digest_class,
-            pharos_core::ArtifactDigestClass::OciManifest
+            evidence.digest_class,
+            pharos_core::ArtifactDigestClass::OciConfig
         );
-        assert_ne!(parsed.oci_index_digest, parsed.oci_manifest_digest);
-        assert_ne!(parsed.oci_manifest_digest, parsed.oci_config_digest);
+        assert_eq!(evidence.digest, config);
+        assert_eq!(evidence.observed_at, 1_700_000_100);
+        assert!(evidence.oci_index_digest.is_none());
+        assert!(evidence.oci_manifest_digest.is_none());
+
+        let mismatch = root.join("docker-mismatch");
+        let other = format!("sha256:{}", "9".repeat(64));
+        std::fs::write(
+            mismatch.with_extension("out"),
+            filtered_container_stdout(&other),
+        )
+        .expect("write mismatch stdout");
+        std::fs::write(&mismatch, "#!/bin/sh\ncat \"$0.out\"\n").expect("write mismatch fixture");
+        std::fs::set_permissions(&mismatch, std::fs::Permissions::from_mode(0o700))
+            .expect("executable mismatch");
+        assert!(
+            collect_measured_deployed_artifact_at(
+                &mismatch.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock"),
+                "pharos-prod",
+                Some(&loaded),
+                1_700_000_100
+            )
+            .is_none(),
+            "unchanged envelope must not prove a replaced image"
+        );
         assert_eq!(
-            parsed.digest,
-            parsed.oci_manifest_digest.clone().expect("manifest digest")
+            parse_approved_release_envelope(&std::fs::read(&envelope_path).unwrap())
+                .unwrap()
+                .oci_config_digest,
+            config
         );
-        assert!(read_deployed_artifact_evidence(Path::new("/missing-allowlisted-file")).is_none());
+
+        let stopped = root.join("docker-stopped");
+        let mut stopped_fields = vec![
+            "false".to_string(),
+            format!("sha256:{}", "a".repeat(64)),
+            config.clone(),
+        ];
+        stopped_fields.resize(11, String::new());
+        std::fs::write(
+            stopped.with_extension("out"),
+            format!("{}\n", stopped_fields.join("\t")),
+        )
+        .expect("write stopped stdout");
+        std::fs::write(&stopped, "#!/bin/sh\ncat \"$0.out\"\n").expect("write stopped fixture");
+        std::fs::set_permissions(&stopped, std::fs::Permissions::from_mode(0o700))
+            .expect("executable stopped");
+        assert!(collect_measured_deployed_artifact_at(
+            &stopped.to_string_lossy(),
+            Path::new("/tmp/pharos-docker.sock"),
+            "pharos-prod",
+            Some(&loaded),
+            1_700_000_100
+        )
+        .is_none());
+
+        let failure = root.join("docker-failure");
+        std::fs::write(
+            &failure,
+            "#!/bin/sh\nprintf 'credential-bearing diagnostic' >&2\nexit 1\n",
+        )
+        .expect("write failure fixture");
+        std::fs::set_permissions(&failure, std::fs::Permissions::from_mode(0o700))
+            .expect("executable failure");
+        assert_eq!(
+            run_running_container_command(
+                &failure.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock"),
+                "pharos-prod"
+            ),
+            Err("deployed artifact command failed")
+        );
+
+        let oversized = root.join("docker-oversized");
+        std::fs::write(&oversized, "#!/bin/sh\nhead -c 5000 /dev/zero\n")
+            .expect("write oversized fixture");
+        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700))
+            .expect("executable oversized");
+        assert_eq!(
+            run_running_container_command(
+                &oversized.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock"),
+                "pharos-prod"
+            ),
+            Err("deployed artifact output exceeded the limit")
+        );
+
+        let linked = root.join("envelope.link");
+        std::os::unix::fs::symlink(&envelope_path, &linked).expect("plant envelope symlink");
+        assert!(read_approved_release_envelope(&linked).is_err());
         assert!(collect_deployed_artifact_from_metadata_file(b"{}").is_err());
-        assert!(collect_deployed_artifact_from_metadata_file(&vec![
-            b'x';
-            (MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES
-                as usize)
-                + 1
-        ])
-        .is_err());
-        let _ = std::fs::remove_dir_all(dir);
+        std::fs::remove_dir_all(root).expect("remove command fixture");
     }
 }

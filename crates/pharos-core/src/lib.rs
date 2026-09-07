@@ -39,6 +39,9 @@ pub const NIX_DEPLOYMENT_EVIDENCE_VERSION: u16 = 1;
 pub const DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA: &str = "inspr.pharos.deployed-artifact.v1";
 pub const DEPLOYED_ARTIFACT_EVIDENCE_VERSION: u16 = 1;
 pub const MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES: u64 = 4 * 1024;
+pub const APPROVED_RELEASE_ENVELOPE_SCHEMA: &str = "inspr.pharos.approved-release-envelope.v1";
+pub const APPROVED_RELEASE_ENVELOPE_VERSION: u16 = 1;
+pub const RUNNING_CONTAINER_DOCKER_FORMAT: &str = "{{.State.Running}}\t{{.Id}}\t{{.Image}}\t{{index .Config.Labels \"org.inspr.release.environment\"}}\t{{index .Config.Labels \"org.inspr.release.version_scheme\"}}\t{{index .Config.Labels \"org.inspr.release.version\"}}\t{{index .Config.Labels \"org.inspr.release.channel\"}}\t{{index .Config.Labels \"org.inspr.release.sequence\"}}\t{{index .Config.Labels \"org.inspr.release.commit_digest\"}}\t{{index .Config.Labels \"org.inspr.release.manifest_coordinate\"}}\t{{index .Config.Labels \"org.inspr.release.manifest_digest\"}}";
 const MAX_UNIX_TIMESTAMP: UnixSeconds = 253_402_300_799;
 pub const MAX_SERVICE_OBSERVATIONS: usize = 64;
 pub const MAX_BACKUP_OBSERVATIONS: usize = 64;
@@ -453,6 +456,8 @@ pub struct DeployedArtifactEvidence {
     pub oci_manifest_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oci_config_digest: Option<String>,
+    /// Clock time of the local measurement. Never copied from operator JSON.
+    pub observed_at: UnixSeconds,
 }
 
 impl DeployedArtifactEvidence {
@@ -538,6 +543,9 @@ impl DeployedArtifactEvidence {
                     .to_string(),
             );
         }
+        if self.observed_at < 0 || self.observed_at > MAX_UNIX_TIMESTAMP {
+            return Err("deployed artifact observed_at must be a valid Unix timestamp".to_string());
+        }
         Ok(())
     }
 
@@ -579,39 +587,323 @@ impl DeployedArtifactEvidence {
                 ArtifactDigestClass::OciConfig => self.oci_config_digest.as_deref() == Some(digest),
             }
     }
+
+    pub fn is_config_class_measurement(&self) -> bool {
+        self.digest_class == ArtifactDigestClass::OciConfig
+            && self.oci_config_digest.as_deref() == Some(self.digest.as_str())
+            && self.oci_index_digest.is_none()
+            && self.oci_manifest_digest.is_none()
+    }
 }
 
-/// Bounded collector that turns already-sanitized local metadata into evidence.
-/// It never reads raw `docker inspect` output, process environments, or logs.
+/// Bounded collector that observes a locally allowlisted running container.
+/// It never reads raw `docker inspect` JSON, process environments, or logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployedArtifactCollectorClass {
-    AllowlistedMetadataFile,
+    AllowlistedRunningContainer,
 }
 
 impl DeployedArtifactCollectorClass {
     pub fn key(self) -> &'static str {
         match self {
-            Self::AllowlistedMetadataFile => "allowlisted-metadata-file",
+            Self::AllowlistedRunningContainer => "allowlisted-running-container",
         }
     }
 }
 
-/// Parse a locally allowlisted measurement document. Unknown, oversized, or
-/// unsanitized input fails closed rather than echoing a configured expectation.
+/// Release tuple bound to an immutable image config digest. This is not an
+/// observation and carries no timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedReleaseEnvelope {
+    pub schema: String,
+    pub version: u16,
+    pub environment: String,
+    pub version_scheme: ArtifactVersionScheme,
+    pub artifact_version: String,
+    pub release_channel: String,
+    pub release_sequence: i64,
+    pub commit_digest: String,
+    pub release_manifest_coordinate: String,
+    pub release_manifest_digest: String,
+    pub oci_config_digest: String,
+}
+
+impl ApprovedReleaseEnvelope {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.schema != APPROVED_RELEASE_ENVELOPE_SCHEMA
+            || self.version != APPROVED_RELEASE_ENVELOPE_VERSION
+        {
+            return Err("unsupported approved release envelope schema/version pair".to_string());
+        }
+        let probe = DeployedArtifactEvidence {
+            schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
+            version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
+            environment: self.environment.clone(),
+            version_scheme: self.version_scheme,
+            artifact_version: self.artifact_version.clone(),
+            release_channel: self.release_channel.clone(),
+            release_sequence: self.release_sequence,
+            digest: self.oci_config_digest.clone(),
+            digest_class: ArtifactDigestClass::OciConfig,
+            commit_digest: self.commit_digest.clone(),
+            release_manifest_coordinate: self.release_manifest_coordinate.clone(),
+            release_manifest_digest: self.release_manifest_digest.clone(),
+            oci_index_digest: None,
+            oci_manifest_digest: None,
+            oci_config_digest: Some(self.oci_config_digest.clone()),
+            observed_at: 0,
+        };
+        probe.validate_contract().map(|_| ())
+    }
+}
+
+/// Filtered facts from a fixed `docker inspect --format` query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningContainerObservation {
+    pub running: bool,
+    pub container_id: String,
+    pub image_config_digest: String,
+    pub environment: Option<String>,
+    pub version_scheme: Option<String>,
+    pub artifact_version: Option<String>,
+    pub release_channel: Option<String>,
+    pub release_sequence: Option<String>,
+    pub commit_digest: Option<String>,
+    pub release_manifest_coordinate: Option<String>,
+    pub release_manifest_digest: Option<String>,
+}
+
+/// Parse a locally allowlisted evidence document. This is a type decoder, not a
+/// measurement producer: it cannot invent a running artifact or a timestamp.
 pub fn collect_deployed_artifact_from_metadata_file(
     raw: &[u8],
 ) -> Result<DeployedArtifactEvidence, String> {
-    if raw.is_empty() || raw.len() as u64 > MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES {
-        return Err("deployed artifact metadata exceeds the bounded collector size".to_string());
-    }
-    let mut deserializer = serde_json::Deserializer::from_slice(raw);
-    let evidence = DeployedArtifactEvidence::deserialize(&mut deserializer)
-        .map_err(|_| "deployed artifact metadata is not a typed measurement".to_string())?;
-    deserializer
-        .end()
-        .map_err(|_| "deployed artifact metadata has trailing data".to_string())?;
+    let evidence =
+        decode_bounded_json::<DeployedArtifactEvidence>(raw, "deployed artifact metadata")?;
     evidence.validate_contract()?;
     Ok(evidence)
+}
+
+/// Parse a trusted release envelope. The envelope never becomes evidence by itself.
+pub fn parse_approved_release_envelope(raw: &[u8]) -> Result<ApprovedReleaseEnvelope, String> {
+    let envelope =
+        decode_bounded_json::<ApprovedReleaseEnvelope>(raw, "approved release envelope")?;
+    envelope.validate_contract()?;
+    Ok(envelope)
+}
+
+pub fn parse_running_container_format(raw: &str) -> Result<RunningContainerObservation, String> {
+    let line = raw.trim_end_matches(['\n', '\r']);
+    if line.is_empty() || line.lines().count() != 1 {
+        return Err("running container measurement must be exactly one filtered line".to_string());
+    }
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() != 11 {
+        return Err(
+            "running container measurement must contain exactly eleven filtered fields".to_string(),
+        );
+    }
+    let running = match fields[0] {
+        "true" => true,
+        "false" => false,
+        _ => return Err("running container measurement running flag is not boolean".to_string()),
+    };
+    let container_id = normalize_container_id(fields[1])
+        .ok_or_else(|| "running container identity is not an exact container id".to_string())?;
+    let image_config_digest = normalize_prefixed_sha256(fields[2])
+        .ok_or_else(|| "running container image is not an OCI config digest".to_string())?;
+    Ok(RunningContainerObservation {
+        running,
+        container_id,
+        image_config_digest,
+        environment: optional_measured_field(fields[3]),
+        version_scheme: optional_measured_field(fields[4]),
+        artifact_version: optional_measured_field(fields[5]),
+        release_channel: optional_measured_field(fields[6]),
+        release_sequence: optional_measured_field(fields[7]),
+        commit_digest: optional_measured_field(fields[8]),
+        release_manifest_coordinate: optional_measured_field(fields[9]),
+        release_manifest_digest: optional_measured_field(fields[10]),
+    })
+}
+
+/// Bind a running-container measurement to an optional digest-locked envelope.
+/// Observation time is supplied by the caller from the measurement clock.
+pub fn evidence_from_running_container(
+    observation: &RunningContainerObservation,
+    envelope: Option<&ApprovedReleaseEnvelope>,
+    observed_at: UnixSeconds,
+) -> Result<DeployedArtifactEvidence, String> {
+    if !observation.running {
+        return Err("allowlisted container is not running".to_string());
+    }
+    if let Some(envelope) = envelope {
+        envelope.validate_contract()?;
+        if envelope.oci_config_digest != observation.image_config_digest {
+            return Err(
+                "approved release envelope is not immutably bound to the measured config digest"
+                    .to_string(),
+            );
+        }
+    }
+    let environment = merge_measured_field(
+        observation.environment.as_deref(),
+        envelope.map(|envelope| envelope.environment.as_str()),
+        "environment",
+    )?;
+    let version_scheme = parse_measured_version_scheme(&merge_measured_field(
+        observation.version_scheme.as_deref(),
+        envelope.map(|envelope| envelope.version_scheme.key()),
+        "version_scheme",
+    )?)?;
+    let artifact_version = merge_measured_field(
+        observation.artifact_version.as_deref(),
+        envelope.map(|envelope| envelope.artifact_version.as_str()),
+        "version",
+    )?;
+    let release_channel = merge_measured_field(
+        observation.release_channel.as_deref(),
+        envelope.map(|envelope| envelope.release_channel.as_str()),
+        "release_channel",
+    )?;
+    let release_sequence_text = envelope.map(|envelope| envelope.release_sequence.to_string());
+    let release_sequence = merge_measured_field(
+        observation.release_sequence.as_deref(),
+        release_sequence_text.as_deref(),
+        "release_sequence",
+    )?
+    .parse::<i64>()
+    .map_err(|_| "release_sequence is not a non-negative integer".to_string())?;
+    let commit_digest = merge_measured_field(
+        observation.commit_digest.as_deref(),
+        envelope.map(|envelope| envelope.commit_digest.as_str()),
+        "commit_digest",
+    )?;
+    let release_manifest_coordinate = merge_measured_field(
+        observation.release_manifest_coordinate.as_deref(),
+        envelope.map(|envelope| envelope.release_manifest_coordinate.as_str()),
+        "release_manifest_coordinate",
+    )?;
+    let release_manifest_digest = merge_measured_field(
+        observation.release_manifest_digest.as_deref(),
+        envelope.map(|envelope| envelope.release_manifest_digest.as_str()),
+        "release_manifest_digest",
+    )?;
+    let evidence = DeployedArtifactEvidence {
+        schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
+        version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
+        environment,
+        version_scheme,
+        artifact_version,
+        release_channel,
+        release_sequence,
+        digest: observation.image_config_digest.clone(),
+        digest_class: ArtifactDigestClass::OciConfig,
+        commit_digest,
+        release_manifest_coordinate,
+        release_manifest_digest,
+        oci_index_digest: None,
+        oci_manifest_digest: None,
+        oci_config_digest: Some(observation.image_config_digest.clone()),
+        observed_at,
+    };
+    evidence.validate_contract()?;
+    Ok(evidence)
+}
+
+pub fn valid_allowlisted_container_ref(value: &str) -> bool {
+    if normalize_prefixed_sha256(value).is_some() || normalize_container_id(value).is_some() {
+        return true;
+    }
+    (1..=128).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !value.starts_with('-')
+        && !value.contains("--")
+}
+
+pub fn configured_container_matches_measurement(
+    configured: &str,
+    measured_container_id: &str,
+) -> bool {
+    match (
+        normalize_container_id(configured),
+        normalize_container_id(measured_container_id),
+    ) {
+        (Some(configured), Some(measured)) => configured == measured,
+        (None, Some(_)) => valid_allowlisted_container_ref(configured),
+        _ => false,
+    }
+}
+
+fn decode_bounded_json<T: serde::de::DeserializeOwned>(
+    raw: &[u8],
+    name: &str,
+) -> Result<T, String> {
+    if raw.is_empty() || raw.len() as u64 > MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES {
+        return Err(format!("{name} exceeds the bounded collector size"));
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(raw);
+    let value = T::deserialize(&mut deserializer)
+        .map_err(|_| format!("{name} is not a typed measurement"))?;
+    deserializer
+        .end()
+        .map_err(|_| format!("{name} has trailing data"))?;
+    Ok(value)
+}
+
+fn optional_measured_field(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value == "<no value>" {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn merge_measured_field(
+    label: Option<&str>,
+    envelope: Option<&str>,
+    name: &str,
+) -> Result<String, String> {
+    match (
+        label.filter(|value| !value.is_empty()),
+        envelope.filter(|value| !value.is_empty()),
+    ) {
+        (Some(label), Some(envelope)) if label == envelope => Ok(label.to_string()),
+        (Some(_), Some(_)) => Err(format!(
+            "{name} label disagrees with the approved release envelope"
+        )),
+        (Some(label), None) => Ok(label.to_string()),
+        (None, Some(envelope)) => Ok(envelope.to_string()),
+        (None, None) => Err(format!("{name} was not measured")),
+    }
+}
+
+fn parse_measured_version_scheme(value: &str) -> Result<ArtifactVersionScheme, String> {
+    match value {
+        "legacy" => Ok(ArtifactVersionScheme::Legacy),
+        "inspr-calendar-v1" => Ok(ArtifactVersionScheme::InsprCalendarV1),
+        _ => Err("version_scheme is not an explicit supported scheme".to_string()),
+    }
+}
+
+fn normalize_prefixed_sha256(value: &str) -> Option<String> {
+    let value = value.trim();
+    if valid_prefixed_sha256(value) {
+        Some(value.to_string())
+    } else if valid_hex_identifier(value, &[SHA256_HEX_BYTES]) {
+        Some(format!("sha256:{value}"))
+    } else {
+        None
+    }
+}
+
+fn normalize_container_id(value: &str) -> Option<String> {
+    normalize_prefixed_sha256(value)
 }
 
 fn oci_digests_overlap(index: Option<&str>, manifest: Option<&str>, config: Option<&str>) -> bool {
@@ -4087,6 +4379,7 @@ mod tests {
             oci_index_digest: Some(format!("sha256:{}", "5".repeat(64))),
             oci_manifest_digest: Some(format!("sha256:{}", "3".repeat(64))),
             oci_config_digest: Some(format!("sha256:{}", "6".repeat(64))),
+            observed_at: 1_700_000_000,
         }
     }
 
@@ -4156,9 +4449,129 @@ mod tests {
         assert_ne!(parsed.oci_index_digest, parsed.oci_manifest_digest);
         assert_ne!(parsed.oci_manifest_digest, parsed.oci_config_digest);
         assert_eq!(
-            DeployedArtifactCollectorClass::AllowlistedMetadataFile.key(),
-            "allowlisted-metadata-file"
+            DeployedArtifactCollectorClass::AllowlistedRunningContainer.key(),
+            "allowlisted-running-container"
         );
+    }
+
+    fn approved_envelope(config_digest: &str) -> ApprovedReleaseEnvelope {
+        ApprovedReleaseEnvelope {
+            schema: APPROVED_RELEASE_ENVELOPE_SCHEMA.to_string(),
+            version: APPROVED_RELEASE_ENVELOPE_VERSION,
+            environment: "production-eu1".to_string(),
+            version_scheme: ArtifactVersionScheme::InsprCalendarV1,
+            artifact_version: "26.09.05.09.00.00".to_string(),
+            release_channel: "stable".to_string(),
+            release_sequence: 260_905_090_000,
+            commit_digest: "b".repeat(40),
+            release_manifest_coordinate: "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00"
+                .to_string(),
+            release_manifest_digest: format!("sha256:{}", "4".repeat(64)),
+            oci_config_digest: config_digest.to_string(),
+        }
+    }
+
+    fn filtered_container_line(running: &str, image: &str) -> String {
+        let mut fields = vec![
+            running.to_string(),
+            format!("sha256:{}", "a".repeat(64)),
+            image.to_string(),
+        ];
+        fields.resize(11, String::new());
+        fields.join("\t")
+    }
+
+    #[test]
+    fn running_container_measurement_binds_digest_locked_envelope() {
+        let config = format!("sha256:{}", "3".repeat(64));
+        let envelope = approved_envelope(&config);
+        let observation = parse_running_container_format(&filtered_container_line("true", &config))
+            .expect("filtered docker format");
+        let evidence =
+            evidence_from_running_container(&observation, Some(&envelope), 1_700_000_100).unwrap();
+        assert!(evidence.is_config_class_measurement());
+        assert_eq!(evidence.observed_at, 1_700_000_100);
+        assert!(evidence.oci_index_digest.is_none());
+        assert!(evidence.oci_manifest_digest.is_none());
+        assert!(evidence.matches_expected(
+            "production-eu1",
+            ArtifactVersionScheme::InsprCalendarV1,
+            "26.09.05.09.00.00",
+            "stable",
+            260_905_090_000,
+            &config,
+            &"b".repeat(40),
+            "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00",
+            &format!("sha256:{}", "4".repeat(64)),
+        ));
+        assert!(!evidence.matches_expected(
+            "production-eu1",
+            ArtifactVersionScheme::InsprCalendarV1,
+            "26.09.05.09.00.00",
+            "stable",
+            260_905_090_000,
+            &format!("sha256:{}", "5".repeat(64)),
+            &"b".repeat(40),
+            "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00",
+            &format!("sha256:{}", "4".repeat(64)),
+        ));
+    }
+
+    #[test]
+    fn running_container_mismatch_keeps_expected_metadata_unchanged() {
+        let expected = format!("sha256:{}", "3".repeat(64));
+        let running = format!("sha256:{}", "9".repeat(64));
+        let envelope = approved_envelope(&expected);
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        let parsed = parse_approved_release_envelope(&encoded).unwrap();
+        assert_eq!(parsed, envelope);
+        let observation =
+            parse_running_container_format(&filtered_container_line("true", &running)).unwrap();
+        assert_eq!(observation.image_config_digest, running);
+        assert!(
+            evidence_from_running_container(&observation, Some(&envelope), 1_700_000_100).is_err()
+        );
+        assert_eq!(envelope.oci_config_digest, expected);
+        assert_eq!(envelope.artifact_version, "26.09.05.09.00.00");
+    }
+
+    #[test]
+    fn running_container_fail_closed_cases() {
+        let config = format!("sha256:{}", "3".repeat(64));
+        let envelope = approved_envelope(&config);
+        let stopped =
+            parse_running_container_format(&filtered_container_line("false", &config)).unwrap();
+        assert!(evidence_from_running_container(&stopped, Some(&envelope), 1).is_err());
+        assert!(parse_running_container_format("true\tonly-two-fields\n").is_err());
+        assert!(parse_running_container_format(&format!(
+            "true\tsha256:{}\tsha256:{}\nextra\n",
+            "a".repeat(64),
+            "3".repeat(64)
+        ))
+        .is_err());
+        let mut with_timestamp = serde_json::to_value(&envelope).unwrap();
+        with_timestamp["observed_at"] = serde_json::json!(1_700_000_100);
+        assert!(
+            parse_approved_release_envelope(&serde_json::to_vec(&with_timestamp).unwrap()).is_err()
+        );
+        assert!(parse_approved_release_envelope(b"{}").is_err());
+        assert!(evidence_from_running_container(
+            &parse_running_container_format(&filtered_container_line("true", &config)).unwrap(),
+            None,
+            1
+        )
+        .is_err());
+        assert!(valid_allowlisted_container_ref("pharos-prod"));
+        assert!(!valid_allowlisted_container_ref("../etc/passwd"));
+        assert!(!valid_allowlisted_container_ref("--privileged"));
+        assert!(configured_container_matches_measurement(
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "a".repeat(64))
+        ));
+        assert!(!configured_container_matches_measurement(
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64))
+        ));
     }
 
     #[test]
