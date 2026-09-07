@@ -12,7 +12,7 @@ RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --release --locked -p pharosd -p phar
     && strip target/release/pharosd target/release/pharos-beacon target/release/pharos
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-ARG DEBIAN_SNAPSHOT=20260901T000000Z
+ARG DEBIAN_SNAPSHOT=20260907T180056Z
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # git: the beacon shells out to it for commits-behind (rev-list HEAD..@{u}).
 # restic: optional PHAROS_BACKUP_MODE=restic collector; no credentials are
@@ -20,9 +20,12 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # openssh-client: pharosd can run read-only existing-host preflight and
 # convergence-marker probes when the runtime has non-interactive SSH access.
 # iputils-ping: the fixed appliance-presence signal used before testing SSH.
-# The Debian image and package indexes share one immutable snapshot date. HTTP
-# transport is safe here because apt verifies Debian's signed Release metadata
-# and package hashes.
+# The runtime base image is pinned by digest. Package indexes are pinned to a
+# separate immutable snapshot; those pins need not share a date.
+# 20260907T180056Z is the debian-security snapshot that indexes
+# libssh2-1 1.10.0-3+deb12u1; the 20260901T000000Z pin still selected
+# 1.10.0-3+b1. HTTP transport is safe here because apt verifies Debian's
+# signed Release metadata and package hashes.
 RUN printf '%s\n' \
       'Types: deb' \
       "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \

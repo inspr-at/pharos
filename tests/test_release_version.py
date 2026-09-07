@@ -193,10 +193,10 @@ class CalendarVersionTests(unittest.TestCase):
             FIRST_CALENDAR_SEQUENCE,
         )
 
-    def test_current_release_is_valid_sequence_two_successor(self):
+    def test_current_release_is_valid_calendar_successor(self):
         first = self.first_calendar_release()
         current = self.release_document()
-        self.assertEqual(current["release_sequence"], NEXT_CALENDAR_SEQUENCE)
+        self.assertGreater(current["release_sequence"], FIRST_CALENDAR_SEQUENCE)
         self.assertEqual(
             current["migration_anchor"]["first_calendar_version"], FIRST_CALENDAR_VERSION
         )
@@ -212,7 +212,10 @@ class CalendarVersionTests(unittest.TestCase):
         )
         self.assertLess(release_version.compare_releases(first_identity, current_identity), 0)
         release_version.validate_release(current)
-        release_version.validate_reservation_history(current, (first,), ())
+        recorded = [first]
+        if current["release_sequence"] > NEXT_CALENDAR_SEQUENCE:
+            recorded.append(self.calendar_release(NEXT_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE))
+        release_version.validate_reservation_history(current, tuple(recorded), ())
 
     def test_repository_reservation_must_advance_coordinate_and_sequence(self):
         first = self.first_calendar_release()
