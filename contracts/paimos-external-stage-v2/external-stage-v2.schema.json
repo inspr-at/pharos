@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paimos.example/contracts/external-stage-v2.schema.json",
+  "title": "Paimos external-stage protocol v2",
+  "description": "Additive scheme-aware external adapter bodies. Authority and credential controls remain frozen v1.",
+  "x-paimos-contract": {
+    "schema_major": 2,
+    "media_type": "application/vnd.paimos.external-stage.v2+json",
+    "encoding": "utf-8-json-lf",
+    "fixture_digest": "sha256:6bba9613230c6ea728db58ffea5533399caed19e6d56a8d78ef19d0fde20be8a"
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/ExternalStagePullResponseV2"},
+    {"$ref": "#/$defs/ExternalStageAcceptRequest"},
+    {"$ref": "#/$defs/ExternalStageReportRequestV2"},
+    {"$ref": "#/$defs/ExternalStageReportReceipt"}
+  ],
+  "$defs": {
+    "ExternalStageArtifactEvidenceV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Explicitly discriminated release identity. inspr-calendar-v1 versions are also calendar-validated by the service; legacy strings are never inferred from punctuation.",
+      "required": ["version_scheme", "version", "release_channel", "release_sequence", "digest", "commit_digest", "release_manifest_coordinate", "release_manifest_digest"],
+      "properties": {
+        "version_scheme": {"type": "string", "enum": ["legacy", "inspr-calendar-v1"]},
+        "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
+        "release_channel": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+        "release_sequence": {"type": "integer", "format": "int64", "minimum": 0},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "commit_digest": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "release_manifest_coordinate": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,189}$"},
+        "release_manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "ExternalStagePharosEvidenceV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Scheme-aware Pharos evidence with exact immutable release-set manifest identity.",
+      "required": ["kind", "workflow", "environment", "artifact", "result", "observed_at"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["deployment", "verification"]},
+        "workflow": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+        "environment": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+        "artifact": {"$ref": "#/$defs/ExternalStageArtifactEvidenceV2"},
+        "result": {"type": "string", "enum": ["succeeded", "failed"]},
+        "observed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "ExternalStageJanusEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "result", "observed_at"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["authorization", "credential_handoff"]},
+        "result": {"type": "string", "enum": ["satisfied", "blocked"]},
+        "authorized": {"type": "boolean"},
+        "credential_ready": {"type": "boolean"},
+        "observed_at": {"type": "string", "format": "date-time"}
+      },
+      "oneOf": [
+        {"properties": {"kind": {"const": "authorization"}, "result": {"const": "satisfied"}, "authorized": {"const": true}}, "required": ["authorized"], "not": {"required": ["credential_ready"]}},
+        {"properties": {"kind": {"const": "authorization"}, "result": {"const": "blocked"}, "authorized": {"const": false}}, "required": ["authorized"], "not": {"required": ["credential_ready"]}},
+        {"properties": {"kind": {"const": "credential_handoff"}, "result": {"const": "satisfied"}, "credential_ready": {"const": true}}, "required": ["credential_ready"], "not": {"required": ["authorized"]}},
+        {"properties": {"kind": {"const": "credential_handoff"}, "result": {"const": "blocked"}, "credential_ready": {"const": false}}, "required": ["credential_ready"], "not": {"required": ["authorized"]}}
+      ],
+      "description": "Value-free enum, boolean, and timestamp facts only; no free text, opaque ID, path, URL, digest, version, ciphertext, command, callback, or secret field exists."
+    },
+    "ExternalStageReportRequestV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "state", "observed_at", "heartbeat"],
+      "properties": {
+        "sequence": {"type": "integer", "format": "int64", "minimum": 2},
+        "state": {"type": "string", "enum": ["active", "waiting", "blocked", "succeeded", "failed"]},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "heartbeat": {"type": "boolean"},
+        "blocker_codes": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "enum": ["dependency_pending", "dependency_failed", "reporter_stale", "external_waiting"]}},
+        "pharos_evidence": {"$ref": "#/$defs/ExternalStagePharosEvidenceV2"},
+        "janus_evidence": {"$ref": "#/$defs/ExternalStageJanusEvidence"}
+      },
+      "allOf": [
+        {"not": {"required": ["pharos_evidence", "janus_evidence"]}},
+        {"if": {"properties": {"heartbeat": {"const": true}}, "required": ["heartbeat"]}, "then": {"properties": {"state": {"enum": ["active", "waiting", "blocked"]}}, "not": {"anyOf": [{"required": ["blocker_codes"]}, {"required": ["pharos_evidence"]}, {"required": ["janus_evidence"]}]}}},
+        {"if": {"properties": {"heartbeat": {"const": false}, "state": {"const": "blocked"}}, "required": ["heartbeat", "state"]}, "then": {"required": ["blocker_codes"], "properties": {"blocker_codes": {"minItems": 1}}}},
+        {"if": {"properties": {"heartbeat": {"const": false}, "state": {"enum": ["active", "waiting", "succeeded", "failed"]}}, "required": ["heartbeat", "state"]}, "then": {"not": {"required": ["blocker_codes"]}}},
+        {"if": {"properties": {"state": {"enum": ["succeeded", "failed"]}}, "required": ["state"]}, "then": {"oneOf": [{"required": ["pharos_evidence"]}, {"required": ["janus_evidence"]}]}},
+        {"if": {"properties": {"state": {"enum": ["active", "waiting"]}}, "required": ["state"]}, "then": {"not": {"anyOf": [{"required": ["pharos_evidence"]}, {"required": ["janus_evidence"]}]}}},
+        {"if": {"required": ["pharos_evidence"]}, "then": {"oneOf": [{"properties": {"state": {"const": "succeeded"}, "pharos_evidence": {"properties": {"result": {"const": "succeeded"}}}}}, {"properties": {"state": {"const": "failed"}, "pharos_evidence": {"properties": {"result": {"const": "failed"}}}}}]}},
+        {"if": {"required": ["janus_evidence"]}, "then": {"oneOf": [{"properties": {"state": {"const": "succeeded"}, "janus_evidence": {"properties": {"result": {"const": "satisfied"}}}}}, {"properties": {"state": {"const": "blocked"}, "janus_evidence": {"properties": {"result": {"const": "blocked"}}}}}]}}
+      ],
+      "description": "The additive v2 report keeps v1 semantics and requires explicit scheme-aware Pharos artifact identity."
+    },
+    "ExternalStagePullResponseV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["handoff_id", "contract_major", "fixture_digest", "credential_epoch", "expires_at", "state", "reporter_class", "reporter_role", "evidence_ceiling", "stage_key", "execution_number", "plan_digest", "predecessor_digest", "authority_epoch", "context_digest"],
+      "properties": {
+        "handoff_id": {"$ref": "#/$defs/ExternalStageHandoffID"},
+        "contract_major": {"type": "integer", "const": 2},
+        "fixture_digest": {"$ref": "#/$defs/ExternalStageSHA256Digest"},
+        "credential_epoch": {"type": "integer", "format": "int64", "minimum": 1},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "state": {"$ref": "#/$defs/ExternalStageHandoffState"},
+        "reporter_class": {"type": "string", "enum": ["pharos", "janus"]},
+        "reporter_role": {"type": "string", "enum": ["owner", "dependency"]},
+        "dependency_key": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+        "evidence_ceiling": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"type": "string", "enum": ["deployment", "verification", "authorization", "credential_handoff"]}},
+        "stage_key": {"type": "string", "enum": ["specification", "implementation", "qa", "deployment", "verification"]},
+        "execution_number": {"type": "integer", "format": "int64", "minimum": 1},
+        "plan_digest": {"$ref": "#/$defs/ExternalStageSHA256Digest"},
+        "predecessor_digest": {"$ref": "#/$defs/ExternalStageSHA256Digest"},
+        "authority_epoch": {"type": "integer", "format": "int64", "minimum": 1},
+        "context_digest": {"$ref": "#/$defs/ExternalStageSHA256Digest"}
+      }
+    },
+    "ExternalStageAcceptRequest": {
+      "type": "object", "additionalProperties": false, "required": ["sequence", "observed_at"],
+      "properties": {"sequence": {"type": "integer", "format": "int64", "const": 1}, "observed_at": {"type": "string", "format": "date-time"}}
+    },
+    "ExternalStageReportReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["handoff_id", "sequence", "state", "credential_epoch", "duplicate", "server_received_at"],
+      "properties": {
+        "handoff_id": {"$ref": "#/$defs/ExternalStageHandoffID"},
+        "sequence": {"type": "integer", "format": "int64", "minimum": 1},
+        "state": {"$ref": "#/$defs/ExternalStageHandoffState"},
+        "credential_epoch": {"type": "integer", "format": "int64", "minimum": 1},
+        "duplicate": {"type": "boolean"},
+        "server_received_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "ExternalStageHandoffID": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "Server-generated non-sequential opaque public locator, distinct from the handoff secret."
+    },
+    "ExternalStageSHA256Digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "ExternalStageHandoffState": {
+      "type": "string",
+      "enum": ["issued", "accepted", "active", "waiting", "blocked", "succeeded", "failed"]
+    }
+  }
+}

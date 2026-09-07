@@ -5344,19 +5344,52 @@ impl HostActionStore {
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
-        if Self::has_active(&jobs, host, HostActionKind::UpdateRestart) {
+        self.create_update_review_locked(&mut jobs, host, actor, intent, now, None)
+    }
+
+    pub(crate) fn ensure_update_review_with_id(
+        &self,
+        id: &str,
+        host: &str,
+        actor: &str,
+        intent: UpdateRestartIntent,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        if let Some(existing) = jobs.get(id) {
+            if existing.host != host {
+                return Err(HostActionStoreError::WrongHost);
+            }
+            if existing.kind != HostActionKind::UpdateRestart {
+                return Err(HostActionStoreError::InvalidJob);
+            }
+            return Ok(existing.clone());
+        }
+        self.create_update_review_locked(&mut jobs, host, actor, intent, now, Some(id.to_string()))
+    }
+
+    fn create_update_review_locked(
+        &self,
+        jobs: &mut BTreeMap<String, HostActionJob>,
+        host: &str,
+        actor: &str,
+        intent: UpdateRestartIntent,
+        now: i64,
+        id: Option<String>,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if Self::has_active(jobs, host, HostActionKind::UpdateRestart) {
             return Err(HostActionStoreError::ActiveJob);
         }
-        if Self::latest_update_for(&jobs, host)
+        if Self::latest_update_for(jobs, host)
             .is_some_and(|job| job.state == HostActionState::Failed)
         {
             return Err(HostActionStoreError::FailedJobRequiresRetry);
         }
-        if Self::blocked_by_other_update(&jobs, host) {
+        if Self::blocked_by_other_update(jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
-        let job = Self::new_update_review(host, actor, intent, now, None, None);
-        self.insert_locked(&mut jobs, job)
+        let job = Self::new_update_review(host, actor, intent, now, None, None, id);
+        self.insert_locked(jobs, job)
     }
 
     pub(crate) fn begin_settings_apply_review(
@@ -5412,6 +5445,7 @@ impl HostActionStore {
             now,
             None,
             Some(settings_id.to_string()),
+            None,
         );
         self.insert_locked(&mut jobs, job)
     }
@@ -5448,6 +5482,7 @@ impl HostActionStore {
             now,
             Some(id.to_string()),
             settings_change_id,
+            None,
         );
         self.insert_locked(&mut jobs, job)
     }
@@ -6563,11 +6598,12 @@ impl HostActionStore {
         now: i64,
         retry_of: Option<String>,
         settings_change_id: Option<String>,
+        id: Option<String>,
     ) -> HostActionJob {
         let mut job = HostActionJob {
             schema: ACTION_SCHEMA.to_string(),
             version: ACTION_VERSION,
-            id: action_id("update-restart", host, now),
+            id: id.unwrap_or_else(|| action_id("update-restart", host, now)),
             host: host.to_string(),
             kind: HostActionKind::UpdateRestart,
             intent: Some(intent),
@@ -7481,6 +7517,74 @@ mod tests {
         job.state = HostActionState::Rebooting;
         job.lease_until = Some(job.updated_at + LEASE_SECS);
         assert!(!job.validate());
+    }
+
+    #[test]
+    fn deterministic_update_review_id_replays_without_a_second_job() {
+        let store = HostActionStore::new(None);
+        let first = store
+            .ensure_update_review_with_id(
+                "action-update-restart-hsb8-paimos01",
+                "hsb8",
+                "paimos-delivery",
+                UpdateRestartIntent::Update,
+                100,
+            )
+            .expect("create deterministic guarded update");
+        let replayed = store
+            .ensure_update_review_with_id(
+                "action-update-restart-hsb8-paimos01",
+                "hsb8",
+                "paimos-delivery",
+                UpdateRestartIntent::Update,
+                200,
+            )
+            .expect("replay finds the same job");
+        assert_eq!(first.id, replayed.id);
+        assert_eq!(first.created_at, replayed.created_at);
+        assert_eq!(first.state, HostActionState::QueuedReview);
+        assert!(first.confirmed_at.is_none());
+        assert!(first.lease_phase.is_none());
+        assert_eq!(
+            store
+                .list()
+                .iter()
+                .filter(|job| job.host == "hsb8" && job.kind == HostActionKind::UpdateRestart)
+                .count(),
+            1
+        );
+        assert!(matches!(
+            store.create_update_review("hsb8", "operator", 300),
+            Err(HostActionStoreError::ActiveJob)
+        ));
+        let other = store
+            .create_system_update_proposal(
+                "action-system-update-hsb8-other".to_string(),
+                "hsb8",
+                "operator",
+                310,
+            )
+            .expect("other kind");
+        assert!(matches!(
+            store.ensure_update_review_with_id(
+                &other.id,
+                "hsb8",
+                "paimos-delivery",
+                UpdateRestartIntent::Update,
+                320,
+            ),
+            Err(HostActionStoreError::InvalidJob)
+        ));
+        assert!(matches!(
+            store.ensure_update_review_with_id(
+                &first.id,
+                "csb0",
+                "paimos-delivery",
+                UpdateRestartIntent::Update,
+                330,
+            ),
+            Err(HostActionStoreError::WrongHost)
+        ));
     }
 
     #[test]
@@ -12208,6 +12312,7 @@ mod tests {
             UpdateRestartIntent::Update,
             300,
             Some("action-update-restart-csb0-200-1".to_string()),
+            None,
             None,
         );
         let mut jobs = BTreeMap::new();

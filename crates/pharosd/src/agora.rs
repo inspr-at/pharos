@@ -2338,6 +2338,7 @@ mod tests {
             backup_observations: vec![],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         }
     }
 

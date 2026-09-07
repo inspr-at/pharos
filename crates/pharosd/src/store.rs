@@ -209,6 +209,7 @@ impl Store {
                 .unwrap_or_default(),
             preferences: existing.map(|h| h.preferences.clone()).unwrap_or_default(),
             requested_preferences: existing.and_then(|h| h.requested_preferences.clone()),
+            deployed_artifact: existing.and_then(|h| h.deployed_artifact.clone()),
         };
         let previous = map.insert(registration.name.clone(), host.clone());
         if let Err(error) = self.persist(&map) {
@@ -339,6 +340,7 @@ impl Store {
                 backup_observations: report.backup_observations,
                 preferences: report.preferences,
                 requested_preferences,
+                deployed_artifact: report.deployed_artifact,
             },
         );
         if let Err(error) = self.persist(&map) {
@@ -465,6 +467,7 @@ mod tests {
             inbound_rtt_ms: None,
             location: None,
             preferences: Default::default(),
+            deployed_artifact: None,
         }
     }
 
@@ -689,6 +692,7 @@ mod tests {
                         inbound_rtt_ms: None,
                         location: None,
                         preferences: Default::default(),
+                        deployed_artifact: None,
                     },
                     now,
                 )
@@ -765,6 +769,7 @@ mod tests {
                     inbound_rtt_ms: Some(37),
                     location: None,
                     preferences: Default::default(),
+                    deployed_artifact: None,
                 },
                 120,
             )
@@ -824,6 +829,7 @@ mod tests {
                     inbound_rtt_ms: None,
                     location: None,
                     preferences: Default::default(),
+                    deployed_artifact: None,
                 },
                 150,
             )
@@ -863,6 +869,7 @@ mod tests {
             inbound_rtt_ms: None,
             location: None,
             preferences,
+            deployed_artifact: None,
         };
         let requested = HostPreferences {
             accent: Some("#48b8a8".to_string()),
