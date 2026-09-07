@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 26.09.07.22.08.13 - 2026-09-07
+
+- Refresh the immutable Debian bookworm-security snapshot so published images include the fixed `libssh2-1` package for CVE-2026-58050 and CVE-2026-7598; keep git, SSH, and restic runtime features, and keep the release vulnerability, SBOM, provenance, and signature gates fail-closed (PHAROS-206).
+
 ## 26.09.07.20.52.53 - 2026-09-07
 
 - Add guarded Paimos deployment and verification handoffs with durable, idempotent job ownership. Operator confirmation remains required before host actions.
