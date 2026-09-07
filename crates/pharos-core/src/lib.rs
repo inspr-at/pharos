@@ -36,6 +36,9 @@ pub const MAX_GIT_REVISION_HEX_BYTES: usize = 64;
 pub const SHA256_HEX_BYTES: usize = 64;
 pub const NIX_DEPLOYMENT_EVIDENCE_SCHEMA: &str = "inspr.pharos.nix-deployment-evidence.v1";
 pub const NIX_DEPLOYMENT_EVIDENCE_VERSION: u16 = 1;
+pub const DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA: &str = "inspr.pharos.deployed-artifact.v1";
+pub const DEPLOYED_ARTIFACT_EVIDENCE_VERSION: u16 = 1;
+pub const MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES: u64 = 4 * 1024;
 const MAX_UNIX_TIMESTAMP: UnixSeconds = 253_402_300_799;
 pub const MAX_SERVICE_OBSERVATIONS: usize = 64;
 pub const MAX_BACKUP_OBSERVATIONS: usize = 64;
@@ -281,6 +284,10 @@ pub struct Host {
     /// apply and report it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_preferences: Option<HostPreferences>,
+    /// Latest measured deployed-release identity. Absence is unknown; Nix
+    /// generation evidence never substitutes for this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployed_artifact: Option<DeployedArtifactEvidence>,
 }
 
 /// A non-system root nixpkgs input observed for lock-maintenance context.
@@ -376,6 +383,320 @@ impl NixDeploymentEvidence {
         }
         Ok(())
     }
+}
+
+/// Which digest a measured deployed artifact actually captured.
+///
+/// Container runtimes expose several unrelated OCI hashes. An index digest,
+/// manifest digest, and config digest must never be compared as equal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactDigestClass {
+    GenericSha256,
+    OciIndex,
+    OciManifest,
+    OciConfig,
+}
+
+impl ArtifactDigestClass {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::GenericSha256 => "generic_sha256",
+            Self::OciIndex => "oci_index",
+            Self::OciManifest => "oci_manifest",
+            Self::OciConfig => "oci_config",
+        }
+    }
+}
+
+/// Explicitly discriminated release identity. Calendar strings are validated
+/// as calendar dates; they are never inferred from punctuation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ArtifactVersionScheme {
+    #[serde(rename = "legacy")]
+    Legacy,
+    #[serde(rename = "inspr-calendar-v1")]
+    InsprCalendarV1,
+}
+
+impl ArtifactVersionScheme {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::InsprCalendarV1 => "inspr-calendar-v1",
+        }
+    }
+}
+
+/// Host-measured identity of a deployed release artifact. This is not Nix
+/// generation evidence and must not be copied from a configured expectation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeployedArtifactEvidence {
+    pub schema: String,
+    pub version: u16,
+    pub environment: String,
+    pub version_scheme: ArtifactVersionScheme,
+    pub artifact_version: String,
+    pub release_channel: String,
+    pub release_sequence: i64,
+    pub digest: String,
+    pub digest_class: ArtifactDigestClass,
+    pub commit_digest: String,
+    pub release_manifest_coordinate: String,
+    pub release_manifest_digest: String,
+    /// Distinct OCI index digest when measured. Never equal to the manifest or
+    /// config digest of the same image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_index_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_manifest_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_config_digest: Option<String>,
+}
+
+impl DeployedArtifactEvidence {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        if self.schema != DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA
+            || self.version != DEPLOYED_ARTIFACT_EVIDENCE_VERSION
+        {
+            return Err("unsupported deployed artifact evidence schema/version pair".to_string());
+        }
+        if !valid_symbol(&self.environment) {
+            return Err("deployed artifact environment must be a bounded symbol".to_string());
+        }
+        if !valid_artifact_version(&self.artifact_version) {
+            return Err("deployed artifact version is not a bounded version string".to_string());
+        }
+        match self.version_scheme {
+            ArtifactVersionScheme::Legacy => {}
+            ArtifactVersionScheme::InsprCalendarV1 => {
+                if !valid_inspr_calendar_version(&self.artifact_version) {
+                    return Err(
+                        "inspr-calendar-v1 artifact version is not a valid calendar coordinate"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if !valid_symbol(&self.release_channel) {
+            return Err("deployed artifact release_channel must be a bounded symbol".to_string());
+        }
+        if self.release_sequence < 0 {
+            return Err("deployed artifact release_sequence must be >= 0".to_string());
+        }
+        if !valid_prefixed_sha256(&self.digest) {
+            return Err("deployed artifact digest must be a sha256: hex digest".to_string());
+        }
+        if !valid_hex_identifier(
+            &self.commit_digest,
+            &[MIN_GIT_REVISION_HEX_BYTES, MAX_GIT_REVISION_HEX_BYTES],
+        ) {
+            return Err(
+                "deployed artifact commit_digest must be an exact Git object id".to_string(),
+            );
+        }
+        if !valid_release_manifest_coordinate(&self.release_manifest_coordinate) {
+            return Err(
+                "deployed artifact release_manifest_coordinate must be a bounded coordinate"
+                    .to_string(),
+            );
+        }
+        if !valid_prefixed_sha256(&self.release_manifest_digest) {
+            return Err(
+                "deployed artifact release_manifest_digest must be a sha256: hex digest"
+                    .to_string(),
+            );
+        }
+        validate_optional_prefixed_sha256(self.oci_index_digest.as_deref(), "oci_index_digest")?;
+        validate_optional_prefixed_sha256(
+            self.oci_manifest_digest.as_deref(),
+            "oci_manifest_digest",
+        )?;
+        validate_optional_prefixed_sha256(self.oci_config_digest.as_deref(), "oci_config_digest")?;
+        let class_digest = match self.digest_class {
+            ArtifactDigestClass::GenericSha256 => None,
+            ArtifactDigestClass::OciIndex => self.oci_index_digest.as_deref(),
+            ArtifactDigestClass::OciManifest => self.oci_manifest_digest.as_deref(),
+            ArtifactDigestClass::OciConfig => self.oci_config_digest.as_deref(),
+        };
+        if let Some(class_digest) = class_digest {
+            if class_digest != self.digest {
+                return Err(
+                    "deployed artifact digest must equal the digest of its declared class"
+                        .to_string(),
+                );
+            }
+        }
+        if oci_digests_overlap(
+            self.oci_index_digest.as_deref(),
+            self.oci_manifest_digest.as_deref(),
+            self.oci_config_digest.as_deref(),
+        ) {
+            return Err(
+                "OCI index, manifest, and config digests must remain distinct measurements"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// True only when the measured identity equals the expected tuple and the
+    /// compared digest is the one named by `digest_class`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matches_expected(
+        &self,
+        environment: &str,
+        version_scheme: ArtifactVersionScheme,
+        version: &str,
+        release_channel: &str,
+        release_sequence: i64,
+        digest: &str,
+        commit_digest: &str,
+        release_manifest_coordinate: &str,
+        release_manifest_digest: &str,
+    ) -> bool {
+        self.validate_contract().is_ok()
+            && self.environment == environment
+            && self.version_scheme == version_scheme
+            && self.artifact_version == version
+            && self.release_channel == release_channel
+            && self.release_sequence == release_sequence
+            && self.digest == digest
+            && self.commit_digest == commit_digest
+            && self.release_manifest_coordinate == release_manifest_coordinate
+            && self.release_manifest_digest == release_manifest_digest
+            && match self.digest_class {
+                ArtifactDigestClass::GenericSha256 => {
+                    self.oci_index_digest.is_none()
+                        && self.oci_manifest_digest.is_none()
+                        && self.oci_config_digest.is_none()
+                }
+                ArtifactDigestClass::OciIndex => self.oci_index_digest.as_deref() == Some(digest),
+                ArtifactDigestClass::OciManifest => {
+                    self.oci_manifest_digest.as_deref() == Some(digest)
+                }
+                ArtifactDigestClass::OciConfig => self.oci_config_digest.as_deref() == Some(digest),
+            }
+    }
+}
+
+/// Bounded collector that turns already-sanitized local metadata into evidence.
+/// It never reads raw `docker inspect` output, process environments, or logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployedArtifactCollectorClass {
+    AllowlistedMetadataFile,
+}
+
+impl DeployedArtifactCollectorClass {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::AllowlistedMetadataFile => "allowlisted-metadata-file",
+        }
+    }
+}
+
+/// Parse a locally allowlisted measurement document. Unknown, oversized, or
+/// unsanitized input fails closed rather than echoing a configured expectation.
+pub fn collect_deployed_artifact_from_metadata_file(
+    raw: &[u8],
+) -> Result<DeployedArtifactEvidence, String> {
+    if raw.is_empty() || raw.len() as u64 > MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES {
+        return Err("deployed artifact metadata exceeds the bounded collector size".to_string());
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(raw);
+    let evidence = DeployedArtifactEvidence::deserialize(&mut deserializer)
+        .map_err(|_| "deployed artifact metadata is not a typed measurement".to_string())?;
+    deserializer
+        .end()
+        .map_err(|_| "deployed artifact metadata has trailing data".to_string())?;
+    evidence.validate_contract()?;
+    Ok(evidence)
+}
+
+fn oci_digests_overlap(index: Option<&str>, manifest: Option<&str>, config: Option<&str>) -> bool {
+    let ids: Vec<&str> = [index, manifest, config].into_iter().flatten().collect();
+    ids.iter()
+        .any(|left| ids.iter().filter(|right| left == *right).count() > 1)
+}
+
+fn validate_optional_prefixed_sha256(value: Option<&str>, name: &str) -> Result<(), String> {
+    match value {
+        None => Ok(()),
+        Some(value) if valid_prefixed_sha256(value) => Ok(()),
+        Some(_) => Err(format!("{name} must be a sha256: hex digest")),
+    }
+}
+
+fn valid_prefixed_sha256(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| valid_hex_identifier(digest, &[SHA256_HEX_BYTES]))
+}
+
+fn valid_symbol(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn valid_artifact_version(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn valid_release_manifest_coordinate(value: &str) -> bool {
+    let Some((kind, coordinate)) = value.split_once(':') else {
+        return false;
+    };
+    valid_symbol(kind)
+        && (1..=190).contains(&coordinate.len())
+        && coordinate.as_bytes()[0].is_ascii_alphanumeric()
+        && coordinate.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'/' | b'@' | b':' | b'+' | b'-')
+        })
+}
+
+/// INSPR Calendar Version v1: `YY.MM.DD` or `YY.MM.DD.hh.mm.ss`, proleptic
+/// Gregorian, UTC fields. Invalid dates such as `26.02.29` fail closed.
+pub fn valid_inspr_calendar_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| part.len() != 2 || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    let numbers = match parts
+        .iter()
+        .map(|part| part.parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(numbers) => numbers,
+        Err(_) => return false,
+    };
+    let (year, month, day, hour, minute, second) = match numbers.as_slice() {
+        [year, month, day] => (2000 + *year, *month, *day, 0, 0, 0),
+        [year, month, day, hour, minute, second] => {
+            (2000 + *year, *month, *day, *hour, *minute, *second)
+        }
+        _ => return false,
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2821,15 +3142,15 @@ pub fn liveness(
     }
 }
 
-// PHAROS-202 moved the contract to v5 by adding generation-owned deployment
-// evidence and fresh exact upstream comparisons.
+// PHAROS-206 moved the contract to v6 by adding optional measured deployed
+// artifact identity, distinct from Nix generation / flake.lock evidence.
 // `deny_unknown_fields` makes any addition breaking for an older consumer, so
 // the version moves with it and the rollout order in README applies: control
 // plane first, then beacons.
-pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v5";
-pub const HOST_REPORT_VERSION: u16 = 5;
-pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v4";
-pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 4;
+pub const HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v6";
+pub const HOST_REPORT_VERSION: u16 = 6;
+pub const PREVIOUS_HOST_REPORT_SCHEMA: &str = "inspr.pharos.host-report.v5";
+pub const PREVIOUS_HOST_REPORT_VERSION: u16 = 5;
 pub const SUPPORTED_HOST_REPORT_CONTRACTS: [(&str, u16); 2] = [
     (PREVIOUS_HOST_REPORT_SCHEMA, PREVIOUS_HOST_REPORT_VERSION),
     (HOST_REPORT_SCHEMA, HOST_REPORT_VERSION),
@@ -2868,6 +3189,10 @@ pub struct HostReport {
     /// the host accepts them.
     #[serde(default)]
     pub preferences: HostPreferences,
+    /// Optional measured deployed-release identity. Missing means unknown, not
+    /// that the configured artifact is running. v5 reports must omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployed_artifact: Option<DeployedArtifactEvidence>,
 }
 
 impl HostReport {
@@ -2878,12 +3203,8 @@ impl HostReport {
         {
             return Err("unsupported report schema/version pair".to_string());
         }
-        if self.version == PREVIOUS_HOST_REPORT_VERSION
-            && (self.freshness.deployment_evidence.is_some()
-                || self.freshness.nixcfg_comparison.is_some()
-                || self.freshness.nixpkgs_comparison.is_some())
-        {
-            return Err("report v4 must not carry v5 deployment evidence".to_string());
+        if self.version == PREVIOUS_HOST_REPORT_VERSION && self.deployed_artifact.is_some() {
+            return Err("report v5 must not carry v6 deployed artifact evidence".to_string());
         }
         validate_report_identity(&self.name, &self.role)?;
         validate_heartbeat_interval(self.heartbeat_interval_secs)?;
@@ -2917,6 +3238,9 @@ impl HostReport {
             observation.validate_contract()?;
         }
         self.preferences.validate_contract()?;
+        if let Some(evidence) = &self.deployed_artifact {
+            evidence.validate_contract()?;
+        }
         if let Some(location) = &self.location {
             location.validate_contract()?;
             if location.manual_override {
@@ -3745,6 +4069,125 @@ mod tests {
         }
     }
 
+    fn measured_artifact() -> DeployedArtifactEvidence {
+        DeployedArtifactEvidence {
+            schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
+            version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
+            environment: "production-eu1".to_string(),
+            version_scheme: ArtifactVersionScheme::InsprCalendarV1,
+            artifact_version: "26.09.05.09.00.00".to_string(),
+            release_channel: "stable".to_string(),
+            release_sequence: 260_905_090_000,
+            digest: format!("sha256:{}", "3".repeat(64)),
+            digest_class: ArtifactDigestClass::OciManifest,
+            commit_digest: "b".repeat(40),
+            release_manifest_coordinate: "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00"
+                .to_string(),
+            release_manifest_digest: format!("sha256:{}", "4".repeat(64)),
+            oci_index_digest: Some(format!("sha256:{}", "5".repeat(64))),
+            oci_manifest_digest: Some(format!("sha256:{}", "3".repeat(64))),
+            oci_config_digest: Some(format!("sha256:{}", "6".repeat(64))),
+        }
+    }
+
+    #[test]
+    fn calendar_versions_reject_non_gregorian_and_ambiguous_strings() {
+        for valid in [
+            "26.09.05",
+            "26.09.05.09.00.00",
+            "24.02.29",
+            "00.01.01.00.00.00",
+        ] {
+            assert!(
+                valid_inspr_calendar_version(valid),
+                "{valid} must be a valid calendar coordinate"
+            );
+        }
+        for invalid in [
+            "2026.08.31",
+            "26.8.31",
+            "26.02.29",
+            "26.04.31",
+            "26.08.31.24.00.00",
+            "26.08.31.12.60.00",
+            "26.08.31.12.00",
+            "1.2.3",
+        ] {
+            assert!(
+                !valid_inspr_calendar_version(invalid),
+                "{invalid} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn deployed_artifact_preserves_distinct_oci_digest_classes() {
+        let evidence = measured_artifact();
+        evidence.validate_contract().unwrap();
+        assert!(evidence.matches_expected(
+            "production-eu1",
+            ArtifactVersionScheme::InsprCalendarV1,
+            "26.09.05.09.00.00",
+            "stable",
+            260_905_090_000,
+            &format!("sha256:{}", "3".repeat(64)),
+            &"b".repeat(40),
+            "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00",
+            &format!("sha256:{}", "4".repeat(64)),
+        ));
+        assert!(!evidence.matches_expected(
+            "production-eu1",
+            ArtifactVersionScheme::InsprCalendarV1,
+            "26.09.05.09.00.00",
+            "stable",
+            260_905_090_000,
+            evidence.oci_index_digest.as_deref().unwrap(),
+            &"b".repeat(40),
+            "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00",
+            &format!("sha256:{}", "4".repeat(64)),
+        ));
+        let mut overlapped = evidence.clone();
+        overlapped.oci_config_digest = overlapped.oci_manifest_digest.clone();
+        assert!(overlapped.validate_contract().is_err());
+
+        let encoded = serde_json::to_vec(&evidence).unwrap();
+        let parsed = collect_deployed_artifact_from_metadata_file(&encoded).unwrap();
+        assert_eq!(parsed.digest_class, ArtifactDigestClass::OciManifest);
+        assert_ne!(parsed.oci_index_digest, parsed.oci_manifest_digest);
+        assert_ne!(parsed.oci_manifest_digest, parsed.oci_config_digest);
+        assert_eq!(
+            DeployedArtifactCollectorClass::AllowlistedMetadataFile.key(),
+            "allowlisted-metadata-file"
+        );
+    }
+
+    #[test]
+    fn previous_host_report_must_not_carry_deployed_artifact_evidence() {
+        let mut report = HostReport {
+            schema: PREVIOUS_HOST_REPORT_SCHEMA.to_string(),
+            version: PREVIOUS_HOST_REPORT_VERSION,
+            name: "hsb8".to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            heartbeat_interval_secs: 60,
+            freshness: NixFreshness {
+                applicable: true,
+                ..Default::default()
+            },
+            kernel: None,
+            service_observations: vec![],
+            backup_observations: vec![],
+            inbound_rtt_ms: None,
+            location: None,
+            preferences: Default::default(),
+            deployed_artifact: Some(measured_artifact()),
+        };
+        assert!(report.validate_contract().is_err());
+        report.schema = HOST_REPORT_SCHEMA.to_string();
+        report.version = HOST_REPORT_VERSION;
+        report.validate_contract().unwrap();
+    }
+
     fn proven_current_freshness(channel: &str) -> NixFreshness {
         let evidence = test_deployment_evidence(channel);
         NixFreshness {
@@ -4112,6 +4555,7 @@ mod tests {
             inbound_rtt_ms: Some(5),
             location: None,
             preferences: Default::default(),
+            deployed_artifact: None,
         };
         valid.validate_contract().unwrap();
 
@@ -4459,6 +4903,7 @@ mod tests {
             inbound_rtt_ms: None,
             location: None,
             preferences: Default::default(),
+            deployed_artifact: None,
         };
         report
             .validate_contract()
@@ -4648,6 +5093,7 @@ mod tests {
             backup_observations: vec![],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let observed = ServerObservedState::from_host(&host, 1_020);

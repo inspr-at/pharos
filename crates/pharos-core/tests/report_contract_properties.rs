@@ -24,6 +24,7 @@ fn report(name: String, role: String, heartbeat_interval_secs: u64) -> HostRepor
         inbound_rtt_ms: None,
         location: None,
         preferences: HostPreferences::default(),
+        deployed_artifact: None,
     }
 }
 

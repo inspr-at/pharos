@@ -380,32 +380,42 @@ Host-action state contains no credentials, arbitrary commands, Nix store paths
 or command output. Target agents can claim only a fixed phase of a persisted
 workflow for a bounded lease.
 
-The optional Paimos delivery-stage adapter is reporter-only. Its owner-written
-local intent file fixes the Paimos origin, handoff IDs, host, one of the two
-compiled workflows (`deploy-production` or `verify-production`), symbolic
-environment, exact artifact tuple and existing guarded `UpdateRestart` binding.
-Paimos supplies none of those authority-bearing selectors, and no Paimos field
-can become a command, path, callback, host selector or arbitrary workflow.
+The optional Paimos delivery-stage adapter reports owner evidence and, after a
+durable local accept, creates exactly one guarded `UpdateRestart` review or
+attaches an explicitly configured matching job. It never confirms, agent-claims
+or dispatches that job. Its owner-written local intent file fixes the Paimos
+origin, handoff IDs, host, one of the two compiled workflows
+(`deploy-production` or `verify-production`), symbolic environment, exact
+artifact tuple and optional existing guarded `UpdateRestart` binding. Paimos
+supplies none of those authority-bearing selectors, and no Paimos field can
+become a command, path, callback, host selector or arbitrary workflow. An
+unrelated active job on the same host is not adopted.
 
 Every external call requires the registered API key and the handoff's separate
 32-byte credential from different owner-only, current-user-owned, single-link
 files. Before a mutation, Pharos durably stores the exact safe JSON request and
 an idempotency key derived from handoff ID, sequence and request digest. The
 journal also stores a domain-separated digest of the canonical Paimos origin
-and every non-secret owner-intent selector, so a crash replay is rejected if
-the destination, workflow, environment, host, artifact or guarded action
-binding changed. An unchanged intent replays the
-exact bytes after a crash or ambiguous response; credential rotation does not
-change request identity. The adapter emits only sequence 1 `accepted` followed
-by sequence 2 `succeeded` or `failed`—never `active` or a heartbeat.
+and every non-secret owner-intent selector, plus a deterministic operation
+identity for the created or attached job, so a crash replay is rejected if the
+destination, workflow, environment, host, artifact, authority epoch or guarded
+action binding changed. An unchanged intent replays the exact bytes after a
+crash or ambiguous response; credential rotation does not change request
+identity. The adapter emits only sequence 1 `accepted` followed by sequence 2
+`succeeded` or `failed`—never `active` or a heartbeat.
 
-Deployment success requires an already operator-confirmed `UpdateRestart` to
-finish and a newer fresh beacon to report Nix generation evidence whose source
-revision and `flake.lock` digest match the locally configured commit and
-artifact digest. Verification uses a separate handoff and remains unreported
-until another fresh beacon arrives after Paimos received deployment, with the
-identical host, environment and artifact tuple. Wrong artifact, wrong
-environment, stale, missing or pre-deployment evidence fails closed.
+Deployment success requires an operator-confirmed owned `UpdateRestart` to
+finish and a newer fresh beacon to report a measured deployed-release identity
+that matches the locally configured environment and artifact tuple. Nix
+generation evidence and `flake.lock` digest are not that identity. Missing,
+stale, mismatched, predated, wrong-environment or wrong-digest-class
+observations fail closed. Verification uses a separate handoff and remains
+unreported until Paimos received deployment and a later observation of the same
+host, environment, artifact and lineage arrives. Human attended confirmation
+remains the first-slice go-live; this adapter does not grant hidden automatic
+authority. Live host proof still requires operator-configured measurement and
+a completed guarded apply—this repository does not claim that proof from
+fixtures.
 
 ### 5. Requested is never presented as applied
 
@@ -734,7 +744,8 @@ promised third-party API. The important boundaries are:
 | `PHAROS_HOSTNAME`, `PHAROS_ROLE`           | Explicit reported identity                                                                                                                                                               |
 | `PHAROS_TOKEN` / `PHAROS_TOKEN_FILE`       | Per-host bearer credential; the file form wins and is preferred                                                                                                                          |
 | `NIXCFG_DIR`                               | Read-only checkout used as a Git object source; lock context is accepted only when its digest matches the active generation                                                              |
-| `PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE`      | Strict generation-owned deployment evidence; missing or malformed evidence renders freshness unverified                                                                                  |
+| `PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE`      | Strict generation-owned Nix evidence; missing or malformed evidence renders freshness unverified. This is not a released-software digest.                                                 |
+| `PHAROS_DEPLOYED_ARTIFACT_EVIDENCE_FILE`   | Optional locally allowlisted measured release identity (`allowlisted-metadata-file`); missing, oversized or untyped files omit the field and deployment matching fails closed             |
 | `PHAROS_NIXCFG_REMOTE_URL`                 | Credential-free HTTPS Git repository used as authoritative nixcfg source                                                                                                                 |
 | `PHAROS_NIXCFG_REMOTE_REF`                 | Exact `refs/heads/*` authoritative nixcfg branch                                                                                                                                         |
 | `PHAROS_NIXPKGS_REMOTE_URL`                | Credential-free HTTPS nixpkgs Git repository; the official NixOS/nixpkgs remote uses the bounded official channel publication, while custom remotes use exact fail-closed Git comparison |
@@ -761,17 +772,20 @@ The Paimos adapter config uses schema
 origin, `poll_interval_secs` from 5–3600,
 `verification_freshness_secs` from 30–900, one `api_key_file`, and 1–128 strict
 intents. A deployment intent has `stage: "deployment"`,
-`workflow: "deploy-production"` and `update_restart_job_id`; a verification
-intent has `stage: "verification"`, `workflow: "verify-production"` and
-`deployment_handoff_id`. Both carry locally selected `handoff_id`,
-`handoff_secret_file`, `host`, `environment`, and a legacy-only artifact
-containing `version_scheme: "legacy"`, a bounded version, `sha256:` digest and
-lowercase 40- or 64-hex commit digest. The scheme is bound into local intent
-identity but omitted from the frozen external-stage v1 wire artifact; Calendar
-evidence remains refused until the additive external-stage v2 contract lands.
-Unknown fields, unsafe origins, mismatched deployment/verification pairs and
-shared credential files reject startup. The bundled contract verifier is
-`scripts/check-paimos-delivery-contract.sh`.
+`workflow: "deploy-production"` and either omits `update_restart_job_id` to
+create one deterministic guarded review or sets it to an explicitly selected
+matching job; a verification intent has `stage: "verification"`,
+`workflow: "verify-production"` and `deployment_handoff_id`. Both carry locally
+selected `handoff_id`, `handoff_secret_file`, `host`, `environment`, and a v2
+artifact containing explicit `version_scheme` (`legacy` or `inspr-calendar-v1`),
+a bounded version, release channel and sequence, `sha256:` digest, lowercase
+40- or 64-hex commit digest, and release-manifest coordinate plus digest.
+Calendar strings are accepted only as calendar dates. Unknown fields, unsafe
+origins, mismatched deployment/verification pairs and shared credential files
+reject startup. The bundled contract verifier is
+`scripts/check-paimos-delivery-contract.sh`. Janus remains a separate v1
+dependency fixture and is never the deployment owner. Paimos still owns
+CreateHandoff as a producer follow-up; this adapter does not create handoffs.
 
 The in-process conformance harness injects its loopback URL directly into a
 test-only configuration value; the production config parser never accepts

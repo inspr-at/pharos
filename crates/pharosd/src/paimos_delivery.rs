@@ -1,10 +1,13 @@
-//! Reporter-only Paimos external-stage adapter (PHAROS-206).
+//! Guarded Paimos external-stage adapter (PHAROS-206).
 //!
 //! Paimos supplies an opaque handoff and a value-free stage projection. Every
 //! authority-bearing choice remains in this service's owner-only local intent
-//! file: host, guarded workflow, environment, artifact, and existing Pharos
-//! workflow binding. This module can report observations; it cannot create,
-//! confirm, claim, or execute a host action.
+//! file: host, guarded workflow, environment, and exact artifact identity.
+//! After a durable deployment accept this adapter creates or attaches exactly
+//! one locally configured `UpdateRestart` review. It never confirms, claims,
+//! or dispatches host commands. Sequence-2 reports require a later measured
+//! deployed-artifact observation; Nix generation / `flake.lock` evidence is
+//! not that proof.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,20 +31,26 @@ use time::OffsetDateTime;
 use url::Url;
 
 use crate::durable_file::atomic_write_json;
-use crate::host_actions::{HostActionState, HostActionStore, HostWorkflowKind};
+use crate::host_actions::{
+    HostActionState, HostActionStore, HostActionStoreError, HostWorkflowKind, UpdateRestartIntent,
+};
 use crate::store::Store;
+use pharos_core::{valid_inspr_calendar_version, ArtifactVersionScheme};
 
-pub(crate) const PAIMOS_SCHEMA_MAJOR: u16 = 1;
-pub(crate) const PAIMOS_RELEASE: &str = "v5.11.0";
-pub(crate) const PAIMOS_CERTIFIED_COMMIT: &str = "e5f4c86bc061775c853d5847e8fb8bb7e3a31c34";
+pub(crate) const PAIMOS_SCHEMA_MAJOR: u16 = 2;
+pub(crate) const PAIMOS_RELEASE: &str = "v26.09.05";
+pub(crate) const PAIMOS_CERTIFIED_COMMIT: &str = "bb3b874f22a14fbe3879b1b575f33d55a001312d";
 pub(crate) const PAIMOS_FIXTURE_DIGEST: &str =
-    "sha256:0318f4025902c9d5dd790384950cc9daebb16e02e79a4a90ce7dddc673e68bed";
+    "sha256:6bba9613230c6ea728db58ffea5533399caed19e6d56a8d78ef19d0fde20be8a";
+pub(crate) const PAIMOS_JANUS_DEPENDENCY_SHA256: &str =
+    "52a647abd52e229fcdef8461eeb9f7d31f07632501ad33f594cdfbc155c23d4b";
 
 const CONFIG_SCHEMA: &str = "inspr.pharos.paimos-delivery-adapter.v2";
 const CONFIG_SCHEMA_VERSION: u16 = 2;
 const JOURNAL_SCHEMA: &str = "inspr.pharos.paimos-delivery-journal.v1";
 const INTENT_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-intent.v2";
-const CONTRACT_MEDIA_TYPE: &str = "application/vnd.paimos.external-stage.v1+json";
+const OPERATION_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-operation.v1";
+const CONTRACT_MEDIA_TYPE: &str = "application/vnd.paimos.external-stage.v2+json";
 const HANDOFF_SECRET_HEADER: &str = "X-PAIMOS-Handoff-Secret";
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const USER_AGENT_VALUE: &str = "pharosd-paimos-delivery/1";
@@ -54,6 +63,7 @@ const MAX_INTENTS: usize = 128;
 const MAX_JOURNAL_RECORDS: usize = MAX_INTENTS * 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const IDEMPOTENCY_DOMAIN: &[u8] = b"inspr.pharos.paimos-delivery-idempotency.v1\0";
+const GUARDED_ACTOR: &str = "paimos-delivery";
 
 #[derive(Debug)]
 enum AdapterError {
@@ -130,80 +140,32 @@ impl GuardedWorkflow {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ArtifactVersionScheme {
-    Legacy,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ArtifactEvidence {
     version_scheme: ArtifactVersionScheme,
     version: String,
+    release_channel: String,
+    release_sequence: i64,
     digest: String,
     commit_digest: String,
+    release_manifest_coordinate: String,
+    release_manifest_digest: String,
 }
 
 impl ArtifactEvidence {
     fn valid(&self) -> bool {
-        self.version_scheme == ArtifactVersionScheme::Legacy
-            && valid_version(&self.version)
+        let scheme_ok = match self.version_scheme {
+            ArtifactVersionScheme::Legacy => valid_version(&self.version),
+            ArtifactVersionScheme::InsprCalendarV1 => valid_inspr_calendar_version(&self.version),
+        };
+        scheme_ok
+            && valid_symbol(&self.release_channel)
+            && self.release_sequence >= 0
             && valid_sha256_digest(&self.digest)
             && valid_lower_hex(&self.commit_digest, &[40, 64])
-    }
-}
-
-mod legacy_wire_artifact {
-    use super::{ArtifactEvidence, ArtifactVersionScheme};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    #[derive(Serialize)]
-    struct WireArtifact<'a> {
-        version: &'a str,
-        digest: &'a str,
-        commit_digest: &'a str,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct OwnedWireArtifact {
-        version: String,
-        digest: String,
-        commit_digest: String,
-    }
-
-    pub(super) fn serialize<S>(
-        artifact: &ArtifactEvidence,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if artifact.version_scheme != ArtifactVersionScheme::Legacy {
-            return Err(serde::ser::Error::custom(
-                "external-stage v1 accepts only legacy artifact evidence",
-            ));
-        }
-        WireArtifact {
-            version: &artifact.version,
-            digest: &artifact.digest,
-            commit_digest: &artifact.commit_digest,
-        }
-        .serialize(serializer)
-    }
-
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<ArtifactEvidence, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = OwnedWireArtifact::deserialize(deserializer)?;
-        Ok(ArtifactEvidence {
-            version_scheme: ArtifactVersionScheme::Legacy,
-            version: wire.version,
-            digest: wire.digest,
-            commit_digest: wire.commit_digest,
-        })
+            && valid_release_manifest_coordinate(&self.release_manifest_coordinate)
+            && valid_sha256_digest(&self.release_manifest_digest)
     }
 }
 
@@ -235,7 +197,7 @@ impl DeliveryIntent {
                         && self
                             .update_restart_job_id
                             .as_deref()
-                            .is_some_and(valid_action_id)
+                            .is_none_or(valid_action_id)
                         && self.deployment_handoff_id.is_none()
                 }
                 IntentStage::Verification => {
@@ -468,7 +430,6 @@ struct PharosEvidence {
     kind: EvidenceKind,
     workflow: String,
     environment: String,
-    #[serde(with = "legacy_wire_artifact")]
     artifact: ArtifactEvidence,
     result: EvidenceResult,
     observed_at: String,
@@ -625,12 +586,56 @@ impl JournalRecord {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OperationBinding {
+    handoff_id: String,
+    job_id: String,
+    host: String,
+    workflow: String,
+    environment: String,
+    artifact: ArtifactEvidence,
+    plan_digest: String,
+    predecessor_digest: String,
+    authority_epoch: i64,
+    execution_number: i64,
+    context_digest: String,
+    operation_id: String,
+}
+
+impl OperationBinding {
+    fn valid(&self) -> bool {
+        valid_handoff_id(&self.handoff_id)
+            && valid_action_id(&self.job_id)
+            && valid_host(&self.host)
+            && valid_symbol(&self.workflow)
+            && valid_symbol(&self.environment)
+            && self.artifact.valid()
+            && valid_sha256_digest(&self.plan_digest)
+            && valid_sha256_digest(&self.predecessor_digest)
+            && self.authority_epoch >= 1
+            && self.execution_number >= 1
+            && valid_sha256_digest(&self.context_digest)
+            && valid_lower_hex(&self.operation_id, &[64])
+    }
+
+    fn matches_pull(&self, pull: &PullResponse) -> bool {
+        self.plan_digest == pull.plan_digest
+            && self.predecessor_digest == pull.predecessor_digest
+            && self.authority_epoch == pull.authority_epoch
+            && self.execution_number == pull.execution_number
+            && self.context_digest == pull.context_digest
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct JournalDocument {
     schema: String,
     schema_version: u16,
     records: BTreeMap<String, JournalRecord>,
+    #[serde(default)]
+    operations: BTreeMap<String, OperationBinding>,
 }
 
 impl Default for JournalDocument {
@@ -639,6 +644,7 @@ impl Default for JournalDocument {
             schema: JOURNAL_SCHEMA.to_string(),
             schema_version: 1,
             records: BTreeMap::new(),
+            operations: BTreeMap::new(),
         }
     }
 }
@@ -659,10 +665,15 @@ impl JournalStore {
         if document.schema != JOURNAL_SCHEMA
             || document.schema_version != 1
             || document.records.len() > MAX_JOURNAL_RECORDS
+            || document.operations.len() > MAX_JOURNAL_RECORDS
             || document
                 .records
                 .iter()
                 .any(|(key, record)| key != &record.key() || !record.valid())
+            || document
+                .operations
+                .iter()
+                .any(|(key, binding)| key != &binding.handoff_id || !binding.valid())
         {
             return Err(AdapterError::Journal);
         }
@@ -779,6 +790,50 @@ impl JournalStore {
         let document = self.document.lock().expect("Paimos delivery journal lock");
         let record = document.records.get(&format!("{handoff_id}:2"))?;
         decode_strict(record.body_json.as_bytes()).ok()
+    }
+
+    fn operation(&self, handoff_id: &str) -> Option<OperationBinding> {
+        self.document
+            .lock()
+            .expect("Paimos delivery journal lock")
+            .operations
+            .get(handoff_id)
+            .cloned()
+    }
+
+    fn persist_operation(
+        &self,
+        binding: OperationBinding,
+    ) -> Result<OperationBinding, AdapterError> {
+        if !binding.valid() {
+            return Err(AdapterError::Journal);
+        }
+        let mut document = self.document.lock().expect("Paimos delivery journal lock");
+        if let Some(existing) = document.operations.get(&binding.handoff_id) {
+            return if existing == &binding {
+                Ok(existing.clone())
+            } else {
+                Err(AdapterError::LocalBinding)
+            };
+        }
+        if document.operations.len() >= MAX_JOURNAL_RECORDS {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated
+            .operations
+            .insert(binding.handoff_id.clone(), binding.clone());
+        match atomic_write_json(&self.path, &updated) {
+            Ok(()) => {
+                *document = updated;
+                Ok(binding)
+            }
+            Err(error) if error.final_file_replaced() => {
+                *document = updated;
+                Err(AdapterError::Journal)
+            }
+            Err(_) => Err(AdapterError::Journal),
+        }
     }
 }
 
@@ -1015,7 +1070,7 @@ impl PaimosDeliveryAdapter {
             paimos_commit = PAIMOS_CERTIFIED_COMMIT,
             schema_major = PAIMOS_SCHEMA_MAJOR,
             fixture_digest = PAIMOS_FIXTURE_DIGEST,
-            "Paimos reporter-only delivery adapter enabled"
+            "Paimos guarded delivery adapter enabled"
         );
         Ok(Some(Self {
             config,
@@ -1065,13 +1120,15 @@ impl PaimosDeliveryAdapter {
                     observed_at: format_timestamp(now_unix())?,
                 };
                 self.send_new(intent, JournalRequestKind::Accept, &request)
-                    .await
+                    .await?;
+                self.bind_after_accept(intent, &pull, now_unix())
             }
             HandoffState::Accepted => {
                 if self.journal.receipt(&intent.handoff_id, 1).is_none() {
                     return Err(AdapterError::LocalBinding);
                 }
-                let Some(request) = self.local_terminal_report(intent, now_unix())? else {
+                self.bind_after_accept(intent, &pull, now_unix())?;
+                let Some(request) = self.local_terminal_report(intent, &pull, now_unix())? else {
                     return Ok(());
                 };
                 self.send_new(intent, JournalRequestKind::Report, &request)
@@ -1133,12 +1190,101 @@ impl PaimosDeliveryAdapter {
     fn local_terminal_report(
         &self,
         intent: &DeliveryIntent,
+        pull: &PullResponse,
         now: i64,
     ) -> Result<Option<ReportRequest>, AdapterError> {
         match intent.stage {
             IntentStage::Deployment => self.deployment_report(intent, now),
-            IntentStage::Verification => self.verification_report(intent, now),
+            IntentStage::Verification => self.verification_report(intent, pull, now),
         }
+    }
+
+    fn bind_after_accept(
+        &self,
+        intent: &DeliveryIntent,
+        pull: &PullResponse,
+        now: i64,
+    ) -> Result<(), AdapterError> {
+        if intent.stage != IntentStage::Deployment {
+            return Ok(());
+        }
+        if let Some(existing) = self.journal.operation(&intent.handoff_id) {
+            if existing.host != intent.host
+                || existing.workflow != intent.workflow.key()
+                || existing.environment != intent.environment
+                || existing.artifact != intent.artifact
+                || !existing.matches_pull(pull)
+            {
+                return Err(AdapterError::LocalBinding);
+            }
+            if intent
+                .update_restart_job_id
+                .as_deref()
+                .is_some_and(|job_id| job_id != existing.job_id)
+            {
+                return Err(AdapterError::LocalBinding);
+            }
+            let Some(job) = self.host_actions.get(&existing.job_id) else {
+                return Err(AdapterError::LocalBinding);
+            };
+            if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
+                return Err(AdapterError::LocalBinding);
+            }
+            return Ok(());
+        }
+        let operation_id = operation_identity(intent, &self.config.paimos_origin, pull)?;
+        let job_id = if let Some(configured) = intent.update_restart_job_id.as_deref() {
+            let Some(job) = self.host_actions.get(configured) else {
+                return Err(AdapterError::LocalBinding);
+            };
+            if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
+                return Err(AdapterError::LocalBinding);
+            }
+            configured.to_string()
+        } else {
+            let job_id = deterministic_job_id(&intent.host, &operation_id);
+            match self.host_actions.ensure_update_review_with_id(
+                &job_id,
+                &intent.host,
+                GUARDED_ACTOR,
+                UpdateRestartIntent::Update,
+                now,
+            ) {
+                Ok(job) => {
+                    if job.host != intent.host
+                        || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+                        || job.confirmed_at.is_some()
+                    {
+                        return Err(AdapterError::LocalBinding);
+                    }
+                    job.id
+                }
+                Err(
+                    HostActionStoreError::ActiveJob
+                    | HostActionStoreError::FailedJobRequiresRetry
+                    | HostActionStoreError::BlockedByFleetGate
+                    | HostActionStoreError::WrongHost
+                    | HostActionStoreError::InvalidJob,
+                ) => return Err(AdapterError::LocalBinding),
+                Err(_) => return Err(AdapterError::Journal),
+            }
+        };
+        let binding = OperationBinding {
+            handoff_id: intent.handoff_id.clone(),
+            job_id,
+            host: intent.host.clone(),
+            workflow: intent.workflow.key().to_string(),
+            environment: intent.environment.clone(),
+            artifact: intent.artifact.clone(),
+            plan_digest: pull.plan_digest.clone(),
+            predecessor_digest: pull.predecessor_digest.clone(),
+            authority_epoch: pull.authority_epoch,
+            execution_number: pull.execution_number,
+            context_digest: pull.context_digest.clone(),
+            operation_id,
+        };
+        self.journal.persist_operation(binding)?;
+        Ok(())
     }
 
     fn deployment_report(
@@ -1146,11 +1292,13 @@ impl PaimosDeliveryAdapter {
         intent: &DeliveryIntent,
         now: i64,
     ) -> Result<Option<ReportRequest>, AdapterError> {
-        let job_id = intent
-            .update_restart_job_id
-            .as_deref()
+        let job_id = self
+            .journal
+            .operation(&intent.handoff_id)
+            .map(|binding| binding.job_id)
+            .or_else(|| intent.update_restart_job_id.clone())
             .ok_or(AdapterError::LocalBinding)?;
-        let Some(job) = self.host_actions.get(job_id) else {
+        let Some(job) = self.host_actions.get(&job_id) else {
             return Ok(None);
         };
         if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
@@ -1177,6 +1325,7 @@ impl PaimosDeliveryAdapter {
     fn verification_report(
         &self,
         intent: &DeliveryIntent,
+        pull: &PullResponse,
         now: i64,
     ) -> Result<Option<ReportRequest>, AdapterError> {
         let deployment_handoff = intent
@@ -1208,6 +1357,17 @@ impl PaimosDeliveryAdapter {
         {
             return Err(AdapterError::LocalBinding);
         }
+        let Some(deployment_op) = self.journal.operation(deployment_handoff) else {
+            return Err(AdapterError::LocalBinding);
+        };
+        if deployment_op.artifact != intent.artifact
+            || deployment_op.host != intent.host
+            || deployment_op.environment != intent.environment
+            || pull.predecessor_digest != deployment_op.plan_digest
+            || pull.authority_epoch != deployment_op.authority_epoch
+        {
+            return Err(AdapterError::LocalBinding);
+        }
         let deployment_received_at = parse_timestamp(&receipt.server_received_at)?;
         let Some(observed_at) =
             self.matching_fresh_beacon(intent, deployment_received_at.unix_timestamp(), now)?
@@ -1229,12 +1389,20 @@ impl PaimosDeliveryAdapter {
         let Some(observed_at) = host.last_seen else {
             return Ok(None);
         };
-        let Some(evidence) = host.freshness.deployment_evidence else {
+        let Some(evidence) = host.deployed_artifact.as_ref() else {
             return Ok(None);
         };
-        if evidence.source_revision != intent.artifact.commit_digest
-            || format!("sha256:{}", evidence.flake_lock_sha256) != intent.artifact.digest
-        {
+        if !evidence.matches_expected(
+            &intent.environment,
+            intent.artifact.version_scheme,
+            &intent.artifact.version,
+            &intent.artifact.release_channel,
+            intent.artifact.release_sequence,
+            &intent.artifact.digest,
+            &intent.artifact.commit_digest,
+            &intent.artifact.release_manifest_coordinate,
+            &intent.artifact.release_manifest_digest,
+        ) {
             return Err(AdapterError::LocalBinding);
         }
         if observed_at <= strictly_after
@@ -1568,6 +1736,62 @@ fn valid_lower_hex(value: &str, lengths: &[usize]) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn valid_release_manifest_coordinate(value: &str) -> bool {
+    let Some((kind, coordinate)) = value.split_once(':') else {
+        return false;
+    };
+    valid_symbol(kind)
+        && (1..=190).contains(&coordinate.len())
+        && coordinate.as_bytes()[0].is_ascii_alphanumeric()
+        && coordinate.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'/' | b'@' | b':' | b'+' | b'-')
+        })
+}
+
+fn operation_identity(
+    intent: &DeliveryIntent,
+    paimos_origin: &Url,
+    pull: &PullResponse,
+) -> Result<String, AdapterError> {
+    #[derive(Serialize)]
+    struct OperationIdentity<'a> {
+        domain: &'static str,
+        paimos_origin: &'a str,
+        handoff_id: &'a str,
+        host: &'a str,
+        workflow: &'static str,
+        environment: &'a str,
+        artifact: &'a ArtifactEvidence,
+        plan_digest: &'a str,
+        predecessor_digest: &'a str,
+        authority_epoch: i64,
+        execution_number: i64,
+        context_digest: &'a str,
+    }
+
+    let bytes = serde_json::to_vec(&OperationIdentity {
+        domain: OPERATION_BINDING_DOMAIN,
+        paimos_origin: paimos_origin.as_str(),
+        handoff_id: &intent.handoff_id,
+        host: &intent.host,
+        workflow: intent.workflow.key(),
+        environment: &intent.environment,
+        artifact: &intent.artifact,
+        plan_digest: &pull.plan_digest,
+        predecessor_digest: &pull.predecessor_digest,
+        authority_epoch: pull.authority_epoch,
+        execution_number: pull.execution_number,
+        context_digest: &pull.context_digest,
+    })
+    .map_err(|_| AdapterError::Contract)?;
+    Ok(hex_digest(&bytes))
+}
+
+fn deterministic_job_id(host: &str, operation_id: &str) -> String {
+    format!("action-update-restart-{host}-{}", &operation_id[..16])
+}
+
 fn valid_host(value: &str) -> bool {
     (1..=63).contains(&value.len())
         && value
@@ -1599,15 +1823,17 @@ mod tests {
     use axum::http::{Request, Response};
     use axum::Router;
     use pharos_core::{
-        HostReport, NixDeploymentEvidence, NixFreshness, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
-        NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
+        collect_deployed_artifact_from_metadata_file, ArtifactDigestClass, ArtifactVersionScheme,
+        DeployedArtifactEvidence, HostReport, NixDeploymentEvidence, NixFreshness,
+        DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA, DEPLOYED_ARTIFACT_EVIDENCE_VERSION, HOST_REPORT_SCHEMA,
+        HOST_REPORT_VERSION, NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
     use serde_json::{json, Value};
     use tokio::io::AsyncWriteExt;
 
     use crate::host_actions::{
-        AgentActionOutcome, AgentActionPhase, AgentActionResultRequest, HostActionPlan,
-        HostActionResult,
+        AgentActionOutcome, AgentActionPhase, AgentActionResultRequest, HostActionEventKind,
+        HostActionKind, HostActionPlan, HostActionResult, HostActionState,
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -1640,8 +1866,46 @@ mod tests {
         ArtifactEvidence {
             version_scheme: ArtifactVersionScheme::Legacy,
             version: "1.2.3".to_string(),
+            release_channel: "stable".to_string(),
+            release_sequence: 123,
             digest: format!("sha256:{}", "1".repeat(64)),
             commit_digest: "a".repeat(40),
+            release_manifest_coordinate: "ghcr:inspr-at/pharos/releases/1.2.3".to_string(),
+            release_manifest_digest: format!("sha256:{}", "9".repeat(64)),
+        }
+    }
+
+    fn calendar_artifact() -> ArtifactEvidence {
+        ArtifactEvidence {
+            version_scheme: ArtifactVersionScheme::InsprCalendarV1,
+            version: "26.09.05.09.00.00".to_string(),
+            release_channel: "stable".to_string(),
+            release_sequence: 260_905_090_000,
+            digest: format!("sha256:{}", "3".repeat(64)),
+            commit_digest: "b".repeat(40),
+            release_manifest_coordinate: "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00"
+                .to_string(),
+            release_manifest_digest: format!("sha256:{}", "4".repeat(64)),
+        }
+    }
+
+    fn measured_from(artifact: &ArtifactEvidence) -> DeployedArtifactEvidence {
+        DeployedArtifactEvidence {
+            schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
+            version: DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
+            environment: "production-eu1".to_string(),
+            version_scheme: artifact.version_scheme,
+            artifact_version: artifact.version.clone(),
+            release_channel: artifact.release_channel.clone(),
+            release_sequence: artifact.release_sequence,
+            digest: artifact.digest.clone(),
+            digest_class: ArtifactDigestClass::OciManifest,
+            commit_digest: artifact.commit_digest.clone(),
+            release_manifest_coordinate: artifact.release_manifest_coordinate.clone(),
+            release_manifest_digest: artifact.release_manifest_digest.clone(),
+            oci_index_digest: Some(format!("sha256:{}", "5".repeat(64))),
+            oci_manifest_digest: Some(artifact.digest.clone()),
+            oci_config_digest: Some(format!("sha256:{}", "6".repeat(64))),
         }
     }
 
@@ -1657,8 +1921,7 @@ mod tests {
             environment: "production-eu1".to_string(),
             host: "hsb8".to_string(),
             artifact: artifact(),
-            update_restart_job_id: (stage == IntentStage::Deployment)
-                .then(|| "action-update-restart-hsb8-placeholder".to_string()),
+            update_restart_job_id: None,
             deployment_handoff_id: (stage == IntentStage::Verification)
                 .then(|| DEPLOYMENT_HANDOFF.to_string()),
         }
@@ -1738,7 +2001,20 @@ mod tests {
         job.id
     }
 
+    fn record_nix_only_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
+        record_beacon_with(store, observed_at, artifact, false);
+    }
+
     fn record_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
+        record_beacon_with(store, observed_at, artifact, true);
+    }
+
+    fn record_beacon_with(
+        store: &Store,
+        observed_at: i64,
+        artifact: &ArtifactEvidence,
+        include_measured: bool,
+    ) {
         let source_revision = artifact.commit_digest.clone();
         let flake_lock_sha256 = artifact
             .digest
@@ -1774,6 +2050,7 @@ mod tests {
                     inbound_rtt_ms: None,
                     location: None,
                     preferences: Default::default(),
+                    deployed_artifact: include_measured.then(|| measured_from(artifact)),
                 },
                 observed_at,
             )
@@ -1856,11 +2133,22 @@ mod tests {
             } else {
                 "deployment"
             };
+            let (plan_digest, predecessor_digest) = if handoff_id == VERIFICATION_HANDOFF {
+                (
+                    format!("sha256:{}", "7".repeat(64)),
+                    format!("sha256:{}", "2".repeat(64)),
+                )
+            } else {
+                (
+                    format!("sha256:{}", "2".repeat(64)),
+                    format!("sha256:{}", "3".repeat(64)),
+                )
+            };
             return fake_json_response(
                 StatusCode::OK,
                 json!({
                     "handoff_id": handoff_id,
-                    "contract_major": 1,
+                    "contract_major": 2,
                     "fixture_digest": PAIMOS_FIXTURE_DIGEST,
                     "credential_epoch": 9,
                     "expires_at": "2030-01-01T00:00:00Z",
@@ -1870,8 +2158,8 @@ mod tests {
                     "evidence_ceiling": ["deployment", "verification"],
                     "stage_key": stage,
                     "execution_number": 1,
-                    "plan_digest": format!("sha256:{}", "2".repeat(64)),
-                    "predecessor_digest": format!("sha256:{}", "3".repeat(64)),
+                    "plan_digest": plan_digest,
+                    "predecessor_digest": predecessor_digest,
                     "authority_epoch": 4,
                     "context_digest": format!("sha256:{}", "4".repeat(64))
                 }),
@@ -1967,43 +2255,47 @@ mod tests {
         let dependency =
             include_bytes!("../../../contracts/paimos-external-stage-v1/dependency-janus-v1.json");
         let owner =
-            include_bytes!("../../../contracts/paimos-external-stage-v1/owner-pharos-v1.json");
+            include_bytes!("../../../contracts/paimos-external-stage-v2/owner-pharos-v2.json");
         let manifest =
-            include_bytes!("../../../contracts/paimos-external-stage-v1/manifest-v1.json");
-        assert_eq!(dependency.len(), 1115);
-        assert_eq!(owner.len(), 1504);
-        assert_eq!(
-            hex_digest(dependency),
-            "52a647abd52e229fcdef8461eeb9f7d31f07632501ad33f594cdfbc155c23d4b"
+            include_bytes!("../../../contracts/paimos-external-stage-v2/manifest-v2.json");
+        let schema = include_bytes!(
+            "../../../contracts/paimos-external-stage-v2/external-stage-v2.schema.json"
         );
+        assert_eq!(dependency.len(), 1115);
+        assert_eq!(owner.len(), 3868);
+        assert_eq!(schema.len(), 10292);
+        assert_eq!(hex_digest(dependency), PAIMOS_JANUS_DEPENDENCY_SHA256);
         assert_eq!(
             hex_digest(owner),
-            "8ab2ab9df3f5e12cf225a83d77129bdcab14241bc2a5ab03505811a556e016fc"
+            "99abbf90592ff319b4e00319bc8bb5141572e6dc66cfcf074d781358c36954a9"
         );
         assert_eq!(
-            hex_digest(manifest),
-            "6aaad204b9e086e49eb0c7c10681ae334819c8d06faf621c68df16bde9ecef87"
+            hex_digest(schema),
+            "57b2ceaebc2991f89b9adb4de713c2c760c40f521ee8bde8cd67dfb5559ae33a"
         );
         let mut set = Sha256::new();
-        set.update(b"paimos.external-stage.fixtures.v1\0");
-        for (name, bytes) in [
-            ("dependency-janus-v1.json", dependency.as_slice()),
-            ("owner-pharos-v1.json", owner.as_slice()),
-        ] {
-            set.update(name.as_bytes());
-            set.update([0]);
-            set.update(bytes);
-            set.update([0]);
-        }
+        set.update(b"paimos.external-stage.fixtures.v2\0");
+        set.update(b"owner-pharos-v2.json");
+        set.update([0]);
+        set.update(owner);
+        set.update([0]);
         assert_eq!(
             format!("sha256:{}", hex_bytes(&set.finalize())),
             PAIMOS_FIXTURE_DIGEST
         );
+        assert_ne!(hex_digest(dependency), &PAIMOS_FIXTURE_DIGEST[7..]);
         let manifest: Value = decode_strict(manifest).unwrap();
         assert_eq!(manifest["schema_major"], PAIMOS_SCHEMA_MAJOR);
         assert_eq!(manifest["paimos_release"], PAIMOS_RELEASE);
         assert_eq!(manifest["paimos_commit"], PAIMOS_CERTIFIED_COMMIT);
         assert_eq!(manifest["fixture_digest"], PAIMOS_FIXTURE_DIGEST);
+        assert_eq!(
+            manifest["media_type"],
+            "application/vnd.paimos.external-stage.v2+json"
+        );
+        assert!(owner
+            .windows(b"janus_evidence".len())
+            .all(|window| window != b"janus_evidence"));
     }
 
     #[test]
@@ -2087,6 +2379,16 @@ mod tests {
         variants.push(changed);
         let mut changed = base.clone();
         changed.artifact.commit_digest = "b".repeat(40);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.artifact.release_channel = "rollback".to_string();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.artifact.release_sequence = 124;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.artifact.version_scheme = ArtifactVersionScheme::InsprCalendarV1;
+        changed.artifact.version = "26.09.05.09.00.00".to_string();
         variants.push(changed);
         let mut changed = base.clone();
         changed.update_restart_job_id = Some("action-update-restart-hsb9".to_string());
@@ -2292,12 +2594,16 @@ mod tests {
         for body in [&bodies[1], &bodies[3]] {
             let artifact = body["pharos_evidence"]["artifact"]
                 .as_object()
-                .expect("frozen v1 artifact object");
-            assert_eq!(artifact.len(), 3);
-            assert!(artifact.contains_key("version"));
-            assert!(artifact.contains_key("digest"));
-            assert!(artifact.contains_key("commit_digest"));
-            assert!(!artifact.contains_key("version_scheme"));
+                .expect("v2 artifact object");
+            assert_eq!(artifact.len(), 8);
+            assert_eq!(artifact["version_scheme"], "legacy");
+            assert!(artifact.contains_key("release_channel"));
+            assert!(artifact.contains_key("release_sequence"));
+            assert!(artifact.contains_key("release_manifest_coordinate"));
+            assert!(artifact.contains_key("release_manifest_digest"));
+            assert!(body
+                .get("janus_evidence")
+                .is_none_or(|value| value.is_null()));
         }
         assert_eq!(
             bodies[1]["pharos_evidence"]["environment"],
@@ -2525,7 +2831,7 @@ mod tests {
                 StatusCode::OK,
                 json!({
                     "handoff_id": handoff_id,
-                    "contract_major": 1,
+                    "contract_major": 2,
                     "fixture_digest": PAIMOS_FIXTURE_DIGEST,
                     "credential_epoch": 9,
                     "expires_at": "2030-01-01T00:00:00Z",
@@ -2712,7 +3018,28 @@ mod tests {
             Err(AdapterError::LocalBinding)
         ));
         assert!(adapter
-            .verification_report(&verification, now)
+            .verification_report(
+                &verification,
+                &PullResponse {
+                    handoff_id: VERIFICATION_HANDOFF.to_string(),
+                    contract_major: PAIMOS_SCHEMA_MAJOR,
+                    fixture_digest: PAIMOS_FIXTURE_DIGEST.to_string(),
+                    credential_epoch: 9,
+                    expires_at: "2030-01-01T00:00:00Z".to_string(),
+                    state: HandoffState::Accepted,
+                    reporter_class: "pharos".to_string(),
+                    reporter_role: "owner".to_string(),
+                    dependency_key: None,
+                    evidence_ceiling: vec![EvidenceKind::Deployment, EvidenceKind::Verification],
+                    stage_key: "verification".to_string(),
+                    execution_number: 1,
+                    plan_digest: format!("sha256:{}", "7".repeat(64)),
+                    predecessor_digest: format!("sha256:{}", "2".repeat(64)),
+                    authority_epoch: 4,
+                    context_digest: format!("sha256:{}", "4".repeat(64)),
+                },
+                now
+            )
             .unwrap()
             .is_none());
     }
@@ -2785,6 +3112,11 @@ mod tests {
         ));
         document["intents"][0]["artifact"]["version_scheme"] = json!("legacy");
 
+        document["intents"][0]["artifact"] = serde_json::to_value(calendar_artifact()).unwrap();
+        document["intents"][1]["artifact"] = serde_json::to_value(calendar_artifact()).unwrap();
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        AdapterConfig::load(&config_path).expect("calendar v2 artifact loads");
+
         // Defect class: cleartext delivery of the handoff secret. The loopback
         // forms the conformance harness uses must stay unreachable from the
         // production document, not merely discouraged.
@@ -2804,5 +3136,496 @@ mod tests {
                 "{origin} must not configure a production reporter"
             );
         }
+    }
+
+    fn test_pull(handoff_id: &str, stage: &str, predecessor: &str) -> PullResponse {
+        PullResponse {
+            handoff_id: handoff_id.to_string(),
+            contract_major: PAIMOS_SCHEMA_MAJOR,
+            fixture_digest: PAIMOS_FIXTURE_DIGEST.to_string(),
+            credential_epoch: 9,
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            state: HandoffState::Accepted,
+            reporter_class: "pharos".to_string(),
+            reporter_role: "owner".to_string(),
+            dependency_key: None,
+            evidence_ceiling: vec![EvidenceKind::Deployment, EvidenceKind::Verification],
+            stage_key: stage.to_string(),
+            execution_number: 1,
+            plan_digest: format!("sha256:{}", "2".repeat(64)),
+            predecessor_digest: predecessor.to_string(),
+            authority_epoch: 4,
+            context_digest: format!("sha256:{}", "4".repeat(64)),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_creates_one_guarded_update_and_replays_the_same_job() {
+        let now = now_unix();
+        let directory = temporary_directory("accept-create");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let fake = FakePaimos::new(now);
+        let (origin, server) = serve_fake(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        let adapter = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            directory.join("journal.json"),
+            hosts,
+            actions.clone(),
+        );
+
+        adapter.process_intent(&deployment).await.unwrap();
+        adapter.process_intent(&deployment).await.unwrap();
+        let jobs: Vec<_> = actions
+            .list()
+            .into_iter()
+            .filter(|job| job.kind == HostActionKind::UpdateRestart)
+            .collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].host, "hsb8");
+        assert_eq!(jobs[0].requested_by, GUARDED_ACTOR);
+        assert_eq!(jobs[0].state, HostActionState::QueuedReview);
+        assert!(jobs[0].confirmed_at.is_none());
+        assert_eq!(jobs[0].events.len(), 1);
+        assert_eq!(jobs[0].events[0].kind, HostActionEventKind::Requested);
+        assert_eq!(
+            adapter
+                .journal
+                .operation(DEPLOYMENT_HANDOFF)
+                .expect("bound job")
+                .job_id,
+            jobs[0].id
+        );
+        let posts = fake
+            .captures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|capture| capture.method == "POST")
+            .count();
+        assert_eq!(posts, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn crash_after_create_before_operation_journal_binds_the_same_job() {
+        let now = now_unix();
+        let directory = temporary_directory("crash-after-create");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let fake = FakePaimos::new(now);
+        let (origin, server) = serve_fake(fake).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        let adapter = test_adapter(
+            config(origin.clone(), api_path.clone(), vec![deployment.clone()]),
+            directory.join("journal.json"),
+            hosts.clone(),
+            actions.clone(),
+        );
+        let journal_path = directory.join("journal.json");
+        adapter.process_intent(&deployment).await.unwrap();
+        let job_id = adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("created job")
+            .job_id;
+        {
+            let mut document = adapter.journal.document.lock().expect("journal");
+            document.operations.clear();
+            crate::durable_file::atomic_write_json(&journal_path, &*document)
+                .expect("drop operation binding from durable journal");
+        }
+
+        let restarted = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            journal_path,
+            hosts,
+            actions.clone(),
+        );
+        restarted.process_intent(&deployment).await.unwrap();
+        let jobs: Vec<_> = actions
+            .list()
+            .into_iter()
+            .filter(|job| job.kind == HostActionKind::UpdateRestart)
+            .collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert_eq!(
+            restarted
+                .journal
+                .operation(DEPLOYMENT_HANDOFF)
+                .unwrap()
+                .job_id,
+            job_id
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_job_wrong_host_or_kind_fails_closed() {
+        let now = now_unix();
+        let directory = temporary_directory("wrong-bind");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let fake = FakePaimos::new(now);
+        let (origin, server) = serve_fake(fake).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let other = actions
+            .create_update_review("csb0", "operator", now)
+            .expect("other host job");
+        let proposal = actions
+            .create_system_update_proposal(
+                "action-system-update-hsb8-kind".to_string(),
+                "hsb8",
+                "operator",
+                now + 1,
+            )
+            .expect("wrong kind");
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let mut deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        deployment.update_restart_job_id = Some(other.id.clone());
+        let adapter = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            directory.join("journal.json"),
+            hosts,
+            actions.clone(),
+        );
+        assert!(matches!(
+            adapter.process_intent(&deployment).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        deployment.update_restart_job_id = Some(proposal.id);
+        assert!(matches!(
+            adapter.process_intent(&deployment).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        assert!(adapter.journal.operation(DEPLOYMENT_HANDOFF).is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unrelated_active_job_and_fleetlock_are_not_adopted() {
+        let now = now_unix();
+        let directory = temporary_directory("unrelated-active");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let fake = FakePaimos::new(now);
+        let (origin, server) = serve_fake(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        actions
+            .create_update_review("hsb8", "operator", now)
+            .expect("unrelated active job");
+        let deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        let adapter = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            directory.join("journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            actions.clone(),
+        );
+        assert!(matches!(
+            adapter.process_intent(&deployment).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        assert!(matches!(
+            adapter.process_intent(&deployment).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        assert_eq!(
+            actions
+                .list()
+                .iter()
+                .filter(|job| job.kind == HostActionKind::UpdateRestart)
+                .count(),
+            1
+        );
+        assert!(adapter.journal.operation(DEPLOYMENT_HANDOFF).is_none());
+        let seq2 = fake
+            .captures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|capture| capture.method == "POST")
+            .filter(|capture| {
+                serde_json::from_slice::<Value>(&capture.body)
+                    .ok()
+                    .and_then(|body| body["sequence"].as_i64())
+                    == Some(2)
+            })
+            .count();
+        assert_eq!(seq2, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fleetlock_on_another_host_blocks_create() {
+        let now = now_unix();
+        let directory = temporary_directory("fleetlock");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let fake = FakePaimos::new(now);
+        let (origin, server) = serve_fake(fake).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        actions
+            .create_update_review("csb0", "operator", now)
+            .expect("blocking fleet job");
+        let deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        let adapter = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            directory.join("journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            actions.clone(),
+        );
+        assert!(matches!(
+            adapter.process_intent(&deployment).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        assert!(matches!(
+            adapter.process_intent(&deployment).await,
+            Err(AdapterError::LocalBinding)
+        ));
+        assert!(actions
+            .list()
+            .iter()
+            .all(|job| job.host != "hsb8" || job.kind != HostActionKind::UpdateRestart));
+        server.abort();
+    }
+
+    #[test]
+    fn nix_only_generation_evidence_is_not_release_artifact_proof() {
+        let now = now_unix();
+        let directory = temporary_directory("nix-only");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_nix_only_beacon(&hosts, now - 20, &artifact());
+        let mut deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        deployment.update_restart_job_id = Some(job_id);
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![deployment.clone()],
+            ),
+            directory.join("journal.json"),
+            hosts,
+            actions,
+        );
+        assert!(adapter
+            .deployment_report(&deployment, now)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stale_mismatched_predated_and_wrong_environment_observations_fail_closed() {
+        let now = now_unix();
+        let directory = temporary_directory("observation-gates");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let mut deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        deployment.update_restart_job_id = Some(job_id);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![deployment.clone()],
+            ),
+            directory.join("journal.json"),
+            hosts.clone(),
+            actions,
+        );
+
+        record_beacon(&hosts, now - 400, &artifact());
+        assert!(adapter
+            .deployment_report(&deployment, now)
+            .unwrap()
+            .is_none());
+
+        let mut mismatched = artifact();
+        mismatched.digest = format!("sha256:{}", "c".repeat(64));
+        record_beacon(&hosts, now - 20, &mismatched);
+        assert!(matches!(
+            adapter.deployment_report(&deployment, now),
+            Err(AdapterError::LocalBinding)
+        ));
+
+        record_beacon(&hosts, now - 80, &artifact());
+        assert!(adapter
+            .deployment_report(&deployment, now)
+            .unwrap()
+            .is_none());
+
+        record_beacon(&hosts, now + 200, &artifact());
+        assert!(adapter
+            .deployment_report(&deployment, now)
+            .unwrap()
+            .is_none());
+
+        let mut wrong_env = measured_from(&artifact());
+        wrong_env.environment = "production-us1".to_string();
+        record_beacon(&hosts, now - 10, &artifact());
+        let report = {
+            let host = hosts.get("hsb8").unwrap();
+            HostReport {
+                schema: HOST_REPORT_SCHEMA.to_string(),
+                version: HOST_REPORT_VERSION,
+                name: host.name.clone(),
+                role: host.role.clone(),
+                is_nix: host.is_nix,
+                heartbeat_interval_secs: host.heartbeat_interval_secs.unwrap_or(60),
+                freshness: host.freshness.clone(),
+                kernel: host.kernel.clone(),
+                service_observations: host.service_observations.clone(),
+                backup_observations: host.backup_observations.clone(),
+                inbound_rtt_ms: None,
+                location: None,
+                preferences: host.preferences.clone(),
+                deployed_artifact: Some(wrong_env),
+            }
+        };
+        report.validate_contract().unwrap();
+        hosts.record(report, now - 5).unwrap();
+        assert!(matches!(
+            adapter.deployment_report(&deployment, now),
+            Err(AdapterError::LocalBinding)
+        ));
+    }
+
+    #[test]
+    fn real_producer_measurement_fixture_preserves_oci_classes() {
+        let artifact = calendar_artifact();
+        let evidence = measured_from(&artifact);
+        let encoded = serde_json::to_vec(&evidence).unwrap();
+        let parsed = collect_deployed_artifact_from_metadata_file(&encoded).unwrap();
+        assert_eq!(parsed.digest_class, ArtifactDigestClass::OciManifest);
+        assert_ne!(parsed.oci_index_digest, parsed.oci_manifest_digest);
+        assert_ne!(parsed.oci_manifest_digest, parsed.oci_config_digest);
+        assert!(parsed.matches_expected(
+            "production-eu1",
+            artifact.version_scheme,
+            &artifact.version,
+            &artifact.release_channel,
+            artifact.release_sequence,
+            &artifact.digest,
+            &artifact.commit_digest,
+            &artifact.release_manifest_coordinate,
+            &artifact.release_manifest_digest,
+        ));
+        assert!(!parsed.matches_expected(
+            "production-eu1",
+            artifact.version_scheme,
+            &artifact.version,
+            &artifact.release_channel,
+            artifact.release_sequence,
+            parsed.oci_index_digest.as_deref().unwrap(),
+            &artifact.commit_digest,
+            &artifact.release_manifest_coordinate,
+            &artifact.release_manifest_digest,
+        ));
+    }
+
+    #[test]
+    fn verification_mismatched_lineage_fails_closed() {
+        let now = now_unix();
+        let directory = temporary_directory("lineage");
+        let api_path = directory.join("api-key");
+        let deployment_secret = directory.join("deployment-secret");
+        let verification_secret = directory.join("verification-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&deployment_secret, HANDOFF_SENTINEL);
+        write_private(&verification_secret, &[8; HANDOFF_SECRET_BYTES]);
+        let actions = Arc::new(HostActionStore::new(None));
+        let job_id = completed_update(&actions, now);
+        let hosts = Arc::new(Store::new(None).unwrap());
+        record_beacon(&hosts, now - 5, &artifact());
+        let mut deployment = intent(
+            DEPLOYMENT_HANDOFF,
+            deployment_secret,
+            IntentStage::Deployment,
+        );
+        deployment.update_restart_job_id = Some(job_id);
+        let verification = intent(
+            VERIFICATION_HANDOFF,
+            verification_secret,
+            IntentStage::Verification,
+        );
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![deployment.clone(), verification.clone()],
+            ),
+            directory.join("journal.json"),
+            hosts,
+            actions,
+        );
+        let pull = test_pull(
+            DEPLOYMENT_HANDOFF,
+            "deployment",
+            &format!("sha256:{}", "3".repeat(64)),
+        );
+        adapter.bind_after_accept(&deployment, &pull, now).unwrap();
+        let record = adapter
+            .journal
+            .ensure(
+                JournalRecord::new(
+                    &deployment,
+                    &Url::parse("https://paimos.example.test").unwrap(),
+                    2,
+                    JournalRequestKind::Report,
+                    &serde_json::to_vec(&terminal_report(&deployment, now - 10, true).unwrap())
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        adapter
+            .journal
+            .acknowledge(
+                &record,
+                ReportReceipt {
+                    handoff_id: DEPLOYMENT_HANDOFF.to_string(),
+                    sequence: 2,
+                    state: HandoffState::Succeeded,
+                    credential_epoch: 9,
+                    duplicate: false,
+                    server_received_at: format_timestamp(now - 8).unwrap(),
+                },
+            )
+            .unwrap();
+        let mut bad = test_pull(
+            VERIFICATION_HANDOFF,
+            "verification",
+            &format!("sha256:{}", "8".repeat(64)),
+        );
+        bad.authority_epoch = 9;
+        assert!(matches!(
+            adapter.verification_report(&verification, &bad, now),
+            Err(AdapterError::LocalBinding)
+        ));
     }
 }

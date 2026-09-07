@@ -5530,6 +5530,7 @@ mod tests {
             backup_observations,
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         }
     }
 
@@ -5917,6 +5918,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "hades".to_string(),
@@ -5940,6 +5942,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "poseidon".to_string(),
@@ -5963,6 +5966,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
         ];
 
@@ -6158,6 +6162,7 @@ mod tests {
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let html = render_home(
@@ -6853,6 +6858,7 @@ mod tests {
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let html = render_backups(
@@ -6980,6 +6986,7 @@ mod tests {
             backup_observations: vec![backup_observation(BackupPostureState::Healthy)],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let payload = hosts_payload(vec![host], &[], &BTreeMap::new(), &[], None, 1000);
@@ -7269,6 +7276,7 @@ mod tests {
                 backup_observations: vec![failed_backup],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "poseidon".to_string(),
@@ -7290,6 +7298,7 @@ mod tests {
                 backup_observations: vec![stale_validation],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "athena".to_string(),
@@ -7326,6 +7335,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "hermes".to_string(),
@@ -7349,6 +7359,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -7468,6 +7479,7 @@ mod tests {
                 backup_observations: vec![healthy_backup],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "athena".to_string(),
@@ -7520,6 +7532,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "hades".to_string(),
@@ -7541,6 +7554,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -7745,6 +7759,7 @@ mod tests {
             backup_observations: vec![failed_backup],
             preferences: suppressed.clone(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let alerts = alert_items(
@@ -8106,6 +8121,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             }
         }
 
@@ -8147,6 +8163,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "csb0".to_string(),
@@ -8178,6 +8195,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "hsb8".to_string(),
@@ -8196,6 +8214,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "dsc0".to_string(),
@@ -8214,6 +8233,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
             Host {
                 name: "new-host".to_string(),
@@ -8232,6 +8252,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             },
         ];
         let manifest: HostManifest = serde_json::from_value(json!({
@@ -8450,6 +8471,7 @@ mod tests {
             backup_observations: vec![],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
         let mut manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -8563,6 +8585,7 @@ mod tests {
             backup_observations: vec![],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let payload = declared_hosts_payload(
@@ -8608,6 +8631,7 @@ mod tests {
                 backup_observations: vec![],
                 preferences: Default::default(),
                 requested_preferences: None,
+                deployed_artifact: None,
             }
         }
 
@@ -8938,6 +8962,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             backup_observations: vec![],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
         let manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -9400,6 +9425,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             backup_observations: vec![],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
         let lone = render_home(
             runtime(&[host], &[]),
@@ -9679,6 +9705,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             backup_observations: vec![],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let html = render_home(
@@ -10369,6 +10396,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             backup_observations: vec![backup_observation(BackupPostureState::Warning)],
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         };
 
         let payload = declared_hosts_payload(
@@ -12713,6 +12741,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             backup_observations,
             preferences: Default::default(),
             requested_preferences: None,
+            deployed_artifact: None,
         }
     }
 
@@ -14719,6 +14748,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             inbound_rtt_ms: None,
             location: None,
             preferences: Default::default(),
+            deployed_artifact: None,
         }
     }
 

@@ -9,6 +9,7 @@
 //!      PHAROS_INTERVAL (secs; loop if set), NIXCFG_DIR (flake checkout;
 //!      auto-detected otherwise), PHAROS_HOSTNAME / PHAROS_ROLE (overrides),
 //!      PHAROS_NIX_DEPLOYMENT_EVIDENCE_FILE (active-generation evidence),
+//!      PHAROS_DEPLOYED_ARTIFACT_EVIDENCE_FILE (optional measured release identity),
 //!      PHAROS_NIXCFG_REMOTE_URL / PHAROS_NIXCFG_REMOTE_REF (authoritative Git),
 //!      PHAROS_NIXPKGS_CHANNEL_BASE_URL (authoritative channel publication),
 //!      PHAROS_NIXPKGS_REMOTE_URL (legacy/custom authoritative Git fallback),
@@ -30,13 +31,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
-    BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
+    collect_deployed_artifact_from_metadata_file, BackupConfiguredState, BackupEngine,
+    BackupObservation, BackupPostureState, BackupRunState, DeployedArtifactEvidence,
     GitRevisionRelation, HostLocation, HostLocationSource, HostPreferences,
     HostPreferencesRegistry, HostReport, HostReportResponse, KernelPosture, NixDeploymentEvidence,
     NixFreshness, NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness,
     NixpkgsRevisionRelation, ServiceObservation, ServiceObservationState, HOST_REPORT_SCHEMA,
-    HOST_REPORT_VERSION, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS, MAX_SERVICE_OBSERVATIONS,
-    MIN_HEARTBEAT_INTERVAL_SECS,
+    HOST_REPORT_VERSION, MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES, MAX_HEARTBEAT_INTERVAL_SECS,
+    MAX_INBOUND_RTT_MS, MAX_SERVICE_OBSERVATIONS, MIN_HEARTBEAT_INTERVAL_SECS,
 };
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -1500,6 +1502,19 @@ fn read_deployment_evidence(path: &Path) -> Option<NixDeploymentEvidence> {
     let evidence: NixDeploymentEvidence = serde_json::from_str(&raw).ok()?;
     evidence.validate_contract().ok()?;
     Some(evidence)
+}
+
+fn deployed_artifact_evidence_path() -> Option<PathBuf> {
+    env_value("PHAROS_DEPLOYED_ARTIFACT_EVIDENCE_FILE").map(PathBuf::from)
+}
+
+fn read_deployed_artifact_evidence(path: &Path) -> Option<DeployedArtifactEvidence> {
+    let file = File::open(path).ok()?;
+    let mut raw = Vec::new();
+    file.take(MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    collect_deployed_artifact_from_metadata_file(&raw).ok()
 }
 
 fn sha256_hex(raw: &[u8]) -> String {
@@ -3519,6 +3534,8 @@ fn main() {
         let kernel = collect_kernel_posture(is_nix, observed_at);
         let location = collect_location(observed_at);
         let backup_observations = collect_backup_observations(observed_at);
+        let deployed_artifact = deployed_artifact_evidence_path()
+            .and_then(|path| read_deployed_artifact_evidence(&path));
         let report = HostReport {
             schema: HOST_REPORT_SCHEMA.to_string(),
             version: HOST_REPORT_VERSION,
@@ -3533,6 +3550,7 @@ fn main() {
             inbound_rtt_ms: last_report_rtt_ms,
             location,
             preferences: preferences.clone(),
+            deployed_artifact,
         };
         if report.validate_contract().is_err() {
             let failure = ReportFailure::local_contract();
@@ -6367,6 +6385,61 @@ mod tests {
             None,
             "a checkout lock that differs from the generation digest is not evidence"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn measured_release_artifact() -> DeployedArtifactEvidence {
+        DeployedArtifactEvidence {
+            schema: pharos_core::DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
+            version: pharos_core::DEPLOYED_ARTIFACT_EVIDENCE_VERSION,
+            environment: "production-eu1".to_string(),
+            version_scheme: pharos_core::ArtifactVersionScheme::InsprCalendarV1,
+            artifact_version: "26.09.05.09.00.00".to_string(),
+            release_channel: "stable".to_string(),
+            release_sequence: 260_905_090_000,
+            digest: format!("sha256:{}", "3".repeat(64)),
+            digest_class: pharos_core::ArtifactDigestClass::OciManifest,
+            commit_digest: "b".repeat(40),
+            release_manifest_coordinate: "ghcr:inspr-at/pharos/releases/26.09.05.09.00.00"
+                .to_string(),
+            release_manifest_digest: format!("sha256:{}", "4".repeat(64)),
+            oci_index_digest: Some(format!("sha256:{}", "5".repeat(64))),
+            oci_manifest_digest: Some(format!("sha256:{}", "3".repeat(64))),
+            oci_config_digest: Some(format!("sha256:{}", "6".repeat(64))),
+        }
+    }
+
+    #[test]
+    fn allowlisted_metadata_file_collects_measured_release_artifact() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-beacon-artifact-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir(&dir).expect("artifact fixture directory");
+        let path = dir.join("deployed-artifact.json");
+        let evidence = measured_release_artifact();
+        std::fs::write(&path, serde_json::to_vec(&evidence).unwrap()).expect("write measurement");
+        let parsed = read_deployed_artifact_evidence(&path).expect("bounded collector");
+        assert_eq!(
+            parsed.digest_class,
+            pharos_core::ArtifactDigestClass::OciManifest
+        );
+        assert_ne!(parsed.oci_index_digest, parsed.oci_manifest_digest);
+        assert_ne!(parsed.oci_manifest_digest, parsed.oci_config_digest);
+        assert_eq!(
+            parsed.digest,
+            parsed.oci_manifest_digest.clone().expect("manifest digest")
+        );
+        assert!(read_deployed_artifact_evidence(Path::new("/missing-allowlisted-file")).is_none());
+        assert!(collect_deployed_artifact_from_metadata_file(b"{}").is_err());
+        assert!(collect_deployed_artifact_from_metadata_file(&vec![
+            b'x';
+            (MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES
+                as usize)
+                + 1
+        ])
+        .is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
