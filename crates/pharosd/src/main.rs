@@ -14228,11 +14228,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let managed = render_hetzner_setup_help(
             true,
             Some("https://secrets.example.test/provider-setup"),
-            true,
-            false,
-            false,
-            false,
-            false,
+            HetznerSetupHelpState {
+                api_ready: true,
+                ssh_available: false,
+                firewall_available: false,
+                choices_ready: false,
+                execution_enabled: false,
+            },
             &PublicBasePath::ROOT,
         );
         let api = managed.find("API connection").expect("API help");
@@ -14340,11 +14342,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let needs_api = render_hetzner_setup_help(
             true,
             Some("https://secrets.example.test/provider-setup"),
-            false,
-            false,
-            false,
-            false,
-            false,
+            HetznerSetupHelpState {
+                api_ready: false,
+                ssh_available: false,
+                firewall_available: false,
+                choices_ready: false,
+                execution_enabled: false,
+            },
             &PublicBasePath::ROOT,
         );
         assert!(needs_api.contains(r#"data-initial-step="api""#));
@@ -14353,11 +14357,13 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let ready_locked = render_hetzner_setup_help(
             true,
             None,
-            true,
-            true,
-            true,
-            true,
-            false,
+            HetznerSetupHelpState {
+                api_ready: true,
+                ssh_available: true,
+                firewall_available: true,
+                choices_ready: true,
+                execution_enabled: false,
+            },
             &PublicBasePath::ROOT,
         );
         assert!(ready_locked.contains(r#"data-initial-step="finish""#));
@@ -14369,27 +14375,35 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!ready_locked.contains(r#"data-initial-step="finish" open"#));
         assert!(ready_locked.contains("expand for details and next steps"));
 
+        let public_base = PublicBasePath::parse("/pharos").unwrap();
         let ready_enabled = render_hetzner_setup_help(
             true,
             None,
-            true,
-            true,
-            true,
-            true,
-            true,
-            &PublicBasePath::ROOT,
+            HetznerSetupHelpState {
+                api_ready: true,
+                ssh_available: true,
+                firewall_available: true,
+                choices_ready: true,
+                execution_enabled: true,
+            },
+            &public_base,
         );
         assert!(ready_enabled.contains("Next: prepare the first server"));
         assert!(ready_enabled.contains("Review, authorization, and creation remain separate"));
+        assert!(ready_enabled.contains(
+            r#"href="/pharos?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template""#
+        ));
 
         let viewer = render_hetzner_setup_help(
             false,
             Some("https://secrets.example.test/provider-setup"),
-            false,
-            false,
-            false,
-            false,
-            false,
+            HetznerSetupHelpState {
+                api_ready: false,
+                ssh_available: false,
+                firewall_available: false,
+                choices_ready: false,
+                execution_enabled: false,
+            },
             &PublicBasePath::ROOT,
         );
         assert!(viewer.contains("An administrator must complete"));

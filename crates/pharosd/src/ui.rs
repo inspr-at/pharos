@@ -3194,16 +3194,28 @@ pub(super) fn provider_select_option(value: &str, label: &str, selected: Option<
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HetznerSetupHelpState {
+    pub(super) api_ready: bool,
+    pub(super) ssh_available: bool,
+    pub(super) firewall_available: bool,
+    pub(super) choices_ready: bool,
+    pub(super) execution_enabled: bool,
+}
+
 pub(super) fn render_hetzner_setup_help(
     can_manage: bool,
     secure_setup_url: Option<&str>,
-    api_ready: bool,
-    ssh_available: bool,
-    firewall_available: bool,
-    choices_ready: bool,
-    execution_enabled: bool,
+    state: HetznerSetupHelpState,
     base: &PublicBasePath,
 ) -> String {
+    let HetznerSetupHelpState {
+        api_ready,
+        ssh_available,
+        firewall_available,
+        choices_ready,
+        execution_enabled,
+    } = state;
     let secure_setup = if can_manage {
         secure_setup_url
             .map(|url| {
@@ -3544,11 +3556,13 @@ pub(super) fn render_hetzner_connection_page(
     let setup_help = render_hetzner_setup_help(
         can_manage,
         janus_url.as_deref(),
-        api_ready,
-        ssh_available,
-        firewall_available,
-        ssh_ready && firewall_ready && location_ready,
-        readiness.execution_enabled,
+        HetznerSetupHelpState {
+            api_ready,
+            ssh_available,
+            firewall_available,
+            choices_ready: ssh_ready && firewall_ready && location_ready,
+            execution_enabled: readiness.execution_enabled,
+        },
         shell.public_base_path,
     );
     let connection_message = if connection_ready && !readiness.execution_enabled {
