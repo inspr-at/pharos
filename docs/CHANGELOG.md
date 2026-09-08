@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 26.09.08.23.58.28 - 2026-09-08
+
+- Support an optional native public URL prefix for Pharos pages, forms, assets, API responses, login callbacks and Flow navigation while keeping standalone root hosting unchanged (PHAROS-258).
+- Build application URLs explicitly so shared-origin hosting preserves peer application links and existing authentication and cookie protections.
+
 ## 26.09.08.11.36.59 - 2026-09-08
 
 - Add opt-in shared Flow navigation to fleet and host workspaces, with host-verified identity and scoped Paimos projection. Review and Start route back to Paimos for fresh authorization; they never deploy from the Flow footer (PHAROS-257).

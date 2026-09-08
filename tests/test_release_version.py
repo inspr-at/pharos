@@ -217,6 +217,8 @@ class CalendarVersionTests(unittest.TestCase):
             recorded.append(self.calendar_release(NEXT_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE))
         if current["release_sequence"] > 3:
             recorded.append(self.calendar_release("26.09.07.22.08.13", 3))
+        if current["release_sequence"] > 4:
+            recorded.append(self.calendar_release("26.09.08.11.36.59", 4))
         release_version.validate_reservation_history(current, tuple(recorded), ())
 
     def test_repository_reservation_must_advance_coordinate_and_sequence(self):
