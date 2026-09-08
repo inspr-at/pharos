@@ -7,6 +7,26 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const vendorRoot = path.join(repoRoot, "crates/pharosd/assets/vendor/flow-shell");
 const bootstrapPath = path.join(repoRoot, "crates/pharosd/assets/flow-host-bootstrap.mjs");
+const playwrightConfigPath = path.join(repoRoot, "playwright.config.mjs");
+
+test("general Playwright config excludes Flow host suites from operational harness", () => {
+  const config = readFileSync(playwrightConfigPath, "utf8");
+  for (const pattern of ["**/flow-host.spec.mjs", "**/flow-host-wire.test.mjs"]) {
+    assert.match(config, new RegExp(`testIgnore:\\s*\\[[\\s\\S]*?${pattern.replaceAll("*", "\\*")}`));
+    assert.match(
+      config,
+      new RegExp(
+        `name:\\s*"chromium-desktop",[\\s\\S]*?testIgnore:\\s*\\[[\\s\\S]*?${pattern.replaceAll("*", "\\*")}`,
+      ),
+    );
+    assert.match(
+      config,
+      new RegExp(
+        `name:\\s*"chromium-mobile",[\\s\\S]*?testIgnore:\\s*\\[[\\s\\S]*?${pattern.replaceAll("*", "\\*")}`,
+      ),
+    );
+  }
+});
 
 test("shipped bootstrap reads nested identity and unwraps main on denial", () => {
   const bootstrap = readFileSync(bootstrapPath, "utf8");
