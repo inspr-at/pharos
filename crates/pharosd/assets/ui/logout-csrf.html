@@ -8,7 +8,7 @@
   const value=document.cookie.split(';').map(part=>part.trim()).find(part=>part.startsWith(prefix));
   if(value)input.value=decodeURIComponent(value.slice(prefix.length));
   form.addEventListener('submit',event=>{
-    if(!input.value){event.preventDefault();window.location.assign('/auth/login')}
+    if(!input.value){event.preventDefault();window.location.assign((typeof window.pharosPublicPath==='function'?window.pharosPublicPath('/auth/login'):'/auth/login'))}
   });
   script?.remove();
 })();

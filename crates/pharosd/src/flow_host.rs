@@ -852,6 +852,7 @@ pub(crate) fn inject_flow_shell(
     mount: bool,
     selected_host: Option<&str>,
     flow: Option<&FlowHostService>,
+    public_base_path: &PublicBasePath,
 ) -> String {
     if !mount {
         return html;
@@ -874,10 +875,13 @@ pub(crate) fn inject_flow_shell(
         ),
     );
     let wrapped = wrapped.replace("</main>", "</main></inspr-flow-shell>");
-    let bootstrap = r#"<script type="module" src="/assets/flow-host-bootstrap.mjs"></script>"#;
+    let bootstrap = format!(
+        r#"<script type="module" src="{src}"></script>"#,
+        src = html_escape_attr(&public_base_path.href("/assets/flow-host-bootstrap.mjs")),
+    );
     if let Some(index) = wrapped.rfind("</body>") {
         let mut output = wrapped;
-        output.insert_str(index, bootstrap);
+        output.insert_str(index, &bootstrap);
         return output;
     }
     format!("{wrapped}{bootstrap}")
@@ -1808,6 +1812,7 @@ mod tests {
             true,
             Some("hsb8"),
             None,
+            &PublicBasePath::ROOT,
         );
         assert!(html.contains("data-flow-host-scope=\"hsb8\""));
         assert!(html.contains("/assets/flow-host-bootstrap.mjs"));

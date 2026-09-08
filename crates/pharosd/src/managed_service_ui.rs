@@ -8,6 +8,7 @@ use super::*;
 use crate::managed_service_operations::{ManagedOperationPhase, REMOVAL_RETRY_WINDOW_SECONDS};
 
 const MANAGED_SETUP_RUNTIME: &str = r#"
+function appUrl(path){return (typeof window.pharosPublicPath==='function')?window.pharosPublicPath(path):path}
 document.querySelectorAll('[data-managed-secret-action]').forEach(button=>button.addEventListener('click',async()=>{
   if(button.disabled)return;
   const status=button.closest('.managed-slot-card')?.querySelector('[data-managed-action-status]');
@@ -21,7 +22,7 @@ document.querySelectorAll('[data-managed-secret-action]').forEach(button=>button
       ?'Creating a short-lived, value-free replacement request…'
       :'Creating a short-lived, value-free setup request…';
   try{
-    const response=await fetch('/managed-service-setup-intents',{
+    const response=await fetch(appUrl('/managed-service-setup-intents'),{
       method:'POST',
       credentials:'same-origin',
       headers:{'Content-Type':'application/json','X-Pharos-Action':'1'},
@@ -60,7 +61,7 @@ document.querySelectorAll('[data-managed-verification-retry]').forEach(button=>b
   if(status)status.textContent='Asking the declared host for fresh exact-generation health evidence…';
   try{
     const operationRef=button.dataset.operationRef||'';
-    const response=await fetch(`/managed-service-operations/${encodeURIComponent(operationRef)}/retry-verification`,{
+    const response=await fetch(appUrl(`/managed-service-operations/${encodeURIComponent(operationRef)}/retry-verification`),{
       method:'POST',
       credentials:'same-origin',
       headers:{'X-Pharos-Action':'1'}
@@ -92,7 +93,7 @@ document.querySelectorAll('[data-managed-removal-retry]').forEach(button=>button
   if(status)status.textContent='Requesting the same declared removal again; no secret is created or revealed…';
   try{
     const operationRef=button.dataset.operationRef||'';
-    const response=await fetch(`/managed-service-operations/${encodeURIComponent(operationRef)}/retry-verification`,{
+    const response=await fetch(appUrl(`/managed-service-operations/${encodeURIComponent(operationRef)}/retry-verification`),{
       method:'POST',
       credentials:'same-origin',
       headers:{'X-Pharos-Action':'1'}
@@ -214,6 +215,7 @@ pub(super) async fn services_page(
     let shell = ShellContext {
         user_label: &user_label,
         logout_enabled: state.auth.is_some(),
+        public_base_path: &state.public_base_path,
     };
     if !access.can_agora() {
         return no_store_html(
@@ -244,6 +246,7 @@ pub(super) async fn service_detail_page(
     let shell = ShellContext {
         user_label: &user_label,
         logout_enabled: state.auth.is_some(),
+        public_base_path: &state.public_base_path,
     };
     if !access.can_agora() {
         return no_store_html(
@@ -327,11 +330,16 @@ fn render_services_page_with_access(
     if !load_errors.is_empty() {
         return render_services_error(shell);
     }
-    let sidebar = sidebar(shell.user_label, shell.logout_enabled, "services");
+    let sidebar = sidebar(
+        shell.public_base_path,
+        shell.user_label,
+        shell.logout_enabled,
+        "services",
+    );
     let access_path = if can_manage {
         String::new()
     } else {
-        viewer_access_path("managed-service")
+        viewer_access_path(shell.public_base_path, "managed-service")
     };
     let header = page_header(
         "Services",
@@ -344,9 +352,11 @@ fn render_services_page_with_access(
             let (tone, state_label) = service_state(manifest, service, operations, now);
             let slot_count = service.slots.len();
             cards.push_str(&format!(
-                r#"<a class="managed-service-card" href="/services/{host_ref}/{service_ref}"><span class="managed-service-icon">{icon}</span><span class="managed-service-copy"><b>{service_label}</b><small>{host_label}</small></span><span class="managed-service-count">{slot_count} {slot_word}</span><span class="managed-state {tone}">{state_label}</span></a>"#,
-                host_ref = html_escape(&manifest.host_ref),
-                service_ref = html_escape(&service.service_ref),
+                r#"<a class="managed-service-card" href="{href}"><span class="managed-service-icon">{icon}</span><span class="managed-service-copy"><b>{service_label}</b><small>{host_label}</small></span><span class="managed-service-count">{slot_count} {slot_word}</span><span class="managed-state {tone}">{state_label}</span></a>"#,
+                href = app_href(
+                    shell.public_base_path,
+                    &format!("/services/{}/{}", manifest.host_ref, service.service_ref),
+                ),
                 icon = icons::KEY_ROUND,
                 service_label = html_escape(&service.safe_label),
                 host_label = html_escape(&managed_host_label(&manifest.host_ref)),
@@ -361,8 +371,9 @@ fn render_services_page_with_access(
             r#"<section class="managed-service-list" aria-label="Declared managed services">{cards}</section><p class="managed-future-note">Managed services are shown first. Other declared secret consumers can fit here later.</p>"#
         )
     };
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="managed-services-main">{header}{access_path}{content}</main></div></body></html>"#
+        r#"{head}{sidebar}<main class="managed-services-main">{header}{access_path}{content}</main></div></body></html>"#
     )
 }
 
@@ -421,14 +432,21 @@ fn service_state(
 }
 
 fn render_services_error(shell: ShellContext<'_>) -> String {
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="managed-services-main">{header}<section class="managed-empty managed-error" role="alert"><span class="managed-empty-icon">!</span><h2>Declarations need attention</h2><p>Pharos could not safely read the current managed-service declaration. No setup action is available until it is fixed.</p><a class="managed-secondary" href="/services">Try again</a></section></main></div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "services"),
+        r#"{head}{sidebar}<main class="managed-services-main">{header}<section class="managed-empty managed-error" role="alert"><span class="managed-empty-icon">!</span><h2>Declarations need attention</h2><p>Pharos could not safely read the current managed-service declaration. No setup action is available until it is fixed.</p><a class="managed-secondary" href="{services}">Try again</a></section></main></div></body></html>"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            "services"
+        ),
         header = page_header(
             "Services",
             "Managed service secrets are temporarily unavailable",
             now_unix()
         ),
+        services = app_href(shell.public_base_path, "/services"),
     )
 }
 
@@ -461,11 +479,16 @@ fn render_service_detail_with_access(
     now: i64,
     can_manage: bool,
 ) -> String {
-    let sidebar = sidebar(shell.user_label, shell.logout_enabled, "services");
+    let sidebar = sidebar(
+        shell.public_base_path,
+        shell.user_label,
+        shell.logout_enabled,
+        "services",
+    );
     let access_path = if can_manage {
         String::new()
     } else {
-        viewer_access_path("managed-service")
+        viewer_access_path(shell.public_base_path, "managed-service")
     };
     let mut slots = String::new();
     for slot in &service.slots {
@@ -505,9 +528,11 @@ fn render_service_detail_with_access(
             },
         ));
     }
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="managed-services-main managed-service-detail"><a class="managed-back" href="/services">{back} Services</a>{access_path}<div class="top managed-detail-top"><div><span class="managed-kicker">Managed service</span><div class="brand"><h1>{service_label}</h1></div><p class="fleet">{host_label} · {slot_count}</p></div><span class="managed-lock">{lock} Declared target</span></div><section class="managed-slot-list" aria-label="Secret slots">{slots}</section><details class="managed-service-details" id="managed-setup-configuration"><summary>Managed setup requirements</summary><p>Pharos never holds a secret value. A fleet operator must configure the reviewed Janus setup integration before create, replace, or removal requests can be issued.</p><p>After that configuration is present, refresh this declared service and use the enabled action for the current state.</p></details><details class="managed-service-details"><summary>Technical details</summary><dl><div><dt>Host reference</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service reference</dt><dd><code>{service_ref}</code></dd></div><div><dt>Runtime</dt><dd>Managed Compose service</dd></div></dl></details><script>{runtime}</script></main></div></body></html>"#,
+        r#"{head}{sidebar}<main class="managed-services-main managed-service-detail"><a class="managed-back" href="{services}">{back} Services</a>{access_path}<div class="top managed-detail-top"><div><span class="managed-kicker">Managed service</span><div class="brand"><h1>{service_label}</h1></div><p class="fleet">{host_label} · {slot_count}</p></div><span class="managed-lock">{lock} Declared target</span></div><section class="managed-slot-list" aria-label="Secret slots">{slots}</section><details class="managed-service-details" id="managed-setup-configuration"><summary>Managed setup requirements</summary><p>Pharos never holds a secret value. A fleet operator must configure the reviewed Janus setup integration before create, replace, or removal requests can be issued.</p><p>After that configuration is present, refresh this declared service and use the enabled action for the current state.</p></details><details class="managed-service-details"><summary>Technical details</summary><dl><div><dt>Host reference</dt><dd><code>{host_ref}</code></dd></div><div><dt>Service reference</dt><dd><code>{service_ref}</code></dd></div><div><dt>Runtime</dt><dd>Managed Compose service</dd></div></dl></details><script>{runtime}</script></main></div></body></html>"#,
         back = icons::ARROW_LEFT,
+        services = app_href(shell.public_base_path, "/services"),
         service_label = html_escape(&service.safe_label),
         host_label = html_escape(&managed_host_label(&manifest.host_ref)),
         slot_count = if service.slots.len() == 1 {
@@ -1017,6 +1042,7 @@ mod tests {
         ShellContext {
             user_label: "markus",
             logout_enabled: true,
+            public_base_path: PublicBasePath::ROOT_REF,
         }
     }
 

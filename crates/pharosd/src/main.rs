@@ -1969,6 +1969,14 @@ async fn host_workflow_receipts_json(
             "Workflow receipt access is not granted",
         );
     }
+    let receipts: Vec<_> = receipts
+        .into_iter()
+        .map(|mut receipt| {
+            receipt.workflow_href = state.public_base_path.href(&receipt.workflow_href);
+            receipt.activity_href = state.public_base_path.href(&receipt.activity_href);
+            receipt
+        })
+        .collect();
     (
         StatusCode::OK,
         Json(json!({
@@ -5471,7 +5479,7 @@ mod tests {
 
     #[test]
     fn sidebar_exposes_root_portaled_release_history_dialog() {
-        let html = sidebar("markus", true, "fleet");
+        let html = sidebar(&PublicBasePath::ROOT, "markus", true, "fleet");
 
         assert!(html.contains(r#"data-sidebar-still="true""#));
         assert!(html.contains(r#"data-sidebar-motion"#));
@@ -5721,6 +5729,7 @@ mod tests {
         ShellContext {
             user_label,
             logout_enabled,
+            public_base_path: PublicBasePath::ROOT_REF,
         }
     }
 
@@ -6358,7 +6367,7 @@ mod tests {
 
         for (state, level, glyph) in cases {
             let summary = backup_ui_summary(&[backup_observation(state)], 1_700_000_120);
-            let html = backup_chip_markup(&summary, "athena");
+            let html = backup_chip_markup(&summary, "athena", &PublicBasePath::ROOT);
             assert!(html.contains(&format!(r#"class="header-chip backup-chip {level}""#)));
             assert!(html.contains(&format!(r#"data-backup-glyph="{glyph}""#)));
             assert!(html.contains(r#"href="/backups?host=athena""#));
@@ -6372,6 +6381,7 @@ mod tests {
                 1_700_000_120,
             ),
             "athena",
+            &PublicBasePath::ROOT,
         );
         assert!(healthy_html.contains(r#"data-backup-state="healthy""#));
         assert!(healthy_html.contains(" hidden>"));
@@ -6381,6 +6391,7 @@ mod tests {
                 1_700_000_120,
             ),
             "athena",
+            &PublicBasePath::ROOT,
         );
         assert!(!failed_html.contains(" hidden>"));
     }
@@ -7018,6 +7029,7 @@ mod tests {
             ShellContext {
                 user_label: "markus",
                 logout_enabled: true,
+                public_base_path: &PublicBasePath::ROOT,
             },
         );
 
@@ -7058,6 +7070,7 @@ mod tests {
             ShellContext {
                 user_label: "markus",
                 logout_enabled: true,
+                public_base_path: &PublicBasePath::ROOT,
             },
         );
         let row_search = html
@@ -8463,7 +8476,7 @@ mod tests {
         ]);
 
         let manifests = vec![manifest];
-        let html = render_map(&hosts, "csb1", 1000, "markus", true);
+        let html = render_map(&hosts, "csb1", 1000, "markus", true, &PublicBasePath::ROOT);
         let payload = map_data_payload(&hosts, "csb1", 1000, &manifests, &probes);
         let data_json = serde_json::to_string(&payload).expect("map payload serializes");
 
@@ -8474,7 +8487,7 @@ mod tests {
         assert!(leaflet_css > body);
         assert!(html.contains(r#"href="/map" aria-current="page""#));
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#));
-        assert!(html.contains("const MAP_DATA_URL='/map/data.json'"));
+        assert!(html.contains("const MAP_DATA_URL=appUrl('/map/data.json')"));
         assert!(html.contains("fetch(MAP_DATA_URL+'?refresh='"));
         assert!(html.contains("loadMapAssets()"));
         assert!(html.contains("data-map-loading"));
@@ -14051,6 +14064,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let shell = ShellContext {
             user_label: "markus",
             logout_enabled: true,
+            public_base_path: &PublicBasePath::ROOT,
         };
         let managed = render_hetzner_connection_page(&runtime, &store, shell, true, None);
         assert_eq!(managed.matches(r#" data-provider-test>"#).count(), 1);
@@ -14174,6 +14188,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ShellContext {
                 user_label: "markus",
                 logout_enabled: true,
+                public_base_path: &PublicBasePath::ROOT,
             },
             true,
         );
@@ -14197,6 +14212,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ShellContext {
                 user_label: "viewer",
                 logout_enabled: true,
+                public_base_path: &PublicBasePath::ROOT,
             },
             false,
         );
@@ -14217,6 +14233,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             false,
             false,
             false,
+            &PublicBasePath::ROOT,
         );
         let api = managed.find("API connection").expect("API help");
         let ssh = managed.find("SSH key").expect("SSH help");
@@ -14328,11 +14345,21 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             false,
             false,
             false,
+            &PublicBasePath::ROOT,
         );
         assert!(needs_api.contains(r#"data-initial-step="api""#));
         assert!(needs_api.contains("https://secrets.example.test/provider-setup"));
 
-        let ready_locked = render_hetzner_setup_help(true, None, true, true, true, true, false);
+        let ready_locked = render_hetzner_setup_help(
+            true,
+            None,
+            true,
+            true,
+            true,
+            true,
+            false,
+            &PublicBasePath::ROOT,
+        );
         assert!(ready_locked.contains(r#"data-initial-step="finish""#));
         assert!(ready_locked.contains("selections have been verified"));
         assert!(ready_locked.contains("Provider setup complete"));
@@ -14342,7 +14369,16 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(!ready_locked.contains(r#"data-initial-step="finish" open"#));
         assert!(ready_locked.contains("expand for details and next steps"));
 
-        let ready_enabled = render_hetzner_setup_help(true, None, true, true, true, true, true);
+        let ready_enabled = render_hetzner_setup_help(
+            true,
+            None,
+            true,
+            true,
+            true,
+            true,
+            true,
+            &PublicBasePath::ROOT,
+        );
         assert!(ready_enabled.contains("Next: prepare the first server"));
         assert!(ready_enabled.contains("Review, authorization, and creation remain separate"));
 
@@ -14354,6 +14390,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             false,
             false,
             false,
+            &PublicBasePath::ROOT,
         );
         assert!(viewer.contains("An administrator must complete"));
         assert!(!viewer.contains("https://secrets.example.test/provider-setup"));
@@ -14380,6 +14417,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         let shell = ShellContext {
             user_label: "markus",
             logout_enabled: true,
+            public_base_path: &PublicBasePath::ROOT,
         };
         let managed = render_hetzner_connection_page(&runtime, &store, shell, true, None);
         assert_eq!(managed.matches(r#"class="provider-check""#).count(), 3);
@@ -14640,6 +14678,26 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"href="/map""#));
         assert!(html.contains(r#"name="pharos-public-base-path" content="""#));
         assert!(!html.contains("/pharos/map"));
+        assert!(html.contains("https://github.com/inspr-at/pharos"));
+        assert!(!html.contains("/pharos/paimos"));
+        let logged_out = client
+            .get(format!("{base}/auth/logged-out"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logged_out.status(), StatusCode::OK);
+        let logged_out_html = logged_out.text().await.unwrap();
+        assert!(logged_out_html.contains(r#"href="/auth/login""#));
+        assert!(logged_out_html.contains(r#"href="/favicon.svg""#));
+        assert_eq!(
+            client
+                .get(format!("{base}/favicon.svg"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -14680,9 +14738,46 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
         assert!(html.contains(r#"content="/pharos""#));
         assert!(html.contains(r#"href="/pharos/map""#));
         assert!(
-            html.contains(r#"action="/pharos/auth/logout""#) || html.contains(r#"href="/pharos""#)
+            !html.contains(
+                r#"href="/pharos/pharos/"));
+        assert!(!html.contains("/pharos/paimos"));
+        assert!(html.contains("https://github.com/inspr-at/pharos"));
+        assert!(
+            html.contains(r#"action="/pharos/auth/logout""#
+            ) || html.contains(r#"href="/pharos""#)
         );
         assert!(html.contains("/pharos/assets/") || html.contains("url('/pharos/assets/"));
+        assert!(html.contains("appUrl('/hosts.json") || html.contains("appUrl('/"));
+        let logged_out = client
+            .get(format!("{base}/pharos/auth/logged-out"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logged_out.status(), StatusCode::OK);
+        let logged_out_html = logged_out.text().await.unwrap();
+        assert!(logged_out_html.contains(r#"href="/pharos/auth/login""#));
+        assert!(logged_out_html.contains(r#"href="/pharos/favicon.svg""#));
+        assert!(!logged_out_html.contains(r#"href="/auth/login""#));
+        assert_eq!(
+            client
+                .get(format!("{base}/pharos/favicon.svg"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!(
+                    "{base}/pharos/assets/vendor/leaflet-1.9.4/leaflet.css"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         let login = client
             .get(format!(
                 "{base}/pharos/auth/login?return_to=%2Fpharos%2Fservices%3Fflow_project%3D17"

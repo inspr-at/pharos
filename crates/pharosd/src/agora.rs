@@ -208,6 +208,7 @@ pub(crate) async fn page(
                 ShellContext {
                     user_label: &user_label,
                     logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
                 },
                 "settings",
             ),
@@ -278,6 +279,7 @@ pub(crate) async fn host_workspace_page(
                 ShellContext {
                     user_label: &user_label,
                     logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
                 },
                 "fleet",
             ),
@@ -311,6 +313,7 @@ pub(crate) async fn host_workspace_page(
                     requested_host: Some(&selected.name),
                     user_label: &user_label,
                     logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
                     can_manage_fleet: access.can_manage_fleet(),
                     workspace: Some(HostWorkspaceContext {
                         runtime,
@@ -322,6 +325,7 @@ pub(crate) async fn host_workspace_page(
             crate::flow_mount_enabled(&state, &state.auth, &headers, &access, Some(&selected.name)),
             Some(&selected.name),
             state.flow_host.as_deref(),
+            &state.public_base_path,
         ),
     ))
 }
@@ -338,11 +342,13 @@ struct PageContext<'a> {
     requested_host: Option<&'a str>,
     user_label: &'a str,
     logout_enabled: bool,
+    public_base_path: &'a pharos_core::PublicBasePath,
     can_manage_fleet: bool,
     workspace: Option<HostWorkspaceContext<'a>>,
 }
 
 fn render_host_workspace(
+    base: &pharos_core::PublicBasePath,
     host: &AgoraHostView,
     runtime: Option<&Host>,
     lifecycle: &crate::HostLifecycle,
@@ -369,15 +375,15 @@ fn render_host_workspace(
             let settings_workflow = lifecycle.slot == crate::HostLifecycleSlot::SettingsChange;
             (
                 if settings_workflow {
-                    format!(
+                    base.href(&format!(
                         "/hosts/{host_path}?workflow={}",
                         crate::url_query_escape(run_id)
-                    )
+                    ))
                 } else {
-                    format!(
+                    base.href(&format!(
                         "/?host={host_path}&workflow={}",
                         crate::url_query_escape(run_id)
-                    )
+                    ))
                 },
                 lifecycle
                     .primary_action
@@ -420,7 +426,7 @@ fn render_host_workspace(
         lifecycle.blocked_by.join(", ")
     };
     format!(
-        r#"{extra_css}<div class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}"><aside class="host-task-rail" data-host-task-rail data-manager="{can_manage}" aria-label="Next safe action"><span class="task-kind">{task_kind}</span><h2>{lifecycle_label}</h2><p>{lifecycle_detail}</p><a class="primary-action" data-host-workspace-primary data-workflow-handler="{workflow_handler}" href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><a class="host-workspace-link" href="{settings_href}">Edit settings in this workspace</a><div class="host-receipt-slot" data-host-workspace-receipts><strong>Workflow receipts</strong><span class="host-receipt-empty" data-host-receipt-empty>Loading saved receipts…</span><ol class="host-receipt-list" data-host-receipt-list></ol></div></aside><div class="host-workspace-main"><header class="host-workspace-identity"><span class="host-workspace-mark">{badge}</span><div><h1>{host_name}</h1><p>{role} · host workspace</p></div></header><section class="host-workspace-section" data-host-workspace-lifecycle><h2>Lifecycle</h2><p>{lifecycle_detail}</p><div class="host-workspace-facts"><div><span>State</span><strong>{lifecycle_label}</strong></div><div><span>Blocked by</span><strong>{blocked_by}</strong></div></div></section><section class="host-workspace-section host-workspace-settings" id="host-settings-editor" data-host-workspace-settings><div class="host-workspace-section-head"><h2>Settings</h2><p>Color, host type, alerts, declarative details, review, execution, and evidence stay attached to this host.</p><div class="host-workspace-facts"><div><span>Settings state</span><strong>{settings_state}</strong></div><div><span>Target</span><strong>{target}</strong></div></div></div>{settings_editor}</section><section class="host-workspace-section" data-host-workspace-protection><h2>Protection</h2><p>Backup evidence remains host-reported; observation does not claim progress.</p><div class="host-workspace-facts"><div><span>Backup observations</span><strong>{protection}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/backups?host={host_path}">Open backup evidence</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-services><h2>Services</h2><p>Non-secret service observations stay linked to this host.</p><div class="host-workspace-facts"><div><span>Observed services</span><strong>{services}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/services">Open services</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-activity><h2>Activity</h2><p>The recorded host report is evidence, not an action.</p><div class="host-workspace-facts"><div><span>Last report</span><strong>{report}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="/activity">Open activity</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-technical><h2>Technical context</h2><div class="host-workspace-facts"><div><span>Host reference</span><strong>{host_name}</strong></div><div><span>Configuration target</span><strong>{target}</strong></div></div></section></div></div>"#,
+        r#"{extra_css}<div class="host-workspace" data-host-workspace data-host="{host_name}" data-can-manage-fleet="{can_manage}"><aside class="host-task-rail" data-host-task-rail data-manager="{can_manage}" aria-label="Next safe action"><span class="task-kind">{task_kind}</span><h2>{lifecycle_label}</h2><p>{lifecycle_detail}</p><a class="primary-action" data-host-workspace-primary data-workflow-handler="{workflow_handler}" href="{primary_href}">{primary_label}</a><p class="task-note">{manager_note}</p><a class="host-workspace-link" href="{settings_href}">Edit settings in this workspace</a><div class="host-receipt-slot" data-host-workspace-receipts><strong>Workflow receipts</strong><span class="host-receipt-empty" data-host-receipt-empty>Loading saved receipts…</span><ol class="host-receipt-list" data-host-receipt-list></ol></div></aside><div class="host-workspace-main"><header class="host-workspace-identity"><span class="host-workspace-mark">{badge}</span><div><h1>{host_name}</h1><p>{role} · host workspace</p></div></header><section class="host-workspace-section" data-host-workspace-lifecycle><h2>Lifecycle</h2><p>{lifecycle_detail}</p><div class="host-workspace-facts"><div><span>State</span><strong>{lifecycle_label}</strong></div><div><span>Blocked by</span><strong>{blocked_by}</strong></div></div></section><section class="host-workspace-section host-workspace-settings" id="host-settings-editor" data-host-workspace-settings><div class="host-workspace-section-head"><h2>Settings</h2><p>Color, host type, alerts, declarative details, review, execution, and evidence stay attached to this host.</p><div class="host-workspace-facts"><div><span>Settings state</span><strong>{settings_state}</strong></div><div><span>Target</span><strong>{target}</strong></div></div></div>{settings_editor}</section><section class="host-workspace-section" data-host-workspace-protection><h2>Protection</h2><p>Backup evidence remains host-reported; observation does not claim progress.</p><div class="host-workspace-facts"><div><span>Backup observations</span><strong>{protection}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="{backups_href}">Open backup evidence</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-services><h2>Services</h2><p>Non-secret service observations stay linked to this host.</p><div class="host-workspace-facts"><div><span>Observed services</span><strong>{services}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="{services_href}">Open services</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-activity><h2>Activity</h2><p>The recorded host report is evidence, not an action.</p><div class="host-workspace-facts"><div><span>Last report</span><strong>{report}</strong></div><div><span>Details</span><strong><a class="host-workspace-link" href="{activity_href}">Open activity</a></strong></div></div></section><section class="host-workspace-section" data-host-workspace-technical><h2>Technical context</h2><div class="host-workspace-facts"><div><span>Host reference</span><strong>{host_name}</strong></div><div><span>Configuration target</span><strong>{target}</strong></div></div></section></div></div>"#,
         extra_css = extra_css,
         host_name = html_escape(&host.name),
         role = html_escape(&host.role),
@@ -438,10 +444,12 @@ fn render_host_workspace(
         workflow_handler = workflow_handler,
         manager_note = html_escape(manager_note),
         settings_href = html_escape(&settings_href),
+        backups_href = crate::app_href(base, &format!("/backups?host={host_path}")),
+        services_href = crate::app_href(base, "/services"),
+        activity_href = crate::app_href(base, "/activity"),
         blocked_by = html_escape(&blocked_by),
         settings_state = settings_state.key(),
         target = html_escape(&host.target_attribute),
-        host_path = html_escape(&host_path),
         protection = html_escape(&protection),
         services = html_escape(&services),
         report = html_escape(&report),
@@ -909,6 +917,7 @@ fn render_page(
             requested_host,
             user_label,
             logout_enabled,
+            public_base_path: &pharos_core::PublicBasePath::ROOT,
             can_manage_fleet: true,
             workspace: None,
         },
@@ -925,6 +934,7 @@ fn render_page_with_access(
         requested_host,
         user_label,
         logout_enabled,
+        public_base_path,
         can_manage_fleet,
         workspace,
     } = page;
@@ -956,8 +966,9 @@ fn render_page_with_access(
         (None, None) => 0,
     };
 
-    let head = crate::head_with_extra(AGORA_CSS);
+    let head = crate::head_with_extra(public_base_path, AGORA_CSS);
     let sidebar = crate::sidebar(
+        public_base_path,
         user_label,
         logout_enabled,
         if workspace.is_some() {
@@ -969,7 +980,7 @@ fn render_page_with_access(
     let access_path = if can_manage_fleet {
         String::new()
     } else {
-        crate::viewer_access_path("settings")
+        crate::viewer_access_path(public_base_path, "settings")
     };
 
     if hosts.is_empty() {
@@ -998,6 +1009,7 @@ fn render_page_with_access(
             ),
             String::new(),
             render_host_workspace(
+                public_base_path,
                 selected,
                 workspace.runtime,
                 workspace.lifecycle,
@@ -1020,8 +1032,9 @@ fn render_page_with_access(
 
     format!(
         r##"{head}{sidebar}<main class="settings-main" data-can-manage-fleet="{can_manage_fleet}">{header}{access_path}{host_table}{content}</main>{action_dialog}<script>
+function appUrl(path){{return (typeof window.pharosPublicPath==='function')?window.pharosPublicPath(path):path}}
 document.querySelector('[data-host-picker]')?.addEventListener('change',event=>{{
-  window.location.assign('/hosts/'+encodeURIComponent(event.target.value));
+  window.location.assign(appUrl('/hosts/'+encodeURIComponent(event.target.value)));
 }});
 const root=document.querySelector('[data-color-root]');
 const settingsWorkflow={{timer:null,controller:null,id:null,lastRevision:'',failures:0,terminal:false,mode:null,confirming:false}};
@@ -1190,7 +1203,7 @@ async function pollSettingsWorkflow(id){{
   const controller=new AbortController();
   settingsWorkflow.controller=controller;
   try{{
-    const response=await fetch('/host-actions/jobs/'+encodeURIComponent(id),{{credentials:'same-origin',cache:'no-store',signal:controller.signal}});
+    const response=await fetch(appUrl('/host-actions/jobs/'+encodeURIComponent(id)),{{credentials:'same-origin',cache:'no-store',signal:controller.signal}});
     const data=await response.json().catch(()=>({{}}));
     if(!response.ok)throw new Error(data.error||'Could not refresh the settings workflow.');
     settingsWorkflow.failures=0;
@@ -1239,7 +1252,7 @@ document.querySelector('[data-host-action-overlay]')?.addEventListener('click',e
       :action==='continue'?'Continuing the saved request through nixcfg…'
       :action==='restart'?'Clearing the incomplete request…'
       :'Reconciling the saved workflow…';
-    fetch('/host-actions/jobs/'+encodeURIComponent(requestRunId)+'/'+endpoint,{{
+    fetch(appUrl('/host-actions/jobs/'+encodeURIComponent(requestRunId)+'/'+endpoint),{{
       method:'POST',
       credentials:'same-origin',
       headers:{{'Content-Type':'application/json','X-Pharos-Action':'1'}},
@@ -1434,7 +1447,7 @@ if(root){{
     if(!output||root.dataset.ready!=='true')return;
     output.textContent='Preparing declarative details...';
     try{{
-      const res=await fetch('/agora/proposals/host-palette.json?host='+encodeURIComponent(root.dataset.host)+'&accent='+encodeURIComponent(color.value),{{headers:{{Accept:'application/json'}}}});
+      const res=await fetch(appUrl('/agora/proposals/host-palette.json?host='+encodeURIComponent(root.dataset.host)+'&accent='+encodeURIComponent(color.value)),{{headers:{{Accept:'application/json'}}}});
       const data=await res.json();
       output.textContent=res.ok?data.patch.value:(data.error||'Details unavailable');
     }}catch(_){{output.textContent='Details unavailable'}}
@@ -1449,7 +1462,7 @@ if(root){{
     const sheetStatus=document.querySelector('[data-host-action-status]');
     if(sheetStatus)sheetStatus.textContent='Creating one saved settings request…';
     try{{
-      const res=await fetch('/agora/requests/host-preferences.json',{{
+      const res=await fetch(appUrl('/agora/requests/host-preferences.json'),{{
         method:'POST',
         headers:{{Accept:'application/json','Content-Type':'application/json'}},
         body:JSON.stringify({{host:root.dataset.host,preferences:draftPreferences()}}),
@@ -1519,13 +1532,13 @@ if(root){{
   updateDraftState();
   const initialWorkflowId=incomingDraft.get('workflow')||'';
   if(initialWorkflowId){{
-    fetch('/host-actions/jobs/'+encodeURIComponent(initialWorkflowId),{{credentials:'same-origin',cache:'no-store'}})
+    fetch(appUrl('/host-actions/jobs/'+encodeURIComponent(initialWorkflowId)),{{credentials:'same-origin',cache:'no-store'}})
       .then(async response=>{{
         const data=await response.json().catch(()=>({{}}));
         if(!response.ok)throw new Error(data.error||'Could not open the saved workflow.');
         const workflowKind=String(data?.job?.workflow?.kind||data?.job?.kind||'');
         if(workflowKind&&workflowKind!=='settings_change'){{
-          const genericWorkflow=new URL('/',window.location.origin);
+          const genericWorkflow=new URL(appUrl('/'),window.location.origin);
           genericWorkflow.searchParams.set('host',root.dataset.host);
           genericWorkflow.searchParams.set('workflow',initialWorkflowId);
           window.location.replace(genericWorkflow.pathname+genericWorkflow.search);
@@ -1542,7 +1555,7 @@ if(receiptSlot&&root){{
   const list=receiptSlot.querySelector('[data-host-receipt-list]');
   const receiptLink=(href,label)=>{{
     if(typeof href!=='string'||!href.startsWith('/')||href.startsWith('//')||href.includes('\\'))return null;
-    const link=document.createElement('a');link.href=href;link.textContent=label;return link;
+    const link=document.createElement('a');link.href=appUrl(href);link.textContent=label;return link;
   }};
   const receiptTime=value=>{{
     const numeric=Number(value);
@@ -1566,7 +1579,7 @@ if(receiptSlot&&root){{
     );
     return stageOrder.filter(stage=>recordedStages.has(stage));
   }};
-  fetch('/hosts/'+encodeURIComponent(root.dataset.host)+'/workflow-receipts.json',{{credentials:'same-origin',cache:'no-store'}})
+  fetch(appUrl('/hosts/'+encodeURIComponent(root.dataset.host)+'/workflow-receipts.json'),{{credentials:'same-origin',cache:'no-store'}})
     .then(async response=>{{
       if(!response.ok)throw new Error('Receipts are not available yet.');
       const payload=await response.json().catch(()=>({{}}));
@@ -2277,8 +2290,8 @@ mod tests {
     use crate::host_actions::{HostLifecycleInvoke, HostWorkflowAction, HostWorkflowActionKind};
     use pharos_core::{
         Host, HostAlertPreferences, HostKind, ManifestHost, ManifestLocationMode, ManifestPalette,
-        ManifestPolicy, NixFreshness, PrivilegedActionMode, PrivilegedActions, RuntimeStateOwner,
-        HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+        ManifestPolicy, NixFreshness, PrivilegedActionMode, PrivilegedActions, PublicBasePath,
+        RuntimeStateOwner, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
     };
 
     fn manifest() -> HostManifest {
@@ -2534,6 +2547,7 @@ mod tests {
         let lifecycle = host_lifecycle(&[], &host.name, settings_state, false);
         let editor = render_ready_content(host, true);
         let html = render_host_workspace(
+            PublicBasePath::ROOT_REF,
             host,
             Some(&runtime_hosts[0]),
             &lifecycle,
@@ -2554,6 +2568,7 @@ mod tests {
 
         let viewer_editor = render_ready_content(host, false);
         let viewer_html = render_host_workspace(
+            PublicBasePath::ROOT_REF,
             host,
             Some(&runtime_hosts[0]),
             &lifecycle,
@@ -2601,6 +2616,7 @@ mod tests {
             action(HostWorkflowActionKind::Continue, "Continue request"),
         );
         let settings_html = render_host_workspace(
+            PublicBasePath::ROOT_REF,
             host,
             Some(&runtime_hosts[0]),
             &settings,
@@ -2622,6 +2638,7 @@ mod tests {
             ),
         );
         let update_html = render_host_workspace(
+            PublicBasePath::ROOT_REF,
             host,
             Some(&runtime_hosts[0]),
             &update,
@@ -2640,6 +2657,7 @@ mod tests {
             action(HostWorkflowActionKind::Retry, "Retry credential retirement"),
         );
         let removal_html = render_host_workspace(
+            PublicBasePath::ROOT_REF,
             host,
             Some(&runtime_hosts[0]),
             &removal,
@@ -2807,6 +2825,7 @@ mod tests {
                 requested_host: Some("hsb8"),
                 user_label: "viewer",
                 logout_enabled: true,
+                public_base_path: &pharos_core::PublicBasePath::ROOT,
                 can_manage_fleet: false,
                 workspace: None,
             },

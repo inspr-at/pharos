@@ -21,8 +21,11 @@ pub struct PublicOrigin {
 }
 
 impl PublicBasePath {
+    pub const ROOT: Self = Self(String::new());
+    pub const ROOT_REF: &'static Self = &Self::ROOT;
+
     pub fn root() -> Self {
-        Self(String::new())
+        Self::ROOT
     }
 
     pub fn as_str(&self) -> &str {
@@ -59,8 +62,17 @@ impl PublicBasePath {
     }
 
     pub fn href(&self, endpoint: &str) -> String {
-        self.join(endpoint)
-            .unwrap_or_else(|_| self.home().to_string())
+        let (without_fragment, fragment) = match endpoint.split_once('#') {
+            Some((path, fragment)) => (path, Some(fragment)),
+            None => (endpoint, None),
+        };
+        let joined = self
+            .join(without_fragment)
+            .unwrap_or_else(|_| self.home().to_string());
+        match fragment {
+            Some(fragment) if !fragment.is_empty() => format!("{joined}#{fragment}"),
+            _ => joined,
+        }
     }
 
     /// Exact segment-boundary strip. `/pharos` matches `/pharos` and
@@ -307,6 +319,12 @@ mod tests {
         );
         assert_eq!(PublicBasePath::root().home(), "/");
         assert_eq!(PublicBasePath::root().href("/map"), "/map");
+        assert_eq!(
+            PublicBasePath::parse("/pharos")
+                .unwrap()
+                .href("/activity?host=athena&workflow=run-1#workflow-run-1"),
+            "/pharos/activity?host=athena&workflow=run-1#workflow-run-1"
+        );
     }
 
     #[test]
