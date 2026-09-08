@@ -173,6 +173,63 @@ test("unavailable projection keeps fleet main visible and collapses flow chrome"
   ).toBeVisible();
 });
 
+test("boundary refresh remounts after initial unavailable projection", async ({
+  page,
+}) => {
+  await page.clock.install({ time: new Date("2026-09-08T10:05:00.000Z") });
+  await loginAsVerifiedHuman(page);
+
+  let unavailable = true;
+  const shellStateRequests = [];
+  await page.route("**/flow/shell-state.json**", async (route) => {
+    shellStateRequests.push(route.request().url());
+    if (unavailable) {
+      unavailable = false;
+      await route.fulfill({ status: 503, body: "unavailable" });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await expect.poll(() => shellStateRequests.length, { timeout: 10_000 }).toBe(1);
+  await expectShellChromeCollapsed(page);
+  await expectFleetMainVisible(page);
+
+  await page.clock.fastForward("11:00");
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const shell = document.querySelector("inspr-flow-shell[data-flow-host]");
+          return shell?.hasAttribute("data-flow-host-unavailable") === false;
+        }),
+      { timeout: 10_000 },
+    )
+    .toBe(true);
+  expect(shellStateRequests.length).toBe(2);
+  await waitForFlowProjection(page);
+
+  const requestsAfterRecovery = shellStateRequests.length;
+  unavailable = true;
+  await page.clock.fastForward("11:00");
+  await expectShellChromeCollapsed(page);
+  expect(shellStateRequests.length).toBe(requestsAfterRecovery + 1);
+
+  await page.clock.fastForward("11:00");
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const shell = document.querySelector("inspr-flow-shell[data-flow-host]");
+          return shell?.hasAttribute("data-flow-host-unavailable") === false;
+        }),
+      { timeout: 10_000 },
+    )
+    .toBe(true);
+  expect(shellStateRequests.length).toBe(requestsAfterRecovery + 2);
+});
+
 test("denied host scope keeps fleet main visible", async ({ page }) => {
   await loginAsVerifiedHuman(page);
   await page.goto("/");

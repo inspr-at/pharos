@@ -39,10 +39,6 @@ if (shell) {
   function unmountShellChrome() {
     shell.setAttribute('data-flow-host-unavailable', 'true');
     unwrapMainFromShell();
-    if (refreshTimer !== null) {
-      clearTimeout(refreshTimer);
-      refreshTimer = null;
-    }
   }
 
   function mountShellChrome() {

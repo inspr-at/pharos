@@ -15,6 +15,11 @@ test("shipped bootstrap reads nested identity and unwraps main on denial", () =>
   assert.match(bootstrap, /unwrapMainFromShell/);
   assert.match(bootstrap, /shell\.shellState\?\.identity/);
   assert.doesNotMatch(bootstrap, /shell\.hidden\s*=\s*true/);
+  const unmountShellChrome = bootstrap.match(
+    /function unmountShellChrome\(\) \{[\s\S]*?\n  \}/,
+  )?.[0];
+  assert.ok(unmountShellChrome);
+  assert.doesNotMatch(unmountShellChrome, /clearTimeout\(refreshTimer\)/);
 });
 
 test("review intent omits identity and stays server-resolvable", async () => {
