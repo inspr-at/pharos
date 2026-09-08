@@ -180,7 +180,7 @@ impl RateWindow {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AuthUser {
     pub operator_ref: String,
     pub managed_human_session_ref: String,
@@ -247,6 +247,15 @@ impl AccessGrant {
     pub fn is_empty(&self) -> bool {
         !self.all_hosts && self.hosts.is_empty() && !self.agora
     }
+
+    pub(crate) fn revision_material(&self) -> String {
+        if self.all_hosts {
+            format!("all:agora={}", self.agora)
+        } else {
+            let hosts: Vec<&str> = self.hosts.iter().map(String::as_str).collect();
+            format!("hosts={}:agora={}", hosts.join(","), self.agora)
+        }
+    }
 }
 
 struct LoginIdentity {
@@ -284,6 +293,8 @@ pub struct AuthState {
     machine: Option<MachineOperatorTokenStore>,
     #[cfg(test)]
     fixed_access: Option<AccessGrant>,
+    #[cfg(test)]
+    fixed_user: Option<AuthUser>,
 }
 
 /// Fully validated human-authentication startup configuration.
@@ -433,6 +444,8 @@ impl Auth {
                 human: None,
                 machine,
                 #[cfg(test)]
+                fixed_user: None,
+                #[cfg(test)]
                 fixed_access: None,
             });
         };
@@ -484,6 +497,8 @@ impl Auth {
                 session_rate: Mutex::new(RateWindow::default()),
             })),
             machine,
+            #[cfg(test)]
+            fixed_user: None,
             #[cfg(test)]
             fixed_access: None,
         })
@@ -635,6 +650,17 @@ impl AuthState {
             human: None,
             machine: None,
             fixed_access: Some(access),
+            fixed_user: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_human(access: AccessGrant, user: AuthUser) -> Self {
+        Self {
+            human: None,
+            machine: None,
+            fixed_access: Some(access),
+            fixed_user: Some(user),
         }
     }
 
@@ -706,6 +732,10 @@ impl AuthState {
     pub(crate) fn human_user(&self, headers: &HeaderMap) -> Option<AuthUser> {
         if headers.contains_key(header::AUTHORIZATION) {
             return None;
+        }
+        #[cfg(test)]
+        if let Some(user) = &self.fixed_user {
+            return Some(user.clone());
         }
         self.human
             .as_ref()
@@ -2911,6 +2941,7 @@ mod tests {
             human: None,
             machine: Some(MachineOperatorTokenStore::load(root.clone()).unwrap()),
             fixed_access: None,
+            fixed_user: None,
         };
         (state, credential, root)
     }

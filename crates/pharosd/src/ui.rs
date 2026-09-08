@@ -767,28 +767,33 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
         })
         .map(|host| host.name.clone())
         .collect();
-    no_store_html(render_home_with_capabilities(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            action_jobs: &action_jobs,
-            declared_preferences: Some(&declared_preferences),
-            janus_managed_hosts: Some(&janus_managed_hosts),
-        },
-        &self_host(),
-        now_unix(),
-        &manifests,
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-        FleetCapabilities {
-            can_manage_fleet: access.can_manage_fleet(),
-            system_update_available: state.nixcfg_dispatch.system_update_available(),
-            host_removal_available: state.nixcfg_dispatch.host_removal_available()
-                && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
-                    || state.retirement_owner.configured()),
-        },
+    no_store_html(crate::flow_host::inject_flow_shell(
+        render_home_with_capabilities(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &jobs,
+                action_jobs: &action_jobs,
+                declared_preferences: Some(&declared_preferences),
+                janus_managed_hosts: Some(&janus_managed_hosts),
+            },
+            &self_host(),
+            now_unix(),
+            &manifests,
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            FleetCapabilities {
+                can_manage_fleet: access.can_manage_fleet(),
+                system_update_available: state.nixcfg_dispatch.system_update_available(),
+                host_removal_available: state.nixcfg_dispatch.host_removal_available()
+                    && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
+                        || state.retirement_owner.configured()),
+            },
+        ),
+        crate::flow_mount_enabled(&state, &state.auth, &headers, &access, None),
+        None,
+        state.flow_host.as_deref(),
     ))
 }
 

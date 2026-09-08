@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-26.09.07.22.08.13-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-26.09.08.11.36.59-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,7 +51,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v26.09.07.22.08.13
+## What ships in v26.09.08.11.36.59
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -709,6 +709,21 @@ promised third-party API. The important boundaries are:
 
 ## Configuration map
 
+### Flow host
+
+Optional bounded `@inspr/flow-shell` integration is enabled when `PHAROS_FLOW_CONFIG_FILE`
+points at a JSON document using schema `inspr.pharos.flow-host-config.v1`. The config
+file and the referenced Paimos API key file must both be owner-readable only (`0600`,
+matching uid, parent directory `0700`). Each binding maps one Paimos project to Pharos
+host names and `operator-ref` values that may use the shell.
+
+For local harnesses against loopback Paimos, set `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN=true`
+when **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback. Cleartext HTTP is
+rejected by default and does not change the PHAROS-206 delivery adapter's production
+HTTPS-only boundary. Store Flow config and API key files under an operator-owned
+`0700` directory (for example `/var/lib/pharos/flow-host/`), not under shared
+`/run/secrets` parents that are typically root-owned `0755`.
+
 ### Server
 
 | Variable                                                       | Purpose                                                                                                                                                                                                                                                |
@@ -718,6 +733,8 @@ promised third-party API. The important boundaries are:
 | `PHAROS_ALLOW_OPEN`                                            | Explicitly allow unauthenticated human routes; valid only for a loopback public address                                                                                                                                                                |
 | `PHAROS_DB`                                                    | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly                                                                                                             |
 | `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE`                           | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files                                                        |
+| `PHAROS_FLOW_CONFIG_FILE`                                      | Optional owner-only Flow host config (`inspr.pharos.flow-host-config.v1`) enabling bounded `@inspr/flow-shell` projection and guarded Review/Start navigation                                                                                          |
+| `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN`                            | When `true` or `1`, allow cleartext loopback Paimos origins only while **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback; for local harnesses only                                                                                           |
 | `PHAROS_PROVISIONING_JOBS_DB`                                  | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset                                                                                                                                          |
 | `PHAROS_OIDC_ISSUER`                                           | OIDC discovery issuer                                                                                                                                                                                                                                  |
 | `PHAROS_OIDC_CLIENT_ID`                                        | Public OIDC client identifier                                                                                                                                                                                                                          |
@@ -815,7 +832,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v26.09.07.22.08.13**. It is already used as a real
+Pharos is an active early release at **v26.09.08.11.36.59**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
@@ -862,6 +879,10 @@ baselines live under `tests/browser/__screenshots__/`. Use the harness output
 paths for ad-hoc evidence and synthetic fixture data only. Cargo's ignored
 `target/` directory is disposable build cache: never park tests or fleet
 captures there, and never commit captured infrastructure data as a fixture.
+
+Flow host integration QA runs with `npm run test:flow-host`. That command builds
+`pharosd`, starts the OIDC and Paimos loopback harness, and exercises the
+shipped bootstrap boundary in Chromium.
 
 [`RELEASE.json`](RELEASE.json) is the single authoritative release coordinate.
 It records the canonical Calendar Version, stable-channel sequence, migration

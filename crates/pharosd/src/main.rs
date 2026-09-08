@@ -14,6 +14,7 @@ mod alerts;
 mod appliance_probes;
 mod auth;
 mod durable_file;
+mod flow_host;
 mod host_actions;
 mod icons;
 mod janus_auth;
@@ -156,6 +157,7 @@ struct AppState {
     retired_hosts: Arc<RetiredHostStore>,
     alert_health: AlertWorkerHealth,
     access_request: AccessRequestConfig,
+    flow_host: Option<Arc<flow_host::FlowHostService>>,
 }
 
 const ACCESS_REQUEST_URL_ENV: &str = "PHAROS_ACCESS_REQUEST_URL";
@@ -4617,8 +4619,8 @@ async fn secure_response(response: Response) -> Response {
             Ok(html) => html,
             Err(_) => return security_policy_failure_response(),
         };
-        let script_open = format!(r#"<script nonce="{nonce}""#);
-        let style_open = format!(r#"<style nonce="{nonce}""#);
+        let script_open = format!(r#"<script nonce="{nonce}" "#);
+        let style_open = format!(r#"<style nonce="{nonce}" "#);
         let html = html
             .replace("<script", &script_open)
             .replace("<style", &style_open);
@@ -4704,6 +4706,127 @@ fn security_policy_failure_response() -> Response {
 
 fn no_store_html(body: String) -> impl IntoResponse {
     (no_store_headers(), Html(body))
+}
+
+pub(crate) fn flow_mount_enabled(
+    state: &AppState,
+    auth: &AuthState,
+    headers: &HeaderMap,
+    access: &AccessGrant,
+    selected_host: Option<&str>,
+) -> bool {
+    state
+        .flow_host
+        .as_ref()
+        .is_some_and(|flow| flow.mount_enabled_for(auth, headers, access, selected_host))
+}
+
+async fn flow_shell_state_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FlowHostQuery>,
+) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
+    if access.is_empty() {
+        return no_store_json(json!({
+            "enabled": false,
+            "mountShell": false,
+            "unavailableReason": "access denied"
+        }));
+    }
+    let Some(flow) = state.flow_host.as_ref() else {
+        return no_store_json(json!({"enabled": false, "mountShell": false}));
+    };
+    let hosts = state.store.list();
+    let selected_host =
+        match flow_host::resolve_flow_host_scope(query.host.as_deref(), &access, &hosts) {
+            Ok(selected_host) => selected_host,
+            Err(reason) => {
+                return no_store_json(json!({
+                    "enabled": true,
+                    "mountShell": false,
+                    "unavailableReason": reason,
+                }));
+            }
+        };
+    let response = flow
+        .shell_state(
+            &state.auth,
+            &headers,
+            &access,
+            &hosts,
+            selected_host.as_deref(),
+            now_unix(),
+        )
+        .await;
+    no_store_json(serde_json::to_value(response).unwrap_or(json!({})))
+}
+
+async fn flow_intents_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FlowHostQuery>,
+    Json(request): Json<flow_host::FlowIntentRequest>,
+) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
+    let Some(flow) = state.flow_host.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(flow_host::FlowIntentResponse {
+                executed: false,
+                error: Some("Flow host is not configured.".to_string()),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    };
+    let hosts = state.store.list();
+    let selected_host =
+        match flow_host::resolve_flow_host_scope(query.host.as_deref(), &access, &hosts) {
+            Ok(selected_host) => selected_host,
+            Err(reason) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(flow_host::FlowIntentResponse {
+                        executed: false,
+                        error: Some(reason),
+                        ..Default::default()
+                    }),
+                )
+                    .into_response();
+            }
+        };
+    let (status, response) = flow
+        .handle_intent(
+            &state.auth,
+            &headers,
+            &access,
+            &hosts,
+            selected_host.as_deref(),
+            request,
+            now_unix(),
+        )
+        .await;
+    (status, Json(response)).into_response()
+}
+
+#[derive(Deserialize)]
+struct FlowHostQuery {
+    host: Option<String>,
+}
+
+async fn flow_host_bootstrap() -> impl IntoResponse {
+    let (bytes, content_type) = flow_host::flow_bootstrap_asset();
+    ([(header::CONTENT_TYPE, content_type)], bytes.to_vec()).into_response()
+}
+
+async fn flow_shell_asset(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
+    match flow_host::flow_static_asset(path.as_str()) {
+        Some((bytes, content_type)) => {
+            ([(header::CONTENT_TYPE, content_type)], bytes.to_vec()).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 fn no_store_json(value: serde_json::Value) -> impl IntoResponse {
@@ -4976,6 +5099,9 @@ async fn main() {
 
     let startup = StartupConfig::from_env()
         .unwrap_or_else(|err| panic!("invalid Pharos startup configuration: {err}"));
+    let loopback_dev_mode = startup
+        .listener_loopback_dev_mode()
+        .unwrap_or_else(|error| panic!("invalid Pharos startup configuration: {error}"));
     let host_store_path = std::env::var("PHAROS_DB").ok().map(PathBuf::from);
     let managed_setup_intent_store_path =
         ManagedSetupIntentStore::path_for(host_store_path.as_deref());
@@ -5048,6 +5174,9 @@ async fn main() {
     let alert_health = alert_notifier.health.clone();
     let access_request = AccessRequestConfig::from_env()
         .unwrap_or_else(|error| panic!("access-request startup failed: {error}"));
+    let flow_host = flow_host::FlowHostService::from_env(loopback_dev_mode)
+        .unwrap_or_else(|error| panic!("flow host startup failed: {error}"))
+        .map(Arc::new);
     let paimos_delivery = paimos_delivery::PaimosDeliveryAdapter::from_env(
         host_store_path.as_deref(),
         Arc::clone(&store),
@@ -5072,6 +5201,7 @@ async fn main() {
         retired_hosts,
         alert_health,
         access_request,
+        flow_host,
     };
     let _ = reconcile_saved_next_actions(&state, now_unix()).await;
     spawn_next_action_loop(state.clone());
@@ -5720,8 +5850,8 @@ mod tests {
             .await
             .expect("secured HTML body");
         let body = std::str::from_utf8(&body).expect("secured HTML is UTF-8");
-        assert!(body.contains(&format!(r#"<style nonce="{nonce}">"#)));
-        assert!(body.contains(&format!(r#"<script nonce="{nonce}">"#)));
+        assert!(body.contains(&format!(r#"<style nonce="{nonce}" "#)));
+        assert!(body.contains(&format!(r#"<script nonce="{nonce}" "#)));
     }
 
     #[tokio::test]
@@ -14464,6 +14594,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             retired_hosts: Arc::new(RetiredHostStore::new(None)),
             alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
             access_request: AccessRequestConfig::default(),
+            flow_host: None,
         }
     }
 
