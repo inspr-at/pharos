@@ -290,21 +290,24 @@ pub(crate) async fn host_workspace_page(
         .collect();
     let lifecycle = host_lifecycle(&action_jobs, &selected.name, settings_state, false);
 
-    Html(render_page_with_access(
-        &manifests,
-        &declared_preferences,
-        &runtime_hosts,
-        PageContext {
-            requested_host: Some(&selected.name),
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-            can_manage_fleet: access.can_manage_fleet(),
-            workspace: Some(HostWorkspaceContext {
-                runtime,
-                lifecycle: &lifecycle,
-                settings_state,
-            }),
-        },
+    Html(crate::flow_host::inject_flow_shell(
+        render_page_with_access(
+            &manifests,
+            &declared_preferences,
+            &runtime_hosts,
+            PageContext {
+                requested_host: Some(&selected.name),
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+                can_manage_fleet: access.can_manage_fleet(),
+                workspace: Some(HostWorkspaceContext {
+                    runtime,
+                    lifecycle: &lifecycle,
+                    settings_state,
+                }),
+            },
+        ),
+        crate::flow_mount_enabled(&state),
     ))
 }
 

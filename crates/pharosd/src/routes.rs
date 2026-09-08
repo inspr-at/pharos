@@ -53,6 +53,12 @@ fn human_routes() -> Router<AppState> {
             get(agora::location_proposal),
         )
         .route("/hosts.json", get(hosts_json))
+        .route("/flow/shell-state.json", get(flow_shell_state_json))
+        .route("/flow/intents", post(flow_intents_json))
+        .route(
+            "/assets/vendor/flow-shell/{*path}",
+            get(flow_shell_asset),
+        )
         .route("/setup/provider-plan.json", get(setup_provider_plan_json))
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
         .route("/host-need-intents", post(create_host_need_intent))

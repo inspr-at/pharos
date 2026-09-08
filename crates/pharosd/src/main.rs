@@ -14,6 +14,7 @@ mod alerts;
 mod appliance_probes;
 mod auth;
 mod durable_file;
+mod flow_host;
 mod host_actions;
 mod icons;
 mod janus_auth;
@@ -156,6 +157,7 @@ struct AppState {
     retired_hosts: Arc<RetiredHostStore>,
     alert_health: AlertWorkerHealth,
     access_request: AccessRequestConfig,
+    flow_host: Option<Arc<flow_host::FlowHostService>>,
 }
 
 const ACCESS_REQUEST_URL_ENV: &str = "PHAROS_ACCESS_REQUEST_URL";
@@ -4706,6 +4708,85 @@ fn no_store_html(body: String) -> impl IntoResponse {
     (no_store_headers(), Html(body))
 }
 
+pub(crate) fn flow_mount_enabled(state: &AppState) -> bool {
+    state
+        .flow_host
+        .as_ref()
+        .is_some_and(|flow| flow.mount_enabled())
+}
+
+async fn flow_shell_state_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
+    if access.is_empty() {
+        return no_store_json(json!({
+            "enabled": false,
+            "mount_shell": false,
+            "unavailable_reason": "access denied"
+        }));
+    }
+    let Some(flow) = state.flow_host.as_ref() else {
+        return no_store_json(json!({"enabled": false, "mount_shell": false}));
+    };
+    let hosts = state.store.list();
+    let response = flow
+        .shell_state(
+            &state.auth,
+            &headers,
+            &access,
+            &hosts,
+            None,
+            now_unix(),
+        )
+        .await;
+    no_store_json(serde_json::to_value(response).unwrap_or(json!({})))
+}
+
+async fn flow_intents_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<flow_host::FlowIntentRequest>,
+) -> impl IntoResponse {
+    let access = access_for_headers(&state.auth, &headers);
+    let Some(flow) = state.flow_host.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(flow_host::FlowIntentResponse {
+                executed: false,
+                error: Some("Flow host is not configured.".to_string()),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    };
+    let hosts = state.store.list();
+    let (status, response) = flow.handle_intent(
+        &state.auth,
+        &headers,
+        &access,
+        &hosts,
+        None,
+        request,
+        now_unix(),
+    );
+    (status, Json(response)).into_response()
+}
+
+async fn flow_shell_asset(
+    AxumPath(path): AxumPath<String>,
+) -> impl IntoResponse {
+    match flow_host::flow_static_asset(path.as_str()) {
+        Some((bytes, content_type)) => (
+            [(header::CONTENT_TYPE, content_type)],
+            bytes.to_vec(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn no_store_json(value: serde_json::Value) -> impl IntoResponse {
     (no_store_headers(), Json(value))
 }
@@ -5048,6 +5129,9 @@ async fn main() {
     let alert_health = alert_notifier.health.clone();
     let access_request = AccessRequestConfig::from_env()
         .unwrap_or_else(|error| panic!("access-request startup failed: {error}"));
+    let flow_host = flow_host::FlowHostService::from_env()
+        .unwrap_or_else(|error| panic!("flow host startup failed: {error}"))
+        .map(Arc::new);
     let paimos_delivery = paimos_delivery::PaimosDeliveryAdapter::from_env(
         host_store_path.as_deref(),
         Arc::clone(&store),
@@ -5072,6 +5156,7 @@ async fn main() {
         retired_hosts,
         alert_health,
         access_request,
+        flow_host,
     };
     let _ = reconcile_saved_next_actions(&state, now_unix()).await;
     spawn_next_action_loop(state.clone());
@@ -14464,6 +14549,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             retired_hosts: Arc::new(RetiredHostStore::new(None)),
             alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
             access_request: AccessRequestConfig::default(),
+            flow_host: None,
         }
     }
 
