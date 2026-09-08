@@ -718,8 +718,11 @@ matching uid, parent directory `0700`). Each binding maps one Paimos project to 
 host names and `operator-ref` values that may use the shell.
 
 For local harnesses against loopback Paimos, set `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN=true`
-so `http://127.0.0.1` origins are accepted in the config. Production configs must use
-HTTPS origins only.
+when **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback. Cleartext HTTP is
+rejected by default and does not change the PHAROS-206 delivery adapter's production
+HTTPS-only boundary. Store Flow config and API key files under an operator-owned
+`0700` directory (for example `/var/lib/pharos/flow-host/`), not under shared
+`/run/secrets` parents that are typically root-owned `0755`.
 
 ### Server
 
@@ -731,7 +734,7 @@ HTTPS origins only.
 | `PHAROS_DB`                                                    | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly                                                                                                             |
 | `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE`                           | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files                                                        |
 | `PHAROS_FLOW_CONFIG_FILE`                                      | Optional owner-only Flow host config (`inspr.pharos.flow-host-config.v1`) enabling bounded `@inspr/flow-shell` projection and guarded Review/Start navigation                                                                                          |
-| `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN`                            | When `true` or `1`, allow `http://127.0.0.1` / `http://localhost` Paimos origins in `PHAROS_FLOW_CONFIG_FILE` for local harnesses only                                                                                                               |
+| `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN`                            | When `true` or `1`, allow cleartext loopback Paimos origins only while **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback; for local harnesses only                                                                                           |
 | `PHAROS_PROVISIONING_JOBS_DB`                                  | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset                                                                                                                                          |
 | `PHAROS_OIDC_ISSUER`                                           | OIDC discovery issuer                                                                                                                                                                                                                                  |
 | `PHAROS_OIDC_CLIENT_ID`                                        | Public OIDC client identifier                                                                                                                                                                                                                          |

@@ -8,40 +8,11 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const vendorRoot = path.join(repoRoot, "crates/pharosd/assets/vendor/flow-shell");
 const bootstrapPath = path.join(repoRoot, "crates/pharosd/assets/flow-host-bootstrap.mjs");
 
-function extractIntentIdentity(detail) {
-  const nested = detail?.detail?.identity ?? detail?.identity;
-  if (nested && typeof nested === "object") {
-    return nested;
-  }
-  return null;
-}
-
-test("bootstrap posts identity extracted from vendored intent nesting", () => {
+test("shipped bootstrap reads nested identity and unmounts on denial", () => {
   const bootstrap = readFileSync(bootstrapPath, "utf8");
   assert.match(bootstrap, /detail\?\.detail\?\.identity/);
-  const vendorStartDetail = {
-    type: "flow:start-intent",
-    detail: {
-      batchRef: "batch-test",
-      identity: {
-        status: "present",
-        principalRef: "pharos-test:prin-abc",
-        projectRef: "paimos:proj-9b2899fb59591130607952d66fcb5607",
-      },
-      executes: false,
-    },
-    emittedAt: "2023-11-14T22:13:20.000Z",
-  };
-  const identity = extractIntentIdentity(vendorStartDetail);
-  assert.equal(identity.status, "present");
-  assert.equal(identity.principalRef, "pharos-test:prin-abc");
-  const wireBody = {
-    type: vendorStartDetail.type,
-    identity,
-    detail: vendorStartDetail,
-  };
-  assert.equal(wireBody.identity.projectRef, "paimos:proj-9b2899fb59591130607952d66fcb5607");
-  assert.equal(wireBody.detail.detail.identity.status, "present");
+  assert.match(bootstrap, /unmountShellChrome/);
+  assert.match(bootstrap, /shell\.shellState\?\.identity/);
 });
 
 test("review intent omits identity and stays server-resolvable", async () => {
@@ -59,10 +30,9 @@ test("review intent omits identity and stays server-resolvable", async () => {
   };
   const intent = createReviewBatchIntent(shellState);
   assert.equal(intent.type, "flow:review-batch");
-  assert.equal(extractIntentIdentity(intent), null);
   const wireBody = {
     type: intent.type,
-    identity: extractIntentIdentity(intent),
+    identity: intent.detail?.identity ?? intent.identity ?? null,
     detail: intent,
   };
   assert.equal(wireBody.identity, null);
@@ -133,5 +103,5 @@ test("vendored start intent nests identity under detail.detail", async () => {
   assert.equal(intent.error, undefined);
   assert.equal(intent.type, "flow:start-intent");
   assert.equal(intent.detail.identity.status, "present");
-  assert.equal(extractIntentIdentity(intent).status, "present");
+  assert.equal(intent.detail.action, "build");
 });

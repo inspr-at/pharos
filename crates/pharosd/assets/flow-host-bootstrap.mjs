@@ -7,6 +7,20 @@ if (shell) {
   let generation = 0;
   let refreshTimer = null;
 
+  function unmountShellChrome() {
+    shell.hidden = true;
+    shell.style.display = 'none';
+    if (refreshTimer !== null) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
+  function mountShellChrome() {
+    shell.hidden = false;
+    shell.style.display = '';
+  }
+
   function clearShell() {
     shell.shellState = {
       evaluatedAt: null,
@@ -77,6 +91,7 @@ if (shell) {
         return;
       }
       if (!response.ok) {
+        unmountShellChrome();
         clearShell();
         return;
       }
@@ -85,20 +100,25 @@ if (shell) {
         return;
       }
       if (!payload.enabled || !payload.mountShell) {
+        unmountShellChrome();
         clearShell();
         return;
       }
       if (payload.unavailableReason) {
+        unmountShellChrome();
         clearShell();
         return;
       }
+      mountShellChrome();
       if (payload.shellState) {
         shell.shellState = payload.shellState;
       } else {
+        unmountShellChrome();
         clearShell();
       }
     } catch {
       if (generation === next) {
+        unmountShellChrome();
         clearShell();
       }
     }

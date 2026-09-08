@@ -247,6 +247,15 @@ impl AccessGrant {
     pub fn is_empty(&self) -> bool {
         !self.all_hosts && self.hosts.is_empty() && !self.agora
     }
+
+    pub(crate) fn revision_material(&self) -> String {
+        if self.all_hosts {
+            format!("all:agora={}", self.agora)
+        } else {
+            let hosts: Vec<&str> = self.hosts.iter().map(String::as_str).collect();
+            format!("hosts={}:agora={}", hosts.join(","), self.agora)
+        }
+    }
 }
 
 struct LoginIdentity {

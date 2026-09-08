@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -229,7 +230,7 @@ impl FlowHostService {
     ) -> FlowShellResponse {
         match self.resolve_context(auth, headers, access, selected_host) {
             Ok(context) => {
-                self.projection_response(context, hosts, selected_host, now)
+                self.projection_response(context, access, hosts, selected_host, now)
                     .await
             }
             Err(reason) => FlowShellResponse {
@@ -302,6 +303,7 @@ impl FlowHostService {
                 .unwrap_or("");
             if let Some(issues) = self.validate_submitted_identity(
                 &context,
+                access,
                 submitted_identity(&request),
                 source_revision,
                 now,
@@ -323,9 +325,20 @@ impl FlowHostService {
             }
         }
         let review_url = self.review_url(context.binding.project_id);
+        let confirmed_action = confirmed_start_action(&request)
+            .or_else(|| {
+                projection.as_ref().and_then(|entry| {
+                    entry
+                        .shell_state
+                        .get("selectedAction")
+                        .or_else(|| entry.shell_state.get("selected_action"))
+                        .and_then(Value::as_str)
+                })
+            })
+            .unwrap_or("build");
         let start_allowed = projection
             .as_ref()
-            .map(|entry| start_permitted(&entry.shell_state, now))
+            .map(|entry| start_permitted(&entry.shell_state, confirmed_action, now))
             .unwrap_or(false);
         match intent_type {
             "flow:start-intent" if !start_allowed => (
@@ -402,14 +415,19 @@ impl FlowHostService {
     async fn projection_response(
         &self,
         context: ResolvedContext,
+        access: &AccessGrant,
         hosts: &[Host],
         selected_host: Option<&str>,
         now: i64,
     ) -> FlowShellResponse {
         match self.fetch_projection(&context, now).await {
             Ok(projection) => {
-                let context_revision =
-                    context_revision_for(&self.config, &context, &projection.source_revision);
+                let context_revision = context_revision_for(
+                    &self.config,
+                    &context,
+                    access,
+                    &projection.source_revision,
+                );
                 let identity =
                     issue_identity(&self.config, &context, &context_revision, &projection, now);
                 let shell_state = merge_shell_state(
@@ -593,6 +611,7 @@ impl FlowHostService {
     fn validate_submitted_identity(
         &self,
         context: &ResolvedContext,
+        access: &AccessGrant,
         submitted: Option<Value>,
         source_revision: &str,
         now: i64,
@@ -609,7 +628,7 @@ impl FlowHostService {
         if status != "present" {
             return Some(vec!["Host identity context was rejected.".to_string()]);
         }
-        let context_revision = context_revision_for(&self.config, context, source_revision);
+        let context_revision = context_revision_for(&self.config, context, access, source_revision);
         let current = issue_identity(
             &self.config,
             context,
@@ -743,7 +762,8 @@ impl FlowHostConfig {
         {
             return Err("invalid flow host configuration".to_string());
         }
-        let paimos_origin = parse_origin(&document.paimos_origin)
+        let loopback_dev_mode = loopback_dev_mode_enabled()?;
+        let paimos_origin = parse_origin(&document.paimos_origin, loopback_dev_mode)
             .map_err(|_| "invalid flow host configuration".to_string())?;
         if !document.api_key_file.is_absolute() {
             return Err("invalid flow host configuration".to_string());
@@ -970,8 +990,8 @@ fn local_health_status(host: &Host, now: i64) -> (String, String) {
     let label = format!("Pharos host {}", host.name);
     let status = match liveness(host.last_seen, host.heartbeat_interval_secs, now) {
         Liveness::Live => "available",
-        Liveness::Stale => "degraded",
-        Liveness::Down | Liveness::AwaitingFirstHeartbeat => "unknown",
+        Liveness::Stale | Liveness::Down => "degraded",
+        Liveness::AwaitingFirstHeartbeat => "unknown",
     };
     (status.to_string(), label)
 }
@@ -1067,9 +1087,20 @@ fn submitted_identity(request: &FlowIntentRequest) -> Option<Value> {
     })
 }
 
+fn confirmed_start_action(request: &FlowIntentRequest) -> Option<&str> {
+    request.detail.as_ref().and_then(|detail| {
+        detail
+            .get("detail")
+            .and_then(|nested| nested.get("action"))
+            .or_else(|| detail.get("action"))
+            .and_then(Value::as_str)
+    })
+}
+
 fn context_revision_for(
     config: &FlowHostConfig,
     context: &ResolvedContext,
+    access: &AccessGrant,
     source_revision: &str,
 ) -> String {
     pharos_opaque_ref(
@@ -1079,6 +1110,7 @@ fn context_revision_for(
             &config.config_digest,
             &context.user.operator_ref,
             &context.user.managed_human_session_ref,
+            &access.revision_material(),
             &context.binding.project_id.to_string(),
             &context.binding.expected_project_ref,
             source_revision,
@@ -1112,7 +1144,7 @@ fn opaque_ref(host_id: &str, kind: &str, parts: &[String]) -> String {
     format!("{host_id}:{kind}-{}", hex_bytes(&digest[..16]))
 }
 
-fn start_permitted(shell_state: &Value, now: i64) -> bool {
+fn start_permitted(shell_state: &Value, action: &str, now: i64) -> bool {
     let delivery = shell_state.get("delivery").and_then(Value::as_object);
     let status = delivery
         .and_then(|value| value.get("status"))
@@ -1147,11 +1179,6 @@ fn start_permitted(shell_state: &Value, now: i64) -> bool {
     {
         return false;
     }
-    let action = shell_state
-        .get("selectedAction")
-        .or_else(|| shell_state.get("selected_action"))
-        .and_then(Value::as_str)
-        .unwrap_or("build");
     if !matches!(
         action,
         "build" | "deploy" | "verify" | "janus_prepare" | "janus_apply"
@@ -1174,6 +1201,9 @@ fn start_permitted(shell_state: &Value, now: i64) -> bool {
     if !required_gate_pass(requirements, now) {
         return false;
     }
+    let pharos = prerequisites
+        .and_then(|value| value.get("pharosTarget"))
+        .or_else(|| prerequisites.and_then(|value| value.get("pharos_target")));
     if matches!(action, "deploy" | "verify") {
         let artifact = prerequisites
             .and_then(|value| value.get("deployArtifact"))
@@ -1181,10 +1211,21 @@ fn start_permitted(shell_state: &Value, now: i64) -> bool {
         if !required_gate_pass(artifact, now) {
             return false;
         }
-        let pharos = prerequisites
-            .and_then(|value| value.get("pharosTarget"))
-            .or_else(|| prerequisites.and_then(|value| value.get("pharos_target")));
         if !required_target_pass(pharos, &["ready", "live"], now) {
+            return false;
+        }
+    } else if action == "janus_prepare" {
+        if !required_target_pass(pharos, &["preliminary", "ready", "live"], now) {
+            return false;
+        }
+    } else if action == "janus_apply" {
+        if !required_target_pass(pharos, &["ready", "live"], now) {
+            return false;
+        }
+        let janus = prerequisites
+            .and_then(|value| value.get("janusGate"))
+            .or_else(|| prerequisites.and_then(|value| value.get("janus_gate")));
+        if !required_gate_pass(janus, now) {
             return false;
         }
     }
@@ -1351,7 +1392,7 @@ fn valid_host_id(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
-fn parse_origin(value: &str) -> Result<Url, FlowError> {
+fn parse_origin(value: &str, loopback_dev_mode: bool) -> Result<Url, FlowError> {
     let url = Url::parse(value).map_err(|_| FlowError::Configuration)?;
     if url.host_str().is_none()
         || !url.username().is_empty()
@@ -1364,13 +1405,31 @@ fn parse_origin(value: &str) -> Result<Url, FlowError> {
     }
     match url.scheme() {
         "https" => Ok(url),
-        "http" if loopback_origin_allowed(&url) => Ok(url),
+        "http" if loopback_dev_mode && loopback_origin_flag_enabled() && is_loopback_url(&url) => {
+            Ok(url)
+        }
         _ => Err(FlowError::Configuration),
     }
 }
 
-fn loopback_origin_allowed(url: &Url) -> bool {
-    matches!(env_bool(FLOW_LOOPBACK_ORIGIN_ENV), Ok(Some(true))) && is_loopback_url(url)
+fn loopback_dev_mode_enabled() -> Result<bool, String> {
+    let bind = socket_addr_from_env("PHAROS_ADDR", "127.0.0.1:8080")?;
+    let public = env_nonempty("PHAROS_PUBLIC_ADDR")
+        .map(|value| value.parse::<SocketAddr>())
+        .transpose()
+        .map_err(|err| format!("PHAROS_PUBLIC_ADDR must be a numeric socket address: {err}"))?
+        .unwrap_or(bind);
+    Ok(bind.ip().is_loopback() && public.ip().is_loopback())
+}
+
+fn socket_addr_from_env(name: &str, default: &str) -> Result<SocketAddr, String> {
+    let raw = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    raw.parse::<SocketAddr>()
+        .map_err(|err| format!("{name} must be a numeric socket address: {err}"))
+}
+
+fn loopback_origin_flag_enabled() -> bool {
+    matches!(env_bool(FLOW_LOOPBACK_ORIGIN_ENV), Ok(Some(true)))
 }
 
 fn is_loopback_url(url: &Url) -> bool {
@@ -1417,15 +1476,20 @@ fn read_config_file(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn read_api_key(path: &Path) -> Result<String, FlowError> {
-    let bytes =
+    let mut bytes =
         read_bounded_private_file(path, MAX_API_KEY_BYTES).map_err(|_| FlowError::Credential)?;
     if bytes.len() < 32 || bytes.len() as u64 > MAX_API_KEY_BYTES {
+        bytes.fill(0);
         return Err(FlowError::Credential);
     }
     if !bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)) {
+        bytes.fill(0);
         return Err(FlowError::Credential);
     }
-    String::from_utf8(bytes).map_err(|_| FlowError::Credential)
+    String::from_utf8(bytes).map_err(|err| {
+        err.into_bytes().fill(0);
+        FlowError::Credential
+    })
 }
 
 fn read_bounded_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, FlowError> {
@@ -1479,7 +1543,7 @@ fn validate_parent_directory(parent: &Path) -> Result<(), FlowError> {
     if !metadata.is_dir() {
         return Err(FlowError::Credential);
     }
-    let expected_uid = unsafe { libc::getuid() };
+    let expected_uid = unsafe { libc::geteuid() };
     if metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
         return Err(FlowError::Credential);
     }
@@ -1500,7 +1564,7 @@ fn validate_private_file_metadata(
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(FlowError::Credential);
     }
-    let expected_uid = unsafe { libc::getuid() };
+    let expected_uid = unsafe { libc::geteuid() };
     if metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
         return Err(FlowError::Credential);
     }
@@ -1581,6 +1645,37 @@ mod tests {
             }],
             config_digest: "sha256:test".to_string(),
         }
+    }
+
+    fn private_fixture_dir(label: &str) -> (PathBuf, PathBuf) {
+        let parent = std::env::temp_dir().join(format!(
+            "pharos-flow-fixture-{}-{}",
+            label,
+            std::process::id()
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let _ = std::fs::remove_dir_all(&parent);
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&parent)
+                .expect("fixture parent");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_dir_all(&parent);
+            std::fs::create_dir_all(&parent).expect("fixture parent");
+        }
+        let key = parent.join("api.key");
+        write_private_key(&key, b"01234567890123456789012345678901");
+        (parent, key)
+    }
+
+    fn cleanup_fixture_dir(parent: &Path) {
+        let _ = std::fs::remove_file(parent.join("api.key"));
+        let _ = std::fs::remove_dir(parent);
     }
 
     fn sample_gate(now: i64) -> Value {
@@ -1753,8 +1848,7 @@ mod tests {
     #[tokio::test]
     async fn configured_projection_and_intent_navigation() {
         let (origin, server) = serve_paimos(sample_state()).await;
-        let key_path = std::env::temp_dir().join(format!("pharos-flow-key-{}", std::process::id()));
-        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let (fixture_dir, key_path) = private_fixture_dir("projection");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1822,7 +1916,7 @@ mod tests {
             .unwrap()
             .contains("/projects/17?tab=overview#baseline-batch"));
         server.abort();
-        std::fs::remove_file(key_path).ok();
+        cleanup_fixture_dir(&fixture_dir);
     }
 
     #[test]
@@ -1841,9 +1935,7 @@ mod tests {
         let mut state = sample_state();
         state["identityContext"]["project_ref"] = json!(PAIMOS_PROJECT_REF_99);
         let (origin, server) = serve_paimos(state).await;
-        let key_path =
-            std::env::temp_dir().join(format!("pharos-flow-key-wrong-{}", std::process::id()));
-        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let (fixture_dir, key_path) = private_fixture_dir("wrong-ref");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1876,15 +1968,13 @@ mod tests {
             .unwrap()
             .contains("project binding mismatch"));
         server.abort();
-        std::fs::remove_file(key_path).ok();
+        cleanup_fixture_dir(&fixture_dir);
     }
 
     #[tokio::test]
     async fn rejects_unauthorized_operator_binding() {
         let (origin, server) = serve_paimos(sample_state()).await;
-        let key_path =
-            std::env::temp_dir().join(format!("pharos-flow-key-operator-{}", std::process::id()));
-        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let (fixture_dir, key_path) = private_fixture_dir("operator");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1917,15 +2007,13 @@ mod tests {
             .unwrap()
             .contains("No configured Flow binding"));
         server.abort();
-        std::fs::remove_file(key_path).ok();
+        cleanup_fixture_dir(&fixture_dir);
     }
 
     #[tokio::test]
     async fn rejects_expired_identity_on_intent() {
         let (origin, server) = serve_paimos(sample_state()).await;
-        let key_path =
-            std::env::temp_dir().join(format!("pharos-flow-key-expired-{}", std::process::id()));
-        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let (fixture_dir, key_path) = private_fixture_dir("expired");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1979,7 +2067,7 @@ mod tests {
         assert!(!intent.executed);
         assert!(intent.error.unwrap().contains("expired"));
         server.abort();
-        std::fs::remove_file(key_path).ok();
+        cleanup_fixture_dir(&fixture_dir);
     }
 
     #[tokio::test]
@@ -1987,9 +2075,7 @@ mod tests {
         let mut state = sample_state();
         state["prerequisites"] = json!({});
         let (origin, server) = serve_paimos(state).await;
-        let key_path =
-            std::env::temp_dir().join(format!("pharos-flow-key-start-{}", std::process::id()));
-        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let (fixture_dir, key_path) = private_fixture_dir("start-blocked");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -2044,7 +2130,7 @@ mod tests {
         assert!(intent.location.is_none());
         assert!(intent.notice.unwrap().contains("Start stays blocked"));
         server.abort();
-        std::fs::remove_file(key_path).ok();
+        cleanup_fixture_dir(&fixture_dir);
     }
 
     #[tokio::test]
@@ -2052,11 +2138,7 @@ mod tests {
         let shell_now = 1_700_000_000_i64;
         let intent_now = shell_now + 60;
         let (origin, server) = serve_paimos(sample_state()).await;
-        let key_path = std::env::temp_dir().join(format!(
-            "pharos-flow-key-time-forward-{}",
-            std::process::id()
-        ));
-        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let (fixture_dir, key_path) = private_fixture_dir("time-forward");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -2115,7 +2197,111 @@ mod tests {
         );
         assert!(!intent.executed);
         server.abort();
-        std::fs::remove_file(key_path).ok();
+        cleanup_fixture_dir(&fixture_dir);
+    }
+
+    #[test]
+    fn rejects_api_key_in_world_writable_parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let parent = std::env::temp_dir().join(format!(
+                "pharos-flow-writable-parent-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&parent);
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o1777)
+                .create(&parent)
+                .expect("writable parent");
+            let key_path = parent.join("api.key");
+            write_private_key(&key_path, b"01234567890123456789012345678901");
+            assert!(read_api_key(&key_path).is_err());
+            let _ = std::fs::remove_file(&key_path);
+            let _ = std::fs::remove_dir(&parent);
+        }
+    }
+
+    #[test]
+    fn loopback_paimos_origin_requires_listener_and_flag() {
+        assert!(parse_origin("https://paimos.example", false).is_ok());
+        std::env::set_var("PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN", "true");
+        assert!(parse_origin("http://127.0.0.1:9", true).is_ok());
+        std::env::remove_var("PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN");
+        assert!(parse_origin("http://127.0.0.1:9", true).is_err());
+        assert!(parse_origin("http://127.0.0.1:9", false).is_err());
+        assert!(parse_origin("http://evil.example", true).is_err());
+    }
+
+    #[test]
+    fn start_permitted_uses_confirmed_action_from_detail() {
+        let now = 1_700_000_000_i64;
+        let shell = json!({
+            "evaluatedAt": iso_timestamp(now),
+            "delivery": {
+                "status": "draft",
+                "batchRef": "batch-test",
+                "baselineRef": "baseline-test",
+                "baselineDigest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            },
+            "prerequisites": {
+                "requirementsBaseline": sample_gate(now),
+                "deployArtifact": sample_gate(now),
+                "pharosTarget": {
+                    "status": "pass",
+                    "evidenceRef": "paimos:ev-target",
+                    "observedAt": iso_timestamp(now),
+                    "freshUntil": iso_timestamp(now + 600),
+                    "readiness": "ready"
+                }
+            }
+        });
+        let minimal = json!({
+            "evaluatedAt": iso_timestamp(now),
+            "delivery": shell["delivery"].clone(),
+            "prerequisites": {
+                "requirementsBaseline": sample_gate(now)
+            }
+        });
+        assert!(start_permitted(&minimal, "build", now));
+        assert!(!start_permitted(&minimal, "deploy", now));
+        assert!(start_permitted(&shell, "deploy", now));
+    }
+
+    #[test]
+    fn janus_apply_requires_janus_gate() {
+        let now = 1_700_000_000_i64;
+        let shell = json!({
+            "evaluatedAt": iso_timestamp(now),
+            "delivery": {
+                "status": "draft",
+                "batchRef": "batch-test",
+                "baselineRef": "baseline-test",
+                "baselineDigest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            },
+            "prerequisites": {
+                "requirementsBaseline": sample_gate(now),
+                "pharosTarget": {
+                    "status": "pass",
+                    "evidenceRef": "paimos:ev-target",
+                    "observedAt": iso_timestamp(now),
+                    "freshUntil": iso_timestamp(now + 600),
+                    "readiness": "live"
+                }
+            }
+        });
+        assert!(!start_permitted(&shell, "janus_apply", now));
+        let gated = json!({
+            "evaluatedAt": iso_timestamp(now),
+            "delivery": shell["delivery"].clone(),
+            "prerequisites": {
+                "requirementsBaseline": sample_gate(now),
+                "pharosTarget": shell["prerequisites"]["pharosTarget"].clone(),
+                "janusGate": sample_gate(now)
+            }
+        });
+        assert!(start_permitted(&gated, "janus_apply", now));
     }
 
     #[test]
