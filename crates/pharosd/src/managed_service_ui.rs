@@ -216,21 +216,22 @@ pub(super) async fn services_page(
         logout_enabled: state.auth.is_some(),
     };
     if !access.can_agora() {
-        return no_store_html(render_no_access_page(
-            "Services",
-            "Managed service secrets",
-            shell,
-            "services",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page("Services", "Managed service secrets", shell, "services"),
+        );
     }
-    no_store_html(render_services_page_with_access(
-        state.manifests.managed_service_manifests(),
-        state.manifests.managed_service_load_errors(),
-        shell,
-        &state.managed_service_operations,
-        now_unix(),
-        access.can_manage_fleet(),
-    ))
+    no_store_html(
+        &state,
+        render_services_page_with_access(
+            state.manifests.managed_service_manifests(),
+            state.manifests.managed_service_load_errors(),
+            shell,
+            &state.managed_service_operations,
+            now_unix(),
+            access.can_manage_fleet(),
+        ),
+    )
 }
 
 pub(super) async fn service_detail_page(
@@ -245,12 +246,15 @@ pub(super) async fn service_detail_page(
         logout_enabled: state.auth.is_some(),
     };
     if !access.can_agora() {
-        return no_store_html(render_no_access_page(
-            "Service secrets",
-            "Managed service secrets",
-            shell,
-            "services",
-        ))
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Service secrets",
+                "Managed service secrets",
+                shell,
+                "services",
+            ),
+        )
         .into_response();
     }
     if !state.manifests.managed_service_load_errors().is_empty() {
@@ -286,15 +290,18 @@ pub(super) async fn service_detail_page(
         )
             .into_response();
     };
-    no_store_html(render_service_detail_with_access(
-        manifest,
-        service,
-        shell,
-        state.managed_setup_intents.is_some(),
-        &state.managed_service_operations,
-        now_unix(),
-        access.can_manage_fleet(),
-    ))
+    no_store_html(
+        &state,
+        render_service_detail_with_access(
+            manifest,
+            service,
+            shell,
+            state.managed_setup_intents.is_some(),
+            &state.managed_service_operations,
+            now_unix(),
+            access.can_manage_fleet(),
+        ),
+    )
     .into_response()
 }
 

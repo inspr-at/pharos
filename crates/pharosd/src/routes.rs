@@ -253,11 +253,25 @@ fn machine_and_public_routes() -> Router<AppState> {
 }
 
 pub(super) fn build_router(state: AppState) -> Router {
-    human_routes()
+    let mut state = state;
+    state.auth.public_base_path = state.public_base_path.clone();
+    let public_base_path = state.public_base_path.clone();
+    let inner = human_routes()
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         .merge(machine_and_public_routes())
         .with_state(state)
-        .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(security_headers));
+    if public_base_path.is_root() {
+        inner
+    } else {
+        Router::new()
+            .nest(public_base_path.as_str(), inner)
+            .fallback(outside_public_mount)
+    }
+}
+
+async fn outside_public_mount() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 #[cfg(test)]

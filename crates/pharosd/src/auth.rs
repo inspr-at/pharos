@@ -43,6 +43,7 @@ use crate::janus_projections::{
     optional_capability_root_from_env, JanusCapability, MachineOperatorPrincipal,
     MachineOperatorTokenStore, MACHINE_OPERATOR_HASH_DIR_ENV,
 };
+use pharos_core::PublicBasePath;
 
 const SESSION_COOKIE: &str = "__Host-pharos_session";
 const FLOW_COOKIE: &str = "__Host-pharos_flow";
@@ -291,6 +292,7 @@ pub struct Auth {
 pub struct AuthState {
     human: Option<Arc<Auth>>,
     machine: Option<MachineOperatorTokenStore>,
+    pub(crate) public_base_path: pharos_core::PublicBasePath,
     #[cfg(test)]
     fixed_access: Option<AccessGrant>,
     #[cfg(test)]
@@ -317,7 +319,11 @@ struct OidcAuthConfig {
 }
 
 impl AuthConfig {
-    pub fn from_env(listener_is_loopback: bool) -> Result<Self, String> {
+    pub fn from_env(
+        listener_is_loopback: bool,
+        public_base_path: &pharos_core::PublicBasePath,
+        public_origin: Option<&pharos_core::PublicOrigin>,
+    ) -> Result<Self, String> {
         let issuer = env_nonempty("PHAROS_OIDC_ISSUER");
         let client_id = env_nonempty("PHAROS_OIDC_CLIENT_ID");
         let redirect = env_nonempty("PHAROS_OIDC_REDIRECT_URI");
@@ -332,6 +338,13 @@ impl AuthConfig {
             operator_policy,
             access_policy_file_from_env(),
         )?;
+        if let AuthConfigMode::Oidc(oidc) = &config.mode {
+            crate::public_mount::validate_oidc_redirect_uri(
+                oidc.redirect.as_str(),
+                public_base_path,
+                public_origin,
+            )?;
+        }
         config.machine_root = optional_capability_root_from_env(
             JanusCapability::PharosMachineOperator,
             MACHINE_OPERATOR_HASH_DIR_ENV,
@@ -430,7 +443,10 @@ impl Auth {
     /// Build from a validated startup configuration and discover provider
     /// metadata. Configuration and discovery errors are returned to the caller
     /// so startup can fail visibly.
-    pub(crate) async fn from_config(config: AuthConfig) -> Result<AuthState, String> {
+    pub(crate) async fn from_config(
+        config: AuthConfig,
+        public_base_path: pharos_core::PublicBasePath,
+    ) -> Result<AuthState, String> {
         let machine = config
             .machine_root
             .map(MachineOperatorTokenStore::load)
@@ -443,6 +459,7 @@ impl Auth {
             return Ok(AuthState {
                 human: None,
                 machine,
+                public_base_path,
                 #[cfg(test)]
                 fixed_user: None,
                 #[cfg(test)]
@@ -497,6 +514,7 @@ impl Auth {
                 session_rate: Mutex::new(RateWindow::default()),
             })),
             machine,
+            public_base_path,
             #[cfg(test)]
             fixed_user: None,
             #[cfg(test)]
@@ -647,20 +665,17 @@ impl AuthState {
     #[cfg(test)]
     pub(crate) fn for_test_access(access: AccessGrant) -> Self {
         Self {
-            human: None,
-            machine: None,
             fixed_access: Some(access),
-            fixed_user: None,
+            ..Self::default()
         }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test_human(access: AccessGrant, user: AuthUser) -> Self {
         Self {
-            human: None,
-            machine: None,
             fixed_access: Some(access),
             fixed_user: Some(user),
+            ..Self::default()
         }
     }
 
@@ -1144,22 +1159,23 @@ fn new_flow_cookie(return_to: &str) -> String {
     format!("{secret}.{encoded_return}")
 }
 
-fn return_to_from_flow_cookie(value: Option<&str>) -> String {
+fn return_to_from_flow_cookie(value: Option<&str>, public_base_path: &PublicBasePath) -> String {
     let Some((_, encoded_return)) = value.and_then(|value| value.split_once('.')) else {
-        return "/".to_string();
+        return public_base_path.home().to_string();
     };
     let Ok(decoded) = URL_SAFE_NO_PAD.decode(encoded_return) else {
-        return "/".to_string();
+        return public_base_path.home().to_string();
     };
     let Ok(return_to) = String::from_utf8(decoded) else {
-        return "/".to_string();
+        return public_base_path.home().to_string();
     };
-    validated_return_to(Some(&return_to))
+    validated_return_to(public_base_path, Some(&return_to))
 }
 
-fn validated_return_to(candidate: Option<&str>) -> String {
+fn validated_return_to(public_base_path: &PublicBasePath, candidate: Option<&str>) -> String {
+    let home = public_base_path.home().to_string();
     let Some(candidate) = candidate else {
-        return "/".to_string();
+        return home;
     };
     if candidate.is_empty()
         || candidate.len() > MAX_RETURN_TO_BYTES
@@ -1169,28 +1185,46 @@ fn validated_return_to(candidate: Option<&str>) -> String {
         || candidate.contains('#')
         || candidate.chars().any(char::is_control)
     {
-        return "/".to_string();
+        return home;
     }
     let Ok(uri) = candidate.parse::<Uri>() else {
-        return "/".to_string();
+        return home;
     };
     if uri.scheme().is_some() || uri.authority().is_some() {
-        return "/".to_string();
+        return home;
     }
     let path = uri.path();
-    if path == "/auth" || path.starts_with("/auth/") {
-        return "/".to_string();
+    let local = public_base_path
+        .strip(path)
+        .unwrap_or_else(|| path.to_string());
+    if local == "/auth" || local.starts_with("/auth/") {
+        return home;
     }
-    candidate.to_string()
+    let Ok(joined) = public_base_path.join(&local) else {
+        return home;
+    };
+    match uri.query() {
+        Some(query)
+            if query.split('&').any(|part| {
+                let value = part.split_once('=').map(|(_, value)| value).unwrap_or("");
+                value.contains("://") || value.starts_with("//")
+            }) =>
+        {
+            home
+        }
+        Some(query) => format!("{joined}?{query}"),
+        None => joined,
+    }
 }
 
-fn login_location(return_to: &str) -> String {
-    if return_to == "/" {
-        return "/auth/login".to_string();
+fn login_location(public_base_path: &PublicBasePath, return_to: &str) -> String {
+    let login = public_base_path.href("/auth/login");
+    if return_to == public_base_path.home() {
+        return login;
     }
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query.append_pair("return_to", return_to);
-    format!("/auth/login?{}", query.finish())
+    format!("{login}?{}", query.finish())
 }
 
 fn classify_transport_signals(
@@ -1297,13 +1331,20 @@ fn classify_token_exchange_error(
     }
 }
 
-fn login_recovery_response(recovery: LoginRecovery, return_to: &str) -> Response {
-    let return_to = validated_return_to(Some(return_to));
-    let login = login_location(&return_to);
-    let html = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign-in recovery · Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>:root{{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#17658f;--sun:#d69b31}}*{{box-sizing:border-box}}body{{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}}main{{width:min(440px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}}.mark{{display:grid;place-items:center;width:44px;height:44px;margin:0 auto 16px;border:1px solid #f0d49f;border-radius:50%;background:#fff9ef;color:#b87808;font-size:22px}}h1{{margin:0 0 8px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}}p{{margin:0 0 22px;color:var(--muted)}}a{{display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:0 17px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}}a:focus-visible{{outline:3px solid rgba(23,101,143,.28);outline-offset:3px}}</style></head><body><main data-auth-recovery><span class="mark" aria-hidden="true">↻</span><h1>Start sign-in again</h1><p>{}</p><a href="{}">Try signing in again</a></main></body></html>"#,
-        recovery.message(),
-        login,
+fn login_recovery_response(
+    recovery: LoginRecovery,
+    public_base_path: &PublicBasePath,
+    return_to: &str,
+) -> Response {
+    let return_to = validated_return_to(public_base_path, Some(return_to));
+    let login = login_location(public_base_path, &return_to);
+    let html = crate::public_mount::localize_document(
+        public_base_path,
+        &format!(
+            r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign-in recovery · Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>:root{{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#17658f;--sun:#d69b31}}*{{box-sizing:border-box}}body{{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}}main{{width:min(440px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.88);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}}.mark{{display:grid;place-items:center;width:44px;height:44px;margin:0 auto 16px;border:1px solid #f0d49f;border-radius:50%;background:#fff9ef;color:#b87808;font-size:22px}}h1{{margin:0 0 8px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}}p{{margin:0 0 22px;color:var(--muted)}}a{{display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:0 17px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}}a:focus-visible{{outline:3px solid rgba(23,101,143,.28);outline-offset:3px}}</style></head><body><main data-auth-recovery><span class="mark" aria-hidden="true">↻</span><h1>Start sign-in again</h1><p>{}</p><a href="{}">Try signing in again</a></main></body></html>"#,
+            recovery.message(),
+            login,
+        ),
     );
     let mut headers = HeaderMap::new();
     headers.append(
@@ -1342,11 +1383,14 @@ pub async fn guard(State(auth): State<AuthState>, req: Request, next: Next) -> R
         Some(human) if human.is_authed(req.headers()) => next.run(req).await,
         Some(_) => {
             let return_to = if matches!(*req.method(), Method::GET | Method::HEAD) {
-                validated_return_to(req.uri().path_and_query().map(|value| value.as_str()))
+                validated_return_to(
+                    &auth.public_base_path,
+                    req.uri().path_and_query().map(|value| value.as_str()),
+                )
             } else {
-                "/".to_string()
+                auth.public_base_path.home().to_string()
             };
-            Redirect::to(&login_location(&return_to)).into_response()
+            Redirect::to(&login_location(&auth.public_base_path, &return_to)).into_response()
         }
     }
 }
@@ -1358,7 +1402,7 @@ pub struct LoginParams {
 
 /// `GET /auth/login` — start the PKCE flow, redirect to the IdP.
 pub async fn login(State(auth): State<AuthState>, Query(params): Query<LoginParams>) -> Response {
-    let return_to = validated_return_to(params.return_to.as_deref());
+    let return_to = validated_return_to(&auth.public_base_path, params.return_to.as_deref());
     let Some(auth) = auth.human().cloned() else {
         return Redirect::to(&return_to).into_response();
     };
@@ -1448,17 +1492,22 @@ pub async fn callback(
     headers: HeaderMap,
     Query(p): Query<CallbackParams>,
 ) -> Response {
+    let public_base_path = auth.public_base_path.clone();
     let Some(auth) = auth.human().cloned() else {
-        return Redirect::to("/").into_response();
+        return Redirect::to(public_base_path.home()).into_response();
     };
     let flow_cookie = cookie(&headers, FLOW_COOKIE);
-    let cookie_return_to = return_to_from_flow_cookie(flow_cookie.as_deref());
+    let cookie_return_to = return_to_from_flow_cookie(flow_cookie.as_deref(), &public_base_path);
     let Some(state) = p.state else {
         tracing::info!(
             category = "missing_state",
             "OIDC callback requires a fresh login"
         );
-        return login_recovery_response(LoginRecovery::FlowUnavailable, &cookie_return_to);
+        return login_recovery_response(
+            LoginRecovery::FlowUnavailable,
+            &public_base_path,
+            &cookie_return_to,
+        );
     };
     let flow_cookie_hash = flow_cookie.as_deref().map(secret_hash);
     let pending = match auth.take_pending(&state, flow_cookie_hash.as_ref(), now()) {
@@ -1468,21 +1517,33 @@ pub async fn callback(
                 category = "unknown_or_replayed_state",
                 "OIDC callback requires a fresh login"
             );
-            return login_recovery_response(LoginRecovery::FlowUnavailable, &cookie_return_to);
+            return login_recovery_response(
+                LoginRecovery::FlowUnavailable,
+                &public_base_path,
+                &cookie_return_to,
+            );
         }
         PendingFlowOutcome::Expired(return_to) => {
             tracing::info!(
                 category = "expired_state",
                 "OIDC callback requires a fresh login"
             );
-            return login_recovery_response(LoginRecovery::FlowUnavailable, &return_to);
+            return login_recovery_response(
+                LoginRecovery::FlowUnavailable,
+                &public_base_path,
+                &return_to,
+            );
         }
         PendingFlowOutcome::BrowserMismatch(return_to) => {
             tracing::info!(
                 category = "superseded_or_wrong_browser",
                 "OIDC callback requires a fresh login"
             );
-            return login_recovery_response(LoginRecovery::FlowUnavailable, &return_to);
+            return login_recovery_response(
+                LoginRecovery::FlowUnavailable,
+                &public_base_path,
+                &return_to,
+            );
         }
     };
     let return_to = pending.return_to.clone();
@@ -1491,14 +1552,22 @@ pub async fn callback(
             category = "authorization_provider_rejection",
             "OIDC provider rejected the authorization request"
         );
-        return login_recovery_response(LoginRecovery::ProviderRejected, &return_to);
+        return login_recovery_response(
+            LoginRecovery::ProviderRejected,
+            &public_base_path,
+            &return_to,
+        );
     }
     let Some(code) = p.code else {
         tracing::warn!(
             category = "authorization_response_malformed",
             "OIDC provider response omitted the authorization code"
         );
-        return login_recovery_response(LoginRecovery::MalformedProviderResponse, &return_to);
+        return login_recovery_response(
+            LoginRecovery::MalformedProviderResponse,
+            &public_base_path,
+            &return_to,
+        );
     };
 
     let client = auth.client();
@@ -1509,7 +1578,11 @@ pub async fn callback(
                 category = "token_endpoint_unavailable",
                 "OIDC token exchange could not be started"
             );
-            return login_recovery_response(LoginRecovery::ProviderUnavailable, &return_to);
+            return login_recovery_response(
+                LoginRecovery::ProviderUnavailable,
+                &public_base_path,
+                &return_to,
+            );
         }
     };
     let token = match token_request
@@ -1525,7 +1598,7 @@ pub async fn callback(
                 source,
                 "OIDC token exchange failed safely"
             );
-            return login_recovery_response(recovery, &return_to);
+            return login_recovery_response(recovery, &public_base_path, &return_to);
         }
     };
     let Some(id_token) = token.id_token() else {
@@ -1533,7 +1606,11 @@ pub async fn callback(
             category = "token_response_missing_id_token",
             "OIDC token response was malformed"
         );
-        return login_recovery_response(LoginRecovery::MalformedProviderResponse, &return_to);
+        return login_recovery_response(
+            LoginRecovery::MalformedProviderResponse,
+            &public_base_path,
+            &return_to,
+        );
     };
     let mut identity = match auth.verify_id_token_identity(&client, id_token, &pending.nonce) {
         Ok(identity) => identity,
@@ -1548,7 +1625,11 @@ pub async fn callback(
                     source = source.as_str(),
                     "OIDC metadata refresh failed safely"
                 );
-                return login_recovery_response(LoginRecovery::ProviderUnavailable, &return_to);
+                return login_recovery_response(
+                    LoginRecovery::ProviderUnavailable,
+                    &public_base_path,
+                    &return_to,
+                );
             }
             let refreshed = auth.client();
             match auth.verify_id_token_identity(&refreshed, id_token, &pending.nonce) {
@@ -1561,7 +1642,11 @@ pub async fn callback(
                         category = "id_token_verification_failed_after_refresh",
                         "OIDC id_token verification failed safely"
                     );
-                    return login_recovery_response(LoginRecovery::VerificationFailed, &return_to);
+                    return login_recovery_response(
+                        LoginRecovery::VerificationFailed,
+                        &public_base_path,
+                        &return_to,
+                    );
                 }
             }
         }
@@ -1570,7 +1655,11 @@ pub async fn callback(
                 category = "id_token_verification_failed",
                 "OIDC id_token verification failed safely"
             );
-            return login_recovery_response(LoginRecovery::VerificationFailed, &return_to);
+            return login_recovery_response(
+                LoginRecovery::VerificationFailed,
+                &public_base_path,
+                &return_to,
+            );
         }
     };
     enrich_identity_from_user_info(
@@ -1656,9 +1745,13 @@ pub async fn callback(
 }
 
 /// `GET /auth/recover` — stable recovery surface for stale browser auth state.
-pub async fn recover(Query(params): Query<LoginParams>) -> Response {
-    let return_to = validated_return_to(params.return_to.as_deref());
-    login_recovery_response(LoginRecovery::FlowUnavailable, &return_to)
+pub async fn recover(State(auth): State<AuthState>, Query(params): Query<LoginParams>) -> Response {
+    let return_to = validated_return_to(&auth.public_base_path, params.return_to.as_deref());
+    login_recovery_response(
+        LoginRecovery::FlowUnavailable,
+        &auth.public_base_path,
+        &return_to,
+    )
 }
 
 #[cfg(test)]
@@ -1718,11 +1811,15 @@ pub async fn logout(
             .parse()
             .expect("logout CSRF clearing header"),
     );
-    (out, Redirect::to("/auth/logged-out")).into_response()
+    (
+        out,
+        Redirect::to(&auth.public_base_path.href("/auth/logged-out")),
+    )
+        .into_response()
 }
 
 /// `GET /auth/logged-out` — neutral landing page after local Pharos logout.
-pub async fn logged_out() -> impl IntoResponse {
+pub async fn logged_out(State(auth): State<AuthState>) -> impl IntoResponse {
     (
         [
             (
@@ -1732,9 +1829,10 @@ pub async fn logged_out() -> impl IntoResponse {
             (header::PRAGMA, "no-cache"),
             (header::EXPIRES, "0"),
         ],
-        Html(
+        Html(crate::public_mount::localize_document(
+            &auth.public_base_path,
             r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Logged out · Pharos</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>:root{--ink:#17304a;--muted:#64778a;--line:#dfe9ef;--accent:#1f7fb5;--sun:#d69b31}*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:linear-gradient(180deg,#fff 0%,#f7fbfc 46%,#edf6f7 100%)}main{width:min(420px,calc(100% - 40px));padding:30px;border:1px solid rgba(211,225,233,.88);border-radius:8px;background:rgba(255,255,255,.86);box-shadow:0 18px 42px rgba(45,75,95,.10);text-align:center}h1{margin:0 0 6px;font-family:Georgia,"Times New Roman",serif;font-size:28px;font-weight:500;color:#12304b}p{margin:0 0 20px;color:var(--muted)}a{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 16px;border-radius:7px;background:var(--accent);color:white;text-decoration:none;font-weight:650}</style></head><body><main><h1>Logged out</h1><p>Your Pharos session has ended.</p><a href="/auth/login">Sign in</a></main></body></html>"#,
-        ),
+        )),
     )
         .into_response()
 }
@@ -1914,7 +2012,9 @@ mod tests {
             None,
         )
         .unwrap();
-        Auth::from_config(config).await.unwrap()
+        Auth::from_config(config, PublicBasePath::root())
+            .await
+            .unwrap()
     }
 
     fn response_cookie(response: &Response, name: &str) -> Option<String> {
@@ -2147,9 +2247,14 @@ mod tests {
 
     #[test]
     fn return_destinations_are_local_bounded_and_never_reenter_auth() {
+        let root = PublicBasePath::root();
         assert_eq!(
-            validated_return_to(Some("/services?view=managed")),
+            validated_return_to(&root, Some("/services?view=managed")),
             "/services?view=managed"
+        );
+        assert_eq!(
+            validated_return_to(&root, Some("/services?view=managed&flow_project=17")),
+            "/services?view=managed&flow_project=17"
         );
         for unsafe_target in [
             "https://attacker.invalid/",
@@ -2161,23 +2266,45 @@ mod tests {
             "services",
             "/fleet#fragment",
         ] {
-            assert_eq!(validated_return_to(Some(unsafe_target)), "/");
+            assert_eq!(validated_return_to(&root, Some(unsafe_target)), "/");
         }
         assert_eq!(
-            validated_return_to(Some(&format!("/{}", "a".repeat(MAX_RETURN_TO_BYTES)))),
+            validated_return_to(
+                &root,
+                Some(&format!("/{}", "a".repeat(MAX_RETURN_TO_BYTES)))
+            ),
             "/"
         );
         assert_eq!(
-            login_location("/services?view=managed"),
+            login_location(&root, "/services?view=managed"),
             "/auth/login?return_to=%2Fservices%3Fview%3Dmanaged"
         );
         let flow_cookie = new_flow_cookie("/services?view=managed");
         assert_eq!(
-            return_to_from_flow_cookie(Some(&flow_cookie)),
+            return_to_from_flow_cookie(Some(&flow_cookie), &root),
             "/services?view=managed"
         );
-        assert_eq!(return_to_from_flow_cookie(Some("tampered")), "/");
-        assert_eq!(return_to_from_flow_cookie(Some("fixture.%%%")), "/");
+        assert_eq!(return_to_from_flow_cookie(Some("tampered"), &root), "/");
+        assert_eq!(return_to_from_flow_cookie(Some("fixture.%%%"), &root), "/");
+
+        let mounted = PublicBasePath::parse("/pharos").unwrap();
+        assert_eq!(
+            validated_return_to(&mounted, Some("/services?flow_project=17")),
+            "/pharos/services?flow_project=17"
+        );
+        assert_eq!(
+            validated_return_to(&mounted, Some("/pharos/services?view=managed")),
+            "/pharos/services?view=managed"
+        );
+        assert_eq!(
+            validated_return_to(&mounted, Some("/pharos/auth/callback")),
+            "/pharos"
+        );
+        assert_eq!(login_location(&mounted, "/pharos"), "/pharos/auth/login");
+        assert_eq!(
+            login_location(&mounted, "/pharos/services?flow_project=17"),
+            "/pharos/auth/login?return_to=%2Fpharos%2Fservices%3Fflow_project%3D17"
+        );
     }
 
     #[test]
@@ -2564,7 +2691,9 @@ mod tests {
             denied_html.contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg">"#)
         );
 
-        let logged_out = logged_out().await.into_response();
+        let logged_out = logged_out(State(AuthState::default()))
+            .await
+            .into_response();
         let logged_out_body = axum::body::to_bytes(logged_out.into_body(), usize::MAX)
             .await
             .expect("logged out body");
@@ -2940,6 +3069,7 @@ mod tests {
         let state = AuthState {
             human: None,
             machine: Some(MachineOperatorTokenStore::load(root.clone()).unwrap()),
+            public_base_path: PublicBasePath::root(),
             fixed_access: None,
             fixed_user: None,
         };

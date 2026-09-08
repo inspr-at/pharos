@@ -200,14 +200,17 @@ pub(crate) async fn page(
             !access_allows_host_request(&access, state.manifests.manifests(), host)
         })
     {
-        return Html(crate::render_no_access_page(
-            "Host settings",
-            "Color and alerts per host",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "settings",
+        return Html(crate::public_mount::localize_document(
+            &state.public_base_path,
+            &crate::render_no_access_page(
+                "Host settings",
+                "Color and alerts per host",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                "settings",
+            ),
         ))
         .into_response();
     }
@@ -217,9 +220,13 @@ pub(crate) async fn page(
         .map(str::trim)
         .filter(|host| !host.is_empty())
     {
-        Some(host) => Redirect::temporary(&format!("/hosts/{}", crate::url_query_escape(host)))
-            .into_response(),
-        None => Redirect::temporary("/").into_response(),
+        Some(host) => Redirect::temporary(
+            &state
+                .public_base_path
+                .href(&format!("/hosts/{}", crate::url_query_escape(host))),
+        )
+        .into_response(),
+        None => Redirect::temporary(state.public_base_path.home()).into_response(),
     }
 }
 
@@ -263,14 +270,17 @@ pub(crate) async fn host_workspace_page(
         .find(|host| host.name == host_ref || host.slug == host_ref);
 
     if !access.can_agora() || selected.is_none() {
-        return Html(crate::render_no_access_page(
-            "Host workspace",
-            "A durable view of one host",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "fleet",
+        return Html(crate::public_mount::localize_document(
+            &state.public_base_path,
+            &crate::render_no_access_page(
+                "Host workspace",
+                "A durable view of one host",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                "fleet",
+            ),
         ));
     }
 
@@ -290,26 +300,29 @@ pub(crate) async fn host_workspace_page(
         .collect();
     let lifecycle = host_lifecycle(&action_jobs, &selected.name, settings_state, false);
 
-    Html(crate::flow_host::inject_flow_shell(
-        render_page_with_access(
-            &manifests,
-            &declared_preferences,
-            &runtime_hosts,
-            PageContext {
-                requested_host: Some(&selected.name),
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-                can_manage_fleet: access.can_manage_fleet(),
-                workspace: Some(HostWorkspaceContext {
-                    runtime,
-                    lifecycle: &lifecycle,
-                    settings_state,
-                }),
-            },
+    Html(crate::public_mount::localize_document(
+        &state.public_base_path,
+        &crate::flow_host::inject_flow_shell(
+            render_page_with_access(
+                &manifests,
+                &declared_preferences,
+                &runtime_hosts,
+                PageContext {
+                    requested_host: Some(&selected.name),
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                    can_manage_fleet: access.can_manage_fleet(),
+                    workspace: Some(HostWorkspaceContext {
+                        runtime,
+                        lifecycle: &lifecycle,
+                        settings_state,
+                    }),
+                },
+            ),
+            crate::flow_mount_enabled(&state, &state.auth, &headers, &access, Some(&selected.name)),
+            Some(&selected.name),
+            state.flow_host.as_deref(),
         ),
-        crate::flow_mount_enabled(&state, &state.auth, &headers, &access, Some(&selected.name)),
-        Some(&selected.name),
-        state.flow_host.as_deref(),
     ))
 }
 

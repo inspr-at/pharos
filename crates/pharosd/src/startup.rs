@@ -6,6 +6,7 @@ pub(super) struct StartupConfig {
     pub(super) addr: SocketAddr,
     pub(super) auth: AuthConfig,
     pub(super) beacon_auth: BeaconAuth,
+    pub(super) public_base_path: PublicBasePath,
 }
 
 impl StartupConfig {
@@ -22,12 +23,19 @@ impl StartupConfig {
             })
             .transpose()?
             .unwrap_or(addr);
-        let auth = AuthConfig::from_env(public_addr.ip().is_loopback())?;
+        let public_base_path = public_mount::public_base_path_from_env()?;
+        let public_origin = public_mount::public_origin_from_env()?;
+        let auth = AuthConfig::from_env(
+            public_addr.ip().is_loopback(),
+            &public_base_path,
+            public_origin.as_ref(),
+        )?;
         let beacon_auth = BeaconAuth::from_env()?;
         Ok(Self {
             addr,
             auth,
             beacon_auth,
+            public_base_path,
         })
     }
 
@@ -49,7 +57,13 @@ pub(super) fn container_healthcheck_url(addr: SocketAddr) -> String {
         IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
     };
-    format!("http://{}/readyz", SocketAddr::new(loopback, addr.port()))
+    format!(
+        "http://{}{}",
+        SocketAddr::new(loopback, addr.port()),
+        public_mount::public_base_path_from_env()
+            .unwrap_or_else(|_| PublicBasePath::root())
+            .href("/readyz")
+    )
 }
 
 /// Resolves the readiness probe target from `PHAROS_ADDR`.

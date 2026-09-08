@@ -28,6 +28,7 @@ mod nixcfg_dispatch;
 mod paimos_delivery;
 mod provider_connections;
 mod provisioning;
+mod public_mount;
 mod routes;
 mod startup;
 mod store;
@@ -78,10 +79,11 @@ use pharos_core::{
     ProvisioningManagedFailure, ProvisioningManagedIdentity, ProvisioningManagedIdentityState,
     ProvisioningPaidAuthorization, ProvisioningPaidExecution, ProvisioningProgressEntry,
     ProvisioningProviderResource, ProvisioningReviewedPaidPlan, ProvisioningSetupIntent,
-    ProvisioningTerminalOutcome, SecretOwner, ServiceObservation, ServiceObservationState,
-    SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA, EXISTING_HOST_PREFLIGHT_VERSION,
-    HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION, MAX_HOST_REGISTRATION_BYTES,
-    MAX_HOST_REPORT_BYTES, PROVISIONING_JOB_SCHEMA, PROVISIONING_JOB_VERSION,
+    ProvisioningTerminalOutcome, PublicBasePath, SecretOwner, ServiceObservation,
+    ServiceObservationState, SshAccessIntent, SshRoute, EXISTING_HOST_PREFLIGHT_SCHEMA,
+    EXISTING_HOST_PREFLIGHT_VERSION, HOST_MANIFEST_SCHEMA, HOST_MANIFEST_VERSION,
+    MAX_HOST_REGISTRATION_BYTES, MAX_HOST_REPORT_BYTES, PROVISIONING_JOB_SCHEMA,
+    PROVISIONING_JOB_VERSION,
 };
 #[cfg(test)]
 use pharos_core::{NixDeploymentEvidence, NixcfgGitComparison, NixpkgsGitComparison};
@@ -158,6 +160,7 @@ struct AppState {
     alert_health: AlertWorkerHealth,
     access_request: AccessRequestConfig,
     flow_host: Option<Arc<flow_host::FlowHostService>>,
+    public_base_path: PublicBasePath,
 }
 
 const ACCESS_REQUEST_URL_ENV: &str = "PHAROS_ACCESS_REQUEST_URL";
@@ -228,6 +231,12 @@ impl FromRef<AppState> for Arc<Store> {
 impl FromRef<AppState> for AuthState {
     fn from_ref(s: &AppState) -> Self {
         s.auth.clone()
+    }
+}
+
+impl FromRef<AppState> for PublicBasePath {
+    fn from_ref(s: &AppState) -> Self {
+        s.public_base_path.clone()
     }
 }
 
@@ -4704,8 +4713,14 @@ fn security_policy_failure_response() -> Response {
     response
 }
 
-fn no_store_html(body: String) -> impl IntoResponse {
-    (no_store_headers(), Html(body))
+fn no_store_html(state: &AppState, body: String) -> impl IntoResponse {
+    (
+        no_store_headers(),
+        Html(public_mount::localize_document(
+            &state.public_base_path,
+            &body,
+        )),
+    )
 }
 
 pub(crate) fn flow_mount_enabled(
@@ -5148,7 +5163,7 @@ async fn main() {
         ManagedServiceOperationStore::new(managed_service_operation_store_path)
             .unwrap_or_else(|error| panic!("managed service operation startup failed: {error}")),
     );
-    let auth = Auth::from_config(startup.auth)
+    let auth = Auth::from_config(startup.auth, startup.public_base_path.clone())
         .await
         .unwrap_or_else(|err| panic!("Pharos authentication startup failed: {err}"));
     let beacon_auth = startup.beacon_auth;
@@ -5202,6 +5217,7 @@ async fn main() {
         alert_health,
         access_request,
         flow_host,
+        public_base_path: startup.public_base_path.clone(),
     };
     let _ = reconcile_saved_next_actions(&state, now_unix()).await;
     spawn_next_action_loop(state.clone());
@@ -14595,7 +14611,93 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
             access_request: AccessRequestConfig::default(),
             flow_host: None,
+            public_base_path: PublicBasePath::root(),
         }
+    }
+
+    async fn serve_test_app(state: AppState) -> (String, reqwest::Client) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        (format!("http://{address}"), client)
+    }
+
+    #[tokio::test]
+    async fn empty_public_base_path_keeps_origin_root_routes() {
+        let (base, client) = serve_test_app(report_test_state(false)).await;
+        let health = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let home = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(home.status(), StatusCode::OK);
+        let html = home.text().await.unwrap();
+        assert!(html.contains(r#"href="/map""#));
+        assert!(html.contains(r#"name="pharos-public-base-path" content="""#));
+        assert!(!html.contains("/pharos/map"));
+    }
+
+    #[tokio::test]
+    async fn configured_prefix_preserves_segment_boundary_and_generated_urls() {
+        let mut state = report_test_state(false);
+        state.public_base_path = PublicBasePath::parse("/pharos").unwrap();
+        let (base, client) = serve_test_app(state).await;
+        assert_eq!(
+            client
+                .get(format!("{base}/pharos/healthz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/healthz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/pharos-other/healthz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let home = client.get(format!("{base}/pharos")).send().await.unwrap();
+        assert_eq!(home.status(), StatusCode::OK);
+        let html = home.text().await.unwrap();
+        assert!(html.contains(r#"content="/pharos""#));
+        assert!(html.contains(r#"href="/pharos/map""#));
+        assert!(
+            html.contains(r#"action="/pharos/auth/logout""#) || html.contains(r#"href="/pharos""#)
+        );
+        assert!(html.contains("/pharos/assets/") || html.contains("url('/pharos/assets/"));
+        let login = client
+            .get(format!(
+                "{base}/pharos/auth/login?return_to=%2Fpharos%2Fservices%3Fflow_project%3D17"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            login
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos/services?flow_project=17")
+        );
     }
 
     #[test]

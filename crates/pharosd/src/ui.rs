@@ -630,7 +630,7 @@ pub(super) async fn access_request_page(
     let (surface, task) = access_scope(query.scope.as_deref());
     let request_text =
         format!("Please ask a Pharos administrator for the Fleet manager role so I can {task}.");
-    no_store_html(format!(
+    no_store_html(&state,format!(
         r#"{HEAD}{sidebar}<main class="ops-main access-request-page"><div class="top"><div><div class="brand"><h1>Request access</h1></div><p class="fleet">{surface}</p></div></div><section class="ops-empty"><h2>Send this to your Pharos administrator</h2><p>The required role is <strong>Fleet manager</strong>. The responsible access owner is your <strong>Pharos administrator</strong>.</p><div class="access-request-copy"><code data-access-request-text>{request_text}</code><button class="access-path-action" type="button" data-copy-access-request>Copy access request</button></div><p class="access-request-status" role="status" aria-live="polite" data-access-request-status>Copy the request, send it through your normal help channel, then return here after access is granted.</p></section></main><script>document.querySelector('[data-copy-access-request]')?.addEventListener('click',async event=>{{const text=document.querySelector('[data-access-request-text]')?.textContent||'';const status=document.querySelector('[data-access-request-status]');try{{await navigator.clipboard.writeText(text);event.currentTarget.textContent='Copied';if(status)status.textContent='Access request copied. Send it to your Pharos administrator.'}}catch(error){{if(status)status.textContent='Copy was unavailable. Select the request text above and copy it manually.'}}}});</script></div></body></html>"#,
         sidebar = sidebar(&user_label, state.auth.is_some(), ""),
         surface = html_escape(surface),
@@ -645,18 +645,21 @@ pub(super) async fn provider_settings_page(
 ) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
-    no_store_html(render_provider_connections_page(
-        &provider_connections(
-            &state.provider_runtime,
-            &state.provider_connections,
-            now_unix(),
+    no_store_html(
+        &state,
+        render_provider_connections_page(
+            &provider_connections(
+                &state.provider_runtime,
+                &state.provider_connections,
+                now_unix(),
+            ),
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            access.can_manage_fleet(),
         ),
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-        access.can_manage_fleet(),
-    ))
+    )
 }
 
 pub(super) async fn provider_settings_detail_page(
@@ -706,7 +709,7 @@ pub(super) async fn provider_settings_detail_page(
             return_path.as_deref(),
         )
     };
-    no_store_html(body).into_response()
+    no_store_html(&state, body).into_response()
 }
 
 pub(super) async fn provider_connections_json(
@@ -731,15 +734,18 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Fleet",
-            "All hosts at a glance",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "fleet",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Fleet",
+                "All hosts at a glance",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                "fleet",
+            ),
+        );
     }
     let all_hosts = state.store.list();
     reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now_unix());
@@ -767,34 +773,37 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
         })
         .map(|host| host.name.clone())
         .collect();
-    no_store_html(crate::flow_host::inject_flow_shell(
-        render_home_with_capabilities(
-            RuntimeSnapshot {
-                hosts: &hosts,
-                jobs: &jobs,
-                action_jobs: &action_jobs,
-                declared_preferences: Some(&declared_preferences),
-                janus_managed_hosts: Some(&janus_managed_hosts),
-            },
-            &self_host(),
-            now_unix(),
-            &manifests,
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            FleetCapabilities {
-                can_manage_fleet: access.can_manage_fleet(),
-                system_update_available: state.nixcfg_dispatch.system_update_available(),
-                host_removal_available: state.nixcfg_dispatch.host_removal_available()
-                    && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
-                        || state.retirement_owner.configured()),
-            },
+    no_store_html(
+        &state,
+        crate::flow_host::inject_flow_shell(
+            render_home_with_capabilities(
+                RuntimeSnapshot {
+                    hosts: &hosts,
+                    jobs: &jobs,
+                    action_jobs: &action_jobs,
+                    declared_preferences: Some(&declared_preferences),
+                    janus_managed_hosts: Some(&janus_managed_hosts),
+                },
+                &self_host(),
+                now_unix(),
+                &manifests,
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                FleetCapabilities {
+                    can_manage_fleet: access.can_manage_fleet(),
+                    system_update_available: state.nixcfg_dispatch.system_update_available(),
+                    host_removal_available: state.nixcfg_dispatch.host_removal_available()
+                        && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
+                            || state.retirement_owner.configured()),
+                },
+            ),
+            crate::flow_mount_enabled(&state, &state.auth, &headers, &access, None),
+            None,
+            state.flow_host.as_deref(),
         ),
-        crate::flow_mount_enabled(&state, &state.auth, &headers, &access, None),
-        None,
-        state.flow_host.as_deref(),
-    ))
+    )
 }
 
 pub(super) async fn map_page(
@@ -804,24 +813,30 @@ pub(super) async fn map_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Map",
-            "Server locations",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "map",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Map",
+                "Server locations",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                "map",
+            ),
+        );
     }
     let hosts = filter_hosts_by_access(state.store.list(), &access);
-    no_store_html(render_map(
-        &hosts,
-        &self_host(),
-        now_unix(),
-        &user_label,
-        state.auth.is_some(),
-    ))
+    no_store_html(
+        &state,
+        render_map(
+            &hosts,
+            &self_host(),
+            now_unix(),
+            &user_label,
+            state.auth.is_some(),
+        ),
+    )
 }
 
 pub(super) async fn map_data_json(
@@ -833,7 +848,13 @@ pub(super) async fn map_data_json(
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let now = now_unix();
     let probes = map_connectivity_probes(&hosts, &manifests).await;
-    let payload = map_data_payload(&hosts, &self_host(), now, &manifests, &probes);
+    let payload = {
+        let mut payload = map_data_payload(&hosts, &self_host(), now, &manifests, &probes);
+        for host in &mut payload.hosts {
+            host.settings_href = state.public_base_path.href(&host.settings_href);
+        }
+        payload
+    };
     no_store_json(serde_json::to_value(payload).expect("map data serializes"))
 }
 
@@ -844,15 +865,18 @@ pub(super) async fn alerts_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Alerts",
-            "Needs attention",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "alerts",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Alerts",
+                "Needs attention",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                "alerts",
+            ),
+        );
     }
     let now = now_unix();
     let all_hosts = state.store.list();
@@ -866,24 +890,27 @@ pub(super) async fn alerts_page(
     } else {
         &[]
     };
-    no_store_html(render_alerts(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            action_jobs: &[],
-            declared_preferences: None,
-            janus_managed_hosts: None,
-        },
-        &self_host(),
-        now,
-        &manifests,
-        load_errors,
-        &probes,
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-    ))
+    no_store_html(
+        &state,
+        render_alerts(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &jobs,
+                action_jobs: &[],
+                declared_preferences: None,
+                janus_managed_hosts: None,
+            },
+            &self_host(),
+            now,
+            &manifests,
+            load_errors,
+            &probes,
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+        ),
+    )
 }
 
 pub(super) async fn activity_page(
@@ -894,15 +921,18 @@ pub(super) async fn activity_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Activity",
-            "Operational timeline",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "activity",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Activity",
+                "Operational timeline",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                "activity",
+            ),
+        );
     }
     let now = now_unix();
     let all_hosts = state.store.list();
@@ -923,28 +953,31 @@ pub(super) async fn activity_page(
         .filter(|job| access.allows_host(&job.host))
         .collect();
     let focus = activity_focus(&query, &action_jobs);
-    no_store_html(render_activity_with_focus(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            action_jobs: &action_jobs,
-            declared_preferences: None,
-            janus_managed_hosts: None,
-        },
-        &self_host(),
-        now,
-        ActivitySources {
-            manifests: &manifests,
-            load_errors,
-            server_probes: &probes,
-            action_jobs: &action_jobs,
-        },
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-        focus,
-    ))
+    no_store_html(
+        &state,
+        render_activity_with_focus(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &jobs,
+                action_jobs: &action_jobs,
+                declared_preferences: None,
+                janus_managed_hosts: None,
+            },
+            &self_host(),
+            now,
+            ActivitySources {
+                manifests: &manifests,
+                load_errors,
+                server_probes: &probes,
+                action_jobs: &action_jobs,
+            },
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+            },
+            focus,
+        ),
+    )
 }
 
 pub(super) async fn backups_page(
@@ -954,25 +987,31 @@ pub(super) async fn backups_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Backups",
-            "Protection at a glance",
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Backups",
+                "Protection at a glance",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                },
+                "backups",
+            ),
+        );
+    }
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    no_store_html(
+        &state,
+        render_backups(
+            &hosts,
+            now_unix(),
             ShellContext {
                 user_label: &user_label,
                 logout_enabled: state.auth.is_some(),
             },
-            "backups",
-        ));
-    }
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
-    no_store_html(render_backups(
-        &hosts,
-        now_unix(),
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-    ))
+        ),
+    )
 }
 
 pub(super) async fn fleet_horizon_asset() -> impl axum::response::IntoResponse {
