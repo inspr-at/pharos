@@ -25,6 +25,97 @@ async function waitForFlowProjection(page) {
     .not.toBeNull();
 }
 
+async function dispatchFlowIntent(page, intentKind) {
+  const paimosOrigin = await page.evaluate(
+    () => document.querySelector("inspr-flow-shell")?.dataset.flowPaimosOrigin ?? "",
+  );
+  let captured = null;
+  await page.route("**/flow/intents**", async (route) => {
+    const upstream = await route.fetch();
+    const body = await upstream.json();
+    captured = { status: upstream.status(), body };
+    await route.fulfill({
+      status: upstream.status(),
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
+  });
+  if (paimosOrigin) {
+    await page.route(`${paimosOrigin}/**`, (route) => route.abort());
+  }
+  await page.evaluate(async (kind) => {
+    const { createReviewBatchIntent, createStartIntent } = await import(
+      "/assets/vendor/flow-shell/src/intents.js"
+    );
+    const { confirmationSnapshot } = await import(
+      "/assets/vendor/flow-shell/src/state.js"
+    );
+    const shell = document.querySelector("inspr-flow-shell");
+    const shellState = shell.shellState;
+    const now = Date.now();
+
+    let intent;
+    if (kind === "review") {
+      intent = createReviewBatchIntent(shellState);
+    } else if (kind === "start") {
+      const snapshot = confirmationSnapshot(shellState, {
+        now,
+        action: shellState.selectedAction ?? "build",
+        executionMode: shellState.selectedExecutionMode ?? "manual",
+      });
+      intent = createStartIntent(shellState, {
+        confirmed: true,
+        executionMode: shellState.selectedExecutionMode ?? "manual",
+        action: shellState.selectedAction ?? "build",
+        capturedSnapshot: snapshot,
+        now,
+      });
+      if (intent.error) {
+        throw new Error(intent.error);
+      }
+    } else {
+      throw new Error(`unknown intent kind: ${kind}`);
+    }
+
+    shell.dispatchEvent(
+      new CustomEvent("flow-intent", {
+        detail: intent,
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }, intentKind);
+  await expect.poll(() => captured, { timeout: 10_000 }).not.toBeNull();
+  await page.unroute("**/flow/intents**");
+  if (paimosOrigin) {
+    await page.unroute(`${paimosOrigin}/**`);
+  }
+  return captured;
+}
+
+async function expectFleetMainVisible(page) {
+  await expect(page.getByRole("heading", { name: "Fleet" })).toBeVisible();
+}
+
+async function expectShellChromeCollapsed(page) {
+  await expect(page.locator("inspr-flow-shell[data-flow-host]")).toHaveAttribute(
+    "data-flow-host-unavailable",
+    "true",
+  );
+  const state = await page.evaluate(() => {
+    const shell = document.querySelector("inspr-flow-shell");
+    const main = document.querySelector("main");
+    return {
+      shellDisplay: shell ? getComputedStyle(shell).display : null,
+      mainParent: main?.parentElement?.tagName ?? null,
+      mainPrevious: main?.previousElementSibling?.tagName ?? null,
+    };
+  });
+  expect(state.shellDisplay).toBe("none");
+  expect(state.mainParent).not.toBe("INSPR-FLOW-SHELL");
+  expect(state.mainPrevious).toBe("ASIDE");
+}
+
 test("OIDC human session projects flow shell with host-verified identity", async ({
   page,
 }) => {
@@ -58,91 +149,195 @@ test("OIDC human session projects flow shell with host-verified identity", async
   expect(bootstrapLoaded).toBe(true);
 });
 
-test("review intent routes through HTTP with bootstrap wire shape", async ({
+test("unavailable projection keeps fleet main visible and collapses flow chrome", async ({
   page,
 }) => {
   await loginAsVerifiedHuman(page);
   await page.goto("/");
   await waitForFlowProjection(page);
 
-  const result = await page.evaluate(async () => {
-    const { createReviewBatchIntent } = await import(
-      "/assets/vendor/flow-shell/src/intents.js"
-    );
-    const shellStateResponse = await fetch("/flow/shell-state.json", {
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-    const shellPayload = await shellStateResponse.json();
-    const intent = createReviewBatchIntent(shellPayload.shellState);
-    const response = await fetch("/flow/intents", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
+  await page.route("**/flow/shell-state.json**", (route) =>
+    route.fulfill({ status: 503, body: "unavailable" }),
+  );
+  await page.reload();
+  await page.waitForTimeout(500);
+
+  await expectFleetMainVisible(page);
+  await expectShellChromeCollapsed(page);
+
+  await page.unroute("**/flow/shell-state.json**");
+  await page.reload();
+  await waitForFlowProjection(page);
+  await expect(
+    page.locator("inspr-flow-shell[data-flow-host]:not([data-flow-host-unavailable])"),
+  ).toBeVisible();
+});
+
+test("denied host scope keeps fleet main visible", async ({ page }) => {
+  await loginAsVerifiedHuman(page);
+  await page.goto("/");
+  await waitForFlowProjection(page);
+
+  await page.route("**/flow/shell-state.json**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
       body: JSON.stringify({
-        type: intent.type,
-        identity: null,
-        detail: intent,
+        enabled: true,
+        mountShell: false,
+        unavailableReason: "access denied for requested host scope",
       }),
-    });
-    return {
-      status: response.status,
-      body: await response.json(),
-    };
-  });
+    }),
+  );
+  await page.reload();
+  await page.waitForTimeout(500);
+
+  await expectFleetMainVisible(page);
+  await expectShellChromeCollapsed(page);
+});
+
+test("review intent routes through bootstrap flow-intent handling", async ({ page }) => {
+  await loginAsVerifiedHuman(page);
+  await page.goto("/");
+  await waitForFlowProjection(page);
+
+  const result = await dispatchFlowIntent(page, "review");
 
   expect(result.status).toBe(200);
   expect(result.body.location).toContain("/projects/17?tab=overview#baseline-batch");
   expect(result.body.executed).toBe(false);
+  expect(result.body.routed).toBe("paimos-project-overview-baseline");
 });
 
-test("start intent accepts nested identity from vendored detail shape", async ({
+test("start intent routes through bootstrap with exact navigation target", async ({
   page,
 }) => {
   await loginAsVerifiedHuman(page);
   await page.goto("/");
   await waitForFlowProjection(page);
 
-  const result = await page.evaluate(async () => {
-    const shellStateResponse = await fetch("/flow/shell-state.json", {
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-    const shellPayload = await shellStateResponse.json();
-    const identity = shellPayload.shellState.identityContext;
-    const detail = {
-      type: "flow:start-intent",
-      detail: {
-        action: "build",
-        identity: {
-          status: "present",
-          principal_ref: identity.principal_ref,
-          project_ref: identity.project_ref,
-          binding_ref: identity.binding_ref,
-          context_revision: identity.context_revision,
-          actor_kind: "human",
-          expires_at: identity.expires_at,
-          fresh_until: identity.fresh_until,
-        },
-      },
-    };
-    const nested = detail?.detail?.identity ?? detail?.identity;
-    const response = await fetch("/flow/intents", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        type: detail.type,
-        identity: nested,
-        detail,
-      }),
-    });
-    return {
-      status: response.status,
-      body: await response.json(),
-    };
-  });
+  const paimosOrigin = await page.evaluate(
+    () => document.querySelector("inspr-flow-shell")?.dataset.flowPaimosOrigin ?? "",
+  );
+
+  const result = await dispatchFlowIntent(page, "start");
 
   expect(result.status).toBe(200);
   expect(result.body.error).toBeUndefined();
+  expect(result.body.routed).toBe("paimos-project-overview-baseline");
+  expect(result.body.location).toBe(
+    `${paimosOrigin.replace(/\/$/, "")}/projects/17?tab=overview#baseline-batch`,
+  );
+});
+
+test("revoked start identity is rejected through bootstrap flow-intent handling", async ({
+  page,
+}) => {
+  await loginAsVerifiedHuman(page);
+  await page.goto("/");
+  await waitForFlowProjection(page);
+
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes("/flow/intents") &&
+      response.request().method() === "POST",
+    { timeout: 10_000 },
+  );
+  await page.evaluate(async () => {
+    const { createStartIntent } = await import(
+      "/assets/vendor/flow-shell/src/intents.js"
+    );
+    const { confirmationSnapshot } = await import(
+      "/assets/vendor/flow-shell/src/state.js"
+    );
+    const shell = document.querySelector("inspr-flow-shell");
+    const shellState = shell.shellState;
+    const now = Date.now();
+    const snapshot = confirmationSnapshot(shellState, {
+      now,
+      action: "build",
+      executionMode: "manual",
+    });
+    const intent = createStartIntent(shellState, {
+      confirmed: true,
+      executionMode: "manual",
+      action: "build",
+      capturedSnapshot: snapshot,
+      now,
+    });
+    intent.detail.identity.principalRef = "pharos-test:revoked-principal";
+
+    shell.dispatchEvent(
+      new CustomEvent("flow-intent", {
+        detail: intent,
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  });
+  const response = await responsePromise;
+  const body = await response.body();
+  const result = {
+    status: response.status(),
+    body: JSON.parse(body.toString()),
+  };
+
+  expect(result.status).toBe(409);
+  expect(result.body.error).toContain("mismatch");
+});
+
+test("stale start identity is rejected through bootstrap flow-intent handling", async ({
+  page,
+}) => {
+  await loginAsVerifiedHuman(page);
+  await page.goto("/");
+  await waitForFlowProjection(page);
+
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes("/flow/intents") &&
+      response.request().method() === "POST",
+    { timeout: 10_000 },
+  );
+  await page.evaluate(async () => {
+    const { createStartIntent } = await import(
+      "/assets/vendor/flow-shell/src/intents.js"
+    );
+    const { confirmationSnapshot } = await import(
+      "/assets/vendor/flow-shell/src/state.js"
+    );
+    const shell = document.querySelector("inspr-flow-shell");
+    const shellState = shell.shellState;
+    const now = Date.now();
+    const snapshot = confirmationSnapshot(shellState, {
+      now,
+      action: "build",
+      executionMode: "manual",
+    });
+    const intent = createStartIntent(shellState, {
+      confirmed: true,
+      executionMode: "manual",
+      action: "build",
+      capturedSnapshot: snapshot,
+      now,
+    });
+    intent.detail.identity.expiresAt = "2000-01-01T00:00:00.000Z";
+
+    shell.dispatchEvent(
+      new CustomEvent("flow-intent", {
+        detail: intent,
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  });
+  const response = await responsePromise;
+  const body = await response.body();
+  const result = {
+    status: response.status(),
+    body: JSON.parse(body.toString()),
+  };
+
+  expect(result.status).toBe(409);
+  expect(result.body.error).toContain("expired");
 });

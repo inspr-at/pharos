@@ -5099,6 +5099,9 @@ async fn main() {
 
     let startup = StartupConfig::from_env()
         .unwrap_or_else(|err| panic!("invalid Pharos startup configuration: {err}"));
+    let loopback_dev_mode = startup
+        .listener_loopback_dev_mode()
+        .unwrap_or_else(|error| panic!("invalid Pharos startup configuration: {error}"));
     let host_store_path = std::env::var("PHAROS_DB").ok().map(PathBuf::from);
     let managed_setup_intent_store_path =
         ManagedSetupIntentStore::path_for(host_store_path.as_deref());
@@ -5171,7 +5174,7 @@ async fn main() {
     let alert_health = alert_notifier.health.clone();
     let access_request = AccessRequestConfig::from_env()
         .unwrap_or_else(|error| panic!("access-request startup failed: {error}"));
-    let flow_host = flow_host::FlowHostService::from_env()
+    let flow_host = flow_host::FlowHostService::from_env(loopback_dev_mode)
         .unwrap_or_else(|error| panic!("flow host startup failed: {error}"))
         .map(Arc::new);
     let paimos_delivery = paimos_delivery::PaimosDeliveryAdapter::from_env(

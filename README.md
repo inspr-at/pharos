@@ -880,6 +880,10 @@ paths for ad-hoc evidence and synthetic fixture data only. Cargo's ignored
 `target/` directory is disposable build cache: never park tests or fleet
 captures there, and never commit captured infrastructure data as a fixture.
 
+Flow host integration QA runs with `npm run test:flow-host`. That command builds
+`pharosd`, starts the OIDC and Paimos loopback harness, and exercises the
+shipped bootstrap boundary in Chromium.
+
 [`RELEASE.json`](RELEASE.json) is the single authoritative release coordinate.
 It records the canonical Calendar Version, stable-channel sequence, migration
 anchor, exact legacy rollback authority and injective Cargo SemVer mapping. The

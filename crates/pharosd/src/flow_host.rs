@@ -6,7 +6,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -185,11 +184,11 @@ pub(crate) struct FlowIntentResponse {
 }
 
 impl FlowHostService {
-    pub(crate) fn from_env() -> Result<Option<Self>, String> {
+    pub(crate) fn from_env(loopback_dev_mode: bool) -> Result<Option<Self>, String> {
         let Some(path) = env_nonempty(FLOW_CONFIG_ENV) else {
             return Ok(None);
         };
-        let config = FlowHostConfig::load(Path::new(&path))?;
+        let config = FlowHostConfig::load(Path::new(&path), loopback_dev_mode)?;
         if !config.enabled {
             return Ok(None);
         }
@@ -750,7 +749,7 @@ struct ResolvedContext {
 }
 
 impl FlowHostConfig {
-    fn load(path: &Path) -> Result<Self, String> {
+    fn load(path: &Path, loopback_dev_mode: bool) -> Result<Self, String> {
         let bytes = read_config_file(path)?;
         let document: FlowConfigDocument = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid flow host configuration".to_string())?;
@@ -762,9 +761,13 @@ impl FlowHostConfig {
         {
             return Err("invalid flow host configuration".to_string());
         }
-        let loopback_dev_mode = loopback_dev_mode_enabled()?;
-        let paimos_origin = parse_origin(&document.paimos_origin, loopback_dev_mode)
-            .map_err(|_| "invalid flow host configuration".to_string())?;
+        let allow_loopback_origin = matches!(env_bool(FLOW_LOOPBACK_ORIGIN_ENV), Ok(Some(true)));
+        let paimos_origin = parse_origin(
+            &document.paimos_origin,
+            loopback_dev_mode,
+            allow_loopback_origin,
+        )
+        .map_err(|_| "invalid flow host configuration".to_string())?;
         if !document.api_key_file.is_absolute() {
             return Err("invalid flow host configuration".to_string());
         }
@@ -1392,7 +1395,11 @@ fn valid_host_id(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
-fn parse_origin(value: &str, loopback_dev_mode: bool) -> Result<Url, FlowError> {
+fn parse_origin(
+    value: &str,
+    loopback_dev_mode: bool,
+    allow_loopback_origin: bool,
+) -> Result<Url, FlowError> {
     let url = Url::parse(value).map_err(|_| FlowError::Configuration)?;
     if url.host_str().is_none()
         || !url.username().is_empty()
@@ -1405,31 +1412,9 @@ fn parse_origin(value: &str, loopback_dev_mode: bool) -> Result<Url, FlowError> 
     }
     match url.scheme() {
         "https" => Ok(url),
-        "http" if loopback_dev_mode && loopback_origin_flag_enabled() && is_loopback_url(&url) => {
-            Ok(url)
-        }
+        "http" if loopback_dev_mode && allow_loopback_origin && is_loopback_url(&url) => Ok(url),
         _ => Err(FlowError::Configuration),
     }
-}
-
-fn loopback_dev_mode_enabled() -> Result<bool, String> {
-    let bind = socket_addr_from_env("PHAROS_ADDR", "127.0.0.1:8080")?;
-    let public = env_nonempty("PHAROS_PUBLIC_ADDR")
-        .map(|value| value.parse::<SocketAddr>())
-        .transpose()
-        .map_err(|err| format!("PHAROS_PUBLIC_ADDR must be a numeric socket address: {err}"))?
-        .unwrap_or(bind);
-    Ok(bind.ip().is_loopback() && public.ip().is_loopback())
-}
-
-fn socket_addr_from_env(name: &str, default: &str) -> Result<SocketAddr, String> {
-    let raw = std::env::var(name).unwrap_or_else(|_| default.to_string());
-    raw.parse::<SocketAddr>()
-        .map_err(|err| format!("{name} must be a numeric socket address: {err}"))
-}
-
-fn loopback_origin_flag_enabled() -> bool {
-    matches!(env_bool(FLOW_LOOPBACK_ORIGIN_ENV), Ok(Some(true)))
 }
 
 fn is_loopback_url(url: &Url) -> bool {
@@ -2225,13 +2210,70 @@ mod tests {
 
     #[test]
     fn loopback_paimos_origin_requires_listener_and_flag() {
-        assert!(parse_origin("https://paimos.example", false).is_ok());
-        std::env::set_var("PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN", "true");
-        assert!(parse_origin("http://127.0.0.1:9", true).is_ok());
-        std::env::remove_var("PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN");
-        assert!(parse_origin("http://127.0.0.1:9", true).is_err());
-        assert!(parse_origin("http://127.0.0.1:9", false).is_err());
-        assert!(parse_origin("http://evil.example", true).is_err());
+        assert!(parse_origin("https://paimos.example", false, false).is_ok());
+        assert!(parse_origin("http://127.0.0.1:9", true, true).is_ok());
+        assert!(parse_origin("http://127.0.0.1:9", true, false).is_err());
+        assert!(parse_origin("http://127.0.0.1:9", false, false).is_err());
+        assert!(parse_origin("http://evil.example", true, true).is_err());
+    }
+
+    #[test]
+    fn select_binding_requires_host_scope_when_multiple_bindings_match() {
+        let service = FlowHostService {
+            config: FlowHostConfig {
+                enabled: true,
+                host_id: "pharos-test".to_string(),
+                paimos_origin: Url::parse("https://paimos.example").expect("origin"),
+                api_key_file: PathBuf::from("/tmp/pharos-flow-test.key"),
+                instance_label: "Pharos test".to_string(),
+                bindings: vec![
+                    FlowBinding {
+                        project_id: 17,
+                        expected_project_ref: PAIMOS_PROJECT_REF_17.to_string(),
+                        label: "Project A".to_string(),
+                        hosts: vec!["host-a".to_string()],
+                        operator_refs: HashSet::from(["operator-a".to_string()]),
+                    },
+                    FlowBinding {
+                        project_id: 18,
+                        expected_project_ref: PAIMOS_PROJECT_REF_99.to_string(),
+                        label: "Project B".to_string(),
+                        hosts: vec!["host-b".to_string()],
+                        operator_refs: HashSet::from(["operator-a".to_string()]),
+                    },
+                ],
+                config_digest: "sha256:test".to_string(),
+            },
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("client"),
+            cache: Arc::new(Mutex::new(ProjectionCache::default())),
+        };
+        let user = AuthUser {
+            operator_ref: "operator-a".to_string(),
+            managed_human_session_ref: "sess".to_string(),
+            display_name: "Operator".to_string(),
+        };
+        let access = AccessGrant::limited(["host-a", "host-b"], true);
+        let err = service
+            .select_binding(&user, &access, None)
+            .expect_err("ambiguous binding");
+        assert_eq!(
+            err,
+            "Multiple configured Flow bindings match; host scope is required."
+        );
+        let binding = service
+            .select_binding(&user, &access, Some("host-a"))
+            .expect("host-a binding");
+        assert_eq!(binding.project_id, 17);
+        let err = service
+            .select_binding(&user, &access, Some("host-unknown"))
+            .expect_err("unknown host");
+        assert_eq!(
+            err,
+            "No configured Flow binding matches this operator and host scope."
+        );
     }
 
     #[test]

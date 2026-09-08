@@ -8,11 +8,13 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const vendorRoot = path.join(repoRoot, "crates/pharosd/assets/vendor/flow-shell");
 const bootstrapPath = path.join(repoRoot, "crates/pharosd/assets/flow-host-bootstrap.mjs");
 
-test("shipped bootstrap reads nested identity and unmounts on denial", () => {
+test("shipped bootstrap reads nested identity and unwraps main on denial", () => {
   const bootstrap = readFileSync(bootstrapPath, "utf8");
   assert.match(bootstrap, /detail\?\.detail\?\.identity/);
-  assert.match(bootstrap, /unmountShellChrome/);
+  assert.match(bootstrap, /data-flow-host-unavailable/);
+  assert.match(bootstrap, /unwrapMainFromShell/);
   assert.match(bootstrap, /shell\.shellState\?\.identity/);
+  assert.doesNotMatch(bootstrap, /shell\.hidden\s*=\s*true/);
 });
 
 test("review intent omits identity and stays server-resolvable", async () => {

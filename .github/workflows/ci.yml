@@ -188,6 +188,8 @@ jobs:
         run: cargo build -p pharosd --locked
       - name: accessibility, focus, responsive, and visual-layout QA
         run: npm run test:browser
+      - name: flow host browser harness
+        run: npm run test:flow-host
       - name: retain browser failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (Node 24)

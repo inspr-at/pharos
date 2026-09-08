@@ -6,10 +6,39 @@ if (shell) {
   const paimosOrigin = shell.dataset.flowPaimosOrigin || '';
   let generation = 0;
   let refreshTimer = null;
+  let mainUnwrapped = false;
+
+  function unwrapMainFromShell() {
+    if (mainUnwrapped) {
+      return;
+    }
+    const main = shell.querySelector('main');
+    if (!main || !shell.parentNode) {
+      return;
+    }
+    shell.parentNode.insertBefore(main, shell);
+    mainUnwrapped = true;
+    shell.style.display = 'none';
+  }
+
+  function wrapMainIntoShell() {
+    if (!mainUnwrapped) {
+      return;
+    }
+    let main = shell.previousElementSibling;
+    if (!main?.matches('main')) {
+      main = document.querySelector('main');
+    }
+    if (main) {
+      shell.appendChild(main);
+    }
+    mainUnwrapped = false;
+    shell.style.display = '';
+  }
 
   function unmountShellChrome() {
-    shell.hidden = true;
-    shell.style.display = 'none';
+    shell.setAttribute('data-flow-host-unavailable', 'true');
+    unwrapMainFromShell();
     if (refreshTimer !== null) {
       clearTimeout(refreshTimer);
       refreshTimer = null;
@@ -17,8 +46,11 @@ if (shell) {
   }
 
   function mountShellChrome() {
-    shell.hidden = false;
-    shell.style.display = '';
+    shell.removeAttribute('data-flow-host-unavailable');
+    wrapMainIntoShell();
+    if (refreshTimer === null) {
+      scheduleBoundaryRefresh();
+    }
   }
 
   function clearShell() {
@@ -91,35 +123,30 @@ if (shell) {
         return;
       }
       if (!response.ok) {
-        unmountShellChrome();
         clearShell();
+        unmountShellChrome();
         return;
       }
       const payload = await response.json();
       if (generation !== next) {
         return;
       }
-      if (!payload.enabled || !payload.mountShell) {
-        unmountShellChrome();
+      if (!payload.enabled || !payload.mountShell || payload.unavailableReason) {
         clearShell();
-        return;
-      }
-      if (payload.unavailableReason) {
         unmountShellChrome();
-        clearShell();
         return;
       }
       mountShellChrome();
       if (payload.shellState) {
         shell.shellState = payload.shellState;
       } else {
-        unmountShellChrome();
         clearShell();
+        unmountShellChrome();
       }
     } catch {
       if (generation === next) {
-        unmountShellChrome();
         clearShell();
+        unmountShellChrome();
       }
     }
   }

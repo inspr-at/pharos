@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { allocateLoopbackPort } from "./harness-path.mjs";
@@ -10,6 +10,15 @@ const playwrightExecutable = path.join(
   ".bin",
   process.platform === "win32" ? "playwright.cmd" : "playwright",
 );
+
+execSync("cargo build -p pharosd --locked", {
+  cwd: repoRoot,
+  env: {
+    ...process.env,
+    CARGO_TARGET_DIR: path.join(repoRoot, "target"),
+  },
+  stdio: "inherit",
+});
 
 const port = await allocateLoopbackPort();
 const childEnv = {
