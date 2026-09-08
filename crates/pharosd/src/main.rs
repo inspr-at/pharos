@@ -4619,8 +4619,8 @@ async fn secure_response(response: Response) -> Response {
             Ok(html) => html,
             Err(_) => return security_policy_failure_response(),
         };
-        let script_open = format!(r#"<script nonce="{nonce}""#);
-        let style_open = format!(r#"<style nonce="{nonce}""#);
+        let script_open = format!(r#"<script nonce="{nonce}" "#);
+        let style_open = format!(r#"<style nonce="{nonce}" "#);
         let html = html
             .replace("<script", &script_open)
             .replace("<style", &style_open);
@@ -4718,26 +4718,41 @@ pub(crate) fn flow_mount_enabled(state: &AppState) -> bool {
 async fn flow_shell_state_json(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<FlowHostQuery>,
 ) -> impl IntoResponse {
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
         return no_store_json(json!({
             "enabled": false,
-            "mount_shell": false,
-            "unavailable_reason": "access denied"
+            "mountShell": false,
+            "unavailableReason": "access denied"
         }));
     }
     let Some(flow) = state.flow_host.as_ref() else {
-        return no_store_json(json!({"enabled": false, "mount_shell": false}));
+        return no_store_json(json!({"enabled": false, "mountShell": false}));
     };
     let hosts = state.store.list();
+    let selected_host = match flow_host::resolve_flow_host_scope(
+        query.host.as_deref(),
+        &access,
+        &hosts,
+    ) {
+        Ok(selected_host) => selected_host,
+        Err(reason) => {
+            return no_store_json(json!({
+                "enabled": true,
+                "mountShell": true,
+                "unavailableReason": reason,
+            }));
+        }
+    };
     let response = flow
         .shell_state(
             &state.auth,
             &headers,
             &access,
             &hosts,
-            None,
+            selected_host.as_deref(),
             now_unix(),
         )
         .await;
@@ -4747,6 +4762,7 @@ async fn flow_shell_state_json(
 async fn flow_intents_json(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<FlowHostQuery>,
     Json(request): Json<flow_host::FlowIntentRequest>,
 ) -> impl IntoResponse {
     let access = access_for_headers(&state.auth, &headers);
@@ -4762,16 +4778,46 @@ async fn flow_intents_json(
             .into_response();
     };
     let hosts = state.store.list();
-    let (status, response) = flow.handle_intent(
-        &state.auth,
-        &headers,
+    let selected_host = match flow_host::resolve_flow_host_scope(
+        query.host.as_deref(),
         &access,
         &hosts,
-        None,
-        request,
-        now_unix(),
-    );
+    ) {
+        Ok(selected_host) => selected_host,
+        Err(reason) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(flow_host::FlowIntentResponse {
+                    executed: false,
+                    error: Some(reason),
+                    ..Default::default()
+                }),
+            )
+                .into_response();
+        }
+    };
+    let (status, response) = flow
+        .handle_intent(
+            &state.auth,
+            &headers,
+            &access,
+            &hosts,
+            selected_host.as_deref(),
+            request,
+            now_unix(),
+        )
+        .await;
     (status, Json(response)).into_response()
+}
+
+#[derive(Deserialize)]
+struct FlowHostQuery {
+    host: Option<String>,
+}
+
+async fn flow_host_bootstrap() -> impl IntoResponse {
+    let (bytes, content_type) = flow_host::flow_bootstrap_asset();
+    ([(header::CONTENT_TYPE, content_type)], bytes.to_vec()).into_response()
 }
 
 async fn flow_shell_asset(
@@ -5805,8 +5851,8 @@ mod tests {
             .await
             .expect("secured HTML body");
         let body = std::str::from_utf8(&body).expect("secured HTML is UTF-8");
-        assert!(body.contains(&format!(r#"<style nonce="{nonce}">"#)));
-        assert!(body.contains(&format!(r#"<script nonce="{nonce}">"#)));
+        assert!(body.contains(&format!(r#"<style nonce="{nonce}" "#)));
+        assert!(body.contains(&format!(r#"<script nonce="{nonce}" "#)));
     }
 
     #[tokio::test]

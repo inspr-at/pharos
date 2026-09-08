@@ -59,6 +59,7 @@ fn human_routes() -> Router<AppState> {
             "/assets/vendor/flow-shell/{*path}",
             get(flow_shell_asset),
         )
+        .route("/assets/flow-host-bootstrap.mjs", get(flow_host_bootstrap))
         .route("/setup/provider-plan.json", get(setup_provider_plan_json))
         .route("/setup/provisioning-jobs", post(create_provisioning_job))
         .route("/host-need-intents", post(create_host_need_intent))

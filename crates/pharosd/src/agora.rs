@@ -308,6 +308,8 @@ pub(crate) async fn host_workspace_page(
             },
         ),
         crate::flow_mount_enabled(&state),
+        Some(&selected.name),
+        state.flow_host.as_deref(),
     ))
 }
 

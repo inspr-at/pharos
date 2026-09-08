@@ -434,6 +434,7 @@ impl Auth {
             return Ok(AuthState {
                 human: None,
                 machine,
+                #[cfg(test)]
                 fixed_user: None,
                 #[cfg(test)]
                 fixed_access: None,
@@ -487,6 +488,7 @@ impl Auth {
                 session_rate: Mutex::new(RateWindow::default()),
             })),
             machine,
+            #[cfg(test)]
             fixed_user: None,
             #[cfg(test)]
             fixed_access: None,

@@ -4,7 +4,7 @@
 //! Pharos-issued `local_host` identity, and guarded Review/Start navigation.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,7 +122,11 @@ struct CachedProjection {
     paimos_evaluated_at: String,
 }
 
+const PAIMOS_PROJECT_REF_17: &str = "paimos:proj-9b2899fb59591130607952d66fcb5607";
+const PAIMOS_PROJECT_REF_99: &str = "paimos:proj-492d86f8b3c9707ece3f9fb96f07682a";
+
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct FlowShellResponse {
     enabled: bool,
     mount_shell: bool,
@@ -131,12 +135,11 @@ pub(crate) struct FlowShellResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     shell_state: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    identity_context: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     projection_meta: Option<ProjectionMeta>,
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectionMeta {
     evaluated_at: String,
     fresh_until: String,
@@ -219,13 +222,12 @@ impl FlowHostService {
                 mount_shell: true,
                 unavailable_reason: Some(reason),
                 shell_state: None,
-                identity_context: None,
                 projection_meta: None,
             },
         }
     }
 
-    pub(crate) fn handle_intent(
+    pub(crate) async fn handle_intent(
         &self,
         auth: &AuthState,
         headers: &HeaderMap,
@@ -273,7 +275,8 @@ impl FlowHostService {
             }
         };
         if is_consequential(intent_type) {
-            if let Some(issues) = self.validate_submitted_identity(&context, &request.identity, now)
+            if let Some(issues) =
+                self.validate_submitted_identity(&context, &request.identity, now)
             {
                 let status = if issues.iter().any(|issue| issue.contains("human")) {
                     StatusCode::FORBIDDEN
@@ -292,13 +295,33 @@ impl FlowHostService {
             }
         }
         let review_url = self.review_url(context.binding.project_id);
+        let projection = if is_consequential(intent_type) {
+            self.fetch_projection(&context, now).await.ok()
+        } else {
+            None
+        };
+        let start_allowed = projection
+            .as_ref()
+            .map(|entry| start_permitted(&entry.shell_state, now))
+            .unwrap_or(false);
         match intent_type {
+            "flow:start-intent" if !start_allowed => (
+                StatusCode::OK,
+                FlowIntentResponse {
+                    executed: false,
+                    routed: None,
+                    notice: Some(
+                        "Start stays blocked until requirements and current context are fresh. Review remains available.".to_string(),
+                    ),
+                    ..Default::default()
+                },
+            ),
             "flow:start-intent" => (
                 StatusCode::OK,
                 FlowIntentResponse {
                     executed: false,
                     routed: Some("paimos-project-overview-baseline".to_string()),
-                    location: Some(review_url),
+                    location: self.valid_navigation_location(&review_url),
                     notice: Some(
                         "Start stays on the configured Paimos project overview baseline controls. Pharos does not start delivery.".to_string(),
                     ),
@@ -310,23 +333,26 @@ impl FlowHostService {
                 FlowIntentResponse {
                     executed: false,
                     routed: Some("paimos-project-overview-baseline".to_string()),
-                    location: Some(review_url),
+                    location: self.valid_navigation_location(&review_url),
                     notice: Some(
                         "Review stays on the configured Paimos project overview baseline controls.".to_string(),
                     ),
                     ..Default::default()
                 },
             ),
-            "flow:header-project" => (
-                StatusCode::OK,
-                FlowIntentResponse {
-                    executed: false,
-                    routed: Some("paimos-project-overview".to_string()),
-                    location: Some(self.project_overview_url(context.binding.project_id)),
-                    notice: Some("Project navigation stays in configured Paimos.".to_string()),
-                    ..Default::default()
-                },
-            ),
+            "flow:header-project" => {
+                let location = self.project_overview_url(context.binding.project_id);
+                (
+                    StatusCode::OK,
+                    FlowIntentResponse {
+                        executed: false,
+                        routed: Some("paimos-project-overview".to_string()),
+                        location: self.valid_navigation_location(&location),
+                        notice: Some("Project navigation stays in configured Paimos.".to_string()),
+                        ..Default::default()
+                    },
+                )
+            }
             "flow:header-account" => (
                 StatusCode::OK,
                 FlowIntentResponse {
@@ -363,6 +389,8 @@ impl FlowHostService {
                 let shell_state = merge_shell_state(
                     &projection.shell_state,
                     &self.config,
+                    &context,
+                    &identity,
                     hosts,
                     selected_host,
                     now,
@@ -372,7 +400,6 @@ impl FlowHostService {
                     mount_shell: true,
                     unavailable_reason: None,
                     shell_state: Some(shell_state),
-                    identity_context: Some(identity),
                     projection_meta: Some(ProjectionMeta {
                         evaluated_at: projection.paimos_evaluated_at.clone(),
                         fresh_until: iso_timestamp(next_ten_minute_boundary(now)),
@@ -390,7 +417,6 @@ impl FlowHostService {
                 mount_shell: true,
                 unavailable_reason: Some(reason.to_string()),
                 shell_state: None,
-                identity_context: None,
                 projection_meta: None,
             },
             Err(_) => FlowShellResponse {
@@ -400,7 +426,6 @@ impl FlowHostService {
                     "Configured Paimos projection is unavailable right now.".to_string(),
                 ),
                 shell_state: None,
-                identity_context: None,
                 projection_meta: None,
             },
         }
@@ -420,9 +445,7 @@ impl FlowHostService {
             .ok_or_else(|| "A verified human Pharos session is required.".to_string())?;
         let binding = self
             .select_binding(&user, access, selected_host)
-            .ok_or_else(|| {
-                "No configured Flow binding matches this operator and host scope.".to_string()
-            })?;
+            .map_err(|reason| reason.to_string())?;
         let binding_ref = pharos_opaque_ref(
             &self.config.host_id,
             "bind",
@@ -455,8 +478,8 @@ impl FlowHostService {
         user: &AuthUser,
         access: &AccessGrant,
         selected_host: Option<&str>,
-    ) -> Option<FlowBinding> {
-        let mut matches: Vec<&FlowBinding> = self
+    ) -> Result<FlowBinding, &'static str> {
+        let matches: Vec<&FlowBinding> = self
             .config
             .bindings
             .iter()
@@ -466,8 +489,13 @@ impl FlowHostService {
                 selected_host.is_none_or(|host| binding.hosts.iter().any(|allowed| allowed == host))
             })
             .collect();
-        matches.sort_by_key(|binding| binding.project_id);
-        matches.first().cloned().cloned()
+        if matches.is_empty() {
+            return Err("No configured Flow binding matches this operator and host scope.");
+        }
+        if matches.len() > 1 {
+            return Err("Multiple configured Flow bindings match; host scope is required.");
+        }
+        Ok(matches[0].clone())
     }
 
     async fn fetch_projection(
@@ -536,10 +564,7 @@ impl FlowHostService {
             .await
             .map_err(|_| FlowError::Transport)?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|_| FlowError::Transport)?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(FlowError::Unavailable("projection response too large"));
-        }
+        let bytes = bounded_response_bytes(response).await?;
         if status == HttpStatus::NOT_FOUND || status == HttpStatus::FORBIDDEN {
             return Err(FlowError::Unavailable(
                 "Configured Paimos project projection is unavailable for this binding.",
@@ -626,7 +651,7 @@ impl FlowHostService {
                 .get("expiresAt")
                 .or_else(|| submitted.get("expires_at")),
         )
-            .is_none_or(|expires| now >= expires)
+        .is_none_or(|expires| now >= expires)
         {
             issues.push("Host identity context has expired.".to_string());
         }
@@ -638,6 +663,27 @@ impl FlowHostService {
         .is_none_or(|fresh| now >= fresh)
         {
             issues.push("Host identity context is stale.".to_string());
+        }
+        for (label, current_value) in [
+            ("expires_at", current["expires_at"].as_str()),
+            ("fresh_until", current["fresh_until"].as_str()),
+        ] {
+            if let Some(current_value) = current_value {
+                let submitted_value = if label == "expires_at" {
+                    submitted
+                        .get("expiresAt")
+                        .or_else(|| submitted.get("expires_at"))
+                        .and_then(Value::as_str)
+                } else {
+                    submitted
+                        .get("freshUntil")
+                        .or_else(|| submitted.get("fresh_until"))
+                        .and_then(Value::as_str)
+                };
+                if submitted_value != Some(current_value) {
+                    issues.push(format!("Host identity context mismatch for {label}."));
+                }
+            }
         }
         if issues.is_empty() {
             None
@@ -661,6 +707,29 @@ impl FlowHostService {
             self.config.paimos_origin.as_str().trim_end_matches('/'),
             project_id
         )
+    }
+
+    fn valid_navigation_location(&self, location: &str) -> Option<String> {
+        let parsed = Url::parse(location).ok()?;
+        if parsed.origin() != self.config.paimos_origin.origin() {
+            return None;
+        }
+        if !parsed
+            .path()
+            .strip_prefix("/projects/")
+            .and_then(|tail| tail.split('/').next())
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some()
+        {
+            return None;
+        }
+        let query_ok = parsed
+            .query()
+            .is_some_and(|query| query.split('&').any(|part| part == "tab=overview"));
+        if !query_ok || !parsed.username().is_empty() || parsed.password().is_some() {
+            return None;
+        }
+        Some(location.to_string())
     }
 }
 
@@ -770,58 +839,47 @@ impl Default for FlowIntentResponse {
     }
 }
 
-pub(crate) fn inject_flow_shell(html: String, mount: bool) -> String {
+pub(crate) fn inject_flow_shell(
+    html: String,
+    mount: bool,
+    selected_host: Option<&str>,
+    flow: Option<&FlowHostService>,
+) -> String {
     if !mount {
         return html;
     }
+    let host_attr = selected_host
+        .map(|host| format!(" data-flow-host-scope=\"{}\"", html_escape_attr(host)))
+        .unwrap_or_default();
+    let origin_attr = flow
+        .map(|service| {
+            format!(
+                " data-flow-paimos-origin=\"{}\"",
+                html_escape_attr(service.config.paimos_origin.as_str())
+            )
+        })
+        .unwrap_or_default();
     let wrapped = html.replace(
         "<main",
-        "<inspr-flow-shell layout-mode=\"bounded\" content-padding=\"34px\" data-flow-host><main",
+        &format!(
+            "<inspr-flow-shell layout-mode=\"bounded\" content-padding=\"34px\" data-flow-host{host_attr}{origin_attr}><main"
+        ),
     );
     let wrapped = wrapped.replace("</main>", "</main></inspr-flow-shell>");
-    let bootstrap = r#"<script type="module">
-import '/assets/vendor/flow-shell/src/inspr-flow-shell.js';
-const shell = document.querySelector('inspr-flow-shell');
-if (shell) {
-  let generation = 0;
-  const refresh = async () => {
-    const next = generation + 1;
-    generation = next;
-    const response = await fetch('/flow/shell-state.json', { credentials: 'same-origin', cache: 'no-store' });
-    if (!response.ok || generation !== next) return;
-    const payload = await response.json();
-    if (generation !== next) return;
-    if (!payload.enabled) return;
-    if (payload.shellState) shell.shellState = payload.shellState;
-    if (payload.identityContext) shell.identityContext = payload.identityContext;
-  };
-  shell.addEventListener('flow-intent', async (event) => {
-    const response = await fetch('/flow/intents', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: event.detail?.type, identity: event.detail?.identity, detail: event.detail }),
-    });
-    const result = await response.json();
-    if (result.location && typeof result.location === 'string') {
-      const origin = new URL(document.baseURI).origin;
-      const target = new URL(result.location, origin);
-      if (target.origin === origin || result.location.startsWith('http')) {
-        window.location.assign(result.location);
-      }
-    }
-  });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
-  refresh();
-  setInterval(refresh, 600000);
-}
-</script>"#;
+    let bootstrap = r#"<script type="module" src="/assets/flow-host-bootstrap.mjs"></script>"#;
     if let Some(index) = wrapped.rfind("</body>") {
         let mut output = wrapped;
         output.insert_str(index, bootstrap);
         return output;
     }
     format!("{wrapped}{bootstrap}")
+}
+
+pub(crate) fn flow_bootstrap_asset() -> (&'static [u8], &'static str) {
+    (
+        include_bytes!("../assets/flow-host-bootstrap.mjs"),
+        "text/javascript",
+    )
 }
 
 pub(crate) fn flow_static_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
@@ -881,17 +939,17 @@ pub(crate) fn flow_static_asset(path: &str) -> Option<(&'static [u8], &'static s
 fn merge_shell_state(
     upstream: &Value,
     config: &FlowHostConfig,
+    context: &ResolvedContext,
+    identity: &Value,
     hosts: &[Host],
     selected_host: Option<&str>,
     now: i64,
 ) -> Value {
     let mut shell = upstream.clone();
-    let project_name = shell
-        .get("header")
-        .and_then(|value| value.get("projectName"))
-        .and_then(Value::as_str)
-        .unwrap_or("Project")
-        .to_string();
+    if let Some(object) = shell.as_object_mut() {
+        object.remove("identityContext");
+    }
+    let project_name = context.binding.label.clone();
     if let Some(header) = shell.get_mut("header").and_then(Value::as_object_mut) {
         header.insert("appName".into(), Value::String("Pharos".into()));
         header.insert(
@@ -904,6 +962,14 @@ fn merge_shell_state(
             "projectSubtitle".into(),
             Value::String("Pharos host projection · upstream observations".into()),
         );
+        if let Some(display) = identity.get("display").and_then(Value::as_object) {
+            if let Some(label) = display.get("user_label").and_then(Value::as_str) {
+                header.insert("userLabel".into(), Value::String(label.to_string()));
+            }
+            if let Some(initials) = display.get("user_initials").and_then(Value::as_str) {
+                header.insert("userInitials".into(), Value::String(initials.to_string()));
+            }
+        }
     }
     if let Some(health) = shell.get_mut("health").and_then(Value::as_object_mut) {
         if let Some(host_name) = selected_host {
@@ -920,6 +986,9 @@ fn merge_shell_state(
             }
         }
     }
+    if let Some(object) = shell.as_object_mut() {
+        object.insert("identityContext".into(), identity.clone());
+    }
     shell
 }
 
@@ -931,6 +1000,7 @@ fn local_health_status(host: &Host, now: i64) -> String {
         Liveness::AwaitingFirstHeartbeat => "awaiting".to_string(),
     }
 }
+
 fn issue_identity(
     config: &FlowHostConfig,
     context: &ResolvedContext,
@@ -1028,7 +1098,69 @@ fn opaque_ref(host_id: &str, kind: &str, parts: &[String]) -> String {
         hasher.update(part.as_bytes());
         hasher.update([0]);
     }
-    format!("{host_id}:{kind}-{}", hex_bytes(&hasher.finalize()))
+    let digest = hasher.finalize();
+    format!("{host_id}:{kind}-{}", hex_bytes(&digest[..16]))
+}
+
+fn start_permitted(shell_state: &Value, now: i64) -> bool {
+    let requirements_pass = shell_state
+        .get("prerequisites")
+        .and_then(|value| value.get("requirementsBaseline"))
+        .and_then(|gate| gate.get("status"))
+        .and_then(Value::as_str) == Some("pass");
+    let evaluated_at = shell_state
+        .get("evaluatedAt")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_rfc3339(Some(&Value::String(value.to_string()))));
+    let evaluation_fresh = evaluated_at.is_some_and(|evaluated| {
+        now >= evaluated && now - evaluated <= 8 * 3600
+    });
+    requirements_pass && evaluation_fresh
+}
+
+fn html_escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+async fn bounded_response_bytes(response: reqwest::Response) -> Result<Vec<u8>, FlowError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(FlowError::Unavailable("projection response too large"));
+    }
+    let mut body = Vec::new();
+    let mut stream = response;
+    while let Some(chunk) = stream.chunk().await.map_err(|_| FlowError::Transport)? {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(FlowError::Unavailable("projection response too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(crate) fn resolve_flow_host_scope(
+    host: Option<&str>,
+    access: &AccessGrant,
+    hosts: &[Host],
+) -> Result<Option<String>, String> {
+    match host.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(host) => {
+            if !access.allows_host(host) {
+                return Err("access denied for requested host scope".to_string());
+            }
+            if !hosts.iter().any(|entry| entry.name == host) {
+                return Err("requested host is not in current fleet".to_string());
+            }
+            Ok(Some(host.to_string()))
+        }
+    }
 }
 
 fn initials_from_ref(reference: &str) -> String {
@@ -1114,6 +1246,26 @@ fn loopback_origin_for_tests(value: &str) -> Url {
 }
 
 fn read_config_file(path: &Path) -> Result<Vec<u8>, String> {
+    read_bounded_private_file(path, MAX_CONFIG_BYTES).map_err(|_| "invalid flow host configuration".to_string())
+}
+
+fn read_api_key(path: &Path) -> Result<String, FlowError> {
+    let bytes = read_bounded_private_file(path, MAX_API_KEY_BYTES).map_err(|_| FlowError::Credential)?;
+    if bytes.len() < 32 || bytes.len() as u64 > MAX_API_KEY_BYTES {
+        return Err(FlowError::Credential);
+    }
+    if !bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)) {
+        return Err(FlowError::Credential);
+    }
+    String::from_utf8(bytes).map_err(|_| FlowError::Credential)
+}
+
+fn read_bounded_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, FlowError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| FlowError::Credential)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(FlowError::Credential);
+    }
+    validate_private_file_metadata(&metadata, max_bytes)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1121,41 +1273,46 @@ fn read_config_file(path: &Path) -> Result<Vec<u8>, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|_| "invalid flow host configuration".to_string())?;
+    let mut file = options.open(path).map_err(|_| FlowError::Credential)?;
+    let opened_metadata = file.metadata().map_err(|_| FlowError::Credential)?;
+    validate_private_file_metadata(&opened_metadata, max_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != opened_metadata.dev() || metadata.ino() != opened_metadata.ino() {
+            return Err(FlowError::Credential);
+        }
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|_| "invalid flow host configuration".to_string())?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_CONFIG_BYTES {
-        return Err("invalid flow host configuration".to_string());
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| FlowError::Credential)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(FlowError::Credential);
     }
     Ok(bytes)
 }
 
-fn read_api_key(path: &Path) -> Result<String, FlowError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(path).map_err(|_| FlowError::Credential)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_API_KEY_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| FlowError::Credential)?;
-    if bytes.len() < 32 || bytes.len() as u64 > MAX_API_KEY_BYTES {
-        bytes.fill(0);
+#[cfg(unix)]
+fn validate_private_file_metadata(metadata: &fs::Metadata, max_bytes: u64) -> Result<(), FlowError> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(FlowError::Credential);
     }
-    if !bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)) {
-        bytes.fill(0);
+    let expected_uid = unsafe { libc::getuid() };
+    if metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
         return Err(FlowError::Credential);
     }
-    let key = String::from_utf8(bytes).map_err(|_| FlowError::Credential)?;
-    Ok(key)
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_file_metadata(metadata: &fs::Metadata, max_bytes: u64) -> Result<(), FlowError> {
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(FlowError::Credential);
+    }
+    Ok(())
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -1184,6 +1341,26 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
 
+    fn write_private_key(path: &Path, content: &[u8]) {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .expect("private key file");
+            file.write_all(content).expect("private key bytes");
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, content).expect("private key bytes");
+        }
+    }
+
     fn sample_config(origin: &Url, api_key_file: PathBuf) -> FlowHostConfig {
         FlowHostConfig {
             enabled: true,
@@ -1193,7 +1370,7 @@ mod tests {
             instance_label: "Pharos test".to_string(),
             bindings: vec![FlowBinding {
                 project_id: 17,
-                expected_project_ref: paimos_opaque_ref("proj", &["17".to_string()]),
+                expected_project_ref: PAIMOS_PROJECT_REF_17.to_string(),
                 label: "Test project".to_string(),
                 hosts: vec!["hsb8".to_string()],
                 operator_refs: HashSet::from(["operator-a".to_string()]),
@@ -1204,17 +1381,19 @@ mod tests {
 
     fn sample_state() -> Value {
         json!({
-            "evaluatedAt": "2026-09-08T08:00:00.000Z",
-            "header": {"appName": "Paimos", "projectName": "Test"},
+            "evaluatedAt": "2023-11-14T22:13:20.000Z",
+            "header": {"appName": "Paimos", "projectName": "Upstream", "userLabel": "Machine", "userInitials": "MC"},
             "health": {"status": "available"},
             "delivery": {"status": "draft"},
-            "prerequisites": {},
+            "prerequisites": {
+                "requirementsBaseline": {"status": "pass", "gateKind": "requirements_baseline"}
+            },
             "progress": {},
             "executionModes": ["manual"],
             "selectedExecutionMode": "manual",
             "selectedAction": "build",
             "identityContext": {
-                "project_ref": paimos_opaque_ref("proj", &["17".to_string()])
+                "project_ref": PAIMOS_PROJECT_REF_17
             }
         })
     }
@@ -1236,6 +1415,51 @@ mod tests {
     }
 
     #[test]
+    fn paimos_opaque_ref_matches_literal_fixture() {
+        assert_eq!(
+            paimos_opaque_ref("proj", &["17".to_string()]),
+            PAIMOS_PROJECT_REF_17
+        );
+        assert_eq!(
+            paimos_opaque_ref("proj", &["99".to_string()]),
+            PAIMOS_PROJECT_REF_99
+        );
+    }
+
+    #[test]
+    fn wire_response_uses_camel_case_and_embedded_identity() {
+        let shell_state = json!({
+            "evaluatedAt": "2023-11-14T22:13:20.000Z",
+            "identityContext": {"project_ref": "pharos:proj-test"},
+            "header": {"userLabel": "Operator"}
+        });
+        let response = FlowShellResponse {
+            enabled: true,
+            mount_shell: true,
+            unavailable_reason: None,
+            shell_state: Some(shell_state),
+            projection_meta: None,
+        };
+        let wire = serde_json::to_value(response).expect("wire json");
+        assert!(wire.get("shellState").is_some());
+        assert!(wire.get("shell_state").is_none());
+        assert!(wire.get("identityContext").is_none());
+        assert_eq!(wire["mountShell"], true);
+    }
+
+    #[test]
+    fn bootstrap_is_external_module_with_host_scope() {
+        let html = inject_flow_shell(
+            "<body><main></main></body>".to_string(),
+            true,
+            Some("hsb8"),
+            None,
+        );
+        assert!(html.contains("data-flow-host-scope=\"hsb8\""));
+        assert!(html.contains("/assets/flow-host-bootstrap.mjs"));
+    }
+
+    #[test]
     fn vendor_manifest_matches_embedded_assets() {
         let manifest = include_str!("../assets/vendor/flow-shell/manifest.json");
         let parsed: Value = serde_json::from_str(manifest).expect("manifest json");
@@ -1254,7 +1478,7 @@ mod tests {
     async fn configured_projection_and_intent_navigation() {
         let (origin, server) = serve_paimos(sample_state()).await;
         let key_path = std::env::temp_dir().join(format!("pharos-flow-key-{}", std::process::id()));
-        std::fs::write(&key_path, b"01234567890123456789012345678901").unwrap();
+        write_private_key(&key_path, b"01234567890123456789012345678901");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1274,34 +1498,50 @@ mod tests {
         let headers = HeaderMap::new();
         let access = AccessGrant::limited(["hsb8"], true);
         let response = service
-            .shell_state(&auth, &headers, &access, &[], None, 1_700_000_000)
+            .shell_state(
+                &auth,
+                &headers,
+                &access,
+                &[],
+                Some("hsb8"),
+                1_700_000_000,
+            )
             .await;
-        assert!(response.shell_state.is_some());
-        assert!(response.identity_context.is_some());
-        let identity = response.identity_context.unwrap();
+        let wire = serde_json::to_value(&response).expect("wire json");
+        let shell_state = response.shell_state.expect("shell state");
+        assert!(wire.get("shellState").is_some());
+        let identity = shell_state
+            .get("identityContext")
+            .expect("embedded identity");
         assert_eq!(identity["principal_kind"], "local_host");
-        let (status, intent) = service.handle_intent(
-            &auth,
-            &headers,
-            &access,
-            &[],
-            None,
-            FlowIntentRequest {
-                intent_type: "flow:review-batch".to_string(),
-                identity: Some(json!({
-                    "status": "present",
-                    "principal_ref": identity["principal_ref"],
-                    "project_ref": identity["project_ref"],
-                    "binding_ref": identity["binding_ref"],
-                    "context_revision": identity["context_revision"],
-                    "actor_kind": "human",
-                    "expires_at": identity["expires_at"],
-                    "fresh_until": identity["fresh_until"]
-                })),
-                detail: None,
-            },
-            1_700_000_000,
+        assert_eq!(
+            shell_state["header"]["userLabel"],
+            "Operator"
         );
+        let (status, intent) = service
+            .handle_intent(
+                &auth,
+                &headers,
+                &access,
+                &[],
+                Some("hsb8"),
+                FlowIntentRequest {
+                    intent_type: "flow:review-batch".to_string(),
+                    identity: Some(json!({
+                        "status": "present",
+                        "principal_ref": identity["principal_ref"],
+                        "project_ref": identity["project_ref"],
+                        "binding_ref": identity["binding_ref"],
+                        "context_revision": identity["context_revision"],
+                        "actor_kind": "human",
+                        "expires_at": identity["expires_at"],
+                        "fresh_until": identity["fresh_until"]
+                    })),
+                    detail: None,
+                },
+                1_700_000_000,
+            )
+            .await;
         assert_eq!(status, StatusCode::OK, "intent error: {:?}", intent.error);
         assert!(!intent.executed);
         assert!(intent.location.unwrap().contains("/projects/17?tab=overview#baseline-batch"));
@@ -1323,10 +1563,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_wrong_paimos_project_ref() {
         let mut state = sample_state();
-        state["identityContext"]["project_ref"] = json!(paimos_opaque_ref("proj", &["99".to_string()]));
+        state["identityContext"]["project_ref"] = json!(PAIMOS_PROJECT_REF_99);
         let (origin, server) = serve_paimos(state).await;
         let key_path = std::env::temp_dir().join(format!("pharos-flow-key-wrong-{}", std::process::id()));
-        std::fs::write(&key_path, b"01234567890123456789012345678901").unwrap();
+        write_private_key(&key_path, b"01234567890123456789012345678901");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1367,7 +1607,7 @@ mod tests {
         let (origin, server) = serve_paimos(sample_state()).await;
         let key_path =
             std::env::temp_dir().join(format!("pharos-flow-key-operator-{}", std::process::id()));
-        std::fs::write(&key_path, b"01234567890123456789012345678901").unwrap();
+        write_private_key(&key_path, b"01234567890123456789012345678901");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1408,7 +1648,7 @@ mod tests {
         let (origin, server) = serve_paimos(sample_state()).await;
         let key_path =
             std::env::temp_dir().join(format!("pharos-flow-key-expired-{}", std::process::id()));
-        std::fs::write(&key_path, b"01234567890123456789012345678901").unwrap();
+        write_private_key(&key_path, b"01234567890123456789012345678901");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
             client: Client::builder()
@@ -1430,29 +1670,34 @@ mod tests {
         let response = service
             .shell_state(&auth, &headers, &access, &[], None, 1_700_000_000)
             .await;
-        let identity = response.identity_context.unwrap();
-        let (status, intent) = service.handle_intent(
-            &auth,
-            &headers,
-            &access,
-            &[],
-            None,
-            FlowIntentRequest {
-                intent_type: "flow:review-batch".to_string(),
-                identity: Some(json!({
-                    "status": "present",
-                    "principal_ref": identity["principal_ref"],
-                    "project_ref": identity["project_ref"],
-                    "binding_ref": identity["binding_ref"],
-                    "context_revision": identity["context_revision"],
-                    "actor_kind": "human",
-                    "expires_at": "2020-01-01T00:00:00Z",
-                    "fresh_until": identity["fresh_until"]
-                })),
-                detail: None,
-            },
-            1_700_000_000,
-        );
+        let identity = response
+            .shell_state
+            .and_then(|shell| shell.get("identityContext").cloned())
+            .expect("embedded identity");
+        let (status, intent) = service
+            .handle_intent(
+                &auth,
+                &headers,
+                &access,
+                &[],
+                Some("hsb8"),
+                FlowIntentRequest {
+                    intent_type: "flow:review-batch".to_string(),
+                    identity: Some(json!({
+                        "status": "present",
+                        "principal_ref": identity["principal_ref"],
+                        "project_ref": identity["project_ref"],
+                        "binding_ref": identity["binding_ref"],
+                        "context_revision": identity["context_revision"],
+                        "actor_kind": "human",
+                        "expires_at": "2020-01-01T00:00:00Z",
+                        "fresh_until": identity["fresh_until"]
+                    })),
+                    detail: None,
+                },
+                1_700_000_000,
+            )
+            .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(!intent.executed);
         assert!(intent
@@ -1461,6 +1706,81 @@ mod tests {
             .contains("expired"));
         server.abort();
         std::fs::remove_file(key_path).ok();
+    }
+
+    #[tokio::test]
+    async fn blocks_start_when_requirements_gate_is_missing() {
+        let mut state = sample_state();
+        state["prerequisites"] = json!({});
+        let (origin, server) = serve_paimos(state).await;
+        let key_path =
+            std::env::temp_dir().join(format!("pharos-flow-key-start-{}", std::process::id()));
+        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let service = FlowHostService {
+            config: sample_config(&origin, key_path.clone()),
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            cache: Arc::new(Mutex::new(ProjectionCache::default())),
+        };
+        let auth = AuthState::for_test_human(
+            AccessGrant::limited(["hsb8"], true),
+            AuthUser {
+                operator_ref: "operator-a".to_string(),
+                managed_human_session_ref: "sess".to_string(),
+                display_name: "Operator".to_string(),
+            },
+        );
+        let headers = HeaderMap::new();
+        let access = AccessGrant::limited(["hsb8"], true);
+        let response = service
+            .shell_state(&auth, &headers, &access, &[], Some("hsb8"), 1_700_000_000)
+            .await;
+        let identity = response
+            .shell_state
+            .and_then(|shell| shell.get("identityContext").cloned())
+            .expect("embedded identity");
+        let (status, intent) = service
+            .handle_intent(
+                &auth,
+                &headers,
+                &access,
+                &[],
+                Some("hsb8"),
+                FlowIntentRequest {
+                    intent_type: "flow:start-intent".to_string(),
+                    identity: Some(json!({
+                        "status": "present",
+                        "principal_ref": identity["principal_ref"],
+                        "project_ref": identity["project_ref"],
+                        "binding_ref": identity["binding_ref"],
+                        "context_revision": identity["context_revision"],
+                        "actor_kind": "human",
+                        "expires_at": identity["expires_at"],
+                        "fresh_until": identity["fresh_until"]
+                    })),
+                    detail: None,
+                },
+                1_700_000_000,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!intent.executed);
+        assert!(intent.location.is_none());
+        assert!(intent
+            .notice
+            .unwrap()
+            .contains("Start stays blocked"));
+        server.abort();
+        std::fs::remove_file(key_path).ok();
+    }
+
+    #[test]
+    fn resolve_flow_host_scope_rejects_unauthorized_host() {
+        let access = AccessGrant::limited(["other"], true);
+        let err = resolve_flow_host_scope(Some("hsb8"), &access, &[]).unwrap_err();
+        assert!(err.contains("access denied"));
     }
 }
 

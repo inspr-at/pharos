@@ -792,6 +792,8 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
             },
         ),
         crate::flow_mount_enabled(&state),
+        None,
+        state.flow_host.as_deref(),
     ))
 }
 
