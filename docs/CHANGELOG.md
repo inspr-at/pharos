@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 26.09.08.11.36.59 - 2026-09-08
+
+- Add opt-in shared Flow navigation to fleet and host workspaces, with host-verified identity and scoped Paimos projection. Review and Start route back to Paimos for fresh authorization; they never deploy from the Flow footer (PHAROS-257).
+- Keep fleet content and add-server controls usable when Flow is unavailable, and restore the shell automatically on full ten-minute boundaries, including recovery from an initial outage.
+- Exercise the shipped bootstrap with mock OIDC and Paimos browser tests, including denied or stale identity, guarded navigation and outage recovery. Existing Pharos deployment and verification handoffs remain unchanged.
+
 ## 26.09.07.22.08.13 - 2026-09-07
 
 - Refresh the immutable Debian bookworm-security snapshot so published images include the fixed `libssh2-1` package for CVE-2026-58050 and CVE-2026-7598; keep git, SSH, and restic runtime features, and keep the release vulnerability, SBOM, provenance, and signature gates fail-closed (PHAROS-206).
