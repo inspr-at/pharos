@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::{Client, StatusCode as HttpStatus};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::auth::{AccessGrant, AuthState, AuthUser};
 use crate::ui::APP_VERSION;
-use pharos_core::{Host, Liveness, liveness};
+use pharos_core::{liveness, Host, Liveness};
 
 pub(crate) const FLOW_CONFIG_ENV: &str = "PHAROS_FLOW_CONFIG_FILE";
 const CONFIG_SCHEMA: &str = "inspr.pharos.flow-host-config.v1";
@@ -39,6 +39,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTEXT_TTL_SECS: i64 = 8 * 3600;
 const PAIMOS_HOST_ID: &str = "paimos";
 const REVIEW_FRAGMENT: &str = "#baseline-batch";
+const FLOW_LOOPBACK_ORIGIN_ENV: &str = "PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN";
+const HOST_VERIFIED_HUMAN_LABEL: &str = "Host-verified human";
+const EVALUATION_MAX_AGE_SECS: i64 = 15 * 60;
+pub(crate) const FLOW_INTENT_MAX_BYTES: usize = 4 * 1024;
+
+#[cfg(test)]
+const PAIMOS_PROJECT_REF_17: &str = "paimos:proj-9b2899fb59591130607952d66fcb5607";
+#[cfg(test)]
+const PAIMOS_PROJECT_REF_99: &str = "paimos:proj-492d86f8b3c9707ece3f9fb96f07682a";
 
 static FETCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -47,7 +56,6 @@ enum FlowError {
     Configuration,
     Credential,
     Transport,
-    Refused(HttpStatus),
     Unavailable(&'static str),
 }
 
@@ -122,9 +130,6 @@ struct CachedProjection {
     paimos_evaluated_at: String,
 }
 
-const PAIMOS_PROJECT_REF_17: &str = "paimos:proj-9b2899fb59591130607952d66fcb5607";
-const PAIMOS_PROJECT_REF_99: &str = "paimos:proj-492d86f8b3c9707ece3f9fb96f07682a";
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FlowShellResponse {
@@ -157,10 +162,11 @@ pub(crate) struct FlowIntentRequest {
     #[serde(rename = "type")]
     intent_type: String,
     identity: Option<Value>,
+    #[serde(default)]
     detail: Option<Value>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Default)]
 pub(crate) struct FlowIntentResponse {
     pub(crate) executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,12 +204,18 @@ impl FlowHostService {
         }))
     }
 
-    pub(crate) fn configured(&self) -> bool {
-        true
-    }
-
-    pub(crate) fn mount_enabled(&self) -> bool {
-        self.config.enabled
+    pub(crate) fn mount_enabled_for(
+        &self,
+        auth: &AuthState,
+        headers: &HeaderMap,
+        access: &AccessGrant,
+        selected_host: Option<&str>,
+    ) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        self.resolve_context(auth, headers, access, selected_host)
+            .is_ok()
     }
 
     pub(crate) async fn shell_state(
@@ -216,10 +228,13 @@ impl FlowHostService {
         now: i64,
     ) -> FlowShellResponse {
         match self.resolve_context(auth, headers, access, selected_host) {
-            Ok(context) => self.projection_response(context, hosts, selected_host, now).await,
+            Ok(context) => {
+                self.projection_response(context, hosts, selected_host, now)
+                    .await
+            }
             Err(reason) => FlowShellResponse {
                 enabled: true,
-                mount_shell: true,
+                mount_shell: false,
                 unavailable_reason: Some(reason),
                 shell_state: None,
                 projection_meta: None,
@@ -227,6 +242,7 @@ impl FlowHostService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_intent(
         &self,
         auth: &AuthState,
@@ -274,10 +290,22 @@ impl FlowHostService {
                 );
             }
         };
-        if is_consequential(intent_type) {
-            if let Some(issues) =
-                self.validate_submitted_identity(&context, &request.identity, now)
-            {
+        let projection = if intent_type == "flow:start-intent" {
+            self.fetch_projection(&context, now).await.ok()
+        } else {
+            None
+        };
+        if requires_submitted_identity(intent_type) {
+            let source_revision = projection
+                .as_ref()
+                .map(|entry| entry.source_revision.as_str())
+                .unwrap_or("");
+            if let Some(issues) = self.validate_submitted_identity(
+                &context,
+                submitted_identity(&request),
+                source_revision,
+                now,
+            ) {
                 let status = if issues.iter().any(|issue| issue.contains("human")) {
                     StatusCode::FORBIDDEN
                 } else {
@@ -295,11 +323,6 @@ impl FlowHostService {
             }
         }
         let review_url = self.review_url(context.binding.project_id);
-        let projection = if is_consequential(intent_type) {
-            self.fetch_projection(&context, now).await.ok()
-        } else {
-            None
-        };
         let start_allowed = projection
             .as_ref()
             .map(|entry| start_permitted(&entry.shell_state, now))
@@ -385,7 +408,10 @@ impl FlowHostService {
     ) -> FlowShellResponse {
         match self.fetch_projection(&context, now).await {
             Ok(projection) => {
-                let identity = issue_identity(&self.config, &context, &projection, now);
+                let context_revision =
+                    context_revision_for(&self.config, &context, &projection.source_revision);
+                let identity =
+                    issue_identity(&self.config, &context, &context_revision, &projection, now);
                 let shell_state = merge_shell_state(
                     &projection.shell_state,
                     &self.config,
@@ -404,7 +430,7 @@ impl FlowHostService {
                         evaluated_at: projection.paimos_evaluated_at.clone(),
                         fresh_until: iso_timestamp(next_ten_minute_boundary(now)),
                         source_revision: projection.source_revision.clone(),
-                        context_revision: context.context_revision.clone(),
+                        context_revision,
                         binding_ref: context.binding_ref.clone(),
                         project_id: context.binding.project_id,
                         selected_host: selected_host.map(str::to_string),
@@ -414,14 +440,14 @@ impl FlowHostService {
             }
             Err(FlowError::Unavailable(reason)) => FlowShellResponse {
                 enabled: true,
-                mount_shell: true,
+                mount_shell: false,
                 unavailable_reason: Some(reason.to_string()),
                 shell_state: None,
                 projection_meta: None,
             },
             Err(_) => FlowShellResponse {
                 enabled: true,
-                mount_shell: true,
+                mount_shell: false,
                 unavailable_reason: Some(
                     "Configured Paimos projection is unavailable right now.".to_string(),
                 ),
@@ -455,21 +481,10 @@ impl FlowHostService {
                 &binding.project_id.to_string(),
             ],
         );
-        let context_revision = pharos_opaque_ref(
-            &self.config.host_id,
-            "ctxrev",
-            &[
-                &self.config.config_digest,
-                &user.operator_ref,
-                &binding.project_id.to_string(),
-                &binding.expected_project_ref,
-            ],
-        );
         Ok(ResolvedContext {
             user,
             binding,
             binding_ref,
-            context_revision,
         })
     }
 
@@ -484,7 +499,7 @@ impl FlowHostService {
             .bindings
             .iter()
             .filter(|binding| binding.operator_refs.contains(&user.operator_ref))
-            .filter(|binding| binding.hosts.iter().all(|host| access.allows_host(host)))
+            .filter(|binding| binding.hosts.iter().any(|host| access.allows_host(host)))
             .filter(|binding| {
                 selected_host.is_none_or(|host| binding.hosts.iter().any(|allowed| allowed == host))
             })
@@ -508,12 +523,8 @@ impl FlowHostService {
             operator_ref: context.user.operator_ref.clone(),
             host: None,
         };
-        let generation = FETCH_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let fresh_until = next_ten_minute_boundary(now);
         if let Some(cached) = self.cache.lock().expect("flow cache").entries.get(&key) {
-            if cached.fetched_at >= floor_ten_minute_boundary(now)
-                && cached.generation >= generation.saturating_sub(1)
-            {
+            if cached.fetched_at >= floor_ten_minute_boundary(now) {
                 return Ok(cached.clone());
             }
         }
@@ -529,7 +540,7 @@ impl FlowHostService {
             &[&context.binding.expected_project_ref, &evaluated_at],
         );
         let entry = CachedProjection {
-            generation,
+            generation: FETCH_GENERATION.fetch_add(1, Ordering::Relaxed),
             fetched_at: now,
             source_revision,
             shell_state: fetched,
@@ -540,7 +551,6 @@ impl FlowHostService {
             .expect("flow cache")
             .entries
             .insert(key, entry.clone());
-        let _ = fresh_until;
         Ok(entry)
     }
 
@@ -571,7 +581,9 @@ impl FlowHostService {
             ));
         }
         if !status.is_success() {
-            return Err(FlowError::Refused(status));
+            return Err(FlowError::Unavailable(
+                "Configured Paimos projection refused the upstream request.",
+            ));
         }
         let payload: Value = serde_json::from_slice(&bytes).map_err(|_| FlowError::Transport)?;
         validate_paimos_project_ref(&payload, &context.binding.expected_project_ref)?;
@@ -581,7 +593,8 @@ impl FlowHostService {
     fn validate_submitted_identity(
         &self,
         context: &ResolvedContext,
-        submitted: &Option<Value>,
+        submitted: Option<Value>,
+        source_revision: &str,
         now: i64,
     ) -> Option<Vec<String>> {
         let Some(submitted) = submitted else {
@@ -596,13 +609,15 @@ impl FlowHostService {
         if status != "present" {
             return Some(vec!["Host identity context was rejected.".to_string()]);
         }
+        let context_revision = context_revision_for(&self.config, context, source_revision);
         let current = issue_identity(
             &self.config,
             context,
+            &context_revision,
             &CachedProjection {
                 generation: 0,
                 fetched_at: now,
-                source_revision: context.context_revision.clone(),
+                source_revision: source_revision.to_string(),
                 shell_state: json!({}),
                 paimos_evaluated_at: iso_timestamp(now),
             },
@@ -630,11 +645,7 @@ impl FlowHostService {
                 current["context_revision"].as_str(),
                 ["contextRevision", "context_revision"],
             ),
-            (
-                "actor_kind",
-                Some("human"),
-                ["actorKind", "actor_kind"],
-            ),
+            ("actor_kind", Some("human"), ["actorKind", "actor_kind"]),
         ];
         for (label, expected, fields) in checks {
             if let Some(expected) = expected {
@@ -663,27 +674,6 @@ impl FlowHostService {
         .is_none_or(|fresh| now >= fresh)
         {
             issues.push("Host identity context is stale.".to_string());
-        }
-        for (label, current_value) in [
-            ("expires_at", current["expires_at"].as_str()),
-            ("fresh_until", current["fresh_until"].as_str()),
-        ] {
-            if let Some(current_value) = current_value {
-                let submitted_value = if label == "expires_at" {
-                    submitted
-                        .get("expiresAt")
-                        .or_else(|| submitted.get("expires_at"))
-                        .and_then(Value::as_str)
-                } else {
-                    submitted
-                        .get("freshUntil")
-                        .or_else(|| submitted.get("fresh_until"))
-                        .and_then(Value::as_str)
-                };
-                if submitted_value != Some(current_value) {
-                    issues.push(format!("Host identity context mismatch for {label}."));
-                }
-            }
         }
         if issues.is_empty() {
             None
@@ -717,9 +707,9 @@ impl FlowHostService {
         if !parsed
             .path()
             .strip_prefix("/projects/")
-            .and_then(|tail| tail.split('/').next())
-            .and_then(|id| id.parse::<u64>().ok())
-            .is_some()
+            .is_some_and(|tail| {
+                !tail.is_empty() && !tail.contains('/') && tail.parse::<u64>().is_ok()
+            })
         {
             return None;
         }
@@ -738,14 +728,13 @@ struct ResolvedContext {
     user: AuthUser,
     binding: FlowBinding,
     binding_ref: String,
-    context_revision: String,
 }
 
 impl FlowHostConfig {
     fn load(path: &Path) -> Result<Self, String> {
         let bytes = read_config_file(path)?;
-        let document: FlowConfigDocument =
-            serde_json::from_slice(&bytes).map_err(|_| "invalid flow host configuration".to_string())?;
+        let document: FlowConfigDocument = serde_json::from_slice(&bytes)
+            .map_err(|_| "invalid flow host configuration".to_string())?;
         if document.schema != CONFIG_SCHEMA
             || document.schema_version != CONFIG_SCHEMA_VERSION
             || !valid_host_id(&document.host_id)
@@ -762,7 +751,7 @@ impl FlowHostConfig {
         let bindings = document
             .bindings
             .into_iter()
-            .map(|binding| FlowBinding::from_document(binding))
+            .map(FlowBinding::from_document)
             .collect::<Result<Vec<_>, _>>()?;
         let config_digest = hex_digest(&bytes);
         let host_id = document.host_id;
@@ -822,20 +811,6 @@ impl FlowBinding {
             hosts,
             operator_refs,
         })
-    }
-}
-
-impl Default for FlowIntentResponse {
-    fn default() -> Self {
-        Self {
-            executed: false,
-            routed: None,
-            location: None,
-            reason: None,
-            notice: None,
-            error: None,
-            issues: None,
-        }
     }
 }
 
@@ -962,10 +937,11 @@ fn merge_shell_state(
             "projectSubtitle".into(),
             Value::String("Pharos host projection · upstream observations".into()),
         );
+        header.insert(
+            "userLabel".into(),
+            Value::String(context.user.display_name.clone()),
+        );
         if let Some(display) = identity.get("display").and_then(Value::as_object) {
-            if let Some(label) = display.get("user_label").and_then(Value::as_str) {
-                header.insert("userLabel".into(), Value::String(label.to_string()));
-            }
             if let Some(initials) = display.get("user_initials").and_then(Value::as_str) {
                 header.insert("userInitials".into(), Value::String(initials.to_string()));
             }
@@ -974,11 +950,9 @@ fn merge_shell_state(
     if let Some(health) = shell.get_mut("health").and_then(Value::as_object_mut) {
         if let Some(host_name) = selected_host {
             if let Some(host) = hosts.iter().find(|host| host.name == host_name) {
-                health.insert("status".into(), Value::String(local_health_status(host, now)));
-                health.insert(
-                    "label".into(),
-                    Value::String(format!("Pharos host {host_name}")),
-                );
+                let (health_status, health_label) = local_health_status(host, now);
+                health.insert("status".into(), Value::String(health_status));
+                health.insert("label".into(), Value::String(health_label));
                 health.insert(
                     "checkedLabel".into(),
                     Value::String("Local Pharos lifecycle observation".into()),
@@ -992,29 +966,27 @@ fn merge_shell_state(
     shell
 }
 
-fn local_health_status(host: &Host, now: i64) -> String {
-    match liveness(host.last_seen, host.heartbeat_interval_secs, now) {
-        Liveness::Live => "live".to_string(),
-        Liveness::Stale => "stale".to_string(),
-        Liveness::Down => "down".to_string(),
-        Liveness::AwaitingFirstHeartbeat => "awaiting".to_string(),
-    }
+fn local_health_status(host: &Host, now: i64) -> (String, String) {
+    let label = format!("Pharos host {}", host.name);
+    let status = match liveness(host.last_seen, host.heartbeat_interval_secs, now) {
+        Liveness::Live => "available",
+        Liveness::Stale => "degraded",
+        Liveness::Down | Liveness::AwaitingFirstHeartbeat => "unknown",
+    };
+    (status.to_string(), label)
 }
 
 fn issue_identity(
     config: &FlowHostConfig,
     context: &ResolvedContext,
+    context_revision: &str,
     _projection: &CachedProjection,
     now: i64,
 ) -> Value {
     let issued = iso_timestamp(now);
     let expires = iso_timestamp(now + CONTEXT_TTL_SECS);
     let fresh_until = iso_timestamp(next_ten_minute_boundary(now));
-    let principal_ref = pharos_opaque_ref(
-        &config.host_id,
-        "prin",
-        &[&context.user.operator_ref],
-    );
+    let principal_ref = pharos_opaque_ref(&config.host_id, "prin", &[&context.user.operator_ref]);
     let project_id = context.binding.project_id.to_string();
     let project_ref = pharos_opaque_ref(&config.host_id, "proj", &[&project_id]);
     json!({
@@ -1030,10 +1002,10 @@ fn issue_identity(
         "issued_at": issued,
         "expires_at": expires,
         "fresh_until": fresh_until,
-        "context_revision": context.context_revision,
+        "context_revision": context_revision,
         "authority_disclaimer": AUTHORITY_DISCLAIMER,
         "display": {
-            "user_label": context.user.display_name,
+            "user_label": HOST_VERIFIED_HUMAN_LABEL,
             "user_initials": initials_from_ref(&principal_ref),
             "project_label": context.binding.label,
             "fixture_label": "Host-verified Pharos human context. Not live Paimos identity."
@@ -1064,7 +1036,9 @@ fn validate_paimos_project_ref(payload: &Value, expected: &str) -> Result<(), Fl
     if actual == Some(expected) {
         Ok(())
     } else {
-        Err(FlowError::Unavailable("configured project binding mismatch"))
+        Err(FlowError::Unavailable(
+            "configured project binding mismatch",
+        ))
     }
 }
 
@@ -1076,10 +1050,39 @@ fn human_user(auth: &AuthState, headers: &HeaderMap) -> Option<AuthUser> {
     auth.human_user(headers)
 }
 
-fn is_consequential(intent_type: &str) -> bool {
-    matches!(
-        intent_type,
-        "flow:start-intent" | "flow:review-batch" | "flow:save-proposal"
+fn requires_submitted_identity(intent_type: &str) -> bool {
+    intent_type == "flow:start-intent"
+}
+
+fn submitted_identity(request: &FlowIntentRequest) -> Option<Value> {
+    request.identity.clone().or_else(|| {
+        request.detail.as_ref().and_then(|detail| {
+            detail.get("identity").cloned().or_else(|| {
+                detail
+                    .get("detail")
+                    .and_then(|nested| nested.get("identity"))
+                    .cloned()
+            })
+        })
+    })
+}
+
+fn context_revision_for(
+    config: &FlowHostConfig,
+    context: &ResolvedContext,
+    source_revision: &str,
+) -> String {
+    pharos_opaque_ref(
+        &config.host_id,
+        "ctxrev",
+        &[
+            &config.config_digest,
+            &context.user.operator_ref,
+            &context.user.managed_human_session_ref,
+            &context.binding.project_id.to_string(),
+            &context.binding.expected_project_ref,
+            source_revision,
+        ],
     )
 }
 
@@ -1088,7 +1091,14 @@ fn paimos_opaque_ref(kind: &str, parts: &[String]) -> String {
 }
 
 fn pharos_opaque_ref(host_id: &str, kind: &str, parts: &[&str]) -> String {
-    opaque_ref(host_id, kind, &parts.iter().map(|part| part.to_string()).collect::<Vec<_>>())
+    opaque_ref(
+        host_id,
+        kind,
+        &parts
+            .iter()
+            .map(|part| part.to_string())
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn opaque_ref(host_id: &str, kind: &str, parts: &[String]) -> String {
@@ -1103,19 +1113,143 @@ fn opaque_ref(host_id: &str, kind: &str, parts: &[String]) -> String {
 }
 
 fn start_permitted(shell_state: &Value, now: i64) -> bool {
-    let requirements_pass = shell_state
-        .get("prerequisites")
-        .and_then(|value| value.get("requirementsBaseline"))
-        .and_then(|gate| gate.get("status"))
-        .and_then(Value::as_str) == Some("pass");
-    let evaluated_at = shell_state
-        .get("evaluatedAt")
+    let delivery = shell_state.get("delivery").and_then(Value::as_object);
+    let status = delivery
+        .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
-        .and_then(|value| parse_rfc3339(Some(&Value::String(value.to_string()))));
-    let evaluation_fresh = evaluated_at.is_some_and(|evaluated| {
-        now >= evaluated && now - evaluated <= 8 * 3600
-    });
-    requirements_pass && evaluation_fresh
+        .unwrap_or("draft");
+    if status != "draft" && status != "authorized" {
+        return false;
+    }
+    if delivery
+        .and_then(|value| value.get("batchRef").or_else(|| value.get("batch_ref")))
+        .is_none()
+    {
+        return false;
+    }
+    if delivery
+        .and_then(|value| {
+            value
+                .get("baselineRef")
+                .or_else(|| value.get("baseline_ref"))
+        })
+        .is_none()
+    {
+        return false;
+    }
+    if delivery
+        .and_then(|value| {
+            value
+                .get("baselineDigest")
+                .or_else(|| value.get("baseline_digest"))
+        })
+        .is_none()
+    {
+        return false;
+    }
+    let action = shell_state
+        .get("selectedAction")
+        .or_else(|| shell_state.get("selected_action"))
+        .and_then(Value::as_str)
+        .unwrap_or("build");
+    if !matches!(
+        action,
+        "build" | "deploy" | "verify" | "janus_prepare" | "janus_apply"
+    ) {
+        return false;
+    }
+    if !evaluation_usable(
+        shell_state
+            .get("evaluatedAt")
+            .or_else(|| shell_state.get("evaluated_at"))
+            .and_then(Value::as_str),
+        now,
+    ) {
+        return false;
+    }
+    let prerequisites = shell_state.get("prerequisites").and_then(Value::as_object);
+    let requirements = prerequisites
+        .and_then(|value| value.get("requirementsBaseline"))
+        .or_else(|| prerequisites.and_then(|value| value.get("requirements_baseline")));
+    if !required_gate_pass(requirements, now) {
+        return false;
+    }
+    if matches!(action, "deploy" | "verify") {
+        let artifact = prerequisites
+            .and_then(|value| value.get("deployArtifact"))
+            .or_else(|| prerequisites.and_then(|value| value.get("deploy_artifact")));
+        if !required_gate_pass(artifact, now) {
+            return false;
+        }
+        let pharos = prerequisites
+            .and_then(|value| value.get("pharosTarget"))
+            .or_else(|| prerequisites.and_then(|value| value.get("pharos_target")));
+        if !required_target_pass(pharos, &["ready", "live"], now) {
+            return false;
+        }
+    }
+    true
+}
+
+fn evaluation_usable(evaluated_at: Option<&str>, now: i64) -> bool {
+    let Some(evaluated_at) = evaluated_at else {
+        return false;
+    };
+    let Some(evaluated) = parse_rfc3339(Some(&Value::String(evaluated_at.to_string()))) else {
+        return false;
+    };
+    if evaluated > now + 5 {
+        return false;
+    }
+    now - evaluated <= EVALUATION_MAX_AGE_SECS
+}
+
+fn required_gate_pass(entry: Option<&Value>, now: i64) -> bool {
+    let Some(entry) = entry.and_then(Value::as_object) else {
+        return false;
+    };
+    if entry.get("status").and_then(Value::as_str) != Some("pass") {
+        return false;
+    }
+    if entry
+        .get("evidenceRef")
+        .or_else(|| entry.get("evidence_ref"))
+        .is_none()
+    {
+        return false;
+    }
+    if entry
+        .get("observedAt")
+        .or_else(|| entry.get("observed_at"))
+        .is_none()
+    {
+        return false;
+    }
+    !gate_stale(entry, now)
+}
+
+fn required_target_pass(entry: Option<&Value>, allowed: &[&str], now: i64) -> bool {
+    if !required_gate_pass(entry, now) {
+        return false;
+    }
+    entry
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("readiness"))
+        .and_then(Value::as_str)
+        .is_some_and(|readiness| allowed.contains(&readiness))
+}
+
+fn gate_stale(entry: &serde_json::Map<String, Value>, now: i64) -> bool {
+    let fresh_until = entry
+        .get("freshUntil")
+        .or_else(|| entry.get("fresh_until"))
+        .and_then(Value::as_str);
+    match fresh_until {
+        None => false,
+        Some(value) => {
+            parse_rfc3339(Some(&Value::String(value.to_string()))).is_none_or(|fresh| now > fresh)
+        }
+    }
 }
 
 fn html_escape_attr(value: &str) -> String {
@@ -1219,8 +1353,7 @@ fn valid_host_id(value: &str) -> bool {
 
 fn parse_origin(value: &str) -> Result<Url, FlowError> {
     let url = Url::parse(value).map_err(|_| FlowError::Configuration)?;
-    if url.scheme() != "https"
-        || url.host_str().is_none()
+    if url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -1229,7 +1362,40 @@ fn parse_origin(value: &str) -> Result<Url, FlowError> {
     {
         return Err(FlowError::Configuration);
     }
-    Ok(url)
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if loopback_origin_allowed(&url) => Ok(url),
+        _ => Err(FlowError::Configuration),
+    }
+}
+
+fn loopback_origin_allowed(url: &Url) -> bool {
+    matches!(env_bool(FLOW_LOOPBACK_ORIGIN_ENV), Ok(Some(true))) && is_loopback_url(url)
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>, ()> {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            if value == "1" || value.eq_ignore_ascii_case("true") {
+                Ok(Some(true))
+            } else if value == "0" || value.eq_ignore_ascii_case("false") {
+                Ok(Some(false))
+            } else {
+                Err(())
+            }
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -1246,11 +1412,13 @@ fn loopback_origin_for_tests(value: &str) -> Url {
 }
 
 fn read_config_file(path: &Path) -> Result<Vec<u8>, String> {
-    read_bounded_private_file(path, MAX_CONFIG_BYTES).map_err(|_| "invalid flow host configuration".to_string())
+    read_bounded_private_file(path, MAX_CONFIG_BYTES)
+        .map_err(|_| "invalid flow host configuration".to_string())
 }
 
 fn read_api_key(path: &Path) -> Result<String, FlowError> {
-    let bytes = read_bounded_private_file(path, MAX_API_KEY_BYTES).map_err(|_| FlowError::Credential)?;
+    let bytes =
+        read_bounded_private_file(path, MAX_API_KEY_BYTES).map_err(|_| FlowError::Credential)?;
     if bytes.len() < 32 || bytes.len() as u64 > MAX_API_KEY_BYTES {
         return Err(FlowError::Credential);
     }
@@ -1261,9 +1429,19 @@ fn read_api_key(path: &Path) -> Result<String, FlowError> {
 }
 
 fn read_bounded_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, FlowError> {
+    if let Some(parent) = path.parent() {
+        validate_parent_directory(parent)?;
+    }
     let metadata = fs::symlink_metadata(path).map_err(|_| FlowError::Credential)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(FlowError::Credential);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(FlowError::Credential);
+        }
     }
     validate_private_file_metadata(&metadata, max_bytes)?;
     let mut options = OpenOptions::new();
@@ -1295,7 +1473,29 @@ fn read_bounded_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Flo
 }
 
 #[cfg(unix)]
-fn validate_private_file_metadata(metadata: &fs::Metadata, max_bytes: u64) -> Result<(), FlowError> {
+fn validate_parent_directory(parent: &Path) -> Result<(), FlowError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(parent).map_err(|_| FlowError::Credential)?;
+    if !metadata.is_dir() {
+        return Err(FlowError::Credential);
+    }
+    let expected_uid = unsafe { libc::getuid() };
+    if metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
+        return Err(FlowError::Credential);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_parent_directory(_parent: &Path) -> Result<(), FlowError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_file_metadata(
+    metadata: &fs::Metadata,
+    max_bytes: u64,
+) -> Result<(), FlowError> {
     use std::os::unix::fs::MetadataExt;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(FlowError::Credential);
@@ -1308,7 +1508,10 @@ fn validate_private_file_metadata(metadata: &fs::Metadata, max_bytes: u64) -> Re
 }
 
 #[cfg(not(unix))]
-fn validate_private_file_metadata(metadata: &fs::Metadata, max_bytes: u64) -> Result<(), FlowError> {
+fn validate_private_file_metadata(
+    metadata: &fs::Metadata,
+    max_bytes: u64,
+) -> Result<(), FlowError> {
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(FlowError::Credential);
     }
@@ -1334,9 +1537,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::auth::{AccessGrant, AuthState, AuthUser};
-    use axum::http::StatusCode;
+    use axum::http::{header, StatusCode};
     use axum::routing::get;
     use axum::Router;
+    use pharos_core::{Host, NixFreshness};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::net::TcpListener;
@@ -1379,14 +1583,30 @@ mod tests {
         }
     }
 
-    fn sample_state() -> Value {
+    fn sample_gate(now: i64) -> Value {
         json!({
-            "evaluatedAt": "2023-11-14T22:13:20.000Z",
+            "status": "pass",
+            "gateKind": "requirements_baseline",
+            "evidenceRef": "paimos:ev-test",
+            "observedAt": iso_timestamp(now),
+            "freshUntil": iso_timestamp(now + 600)
+        })
+    }
+
+    fn sample_state() -> Value {
+        let now = 1_700_000_000_i64;
+        json!({
+            "evaluatedAt": iso_timestamp(now),
             "header": {"appName": "Paimos", "projectName": "Upstream", "userLabel": "Machine", "userInitials": "MC"},
             "health": {"status": "available"},
-            "delivery": {"status": "draft"},
+            "delivery": {
+                "status": "draft",
+                "batchRef": "batch-test",
+                "baselineRef": "baseline-test",
+                "baselineDigest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            },
             "prerequisites": {
-                "requirementsBaseline": {"status": "pass", "gateKind": "requirements_baseline"}
+                "requirementsBaseline": sample_gate(now)
             },
             "progress": {},
             "executionModes": ["manual"],
@@ -1396,6 +1616,28 @@ mod tests {
                 "project_ref": PAIMOS_PROJECT_REF_17
             }
         })
+    }
+
+    fn sample_host(name: &str, last_seen: i64) -> Host {
+        Host {
+            name: name.to_string(),
+            role: "server".to_string(),
+            is_nix: true,
+            report_version: pharos_core::HOST_REPORT_VERSION,
+            token_hash: None,
+            last_seen: Some(last_seen),
+            heartbeat_log: vec![last_seen],
+            heartbeat_interval_secs: Some(60),
+            inbound_rtt: None,
+            location: None,
+            freshness: NixFreshness::default(),
+            kernel: None,
+            service_observations: vec![],
+            backup_observations: vec![],
+            preferences: Default::default(),
+            requested_preferences: None,
+            deployed_artifact: None,
+        }
     }
 
     async fn serve_paimos(state: Value) -> (Url, tokio::task::JoinHandle<()>) {
@@ -1464,14 +1706,48 @@ mod tests {
         let manifest = include_str!("../assets/vendor/flow-shell/manifest.json");
         let parsed: Value = serde_json::from_str(manifest).expect("manifest json");
         assert_eq!(parsed["version"], "0.1.3");
-        let (bytes, _) = flow_static_asset("src/inspr-flow-shell.js").expect("shell asset");
-        let digest = format!("sha256:{}", hex_bytes(&Sha256::digest(bytes)));
-        let files = parsed["files"].as_array().expect("files");
-        let entry = files
-            .iter()
-            .find(|entry| entry["path"] == "src/inspr-flow-shell.js")
-            .expect("shell file entry");
-        assert_eq!(entry["sha256"], digest);
+        let vendor_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/vendor/flow-shell");
+        for entry in parsed["files"].as_array().expect("files") {
+            let path = entry["path"].as_str().expect("path");
+            let expected = entry["sha256"].as_str().expect("sha256");
+            let bytes = std::fs::read(vendor_root.join(path)).expect("vendor file");
+            let digest = format!("sha256:{}", hex_bytes(&Sha256::digest(bytes)));
+            assert_eq!(digest, expected, "digest mismatch for {path}");
+        }
+    }
+
+    #[test]
+    fn submitted_identity_reads_nested_start_detail() {
+        let nested = json!({
+            "status": "present",
+            "principal_ref": "pharos-test:prin-abc",
+            "project_ref": "pharos-test:proj-17"
+        });
+        let request = FlowIntentRequest {
+            intent_type: "flow:start-intent".to_string(),
+            identity: None,
+            detail: Some(json!({
+                "type": "flow:start-intent",
+                "detail": { "identity": nested }
+            })),
+        };
+        let extracted = submitted_identity(&request).expect("nested identity");
+        assert_eq!(extracted["principal_ref"], "pharos-test:prin-abc");
+    }
+
+    #[test]
+    fn wire_intent_request_deserializes_bootstrap_body() {
+        let body = json!({
+            "type": "flow:review-batch",
+            "identity": null,
+            "detail": {
+                "type": "flow:review-batch",
+                "detail": { "batchRef": "batch-test", "executes": false }
+            }
+        });
+        let request: FlowIntentRequest = serde_json::from_value(body).expect("bootstrap body");
+        assert_eq!(request.intent_type, "flow:review-batch");
+        assert!(submitted_identity(&request).is_none());
     }
 
     #[tokio::test]
@@ -1497,12 +1773,13 @@ mod tests {
         );
         let headers = HeaderMap::new();
         let access = AccessGrant::limited(["hsb8"], true);
+        let hosts = [sample_host("hsb8", 1_700_000_000)];
         let response = service
             .shell_state(
                 &auth,
                 &headers,
                 &access,
-                &[],
+                &hosts,
                 Some("hsb8"),
                 1_700_000_000,
             )
@@ -1514,37 +1791,36 @@ mod tests {
             .get("identityContext")
             .expect("embedded identity");
         assert_eq!(identity["principal_kind"], "local_host");
-        assert_eq!(
-            shell_state["header"]["userLabel"],
-            "Operator"
-        );
+        assert_eq!(identity["display"]["user_label"], HOST_VERIFIED_HUMAN_LABEL);
+        assert_eq!(shell_state["header"]["userLabel"], "Operator");
+        assert_eq!(shell_state["health"]["status"], "available");
         let (status, intent) = service
             .handle_intent(
                 &auth,
                 &headers,
                 &access,
-                &[],
+                &hosts,
                 Some("hsb8"),
                 FlowIntentRequest {
                     intent_type: "flow:review-batch".to_string(),
-                    identity: Some(json!({
-                        "status": "present",
-                        "principal_ref": identity["principal_ref"],
-                        "project_ref": identity["project_ref"],
-                        "binding_ref": identity["binding_ref"],
-                        "context_revision": identity["context_revision"],
-                        "actor_kind": "human",
-                        "expires_at": identity["expires_at"],
-                        "fresh_until": identity["fresh_until"]
+                    identity: None,
+                    detail: Some(json!({
+                        "type": "flow:review-batch",
+                        "detail": {
+                            "batchRef": "batch-test",
+                            "executes": false
+                        }
                     })),
-                    detail: None,
                 },
                 1_700_000_000,
             )
             .await;
         assert_eq!(status, StatusCode::OK, "intent error: {:?}", intent.error);
         assert!(!intent.executed);
-        assert!(intent.location.unwrap().contains("/projects/17?tab=overview#baseline-batch"));
+        assert!(intent
+            .location
+            .unwrap()
+            .contains("/projects/17?tab=overview#baseline-batch"));
         server.abort();
         std::fs::remove_file(key_path).ok();
     }
@@ -1565,7 +1841,8 @@ mod tests {
         let mut state = sample_state();
         state["identityContext"]["project_ref"] = json!(PAIMOS_PROJECT_REF_99);
         let (origin, server) = serve_paimos(state).await;
-        let key_path = std::env::temp_dir().join(format!("pharos-flow-key-wrong-{}", std::process::id()));
+        let key_path =
+            std::env::temp_dir().join(format!("pharos-flow-key-wrong-{}", std::process::id()));
         write_private_key(&key_path, b"01234567890123456789012345678901");
         let service = FlowHostService {
             config: sample_config(&origin, key_path.clone()),
@@ -1682,7 +1959,7 @@ mod tests {
                 &[],
                 Some("hsb8"),
                 FlowIntentRequest {
-                    intent_type: "flow:review-batch".to_string(),
+                    intent_type: "flow:start-intent".to_string(),
                     identity: Some(json!({
                         "status": "present",
                         "principal_ref": identity["principal_ref"],
@@ -1700,10 +1977,7 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(!intent.executed);
-        assert!(intent
-            .error
-            .unwrap()
-            .contains("expired"));
+        assert!(intent.error.unwrap().contains("expired"));
         server.abort();
         std::fs::remove_file(key_path).ok();
     }
@@ -1768,10 +2042,78 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(!intent.executed);
         assert!(intent.location.is_none());
-        assert!(intent
-            .notice
-            .unwrap()
-            .contains("Start stays blocked"));
+        assert!(intent.notice.unwrap().contains("Start stays blocked"));
+        server.abort();
+        std::fs::remove_file(key_path).ok();
+    }
+
+    #[tokio::test]
+    async fn start_intent_identity_survives_time_forward() {
+        let shell_now = 1_700_000_000_i64;
+        let intent_now = shell_now + 60;
+        let (origin, server) = serve_paimos(sample_state()).await;
+        let key_path = std::env::temp_dir().join(format!(
+            "pharos-flow-key-time-forward-{}",
+            std::process::id()
+        ));
+        write_private_key(&key_path, b"01234567890123456789012345678901");
+        let service = FlowHostService {
+            config: sample_config(&origin, key_path.clone()),
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            cache: Arc::new(Mutex::new(ProjectionCache::default())),
+        };
+        let auth = AuthState::for_test_human(
+            AccessGrant::limited(["hsb8"], true),
+            AuthUser {
+                operator_ref: "operator-a".to_string(),
+                managed_human_session_ref: "sess".to_string(),
+                display_name: "Operator".to_string(),
+            },
+        );
+        let headers = HeaderMap::new();
+        let access = AccessGrant::limited(["hsb8"], true);
+        let hosts = [sample_host("hsb8", shell_now)];
+        let response = service
+            .shell_state(&auth, &headers, &access, &hosts, Some("hsb8"), shell_now)
+            .await;
+        let identity = response
+            .shell_state
+            .and_then(|shell| shell.get("identityContext").cloned())
+            .expect("embedded identity");
+        let (status, intent) = service
+            .handle_intent(
+                &auth,
+                &headers,
+                &access,
+                &hosts,
+                Some("hsb8"),
+                FlowIntentRequest {
+                    intent_type: "flow:start-intent".to_string(),
+                    identity: Some(json!({
+                        "status": "present",
+                        "principal_ref": identity["principal_ref"],
+                        "project_ref": identity["project_ref"],
+                        "binding_ref": identity["binding_ref"],
+                        "context_revision": identity["context_revision"],
+                        "actor_kind": "human",
+                        "expires_at": identity["expires_at"],
+                        "fresh_until": identity["fresh_until"]
+                    })),
+                    detail: None,
+                },
+                intent_now,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "intent error: {:?}", intent.error);
+        assert!(
+            intent.error.is_none(),
+            "identity must remain valid after time forward: {:?}",
+            intent.error
+        );
+        assert!(!intent.executed);
         server.abort();
         std::fs::remove_file(key_path).ok();
     }
@@ -1783,4 +2125,3 @@ mod tests {
         assert!(err.contains("access denied"));
     }
 }
-

@@ -53,6 +53,8 @@ jobs:
         run: scripts/check-release-consistency.sh
       - name: pinned Paimos delivery contract
         run: scripts/check-paimos-delivery-contract.sh
+      - name: flow-shell vendor manifest
+        run: scripts/check-flow-shell-vendor.sh
       - name: native systemd settings state dry run
         run: |
           work="$(mktemp -d)"

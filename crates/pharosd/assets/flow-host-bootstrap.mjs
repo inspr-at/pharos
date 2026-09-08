@@ -11,7 +11,7 @@ if (shell) {
     shell.shellState = {
       evaluatedAt: null,
       header: {},
-      health: { status: 'unavailable', label: 'Flow unavailable' },
+      health: { status: 'unknown', label: 'Flow unavailable' },
       delivery: { status: 'draft' },
       prerequisites: {},
       progress: {},
@@ -36,6 +36,18 @@ if (shell) {
       url.searchParams.set('host', hostScope);
     }
     return url;
+  }
+
+  function extractIntentIdentity(detail) {
+    const nested = detail?.detail?.identity ?? detail?.identity;
+    if (nested && typeof nested === 'object') {
+      return nested;
+    }
+    const identity = shell.shellState?.identity;
+    if (identity?.status === 'present' && identity?.value) {
+      return identity.value;
+    }
+    return null;
   }
 
   function msUntilNextTenMinuteBoundary(now = Date.now()) {
@@ -120,6 +132,7 @@ if (shell) {
   shell.addEventListener('flow-intent', async (event) => {
     const detail = event.detail ?? {};
     const intentType = detail.type ?? detail.intentType;
+    const identity = extractIntentIdentity(detail);
     try {
       const response = await fetch(intentsUrl(), {
         method: 'POST',
@@ -127,7 +140,7 @@ if (shell) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           type: intentType,
-          identity: detail.identity ?? null,
+          identity,
           detail,
         }),
       });

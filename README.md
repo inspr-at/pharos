@@ -709,6 +709,18 @@ promised third-party API. The important boundaries are:
 
 ## Configuration map
 
+### Flow host
+
+Optional bounded `@inspr/flow-shell` integration is enabled when `PHAROS_FLOW_CONFIG_FILE`
+points at a JSON document using schema `inspr.pharos.flow-host-config.v1`. The config
+file and the referenced Paimos API key file must both be owner-readable only (`0600`,
+matching uid, parent directory `0700`). Each binding maps one Paimos project to Pharos
+host names and `operator-ref` values that may use the shell.
+
+For local harnesses against loopback Paimos, set `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN=true`
+so `http://127.0.0.1` origins are accepted in the config. Production configs must use
+HTTPS origins only.
+
 ### Server
 
 | Variable                                                       | Purpose                                                                                                                                                                                                                                                |
@@ -718,6 +730,8 @@ promised third-party API. The important boundaries are:
 | `PHAROS_ALLOW_OPEN`                                            | Explicitly allow unauthenticated human routes; valid only for a loopback public address                                                                                                                                                                |
 | `PHAROS_DB`                                                    | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly                                                                                                             |
 | `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE`                           | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files                                                        |
+| `PHAROS_FLOW_CONFIG_FILE`                                      | Optional owner-only Flow host config (`inspr.pharos.flow-host-config.v1`) enabling bounded `@inspr/flow-shell` projection and guarded Review/Start navigation                                                                                          |
+| `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN`                            | When `true` or `1`, allow `http://127.0.0.1` / `http://localhost` Paimos origins in `PHAROS_FLOW_CONFIG_FILE` for local harnesses only                                                                                                               |
 | `PHAROS_PROVISIONING_JOBS_DB`                                  | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset                                                                                                                                          |
 | `PHAROS_OIDC_ISSUER`                                           | OIDC discovery issuer                                                                                                                                                                                                                                  |
 | `PHAROS_OIDC_CLIENT_ID`                                        | Public OIDC client identifier                                                                                                                                                                                                                          |

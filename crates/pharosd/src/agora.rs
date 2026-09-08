@@ -307,7 +307,7 @@ pub(crate) async fn host_workspace_page(
                 }),
             },
         ),
-        crate::flow_mount_enabled(&state),
+        crate::flow_mount_enabled(&state, &state.auth, &headers, &access, Some(&selected.name)),
         Some(&selected.name),
         state.flow_host.as_deref(),
     ))

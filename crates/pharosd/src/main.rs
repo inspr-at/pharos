@@ -4708,11 +4708,17 @@ fn no_store_html(body: String) -> impl IntoResponse {
     (no_store_headers(), Html(body))
 }
 
-pub(crate) fn flow_mount_enabled(state: &AppState) -> bool {
+pub(crate) fn flow_mount_enabled(
+    state: &AppState,
+    auth: &AuthState,
+    headers: &HeaderMap,
+    access: &AccessGrant,
+    selected_host: Option<&str>,
+) -> bool {
     state
         .flow_host
         .as_ref()
-        .is_some_and(|flow| flow.mount_enabled())
+        .is_some_and(|flow| flow.mount_enabled_for(auth, headers, access, selected_host))
 }
 
 async fn flow_shell_state_json(
@@ -4732,20 +4738,17 @@ async fn flow_shell_state_json(
         return no_store_json(json!({"enabled": false, "mountShell": false}));
     };
     let hosts = state.store.list();
-    let selected_host = match flow_host::resolve_flow_host_scope(
-        query.host.as_deref(),
-        &access,
-        &hosts,
-    ) {
-        Ok(selected_host) => selected_host,
-        Err(reason) => {
-            return no_store_json(json!({
-                "enabled": true,
-                "mountShell": true,
-                "unavailableReason": reason,
-            }));
-        }
-    };
+    let selected_host =
+        match flow_host::resolve_flow_host_scope(query.host.as_deref(), &access, &hosts) {
+            Ok(selected_host) => selected_host,
+            Err(reason) => {
+                return no_store_json(json!({
+                    "enabled": true,
+                    "mountShell": false,
+                    "unavailableReason": reason,
+                }));
+            }
+        };
     let response = flow
         .shell_state(
             &state.auth,
@@ -4778,24 +4781,21 @@ async fn flow_intents_json(
             .into_response();
     };
     let hosts = state.store.list();
-    let selected_host = match flow_host::resolve_flow_host_scope(
-        query.host.as_deref(),
-        &access,
-        &hosts,
-    ) {
-        Ok(selected_host) => selected_host,
-        Err(reason) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(flow_host::FlowIntentResponse {
-                    executed: false,
-                    error: Some(reason),
-                    ..Default::default()
-                }),
-            )
-                .into_response();
-        }
-    };
+    let selected_host =
+        match flow_host::resolve_flow_host_scope(query.host.as_deref(), &access, &hosts) {
+            Ok(selected_host) => selected_host,
+            Err(reason) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(flow_host::FlowIntentResponse {
+                        executed: false,
+                        error: Some(reason),
+                        ..Default::default()
+                    }),
+                )
+                    .into_response();
+            }
+        };
     let (status, response) = flow
         .handle_intent(
             &state.auth,
@@ -4820,15 +4820,11 @@ async fn flow_host_bootstrap() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, content_type)], bytes.to_vec()).into_response()
 }
 
-async fn flow_shell_asset(
-    AxumPath(path): AxumPath<String>,
-) -> impl IntoResponse {
+async fn flow_shell_asset(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
     match flow_host::flow_static_asset(path.as_str()) {
-        Some((bytes, content_type)) => (
-            [(header::CONTENT_TYPE, content_type)],
-            bytes.to_vec(),
-        )
-            .into_response(),
+        Some((bytes, content_type)) => {
+            ([(header::CONTENT_TYPE, content_type)], bytes.to_vec()).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }

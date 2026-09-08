@@ -791,7 +791,7 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
                         || state.retirement_owner.configured()),
             },
         ),
-        crate::flow_mount_enabled(&state),
+        crate::flow_mount_enabled(&state, &state.auth, &headers, &access, None),
         None,
         state.flow_host.as_deref(),
     ))
