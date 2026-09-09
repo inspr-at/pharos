@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Strict INSPR Calendar Version v1 validation and Cargo mapping."""
+"""Strict INSPR Calendar Version v1/v2 validation and Cargo mapping.
+
+v2 (PHAROS-259 / INSPR-395) is the UTC reservation second as ``YYMMDDhhmmss.0.0``:
+SemVer-syntactic, fixed width, string-sortable. v1 records stay valid history.
+"""
 
 from __future__ import annotations
 
@@ -13,17 +17,40 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CALENDAR_SCHEME = "inspr-calendar-v1"
+CALENDAR_V2_SCHEME = "inspr-calendar-v2"
+CALENDAR_SCHEMES = (CALENDAR_SCHEME, CALENDAR_V2_SCHEME)
 LEGACY_SCHEME = "legacy"
+RELEASE_SCHEMA_V1 = "inspr.release-coordinate.v1"
+RELEASE_SCHEMA_V2 = "inspr.release-coordinate.v2"
+# Immutable v1 → v2 anchor: the last v1 coordinate and its stable sequence.
+LAST_CALENDAR_V1_VERSION = "26.09.08.23.58.28"
+LAST_CALENDAR_V1_SEQUENCE = 5
+FIRST_CALENDAR_V2_SEQUENCE = 6
 CALENDAR_LONG = re.compile(
     r"^([0-9]{2})\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])\."
     r"([01][0-9]|2[0-3])\.([0-5][0-9])\.([0-5][0-9])$"
 )
 CALENDAR_SHORT = re.compile(r"^([0-9]{2})\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])$")
+CALENDAR_V2 = re.compile(
+    r"^([1-9][0-9])(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])"
+    r"([01][0-9]|2[0-3])([0-5][0-9])([0-5][0-9])\.0\.0$"
+)
 LEGACY_SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 CARGO_SEMVER = re.compile(r"^(200[0-9]|20[1-9][0-9])\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 IMAGE = "ghcr.io/inspr-at/pharos/pharosd"
+LEGACY_ROLLBACK = {
+    "version_scheme": "legacy",
+    "version": "0.2.0",
+    "release_channel": "stable",
+    "release_sequence": 0,
+    "source_commit": "5c8bd1fbd2271a5c157ca239ec2d98b66b201e19",
+    "tag": "v0.2.0",
+    "image": IMAGE,
+    "digest": "sha256:a00b9dc078ce4930e50f47da684409468c6996dba64338926ad790c1e1d1b74b",
+    "reference": "ghcr.io/inspr-at/pharos/pharosd:0.2.0@sha256:a00b9dc078ce4930e50f47da684409468c6996dba64338926ad790c1e1d1b74b",
+}
 SOURCE_LOCK_DOMAIN = b"inspr.pharos.source-lock-set.v1\0"
 SOURCE_LOCK_PATHS = ("Cargo.lock", "devenv.lock", "flake.lock", "package-lock.json")
 
@@ -50,7 +77,34 @@ def parse_calendar(value: str) -> tuple[int, int, int, int, int, int]:
     return fields
 
 
+def parse_calendar_v2(value: str) -> tuple[int, int, int, int, int, int]:
+    """Exact YYMMDDhhmmss.0.0 with a real UTC date; never a short form."""
+
+    match = CALENDAR_V2.fullmatch(value)
+    if match is None:
+        raise ReleaseVersionError("calendar v2 version must use YYMMDDhhmmss.0.0")
+    fields = tuple(int(part) for part in match.groups())
+    year, month, day, hour, minute, second = fields
+    try:
+        dt.datetime(2000 + year, month, day, hour, minute, second, tzinfo=dt.timezone.utc)
+    except ValueError as error:
+        raise ReleaseVersionError("calendar v2 version is not a real UTC date") from error
+    return fields
+
+
+def parse_scheme_version(scheme: str, value: str) -> tuple[int, int, int, int, int, int]:
+    if scheme == CALENDAR_SCHEME:
+        return parse_calendar(value)
+    if scheme == CALENDAR_V2_SCHEME:
+        return parse_calendar_v2(value)
+    raise ReleaseVersionError("absent, unknown, ambiguous, or invalid version scheme")
+
+
 def calendar_to_cargo(value: str) -> str:
+    if CALENDAR_V2.fullmatch(value):
+        # A v2 coordinate is itself valid SemVer; the ecosystem mapping is the identity.
+        parse_calendar_v2(value)
+        return value
     if not CALENDAR_LONG.fullmatch(value):
         raise ReleaseVersionError("Pharos Cargo mapping requires a long calendar coordinate")
     year, month, day, hour, minute, second = parse_calendar(value)
@@ -58,6 +112,9 @@ def calendar_to_cargo(value: str) -> str:
 
 
 def cargo_to_calendar(value: str) -> str:
+    if CALENDAR_V2.fullmatch(value):
+        parse_calendar_v2(value)
+        return value
     match = CARGO_SEMVER.fullmatch(value)
     if not match:
         raise ReleaseVersionError("Cargo compatibility version is not canonical")
@@ -99,6 +156,8 @@ class ReleaseIdentity:
             raise ReleaseVersionError("release sequence must be non-negative")
         if self.scheme == CALENDAR_SCHEME:
             return parse_calendar(self.version)
+        if self.scheme == CALENDAR_V2_SCHEME:
+            return parse_calendar_v2(self.version)
         if self.scheme == LEGACY_SCHEME and LEGACY_SEMVER.fullmatch(self.version):
             return tuple(int(part) for part in self.version.split("."))
         raise ReleaseVersionError("absent, unknown, ambiguous, or invalid version scheme")
@@ -129,10 +188,21 @@ def validate_reservation_history(
     validate_release(current)
     by_sequence: dict[int, dict[str, object]] = {}
     by_version: dict[str, dict[str, object]] = {}
+    current_anchor = current["migration_anchor"]
+    assert isinstance(current_anchor, dict)
     for candidate in (*recorded, *tagged, current):
         validate_release(candidate)
-        if candidate["migration_anchor"] != current["migration_anchor"]:
-            raise ReleaseVersionError("repository Calendar reservations disagree on migration anchor")
+        anchor = candidate["migration_anchor"]
+        assert isinstance(anchor, dict)
+        # Every era agrees on the legacy → v1 anchor; v2 records also agree on
+        # the v1 → v2 anchor. A v1 record cannot carry v2 keys it predates.
+        for key in V1_ANCHOR_KEYS:
+            if anchor.get(key) != current_anchor.get(key):
+                raise ReleaseVersionError("repository Calendar reservations disagree on migration anchor")
+        if candidate["version_scheme"] == CALENDAR_V2_SCHEME:
+            for key in V2_ANCHOR_EXTRA_KEYS:
+                if anchor.get(key) != current_anchor.get(key):
+                    raise ReleaseVersionError("repository Calendar reservations disagree on the v2 migration anchor")
         sequence = int(candidate["release_sequence"])
         version = str(candidate["version"])
         existing_sequence = by_sequence.get(sequence)
@@ -150,10 +220,12 @@ def validate_reservation_history(
     if [int(candidate["release_sequence"]) for candidate in ordered] != expected_sequences:
         raise ReleaseVersionError("repository Calendar reservation sequence has a gap or regression")
     for previous, following in zip(ordered, ordered[1:]):
-        left = ReleaseIdentity(CALENDAR_SCHEME, str(previous["version"]), int(previous["release_sequence"]))
-        right = ReleaseIdentity(CALENDAR_SCHEME, str(following["version"]), int(following["release_sequence"]))
+        left = ReleaseIdentity(str(previous["version_scheme"]), str(previous["version"]), int(previous["release_sequence"]))
+        right = ReleaseIdentity(str(following["version_scheme"]), str(following["version"]), int(following["release_sequence"]))
         if compare_releases(left, right) >= 0:
             raise ReleaseVersionError("repository Calendar coordinates are not strictly monotonic")
+        if previous["version_scheme"] == CALENDAR_V2_SCHEME and following["version_scheme"] == CALENDAR_SCHEME:
+            raise ReleaseVersionError("calendar v1 reservations are closed after the first v2 coordinate")
     if ordered[-1] != current:
         raise ReleaseVersionError("current reservation does not follow the full stable-channel history")
 
@@ -178,7 +250,31 @@ def _workspace_cargo_version(cargo_toml: str) -> str:
     return match.group(1)
 
 
+V1_ANCHOR_KEYS = (
+    "last_legacy_version",
+    "last_legacy_release_sequence",
+    "first_calendar_version",
+    "first_calendar_release_sequence",
+)
+V2_ANCHOR_EXTRA_KEYS = (
+    "last_calendar_v1_version",
+    "last_calendar_v1_release_sequence",
+    "first_calendar_v2_version",
+    "first_calendar_v2_release_sequence",
+)
+
+
 def validate_release(release: dict[str, object]) -> None:
+    """Validate a v1 (history) or v2 (current default) release coordinate record."""
+
+    schema = release.get("schema")
+    if schema == RELEASE_SCHEMA_V2:
+        _validate_release_v2(release)
+        return
+    _validate_release_v1(release)
+
+
+def _validate_release_v1(release: dict[str, object]) -> None:
     required = {
         "schema",
         "schema_version",
@@ -257,6 +353,74 @@ def validate_release(release: dict[str, object]) -> None:
     legacy = ReleaseIdentity(LEGACY_SCHEME, "0.2.0", 0)
     if compare_releases(legacy, first_calendar) >= 0:
         raise ReleaseVersionError("migration anchor does not order calendar after legacy")
+
+
+def _validate_release_v2(release: dict[str, object]) -> None:
+    required = {
+        "schema",
+        "schema_version",
+        "version_scheme",
+        "version",
+        "release_channel",
+        "release_sequence",
+        "ecosystem_versions",
+        "migration_anchor",
+        "legacy_rollback",
+        "compatibility_window",
+    }
+    if set(release) != required:
+        raise ReleaseVersionError("RELEASE.json fields do not match the v2 contract")
+    if release["schema"] != RELEASE_SCHEMA_V2 or release["schema_version"] != 2:
+        raise ReleaseVersionError("release coordinate schema is unsupported")
+    if release["version_scheme"] != CALENDAR_V2_SCHEME:
+        raise ReleaseVersionError("version_scheme must be inspr-calendar-v2 in a v2 record")
+    if release["release_channel"] != "stable":
+        raise ReleaseVersionError("release_channel must be stable")
+    version = release["version"]
+    sequence = release["release_sequence"]
+    if not isinstance(version, str) or not isinstance(sequence, int) or isinstance(sequence, bool):
+        raise ReleaseVersionError("version and release_sequence have invalid types")
+    parse_calendar_v2(version)
+    ecosystem = release["ecosystem_versions"]
+    if not isinstance(ecosystem, dict) or set(ecosystem) != {"cargo_semver"}:
+        raise ReleaseVersionError("Cargo ecosystem mapping is absent or ambiguous")
+    if ecosystem["cargo_semver"] != version:
+        raise ReleaseVersionError("Cargo mapping of a v2 coordinate is the identity")
+    anchor = release["migration_anchor"]
+    if not isinstance(anchor, dict) or set(anchor) != set(V1_ANCHOR_KEYS) | set(V2_ANCHOR_EXTRA_KEYS):
+        raise ReleaseVersionError("migration anchor fields do not match the v2 contract")
+    first_version = anchor["first_calendar_version"]
+    if (
+        anchor["last_legacy_version"] != "0.2.0"
+        or anchor["last_legacy_release_sequence"] != 0
+        or not isinstance(first_version, str)
+        or not CALENDAR_LONG.fullmatch(first_version)
+        or anchor["first_calendar_release_sequence"] != 1
+    ):
+        raise ReleaseVersionError("migration anchor does not bind v0.2.0 to the first calendar release")
+    parse_calendar(first_version)
+    first_v2 = anchor["first_calendar_v2_version"]
+    if (
+        anchor["last_calendar_v1_version"] != LAST_CALENDAR_V1_VERSION
+        or anchor["last_calendar_v1_release_sequence"] != LAST_CALENDAR_V1_SEQUENCE
+        or anchor["first_calendar_v2_release_sequence"] != FIRST_CALENDAR_V2_SEQUENCE
+        or not isinstance(first_v2, str)
+    ):
+        raise ReleaseVersionError("migration anchor does not bind the last calendar v1 release to the first v2 coordinate")
+    parse_calendar_v2(first_v2)
+    first_identity = ReleaseIdentity(CALENDAR_V2_SCHEME, first_v2, FIRST_CALENDAR_V2_SEQUENCE)
+    current = ReleaseIdentity(CALENDAR_V2_SCHEME, version, sequence)
+    if sequence < FIRST_CALENDAR_V2_SEQUENCE or compare_releases(first_identity, current) > 0:
+        raise ReleaseVersionError("release predates the immutable first-calendar-v2 anchor")
+    if (sequence == FIRST_CALENDAR_V2_SEQUENCE) != (version == first_v2):
+        raise ReleaseVersionError("first calendar v2 coordinate and sequence disagree")
+    last_v1 = ReleaseIdentity(CALENDAR_SCHEME, LAST_CALENDAR_V1_VERSION, LAST_CALENDAR_V1_SEQUENCE)
+    if compare_releases(last_v1, first_identity) >= 0:
+        raise ReleaseVersionError("migration anchor does not order calendar v2 after calendar v1")
+    if release["compatibility_window"] != "legacy-rollback-until-owner-approved-removal":
+        raise ReleaseVersionError("legacy compatibility window is absent")
+    if release["legacy_rollback"] != LEGACY_ROLLBACK:
+        raise ReleaseVersionError("legacy rollback authority changed or is incomplete")
 
 
 def validate_release_set(document: dict[str, object], release: dict[str, object]) -> None:
@@ -468,7 +632,7 @@ def _first_parent_calendar_releases(repo: Path) -> tuple[dict[str, object], ...]
         if not isinstance(candidate, dict):
             raise ReleaseVersionError(f"first-parent RELEASE.json is not an object at {commit}")
         scheme = candidate.get("version_scheme")
-        if scheme == CALENDAR_SCHEME:
+        if scheme in CALENDAR_SCHEMES:
             validate_release(candidate)
             if candidate != current and candidate not in releases:
                 releases.append(candidate)
@@ -492,10 +656,15 @@ def _tagged_calendar_releases(repo: Path) -> tuple[dict[str, object], ...]:
         value = tag.removeprefix("v")
         try:
             parse_calendar(value)
+            tag_scheme = CALENDAR_SCHEME
         except ReleaseVersionError:
-            if re.fullmatch(r"v[0-9]{2}\..*", tag):
-                raise ReleaseVersionError(f"Calendar-looking tag is invalid: {tag}")
-            continue
+            try:
+                parse_calendar_v2(value)
+                tag_scheme = CALENDAR_V2_SCHEME
+            except ReleaseVersionError:
+                if re.fullmatch(r"v[0-9]{2}\..*", tag) or re.fullmatch(r"v[0-9]{10,}\..*", tag):
+                    raise ReleaseVersionError(f"Calendar-looking tag is invalid: {tag}")
+                continue
         tag_ref = f"refs/tags/{tag}"
         kind = subprocess.run(
             ["git", "cat-file", "-t", tag_ref],
@@ -522,7 +691,7 @@ def _tagged_calendar_releases(repo: Path) -> tuple[dict[str, object], ...]:
         if not isinstance(release, dict):
             raise ReleaseVersionError(f"Calendar tag release coordinate is not an object: {tag}")
         validate_release(release)
-        if release["version_scheme"] != CALENDAR_SCHEME or release["version"] != value:
+        if release["version_scheme"] != tag_scheme or release["version"] != value:
             raise ReleaseVersionError(f"Calendar tag does not match its explicit release identity: {tag}")
         releases.append(release)
     return tuple(releases)

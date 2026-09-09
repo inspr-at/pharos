@@ -29,6 +29,12 @@ pub(super) const LAST_LEGACY_RELEASE_SEQUENCE: &str = env!("PHAROS_LAST_LEGACY_R
 pub(super) const FIRST_CALENDAR_VERSION: &str = env!("PHAROS_FIRST_CALENDAR_VERSION");
 pub(super) const FIRST_CALENDAR_RELEASE_SEQUENCE: &str =
     env!("PHAROS_FIRST_CALENDAR_RELEASE_SEQUENCE");
+pub(super) const LAST_CALENDAR_V1_VERSION: &str = env!("PHAROS_LAST_CALENDAR_V1_VERSION");
+pub(super) const LAST_CALENDAR_V1_RELEASE_SEQUENCE: &str =
+    env!("PHAROS_LAST_CALENDAR_V1_RELEASE_SEQUENCE");
+pub(super) const FIRST_CALENDAR_V2_VERSION: &str = env!("PHAROS_FIRST_CALENDAR_V2_VERSION");
+pub(super) const FIRST_CALENDAR_V2_RELEASE_SEQUENCE: &str =
+    env!("PHAROS_FIRST_CALENDAR_V2_RELEASE_SEQUENCE");
 pub(super) const GIT_COMMIT: &str = env!("PHAROS_GIT_COMMIT");
 pub(super) const CHANGELOG_MD: &str = include_str!("../../../docs/CHANGELOG.md");
 
@@ -70,6 +76,7 @@ pub(super) fn release_label() -> String {
 
 pub(super) fn release_scheme_label() -> &'static str {
     match VERSION_SCHEME {
+        "inspr-calendar-v2" => "Calendar v2",
         "inspr-calendar-v1" => "Calendar v1",
         "legacy" => "Legacy",
         _ => "Unknown",
@@ -218,7 +225,7 @@ mod module_tests {
     #[test]
     fn release_dialog_exposes_discriminated_identity_and_exact_manifest_link() {
         let dialog = release_dialog();
-        assert!(dialog.contains(">Calendar v1<"));
+        assert!(dialog.contains(">Calendar v2<"));
         assert!(dialog.contains(">stable<"));
         assert!(dialog.contains(&format!(">#{RELEASE_SEQUENCE}<")));
         assert!(dialog.contains(&format!(

@@ -3382,7 +3382,11 @@ async fn version() -> Json<serde_json::Value> {
             "last_legacy_version": LAST_LEGACY_VERSION,
             "last_legacy_release_sequence": LAST_LEGACY_RELEASE_SEQUENCE.parse::<u64>().expect("embedded legacy sequence"),
             "first_calendar_version": FIRST_CALENDAR_VERSION,
-            "first_calendar_release_sequence": FIRST_CALENDAR_RELEASE_SEQUENCE.parse::<u64>().expect("embedded first calendar sequence")
+            "first_calendar_release_sequence": FIRST_CALENDAR_RELEASE_SEQUENCE.parse::<u64>().expect("embedded first calendar sequence"),
+            "last_calendar_v1_version": LAST_CALENDAR_V1_VERSION,
+            "last_calendar_v1_release_sequence": LAST_CALENDAR_V1_RELEASE_SEQUENCE.parse::<u64>().expect("embedded last calendar v1 sequence"),
+            "first_calendar_v2_version": FIRST_CALENDAR_V2_VERSION,
+            "first_calendar_v2_release_sequence": FIRST_CALENDAR_V2_RELEASE_SEQUENCE.parse::<u64>().expect("embedded first calendar v2 sequence")
         },
         "git_commit": GIT_COMMIT,
         "display_version": release_label()

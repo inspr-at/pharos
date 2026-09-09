@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-26.09.08.23.58.28-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260909194540.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -815,10 +815,12 @@ create one deterministic guarded review or sets it to an explicitly selected
 matching job; a verification intent has `stage: "verification"`,
 `workflow: "verify-production"` and `deployment_handoff_id`. Both carry locally
 selected `handoff_id`, `handoff_secret_file`, `host`, `environment`, and a v2
-artifact containing explicit `version_scheme` (`legacy` or `inspr-calendar-v1`),
+artifact containing explicit `version_scheme` (`legacy`, `inspr-calendar-v1` or
+`inspr-calendar-v2`),
 a bounded version, release channel and sequence, `sha256:` digest, lowercase
 40- or 64-hex commit digest, and release-manifest coordinate plus digest.
-Calendar strings are accepted only as calendar dates. Unknown fields, unsafe
+Calendar strings are accepted only as calendar dates of their declared scheme
+(v1 `yy.mm.dd[.hh.mm.ss]`, v2 UTC `YYMMDDhhmmss.0.0`). Unknown fields, unsafe
 origins, mismatched deployment/verification pairs and shared credential files
 reject startup. The bundled contract verifier is
 `scripts/check-paimos-delivery-contract.sh`. Janus remains a separate v1
@@ -899,8 +901,11 @@ Flow host integration QA runs with `npm run test:flow-host`. That command builds
 shipped bootstrap boundary in Chromium.
 
 [`RELEASE.json`](RELEASE.json) is the single authoritative release coordinate.
-It records the canonical Calendar Version, stable-channel sequence, migration
-anchor, exact legacy rollback authority and injective Cargo SemVer mapping. The
+It records the canonical INSPR Calendar Version v2 coordinate (the UTC
+reservation second as `YYMMDDhhmmss.0.0`, itself valid SemVer), the
+stable-channel sequence, the two-step migration anchor (legacy → calendar v1 →
+calendar v2), the exact legacy rollback authority and the Cargo SemVer mapping,
+which is the identity for v2 coordinates. The
 consistency gate keeps Cargo, Nix, the changelog and release workflow aligned.
 Each release first validates an untagged digest-only OCI candidate, then signs
 an exact release-set containing both immutable image coordinates and the real

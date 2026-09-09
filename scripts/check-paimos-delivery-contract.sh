@@ -28,8 +28,8 @@ check_file() {
 }
 
 # Owner v2 is the Pharos reporter pin. Janus v1 stays a separate dependency fixture.
-check_file "$owner_root" owner-pharos-v2.json 3868 99abbf90592ff319b4e00319bc8bb5141572e6dc66cfcf074d781358c36954a9
-check_file "$owner_root" external-stage-v2.schema.json 10292 57b2ceaebc2991f89b9adb4de713c2c760c40f521ee8bde8cd67dfb5559ae33a
+check_file "$owner_root" owner-pharos-v2.json 5780 e63cc10020b706a07af969e5dab0052894c2dcbc338c53e7bf6327a7a92baf2b
+check_file "$owner_root" external-stage-v2.schema.json 10380 9e9140bb7fbf4b46caf53ab9576be8ff99b208dcb4a10b8512f0d69959190ed0
 check_file "$dependency_root" dependency-janus-v1.json 1115 52a647abd52e229fcdef8461eeb9f7d31f07632501ad33f594cdfbc155c23d4b
 
 owner_sha=$(
@@ -40,13 +40,13 @@ owner_sha=$(
     printf '\0'
   } | sha256_stream
 )
-if [[ "$owner_sha" != 6bba9613230c6ea728db58ffea5533399caed19e6d56a8d78ef19d0fde20be8a ]]; then
+if [[ "$owner_sha" != fb68cb9990bfcdfe4168f9780c412327d357ecd4181a6b24499352c7858be5f6 ]]; then
   printf 'error: pinned Paimos owner v2 fixture-set digest drifted\n' >&2
   exit 1
 fi
 
 manifest_sha=$(sha256_file "$owner_root/manifest-v2.json")
-if [[ "$manifest_sha" != 9f7c57503d2a883d548e41714ba8c37c5049a6e6a3e3fb0add6f460cfc7199ef ]]; then
+if [[ "$manifest_sha" != 3982cff68d4b41ebe82bf8bc709f530abf2a5aa3019c43d4c6fefdec77e15e18 ]]; then
   printf 'error: pinned Paimos v2 manifest drifted\n' >&2
   exit 1
 fi
@@ -64,4 +64,4 @@ if [[ "$janus_set_sha" == "$owner_sha" ]]; then
   exit 1
 fi
 
-printf 'paimos_delivery_contract=ok release=v26.09.05 commit=bb3b874f22a14fbe3879b1b575f33d55a001312d schema_major=2 fixture_set_sha256=%s janus_dependency_sha256=%s\n' "$owner_sha" "$(sha256_file "$dependency_root/dependency-janus-v1.json")"
+printf 'paimos_delivery_contract=ok release=v260909151030.0.0 commit=c656912e28c7da208148f4f940991c228f0bf71a schema_major=2 fixture_set_sha256=%s janus_dependency_sha256=%s\n' "$owner_sha" "$(sha256_file "$dependency_root/dependency-janus-v1.json")"

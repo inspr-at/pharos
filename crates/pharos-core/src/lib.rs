@@ -423,6 +423,11 @@ pub enum ArtifactVersionScheme {
     Legacy,
     #[serde(rename = "inspr-calendar-v1")]
     InsprCalendarV1,
+    /// INSPR calendar v2 (INSPR-395 / PHAROS-259): the UTC reservation second
+    /// as a twelve-digit SemVer MAJOR with MINOR and PATCH fixed at 0.0.
+    /// SemVer-shaped on purpose and still never inferred from punctuation.
+    #[serde(rename = "inspr-calendar-v2")]
+    InsprCalendarV2,
 }
 
 impl ArtifactVersionScheme {
@@ -430,6 +435,17 @@ impl ArtifactVersionScheme {
         match self {
             Self::Legacy => "legacy",
             Self::InsprCalendarV1 => "inspr-calendar-v1",
+            Self::InsprCalendarV2 => "inspr-calendar-v2",
+        }
+    }
+
+    /// Validate a version spelling against the grammar of its declared scheme.
+    /// Legacy spellings stay opaque (bounded elsewhere); calendar eras are exact.
+    pub fn accepts_version(self, value: &str) -> bool {
+        match self {
+            Self::Legacy => true,
+            Self::InsprCalendarV1 => valid_inspr_calendar_version(value),
+            Self::InsprCalendarV2 => valid_inspr_calendar_v2_version(value),
         }
     }
 }
@@ -482,6 +498,14 @@ impl DeployedArtifactEvidence {
                 if !valid_inspr_calendar_version(&self.artifact_version) {
                     return Err(
                         "inspr-calendar-v1 artifact version is not a valid calendar coordinate"
+                            .to_string(),
+                    );
+                }
+            }
+            ArtifactVersionScheme::InsprCalendarV2 => {
+                if !valid_inspr_calendar_v2_version(&self.artifact_version) {
+                    return Err(
+                        "inspr-calendar-v2 artifact version is not a valid YYMMDDhhmmss.0.0 coordinate"
                             .to_string(),
                     );
                 }
@@ -890,6 +914,7 @@ fn parse_measured_version_scheme(value: &str) -> Result<ArtifactVersionScheme, S
     match value {
         "legacy" => Ok(ArtifactVersionScheme::Legacy),
         "inspr-calendar-v1" => Ok(ArtifactVersionScheme::InsprCalendarV1),
+        "inspr-calendar-v2" => Ok(ArtifactVersionScheme::InsprCalendarV2),
         _ => Err("version_scheme is not an explicit supported scheme".to_string()),
     }
 }
@@ -983,6 +1008,44 @@ pub fn valid_inspr_calendar_version(value: &str) -> bool {
         }
         _ => return false,
     };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
+}
+
+/// Exact INSPR calendar v2 coordinate: `YYMMDDhhmmss.0.0` with a real UTC date.
+/// Twelve fixed-width digits that never start with zero, then the literal
+/// constant `0.0`. Shorter or longer majors, prerelease or build suffixes and
+/// any non-zero MINOR/PATCH are rejected.
+pub fn valid_inspr_calendar_v2_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    let [stamp, minor, patch] = parts.as_slice() else {
+        return false;
+    };
+    if *minor != "0" || *patch != "0" {
+        return false;
+    }
+    if stamp.len() != 12
+        || !stamp.bytes().all(|byte| byte.is_ascii_digit())
+        || stamp.starts_with('0')
+    {
+        return false;
+    }
+    let field = |start: usize| stamp[start..start + 2].parse::<u32>().unwrap_or(u32::MAX);
+    let (year, month, day, hour, minute, second) = (
+        2000 + field(0),
+        field(2),
+        field(4),
+        field(6),
+        field(8),
+        field(10),
+    );
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let days = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -4434,6 +4497,59 @@ mod tests {
                 "{invalid} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn calendar_v2_versions_are_exact_and_scheme_discriminated() {
+        for value in [
+            "260909194540.0.0",
+            "261231235959.0.0",
+            "280229120000.0.0",
+            "100101000000.0.0",
+        ] {
+            assert!(valid_inspr_calendar_v2_version(value), "{value}");
+            assert!(
+                !valid_inspr_calendar_version(value),
+                "{value} must not pass v1"
+            );
+            assert!(ArtifactVersionScheme::InsprCalendarV2.accepts_version(value));
+            assert!(!ArtifactVersionScheme::InsprCalendarV1.accepts_version(value));
+        }
+        for value in [
+            "26.09.09",
+            "26.09.09.19.45.40",
+            "2609091945.0.0",
+            "20260909194540.0.0",
+            "260909194540",
+            "260909194540.0",
+            "260909194540.0.1",
+            "260909194540.1.0",
+            "260909194540.0.0-rc1",
+            "260909194540.0.0+g1",
+            "090909194540.0.0",
+            "260230194540.0.0",
+            "260431194540.0.0",
+            "260909240000.0.0",
+            "260909196000.0.0",
+            "260909194560.0.0",
+            "260909194540.00.0",
+            " 260909194540.0.0",
+            "v260909194540.0.0",
+            "٢٦0909194540.0.0",
+        ] {
+            assert!(!valid_inspr_calendar_v2_version(value), "{value}");
+        }
+        assert!(ArtifactVersionScheme::InsprCalendarV1.accepts_version("26.09.09.19.45.40"));
+        assert!(!ArtifactVersionScheme::InsprCalendarV2.accepts_version("26.09.09.19.45.40"));
+        assert_eq!(
+            parse_measured_version_scheme("inspr-calendar-v2").unwrap(),
+            ArtifactVersionScheme::InsprCalendarV2
+        );
+        assert!(parse_measured_version_scheme("inspr-calendar-v3").is_err());
+        assert_eq!(
+            serde_json::to_string(&ArtifactVersionScheme::InsprCalendarV2).unwrap(),
+            "\"inspr-calendar-v2\""
+        );
     }
 
     #[test]
