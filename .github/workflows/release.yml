@@ -216,6 +216,7 @@ jobs:
           IMAGE: ${{ steps.version.outputs.image }}
           DIGEST: ${{ steps.candidate.outputs.digest }}
           VERSION: ${{ steps.version.outputs.value }}
+          SCHEME: ${{ steps.version.outputs.scheme }}
           SEQUENCE: ${{ steps.version.outputs.sequence }}
         run: |
           container="pharos-release-${GITHUB_RUN_ID}"
@@ -232,10 +233,11 @@ jobs:
             sleep 1
           done
           jq -e \
+            --arg scheme "${SCHEME}" \
             --arg version "${VERSION}" \
             --arg commit "${GITHUB_SHA}" \
             --argjson sequence "${SEQUENCE}" \
-            '.version_scheme == "inspr-calendar-v1"
+            '.version_scheme == $scheme
               and .version == $version
               and .release_channel == "stable"
               and .release_sequence == $sequence
@@ -243,8 +245,8 @@ jobs:
           docker run --rm --network host \
             -e PHAROS_URL=http://127.0.0.1:18088 \
             --entrypoint /usr/local/bin/pharos \
-            "${IMAGE}@${DIGEST}" version | jq -e --arg version "${VERSION}" \
-            '.version_scheme == "inspr-calendar-v1" and .version == $version' >/dev/null
+            "${IMAGE}@${DIGEST}" version | jq -e --arg scheme "${SCHEME}" --arg version "${VERSION}" \
+            '.version_scheme == $scheme and .version == $version' >/dev/null
       - name: scan candidate image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (composite; Node 24 nested actions)
         with:
