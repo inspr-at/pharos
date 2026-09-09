@@ -1,0 +1,2 @@
+// Production pharosPublicPath from crates/pharosd/src/public_mount.rs (inject_public_base_meta).
+export const pharosPublicPathSource = `window.pharosPublicPath=function(p){var b=document.querySelector('meta[name="pharos-public-base-path"]')&&document.querySelector('meta[name="pharos-public-base-path"]').content||'';if(!p||p==='/')return b||'/';if(typeof p!=='string'||p.charAt(0)!=='/'||p.slice(0,2)==='//')return p;if(b&&(p===b||p.indexOf(b+'/')===0||p.indexOf(b+'?')===0||p.indexOf(b+'#')===0))return p;return b+p;};`;
