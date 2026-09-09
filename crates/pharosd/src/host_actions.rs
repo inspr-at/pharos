@@ -6095,11 +6095,65 @@ impl HostActionStore {
         actor: &str,
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
+        self.confirm_update_with_authority(id, host, actor, now, HostActionEventSource::Operator)
+    }
+
+    /// Queue the already-reviewed deterministic update under one consumed,
+    /// server-issued launch admission. This shares every human confirmation
+    /// transition and ready-plan guard; the persisted Pharos source keeps the
+    /// delegated authority distinguishable from an operator confirmation.
+    pub(crate) fn confirm_update_delegated(
+        &self,
+        id: &str,
+        host: &str,
+        admission_id: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        self.confirm_update_with_authority(
+            id,
+            host,
+            admission_id,
+            now,
+            HostActionEventSource::Pharos,
+        )
+    }
+
+    fn confirm_update_with_authority(
+        &self,
+        id: &str,
+        host: &str,
+        actor: &str,
+        now: i64,
+        source: HostActionEventSource,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        if !safe_actor(actor) {
+            return Err(HostActionStoreError::InvalidJob);
+        }
         let mut jobs = self.jobs.write().expect("host action store lock");
         let (previous, updated) = {
             let job = jobs.get_mut(id).ok_or(HostActionStoreError::NotFound)?;
             if job.host != host {
                 return Err(HostActionStoreError::WrongHost);
+            }
+            if source == HostActionEventSource::Pharos
+                && job.kind == HostActionKind::UpdateRestart
+                && job.state != HostActionState::AwaitingConfirmation
+                && job.confirmed_at.is_some()
+                && matches!(
+                    job.state,
+                    HostActionState::QueuedApply
+                        | HostActionState::Applying
+                        | HostActionState::Rebooting
+                        | HostActionState::Succeeded
+                        | HostActionState::Failed
+                )
+                && job.events.iter().any(|event| {
+                    event.kind == HostActionEventKind::Confirmed
+                        && event.source == HostActionEventSource::Pharos
+                        && event.actor.as_deref() == Some(actor)
+                })
+            {
+                return Ok(job.clone());
             }
             if job.kind != HostActionKind::UpdateRestart
                 || job.state != HostActionState::AwaitingConfirmation
@@ -6115,12 +6169,7 @@ impl HostActionStore {
             job.updated_at = now;
             job.lease_phase = None;
             job.lease_until = None;
-            job.record_event(
-                now,
-                HostActionEventSource::Operator,
-                HostActionEventKind::Confirmed,
-                Some(actor),
-            );
+            job.record_event(now, source, HostActionEventKind::Confirmed, Some(actor));
             (previous, job.clone())
         };
         if let Err(error) = self.persist_jobs(&jobs) {
@@ -7617,6 +7666,72 @@ mod tests {
         assert_eq!(
             store.claim("hsb8", 104).expect("claim").unwrap().phase,
             AgentActionPhase::Apply
+        );
+    }
+
+    #[test]
+    fn delegated_confirmation_shares_ready_guard_and_records_distinct_authority() {
+        let store = HostActionStore::new(None);
+        let job = store
+            .create_update_review("hsb8", "paimos-delivery", 200)
+            .expect("job created");
+        assert!(matches!(
+            store.confirm_update_delegated(
+                &job.id,
+                "hsb8",
+                "20600000-0000-4000-8000-000000000002",
+                201,
+            ),
+            Err(HostActionStoreError::InvalidTransition)
+        ));
+        let lease = store.claim("hsb8", 202).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &job.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: lease.phase,
+                    outcome: AgentActionOutcome::Succeeded,
+                    plan: Some(ready_plan()),
+                    result: None,
+                },
+                203,
+            )
+            .expect("review stored");
+        assert!(matches!(
+            store.confirm_update_delegated(
+                &job.id,
+                "other-host",
+                "20600000-0000-4000-8000-000000000002",
+                204,
+            ),
+            Err(HostActionStoreError::WrongHost)
+        ));
+        let confirmed = store
+            .confirm_update_delegated(&job.id, "hsb8", "20600000-0000-4000-8000-000000000002", 204)
+            .expect("delegated admission confirms reviewed job");
+        assert_eq!(confirmed.state, HostActionState::QueuedApply);
+        let event = confirmed.events.last().expect("confirmation event");
+        assert_eq!(event.kind, HostActionEventKind::Confirmed);
+        assert_eq!(event.source, HostActionEventSource::Pharos);
+        assert_eq!(
+            event.actor.as_deref(),
+            Some("20600000-0000-4000-8000-000000000002")
+        );
+        let replayed = store
+            .confirm_update_delegated(&job.id, "hsb8", "20600000-0000-4000-8000-000000000002", 205)
+            .expect("exact delegated confirmation replay is idempotent");
+        assert_eq!(replayed, confirmed);
+        assert_eq!(
+            store
+                .get(&job.id)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
         );
     }
 
