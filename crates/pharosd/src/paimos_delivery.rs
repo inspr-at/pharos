@@ -5089,32 +5089,33 @@ mod tests {
         assert!(!contains_slice(&durable, API_KEY_SENTINEL));
         assert!(!contains_slice(&durable, HANDOFF_SENTINEL));
 
-        let captures = fake.captures.lock().unwrap();
-        let candidates: Vec<_> = captures
-            .iter()
-            .filter(|capture| capture.path.ends_with("/launch-candidates"))
-            .collect();
-        let consumes: Vec<_> = captures
-            .iter()
-            .filter(|capture| capture.path.ends_with("/consume"))
-            .collect();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(consumes.len(), 1);
-        assert_eq!(candidates[0].content_type, LAUNCH_MEDIA_TYPE);
-        assert_eq!(candidates[0].accept, LAUNCH_MEDIA_TYPE);
-        assert_eq!(candidates[0].body, launch.candidate_body_json.as_bytes());
-        assert_eq!(
-            candidates[0].idempotency_key,
-            launch.candidate_idempotency_key
-        );
-        assert_eq!(consumes[0].content_type, LAUNCH_MEDIA_TYPE);
-        assert_eq!(consumes[0].accept, LAUNCH_MEDIA_TYPE);
-        assert_eq!(
-            consumes[0].body,
-            launch.consume_body_json.as_deref().unwrap().as_bytes()
-        );
+        {
+            let captures = fake.captures.lock().unwrap();
+            let candidates: Vec<_> = captures
+                .iter()
+                .filter(|capture| capture.path.ends_with("/launch-candidates"))
+                .collect();
+            let consumes: Vec<_> = captures
+                .iter()
+                .filter(|capture| capture.path.ends_with("/consume"))
+                .collect();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(consumes.len(), 1);
+            assert_eq!(candidates[0].content_type, LAUNCH_MEDIA_TYPE);
+            assert_eq!(candidates[0].accept, LAUNCH_MEDIA_TYPE);
+            assert_eq!(candidates[0].body, launch.candidate_body_json.as_bytes());
+            assert_eq!(
+                candidates[0].idempotency_key,
+                launch.candidate_idempotency_key
+            );
+            assert_eq!(consumes[0].content_type, LAUNCH_MEDIA_TYPE);
+            assert_eq!(consumes[0].accept, LAUNCH_MEDIA_TYPE);
+            assert_eq!(
+                consumes[0].body,
+                launch.consume_body_json.as_deref().unwrap().as_bytes()
+            );
+        }
 
-        drop(captures);
         adapter.process_intent(&deployment).await.unwrap();
         assert_eq!(actions.list().len(), 1);
         assert_eq!(
