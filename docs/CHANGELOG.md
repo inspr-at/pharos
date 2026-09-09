@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 26.09.09.13.50.55 - 2026-09-09
+
+- Add an explicit, default-off delegated delivery mode that consumes a one-use Paimos launch admission rooted in human review and confirms only the existing ready Pharos job (PHAROS-206).
+- Persist candidate and consumption receipts across retries, revalidate target and reviewed-plan bindings, and retain attended operation when delegated delivery is not configured.
+- Keep frozen v1/v2 contract fixtures unchanged and cover admission, replay, refusal and recovery with real network tests.
+
 ## 26.09.08.23.58.28 - 2026-09-08
 
 - Support an optional native public URL prefix for Pharos pages, forms, assets, API responses, login callbacks and Flow navigation while keeping standalone root hosting unchanged (PHAROS-258).
