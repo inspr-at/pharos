@@ -38,10 +38,10 @@ use crate::store::Store;
 use pharos_core::{valid_inspr_calendar_version, ArtifactVersionScheme};
 
 pub(crate) const PAIMOS_SCHEMA_MAJOR: u16 = 2;
-pub(crate) const PAIMOS_RELEASE: &str = "v26.09.05";
-pub(crate) const PAIMOS_CERTIFIED_COMMIT: &str = "bb3b874f22a14fbe3879b1b575f33d55a001312d";
+pub(crate) const PAIMOS_RELEASE: &str = "v260909151030.0.0";
+pub(crate) const PAIMOS_CERTIFIED_COMMIT: &str = "c656912e28c7da208148f4f940991c228f0bf71a";
 pub(crate) const PAIMOS_FIXTURE_DIGEST: &str =
-    "sha256:6bba9613230c6ea728db58ffea5533399caed19e6d56a8d78ef19d0fde20be8a";
+    "sha256:fb68cb9990bfcdfe4168f9780c412327d357ecd4181a6b24499352c7858be5f6";
 #[cfg(test)]
 pub(crate) const PAIMOS_JANUS_DEPENDENCY_SHA256: &str =
     "52a647abd52e229fcdef8461eeb9f7d31f07632501ad33f594cdfbc155c23d4b";
@@ -159,6 +159,9 @@ impl ArtifactEvidence {
         let scheme_ok = match self.version_scheme {
             ArtifactVersionScheme::Legacy => valid_version(&self.version),
             ArtifactVersionScheme::InsprCalendarV1 => valid_inspr_calendar_version(&self.version),
+            ArtifactVersionScheme::InsprCalendarV2 => {
+                pharos_core::valid_inspr_calendar_v2_version(&self.version)
+            }
         };
         scheme_ok
             && valid_symbol(&self.release_channel)
@@ -1895,6 +1898,45 @@ mod tests {
         }
     }
 
+    fn calendar_v2_artifact() -> ArtifactEvidence {
+        ArtifactEvidence {
+            version_scheme: ArtifactVersionScheme::InsprCalendarV2,
+            version: "260910081500.0.0".to_string(),
+            release_channel: "stable".to_string(),
+            release_sequence: 260_910_081_500,
+            digest: format!("sha256:{}", "7".repeat(64)),
+            commit_digest: "d".repeat(40),
+            release_manifest_coordinate: "ghcr:inspr-at/pharos/releases/260910081500.0.0"
+                .to_string(),
+            release_manifest_digest: format!("sha256:{}", "8".repeat(64)),
+        }
+    }
+
+    #[test]
+    fn calendar_v2_artifact_evidence_validates_only_its_own_grammar() {
+        assert!(calendar_v2_artifact().valid());
+        let mut v1_spelling = calendar_v2_artifact();
+        v1_spelling.version = "26.09.10.08.15.00".to_string();
+        assert!(!v1_spelling.valid());
+        let mut v2_spelling_under_v1 = calendar_artifact();
+        v2_spelling_under_v1.version = "260910081500.0.0".to_string();
+        assert!(!v2_spelling_under_v1.valid());
+        let mut suffixed = calendar_v2_artifact();
+        suffixed.version = "260910081500.0.0-rc1".to_string();
+        assert!(!suffixed.valid());
+        let parsed: ArtifactEvidence = serde_json::from_str(
+            &serde_json::to_string(&calendar_v2_artifact()).expect("serialize"),
+        )
+        .expect("round trip");
+        assert_eq!(parsed, calendar_v2_artifact());
+        assert!(serde_json::from_str::<ArtifactEvidence>(
+            &serde_json::to_string(&calendar_v2_artifact())
+                .expect("serialize")
+                .replace("inspr-calendar-v2", "inspr-calendar-v3")
+        )
+        .is_err());
+    }
+
     fn measured_from(artifact: &ArtifactEvidence, observed_at: i64) -> DeployedArtifactEvidence {
         DeployedArtifactEvidence {
             schema: DEPLOYED_ARTIFACT_EVIDENCE_SCHEMA.to_string(),
@@ -2327,16 +2369,16 @@ mod tests {
             "../../../contracts/paimos-external-stage-v2/external-stage-v2.schema.json"
         );
         assert_eq!(dependency.len(), 1115);
-        assert_eq!(owner.len(), 3868);
-        assert_eq!(schema.len(), 10292);
+        assert_eq!(owner.len(), 5780);
+        assert_eq!(schema.len(), 10380);
         assert_eq!(hex_digest(dependency), PAIMOS_JANUS_DEPENDENCY_SHA256);
         assert_eq!(
             hex_digest(owner),
-            "99abbf90592ff319b4e00319bc8bb5141572e6dc66cfcf074d781358c36954a9"
+            "e63cc10020b706a07af969e5dab0052894c2dcbc338c53e7bf6327a7a92baf2b"
         );
         assert_eq!(
             hex_digest(schema),
-            "57b2ceaebc2991f89b9adb4de713c2c760c40f521ee8bde8cd67dfb5559ae33a"
+            "9e9140bb7fbf4b46caf53ab9576be8ff99b208dcb4a10b8512f0d69959190ed0"
         );
         let mut set = Sha256::new();
         set.update(b"paimos.external-stage.fixtures.v2\0");

@@ -68,6 +68,33 @@ fn main() {
             .expect("RELEASE.json migration anchor has first_calendar_release_sequence")
     );
 
+    // PHAROS-259: the v1 → v2 anchor. Present in every v2 record; a v1 record
+    // (schema v1) has no successor era yet, so these stay empty there.
+    let anchor = &release["migration_anchor"];
+    let optional_anchor = |key: &str| anchor[key].as_str().unwrap_or("").to_string();
+    let optional_sequence = |key: &str| {
+        anchor[key]
+            .as_u64()
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    };
+    println!(
+        "cargo:rustc-env=PHAROS_LAST_CALENDAR_V1_VERSION={}",
+        optional_anchor("last_calendar_v1_version")
+    );
+    println!(
+        "cargo:rustc-env=PHAROS_LAST_CALENDAR_V1_RELEASE_SEQUENCE={}",
+        optional_sequence("last_calendar_v1_release_sequence")
+    );
+    println!(
+        "cargo:rustc-env=PHAROS_FIRST_CALENDAR_V2_VERSION={}",
+        optional_anchor("first_calendar_v2_version")
+    );
+    println!(
+        "cargo:rustc-env=PHAROS_FIRST_CALENDAR_V2_RELEASE_SEQUENCE={}",
+        optional_sequence("first_calendar_v2_release_sequence")
+    );
+
     let git_commit = env::var("GIT_COMMIT")
         .ok()
         .filter(|value| !value.trim().is_empty())

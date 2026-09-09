@@ -53,7 +53,13 @@ test("release history exposes the complete immutable release identity", async ({
   const dialog = page.locator("[data-release-modal]");
   await expect(dialog).toHaveCount(1);
   const identity = dialog.locator("[data-release-identity]");
-  await expect(identity).toContainText("Calendar v1");
+  const schemeLabel = {
+    "inspr-calendar-v2": "Calendar v2",
+    "inspr-calendar-v1": "Calendar v1",
+    legacy: "Legacy",
+  }[releaseCoordinate.version_scheme];
+  expect(schemeLabel).toBeDefined();
+  await expect(identity).toContainText(schemeLabel);
   await expect(identity).toContainText(releaseCoordinate.release_channel);
   await expect(identity).toContainText(`#${releaseCoordinate.release_sequence}`);
   await expect(dialog.locator("[data-release-set]")).toHaveAttribute(

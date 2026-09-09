@@ -22,6 +22,15 @@ FIRST_CALENDAR_SEQUENCE = 1
 NEXT_CALENDAR_VERSION = "26.09.01.13.29.32"
 NEXT_CALENDAR_SEQUENCE = 2
 LATER_CALENDAR_VERSION = "26.09.01.13.29.33"
+# Real v1 stable-channel history (sequences 1–5) that precedes the v2 era.
+V1_HISTORY = (
+    ("26.09.01.13.29.31", 1),
+    ("26.09.07.20.52.53", 2),
+    ("26.09.07.22.08.13", 3),
+    ("26.09.08.11.36.59", 4),
+    ("26.09.08.23.58.28", 5),
+)
+FIRST_V2_SEQUENCE = 6
 
 
 class CalendarVersionTests(unittest.TestCase):
@@ -33,15 +42,44 @@ class CalendarVersionTests(unittest.TestCase):
 
     @classmethod
     def calendar_release(cls, version, sequence, *, first=None):
-        document = copy.deepcopy(cls.release_document())
-        document["version"] = version
-        document["release_sequence"] = sequence
-        document["ecosystem_versions"]["cargo_semver"] = release_version.calendar_to_cargo(
-            version
-        )
+        """A v1 release-coordinate record (schema v1) as it exists in history."""
+
+        live = cls.release_document()
+        anchor = live["migration_anchor"]
+        document = {
+            "schema": release_version.RELEASE_SCHEMA_V1,
+            "schema_version": 1,
+            "version_scheme": release_version.CALENDAR_SCHEME,
+            "version": version,
+            "release_channel": "stable",
+            "release_sequence": sequence,
+            "ecosystem_versions": {"cargo_semver": release_version.calendar_to_cargo(version)},
+            "migration_anchor": {
+                "last_legacy_version": anchor["last_legacy_version"],
+                "last_legacy_release_sequence": anchor["last_legacy_release_sequence"],
+                "first_calendar_version": anchor["first_calendar_version"],
+                "first_calendar_release_sequence": anchor["first_calendar_release_sequence"],
+            },
+            "legacy_rollback": copy.deepcopy(live["legacy_rollback"]),
+            "compatibility_window": live["compatibility_window"],
+        }
         if first is not None:
             document["migration_anchor"]["first_calendar_version"] = first
         return document
+
+    @classmethod
+    def calendar_v2_release(cls, version, sequence):
+        """A v2 release-coordinate record derived from the live document."""
+
+        document = copy.deepcopy(cls.release_document())
+        document["version"] = version
+        document["release_sequence"] = sequence
+        document["ecosystem_versions"]["cargo_semver"] = version
+        return document
+
+    @classmethod
+    def v1_history(cls):
+        return tuple(cls.calendar_release(version, sequence) for version, sequence in V1_HISTORY)
 
     @classmethod
     def first_calendar_release(cls):
@@ -193,33 +231,82 @@ class CalendarVersionTests(unittest.TestCase):
             FIRST_CALENDAR_SEQUENCE,
         )
 
-    def test_current_release_is_valid_calendar_successor(self):
-        first = self.first_calendar_release()
+    def test_current_release_is_valid_calendar_v2_successor(self):
         current = self.release_document()
-        self.assertGreater(current["release_sequence"], FIRST_CALENDAR_SEQUENCE)
-        self.assertEqual(
-            current["migration_anchor"]["first_calendar_version"], FIRST_CALENDAR_VERSION
-        )
-        self.assertEqual(current["migration_anchor"], first["migration_anchor"])
-        self.assertNotEqual(current["version"], FIRST_CALENDAR_VERSION)
-        first_identity = release_version.ReleaseIdentity(
-            release_version.CALENDAR_SCHEME, FIRST_CALENDAR_VERSION, FIRST_CALENDAR_SEQUENCE
+        self.assertEqual(current["schema"], release_version.RELEASE_SCHEMA_V2)
+        self.assertEqual(current["version_scheme"], release_version.CALENDAR_V2_SCHEME)
+        self.assertGreaterEqual(current["release_sequence"], FIRST_V2_SEQUENCE)
+        anchor = current["migration_anchor"]
+        self.assertEqual(anchor["first_calendar_version"], FIRST_CALENDAR_VERSION)
+        self.assertEqual(anchor["last_calendar_v1_version"], V1_HISTORY[-1][0])
+        self.assertEqual(anchor["last_calendar_v1_release_sequence"], V1_HISTORY[-1][1])
+        self.assertEqual(anchor["first_calendar_v2_release_sequence"], FIRST_V2_SEQUENCE)
+        # The Cargo mapping of a v2 coordinate is the identity.
+        self.assertEqual(current["ecosystem_versions"]["cargo_semver"], current["version"])
+        release_version.validate_release(current)
+        last_v1 = release_version.ReleaseIdentity(
+            release_version.CALENDAR_SCHEME, *V1_HISTORY[-1]
         )
         current_identity = release_version.ReleaseIdentity(
-            release_version.CALENDAR_SCHEME,
-            current["version"],
-            current["release_sequence"],
+            release_version.CALENDAR_V2_SCHEME, current["version"], current["release_sequence"]
         )
-        self.assertLess(release_version.compare_releases(first_identity, current_identity), 0)
-        release_version.validate_release(current)
-        recorded = [first]
-        if current["release_sequence"] > NEXT_CALENDAR_SEQUENCE:
-            recorded.append(self.calendar_release(NEXT_CALENDAR_VERSION, NEXT_CALENDAR_SEQUENCE))
-        if current["release_sequence"] > 3:
-            recorded.append(self.calendar_release("26.09.07.22.08.13", 3))
-        if current["release_sequence"] > 4:
-            recorded.append(self.calendar_release("26.09.08.11.36.59", 4))
+        self.assertLess(release_version.compare_releases(last_v1, current_identity), 0)
+        recorded = list(self.v1_history())
+        if current["release_sequence"] > FIRST_V2_SEQUENCE:
+            recorded.append(
+                self.calendar_v2_release(anchor["first_calendar_v2_version"], FIRST_V2_SEQUENCE)
+            )
         release_version.validate_reservation_history(current, tuple(recorded), ())
+
+    def test_calendar_v2_grammar_is_exact_and_gregorian(self):
+        for value in ("260909194540.0.0", "261231235959.0.0", "280229120000.0.0", "100101000000.0.0"):
+            with self.subTest(value=value):
+                release_version.parse_calendar_v2(value)
+                self.assertEqual(release_version.calendar_to_cargo(value), value)
+                self.assertEqual(release_version.cargo_to_calendar(value), value)
+        for value in (
+            "26.09.09", "26.09.09.19.45.40", "2609091945.0.0", "20260909194540.0.0",
+            "260909194540", "260909194540.0", "260909194540.0.1", "260909194540.1.0",
+            "260909194540.0.0-rc1", "260909194540.0.0+g1", "090909194540.0.0",
+            "260230194540.0.0", "260431194540.0.0", "260909240000.0.0", "260909196000.0.0",
+            "260909194560.0.0", "260909194540.00.0", " 260909194540.0.0", "v260909194540.0.0",
+        ):
+            with self.subTest(value=value), self.assertRaises(release_version.ReleaseVersionError):
+                release_version.parse_calendar_v2(value)
+        # Mixed-era readers discriminate on the scheme, never on shape.
+        with self.assertRaises(release_version.ReleaseVersionError):
+            release_version.ReleaseIdentity(
+                release_version.CALENDAR_SCHEME, "260909194540.0.0", 6
+            ).validated_key()
+        with self.assertRaises(release_version.ReleaseVersionError):
+            release_version.ReleaseIdentity(
+                release_version.CALENDAR_V2_SCHEME, "26.09.09.19.45.40", 6
+            ).validated_key()
+
+    def test_v2_history_closes_v1_and_orders_across_eras_by_sequence(self):
+        current = self.release_document()
+        first_v2 = current["migration_anchor"]["first_calendar_v2_version"]
+        history = self.v1_history()
+        # A v1 reservation after the first v2 coordinate is closed.
+        stray_v1 = self.calendar_release("26.09.09.23.00.00", FIRST_V2_SEQUENCE + 1)
+        with self.assertRaises(release_version.ReleaseVersionError):
+            release_version.validate_reservation_history(
+                stray_v1, (*history, self.calendar_v2_release(first_v2, FIRST_V2_SEQUENCE)), ()
+            )
+        # A v2 record that disagrees on the v1 → v2 anchor is refused.
+        drifted = self.calendar_v2_release(first_v2, FIRST_V2_SEQUENCE)
+        drifted["migration_anchor"]["last_calendar_v1_version"] = "26.09.08.11.36.59"
+        with self.assertRaises(release_version.ReleaseVersionError):
+            release_version.validate_release(drifted)
+        # Cross-era ordering is by sequence, never by string or SemVer shape.
+        last_v1 = release_version.ReleaseIdentity(release_version.CALENDAR_SCHEME, *V1_HISTORY[-1])
+        v2 = release_version.ReleaseIdentity(release_version.CALENDAR_V2_SCHEME, first_v2, FIRST_V2_SEQUENCE)
+        self.assertLess(release_version.compare_releases(last_v1, v2), 0)
+        with self.assertRaises(release_version.ReleaseVersionError):
+            release_version.compare_releases(
+                last_v1,
+                release_version.ReleaseIdentity(release_version.CALENDAR_V2_SCHEME, first_v2, V1_HISTORY[-1][1]),
+            )
 
     def test_repository_reservation_must_advance_coordinate_and_sequence(self):
         first = self.first_calendar_release()
@@ -338,7 +425,7 @@ class CalendarVersionTests(unittest.TestCase):
                 )
 
     def test_unknown_absent_and_ambiguous_schemes_fail_closed(self):
-        for scheme in ("", "semver", "inspr-calendar-v2"):
+        for scheme in ("", "semver", "inspr-calendar-v3"):
             with self.subTest(scheme=scheme), self.assertRaises(
                 release_version.ReleaseVersionError
             ):
@@ -381,10 +468,10 @@ class CalendarVersionTests(unittest.TestCase):
         del missing_scheme["version_scheme"]
         mutations.append(missing_scheme)
         unknown_scheme = copy.deepcopy(release)
-        unknown_scheme["version_scheme"] = "inspr-calendar-v2"
+        unknown_scheme["version_scheme"] = "inspr-calendar-v3"
         mutations.append(unknown_scheme)
         short_version = copy.deepcopy(release)
-        short_version["version"] = "26.09.01"
+        short_version["version"] = "2609091945.0.0"
         mutations.append(short_version)
         wrong_mapping = copy.deepcopy(release)
         wrong_mapping["ecosystem_versions"]["cargo_semver"] = "2026.901.132932"

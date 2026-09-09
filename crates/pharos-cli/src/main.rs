@@ -214,7 +214,8 @@ fn validate_version_response(value: &Value) -> Result<(), String> {
     match scheme {
         "legacy" if sequence == 0 && valid_legacy_version(version) => Ok(()),
         "inspr-calendar-v1" if sequence > 0 && valid_calendar_version(version) => Ok(()),
-        "legacy" | "inspr-calendar-v1" => {
+        "inspr-calendar-v2" if sequence > 0 && valid_calendar_v2_version(version) => Ok(()),
+        "legacy" | "inspr-calendar-v1" | "inspr-calendar-v2" => {
             Err("Pharos version response has invalid release metadata".to_string())
         }
         _ => Err("Pharos version response has an unknown version scheme".to_string()),
@@ -229,6 +230,42 @@ fn valid_legacy_version(value: &str) -> bool {
                 && part.bytes().all(|byte| byte.is_ascii_digit())
                 && (part == &"0" || !part.starts_with('0'))
         })
+}
+
+/// INSPR calendar v2 (PHAROS-259): exactly `YYMMDDhhmmss.0.0` with a real UTC
+/// date. The CLI keeps its own copy so it stays independent of pharos-core.
+fn valid_calendar_v2_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    let [stamp, minor, patch] = parts.as_slice() else {
+        return false;
+    };
+    if *minor != "0" || *patch != "0" {
+        return false;
+    }
+    if stamp.len() != 12
+        || !stamp.bytes().all(|byte| byte.is_ascii_digit())
+        || stamp.starts_with('0')
+    {
+        return false;
+    }
+    let field = |start: usize| stamp[start..start + 2].parse::<u32>().unwrap_or(u32::MAX);
+    let (year, month, day, hour, minute, second) = (
+        2000 + field(0),
+        field(2),
+        field(4),
+        field(6),
+        field(8),
+        field(10),
+    );
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
 }
 
 fn valid_calendar_version(value: &str) -> bool {
@@ -356,6 +393,12 @@ mod tests {
                 "release_channel": "stable",
                 "release_sequence": 0
             }),
+            json!({
+                "version_scheme": "inspr-calendar-v2",
+                "version": "260909194540.0.0",
+                "release_channel": "stable",
+                "release_sequence": 6
+            }),
         ] {
             assert!(render(&Command::Version, StatusCode::OK, &body.to_string()).is_ok());
         }
@@ -370,6 +413,24 @@ mod tests {
                 "version": "26.09.01.13.29.31",
                 "release_channel": "stable",
                 "release_sequence": 1
+            }),
+            json!({
+                "version_scheme": "inspr-calendar-v1",
+                "version": "260909194540.0.0",
+                "release_channel": "stable",
+                "release_sequence": 6
+            }),
+            json!({
+                "version_scheme": "inspr-calendar-v3",
+                "version": "260909194540.0.0",
+                "release_channel": "stable",
+                "release_sequence": 6
+            }),
+            json!({
+                "version_scheme": "inspr-calendar-v2",
+                "version": "260909194540.0.0-rc1",
+                "release_channel": "stable",
+                "release_sequence": 6
             }),
             json!({
                 "version_scheme": "inspr-calendar-v1",

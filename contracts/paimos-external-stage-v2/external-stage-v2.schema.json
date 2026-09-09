@@ -7,7 +7,7 @@
     "schema_major": 2,
     "media_type": "application/vnd.paimos.external-stage.v2+json",
     "encoding": "utf-8-json-lf",
-    "fixture_digest": "sha256:6bba9613230c6ea728db58ffea5533399caed19e6d56a8d78ef19d0fde20be8a"
+    "fixture_digest": "sha256:fb68cb9990bfcdfe4168f9780c412327d357ecd4181a6b24499352c7858be5f6"
   },
   "oneOf": [
     {"$ref": "#/$defs/ExternalStagePullResponseV2"},
@@ -19,10 +19,10 @@
     "ExternalStageArtifactEvidenceV2": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Explicitly discriminated release identity. inspr-calendar-v1 versions are also calendar-validated by the service; legacy strings are never inferred from punctuation.",
+      "description": "Explicitly discriminated release identity. inspr-calendar-v1 (yy.mm.dd[.hh.mm.ss]) and inspr-calendar-v2 (UTC YYMMDDhhmmss.0.0) versions are also calendar-validated by the service; legacy strings are never inferred from punctuation.",
       "required": ["version_scheme", "version", "release_channel", "release_sequence", "digest", "commit_digest", "release_manifest_coordinate", "release_manifest_digest"],
       "properties": {
-        "version_scheme": {"type": "string", "enum": ["legacy", "inspr-calendar-v1"]},
+        "version_scheme": {"type": "string", "enum": ["legacy", "inspr-calendar-v1", "inspr-calendar-v2"]},
         "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
         "release_channel": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
         "release_sequence": {"type": "integer", "format": "int64", "minimum": 0},

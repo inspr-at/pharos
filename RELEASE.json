@@ -1,18 +1,22 @@
 {
-  "schema": "inspr.release-coordinate.v1",
-  "schema_version": 1,
-  "version_scheme": "inspr-calendar-v1",
-  "version": "26.09.08.23.58.28",
+  "schema": "inspr.release-coordinate.v2",
+  "schema_version": 2,
+  "version_scheme": "inspr-calendar-v2",
+  "version": "260909194540.0.0",
   "release_channel": "stable",
-  "release_sequence": 5,
+  "release_sequence": 6,
   "ecosystem_versions": {
-    "cargo_semver": "2026.908.235828"
+    "cargo_semver": "260909194540.0.0"
   },
   "migration_anchor": {
     "last_legacy_version": "0.2.0",
     "last_legacy_release_sequence": 0,
     "first_calendar_version": "26.09.01.13.29.31",
-    "first_calendar_release_sequence": 1
+    "first_calendar_release_sequence": 1,
+    "last_calendar_v1_version": "26.09.08.23.58.28",
+    "last_calendar_v1_release_sequence": 5,
+    "first_calendar_v2_version": "260909194540.0.0",
+    "first_calendar_v2_release_sequence": 6
   },
   "legacy_rollback": {
     "version_scheme": "legacy",

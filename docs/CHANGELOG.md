@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 260909194540.0.0 - 2026-09-09
+
+- Adopt INSPR Calendar Version v2 (PHAROS-259, INSPR-395): releases are now the UTC reservation second as `YYMMDDhhmmss.0.0`, a fixed-width, string-sortable and SemVer-syntactic coordinate with no numeric aliases. The migration anchor records legacy → calendar v1 (26.09.01.13.29.31 … 26.09.08.23.58.28, sequences 1–5) → calendar v2 from sequence 6; the Cargo mapping becomes the identity. Every published tag, image and changelog entry stays exactly as it is.
+- Accept `inspr-calendar-v2` next to `legacy` and `inspr-calendar-v1` in deployed-artifact evidence, approved release envelopes, Paimos delivery intents, the CLI version view and the release dialog, validating each version only against the grammar of its declared scheme. Unknown schemes still fail closed.
+- Adopt the republished Paimos external-stage v2 contract (schema, owner fixture with the calendar v2 deployment and verification pair, re-certified manifest) so Paimos delivery handoffs can carry v2 identities.
+
 ## 26.09.08.23.58.28 - 2026-09-08
 
 - Support an optional native public URL prefix for Pharos pages, forms, assets, API responses, login callbacks and Flow navigation while keeping standalone root hosting unchanged (PHAROS-258).
