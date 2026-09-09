@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-26.09.08.11.36.59-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-26.09.08.23.58.28-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,7 +51,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v26.09.08.11.36.59
+## What ships in v26.09.08.23.58.28
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -715,7 +715,19 @@ Optional bounded `@inspr/flow-shell` integration is enabled when `PHAROS_FLOW_CO
 points at a JSON document using schema `inspr.pharos.flow-host-config.v1`. The config
 file and the referenced Paimos API key file must both be owner-readable only (`0600`,
 matching uid, parent directory `0700`). Each binding maps one Paimos project to Pharos
-host names and `operator-ref` values that may use the shell.
+host names and `operator-ref` values that may use the shell. `paimos_origin` is the
+server-side projection URL and may include Paimos's own public base path; the
+API key file stays off the browser. Optional `paimos_public_url` is the
+browser navigation address when that public URL differs from the server-side
+origin (for example a same-origin `/paimos` mount).
+
+Optional `PHAROS_PUBLIC_BASE_PATH` (empty default) serves the same binary under
+a configured prefix such as `/pharos` without changing cookie names, `__Host-`
+flags (`Secure`, `Path=/`, no `Domain`), or per-app operator/project
+verification. `PHAROS_PUBLIC_ORIGIN` is scheme+host separately. The edge must
+forward the same public path. There is no HTML rewriter, iframe gateway,
+shared session, or forwarded-user trust. Register the OIDC callback as origin
+plus base path plus `/auth/callback` (origin-root when the base path is empty).
 
 For local harnesses against loopback Paimos, set `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN=true`
 when **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback. Cleartext HTTP is
@@ -730,6 +742,8 @@ HTTPS-only boundary. Store Flow config and API key files under an operator-owned
 | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `PHAROS_ADDR`                                                  | Listen address, default `127.0.0.1:8080`                                                                                                                                                                                                               |
 | `PHAROS_PUBLIC_ADDR`                                           | Optional effective public bind used to validate explicit loopback-only open mode behind a local container port mapping                                                                                                                                 |
+| `PHAROS_PUBLIC_ORIGIN`                                         | Optional scheme+host of the customer address; never includes a path. When set, `PHAROS_OIDC_REDIRECT_URI` must match this origin                                                                                                                       |
+| `PHAROS_PUBLIC_BASE_PATH`                                      | Optional native public mount (`""` standalone root, or `/pharos` / `/ops/pharos` when sharing one customer origin). Canonical ASCII `[A-Za-z0-9_-]+` segments, no trailing slash. Empty default keeps today's root routes. Same binary, runtime config |
 | `PHAROS_ALLOW_OPEN`                                            | Explicitly allow unauthenticated human routes; valid only for a loopback public address                                                                                                                                                                |
 | `PHAROS_DB`                                                    | JSON host-store path; enables derived persistent sidecars and is required for paid provider actions unless their sidecar is set explicitly                                                                                                             |
 | `PHAROS_PAIMOS_DELIVERY_CONFIG_FILE`                           | Optional owner-only reporter intent document; requires `PHAROS_DB` for the derived exact-replay journal and keeps API-key and per-handoff secret values in separate referenced owner-only files                                                        |
@@ -832,7 +846,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v26.09.08.11.36.59**. It is already used as a real
+Pharos is an active early release at **v26.09.08.23.58.28**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

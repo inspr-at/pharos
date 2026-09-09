@@ -36,6 +36,28 @@ pub(super) const HEAD: &str = include_str!("../assets/ui/head.html");
 
 pub(super) const FOOT: &str = include_str!("../assets/ui/foot.html");
 
+pub(super) fn app_href(base: &PublicBasePath, endpoint: &str) -> String {
+    html_escape(&base.href(endpoint))
+}
+
+const HETZNER_ASSISTANT_ENDPOINT: &str =
+    "/?setup=add-server&setup_path=new&setup_provider=hetzner-cloud&setup_stage=template";
+
+pub(super) fn document_head(base: &PublicBasePath) -> String {
+    HEAD.replace(
+        r#"href="/favicon.svg""#,
+        &format!(r#"href="{}""#, app_href(base, "/favicon.svg")),
+    )
+    .replace(
+        "url('/assets/sidebar-lighthouse.png')",
+        &format!("url('{}')", base.href("/assets/sidebar-lighthouse.png")),
+    )
+    .replace(
+        "url('/assets/fleet-horizon.png')",
+        &format!("url('{}')", base.href("/assets/fleet-horizon.png")),
+    )
+}
+
 pub(super) const HEARTBEAT_HISTORY_DOTS: usize = 12;
 pub(super) const HEARTBEAT_EXPECT_X: f64 = 64.0;
 pub(super) const HEARTBEAT_STALE_X: f64 = 82.0;
@@ -246,7 +268,7 @@ mod module_tests {
             );
         }
 
-        let recovery = activity_focus_path(&ActivityFocus::Unavailable);
+        let recovery = activity_focus_path(&PublicBasePath::ROOT, &ActivityFocus::Unavailable);
         assert!(recovery.contains("Workflow activity unavailable"));
         assert!(recovery.contains(r#"href="/activity""#));
         assert!(!recovery.contains("activity-workflow-known"));
@@ -280,14 +302,14 @@ mod module_tests {
             .with_workflow("activity-workflow-oldest"),
         );
 
-        assert!(!activity_rows(&events).contains("activity-workflow-oldest"));
+        assert!(!activity_rows(&PublicBasePath::ROOT, &events).contains("activity-workflow-oldest"));
         let focus = ActivityFocus::Workflow {
             host: "athena".to_string(),
             workflow_id: "activity-workflow-oldest".to_string(),
         };
         let focused = focus_activity_events(events, &focus);
         assert_eq!(focused.len(), 1);
-        let rows = activity_rows(&focused);
+        let rows = activity_rows(&PublicBasePath::ROOT, &focused);
         assert!(rows.contains(r#"id="workflow-activity-workflow-oldest""#));
         assert!(rows.contains(r#"data-workflow-id="activity-workflow-oldest""#));
         assert!(rows.contains(r#"data-host="athena""#));
@@ -296,7 +318,7 @@ mod module_tests {
     #[test]
     fn viewer_access_path_names_role_owner_and_get_only_help_route() {
         for scope in ["fleet", "settings", "provider", "managed-service"] {
-            let html = viewer_access_path(scope);
+            let html = viewer_access_path(&PublicBasePath::ROOT, scope);
             assert!(html.contains("Fleet manager access required"), "{html}");
             assert!(html.contains("Pharos administrator"), "{html}");
             assert!(
@@ -408,7 +430,7 @@ mod module_tests {
 
     #[test]
     fn host_quick_drawer_is_a_local_draft_with_an_explicit_workspace_exit() {
-        let drawer = host_quick_drawer(true);
+        let drawer = host_quick_drawer(&PublicBasePath::ROOT, true);
         assert!(drawer.contains(r#"role="dialog" aria-modal="true""#));
         assert!(drawer.contains("data-host-drawer-workspace"));
         assert!(drawer.contains("Prepare a local draft"));
@@ -428,7 +450,7 @@ mod module_tests {
             "drawer drafts must not dispatch"
         );
 
-        let viewer = host_quick_drawer(false);
+        let viewer = host_quick_drawer(&PublicBasePath::ROOT, false);
         assert!(viewer.contains(r#"data-can-manage="false""#));
         assert!(viewer.contains("Fleet operator access is required"));
     }
@@ -578,10 +600,16 @@ pub(super) fn render_no_access_page(
         "services" => "managed-service",
         _ => "fleet",
     };
-    let access_path = viewer_access_path(scope);
+    let access_path = viewer_access_path(shell.public_base_path, scope);
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div>{access_path}<section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, active),
+        r#"{head}{sidebar}<main class="ops-main"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>{title}</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">{subtitle}</p></div><div class="asof">as of {as_of}</div></div>{access_path}<section class="ops-empty"><h2>No access yet</h2><p>Your login works, but this Pharos account has not been granted any hosts or settings yet.</p></section></main></div></body></html>"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            active
+        ),
         title = html_escape(title),
         subtitle = html_escape(subtitle),
         as_of = clock_label(now_unix()),
@@ -607,14 +635,15 @@ fn access_scope(value: Option<&str>) -> (&'static str, &'static str) {
 }
 
 /// One consistent, non-mutating access path for every guarded product surface.
-pub(super) fn viewer_access_path(scope: &str) -> String {
+pub(super) fn viewer_access_path(base: &PublicBasePath, scope: &str) -> String {
     let (surface, task) = access_scope(Some(scope));
     format!(
-        r#"<aside class="access-path" data-access-path data-scope="{scope}"><span class="access-path-icon" aria-hidden="true">{shield}</span><span class="access-path-copy"><strong>Fleet manager access required</strong><span>You can keep viewing {surface}. A Pharos administrator owns access for people who need to {task}.</span></span><a class="access-path-action" href="/access/request?scope={scope}">Request access</a></aside>"#,
+        r#"<aside class="access-path" data-access-path data-scope="{scope}"><span class="access-path-icon" aria-hidden="true">{shield}</span><span class="access-path-copy"><strong>Fleet manager access required</strong><span>You can keep viewing {surface}. A Pharos administrator owns access for people who need to {task}.</span></span><a class="access-path-action" href="{href}">Request access</a></aside>"#,
         scope = html_escape(scope),
         surface = html_escape(surface),
         task = html_escape(task),
         shield = icons::SHIELD_CHECK,
+        href = app_href(base, &format!("/access/request?scope={scope}")),
     )
 }
 
@@ -630,9 +659,10 @@ pub(super) async fn access_request_page(
     let (surface, task) = access_scope(query.scope.as_deref());
     let request_text =
         format!("Please ask a Pharos administrator for the Fleet manager role so I can {task}.");
-    no_store_html(format!(
-        r#"{HEAD}{sidebar}<main class="ops-main access-request-page"><div class="top"><div><div class="brand"><h1>Request access</h1></div><p class="fleet">{surface}</p></div></div><section class="ops-empty"><h2>Send this to your Pharos administrator</h2><p>The required role is <strong>Fleet manager</strong>. The responsible access owner is your <strong>Pharos administrator</strong>.</p><div class="access-request-copy"><code data-access-request-text>{request_text}</code><button class="access-path-action" type="button" data-copy-access-request>Copy access request</button></div><p class="access-request-status" role="status" aria-live="polite" data-access-request-status>Copy the request, send it through your normal help channel, then return here after access is granted.</p></section></main><script>document.querySelector('[data-copy-access-request]')?.addEventListener('click',async event=>{{const text=document.querySelector('[data-access-request-text]')?.textContent||'';const status=document.querySelector('[data-access-request-status]');try{{await navigator.clipboard.writeText(text);event.currentTarget.textContent='Copied';if(status)status.textContent='Access request copied. Send it to your Pharos administrator.'}}catch(error){{if(status)status.textContent='Copy was unavailable. Select the request text above and copy it manually.'}}}});</script></div></body></html>"#,
-        sidebar = sidebar(&user_label, state.auth.is_some(), ""),
+    let head = document_head(&state.public_base_path);
+    no_store_html(&state,format!(
+        r#"{head}{sidebar}<main class="ops-main access-request-page"><div class="top"><div><div class="brand"><h1>Request access</h1></div><p class="fleet">{surface}</p></div></div><section class="ops-empty"><h2>Send this to your Pharos administrator</h2><p>The required role is <strong>Fleet manager</strong>. The responsible access owner is your <strong>Pharos administrator</strong>.</p><div class="access-request-copy"><code data-access-request-text>{request_text}</code><button class="access-path-action" type="button" data-copy-access-request>Copy access request</button></div><p class="access-request-status" role="status" aria-live="polite" data-access-request-status>Copy the request, send it through your normal help channel, then return here after access is granted.</p></section></main><script>document.querySelector('[data-copy-access-request]')?.addEventListener('click',async event=>{{const text=document.querySelector('[data-access-request-text]')?.textContent||'';const status=document.querySelector('[data-access-request-status]');try{{await navigator.clipboard.writeText(text);event.currentTarget.textContent='Copied';if(status)status.textContent='Access request copied. Send it to your Pharos administrator.'}}catch(error){{if(status)status.textContent='Copy was unavailable. Select the request text above and copy it manually.'}}}});</script></div></body></html>"#,
+        sidebar = sidebar(&state.public_base_path, &user_label, state.auth.is_some(), ""),
         surface = html_escape(surface),
         request_text = html_escape(&request_text),
     ))
@@ -645,18 +675,22 @@ pub(super) async fn provider_settings_page(
 ) -> impl IntoResponse {
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
-    no_store_html(render_provider_connections_page(
-        &provider_connections(
-            &state.provider_runtime,
-            &state.provider_connections,
-            now_unix(),
+    no_store_html(
+        &state,
+        render_provider_connections_page(
+            &provider_connections(
+                &state.provider_runtime,
+                &state.provider_connections,
+                now_unix(),
+            ),
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+                public_base_path: &state.public_base_path,
+            },
+            access.can_manage_fleet(),
         ),
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-        access.can_manage_fleet(),
-    ))
+    )
 }
 
 pub(super) async fn provider_settings_detail_page(
@@ -670,6 +704,7 @@ pub(super) async fn provider_settings_detail_page(
     let shell = ShellContext {
         user_label: &user_label,
         logout_enabled: state.auth.is_some(),
+        public_base_path: &state.public_base_path,
     };
     let Some(provider) = provider_connection(
         &state.provider_runtime,
@@ -706,7 +741,7 @@ pub(super) async fn provider_settings_detail_page(
             return_path.as_deref(),
         )
     };
-    no_store_html(body).into_response()
+    no_store_html(&state, body).into_response()
 }
 
 pub(super) async fn provider_connections_json(
@@ -731,15 +766,19 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Fleet",
-            "All hosts at a glance",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "fleet",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Fleet",
+                "All hosts at a glance",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
+                },
+                "fleet",
+            ),
+        );
     }
     let all_hosts = state.store.list();
     reconcile_provisioning_jobs_with_runtime(&state.provisioning_jobs, &all_hosts, now_unix());
@@ -767,34 +806,39 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
         })
         .map(|host| host.name.clone())
         .collect();
-    no_store_html(crate::flow_host::inject_flow_shell(
-        render_home_with_capabilities(
-            RuntimeSnapshot {
-                hosts: &hosts,
-                jobs: &jobs,
-                action_jobs: &action_jobs,
-                declared_preferences: Some(&declared_preferences),
-                janus_managed_hosts: Some(&janus_managed_hosts),
-            },
-            &self_host(),
-            now_unix(),
-            &manifests,
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            FleetCapabilities {
-                can_manage_fleet: access.can_manage_fleet(),
-                system_update_available: state.nixcfg_dispatch.system_update_available(),
-                host_removal_available: state.nixcfg_dispatch.host_removal_available()
-                    && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
-                        || state.retirement_owner.configured()),
-            },
+    no_store_html(
+        &state,
+        crate::flow_host::inject_flow_shell(
+            render_home_with_capabilities(
+                RuntimeSnapshot {
+                    hosts: &hosts,
+                    jobs: &jobs,
+                    action_jobs: &action_jobs,
+                    declared_preferences: Some(&declared_preferences),
+                    janus_managed_hosts: Some(&janus_managed_hosts),
+                },
+                &self_host(),
+                now_unix(),
+                &manifests,
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
+                },
+                FleetCapabilities {
+                    can_manage_fleet: access.can_manage_fleet(),
+                    system_update_available: state.nixcfg_dispatch.system_update_available(),
+                    host_removal_available: state.nixcfg_dispatch.host_removal_available()
+                        && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
+                            || state.retirement_owner.configured()),
+                },
+            ),
+            crate::flow_mount_enabled(&state, &state.auth, &headers, &access, None),
+            None,
+            state.flow_host.as_deref(),
+            &state.public_base_path,
         ),
-        crate::flow_mount_enabled(&state, &state.auth, &headers, &access, None),
-        None,
-        state.flow_host.as_deref(),
-    ))
+    )
 }
 
 pub(super) async fn map_page(
@@ -804,24 +848,32 @@ pub(super) async fn map_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Map",
-            "Server locations",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "map",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Map",
+                "Server locations",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
+                },
+                "map",
+            ),
+        );
     }
     let hosts = filter_hosts_by_access(state.store.list(), &access);
-    no_store_html(render_map(
-        &hosts,
-        &self_host(),
-        now_unix(),
-        &user_label,
-        state.auth.is_some(),
-    ))
+    no_store_html(
+        &state,
+        render_map(
+            &hosts,
+            &self_host(),
+            now_unix(),
+            &user_label,
+            state.auth.is_some(),
+            &state.public_base_path,
+        ),
+    )
 }
 
 pub(super) async fn map_data_json(
@@ -833,7 +885,13 @@ pub(super) async fn map_data_json(
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
     let now = now_unix();
     let probes = map_connectivity_probes(&hosts, &manifests).await;
-    let payload = map_data_payload(&hosts, &self_host(), now, &manifests, &probes);
+    let payload = {
+        let mut payload = map_data_payload(&hosts, &self_host(), now, &manifests, &probes);
+        for host in &mut payload.hosts {
+            host.settings_href = state.public_base_path.href(&host.settings_href);
+        }
+        payload
+    };
     no_store_json(serde_json::to_value(payload).expect("map data serializes"))
 }
 
@@ -844,15 +902,19 @@ pub(super) async fn alerts_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Alerts",
-            "Needs attention",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "alerts",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Alerts",
+                "Needs attention",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
+                },
+                "alerts",
+            ),
+        );
     }
     let now = now_unix();
     let all_hosts = state.store.list();
@@ -866,24 +928,28 @@ pub(super) async fn alerts_page(
     } else {
         &[]
     };
-    no_store_html(render_alerts(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            action_jobs: &[],
-            declared_preferences: None,
-            janus_managed_hosts: None,
-        },
-        &self_host(),
-        now,
-        &manifests,
-        load_errors,
-        &probes,
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-    ))
+    no_store_html(
+        &state,
+        render_alerts(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &jobs,
+                action_jobs: &[],
+                declared_preferences: None,
+                janus_managed_hosts: None,
+            },
+            &self_host(),
+            now,
+            &manifests,
+            load_errors,
+            &probes,
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+                public_base_path: &state.public_base_path,
+            },
+        ),
+    )
 }
 
 pub(super) async fn activity_page(
@@ -894,15 +960,19 @@ pub(super) async fn activity_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Activity",
-            "Operational timeline",
-            ShellContext {
-                user_label: &user_label,
-                logout_enabled: state.auth.is_some(),
-            },
-            "activity",
-        ));
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Activity",
+                "Operational timeline",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
+                },
+                "activity",
+            ),
+        );
     }
     let now = now_unix();
     let all_hosts = state.store.list();
@@ -923,28 +993,32 @@ pub(super) async fn activity_page(
         .filter(|job| access.allows_host(&job.host))
         .collect();
     let focus = activity_focus(&query, &action_jobs);
-    no_store_html(render_activity_with_focus(
-        RuntimeSnapshot {
-            hosts: &hosts,
-            jobs: &jobs,
-            action_jobs: &action_jobs,
-            declared_preferences: None,
-            janus_managed_hosts: None,
-        },
-        &self_host(),
-        now,
-        ActivitySources {
-            manifests: &manifests,
-            load_errors,
-            server_probes: &probes,
-            action_jobs: &action_jobs,
-        },
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-        focus,
-    ))
+    no_store_html(
+        &state,
+        render_activity_with_focus(
+            RuntimeSnapshot {
+                hosts: &hosts,
+                jobs: &jobs,
+                action_jobs: &action_jobs,
+                declared_preferences: None,
+                janus_managed_hosts: None,
+            },
+            &self_host(),
+            now,
+            ActivitySources {
+                manifests: &manifests,
+                load_errors,
+                server_probes: &probes,
+                action_jobs: &action_jobs,
+            },
+            ShellContext {
+                user_label: &user_label,
+                logout_enabled: state.auth.is_some(),
+                public_base_path: &state.public_base_path,
+            },
+            focus,
+        ),
+    )
 }
 
 pub(super) async fn backups_page(
@@ -954,25 +1028,33 @@ pub(super) async fn backups_page(
     let user_label = sidebar_user_label(&state.auth, &headers);
     let access = access_for_headers(&state.auth, &headers);
     if access.is_empty() {
-        return no_store_html(render_no_access_page(
-            "Backups",
-            "Protection at a glance",
+        return no_store_html(
+            &state,
+            render_no_access_page(
+                "Backups",
+                "Protection at a glance",
+                ShellContext {
+                    user_label: &user_label,
+                    logout_enabled: state.auth.is_some(),
+                    public_base_path: &state.public_base_path,
+                },
+                "backups",
+            ),
+        );
+    }
+    let hosts = filter_hosts_by_access(state.store.list(), &access);
+    no_store_html(
+        &state,
+        render_backups(
+            &hosts,
+            now_unix(),
             ShellContext {
                 user_label: &user_label,
                 logout_enabled: state.auth.is_some(),
+                public_base_path: &state.public_base_path,
             },
-            "backups",
-        ));
-    }
-    let hosts = filter_hosts_by_access(state.store.list(), &access);
-    no_store_html(render_backups(
-        &hosts,
-        now_unix(),
-        ShellContext {
-            user_label: &user_label,
-            logout_enabled: state.auth.is_some(),
-        },
-    ))
+        ),
+    )
 }
 
 pub(super) async fn fleet_horizon_asset() -> impl axum::response::IntoResponse {
@@ -1893,7 +1975,11 @@ pub(super) fn backup_glyph(level: &str) -> &'static str {
     }
 }
 
-pub(super) fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> String {
+pub(super) fn backup_chip_markup(
+    summary: &BackupUiSummary,
+    host: &str,
+    base: &PublicBasePath,
+) -> String {
     let title = format!("Backup: {} - {}", summary.label, summary.detail);
     let aria_label = format!("Backup for {host}: {}, {}", summary.label, summary.detail);
     let hidden = if summary.state == "healthy" {
@@ -1902,9 +1988,9 @@ pub(super) fn backup_chip_markup(summary: &BackupUiSummary, host: &str) -> Strin
         ""
     };
     format!(
-        r#"<a class="header-chip backup-chip {level}" href="/backups?host={host_query}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"{hidden}><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
+        r#"<a class="header-chip backup-chip {level}" href="{href}" data-backup-state="{state}" data-backup-level="{level}" data-backup-glyph="{glyph}" title="{title}" aria-label="{aria_label}"{hidden}><span class="backup-chip-glyphs" aria-hidden="true"><span class="backup-chip-glyph check">{check}</span><span class="backup-chip-glyph question">{question}</span><span class="backup-chip-glyph alert">{alert}</span><span class="backup-chip-glyph x">{x}</span></span><span class="header-chip-label" aria-hidden="true">Backup</span></a>"#,
+        href = app_href(base, &format!("/backups?host={}", url_query_escape(host))),
         level = html_escape(summary.level),
-        host_query = html_escape(&url_query_escape(host)),
         state = html_escape(summary.state),
         glyph = backup_glyph(summary.level),
         title = html_escape(&title),
@@ -2105,13 +2191,14 @@ pub(super) fn host_actions_markup(
     )
 }
 
-fn host_quick_drawer(can_manage_fleet: bool) -> String {
+fn host_quick_drawer(base: &PublicBasePath, can_manage_fleet: bool) -> String {
     format!(
-        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="/">Open host workspace {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form></div></aside></div>"#,
+        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="{home}">Open host workspace {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form></div></aside></div>"#,
         can_manage = can_manage_fleet,
         server = icons::SERVER,
         close = icons::X,
         arrow = icons::ARROW_RIGHT,
+        home = app_href(base, "/"),
         viewer_hidden = if can_manage_fleet { " hidden" } else { "" },
     )
 }
@@ -2819,11 +2906,17 @@ pub(super) fn sidebar_user_label(auth: &AuthState, headers: &HeaderMap) -> Strin
         })
 }
 
-pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> String {
+pub(super) fn sidebar(
+    base: &PublicBasePath,
+    user_label: &str,
+    logout_enabled: bool,
+    active: &str,
+) -> String {
     let logout = if logout_enabled {
         format!(
-            r#"<form class="side-logout-form" action="/auth/logout" method="post" data-logout-form><input type="hidden" name="csrf" value="" data-logout-csrf><button class="side-logout" type="submit" title="Log out of Pharos" aria-label="Log out of Pharos">{}</button></form>"#,
-            icons::LOG_OUT
+            r#"<form class="side-logout-form" action="{logout}" method="post" data-logout-form><input type="hidden" name="csrf" value="" data-logout-csrf><button class="side-logout" type="submit" title="Log out of Pharos" aria-label="Log out of Pharos">{}</button></form>"#,
+            icons::LOG_OUT,
+            logout = app_href(base, "/auth/logout"),
         )
     } else {
         String::new()
@@ -2864,7 +2957,7 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
         ""
     };
     format!(
-        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="/assets/sidebar-lighthouse-motion-v1.mp4" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="/"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="/map"{map_current}>{map}<span>Map</span></a><a class="side-link" href="/alerts"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="/backups"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="/services"{services_current}>{services}<span>Services</span></a><a class="side-link" href="/activity"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="/settings/providers"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{logout_csrf}{sidebar_motion}"##,
+        r##"<aside class="sidebar" aria-label="primary navigation" data-sidebar data-sidebar-still="true"><div class="sidebar-motion" aria-hidden="true"><video data-sidebar-motion data-src="{motion}" muted loop playsinline preload="none" tabindex="-1"></video></div><div class="side-brand"><span class="side-mark">{lighthouse}</span><span class="side-logo">PHAROS</span></div><nav class="side-nav"><a class="side-link" href="{home}"{fleet_current}>{fleet}<span>Fleet</span></a><a class="side-link" href="{map_href}"{map_current}>{map}<span>Map</span></a><a class="side-link" href="{alerts_href}"{alerts_current}>{alerts}<span>Alerts</span></a><a class="side-link" href="{backups_href}"{backups_current}>{backups}<span>Backups</span></a><a class="side-link" href="{services_href}"{services_current}>{services}<span>Services</span></a><a class="side-link" href="{activity_href}"{activity_current}>{activity}<span>Activity</span></a><a class="side-link" href="{settings_href}"{platform_settings_current}>{platform_settings}<span>Settings</span></a></nav><div class="side-bottom"><button class="side-version" type="button" data-release-open title="Open release history" aria-label="Open release history">{history}<span>{version}</span></button><div class="side-foot"><span class="side-user" title="{user_title}"><span>{user_label}</span></span>{logout}</div></div></aside>{release_dialog}{release_portal}{logout_csrf}{sidebar_motion}"##,
         lighthouse = icons::LIGHTHOUSE,
         fleet = icons::GRID,
         map = icons::SERVER,
@@ -2888,7 +2981,15 @@ pub(super) fn sidebar(user_label: &str, logout_enabled: bool, active: &str) -> S
         platform_settings_current = platform_settings_current,
         user_label = html_escape(user_label),
         user_title = html_escape(user_label),
-        logout = logout
+        logout = logout,
+        motion = app_href(base, "/assets/sidebar-lighthouse-motion-v1.mp4"),
+        home = app_href(base, "/"),
+        map_href = app_href(base, "/map"),
+        alerts_href = app_href(base, "/alerts"),
+        backups_href = app_href(base, "/backups"),
+        services_href = app_href(base, "/services"),
+        activity_href = app_href(base, "/activity"),
+        settings_href = app_href(base, "/settings/providers"),
     )
 }
 
@@ -2915,11 +3016,12 @@ pub(super) fn provider_icon(key: &str) -> &'static str {
 pub(super) fn render_provider_connection_row(
     provider: &ProviderConnectionSummary,
     can_manage: bool,
+    base: &PublicBasePath,
 ) -> String {
     let action = if can_manage {
         format!(
             r#"<a class="provider-action" href="{href}">{label}</a>"#,
-            href = html_escape(provider.detail_href),
+            href = app_href(base, provider.detail_href),
             label = html_escape(provider.action_label),
         )
     } else {
@@ -2952,16 +3054,24 @@ pub(super) fn render_provider_connections_page(
     let access_path = if can_manage {
         String::new()
     } else {
-        viewer_access_path("provider")
+        viewer_access_path(shell.public_base_path, "provider")
     };
     let rows = providers
         .providers
         .iter()
-        .map(|provider| render_provider_connection_row(provider, can_manage))
+        .map(|provider| {
+            render_provider_connection_row(provider, can_manage, shell.public_base_path)
+        })
         .collect::<String>();
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main">{header}{access_path}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
+        r#"{head}{sidebar}<main class="providers-main">{header}{access_path}<section class="appearance-settings" aria-labelledby="appearance-settings-title"><h2 class="settings-section-title" id="appearance-settings-title">Appearance</h2><div class="appearance-row"><span class="appearance-copy"><strong>Still sidebar image</strong><span id="sidebar-still-note" data-sidebar-still-note>Gentle motion is on.</span></span><label class="appearance-toggle"><input type="checkbox" data-sidebar-still-toggle aria-label="Use a still sidebar image" aria-describedby="sidebar-still-note"><span class="appearance-switch" aria-hidden="true"></span></label></div></section><h2 class="settings-section-title">Provider connections</h2><section class="provider-list" aria-label="provider connections">{rows}</section><p class="providers-footnote">Managed creation unlocks only after every readiness check passes.</p></main>{FOOT}"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            "platform-settings"
+        ),
         header = page_header(
             "Settings",
             "Appearance and provider connections.",
@@ -3002,7 +3112,7 @@ pub(super) fn render_guided_provider_page(
     let access_path = if can_manage {
         String::new()
     } else {
-        viewer_access_path("provider")
+        viewer_access_path(shell.public_base_path, "provider")
     };
     let (external_label, external_url) = provider_official_destination(provider.key)
         .unwrap_or(("Open provider", "https://pharos.barta.cm/"));
@@ -3019,18 +3129,30 @@ pub(super) fn render_guided_provider_page(
     let import_action = if can_manage {
         format!(
             r#"<a class="provider-secondary" href="{href}">Continue in Pharos{arrow}</a>"#,
-            href = html_escape(&guided_provider_import_href(provider.key)),
+            href = app_href(
+                shell.public_base_path,
+                &guided_provider_import_href(provider.key)
+            ),
             arrow = icons::ARROW_RIGHT,
         )
     } else {
         String::new()
     };
-    let back_href =
-        safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
+    let back_href = app_href(
+        shell.public_base_path,
+        &safe_provider_return_path(return_path)
+            .unwrap_or_else(|| "/settings/providers".to_string()),
+    );
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a>{access_path}<header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
-        back_href = html_escape(&back_href),
+        r#"{head}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Back</a>{access_path}<header class="provider-detail-head"><span class="provider-detail-mark" aria-hidden="true">{icon}</span><div><h1>Set up {name}</h1><p>{description}</p></div></header><section class="provider-step-list" aria-label="guided provider setup"><article class="provider-step"><span>1</span><div><strong>Choose the server with {name}</strong><p>{note}</p></div>{external_action}</article><article class="provider-step"><span>2</span><div><strong>Connect it to Pharos</strong><p>Return after the server exists. Pharos checks access before making any change.</p></div>{import_action}</article></section><p class="providers-footnote">No provider password or API token is entered into Pharos for this path.</p></main>{FOOT}"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            "platform-settings"
+        ),
+        back_href = back_href,
         back = icons::ARROW_LEFT,
         icon = provider_icon(provider.key),
         name = html_escape(provider.name),
@@ -3072,15 +3194,28 @@ pub(super) fn provider_select_option(value: &str, label: &str, selected: Option<
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HetznerSetupHelpState {
+    pub(super) api_ready: bool,
+    pub(super) ssh_available: bool,
+    pub(super) firewall_available: bool,
+    pub(super) choices_ready: bool,
+    pub(super) execution_enabled: bool,
+}
+
 pub(super) fn render_hetzner_setup_help(
     can_manage: bool,
     secure_setup_url: Option<&str>,
-    api_ready: bool,
-    ssh_available: bool,
-    firewall_available: bool,
-    choices_ready: bool,
-    execution_enabled: bool,
+    state: HetznerSetupHelpState,
+    base: &PublicBasePath,
 ) -> String {
+    let HetznerSetupHelpState {
+        api_ready,
+        ssh_available,
+        firewall_available,
+        choices_ready,
+        execution_enabled,
+    } = state;
     let secure_setup = if can_manage {
         secure_setup_url
             .map(|url| {
@@ -3139,11 +3274,14 @@ pub(super) fn render_hetzner_setup_help(
         )
     };
     let finish_actions = if choices_ready && can_manage {
-        r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Continue to server assistant</a>"#
+        format!(
+            r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><a class="provider-primary" href="{href}">Continue to server assistant</a>"#,
+            href = app_href(base, HETZNER_ASSISTANT_ENDPOINT),
+        )
     } else if choices_ready {
-        r#"<span class="provider-help-secret-note">Ask an installation administrator to continue.</span>"#
+        r#"<span class="provider-help-secret-note">Ask an installation administrator to continue.</span>"#.to_string()
     } else {
-        r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><button class="provider-primary" type="button" data-guide-open-details>Open Connection details</button>"#
+        r#"<button class="provider-secondary" type="button" data-guide-provider-test>Test connection</button><button class="provider-primary" type="button" data-guide-open-details>Open Connection details</button>"#.to_string()
     };
     let guide_open = if choices_ready { "" } else { " open" };
     let guide_summary = if choices_ready {
@@ -3311,8 +3449,11 @@ pub(super) fn render_hetzner_connection_page(
         ),
     ]
     .join("");
-    let back_href =
-        safe_provider_return_path(return_path).unwrap_or_else(|| "/settings/providers".to_string());
+    let back_href = app_href(
+        shell.public_base_path,
+        &safe_provider_return_path(return_path)
+            .unwrap_or_else(|| "/settings/providers".to_string()),
+    );
     let janus_url = hetzner_janus_setup_url(runtime, &self_host());
     let setup_link = janus_url.as_ref().map(|url| {
         format!(
@@ -3325,7 +3466,10 @@ pub(super) fn render_hetzner_connection_page(
         r#"<p class="provider-admin-note">Ask a Pharos administrator to connect this provider.</p>"#
             .to_string()
     } else if connection_ready {
-        r#"<a class="provider-primary" href="/?setup=add-server&amp;setup_path=new&amp;setup_provider=hetzner-cloud&amp;setup_stage=template">Continue to server assistant<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a>"#.to_string()
+        format!(
+            r#"<a class="provider-primary" href="{href}">Continue to server assistant<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></a>"#,
+            href = app_href(shell.public_base_path, HETZNER_ASSISTANT_ENDPOINT),
+        )
     } else if !readiness.credential_configured || !readiness.credential_boundary_ready {
         setup_link.unwrap_or_else(|| {
             r#"<p class="provider-admin-note">Secure setup is not connected to Janus on this Pharos installation.</p>"#.to_string()
@@ -3412,11 +3556,14 @@ pub(super) fn render_hetzner_connection_page(
     let setup_help = render_hetzner_setup_help(
         can_manage,
         janus_url.as_deref(),
-        api_ready,
-        ssh_available,
-        firewall_available,
-        ssh_ready && firewall_ready && location_ready,
-        readiness.execution_enabled,
+        HetznerSetupHelpState {
+            api_ready,
+            ssh_available,
+            firewall_available,
+            choices_ready: ssh_ready && firewall_ready && location_ready,
+            execution_enabled: readiness.execution_enabled,
+        },
+        shell.public_base_path,
     );
     let connection_message = if connection_ready && !readiness.execution_enabled {
         "Provider setup is complete. Continue below for the installation-level activation step; no more provider-portal work is needed."
@@ -3426,12 +3573,18 @@ pub(super) fn render_hetzner_connection_page(
     let access_path = if can_manage {
         String::new()
     } else {
-        viewer_access_path("provider")
+        viewer_access_path(shell.public_base_path, "provider")
     };
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a>{access_path}<header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "platform-settings"),
-        back_href = html_escape(&back_href),
+        r#"{head}{sidebar}<main class="providers-main provider-detail"><a class="provider-back" href="{back_href}">{back} Provider connections</a>{access_path}<header class="provider-detail-head provider-connection-head"><span class="provider-detail-mark" aria-hidden="true">{cloud}</span><div><h1>Hetzner Cloud</h1><p>Connect once, then add servers.</p></div><span class="provider-head-state" data-ready="{ready}"><i aria-hidden="true"></i>{status}</span></header><section class="provider-connection-card" data-provider-ready="{ready}"><div class="provider-connection-copy"><div><strong>{headline}</strong><p>{message}</p></div><div class="provider-connection-actions">{primary_action}{secondary_action}{menu}</div></div><div class="provider-checks">{checks}</div>{details}<p class="provider-action-feedback" data-provider-action-status aria-live="polite"></p></section>{setup_help}<p class="providers-footnote">{setup_note} Paid server creation always has its own review and confirmation.</p></main>{FOOT}"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            "platform-settings"
+        ),
+        back_href = back_href,
         back = icons::ARROW_LEFT,
         cloud = icons::CLOUD,
         ready = connection_ready,
@@ -3473,6 +3626,7 @@ pub(super) fn header(now: i64) -> String {
 pub(super) struct ShellContext<'a> {
     pub(super) user_label: &'a str,
     pub(super) logout_enabled: bool,
+    pub(super) public_base_path: &'a PublicBasePath,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3909,7 +4063,12 @@ pub(super) fn reconcile_provisioning_jobs_with_runtime(
     }
 }
 
-pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64, can_manage_fleet: bool) -> String {
+pub(super) fn render_setup_card(
+    job: &ProvisioningJob,
+    now: i64,
+    can_manage_fleet: bool,
+    base: &PublicBasePath,
+) -> String {
     let Some(raw_name) = provisioning_job_host_name(job) else {
         return String::new();
     };
@@ -3943,8 +4102,8 @@ pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64, can_manage_flee
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
     let header_action = if can_manage_fleet {
         format!(
-            r#"<div class="card-actions"><a class="header-chip settings-card" href="/?setup=add-server&amp;setup_job={job_id}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div>"#,
-            job_id = html_escape(&job.id),
+            r#"<div class="card-actions"><a class="header-chip settings-card" href="{href}" title="Continue setup for {name}" aria-label="Continue setup for {name}"><span class="settings-icon">{settings}</span><span class="header-chip-label" aria-hidden="true">Setup</span></a></div>"#,
+            href = app_href(base, &format!("/?setup=add-server&setup_job={}", job.id)),
             settings = icons::SLIDERS,
         )
     } else {
@@ -3952,8 +4111,8 @@ pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64, can_manage_flee
     };
     let continue_action = if can_manage_fleet {
         format!(
-            r#"<div class="card-tools"><a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a></div>"#,
-            job_id = html_escape(&job.id),
+            r#"<div class="card-tools"><a class="setup-action" href="{href}">Continue setup</a></div>"#,
+            href = app_href(base, &format!("/?setup=add-server&setup_job={}", job.id)),
         )
     } else {
         String::new()
@@ -3969,7 +4128,12 @@ pub(super) fn render_setup_card(job: &ProvisioningJob, now: i64, can_manage_flee
     )
 }
 
-pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64, can_manage_fleet: bool) -> String {
+pub(super) fn render_setup_row(
+    job: &ProvisioningJob,
+    now: i64,
+    can_manage_fleet: bool,
+    base: &PublicBasePath,
+) -> String {
     let Some(raw_name) = provisioning_job_host_name(job) else {
         return String::new();
     };
@@ -3994,8 +4158,8 @@ pub(super) fn render_setup_row(job: &ProvisioningJob, now: i64, can_manage_fleet
     let started = format!("setup started {} ago", duration_label(now - job.created_at));
     let action = if can_manage_fleet {
         format!(
-            r#"<a class="setup-action" href="/?setup=add-server&amp;setup_job={job_id}">Continue setup</a>"#,
-            job_id = html_escape(&job.id),
+            r#"<a class="setup-action" href="{href}">Continue setup</a>"#,
+            href = app_href(base, &format!("/?setup=add-server&setup_job={}", job.id)),
         )
     } else {
         String::new()
@@ -4123,8 +4287,8 @@ pub(super) fn availability_markup(signal: &HeartbeatSignal) -> String {
     )
 }
 
-pub(super) fn head_with_extra(extra: &str) -> String {
-    HEAD.replacen("</style></head>", &format!("</style>{extra}</head>"), 1)
+pub(super) fn head_with_extra(base: &PublicBasePath, extra: &str) -> String {
+    document_head(base).replacen("</style></head>", &format!("</style>{extra}</head>"), 1)
 }
 
 pub(super) const LOCATION_STALE_AFTER_SECS: i64 = 24 * 3600;
@@ -5681,7 +5845,7 @@ pub(super) fn render_alert_rows(groups: &[AlertGroup]) -> String {
     groups.iter().map(render_alert_row).collect()
 }
 
-pub(super) fn posture_panel(alerts: &[AlertItem], hosts: &[Host]) -> String {
+pub(super) fn posture_panel(alerts: &[AlertItem], hosts: &[Host], base: &PublicBasePath) -> String {
     let (critical, warning, watch, clear) = alert_counts(alerts, hosts);
     let total_alerts = alerts.len().max(1);
     let (posture_label, posture_color, posture_count, posture_filter) = if critical > 0 {
@@ -5699,7 +5863,8 @@ pub(super) fn posture_panel(alerts: &[AlertItem], hosts: &[Host]) -> String {
         ((posture_count * 100) / total_alerts).clamp(8, 100)
     };
     format!(
-        r#"<aside class="ops-side-panel" aria-label="operations posture"><div><h2>Operations posture</h2><p>Most important work first.</p></div><button class="posture-ring" type="button" data-ops-filter="{posture_filter}" aria-pressed="false" style="--posture-fill:{posture_fill}%;--posture-color:{posture_color}"><div><strong>{posture_count}</strong><span>{posture_label}</span></div></button><div class="posture-list"><button class="posture-chip critical" type="button" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="posture-chip warning" type="button" data-ops-filter="warning" aria-pressed="false">warning {warning}</button><button class="posture-chip watch" type="button" data-ops-filter="watch" aria-pressed="false">watch {watch}</button><button class="posture-chip clear" type="button" data-ops-filter="clear" aria-pressed="false">clear {clear}</button><button class="posture-chip info" type="button" data-ops-filter="all" aria-pressed="true">show all</button></div><div class="ops-note">Repeated alerts are grouped. Use the host search and severity controls to focus the queue.</div><a class="ops-action" href="/map">View on map</a></aside>"#
+        r#"<aside class="ops-side-panel" aria-label="operations posture"><div><h2>Operations posture</h2><p>Most important work first.</p></div><button class="posture-ring" type="button" data-ops-filter="{posture_filter}" aria-pressed="false" style="--posture-fill:{posture_fill}%;--posture-color:{posture_color}"><div><strong>{posture_count}</strong><span>{posture_label}</span></div></button><div class="posture-list"><button class="posture-chip critical" type="button" data-ops-filter="critical" aria-pressed="false">critical {critical}</button><button class="posture-chip warning" type="button" data-ops-filter="warning" aria-pressed="false">warning {warning}</button><button class="posture-chip watch" type="button" data-ops-filter="watch" aria-pressed="false">watch {watch}</button><button class="posture-chip clear" type="button" data-ops-filter="clear" aria-pressed="false">clear {clear}</button><button class="posture-chip info" type="button" data-ops-filter="all" aria-pressed="true">show all</button></div><div class="ops-note">Repeated alerts are grouped. Use the host search and severity controls to focus the queue.</div><a class="ops-action" href="{map_href}">View on map</a></aside>"#,
+        map_href = app_href(base, "/map"),
     )
 }
 
@@ -5723,14 +5888,20 @@ pub(super) fn render_alerts(
     );
     let groups = alert_groups(&alerts);
     let rows = render_alert_rows(&groups);
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, backup, freshness, kernel, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "alerts"),
+        r#"{head}{sidebar}<main class="ops-main" data-ops-page="alerts">{header}{summary}{toolbar}<section class="ops-layout"><section class="ops-panel" aria-label="attention queue"><header class="ops-panel-head"><div><h2>Needs attention</h2><p>Plain-language queue from heartbeat, backup, freshness, kernel, service, probe, and config state.</p></div><span class="ops-count">{count}</span></header><div class="alert-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching alerts.</section></section>{posture}</section></main>{script}</div></body></html>"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            "alerts"
+        ),
         header = page_header("Alerts", "Needs attention", now),
         summary = ops_summary_metrics(&alerts, runtime.hosts),
         toolbar = ops_toolbar(),
         count = alerts.len(),
-        posture = posture_panel(&alerts, runtime.hosts),
+        posture = posture_panel(&alerts, runtime.hosts, shell.public_base_path),
         script = ops_script()
     )
 }
@@ -5822,9 +5993,15 @@ pub(super) fn render_backup_rows(hosts: &[Host], now: i64) -> String {
 
 pub(super) fn render_backups(hosts: &[Host], now: i64, shell: ShellContext<'_>) -> String {
     let rows = render_backup_rows(hosts, now);
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main backup-page" data-ops-page="backups">{header}{summary}{toolbar}<section class="ops-panel" aria-label="backup posture"><header class="ops-panel-head"><div><h2>Backup posture</h2><p>Sanitized runtime evidence from backup jobs. No logs, paths, repositories, or credentials are shown.</p></div><span class="ops-count">{count}</span></header><div class="backup-list-full">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching backup rows.</section></section><div class="ops-note" style="margin-top:14px">A protected state means the latest reported backup source is healthy. Restore validation is tracked separately from last backup success when evidence exists.</div></main>{script}</div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "backups"),
+        r#"{head}{sidebar}<main class="ops-main backup-page" data-ops-page="backups">{header}{summary}{toolbar}<section class="ops-panel" aria-label="backup posture"><header class="ops-panel-head"><div><h2>Backup posture</h2><p>Sanitized runtime evidence from backup jobs. No logs, paths, repositories, or credentials are shown.</p></div><span class="ops-count">{count}</span></header><div class="backup-list-full">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching backup rows.</section></section><div class="ops-note" style="margin-top:14px">A protected state means the latest reported backup source is healthy. Restore validation is tracked separately from last backup success when evidence exists.</div></main>{script}</div></body></html>"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            "backups"
+        ),
         header = page_header("Backups", "Protection at a glance", now),
         summary = backup_summary_metrics(hosts, now),
         toolbar = ops_toolbar(),
@@ -6428,7 +6605,7 @@ pub(super) fn activity_filter_bar(events: &[ActivityEvent]) -> String {
     )
 }
 
-pub(super) fn render_activity_row(event: &ActivityEvent) -> String {
+pub(super) fn render_activity_row(event: &ActivityEvent, base: &PublicBasePath) -> String {
     let (tag, workflow_attributes, href) = event.workflow_id.as_deref().map_or_else(
         || ("article", String::new(), String::new()),
         |workflow_id| {
@@ -6439,9 +6616,15 @@ pub(super) fn render_activity_row(event: &ActivityEvent) -> String {
                     workflow = html_escape(workflow_id),
                 ),
                 format!(
-                    r#" href="/?host={host}&amp;workflow={workflow}" aria-label="Open saved workflow for {host_label}" title="Open saved workflow""#,
-                    host = html_escape(&url_query_escape(&event.host)),
-                    workflow = html_escape(&url_query_escape(workflow_id)),
+                    r#" href="{href}" aria-label="Open saved workflow for {host_label}" title="Open saved workflow""#,
+                    href = app_href(
+                        base,
+                        &format!(
+                            "/?host={}&workflow={}",
+                            url_query_escape(&event.host),
+                            url_query_escape(workflow_id)
+                        ),
+                    ),
                     host_label = html_escape(&event.host),
                 ),
             )
@@ -6470,11 +6653,15 @@ pub(super) fn render_activity_row(event: &ActivityEvent) -> String {
     )
 }
 
-pub(super) fn activity_rows(events: &[ActivityEvent]) -> String {
+pub(super) fn activity_rows(base: &PublicBasePath, events: &[ActivityEvent]) -> String {
     if events.is_empty() {
         return r#"<section class="ops-empty"><h2>No activity yet</h2><p>Once hosts report, Pharos will show heartbeats, backup changes, freshness changes, kernel posture, service observations, and config events here.</p></section>"#.to_string();
     }
-    events.iter().take(80).map(render_activity_row).collect()
+    events
+        .iter()
+        .take(80)
+        .map(|event| render_activity_row(event, base))
+        .collect()
 }
 
 pub(super) fn focus_activity_events(
@@ -6493,14 +6680,18 @@ pub(super) fn focus_activity_events(
     }
 }
 
-pub(super) fn activity_focus_path(focus: &ActivityFocus) -> String {
+pub(super) fn activity_focus_path(base: &PublicBasePath, focus: &ActivityFocus) -> String {
     match focus {
         ActivityFocus::All => String::new(),
         ActivityFocus::Workflow { host, .. } => format!(
-            r#"<aside class="ops-note" data-activity-workflow-focus role="status"><strong>Saved workflow activity</strong><span>Showing the exact recorded workflow for {host}.</span><a class="ops-action" href="/activity">Show all activity</a></aside>"#,
+            r#"<aside class="ops-note" data-activity-workflow-focus role="status"><strong>Saved workflow activity</strong><span>Showing the exact recorded workflow for {host}.</span><a class="ops-action" href="{href}">Show all activity</a></aside>"#,
             host = html_escape(host),
+            href = app_href(base, "/activity"),
         ),
-        ActivityFocus::Unavailable => r#"<section class="ops-empty" data-activity-workflow-unavailable><h2>Workflow activity unavailable</h2><p>This workflow is unknown, belongs to another host, or is not available to your account.</p><a class="ops-action" href="/activity">Show all activity</a></section>"#.to_string(),
+        ActivityFocus::Unavailable => format!(
+            r#"<section class="ops-empty" data-activity-workflow-unavailable><h2>Workflow activity unavailable</h2><p>This workflow is unknown, belongs to another host, or is not available to your account.</p><a class="ops-action" href="{href}">Show all activity</a></section>"#,
+            href = app_href(base, "/activity"),
+        ),
     }
 }
 
@@ -6552,15 +6743,21 @@ pub(super) fn render_activity_with_focus(
     focus: ActivityFocus,
 ) -> String {
     let events = focus_activity_events(activity_events(runtime, self_name, now, sources), &focus);
-    let focus_path = activity_focus_path(&focus);
+    let focus_path = activity_focus_path(shell.public_base_path, &focus);
     let rows = if focus == ActivityFocus::Unavailable {
         String::new()
     } else {
-        activity_rows(&events)
+        activity_rows(shell.public_base_path, &events)
     };
+    let head = document_head(shell.public_base_path);
     format!(
-        r#"{HEAD}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{focus_path}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "activity"),
+        r#"{head}{sidebar}<main class="ops-main" data-ops-page="activity">{header}{focus_path}{summary}{toolbar}<section class="ops-panel" aria-label="operational timeline"><header class="ops-panel-head"><div><h2>Operational timeline</h2><p>Reverse chronological history from heartbeat, backup, freshness, kernel, service, config, and guarded action signals.</p></div><span class="ops-count">{count}</span></header><div style="padding:14px 16px;border-bottom:1px solid rgba(214,226,234,.72)">{filters}</div><div class="activity-list">{rows}</div><section class="ops-filter-empty" data-ops-empty>No matching activity.</section></section><div class="ops-note" style="margin-top:14px">Guarded action requests and results are persisted. Other operational events are derived from the current retained state.</div></main>{script}</div></body></html>"#,
+        sidebar = sidebar(
+            shell.public_base_path,
+            shell.user_label,
+            shell.logout_enabled,
+            "activity"
+        ),
         header = page_header("Activity", "Operational timeline", now),
         focus_path = focus_path,
         summary = activity_summary_metrics(&events),
@@ -6577,13 +6774,15 @@ pub(super) fn render_map(
     now: i64,
     user_label: &str,
     logout_enabled: bool,
+    base: &PublicBasePath,
 ) -> String {
     let summary = summary_cards(hosts, self_name, now);
     let toolbar = map_toolbar();
     let map_script = include_str!("../assets/ui/map.html");
+    let head = document_head(base);
     format!(
-        r#"{HEAD}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof" data-as-of>as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal" data-loading="true" data-map-state="loading"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-loading" data-map-loading><div class="map-load-card"><strong>Preparing map</strong><p data-map-status-message>Loading server locations and reachability checks.</p><span class="map-load-rail" aria-hidden="true"></span></div></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available when data can be loaded.</p></div></div></div><aside class="site-panel" aria-label="server locations" data-site-panel data-loading="true"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list" data-site-list><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div></div><div class="map-note" data-map-note>Loading server locations and reachability checks.</div></aside></section></main>{map_script}{FOOT}"#,
-        sidebar = sidebar(user_label, logout_enabled, "map"),
+        r#"{head}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof" data-as-of>as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal" data-loading="true" data-map-state="loading"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-loading" data-map-loading><div class="map-load-card"><strong>Preparing map</strong><p data-map-status-message>Loading server locations and reachability checks.</p><span class="map-load-rail" aria-hidden="true"></span></div></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available when data can be loaded.</p></div></div></div><aside class="site-panel" aria-label="server locations" data-site-panel data-loading="true"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list" data-site-list><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div></div><div class="map-note" data-map-note>Loading server locations and reachability checks.</div></aside></section></main>{map_script}{FOOT}"#,
+        sidebar = sidebar(base, user_label, logout_enabled, "map"),
         as_of = clock_label(now),
         summary = summary,
         toolbar = toolbar,
@@ -6865,7 +7064,7 @@ pub(super) fn render_home_with_capabilities(
     let access_path = if capabilities.can_manage_fleet {
         String::new()
     } else {
-        viewer_access_path("fleet")
+        viewer_access_path(shell.public_base_path, "fleet")
     };
     let hosts = runtime.hosts;
     let setup_jobs = pending_setup_jobs(runtime.hosts, runtime.jobs);
@@ -6875,9 +7074,15 @@ pub(super) fn render_home_with_capabilities(
         } else {
             String::new()
         };
+        let head = document_head(shell.public_base_path);
         return format!(
-            "{HEAD}{sidebar}<main>{header}{access_path}{empty}</main>{assistant}{FOOT}",
-            sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
+            "{head}{sidebar}<main>{header}{access_path}{empty}</main>{assistant}{FOOT}",
+            sidebar = sidebar(
+                shell.public_base_path,
+                shell.user_label,
+                shell.logout_enabled,
+                "fleet"
+            ),
             header = header(now),
             empty = empty_state(can_onboard),
             access_path = access_path,
@@ -6934,7 +7139,7 @@ pub(super) fn render_home_with_capabilities(
         let (card_fresh, card_fresh_visible) =
             card_freshness_fault_markup(&h.freshness, &backup, h.kernel.as_ref(), now);
         let card_fresh_hidden = if card_fresh_visible { "" } else { " hidden" };
-        let backup_chip = backup_chip_markup(&backup, &h.name);
+        let backup_chip = backup_chip_markup(&backup, &h.name, shell.public_base_path);
         let protection = protection_onboarding_status(h, runtime.jobs, now);
         let protection_card = protection
             .as_ref()
@@ -7035,7 +7240,9 @@ pub(super) fn render_home_with_capabilities(
             search_parts.push(lifecycle.label.to_lowercase());
         }
         let search = html_escape(&search_parts.join(" "));
-        let settings_href_raw = format!("/hosts/{}", url_query_escape(&h.name));
+        let settings_href_raw = shell
+            .public_base_path
+            .href(&format!("/hosts/{}", url_query_escape(&h.name)));
         let settings_href = html_escape(&settings_href_raw);
         let settings_color = h
             .preferences
@@ -7099,7 +7306,9 @@ pub(super) fn render_home_with_capabilities(
                 HostLifecycleSlot::Blocked => "Open the blocking workflow",
                 _ => "Open the host workspace",
             });
-        let workspace_href = format!("/hosts/{}", url_query_escape(&h.name));
+        let workspace_href = shell
+            .public_base_path
+            .href(&format!("/hosts/{}", url_query_escape(&h.name)));
         let drawer_attrs = format!(
             r#" data-drawer-accent="{}" data-drawer-kind="{}" data-drawer-suppress-down="{}" data-drawer-suppress-backup="{}" data-drawer-suppress-nix="{}" data-drawer-settings-state="{}" data-drawer-lifecycle-label="{}" data-drawer-lifecycle-detail="{}" data-drawer-lifecycle-owner="{}" data-drawer-next-action="{}" data-drawer-workspace-href="{}" data-drawer-can-manage="{}""#,
             html_escape(drawer_accent),
@@ -7238,8 +7447,18 @@ pub(super) fn render_home_with_capabilities(
         ));
     }
     for job in setup_jobs {
-        cards.push_str(&render_setup_card(job, now, capabilities.can_manage_fleet));
-        rows.push_str(&render_setup_row(job, now, capabilities.can_manage_fleet));
+        cards.push_str(&render_setup_card(
+            job,
+            now,
+            capabilities.can_manage_fleet,
+            shell.public_base_path,
+        ));
+        rows.push_str(&render_setup_row(
+            job,
+            now,
+            capabilities.can_manage_fleet,
+            shell.public_base_path,
+        ));
     }
 
     let lone = if hosts.len() == 1 {
@@ -7261,11 +7480,12 @@ pub(super) fn render_home_with_capabilities(
     } else {
         String::new()
     };
-    let host_drawer = host_quick_drawer(capabilities.can_manage_fleet);
+    let host_drawer = host_quick_drawer(shell.public_base_path, capabilities.can_manage_fleet);
 
+    let head = document_head(shell.public_base_path);
     format!(
-        "{HEAD}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
-        sidebar = sidebar(shell.user_label, shell.logout_enabled, "fleet"),
+        "{head}{sidebar}<main data-view=\"grid\" data-fleet-sync-state=\"current\" data-fleet-snapshot-at=\"{now}\">{header}{access_path}{summary}{toolbar}<div class=\"grid\" data-grid>{cards}</div><section class=\"list-wrap\"><table class=\"list\"><colgroup><col class=\"host-col\"><col class=\"attention-col\"><col class=\"freshness-col\"><col class=\"seen-col\"><col class=\"heartbeat-col\"><col class=\"actions-col\"></colgroup><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">Attention</th><th scope=\"col\">Freshness</th><th scope=\"col\">Last seen</th><th scope=\"col\">Heartbeat</th><th scope=\"col\">Actions</th></tr></thead><tbody data-list-body>{rows}</tbody></table></section>{lone}</main>{assistant}{host_drawer}{action_dialog}{FOOT}",
+        sidebar = sidebar(shell.public_base_path, shell.user_label, shell.logout_enabled, "fleet"),
         header = header(now),
         summary = summary_cards(hosts, self_name, now),
         access_path = access_path,

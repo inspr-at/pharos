@@ -7,7 +7,10 @@
 
 pub mod managed_operations;
 pub mod managed_services;
+pub mod public_path;
 pub mod secret_input;
+
+pub use public_path::{PublicBasePath, PublicOrigin};
 
 use std::collections::{BTreeMap, BTreeSet};
 

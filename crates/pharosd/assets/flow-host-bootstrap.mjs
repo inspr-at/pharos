@@ -1,4 +1,4 @@
-import '/assets/vendor/flow-shell/src/inspr-flow-shell.js';
+import './vendor/flow-shell/src/inspr-flow-shell.js';
 
 const shell = document.querySelector('inspr-flow-shell[data-flow-host]');
 if (shell) {
@@ -64,8 +64,22 @@ if (shell) {
     };
   }
 
+  function publicPath(appPath) {
+    if (typeof window.pharosPublicPath === 'function') {
+      return window.pharosPublicPath(appPath);
+    }
+    const base = document.querySelector('meta[name="pharos-public-base-path"]')?.content || '';
+    if (!appPath || appPath === '/') {
+      return base || '/';
+    }
+    if (base && (appPath === base || appPath.startsWith(`${base}/`))) {
+      return appPath;
+    }
+    return `${base}${appPath}`;
+  }
+
   function shellStateUrl() {
-    const url = new URL('/flow/shell-state.json', document.baseURI);
+    const url = new URL(publicPath('/flow/shell-state.json'), document.baseURI);
     if (hostScope) {
       url.searchParams.set('host', hostScope);
     }
@@ -73,7 +87,7 @@ if (shell) {
   }
 
   function intentsUrl() {
-    const url = new URL('/flow/intents', document.baseURI);
+    const url = new URL(publicPath('/flow/intents'), document.baseURI);
     if (hostScope) {
       url.searchParams.set('host', hostScope);
     }
@@ -169,7 +183,11 @@ if (shell) {
     if (target.origin !== allowed.origin) {
       return false;
     }
-    return /^\/projects\/\d+$/.test(target.pathname);
+    const prefix = allowed.pathname === '/' ? '' : allowed.pathname.replace(/\/$/, '');
+    const rest = prefix && (target.pathname === prefix || target.pathname.startsWith(`${prefix}/`))
+      ? target.pathname.slice(prefix.length)
+      : (prefix ? '' : target.pathname);
+    return /^\/projects\/\d+$/.test(rest);
   }
 
   shell.addEventListener('flow-intent', async (event) => {

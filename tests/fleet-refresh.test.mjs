@@ -2,21 +2,28 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { pharosPublicPathSource } from "./fixtures/pharos-public-path.mjs";
 
 const fleetRuntimeSource = readFileSync(
   new URL("../crates/pharosd/assets/ui/foot.html", import.meta.url),
   "utf8",
 );
+const appUrlStart = fleetRuntimeSource.indexOf("function appUrl(path)");
+const appUrlEnd = fleetRuntimeSource.indexOf("}", appUrlStart) + 1;
 const lifecycleStart = fleetRuntimeSource.indexOf("const REFRESH_MS=10000;");
 const lifecycleEnd = fleetRuntimeSource.indexOf(
   "document.addEventListener('visibilitychange'",
   lifecycleStart,
 );
 
+assert.notEqual(appUrlStart, -1, "appUrl helper must exist in foot.html");
+assert.notEqual(appUrlEnd, 0, "appUrl helper must exist in foot.html");
 assert.notEqual(lifecycleStart, -1, "Fleet refresh lifecycle start must exist");
 assert.notEqual(lifecycleEnd, -1, "Fleet refresh lifecycle end must exist");
 
+const appUrlSource = fleetRuntimeSource.slice(appUrlStart, appUrlEnd);
 const lifecycleSource = fleetRuntimeSource.slice(lifecycleStart, lifecycleEnd);
+const fleetRuntimeSourcePrefix = `${appUrlSource}\n${lifecycleSource}`;
 const exposeTestApi = `
 globalThis.__fleetTest = {
   refresh,
@@ -73,7 +80,7 @@ function deferredFetchQueue() {
   return { fetch, pending };
 }
 
-function harness(fetch) {
+function harness(fetch, { publicBasePath = "" } = {}) {
   const summary = new Map(
     ["all", "live", "stale", "down"].map((key) => [key, { textContent: "" }]),
   );
@@ -88,22 +95,27 @@ function harness(fetch) {
   const events = [];
   let timerId = 0;
   const activeTimers = new Set();
+  const publicBaseMeta = publicBasePath
+    ? { content: publicBasePath, getAttribute: (name) => (name === "content" ? publicBasePath : null) }
+    : null;
   const document = {
     hidden: false,
     body: { dataset: {} },
     hasFocus: () => true,
     querySelector(selector) {
+      if (selector === 'meta[name="pharos-public-base-path"]') return publicBaseMeta;
       if (selector === "main[data-fleet-sync-state]") return main;
       const match = selector.match(/^\[data-summary-count="(all|live|stale|down)"\]$/);
       return match ? summary.get(match[1]) : null;
     },
   };
+  const window = { location: { reload: () => events.push("reload") } };
   const context = vm.createContext({
     AbortController,
     console,
     document,
     fetch,
-    window: { location: { reload: () => events.push("reload") } },
+    window,
     clock: (value) => String(value),
     stopBeatClock: () => events.push("stop"),
     resumeBeatClock: () => events.push("resume"),
@@ -114,7 +126,10 @@ function harness(fetch) {
     },
     clearTimeout: (id) => activeTimers.delete(id),
   });
-  vm.runInContext(lifecycleSource + exposeTestApi, context);
+  if (publicBasePath) {
+    vm.runInContext(pharosPublicPathSource, context);
+  }
+  vm.runInContext(fleetRuntimeSourcePrefix + exposeTestApi, context);
   return {
     api: context.__fleetTest,
     activeTimers,
@@ -199,6 +214,31 @@ test("summary counters reconcile from the same host snapshot", () => {
   assert.equal(page.summary.get("live").textContent, "1");
   assert.equal(page.summary.get("stale").textContent, "1");
   assert.equal(page.summary.get("down").textContent, "1");
+});
+
+test("fleet refresh requests hosts.json through appUrl at root and prefixed mounts", async () => {
+  const rootUrls = [];
+  const rootPage = harness(async (url) => {
+    rootUrls.push(url);
+    return jsonResponse(snapshot());
+  });
+  rootPage.api.replaceApplyFleetSnapshot(() => true);
+  assert.equal(await rootPage.api.refresh("manual"), true);
+  assert.equal(rootUrls.length, 1);
+  assert.match(rootUrls[0], /^\/hosts\.json\?refresh=\d+$/);
+
+  const prefixedUrls = [];
+  const prefixedPage = harness(
+    async (url) => {
+      prefixedUrls.push(url);
+      return jsonResponse(snapshot());
+    },
+    { publicBasePath: "/pharos" },
+  );
+  prefixedPage.api.replaceApplyFleetSnapshot(() => true);
+  assert.equal(await prefixedPage.api.refresh("manual"), true);
+  assert.equal(prefixedUrls.length, 1);
+  assert.match(prefixedUrls[0], /^\/pharos\/hosts\.json\?refresh=\d+$/);
 });
 
 test("suspension cancels polling instead of trusting background timers", async () => {

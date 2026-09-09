@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::auth::{AccessGrant, AuthState, AuthUser};
 use crate::ui::APP_VERSION;
-use pharos_core::{liveness, Host, Liveness};
+use pharos_core::{liveness, Host, Liveness, PublicBasePath};
 
 pub(crate) const FLOW_CONFIG_ENV: &str = "PHAROS_FLOW_CONFIG_FILE";
 const CONFIG_SCHEMA: &str = "inspr.pharos.flow-host-config.v1";
@@ -67,6 +67,8 @@ struct FlowConfigDocument {
     enabled: bool,
     host_id: String,
     paimos_origin: String,
+    #[serde(default)]
+    paimos_public_url: Option<String>,
     api_key_file: PathBuf,
     instance_label: Option<String>,
     bindings: Vec<FlowBindingDocument>,
@@ -96,6 +98,7 @@ pub(crate) struct FlowHostConfig {
     pub(crate) enabled: bool,
     pub(crate) host_id: String,
     pub(crate) paimos_origin: Url,
+    pub(crate) paimos_public_url: Url,
     pub(crate) api_key_file: PathBuf,
     pub(crate) instance_label: String,
     pub(crate) bindings: Vec<FlowBinding>,
@@ -573,14 +576,13 @@ impl FlowHostService {
 
     async fn fetch_paimos_state(&self, context: &ResolvedContext) -> Result<Value, FlowError> {
         let api_key = read_api_key(&self.config.api_key_file)?;
-        let url = self
-            .config
-            .paimos_origin
-            .join(&format!(
-                "api/projects/{}/baseline-batches/flow-state",
+        let url = join_origin_path(
+            &self.config.paimos_origin,
+            &format!(
+                "/api/projects/{}/baseline-batches/flow-state",
                 context.binding.project_id
-            ))
-            .map_err(|_| FlowError::Configuration)?;
+            ),
+        )?;
         let response = self
             .client
             .get(url)
@@ -701,34 +703,36 @@ impl FlowHostService {
     }
 
     fn review_url(&self, project_id: u64) -> String {
-        format!(
-            "{}/projects/{}?tab=overview{}",
-            self.config.paimos_origin.as_str().trim_end_matches('/'),
-            project_id,
-            REVIEW_FRAGMENT
+        let mut url = join_origin_path(
+            &self.config.paimos_public_url,
+            &format!("/projects/{project_id}"),
         )
+        .expect("review path is app-relative");
+        url.set_query(Some("tab=overview"));
+        url.set_fragment(Some(REVIEW_FRAGMENT.trim_start_matches('#')));
+        url.to_string()
     }
 
     fn project_overview_url(&self, project_id: u64) -> String {
-        format!(
-            "{}/projects/{}?tab=overview",
-            self.config.paimos_origin.as_str().trim_end_matches('/'),
-            project_id
+        let mut url = join_origin_path(
+            &self.config.paimos_public_url,
+            &format!("/projects/{project_id}"),
         )
+        .expect("overview path is app-relative");
+        url.set_query(Some("tab=overview"));
+        url.to_string()
     }
 
     fn valid_navigation_location(&self, location: &str) -> Option<String> {
         let parsed = Url::parse(location).ok()?;
-        if parsed.origin() != self.config.paimos_origin.origin() {
+        if parsed.origin() != self.config.paimos_public_url.origin() {
             return None;
         }
-        if !parsed
-            .path()
-            .strip_prefix("/projects/")
-            .is_some_and(|tail| {
-                !tail.is_empty() && !tail.contains('/') && tail.parse::<u64>().is_ok()
-            })
-        {
+        let base = url_public_base(&self.config.paimos_public_url).ok()?;
+        let local = base.strip(parsed.path())?;
+        if !local.strip_prefix("/projects/").is_some_and(|tail| {
+            !tail.is_empty() && !tail.contains('/') && tail.parse::<u64>().is_ok()
+        }) {
             return None;
         }
         let query_ok = parsed
@@ -768,6 +772,11 @@ impl FlowHostConfig {
             allow_loopback_origin,
         )
         .map_err(|_| "invalid flow host configuration".to_string())?;
+        let paimos_public_url = match document.paimos_public_url.as_deref() {
+            None => paimos_origin.clone(),
+            Some(value) => parse_origin(value, loopback_dev_mode, allow_loopback_origin)
+                .map_err(|_| "invalid flow host configuration".to_string())?,
+        };
         if !document.api_key_file.is_absolute() {
             return Err("invalid flow host configuration".to_string());
         }
@@ -786,6 +795,7 @@ impl FlowHostConfig {
             enabled: document.enabled,
             host_id,
             paimos_origin,
+            paimos_public_url,
             api_key_file: document.api_key_file,
             instance_label,
             bindings,
@@ -842,6 +852,7 @@ pub(crate) fn inject_flow_shell(
     mount: bool,
     selected_host: Option<&str>,
     flow: Option<&FlowHostService>,
+    public_base_path: &PublicBasePath,
 ) -> String {
     if !mount {
         return html;
@@ -853,7 +864,7 @@ pub(crate) fn inject_flow_shell(
         .map(|service| {
             format!(
                 " data-flow-paimos-origin=\"{}\"",
-                html_escape_attr(service.config.paimos_origin.as_str())
+                html_escape_attr(service.config.paimos_public_url.as_str())
             )
         })
         .unwrap_or_default();
@@ -864,10 +875,13 @@ pub(crate) fn inject_flow_shell(
         ),
     );
     let wrapped = wrapped.replace("</main>", "</main></inspr-flow-shell>");
-    let bootstrap = r#"<script type="module" src="/assets/flow-host-bootstrap.mjs"></script>"#;
+    let bootstrap = format!(
+        r#"<script type="module" src="{src}"></script>"#,
+        src = html_escape_attr(&public_base_path.href("/assets/flow-host-bootstrap.mjs")),
+    );
     if let Some(index) = wrapped.rfind("</body>") {
         let mut output = wrapped;
-        output.insert_str(index, bootstrap);
+        output.insert_str(index, &bootstrap);
         return output;
     }
     format!("{wrapped}{bootstrap}")
@@ -1400,21 +1414,42 @@ fn parse_origin(
     loopback_dev_mode: bool,
     allow_loopback_origin: bool,
 ) -> Result<Url, FlowError> {
-    let url = Url::parse(value).map_err(|_| FlowError::Configuration)?;
+    let mut url = Url::parse(value).map_err(|_| FlowError::Configuration)?;
     if url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || (url.path() != "" && url.path() != "/")
     {
         return Err(FlowError::Configuration);
     }
+    let base = url_public_base(&url)?;
+    url.set_path(base.home());
     match url.scheme() {
         "https" => Ok(url),
         "http" if loopback_dev_mode && allow_loopback_origin && is_loopback_url(&url) => Ok(url),
         _ => Err(FlowError::Configuration),
     }
+}
+
+fn url_public_base(url: &Url) -> Result<PublicBasePath, FlowError> {
+    let path = url.path();
+    if path.is_empty() || path == "/" {
+        Ok(PublicBasePath::root())
+    } else {
+        PublicBasePath::parse(path.trim_end_matches('/')).map_err(|_| FlowError::Configuration)
+    }
+}
+
+fn join_origin_path(base: &Url, endpoint: &str) -> Result<Url, FlowError> {
+    let path = url_public_base(base)?
+        .join(endpoint)
+        .map_err(|_| FlowError::Configuration)?;
+    let mut url = base.clone();
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
 }
 
 fn is_loopback_url(url: &Url) -> bool {
@@ -1619,6 +1654,7 @@ mod tests {
             enabled: true,
             host_id: "pharos-test".to_string(),
             paimos_origin: origin.clone(),
+            paimos_public_url: origin.clone(),
             api_key_file,
             instance_label: "Pharos test".to_string(),
             bindings: vec![FlowBinding {
@@ -1776,6 +1812,7 @@ mod tests {
             true,
             Some("hsb8"),
             None,
+            &PublicBasePath::ROOT,
         );
         assert!(html.contains("data-flow-host-scope=\"hsb8\""));
         assert!(html.contains("/assets/flow-host-bootstrap.mjs"));
@@ -2211,6 +2248,13 @@ mod tests {
     #[test]
     fn loopback_paimos_origin_requires_listener_and_flag() {
         assert!(parse_origin("https://paimos.example", false, false).is_ok());
+        assert!(parse_origin("https://apps.example/paimos", false, false).is_ok());
+        assert_eq!(
+            parse_origin("https://apps.example/paimos/", false, false)
+                .expect("trailing slash is canonicalized")
+                .as_str(),
+            "https://apps.example/paimos"
+        );
         assert!(parse_origin("http://127.0.0.1:9", true, true).is_ok());
         assert!(parse_origin("http://127.0.0.1:9", true, false).is_err());
         assert!(parse_origin("http://127.0.0.1:9", false, false).is_err());
@@ -2224,6 +2268,7 @@ mod tests {
                 enabled: true,
                 host_id: "pharos-test".to_string(),
                 paimos_origin: Url::parse("https://paimos.example").expect("origin"),
+                paimos_public_url: Url::parse("https://paimos.example").expect("origin"),
                 api_key_file: PathBuf::from("/tmp/pharos-flow-test.key"),
                 instance_label: "Pharos test".to_string(),
                 bindings: vec![

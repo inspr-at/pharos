@@ -1,8 +1,9 @@
 <script>
-const MAP_DATA_URL='/map/data.json';
-const MAP_LEAFLET_CSS='/assets/vendor/leaflet-1.9.4/leaflet.css';
-const MAP_LEAFLET_JS='/assets/vendor/leaflet-1.9.4/leaflet.js';
-const MAP_D3_JS='/assets/vendor/d3-7.9.0/d3.min.js';
+function appUrl(path){return (typeof window.pharosPublicPath==='function')?window.pharosPublicPath(path):path}
+const MAP_DATA_URL=appUrl('/map/data.json');
+const MAP_LEAFLET_CSS=appUrl('/assets/vendor/leaflet-1.9.4/leaflet.css');
+const MAP_LEAFLET_JS=appUrl('/assets/vendor/leaflet-1.9.4/leaflet.js');
+const MAP_D3_JS=appUrl('/assets/vendor/d3-7.9.0/d3.min.js');
 let MAP_HOSTS=[];
 let applyMapFilterNow=null;
 let pendingMapFilter={q:'',live:'all'};
