@@ -42,11 +42,13 @@ pub(super) const HEAD: &str = include_str!("../assets/ui/head.html");
 
 pub(super) const FOOT: &str = include_str!("../assets/ui/foot.html");
 
-/// Calendar v2 display weights, read at build time from the vendored doctrine
-/// (inspr-modules `lib/calendar-version-display.json`, INSPR-400). The UI never
-/// carries hand-copied weights: everything below renders from this file.
+/// Calendar v2 display weights, read at build time from the in-repo copy of the
+/// doctrine data file (inspr-modules `lib/calendar-version-display.json`,
+/// INSPR-400). `scripts/check-calendar-version-display.sh` pins the copy to the
+/// published bytes and to the doctrine submodule, so the UI never carries
+/// hand-copied weights: everything below renders from this file.
 pub(super) const CALENDAR_VERSION_DISPLAY_JSON: &str =
-    include_str!("../../../doctrine/lib/calendar-version-display.json");
+    include_str!("../../../contracts/inspr-calendar-version-display/calendar-version-display.json");
 
 /// Pharos' dark highlight colour (the active-navigation ink), used as the
 /// Schmuckfarbe tint for the date segments per doctrine.
