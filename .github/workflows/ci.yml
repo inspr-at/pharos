@@ -42,7 +42,12 @@ jobs:
         run: |
           bash -n scripts/*.sh
           shellcheck scripts/*.sh
-          shfmt -d -i 2 -ci scripts/*.sh
+          # This checker is vendored byte-for-byte from inspr-modules v0.10.0.
+          shfmt_files=()
+          for script in scripts/*.sh; do
+            [[ "$script" == scripts/check-calendar-version-display-pin.sh ]] || shfmt_files+=("$script")
+          done
+          shfmt -d -i 2 -ci "${shfmt_files[@]}"
       - name: fleet browser lifecycle
         run: node --test tests/fleet-refresh.test.mjs
       - name: GitHub Actions Node runtime assurance
