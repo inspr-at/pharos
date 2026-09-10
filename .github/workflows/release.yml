@@ -40,6 +40,8 @@ jobs:
         run: scripts/check-release-consistency.sh
       - name: pinned Paimos delivery contract
         run: scripts/check-paimos-delivery-contract.sh
+      - name: check the vendored calendar v2 display weights
+        run: scripts/check-calendar-version-display.sh
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0 (Node 24)
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0 (Node 24)
         with:

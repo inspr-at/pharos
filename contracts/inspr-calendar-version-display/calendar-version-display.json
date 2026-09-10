@@ -1,0 +1,43 @@
+{
+  "schema": "inspr.calendar-version-display.v1",
+  "scheme": "inspr-calendar-v2",
+  "segments": ["v", "yy", "mm", "dd", "hh", "mi", "ss", "tail"],
+  "weights": {
+    "v": 0.2,
+    "yy": 1,
+    "mm": 0.7,
+    "dd": 0.7,
+    "hh": 0.9,
+    "mi": 0.6,
+    "ss": 0.2,
+    "tail": 0.1
+  },
+  "floor": {
+    "yy": 1
+  },
+  "tint": {
+    "segments": ["yy", "mm", "dd"],
+    "mix": 0.5,
+    "space": "oklab",
+    "default": "currentColor"
+  },
+  "typography": {
+    "family": "ui-monospace,SFMono-Regular,Menlo,monospace",
+    "numeric": "tabular-nums"
+  },
+  "css": {
+    "class": "cv2",
+    "properties": {
+      "v": "--o-v",
+      "yy": "--o-yy",
+      "mm": "--o-mm",
+      "dd": "--o-dd",
+      "hh": "--o-hh",
+      "mi": "--o-mi",
+      "ss": "--o-ss",
+      "tail": "--o-tail",
+      "tint": "--cv2-tint",
+      "mix": "--cv2-mix"
+    }
+  }
+}
