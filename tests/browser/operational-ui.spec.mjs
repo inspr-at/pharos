@@ -66,6 +66,22 @@ test("release history exposes the complete immutable release identity", async ({
     "href",
     `https://github.com/inspr-at/pharos/releases/download/v${releaseCoordinate.version}/release-set.json`,
   );
+
+  const pill = page.locator(".side-version");
+  await expect(pill).toContainText(`v${releaseCoordinate.version}`);
+  if (releaseCoordinate.version_scheme === "inspr-calendar-v2") {
+    const weighted = pill.locator("span.cv2");
+    await expect(weighted).toHaveAttribute(
+      "data-version",
+      `v${releaseCoordinate.version}`,
+    );
+    await expect(weighted.locator("b.yy")).toHaveText(
+      releaseCoordinate.version.slice(0, 2),
+    );
+    await expect(weighted.locator("b.tail")).toHaveText(".0.0");
+  } else {
+    await expect(pill.locator("span.cv2")).toHaveCount(0);
+  }
 });
 
 test("sign-in recovery is accessible, no-store, and restarts with one safe action", async ({

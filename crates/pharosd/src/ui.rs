@@ -42,6 +42,149 @@ pub(super) const HEAD: &str = include_str!("../assets/ui/head.html");
 
 pub(super) const FOOT: &str = include_str!("../assets/ui/foot.html");
 
+/// Calendar v2 display weights, read at build time from the vendored doctrine
+/// (inspr-modules `lib/calendar-version-display.json`, INSPR-400). The UI never
+/// carries hand-copied weights: everything below renders from this file.
+pub(super) const CALENDAR_VERSION_DISPLAY_JSON: &str =
+    include_str!("../../../doctrine/lib/calendar-version-display.json");
+
+/// Pharos' dark highlight colour (the active-navigation ink), used as the
+/// Schmuckfarbe tint for the date segments per doctrine.
+pub(super) const CALENDAR_VERSION_TINT: &str = "#0f4f80";
+
+const CALENDAR_DISPLAY_SEGMENTS: [&str; 8] = ["v", "yy", "mm", "dd", "hh", "mi", "ss", "tail"];
+
+pub(super) fn calendar_version_display() -> &'static serde_json::Value {
+    static DATA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    DATA.get_or_init(|| {
+        let data: serde_json::Value = serde_json::from_str(CALENDAR_VERSION_DISPLAY_JSON)
+            .expect("doctrine calendar-version-display data parses");
+        assert_eq!(
+            data["schema"].as_str(),
+            Some("inspr.calendar-version-display.v1"),
+            "unsupported calendar-version-display schema"
+        );
+        assert_eq!(
+            data["scheme"].as_str(),
+            Some("inspr-calendar-v2"),
+            "display weights apply to inspr-calendar-v2 only"
+        );
+        data
+    })
+}
+
+fn display_weight(value: &serde_json::Value) -> String {
+    let number = value.as_f64().unwrap_or(1.0);
+    let text = format!("{number:.3}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text.is_empty() {
+        "0".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// The stylesheet fragment rendered from the doctrine data: custom properties
+/// with the weights, the segment rules, and the Schmuckfarbe mix on the date.
+pub(super) fn calendar_version_display_css() -> String {
+    let data = calendar_version_display();
+    let weights = &data["weights"];
+    let props = &data["css"]["properties"];
+    let class = data["css"]["class"].as_str().unwrap_or("cv2");
+    let tint = &data["tint"];
+    let mix = (tint["mix"].as_f64().unwrap_or(0.5) * 100.0).round() as i64;
+    let space = tint["space"].as_str().unwrap_or("oklab");
+    let family = data["typography"]["family"]
+        .as_str()
+        .unwrap_or("ui-monospace,SFMono-Regular,Menlo,monospace");
+    let numeric = data["typography"]["numeric"]
+        .as_str()
+        .unwrap_or("tabular-nums");
+    let prop = |key: &str| {
+        props[key]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("--o-{key}"))
+    };
+    let mut css = String::from(":root{");
+    for segment in CALENDAR_DISPLAY_SEGMENTS {
+        css.push_str(&format!(
+            "{}:{};",
+            prop(segment),
+            display_weight(&weights[segment])
+        ));
+    }
+    css.push_str(&format!(
+        "{}:{};{}:{}%}}",
+        prop("tint"),
+        CALENDAR_VERSION_TINT,
+        prop("mix"),
+        mix
+    ));
+    css.push_str(&format!(
+        ".{class}{{font-family:{family};font-variant-numeric:{numeric};white-space:nowrap}}.{class}>b{{font-weight:inherit}}"
+    ));
+    for segment in CALENDAR_DISPLAY_SEGMENTS {
+        css.push_str(&format!(
+            ".{class} .{segment}{{opacity:var({})}}",
+            prop(segment)
+        ));
+    }
+    let tinted: Vec<String> = tint["segments"]
+        .as_array()
+        .map(|segments| {
+            segments
+                .iter()
+                .filter_map(|segment| segment.as_str())
+                .map(|segment| format!(".{class} .{segment}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !tinted.is_empty() {
+        css.push_str(&format!(
+            "{}{{color:color-mix(in {space},currentColor,var({}) var({}))}}",
+            tinted.join(","),
+            prop("tint"),
+            prop("mix")
+        ));
+    }
+    css
+}
+
+/// Weighted markup for a calendar v2 coordinate. The scheme comes from the
+/// release record, never from the string's shape; anything else renders plain.
+/// The element's text content and `data-version` stay the canonical label.
+pub(super) fn weighted_version_html(scheme: &str, version: &str) -> String {
+    let plain = format!("v{version}");
+    if scheme != "inspr-calendar-v2" || !pharos_core::valid_inspr_calendar_v2_version(version) {
+        return html_escape(&plain);
+    }
+    let class = calendar_version_display()["css"]["class"]
+        .as_str()
+        .unwrap_or("cv2");
+    let digits = &version[..12];
+    format!(
+        concat!(
+            "<span class=\"{class}\" data-version=\"{plain}\">",
+            "<b class=\"v\">v</b><b class=\"yy\">{yy}</b><b class=\"mm\">{mm}</b><b class=\"dd\">{dd}</b>",
+            "<b class=\"hh\">{hh}</b><b class=\"mi\">{mi}</b><b class=\"ss\">{ss}</b><b class=\"tail\">.0.0</b>",
+            "</span>"
+        ),
+        class = class,
+        plain = html_escape(&plain),
+        yy = &digits[0..2],
+        mm = &digits[2..4],
+        dd = &digits[4..6],
+        hh = &digits[6..8],
+        mi = &digits[8..10],
+        ss = &digits[10..12],
+    )
+}
+
+pub(super) fn release_label_html() -> String {
+    weighted_version_html(VERSION_SCHEME, APP_VERSION)
+}
+
 pub(super) fn app_href(base: &PublicBasePath, endpoint: &str) -> String {
     html_escape(&base.href(endpoint))
 }
@@ -51,6 +194,13 @@ const HETZNER_ASSISTANT_ENDPOINT: &str =
 
 pub(super) fn document_head(base: &PublicBasePath) -> String {
     HEAD.replace(
+        "</head>",
+        &format!(
+            "<style data-calendar-version-display>{}</style></head>",
+            calendar_version_display_css()
+        ),
+    )
+    .replace(
         r#"href="/favicon.svg""#,
         &format!(r#"href="{}""#, app_href(base, "/favicon.svg")),
     )
@@ -137,7 +287,7 @@ pub(super) fn changelog_html() -> String {
 pub(super) fn release_dialog() -> String {
     format!(
         r#"<section class="release-overlay" data-release-modal hidden aria-label="release history"><div class="release-backdrop" data-release-close></div><div class="release-sheet" role="dialog" aria-modal="true" aria-labelledby="release-history-title"><header class="release-head"><div><h2 id="release-history-title">Release history</h2><p>Running {version} · build {commit}</p><dl class="release-identity" data-release-identity><div><dt>Scheme</dt><dd>{scheme}</dd></div><div><dt>Channel</dt><dd>{channel}</dd></div><div><dt>Sequence</dt><dd>#{sequence}</dd></div></dl><a class="release-set-link" data-release-set href="{release_set}" target="_blank" rel="noopener noreferrer">Open exact release set</a></div><button class="release-close" type="button" data-release-close>Close</button></header><div class="release-body">{history}</div></div></section>"#,
-        version = html_escape(&release_label()),
+        version = release_label_html(),
         commit = html_escape(GIT_COMMIT),
         scheme = html_escape(release_scheme_label()),
         channel = html_escape(RELEASE_CHANNEL),
@@ -158,6 +308,87 @@ pub(super) const SETUP_ASSISTANT_TEMPLATE: &str = include_str!("../assets/ui/set
 mod module_tests {
     use super::*;
     use crate::host_actions::{HostLifecycle, HostLifecycleInvoke, HostLifecycleSlot};
+
+    fn text_content(html: &str) -> String {
+        let mut text = String::new();
+        let mut in_tag = false;
+        for ch in html.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => text.push(ch),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn calendar_version_display_renders_the_pinned_doctrine_data() {
+        let data = calendar_version_display();
+        assert_eq!(data["schema"], "inspr.calendar-version-display.v1");
+        assert_eq!(data["scheme"], "inspr-calendar-v2");
+        assert_eq!(data["weights"]["yy"], 1);
+        let css = calendar_version_display_css();
+        for segment in CALENDAR_DISPLAY_SEGMENTS {
+            let prop = data["css"]["properties"][segment]
+                .as_str()
+                .expect("segment property");
+            let expected = format!("{prop}:{};", display_weight(&data["weights"][segment]));
+            assert!(css.contains(&expected), "{expected} missing from {css}");
+            assert!(css.contains(&format!(".cv2 .{segment}{{opacity:var({prop})}}")));
+        }
+        assert!(css.contains(&format!("--cv2-tint:{CALENDAR_VERSION_TINT};--cv2-mix:50%")));
+        assert!(css.contains(
+            ".cv2 .yy,.cv2 .mm,.cv2 .dd{color:color-mix(in oklab,currentColor,var(--cv2-tint) var(--cv2-mix))}"
+        ));
+        assert!(css.contains("font-variant-numeric:tabular-nums"));
+    }
+
+    #[test]
+    fn weighted_version_html_keeps_the_canonical_string() {
+        let html = weighted_version_html("inspr-calendar-v2", "260909202506.0.0");
+        assert!(html.starts_with(r#"<span class="cv2" data-version="v260909202506.0.0">"#));
+        assert!(html.contains(
+            r#"<b class="v">v</b><b class="yy">26</b><b class="mm">09</b><b class="dd">09</b>"#
+        ));
+        assert!(html.contains(
+            r#"<b class="hh">20</b><b class="mi">25</b><b class="ss">06</b><b class="tail">.0.0</b>"#
+        ));
+        assert_eq!(text_content(&html), "v260909202506.0.0");
+    }
+
+    #[test]
+    fn weighted_version_html_never_infers_the_scheme_from_shape() {
+        assert_eq!(
+            weighted_version_html("inspr-calendar-v1", "26.09.08.23.58.28"),
+            "v26.09.08.23.58.28"
+        );
+        assert_eq!(weighted_version_html("legacy", "0.1.0"), "v0.1.0");
+        assert_eq!(
+            weighted_version_html("inspr-calendar-v1", "260909202506.0.0"),
+            "v260909202506.0.0"
+        );
+        assert_eq!(
+            weighted_version_html("inspr-calendar-v2", "26.09.08.23.58.28"),
+            "v26.09.08.23.58.28"
+        );
+    }
+
+    #[test]
+    fn document_head_carries_the_display_stylesheet_once() {
+        let head = document_head(&PublicBasePath::ROOT);
+        assert_eq!(
+            head.matches("<style data-calendar-version-display>")
+                .count(),
+            1
+        );
+        assert!(head.contains(&calendar_version_display_css()));
+        assert!(
+            head.ends_with(r#"<body><div class="app-shell">"#) || head.contains("</head><body>")
+        );
+        assert_eq!(text_content(&release_label_html()), release_label());
+    }
 
     fn proven_current(channel: &str) -> NixFreshness {
         let source_revision = "1".repeat(40);
@@ -2974,7 +3205,7 @@ pub(super) fn sidebar(
         activity = icons::LIST,
         platform_settings = icons::SETTINGS,
         history = icons::HISTORY,
-        version = html_escape(&release_label()),
+        version = release_label_html(),
         release_dialog = release_dialog(),
         release_portal = RELEASE_HISTORY_PORTAL,
         logout_csrf = LOGOUT_CSRF_RUNTIME,

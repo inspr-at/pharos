@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Render calendar v2 versions in the sidebar pill and the release sheet with the doctrine display weights: per-segment opacity and the deep-accent tint on the date, read at build time from the vendored `doctrine/lib/calendar-version-display.json` (inspr-modules 0.9.0). The element's text content and `data-version` stay the canonical label; v1 and legacy versions render plain (PHAROS-261, INSPR-400).
+
 ## 260909202506.0.0 - 2026-09-09
 
 - Coordinate `260909194540.0.0` (sequence 6) was reserved first; its publication was refused by the release gate before any artifact existed, so it stays a tag-only reservation and sequence 7 carries the release.
