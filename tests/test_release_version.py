@@ -31,6 +31,12 @@ V1_HISTORY = (
     ("26.09.08.23.58.28", 5),
 )
 FIRST_V2_SEQUENCE = 6
+# Published calendar v2 reservations in first-parent order. Sequence 6 was a
+# refused tag-only reservation; sequence 7 carried the first v2 release.
+V2_HISTORY = (
+    ("260909194540.0.0", 6),
+    ("260909202506.0.0", 7),
+)
 
 
 class CalendarVersionTests(unittest.TestCase):
@@ -252,10 +258,12 @@ class CalendarVersionTests(unittest.TestCase):
         )
         self.assertLess(release_version.compare_releases(last_v1, current_identity), 0)
         recorded = list(self.v1_history())
-        if current["release_sequence"] > FIRST_V2_SEQUENCE:
-            recorded.append(
-                self.calendar_v2_release(anchor["first_calendar_v2_version"], FIRST_V2_SEQUENCE)
-            )
+        self.assertEqual(V2_HISTORY[0], (anchor["first_calendar_v2_version"], FIRST_V2_SEQUENCE))
+        recorded.extend(
+            self.calendar_v2_release(version, sequence)
+            for version, sequence in V2_HISTORY
+            if sequence < current["release_sequence"]
+        )
         release_version.validate_reservation_history(current, tuple(recorded), ())
 
     def test_calendar_v2_grammar_is_exact_and_gregorian(self):
