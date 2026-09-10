@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 260910215149.0.0 - 2026-09-10
+
+- Adopt the final shared calendar display revision 3 from inspr-modules 0.10.0: use the approved segment weights and sun tint for the date, while preserving canonical version text and plain legacy rendering. Verify the bundled display data against its immutable upstream bytes, including builds without the doctrine checkout (PHAROS-264).
+
 ## 260910065821.0.0 - 2026-09-10
 
 - Render calendar v2 versions in the sidebar pill and the release sheet with the doctrine display weights: per-segment opacity and the deep-accent tint on the date, read at build time from `contracts/inspr-calendar-version-display/calendar-version-display.json`, an in-repo copy pinned byte-for-byte to `doctrine/lib/calendar-version-display.json` (inspr-modules 0.9.0) by `scripts/check-calendar-version-display.sh`. The element's text content and `data-version` stay the canonical label; v1 and legacy versions render plain (PHAROS-261, INSPR-400).

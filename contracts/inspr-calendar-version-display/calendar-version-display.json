@@ -1,25 +1,26 @@
 {
   "schema": "inspr.calendar-version-display.v1",
   "scheme": "inspr-calendar-v2",
+  "design_revision": 3,
   "segments": ["v", "yy", "mm", "dd", "hh", "mi", "ss", "tail"],
   "weights": {
     "v": 0.2,
     "yy": 1,
-    "mm": 0.7,
-    "dd": 0.7,
-    "hh": 0.9,
-    "mi": 0.6,
+    "mm": 0.8,
+    "dd": 1,
+    "hh": 0.6,
+    "mi": 0.4,
     "ss": 0.2,
-    "tail": 0.1
+    "tail": 0.2
   },
   "floor": {
     "yy": 1
   },
   "tint": {
     "segments": ["yy", "mm", "dd"],
-    "mix": 0.5,
+    "mix": 0.8,
     "space": "oklab",
-    "default": "currentColor"
+    "default": "#d69b31"
   },
   "typography": {
     "family": "ui-monospace,SFMono-Regular,Menlo,monospace",

@@ -42,17 +42,13 @@ pub(super) const HEAD: &str = include_str!("../assets/ui/head.html");
 
 pub(super) const FOOT: &str = include_str!("../assets/ui/foot.html");
 
-/// Calendar v2 display weights, read at build time from the in-repo copy of the
+/// Calendar v2 display settings, read at build time from the in-repo copy of the
 /// doctrine data file (inspr-modules `lib/calendar-version-display.json`,
-/// INSPR-400). `scripts/check-calendar-version-display.sh` pins the copy to the
+/// INSPR-414). `scripts/check-calendar-version-display.sh` pins the copy to the
 /// published bytes and to the doctrine submodule, so the UI never carries
-/// hand-copied weights: everything below renders from this file.
+/// hand-copied defaults: everything below renders from this file.
 pub(super) const CALENDAR_VERSION_DISPLAY_JSON: &str =
     include_str!("../../../contracts/inspr-calendar-version-display/calendar-version-display.json");
-
-/// Pharos' dark highlight colour (the active-navigation ink), used as the
-/// Schmuckfarbe tint for the date segments per doctrine.
-pub(super) const CALENDAR_VERSION_TINT: &str = "#0f4f80";
 
 const CALENDAR_DISPLAY_SEGMENTS: [&str; 8] = ["v", "yy", "mm", "dd", "hh", "mi", "ss", "tail"];
 
@@ -70,6 +66,11 @@ pub(super) fn calendar_version_display() -> &'static serde_json::Value {
             data["scheme"].as_str(),
             Some("inspr-calendar-v2"),
             "display weights apply to inspr-calendar-v2 only"
+        );
+        assert_eq!(
+            data["design_revision"].as_u64(),
+            Some(3),
+            "unsupported calendar-version display design revision"
         );
         data
     })
@@ -94,8 +95,9 @@ pub(super) fn calendar_version_display_css() -> String {
     let props = &data["css"]["properties"];
     let class = data["css"]["class"].as_str().unwrap_or("cv2");
     let tint = &data["tint"];
-    let mix = (tint["mix"].as_f64().unwrap_or(0.5) * 100.0).round() as i64;
-    let space = tint["space"].as_str().unwrap_or("oklab");
+    let mix = (tint["mix"].as_f64().expect("display tint mix") * 100.0).round() as i64;
+    let space = tint["space"].as_str().expect("display tint colour space");
+    let tint_default = tint["default"].as_str().expect("display tint default");
     let family = data["typography"]["family"]
         .as_str()
         .unwrap_or("ui-monospace,SFMono-Regular,Menlo,monospace");
@@ -119,7 +121,7 @@ pub(super) fn calendar_version_display_css() -> String {
     css.push_str(&format!(
         "{}:{};{}:{}%}}",
         prop("tint"),
-        CALENDAR_VERSION_TINT,
+        tint_default,
         prop("mix"),
         mix
     ));
@@ -330,7 +332,20 @@ mod module_tests {
         let data = calendar_version_display();
         assert_eq!(data["schema"], "inspr.calendar-version-display.v1");
         assert_eq!(data["scheme"], "inspr-calendar-v2");
-        assert_eq!(data["weights"]["yy"], 1);
+        assert_eq!(data["design_revision"], 3);
+        assert_eq!(
+            data["weights"],
+            serde_json::json!({
+                "v": 0.2,
+                "yy": 1,
+                "mm": 0.8,
+                "dd": 1,
+                "hh": 0.6,
+                "mi": 0.4,
+                "ss": 0.2,
+                "tail": 0.2
+            })
+        );
         let css = calendar_version_display_css();
         for segment in CALENDAR_DISPLAY_SEGMENTS {
             let prop = data["css"]["properties"][segment]
@@ -340,7 +355,7 @@ mod module_tests {
             assert!(css.contains(&expected), "{expected} missing from {css}");
             assert!(css.contains(&format!(".cv2 .{segment}{{opacity:var({prop})}}")));
         }
-        assert!(css.contains(&format!("--cv2-tint:{CALENDAR_VERSION_TINT};--cv2-mix:50%")));
+        assert!(css.contains("--cv2-tint:#d69b31;--cv2-mix:80%"));
         assert!(css.contains(
             ".cv2 .yy,.cv2 .mm,.cv2 .dd{color:color-mix(in oklab,currentColor,var(--cv2-tint) var(--cv2-mix))}"
         ));
