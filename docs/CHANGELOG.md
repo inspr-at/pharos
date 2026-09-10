@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 260910215149.0.0 - 2026-09-10
+
 - Adopt the final shared calendar display revision 3 from inspr-modules 0.10.0: use the approved segment weights and sun tint for the date, while preserving canonical version text and plain legacy rendering. Verify the bundled display data against its immutable upstream bytes, including builds without the doctrine checkout (PHAROS-264).
 
 ## 260910065821.0.0 - 2026-09-10
