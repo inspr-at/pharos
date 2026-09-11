@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an explicit, default-off delegated delivery mode that consumes a one-use Paimos launch admission rooted in human review and confirms only the existing ready Pharos job (PHAROS-206).
+- Persist candidate and consumption receipts across retries, revalidate target and reviewed-plan bindings, and retain attended operation when delegated delivery is not configured.
+- Keep the reviewed launch-admission candidate fixtures unchanged alongside current main's external-stage v2 pin, and cover admission, replay, refusal and recovery with real network tests. Final launch-admission release metadata remains deferred until the corresponding Paimos artifact is published.
+
 ## 260911012118.0.0 - 2026-09-11
 
 - Update the embedded INSPR Flow shell to the immutable 0.1.5 release, including its responsive host layout and project navigation fixes. Verify the vendored files against the pinned upstream source, archive digest and notices. Existing scoped navigation and deployment authority remain unchanged (PHAROS-257).
