@@ -1822,7 +1822,7 @@ mod tests {
     fn vendor_manifest_matches_embedded_assets() {
         let manifest = include_str!("../assets/vendor/flow-shell/manifest.json");
         let parsed: Value = serde_json::from_str(manifest).expect("manifest json");
-        assert_eq!(parsed["version"], "0.1.3");
+        assert_eq!(parsed["version"], "0.1.5");
         let vendor_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/vendor/flow-shell");
         for entry in parsed["files"].as_array().expect("files") {
             let path = entry["path"].as_str().expect("path");
