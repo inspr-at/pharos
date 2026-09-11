@@ -4837,6 +4837,15 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
   const failedRunId = failedPayload.job.id;
 
   await page.goto("/");
+  const fleetRefreshUrl = /\/hosts\.json\?refresh=\d+$/;
+  let heldFleetPayload = null;
+  await page.route(fleetRefreshUrl, async (route) => {
+    if (!heldFleetPayload) {
+      await route.continue();
+      return;
+    }
+    await route.fulfill({ status: 200, json: heldFleetPayload });
+  });
   const failedCard = page
     .locator(`[data-host="${failedHost}"][data-host-surface="runtime"].card`)
     .first();
@@ -4848,6 +4857,8 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
   const hiddenPayload = await page.request.get("/hosts.json").then((r) => r.json());
   const hiddenEntry = hiddenPayload.hosts.find((entry) => entry.name === failedHost);
   delete hiddenEntry.lifecycle.primary_action;
+  heldFleetPayload = hiddenPayload;
+  await page.evaluate(() => abandonRefresh());
   expect(await page.evaluate((body) => applyFleetSnapshot(body), hiddenPayload)).toBe(
     true,
   );
@@ -4861,6 +4872,8 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
     kind: "recover",
     label: "Run recovery checks",
   };
+  heldFleetPayload = visiblePayload;
+  await page.evaluate(() => abandonRefresh());
   expect(await page.evaluate((body) => applyFleetSnapshot(body), visiblePayload)).toBe(
     true,
   );
@@ -4868,6 +4881,7 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
   await expect(failedContinue).toBeVisible();
   await expect(failedContinue).toContainText("Run recovery checks");
   await expect(failedContinue).toHaveAttribute("data-lifecycle-run-id", failedRunId);
+  await page.unroute(fleetRefreshUrl);
 
   fs.writeFileSync(acceptFlagPath, "false", { mode: 0o600 });
   fs.writeFileSync(settingsUncertainFlagPath, "false", { mode: 0o600 });
