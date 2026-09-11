@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 260911012118.0.0 - 2026-09-11
+
+- Update the embedded INSPR Flow shell to the immutable 0.1.5 release, including its responsive host layout and project navigation fixes. Verify the vendored files against the pinned upstream source, archive digest and notices. Existing scoped navigation and deployment authority remain unchanged (PHAROS-257).
+
 ## 260910215149.0.0 - 2026-09-10
 
 - Adopt the final shared calendar display revision 3 from inspr-modules 0.10.0: use the approved segment weights and sun tint for the date, while preserving canonical version text and plain legacy rendering. Verify the bundled display data against its immutable upstream bytes, including builds without the doctrine checkout (PHAROS-264).

@@ -17,11 +17,34 @@
   padding-bottom: var(--shell-footer-space);
 }
 
+:host([content-layout='fill']) {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
 .shell-root {
   container-type: inline-size;
   container-name: shell;
   display: block;
   min-height: inherit;
+}
+
+:host([content-layout='fill']) .shell-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+:host([content-layout='fill']) .shell-scaffold {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .shell-scaffold {
@@ -67,6 +90,10 @@ input:focus-visible {
   position: relative;
   z-index: 2;
   background: rgba(249, 251, 252, 0.7);
+}
+
+:host([content-layout='fill']) .shell-header {
+  flex: 0 0 auto;
 }
 
 .identity {
@@ -153,12 +180,24 @@ input:focus-visible {
   min-height: calc(100dvh - 268px);
 }
 
+:host([content-layout='fill']) .shell-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .health {
   display: flex;
   align-items: center;
   gap: 7px;
   font-size: 11px;
   padding: 25px var(--shell-content-padding-inline);
+}
+
+:host([content-layout='fill']) .health {
+  flex: 0 0 auto;
 }
 
 .health button {
@@ -184,6 +223,33 @@ input:focus-visible {
 
 .host-slot {
   display: block;
+}
+
+:host([content-layout='fill']) .host-slot {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+:host([content-layout='fill']) .host-slot ::slotted([data-flow-host-region='toolbar']),
+:host([content-layout='fill']) .host-slot ::slotted([data-flow-host-region='footer']) {
+  flex: 0 0 auto;
+}
+
+:host([content-layout='fill']) .host-slot ::slotted([data-flow-host-region='body']) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+:host([content-layout='fill']) .host-slot ::slotted(:not([data-flow-host-region])) {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .shell-footer {
@@ -213,6 +279,44 @@ input:focus-visible {
   bottom: 0;
   left: 0;
   right: 0;
+}
+
+:host([content-layout='fill']) .shell-footer.shell-chrome-fixed {
+  display: flex;
+  flex-direction: column;
+  max-height: var(--shell-footer-max-height, none);
+  overflow: hidden;
+}
+
+:host([content-layout='fill']) .shell-footer-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+:host([content-layout='fill']) .shell-footer-scaffold {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+:host([content-layout='fill']) .expanded-panel {
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+}
+
+:host([content-layout='fill']) .bar-heading,
+:host([content-layout='fill']) .steps,
+:host([content-layout='fill']) .bar-bottom {
+  flex: 0 0 auto;
 }
 
 :host([layout-mode='bounded']) .shell-footer.shell-chrome-fixed {

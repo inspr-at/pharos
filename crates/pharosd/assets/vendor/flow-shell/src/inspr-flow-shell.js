@@ -4,11 +4,14 @@ import { formatProgressLine, formatFreshnessLabel, isStaleSnapshot, resolveFresh
 import {
   normalizeShellState,
   confirmationSnapshot,
+  isConfirmationExpired,
+  nextClockAgingDelayMs,
   withViewedStage,
   withMapExpanded,
   withExecutionMode,
   withSelectedAction,
 } from './state.js';
+import { identityFreshnessIssues } from './identity.js';
 import {
   createNavigateStageIntent,
   createToggleMapIntent,
@@ -23,7 +26,14 @@ import { escapeHtml } from './sanitize.js';
 import {
   applyBoundedGeometry,
   applyFooterSpace,
+  applyFillFooterCap,
   clearBoundedGeometry,
+  clearFillFooterCap,
+  resolveContentLayout,
+  resolveFillFooterCapacity,
+  resolveFillFooterReservation,
+  measureHostLocalTopOffset,
+  measureFillContentMinimumFromMetrics,
   resolveLayoutMode,
 } from './host-layout.js';
 
@@ -43,17 +53,23 @@ const HOST_LAYOUT_VARS = {
 
 export class InsprFlowShell extends HTMLElement {
   static get observedAttributes() {
-    return ['logo-src', 'content-padding', 'footer-space', 'layout-mode'];
+    return ['logo-src', 'content-padding', 'footer-space', 'layout-mode', 'content-layout'];
   }
 
   #state = normalizeShellState({});
   #reviewSnapshot = null;
   #noticeTimer = null;
+  #clockTimer = null;
   #eventsBound = false;
   #footerObserver = null;
   #hostObserver = null;
   #geometryFrame = null;
   #onWindowGeometryChange = () => this.#scheduleGeometrySync();
+  #onVisibilityChange = () => {
+    if (this.ownerDocument?.visibilityState === 'visible') {
+      this.#refreshClockPresentation();
+    }
+  };
 
   constructor() {
     super();
@@ -64,9 +80,11 @@ export class InsprFlowShell extends HTMLElement {
   connectedCallback() {
     this.#syncHostLayoutVars();
     this.render();
+    this.#bindClockAging();
   }
 
   disconnectedCallback() {
+    this.#teardownClockAging();
     this.#teardownLayoutObservers();
   }
 
@@ -82,11 +100,23 @@ export class InsprFlowShell extends HTMLElement {
       this.#syncLayoutMode();
       return;
     }
+    if (name === 'content-layout') {
+      this.#syncContentLayout();
+      return;
+    }
     this.render();
   }
 
   #layoutMode() {
     return resolveLayoutMode(this.getAttribute('layout-mode'));
+  }
+
+  #contentLayout() {
+    return resolveContentLayout(this.getAttribute('content-layout'));
+  }
+
+  #isFillLayout() {
+    return this.#contentLayout() === 'fill';
   }
 
   #isBounded() {
@@ -100,7 +130,19 @@ export class InsprFlowShell extends HTMLElement {
       return;
     }
     clearBoundedGeometry(this);
+    if (this.#isFillLayout()) {
+      this.#bindLayoutObservers();
+      return;
+    }
     this.#teardownBoundedObservers();
+  }
+
+  #syncContentLayout() {
+    if (!this.#isFillLayout()) {
+      clearFillFooterCap(this);
+    }
+    this.#bindLayoutObservers();
+    this.#syncFooterSpace();
   }
 
   #scheduleGeometrySync() {
@@ -117,11 +159,99 @@ export class InsprFlowShell extends HTMLElement {
     applyBoundedGeometry(this, this.getBoundingClientRect());
   }
 
+  #footerSpaceSyncing = false;
+
   #syncFooterSpace() {
-    if (this.hasAttribute('footer-space')) return;
+    if (!this.isConnected || this.#footerSpaceSyncing) return;
+    if (this.hasAttribute('footer-space')) {
+      if (!this.#isFillLayout()) {
+        clearFillFooterCap(this);
+      }
+      return;
+    }
     const footer = this.shadowRoot?.querySelector('.shell-footer');
     if (!footer) return;
-    applyFooterSpace(this, footer.getBoundingClientRect().height);
+
+    this.#footerSpaceSyncing = true;
+    try {
+      if (this.#isFillLayout()) {
+        const minContent = this.#measureFillContentMinimum();
+        const hostHeight = this.#hostLayoutHeight();
+        if (hostHeight > 0) {
+          const maxCapacity = resolveFillFooterCapacity(hostHeight, minContent);
+          const natural = this.#measureFooterNaturalHeight(footer);
+          const reserved = resolveFillFooterReservation(natural, maxCapacity);
+          applyFillFooterCap(this, reserved, maxCapacity);
+          return;
+        }
+      }
+      clearFillFooterCap(this);
+      applyFooterSpace(this, footer.getBoundingClientRect().height);
+    } finally {
+      this.#footerSpaceSyncing = false;
+    }
+  }
+
+  #measureFooterNaturalHeight(footer) {
+    const previous = this.style.getPropertyValue('--shell-footer-max-height');
+    this.style.removeProperty('--shell-footer-max-height');
+    const rectHeight = footer.getBoundingClientRect().height;
+    const scaffold = footer.querySelector('.shell-footer-scaffold');
+    const measured = Math.max(rectHeight, scaffold?.scrollHeight ?? 0);
+    if (previous) {
+      this.style.setProperty('--shell-footer-max-height', previous);
+    }
+    return measured;
+  }
+
+  #hostLayoutHeight() {
+    if (this.clientHeight > 0) return this.clientHeight;
+    const rect = this.getBoundingClientRect();
+    if (rect.height > 0) return rect.height;
+    return this.offsetHeight;
+  }
+
+  #hostComputedStyle() {
+    const view = this.ownerDocument?.defaultView;
+    if (!view?.getComputedStyle) return null;
+    return view.getComputedStyle(this);
+  }
+
+  #measureFillContentMinimum() {
+    const computed = this.#hostComputedStyle();
+    const custom = Number.parseFloat(computed?.getPropertyValue('--shell-fill-content-min') ?? '');
+    const scrollMin = Number.parseFloat(computed?.getPropertyValue('--shell-fill-scroll-min') ?? '');
+    const scrollReserve = Number.isFinite(scrollMin) && scrollMin > 0 ? scrollMin : 48;
+
+    const hostRect = this.getBoundingClientRect();
+    const hostSlot = this.shadowRoot?.querySelector('.host-slot');
+    const chromeAboveSlot = hostSlot
+      ? measureHostLocalTopOffset(hostRect, hostSlot.getBoundingClientRect())
+      : 0;
+
+    let slottedFixed = 0;
+    for (const child of this.children) {
+      const region = child.getAttribute('data-flow-host-region');
+      if (region === 'toolbar' || region === 'footer') {
+        slottedFixed += child.getBoundingClientRect().height;
+        continue;
+      }
+      const footer = child.querySelector?.(
+        '[data-flow-host-region="footer"], .project-footer, footer#project-footer, footer.project-footer',
+      );
+      if (footer) slottedFixed += footer.getBoundingClientRect().height;
+      if (!region) {
+        const toolbar = child.querySelector?.('[data-flow-host-region="toolbar"], .host-toolbar');
+        if (toolbar) slottedFixed += toolbar.getBoundingClientRect().height;
+      }
+    }
+
+    return measureFillContentMinimumFromMetrics({
+      chromeAboveSlot,
+      slottedFixedHeight: slottedFixed,
+      scrollReserve,
+      customMin: custom,
+    });
   }
 
   #bindBoundedGeometryListeners() {
@@ -165,7 +295,10 @@ export class InsprFlowShell extends HTMLElement {
 
     if (hasResizeObserver) {
       if (!this.#footerObserver) {
-        this.#footerObserver = new ResizeObserver(() => this.#syncFooterSpace());
+        this.#footerObserver = new ResizeObserver(() => {
+          if (!this.isConnected) return;
+          this.#syncFooterSpace();
+        });
       }
       this.#footerObserver.disconnect();
       this.#footerObserver.observe(footer);
@@ -173,7 +306,7 @@ export class InsprFlowShell extends HTMLElement {
 
     this.#syncFooterSpace();
 
-    if (!this.#isBounded()) {
+    if (!this.#isBounded() && !this.#isFillLayout()) {
       this.#teardownBoundedObservers();
       clearBoundedGeometry(this);
       return;
@@ -181,14 +314,24 @@ export class InsprFlowShell extends HTMLElement {
 
     if (hasResizeObserver) {
       if (!this.#hostObserver) {
-        this.#hostObserver = new ResizeObserver(() => this.#scheduleGeometrySync());
+        this.#hostObserver = new ResizeObserver(() => {
+          if (!this.isConnected) return;
+          if (this.#isBounded()) {
+            this.#scheduleGeometrySync();
+          }
+          if (this.#isFillLayout()) {
+            this.#syncFooterSpace();
+          }
+        });
       }
       this.#hostObserver.disconnect();
       this.#hostObserver.observe(this);
     }
 
-    this.#bindBoundedGeometryListeners();
-    this.#syncBoundedGeometry();
+    if (this.#isBounded()) {
+      this.#bindBoundedGeometryListeners();
+      this.#syncBoundedGeometry();
+    }
   }
 
   #syncHostLayoutVars() {
@@ -209,6 +352,7 @@ export class InsprFlowShell extends HTMLElement {
   set shellState(next) {
     this.#state = normalizeShellState(next);
     this.render();
+    this.#scheduleClockAging();
   }
 
   emitIntent(intent) {
@@ -230,6 +374,111 @@ export class InsprFlowShell extends HTMLElement {
     this.#noticeTimer = setTimeout(() => {
       notice.hidden = true;
     }, 4500);
+  }
+
+  #bindClockAging() {
+    if (!this.isConnected) return;
+    this.#teardownClockAging();
+    const doc = this.ownerDocument;
+    doc?.addEventListener('visibilitychange', this.#onVisibilityChange);
+    this.#scheduleClockAging();
+  }
+
+  #teardownClockAging() {
+    clearTimeout(this.#clockTimer);
+    this.#clockTimer = null;
+    this.ownerDocument?.removeEventListener('visibilitychange', this.#onVisibilityChange);
+  }
+
+  #scheduleClockAging() {
+    if (!this.isConnected) return;
+    clearTimeout(this.#clockTimer);
+    const extraBoundaries = this.#reviewSnapshot?.expiresAt ? [this.#reviewSnapshot.expiresAt] : [];
+    const delay = nextClockAgingDelayMs(this.#state, { extraBoundaries });
+    this.#clockTimer = setTimeout(() => {
+      this.#clockTimer = null;
+      if (!this.isConnected) return;
+      this.#refreshClockPresentation();
+    }, delay);
+  }
+
+  #identityCaption(now = Date.now()) {
+    const identity = this.#state.identity;
+    const freshnessIssues = identity?.status === 'present' ? identityFreshnessIssues(identity, now) : [];
+    if (freshnessIssues.length) return freshnessIssues.join(' ');
+    if (identity?.status === 'present') {
+      return (
+        identity.value.display.fixtureLabel ||
+        `Host-scoped binding ${identity.value.bindingRef}. Host must revalidate. Labels are untrusted.`
+      );
+    }
+    if (identity?.status === 'rejected') return identity.reasons.join(' ');
+    return 'No host identity context. Read-only navigation remains available; start intent is blocked.';
+  }
+
+  #reviewGateState({ confirmed, executionMode, now = Date.now() } = {}) {
+    const gate = canEmitStartIntent(this.#state, {
+      confirmed,
+      executionMode,
+      action: this.#state.selectedAction,
+      now,
+    });
+    const snapshotExpired = Boolean(this.#reviewSnapshot && isConfirmationExpired(this.#reviewSnapshot, now));
+    const allowed = gate.allowed && !snapshotExpired;
+    const reasons = [...gate.reasons];
+    if (snapshotExpired) {
+      reasons.push('Confirmation snapshot has expired. Refresh the review dialog and confirm again.');
+    }
+    return { allowed, reasons: [...new Set(reasons)] };
+  }
+
+  #refreshReviewDialogClock(now = Date.now()) {
+    const dialog = this.shadowRoot?.querySelector('dialog[data-shell-dialog]');
+    if (!dialog?.open) return;
+    const confirm = dialog.querySelector('[data-review-confirm]');
+    const mode = dialog.querySelector('[data-action="execution-mode"]');
+    const start = dialog.querySelector('[data-action="confirm-start"]');
+    if (!confirm || !start) return;
+
+    const gate = this.#reviewGateState({
+      confirmed: confirm.checked,
+      executionMode: mode?.value ?? this.#state.selectedExecutionMode,
+      now,
+    });
+    const reasonEl = dialog.querySelector('[data-review-gate-reason]');
+    if (reasonEl) {
+      reasonEl.textContent = gate.reasons.join(' ') || 'Ready to emit start intent after confirmation.';
+    }
+    const identityCaption = dialog.querySelector('[data-identity-caption]');
+    if (identityCaption) identityCaption.textContent = this.#identityCaption(now);
+    start.disabled = !confirm.checked || !gate.allowed;
+  }
+
+  #preserveFocusedStage(update) {
+    const root = this.shadowRoot;
+    const active = root.activeElement;
+    const stage = active?.dataset?.stage;
+    update();
+    if (stage != null) {
+      root.querySelector(`[data-action="stage"][data-stage="${stage}"]`)?.focus();
+      return;
+    }
+    if (active?.isConnected) active.focus();
+  }
+
+  #refreshClockPresentation() {
+    if (!this.isConnected) return;
+    const root = this.shadowRoot;
+    if (!root?.querySelector('.shell-footer')) return;
+
+    this.#preserveFocusedStage(() => {
+      const steps = root.querySelector('.steps');
+      if (steps) steps.innerHTML = this.renderSteps();
+      const progress = root.querySelector('[data-shell-clock-progress]');
+      if (progress) progress.innerHTML = this.renderProgress();
+    });
+    this.#refreshReviewDialogClock();
+    this.#scheduleClockAging();
   }
 
   #ensureEventsBound() {
@@ -336,6 +585,7 @@ export class InsprFlowShell extends HTMLElement {
       action,
       executionMode: this.#state.selectedExecutionMode,
     });
+    this.#scheduleClockAging();
     this.emitIntent(createReviewBatchIntent(this.#state));
     const items = this.#state.delivery.scopeItems
       .map((item) => `<div><strong>${escapeHtml(item)}</strong><span>Included</span></div>`)
@@ -346,14 +596,7 @@ export class InsprFlowShell extends HTMLElement {
       action,
       now,
     });
-    const identity = this.#state.identity;
-    const identityCaption =
-      identity?.status === 'present'
-        ? identity.value.display.fixtureLabel ||
-          `Host-scoped binding ${identity.value.bindingRef}. Host must revalidate. Labels are untrusted.`
-        : identity?.status === 'rejected'
-          ? identity.reasons.join(' ')
-          : 'No host identity context. Read-only navigation remains available; start intent is blocked.';
+    const identityCaption = this.#identityCaption(now);
     const html = `
       <button class="modal-close" type="button" data-action="modal-close" aria-label="Close dialog">×</button>
       <span class="eyebrow">REVIEW BEFORE YOU BEGIN</span>
@@ -371,7 +614,7 @@ export class InsprFlowShell extends HTMLElement {
           )
           .join('')}</select>
       </label>
-      <p class="muted" style="font-size:11px">${escapeHtml(gate.reasons.join(' ') || 'Ready to emit start intent after confirmation.')}</p>
+      <p class="muted" style="font-size:11px" data-review-gate-reason>${escapeHtml(gate.reasons.join(' ') || 'Ready to emit start intent after confirmation.')}</p>
       <div class="actions">
         <button class="primary" type="button" data-action="confirm-start" disabled>Emit start intent</button>
         <button class="text-button" type="button" data-action="modal-close">Keep as draft</button>
@@ -390,13 +633,15 @@ export class InsprFlowShell extends HTMLElement {
     const mode = dialog.querySelector('[data-action="execution-mode"]');
 
     const refresh = () => {
-      const now = Date.now();
-      const gate = canEmitStartIntent(this.#state, {
+      const gate = this.#reviewGateState({
         confirmed: confirm.checked,
         executionMode: mode.value,
-        action: this.#state.selectedAction,
-        now,
+        now: Date.now(),
       });
+      const reasonEl = dialog.querySelector('[data-review-gate-reason]');
+      if (reasonEl) {
+        reasonEl.textContent = gate.reasons.join(' ') || 'Ready to emit start intent after confirmation.';
+      }
       start.disabled = !confirm.checked || !gate.allowed;
     };
 
@@ -408,6 +653,7 @@ export class InsprFlowShell extends HTMLElement {
         action: this.#state.selectedAction,
         executionMode: event.target.value,
       });
+      this.#scheduleClockAging();
       const footerMode = root.querySelector('[data-action="footer-execution-mode"]');
       if (footerMode) footerMode.value = event.target.value;
       const expiry = dialog.querySelector('[data-review-expiry]');
@@ -448,8 +694,7 @@ export class InsprFlowShell extends HTMLElement {
     firstFocusable?.focus();
   }
 
-  renderSteps() {
-    const now = Date.now();
+  renderSteps(now = Date.now()) {
     return STAGES.map((stage) => {
       const view = buildStagePresentation(stage.index, this.#state, this.#state.delivery.viewedStage, { now });
       const marker = view.done
@@ -480,8 +725,7 @@ export class InsprFlowShell extends HTMLElement {
     }).join('');
   }
 
-  renderProgress() {
-    const now = Date.now();
+  renderProgress(now = Date.now()) {
     const taskStale = isStaleSnapshot(this.#state.progress.task, now);
     const overallStale = isStaleSnapshot(this.#state.progress.overall, now);
     const taskLine = formatProgressLine(this.#state.progress.task, { prefix: '', now });
@@ -595,7 +839,7 @@ export class InsprFlowShell extends HTMLElement {
         </div>
         <nav class="steps" aria-label="Delivery stages">${this.renderSteps()}</nav>
         <div class="bar-bottom">
-          ${this.renderProgress()}
+          <div class="clock-progress" data-shell-clock-progress>${this.renderProgress()}</div>
           <label class="mode-label">Execution mode
             <select data-action="footer-execution-mode">${this.#state.executionModes
               .map(
@@ -611,6 +855,7 @@ export class InsprFlowShell extends HTMLElement {
       </footer>
       <dialog data-shell-dialog></dialog>`;
     this.#bindLayoutObservers();
+    this.#scheduleClockAging();
   }
 }
 
@@ -640,3 +885,19 @@ export * from './intents.js';
 export * from './gates.js';
 export * from './forecast.js';
 export * from './sanitize.js';
+export {
+  applyBoundedGeometry,
+  applyFooterSpace,
+  applyFillFooterCap,
+  clearBoundedGeometry,
+  clearFillFooterCap,
+  resolveLayoutMode,
+  resolveContentLayout,
+  resolveFillFooterHeight,
+  resolveFillFooterCapacity,
+  resolveFillFooterReservation,
+  measureHostLocalTopOffset,
+  measureFillContentMinimumFromMetrics,
+  LAYOUT_MODES,
+  CONTENT_LAYOUTS,
+} from './host-layout.js';
