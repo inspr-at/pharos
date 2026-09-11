@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 260911173640.0.0 - 2026-09-11
+
+- Add an explicit, default-off delegated delivery mode that consumes a one-use Paimos launch admission rooted in human review and confirms only the existing ready Pharos job (PHAROS-206).
+- Persist candidate and consumption receipts across retries, revalidate target and reviewed-plan bindings, and retain attended operation when delegated delivery is not configured.
+- Pin the launch-admission schema and fixtures byte-exact to Paimos's protected release merge `b3e4634af72fa2d1fec51b3d8ca8b7ced2e95270` and published `v260911172741.0.0` OCI index `sha256:3143fe79fb72ba1f1ef8fef4380e2ca5285ee011058d6f4f3e9e3da10e9d2155`, and cover admission, replay, refusal and recovery with real network tests. This supply-chain admission is not a claim of runtime deployment.
+- Add an optional protected PEM CA file for the Paimos HTTPS adapter only. Bundled roots remain the default; exact-origin confinement, redirect refusal, and certificate chain, hostname and validity-time verification remain enforced (PHAROS-267).
+
 ## 260911012118.0.0 - 2026-09-11
 
 - Update the embedded INSPR Flow shell to the immutable 0.1.5 release, including its responsive host layout and project navigation fixes. Verify the vendored files against the pinned upstream source, archive digest and notices. Existing scoped navigation and deployment authority remain unchanged (PHAROS-257).

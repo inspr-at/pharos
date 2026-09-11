@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-260911012118.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260911173640.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,7 +51,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v26.09.08.23.58.28
+## What ships in v260911173640.0.0
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -383,8 +383,9 @@ workflow for a bounded lease.
 
 The optional Paimos delivery-stage adapter reports owner evidence and, after a
 durable local accept, creates exactly one guarded `UpdateRestart` review or
-attaches an explicitly configured matching job. It never confirms, agent-claims
-or dispatches that job. Its owner-written local intent file fixes the Paimos
+attaches an explicitly configured matching job. Adapter-v2 and adapter-v3
+intents without `delegated_launch` never confirm, agent-claim or dispatch that
+job. Its owner-written local intent file fixes the Paimos
 origin, handoff IDs, host, one of the two compiled workflows
 (`deploy-production` or `verify-production`), symbolic environment, exact
 artifact tuple and optional existing guarded `UpdateRestart` binding. Paimos
@@ -405,6 +406,24 @@ crash or ambiguous response; credential rotation does not change request
 identity. The adapter emits only sequence 1 `accepted` followed by sequence 2
 `succeeded` or `failed`—never `active` or a heartbeat.
 
+Config v3 may opt one deployment intent into `delegated_launch` with only an
+owner-selected `target_ref`; the workflow remains compiled as
+`deploy-production`, and host, environment, artifact, paths and credentials
+still come from their existing closed local fields. Only that exact intent's
+`AwaitingConfirmation` job with a complete ready host-agent plan can submit a
+one-shot launch candidate. Pharos separately hashes the complete reviewed plan
+and all public pull commitments—including the Paimos plan, predecessor and
+context digests that transitively bind the private attempt and plan revision—
+then journals exact candidate and consume bytes before sending them. It accepts
+only an exact, live, one-launch admission, re-pulls and rechecks the unchanged
+job and plan immediately before consume, and persists the immutable consumed
+receipt before recording a Pharos-sourced confirmation on that same job.
+Consume is the point of no return. A consumed receipt may complete that one
+pending transition after a crash; it
+never creates or confirms another job and never claims, redispatches or executes
+an already queued or terminal job. Pause, revocation, expiry, target drift,
+credential rotation or any reflected/unknown response fails closed.
+
 Deployment success requires an operator-confirmed owned `UpdateRestart` to
 finish and a newer fresh beacon to report a measured running-container identity
 whose immutable image **config ID** matches the locally configured artifact
@@ -418,8 +437,9 @@ replaced, stale, mismatched, predated, wrong-environment or wrong-digest-class
 observations fail closed. Verification uses a separate handoff and remains
 unreported until Paimos received deployment and a later observation of the same
 host, environment, artifact and lineage arrives. Human attended confirmation
-remains the first-slice go-live; this adapter does not grant hidden automatic
-authority. Live host proof still requires operator-configured container
+remains the default; automatic progression exists only through the explicit
+local v3 selection plus a consumed Paimos admission rooted in prior human
+review. Live host proof still requires operator-configured container
 allowlisting plus a completed guarded apply—this repository does not claim that
 proof from fixtures.
 
@@ -805,9 +825,19 @@ public service endpoints. The CLI has no write command and never calls
 
 See the committed Compose files and NixOS module for the complete wiring.
 
-The Paimos adapter config uses schema
-`inspr.pharos.paimos-delivery-adapter.v2`. It requires a credential-free HTTPS
-origin, `poll_interval_secs` from 5–3600,
+The Paimos adapter accepts an optional top-level `"paimos_ca_file":"…"` in
+both `inspr.pharos.paimos-delivery-adapter.v2` and v3. When absent, the existing
+bundled WebPKI roots remain unchanged. When present, the path must identify a
+mounted, owner-selected regular file with current-user ownership, no group or
+world permissions, one link, at most 256 KiB, and 1–32 PEM `CERTIFICATE`
+blocks with no keys or other content. Those roots are added only to this
+adapter's client; certificate chain, hostname and time checks remain enabled,
+redirects remain disabled, and
+requests remain confined to the exact configured HTTPS origin. The v3 schema
+additionally permits only the optional deployment field
+`"delegated_launch":{"target_ref":"sha256:…"}`; its absence preserves the
+attended behavior. The adapter requires a credential-free HTTPS origin,
+`poll_interval_secs` from 5–3600,
 `verification_freshness_secs` from 30–900, one `api_key_file`, and 1–128 strict
 intents. A deployment intent has `stage: "deployment"`,
 `workflow: "deploy-production"` and either omits `update_restart_job_id` to
@@ -826,6 +856,15 @@ reject startup. The bundled contract verifier is
 `scripts/check-paimos-delivery-contract.sh`. Janus remains a separate v1
 dependency fixture and is never the deployment owner. Paimos still owns
 CreateHandoff as a producer follow-up; this adapter does not create handoffs.
+The bundled launch-admission v1 schema and four fixtures are pinned byte-exact
+to Paimos's protected release merge
+`b3e4634af72fa2d1fec51b3d8ca8b7ced2e95270`, whose tree matches approved
+release source `f3592475`, for release `v260911172741.0.0`. That immutable tag
+is published and admitted at OCI index digest
+`sha256:3143fe79fb72ba1f1ef8fef4380e2ca5285ee011058d6f4f3e9e3da10e9d2155`,
+with verified signature, SBOM attestations and provenance. This exact supply-chain
+pin does not by itself claim that the artifact has been deployed or observed at
+runtime.
 
 The in-process conformance harness injects its loopback URL directly into a
 test-only configuration value; the production config parser never accepts
@@ -848,7 +887,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v26.09.08.23.58.28**. It is already used as a real
+Pharos is an active early release at **v260911173640.0.0**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

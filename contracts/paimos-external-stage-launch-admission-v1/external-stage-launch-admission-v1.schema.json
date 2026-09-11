@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paimos.example/contracts/external-stage-launch-admission-v1.schema.json",
+  "title": "Paimos external-stage one-shot launch admission v1",
+  "description": "Closed additive candidate, admission, consume, and receipt bodies. A consumed receipt is historical idempotent evidence and never fresh authority for another launch.",
+  "x-paimos-contract": {
+    "schema_major": 1,
+    "media_type": "application/vnd.paimos.external-stage-launch-admission.v1+json",
+    "encoding": "utf-8-json"
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/ExternalStageLaunchCandidate"},
+    {"$ref": "#/$defs/ExternalStageLaunchAdmission"},
+    {"$ref": "#/$defs/ExternalStageLaunchConsumeRequest"},
+    {"$ref": "#/$defs/ExternalStageLaunchReceipt"}
+  ],
+  "$defs": {
+    "ExternalStageLaunchArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version_scheme", "version", "release_channel", "release_sequence", "digest", "commit_digest", "release_manifest_coordinate", "release_manifest_digest"],
+      "properties": {
+        "version_scheme": {"type": "string", "enum": ["legacy", "inspr-calendar-v1", "inspr-calendar-v2"]},
+        "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
+        "release_channel": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+        "release_sequence": {"type": "integer", "format": "int64", "minimum": 0},
+        "digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "commit_digest": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+        "release_manifest_coordinate": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,189}$"},
+        "release_manifest_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"}
+      }
+    },
+    "ExternalStageLaunchCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "target_ref", "workflow", "environment", "artifact", "reviewed_plan_digest", "operation_binding_digest", "observed_at"],
+      "properties": {
+        "schema": {"const": "paimos.external-stage-launch-admission"},
+        "version": {"const": 1},
+        "target_ref": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "workflow": {"const": "deploy-production"},
+        "environment": {"$ref": "#/$defs/ExternalStageLaunchSymbol"},
+        "artifact": {"$ref": "#/$defs/ExternalStageLaunchArtifact"},
+        "reviewed_plan_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "operation_binding_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "observed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "ExternalStageLaunchAdmission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "grant_id", "grant_revision", "grant_digest", "admission_id", "admission_digest", "handoff_id", "credential_epoch", "target_ref", "workflow", "environment", "artifact", "stage", "attempt", "plan", "execution", "authority", "plan_digest", "predecessor_digest", "context_digest", "reviewed_plan_digest", "operation_binding_digest", "max_launches", "used_launches", "issued_at", "expires_at", "state"],
+      "properties": {
+        "schema": {"const": "paimos.external-stage-launch-admission"},
+        "version": {"const": 1},
+        "grant_id": {"$ref": "#/$defs/ExternalStageLaunchUUID"},
+        "grant_revision": {"const": 1},
+        "grant_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "admission_id": {"$ref": "#/$defs/ExternalStageLaunchUUID"},
+        "admission_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "handoff_id": {"$ref": "#/$defs/ExternalStageLaunchHandoffID"},
+        "credential_epoch": {"type": "integer", "format": "int64", "minimum": 1},
+        "target_ref": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "workflow": {"const": "deploy-production"},
+        "environment": {"$ref": "#/$defs/ExternalStageLaunchSymbol"},
+        "artifact": {"$ref": "#/$defs/ExternalStageLaunchArtifact"},
+        "stage": {"const": "deployment"},
+        "attempt": {"type": "integer", "format": "int64", "minimum": 1},
+        "plan": {"type": "integer", "format": "int64", "minimum": 1},
+        "execution": {"type": "integer", "format": "int64", "minimum": 1},
+        "authority": {"type": "integer", "format": "int64", "minimum": 1},
+        "plan_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "predecessor_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "context_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "reviewed_plan_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "operation_binding_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "max_launches": {"const": 1},
+        "used_launches": {"const": 0},
+        "issued_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "state": {"const": "issued"}
+      }
+    },
+    "ExternalStageLaunchConsumeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "admission_digest"],
+      "properties": {
+        "schema": {"const": "paimos.external-stage-launch-admission"},
+        "version": {"const": 1},
+        "admission_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"}
+      }
+    },
+    "ExternalStageLaunchReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "admission_id", "admission_digest", "handoff_id", "credential_epoch", "launch_number", "state", "consumed_at"],
+      "properties": {
+        "schema": {"const": "paimos.external-stage-launch-admission"},
+        "version": {"const": 1},
+        "admission_id": {"$ref": "#/$defs/ExternalStageLaunchUUID"},
+        "admission_digest": {"$ref": "#/$defs/ExternalStageLaunchDigest"},
+        "handoff_id": {"$ref": "#/$defs/ExternalStageLaunchHandoffID"},
+        "credential_epoch": {"type": "integer", "format": "int64", "minimum": 1},
+        "launch_number": {"const": 1},
+        "state": {"const": "consumed"},
+        "consumed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "ExternalStageLaunchDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "ExternalStageLaunchSymbol": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+    "ExternalStageLaunchUUID": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "ExternalStageLaunchHandoffID": {"type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"}
+  }
+}

@@ -4,10 +4,12 @@
 //! authority-bearing choice remains in this service's owner-only local intent
 //! file: host, guarded workflow, environment, and exact artifact identity.
 //! After a durable deployment accept this adapter creates or attaches exactly
-//! one locally configured `UpdateRestart` review. It never confirms, claims,
-//! or dispatches host commands. Sequence-2 reports require a later measured
-//! deployed-artifact observation; Nix generation / `flake.lock` evidence is
-//! not that proof.
+//! one locally configured `UpdateRestart` review. The default attended path
+//! never confirms it; a v3 intent can opt into one Paimos-rooted, consumed
+//! launch admission after the complete host-agent review. Neither path claims,
+//! dispatches, or executes host commands. Sequence-2 reports require a later
+//! measured deployed-artifact observation; Nix generation / `flake.lock`
+//! evidence is not that proof.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -32,7 +34,8 @@ use url::Url;
 
 use crate::durable_file::atomic_write_json;
 use crate::host_actions::{
-    HostActionState, HostActionStore, HostActionStoreError, HostWorkflowKind, UpdateRestartIntent,
+    HostActionJob, HostActionPlan, HostActionState, HostActionStore, HostActionStoreError,
+    HostWorkflowKind, UpdateRestartIntent,
 };
 use crate::store::Store;
 use pharos_core::{valid_inspr_calendar_version, ArtifactVersionScheme};
@@ -46,19 +49,36 @@ pub(crate) const PAIMOS_FIXTURE_DIGEST: &str =
 pub(crate) const PAIMOS_JANUS_DEPENDENCY_SHA256: &str =
     "52a647abd52e229fcdef8461eeb9f7d31f07632501ad33f594cdfbc155c23d4b";
 
-const CONFIG_SCHEMA: &str = "inspr.pharos.paimos-delivery-adapter.v2";
-const CONFIG_SCHEMA_VERSION: u16 = 2;
+const CONFIG_SCHEMA_V2: &str = "inspr.pharos.paimos-delivery-adapter.v2";
+const CONFIG_SCHEMA_V3: &str = "inspr.pharos.paimos-delivery-adapter.v3";
+const CONFIG_SCHEMA_VERSION_V2: u16 = 2;
+const CONFIG_SCHEMA_VERSION_V3: u16 = 3;
 const JOURNAL_SCHEMA: &str = "inspr.pharos.paimos-delivery-journal.v1";
 const INTENT_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-intent.v2";
+const DELEGATED_INTENT_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-intent.v3";
 const OPERATION_BINDING_DOMAIN: &str = "inspr.pharos.paimos-delivery-operation.v1";
 const CONTRACT_MEDIA_TYPE: &str = "application/vnd.paimos.external-stage.v2+json";
+const LAUNCH_MEDIA_TYPE: &str = "application/vnd.paimos.external-stage-launch-admission.v1+json";
+const LAUNCH_SCHEMA: &str = "paimos.external-stage-launch-admission";
+const LAUNCH_VERSION: u16 = 1;
+const LAUNCH_WORKFLOW: &str = "deploy-production";
+const LAUNCH_STAGE: &str = "deployment";
+const REVIEWED_PLAN_DOMAIN: &[u8] = b"inspr.pharos.paimos-launch-reviewed-plan.v1\0";
+const LAUNCH_OPERATION_DOMAIN: &[u8] = b"inspr.pharos.paimos-launch-operation.v1\0";
+const LAUNCH_CANDIDATE_IDEMPOTENCY_DOMAIN: &[u8] =
+    b"inspr.pharos.paimos-launch-candidate-idempotency.v1\0";
+const LAUNCH_CONSUME_IDEMPOTENCY_DOMAIN: &[u8] =
+    b"inspr.pharos.paimos-launch-consume-idempotency.v1\0";
 const HANDOFF_SECRET_HEADER: &str = "X-PAIMOS-Handoff-Secret";
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const USER_AGENT_VALUE: &str = "pharosd-paimos-delivery/1";
 const IDENTITY_ENCODING: &str = "identity";
 const HANDOFF_SECRET_BYTES: usize = 32;
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_API_KEY_BYTES: u64 = 512;
+const MAX_CA_BUNDLE_BYTES: u64 = 256 * 1024;
+const MAX_CA_CERTIFICATES: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_INTENTS: usize = 128;
 const MAX_JOURNAL_RECORDS: usize = MAX_INTENTS * 2;
@@ -70,6 +90,7 @@ const GUARDED_ACTOR: &str = "paimos-delivery";
 enum AdapterError {
     Configuration,
     Credential,
+    Trust,
     Contract,
     Journal,
     LocalBinding,
@@ -82,6 +103,7 @@ impl AdapterError {
         match self {
             Self::Configuration => "configuration_invalid",
             Self::Credential => "credential_unavailable",
+            Self::Trust => "trust_configuration_invalid",
             Self::Contract => "contract_refused",
             Self::Journal => "journal_unavailable",
             Self::LocalBinding => "local_binding_refused",
@@ -187,6 +209,8 @@ struct DeliveryIntent {
     update_restart_job_id: Option<String>,
     #[serde(default)]
     deployment_handoff_id: Option<String>,
+    #[serde(default)]
+    delegated_launch: Option<DelegatedLaunchSelection>,
 }
 
 impl DeliveryIntent {
@@ -203,10 +227,15 @@ impl DeliveryIntent {
                             .as_deref()
                             .is_none_or(valid_action_id)
                         && self.deployment_handoff_id.is_none()
+                        && self
+                            .delegated_launch
+                            .as_ref()
+                            .is_none_or(DelegatedLaunchSelection::valid)
                 }
                 IntentStage::Verification => {
                     self.workflow == GuardedWorkflow::VerifyProduction
                         && self.update_restart_job_id.is_none()
+                        && self.delegated_launch.is_none()
                         && self
                             .deployment_handoff_id
                             .as_deref()
@@ -230,38 +259,140 @@ impl DeliveryIntent {
             deployment_handoff_id: Option<&'a str>,
         }
 
-        let binding = IntentBinding {
-            domain: INTENT_BINDING_DOMAIN,
-            paimos_origin: paimos_origin.as_str(),
-            handoff_id: &self.handoff_id,
-            stage: self.stage.key(),
-            workflow: self.workflow.key(),
-            environment: &self.environment,
-            host: &self.host,
-            artifact: &self.artifact,
-            update_restart_job_id: self.update_restart_job_id.as_deref(),
-            deployment_handoff_id: self.deployment_handoff_id.as_deref(),
-        };
-        let bytes = serde_json::to_vec(&binding).map_err(|_| AdapterError::Contract)?;
+        let bytes = if let Some(selection) = &self.delegated_launch {
+            #[derive(Serialize)]
+            struct DelegatedIntentBinding<'a> {
+                domain: &'static str,
+                paimos_origin: &'a str,
+                handoff_id: &'a str,
+                stage: &'static str,
+                workflow: &'static str,
+                environment: &'a str,
+                host: &'a str,
+                artifact: &'a ArtifactEvidence,
+                update_restart_job_id: Option<&'a str>,
+                deployment_handoff_id: Option<&'a str>,
+                delegated_launch_target_ref: &'a str,
+            }
+            serde_json::to_vec(&DelegatedIntentBinding {
+                domain: DELEGATED_INTENT_BINDING_DOMAIN,
+                paimos_origin: paimos_origin.as_str(),
+                handoff_id: &self.handoff_id,
+                stage: self.stage.key(),
+                workflow: self.workflow.key(),
+                environment: &self.environment,
+                host: &self.host,
+                artifact: &self.artifact,
+                update_restart_job_id: self.update_restart_job_id.as_deref(),
+                deployment_handoff_id: self.deployment_handoff_id.as_deref(),
+                delegated_launch_target_ref: &selection.target_ref,
+            })
+        } else {
+            serde_json::to_vec(&IntentBinding {
+                domain: INTENT_BINDING_DOMAIN,
+                paimos_origin: paimos_origin.as_str(),
+                handoff_id: &self.handoff_id,
+                stage: self.stage.key(),
+                workflow: self.workflow.key(),
+                environment: &self.environment,
+                host: &self.host,
+                artifact: &self.artifact,
+                update_restart_job_id: self.update_restart_job_id.as_deref(),
+                deployment_handoff_id: self.deployment_handoff_id.as_deref(),
+            })
+        }
+        .map_err(|_| AdapterError::Contract)?;
         Ok(hex_digest(&bytes))
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct ConfigDocument {
+struct DelegatedLaunchSelection {
+    target_ref: String,
+}
+
+impl DelegatedLaunchSelection {
+    fn valid(&self) -> bool {
+        valid_sha256_digest(&self.target_ref)
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigVersionProbe {
     schema: String,
     schema_version: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigDocumentV2 {
+    #[serde(rename = "schema")]
+    _schema: String,
+    #[serde(rename = "schema_version")]
+    _schema_version: u16,
     paimos_origin: String,
     api_key_file: PathBuf,
+    #[serde(default)]
+    paimos_ca_file: Option<PathBuf>,
+    poll_interval_secs: u64,
+    verification_freshness_secs: i64,
+    intents: Vec<DeliveryIntentV2>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigDocumentV3 {
+    #[serde(rename = "schema")]
+    _schema: String,
+    #[serde(rename = "schema_version")]
+    _schema_version: u16,
+    paimos_origin: String,
+    api_key_file: PathBuf,
+    #[serde(default)]
+    paimos_ca_file: Option<PathBuf>,
     poll_interval_secs: u64,
     verification_freshness_secs: i64,
     intents: Vec<DeliveryIntent>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryIntentV2 {
+    handoff_id: String,
+    handoff_secret_file: PathBuf,
+    stage: IntentStage,
+    workflow: GuardedWorkflow,
+    environment: String,
+    host: String,
+    artifact: ArtifactEvidence,
+    #[serde(default)]
+    update_restart_job_id: Option<String>,
+    #[serde(default)]
+    deployment_handoff_id: Option<String>,
+}
+
+impl From<DeliveryIntentV2> for DeliveryIntent {
+    fn from(intent: DeliveryIntentV2) -> Self {
+        Self {
+            handoff_id: intent.handoff_id,
+            handoff_secret_file: intent.handoff_secret_file,
+            stage: intent.stage,
+            workflow: intent.workflow,
+            environment: intent.environment,
+            host: intent.host,
+            artifact: intent.artifact,
+            update_restart_job_id: intent.update_restart_job_id,
+            deployment_handoff_id: intent.deployment_handoff_id,
+            delegated_launch: None,
+        }
+    }
+}
+
 struct AdapterConfig {
     paimos_origin: Url,
     api_key_file: PathBuf,
+    paimos_ca_certificates: Vec<reqwest::Certificate>,
     poll_interval: Duration,
     verification_freshness_secs: i64,
     intents: Vec<DeliveryIntent>,
@@ -269,22 +400,61 @@ struct AdapterConfig {
 
 impl AdapterConfig {
     fn load(path: &Path) -> Result<Self, AdapterError> {
-        let (bytes, _) = read_private_file(path, MAX_CONFIG_BYTES, None)?;
-        let document: ConfigDocument =
-            serde_json::from_slice(&bytes).map_err(|_| AdapterError::Configuration)?;
-        if document.schema != CONFIG_SCHEMA
-            || document.schema_version != CONFIG_SCHEMA_VERSION
-            || !(5..=3600).contains(&document.poll_interval_secs)
-            || !(30..=900).contains(&document.verification_freshness_secs)
-            || document.intents.is_empty()
-            || document.intents.len() > MAX_INTENTS
-            || document.intents.iter().any(|intent| !intent.valid_shape())
+        let (bytes, config_identity) = read_private_file(path, MAX_CONFIG_BYTES, None)?;
+        let probe: ConfigVersionProbe =
+            decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
+        let (
+            paimos_origin,
+            api_key_file,
+            paimos_ca_file,
+            poll_interval_secs,
+            verification_freshness_secs,
+            intents,
+        ) = match (probe.schema.as_str(), probe.schema_version) {
+            (CONFIG_SCHEMA_V2, CONFIG_SCHEMA_VERSION_V2) => {
+                let document: ConfigDocumentV2 =
+                    decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
+                (
+                    document.paimos_origin,
+                    document.api_key_file,
+                    document.paimos_ca_file,
+                    document.poll_interval_secs,
+                    document.verification_freshness_secs,
+                    document.intents.into_iter().map(Into::into).collect(),
+                )
+            }
+            (CONFIG_SCHEMA_V3, CONFIG_SCHEMA_VERSION_V3) => {
+                let document: ConfigDocumentV3 =
+                    decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
+                (
+                    document.paimos_origin,
+                    document.api_key_file,
+                    document.paimos_ca_file,
+                    document.poll_interval_secs,
+                    document.verification_freshness_secs,
+                    document.intents,
+                )
+            }
+            _ => return Err(AdapterError::Configuration),
+        };
+        if !(5..=3600).contains(&poll_interval_secs)
+            || !(30..=900).contains(&verification_freshness_secs)
+            || intents.is_empty()
+            || intents.len() > MAX_INTENTS
+            || intents.iter().any(|intent| !intent.valid_shape())
         {
             return Err(AdapterError::Configuration);
         }
-        let paimos_origin = parse_origin(&document.paimos_origin)?;
+        let paimos_origin = parse_origin(&paimos_origin)?;
+        let (paimos_ca_certificates, ca_identity) = match paimos_ca_file {
+            Some(path) => {
+                let (certificates, identity) = load_ca_certificates(&path)?;
+                (certificates, Some(identity))
+            }
+            None => (Vec::new(), None),
+        };
         let (mut api_key, api_identity) =
-            read_private_file(&document.api_key_file, MAX_API_KEY_BYTES, None)?;
+            read_private_file(&api_key_file, MAX_API_KEY_BYTES, None)?;
         let api_key_valid =
             api_key.len() >= 32 && api_key.iter().all(|byte| (0x21..=0x7e).contains(byte));
         api_key.fill(0);
@@ -293,8 +463,12 @@ impl AdapterConfig {
         }
         let mut handoff_ids = BTreeSet::new();
         let mut credential_files = BTreeSet::new();
+        credential_files.insert(config_identity);
         credential_files.insert(api_identity);
-        for intent in &document.intents {
+        if ca_identity.is_some_and(|identity| !credential_files.insert(identity)) {
+            return Err(AdapterError::Trust);
+        }
+        for intent in &intents {
             if !handoff_ids.insert(intent.handoff_id.clone()) {
                 return Err(AdapterError::Configuration);
             }
@@ -308,12 +482,11 @@ impl AdapterConfig {
                 return Err(AdapterError::Credential);
             }
         }
-        for intent in document
-            .intents
+        for intent in intents
             .iter()
             .filter(|intent| intent.stage == IntentStage::Verification)
         {
-            let deployment = document.intents.iter().find(|candidate| {
+            let deployment = intents.iter().find(|candidate| {
                 Some(candidate.handoff_id.as_str()) == intent.deployment_handoff_id.as_deref()
                     && candidate.stage == IntentStage::Deployment
             });
@@ -328,10 +501,11 @@ impl AdapterConfig {
         }
         Ok(Self {
             paimos_origin,
-            api_key_file: document.api_key_file,
-            poll_interval: Duration::from_secs(document.poll_interval_secs),
-            verification_freshness_secs: document.verification_freshness_secs,
-            intents: document.intents,
+            api_key_file,
+            paimos_ca_certificates,
+            poll_interval: Duration::from_secs(poll_interval_secs),
+            verification_freshness_secs,
+            intents,
         })
     }
 }
@@ -355,7 +529,7 @@ enum EvidenceKind {
     Verification,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct PullResponse {
     handoff_id: String,
@@ -375,6 +549,200 @@ struct PullResponse {
     predecessor_digest: String,
     authority_epoch: i64,
     context_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaunchCandidate {
+    schema: String,
+    version: u16,
+    target_ref: String,
+    workflow: String,
+    environment: String,
+    artifact: ArtifactEvidence,
+    reviewed_plan_digest: String,
+    operation_binding_digest: String,
+    observed_at: String,
+}
+
+impl LaunchCandidate {
+    fn valid(&self) -> bool {
+        self.schema == LAUNCH_SCHEMA
+            && self.version == LAUNCH_VERSION
+            && valid_sha256_digest(&self.target_ref)
+            && self.workflow == LAUNCH_WORKFLOW
+            && valid_symbol(&self.environment)
+            && self.artifact.valid()
+            && valid_sha256_digest(&self.reviewed_plan_digest)
+            && valid_sha256_digest(&self.operation_binding_digest)
+            && self.reviewed_plan_digest != self.operation_binding_digest
+            && parse_timestamp(&self.observed_at).is_ok()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaunchAdmission {
+    schema: String,
+    version: u16,
+    grant_id: String,
+    grant_revision: i64,
+    grant_digest: String,
+    admission_id: String,
+    admission_digest: String,
+    handoff_id: String,
+    credential_epoch: i64,
+    target_ref: String,
+    workflow: String,
+    environment: String,
+    artifact: ArtifactEvidence,
+    stage: String,
+    attempt: i64,
+    plan: i64,
+    execution: i64,
+    authority: i64,
+    plan_digest: String,
+    predecessor_digest: String,
+    context_digest: String,
+    reviewed_plan_digest: String,
+    operation_binding_digest: String,
+    max_launches: i64,
+    used_launches: i64,
+    issued_at: String,
+    expires_at: String,
+    state: String,
+}
+
+impl LaunchAdmission {
+    fn valid_journaled(&self, handoff_id: &str, candidate: &LaunchCandidate) -> bool {
+        let times_valid = parse_timestamp(&self.issued_at)
+            .and_then(|issued| {
+                parse_timestamp(&self.expires_at).map(|expires| {
+                    expires > issued && expires <= issued + time::Duration::minutes(15)
+                })
+            })
+            .unwrap_or(false);
+        self.schema == LAUNCH_SCHEMA
+            && self.version == LAUNCH_VERSION
+            && valid_uuid(&self.grant_id)
+            && self.grant_revision == 1
+            && valid_sha256_digest(&self.grant_digest)
+            && valid_uuid(&self.admission_id)
+            && self.admission_id != self.grant_id
+            && valid_sha256_digest(&self.admission_digest)
+            && self.handoff_id == handoff_id
+            && self.credential_epoch >= 1
+            && self.target_ref == candidate.target_ref
+            && self.workflow == candidate.workflow
+            && self.environment == candidate.environment
+            && self.artifact == candidate.artifact
+            && self.stage == LAUNCH_STAGE
+            && self.attempt >= 1
+            && self.plan >= 1
+            && self.execution >= 1
+            && self.authority >= 1
+            && valid_sha256_digest(&self.plan_digest)
+            && valid_sha256_digest(&self.predecessor_digest)
+            && valid_sha256_digest(&self.context_digest)
+            && self.reviewed_plan_digest == candidate.reviewed_plan_digest
+            && self.operation_binding_digest == candidate.operation_binding_digest
+            && self.max_launches == 1
+            && self.used_launches == 0
+            && self.state == "issued"
+            && times_valid
+    }
+
+    fn validate(
+        &self,
+        handoff_id: &str,
+        candidate: &LaunchCandidate,
+        pull: &PullResponse,
+        now: i64,
+    ) -> Result<(), AdapterError> {
+        let issued_at = parse_timestamp(&self.issued_at)?;
+        let expires_at = parse_timestamp(&self.expires_at)?;
+        let pull_expires_at = parse_timestamp(&pull.expires_at)?;
+        if self.schema != LAUNCH_SCHEMA
+            || self.version != LAUNCH_VERSION
+            || !valid_uuid(&self.grant_id)
+            || self.grant_revision != 1
+            || !valid_sha256_digest(&self.grant_digest)
+            || !valid_uuid(&self.admission_id)
+            || self.admission_id == self.grant_id
+            || !valid_sha256_digest(&self.admission_digest)
+            || self.handoff_id != handoff_id
+            || self.credential_epoch != pull.credential_epoch
+            || self.target_ref != candidate.target_ref
+            || self.workflow != candidate.workflow
+            || self.environment != candidate.environment
+            || self.artifact != candidate.artifact
+            || self.stage != LAUNCH_STAGE
+            || self.attempt < 1
+            || self.plan < 1
+            || self.execution != pull.execution_number
+            || self.authority != pull.authority_epoch
+            || self.plan_digest != pull.plan_digest
+            || self.predecessor_digest != pull.predecessor_digest
+            || self.context_digest != pull.context_digest
+            || self.reviewed_plan_digest != candidate.reviewed_plan_digest
+            || self.operation_binding_digest != candidate.operation_binding_digest
+            || self.max_launches != 1
+            || self.used_launches != 0
+            || self.state != "issued"
+            || issued_at.unix_timestamp() > now.saturating_add(120)
+            || expires_at <= issued_at
+            || expires_at.unix_timestamp() <= now
+            || expires_at > pull_expires_at
+            || expires_at > issued_at + time::Duration::minutes(15)
+        {
+            return Err(AdapterError::Contract);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaunchConsumeRequest {
+    schema: String,
+    version: u16,
+    admission_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaunchReceipt {
+    schema: String,
+    version: u16,
+    admission_id: String,
+    admission_digest: String,
+    handoff_id: String,
+    credential_epoch: i64,
+    launch_number: i64,
+    state: String,
+    consumed_at: String,
+}
+
+impl LaunchReceipt {
+    fn validate(&self, admission: &LaunchAdmission) -> Result<(), AdapterError> {
+        let consumed_at = parse_timestamp(&self.consumed_at)?;
+        let issued_at = parse_timestamp(&admission.issued_at)?;
+        let expires_at = parse_timestamp(&admission.expires_at)?;
+        if self.schema != LAUNCH_SCHEMA
+            || self.version != LAUNCH_VERSION
+            || self.admission_id != admission.admission_id
+            || self.admission_digest != admission.admission_digest
+            || self.handoff_id != admission.handoff_id
+            || self.credential_epoch != admission.credential_epoch
+            || self.launch_number != 1
+            || self.state != "consumed"
+            || consumed_at < issued_at
+            || consumed_at >= expires_at
+        {
+            return Err(AdapterError::Contract);
+        }
+        Ok(())
+    }
 }
 
 impl PullResponse {
@@ -607,6 +975,152 @@ struct OperationBinding {
     operation_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LaunchJournalRecord {
+    handoff_id: String,
+    intent_digest: String,
+    job_id: String,
+    candidate_digest: String,
+    candidate_idempotency_key: String,
+    candidate_body_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission: Option<LaunchAdmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consume_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consume_idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consume_body_json: Option<String>,
+    #[serde(default)]
+    consume_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt: Option<LaunchReceipt>,
+}
+
+impl LaunchJournalRecord {
+    fn new(
+        intent: &DeliveryIntent,
+        paimos_origin: &Url,
+        job_id: &str,
+        candidate: &LaunchCandidate,
+    ) -> Result<Self, AdapterError> {
+        let selection = intent
+            .delegated_launch
+            .as_ref()
+            .ok_or(AdapterError::LocalBinding)?;
+        if !candidate.valid()
+            || !valid_action_id(job_id)
+            || intent.stage != IntentStage::Deployment
+            || candidate.target_ref != selection.target_ref
+            || candidate.workflow != intent.workflow.key()
+            || candidate.environment != intent.environment
+            || candidate.artifact != intent.artifact
+        {
+            return Err(AdapterError::Contract);
+        }
+        let body = serde_json::to_vec(candidate).map_err(|_| AdapterError::Contract)?;
+        let candidate_digest = sha256_digest(&body);
+        Ok(Self {
+            handoff_id: intent.handoff_id.clone(),
+            intent_digest: intent.binding_digest(paimos_origin)?,
+            job_id: job_id.to_string(),
+            candidate_idempotency_key: launch_idempotency_key(
+                LAUNCH_CANDIDATE_IDEMPOTENCY_DOMAIN,
+                &intent.handoff_id,
+                &candidate_digest,
+            ),
+            candidate_digest,
+            candidate_body_json: String::from_utf8(body).map_err(|_| AdapterError::Contract)?,
+            admission: None,
+            consume_digest: None,
+            consume_idempotency_key: None,
+            consume_body_json: None,
+            consume_started: false,
+            receipt: None,
+        })
+    }
+
+    fn candidate(&self) -> Result<LaunchCandidate, AdapterError> {
+        decode_strict(self.candidate_body_json.as_bytes())
+    }
+
+    fn consume(&self) -> Result<LaunchConsumeRequest, AdapterError> {
+        let body = self
+            .consume_body_json
+            .as_deref()
+            .ok_or(AdapterError::Journal)?;
+        decode_strict(body.as_bytes())
+    }
+
+    fn bound_to(&self, intent: &DeliveryIntent, paimos_origin: &Url, job_id: &str) -> bool {
+        self.handoff_id == intent.handoff_id
+            && self.job_id == job_id
+            && intent
+                .binding_digest(paimos_origin)
+                .is_ok_and(|digest| digest == self.intent_digest)
+    }
+
+    fn valid(&self) -> bool {
+        let Ok(candidate) = self.candidate() else {
+            return false;
+        };
+        if !candidate.valid()
+            || !valid_handoff_id(&self.handoff_id)
+            || !valid_action_id(&self.job_id)
+            || !valid_lower_hex(&self.intent_digest, &[64])
+            || self.candidate_digest != sha256_digest(self.candidate_body_json.as_bytes())
+            || self.candidate_idempotency_key
+                != launch_idempotency_key(
+                    LAUNCH_CANDIDATE_IDEMPOTENCY_DOMAIN,
+                    &self.handoff_id,
+                    &self.candidate_digest,
+                )
+        {
+            return false;
+        }
+        let Some(admission) = &self.admission else {
+            return self.consume_digest.is_none()
+                && self.consume_idempotency_key.is_none()
+                && self.consume_body_json.is_none()
+                && !self.consume_started
+                && self.receipt.is_none();
+        };
+        if !admission.valid_journaled(&self.handoff_id, &candidate) {
+            return false;
+        }
+        let Ok(consume) = self.consume() else {
+            return false;
+        };
+        let Some(consume_digest) = &self.consume_digest else {
+            return false;
+        };
+        let Some(consume_idempotency_key) = &self.consume_idempotency_key else {
+            return false;
+        };
+        consume.schema == LAUNCH_SCHEMA
+            && consume.version == LAUNCH_VERSION
+            && consume.admission_digest == admission.admission_digest
+            && consume_digest
+                == &sha256_digest(
+                    self.consume_body_json
+                        .as_deref()
+                        .expect("decoded consume body exists")
+                        .as_bytes(),
+                )
+            && consume_idempotency_key
+                == &launch_idempotency_key(
+                    LAUNCH_CONSUME_IDEMPOTENCY_DOMAIN,
+                    &self.handoff_id,
+                    consume_digest,
+                )
+            && self
+                .receipt
+                .as_ref()
+                .is_none_or(|receipt| self.consume_started && receipt.validate(admission).is_ok())
+    }
+}
+
 impl OperationBinding {
     fn valid(&self) -> bool {
         valid_handoff_id(&self.handoff_id)
@@ -640,6 +1154,8 @@ struct JournalDocument {
     records: BTreeMap<String, JournalRecord>,
     #[serde(default)]
     operations: BTreeMap<String, OperationBinding>,
+    #[serde(default)]
+    launches: BTreeMap<String, LaunchJournalRecord>,
 }
 
 impl Default for JournalDocument {
@@ -649,6 +1165,7 @@ impl Default for JournalDocument {
             schema_version: 1,
             records: BTreeMap::new(),
             operations: BTreeMap::new(),
+            launches: BTreeMap::new(),
         }
     }
 }
@@ -661,15 +1178,17 @@ struct JournalStore {
 impl JournalStore {
     fn new(path: PathBuf) -> Result<Self, AdapterError> {
         let document = if path.exists() {
-            let (bytes, _) = read_private_file(&path, MAX_CONFIG_BYTES, None)?;
+            let (bytes, _) = read_private_file(&path, MAX_JOURNAL_BYTES, None)?;
             decode_strict::<JournalDocument>(&bytes).map_err(|_| AdapterError::Journal)?
         } else {
             JournalDocument::default()
         };
         if document.schema != JOURNAL_SCHEMA
-            || document.schema_version != 1
+            || !matches!(document.schema_version, 1 | 2)
+            || (document.schema_version == 1 && !document.launches.is_empty())
             || document.records.len() > MAX_JOURNAL_RECORDS
             || document.operations.len() > MAX_JOURNAL_RECORDS
+            || document.launches.len() > MAX_INTENTS
             || document
                 .records
                 .iter()
@@ -678,6 +1197,10 @@ impl JournalStore {
                 .operations
                 .iter()
                 .any(|(key, binding)| key != &binding.handoff_id || !binding.valid())
+            || document
+                .launches
+                .iter()
+                .any(|(key, launch)| key != &launch.handoff_id || !launch.valid())
         {
             return Err(AdapterError::Journal);
         }
@@ -839,6 +1362,179 @@ impl JournalStore {
             Err(_) => Err(AdapterError::Journal),
         }
     }
+
+    fn launch(&self, handoff_id: &str) -> Option<LaunchJournalRecord> {
+        self.document
+            .lock()
+            .expect("Paimos delivery journal lock")
+            .launches
+            .get(handoff_id)
+            .cloned()
+    }
+
+    fn ensure_launch(
+        &self,
+        record: LaunchJournalRecord,
+    ) -> Result<LaunchJournalRecord, AdapterError> {
+        if !record.valid() {
+            return Err(AdapterError::Journal);
+        }
+        let mut document = self.document.lock().expect("Paimos delivery journal lock");
+        if let Some(existing) = document.launches.get(&record.handoff_id) {
+            return if existing == &record {
+                Ok(existing.clone())
+            } else {
+                Err(AdapterError::LocalBinding)
+            };
+        }
+        if document.launches.len() >= MAX_INTENTS {
+            return Err(AdapterError::Journal);
+        }
+        let mut updated = document.clone();
+        updated.schema_version = 2;
+        updated
+            .launches
+            .insert(record.handoff_id.clone(), record.clone());
+        persist_journal_update(&self.path, &mut document, updated)?;
+        Ok(record)
+    }
+
+    fn acknowledge_launch_admission(
+        &self,
+        record: &LaunchJournalRecord,
+        admission: LaunchAdmission,
+    ) -> Result<LaunchJournalRecord, AdapterError> {
+        let mut document = self.document.lock().expect("Paimos delivery journal lock");
+        let existing = document
+            .launches
+            .get(&record.handoff_id)
+            .ok_or(AdapterError::Journal)?;
+        if existing != record {
+            return Err(AdapterError::Journal);
+        }
+        if let Some(saved) = &existing.admission {
+            return if saved == &admission {
+                Ok(existing.clone())
+            } else {
+                Err(AdapterError::Contract)
+            };
+        }
+        let candidate = existing.candidate()?;
+        if !admission.valid_journaled(&record.handoff_id, &candidate) {
+            return Err(AdapterError::Contract);
+        }
+        let consume = LaunchConsumeRequest {
+            schema: LAUNCH_SCHEMA.to_string(),
+            version: LAUNCH_VERSION,
+            admission_digest: admission.admission_digest.clone(),
+        };
+        let consume_body = serde_json::to_vec(&consume).map_err(|_| AdapterError::Contract)?;
+        let consume_digest = sha256_digest(&consume_body);
+        let mut updated = document.clone();
+        updated.schema_version = 2;
+        let launch = updated
+            .launches
+            .get_mut(&record.handoff_id)
+            .expect("launch record remains present");
+        launch.admission = Some(admission);
+        launch.consume_idempotency_key = Some(launch_idempotency_key(
+            LAUNCH_CONSUME_IDEMPOTENCY_DOMAIN,
+            &record.handoff_id,
+            &consume_digest,
+        ));
+        launch.consume_digest = Some(consume_digest);
+        launch.consume_body_json =
+            Some(String::from_utf8(consume_body).map_err(|_| AdapterError::Contract)?);
+        if !launch.valid() {
+            return Err(AdapterError::Journal);
+        }
+        let saved = launch.clone();
+        persist_journal_update(&self.path, &mut document, updated)?;
+        Ok(saved)
+    }
+
+    fn mark_launch_consume_started(
+        &self,
+        record: &LaunchJournalRecord,
+    ) -> Result<LaunchJournalRecord, AdapterError> {
+        let mut document = self.document.lock().expect("Paimos delivery journal lock");
+        let existing = document
+            .launches
+            .get(&record.handoff_id)
+            .ok_or(AdapterError::Journal)?;
+        if existing != record || existing.admission.is_none() {
+            return Err(AdapterError::Journal);
+        }
+        if existing.consume_started {
+            return Ok(existing.clone());
+        }
+        let mut updated = document.clone();
+        let launch = updated
+            .launches
+            .get_mut(&record.handoff_id)
+            .expect("launch record remains present");
+        launch.consume_started = true;
+        if !launch.valid() {
+            return Err(AdapterError::Journal);
+        }
+        let saved = launch.clone();
+        persist_journal_update(&self.path, &mut document, updated)?;
+        Ok(saved)
+    }
+
+    fn acknowledge_launch_receipt(
+        &self,
+        record: &LaunchJournalRecord,
+        receipt: LaunchReceipt,
+    ) -> Result<LaunchJournalRecord, AdapterError> {
+        let mut document = self.document.lock().expect("Paimos delivery journal lock");
+        let existing = document
+            .launches
+            .get(&record.handoff_id)
+            .ok_or(AdapterError::Journal)?;
+        if existing != record || !existing.consume_started {
+            return Err(AdapterError::Journal);
+        }
+        if let Some(saved) = &existing.receipt {
+            return if saved == &receipt {
+                Ok(existing.clone())
+            } else {
+                Err(AdapterError::Contract)
+            };
+        }
+        let admission = existing.admission.as_ref().ok_or(AdapterError::Journal)?;
+        receipt.validate(admission)?;
+        let mut updated = document.clone();
+        let launch = updated
+            .launches
+            .get_mut(&record.handoff_id)
+            .expect("launch record remains present");
+        launch.receipt = Some(receipt);
+        if !launch.valid() {
+            return Err(AdapterError::Journal);
+        }
+        let saved = launch.clone();
+        persist_journal_update(&self.path, &mut document, updated)?;
+        Ok(saved)
+    }
+}
+
+fn persist_journal_update(
+    path: &Path,
+    document: &mut JournalDocument,
+    updated: JournalDocument,
+) -> Result<(), AdapterError> {
+    match atomic_write_json(path, &updated) {
+        Ok(()) => {
+            *document = updated;
+            Ok(())
+        }
+        Err(error) if error.final_file_replaced() => {
+            *document = updated;
+            Err(AdapterError::Journal)
+        }
+        Err(_) => Err(AdapterError::Journal),
+    }
 }
 
 struct Credentials {
@@ -866,17 +1562,30 @@ struct PaimosClient {
 }
 
 impl PaimosClient {
-    fn new(origin: Url, api_key_file: PathBuf) -> Result<Self, AdapterError> {
-        let client = reqwest::Client::builder()
+    fn new(
+        origin: Url,
+        api_key_file: PathBuf,
+        root_certificates: &[reqwest::Certificate],
+    ) -> Result<Self, AdapterError> {
+        let has_custom_roots = !root_certificates.is_empty();
+        let mut builder = reqwest::Client::builder()
             .no_gzip()
             .no_brotli()
             .no_zstd()
             .no_deflate()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|_| AdapterError::Configuration)?;
+            .timeout(REQUEST_TIMEOUT);
+        for certificate in root_certificates {
+            builder = builder.add_root_certificate(certificate.clone());
+        }
+        let client = builder.build().map_err(|_| {
+            if has_custom_roots {
+                AdapterError::Trust
+            } else {
+                AdapterError::Configuration
+            }
+        })?;
         Ok(Self {
             origin,
             api_key_file,
@@ -890,6 +1599,7 @@ impl PaimosClient {
             .request(
                 Method::GET,
                 &format!("/api/external-stage/handoffs/{}", intent.handoff_id),
+                CONTRACT_MEDIA_TYPE,
                 None,
                 None,
                 &credentials,
@@ -898,7 +1608,8 @@ impl PaimosClient {
         if response.status() != StatusCode::OK {
             return Err(AdapterError::Refused(response.status()));
         }
-        self.decode_response(response, &credentials, None).await
+        self.decode_response(response, CONTRACT_MEDIA_TYPE, &credentials, None)
+            .await
     }
 
     async fn mutate(
@@ -918,6 +1629,7 @@ impl PaimosClient {
                     "/api/external-stage/handoffs/{}/{suffix}",
                     intent.handoff_id
                 ),
+                CONTRACT_MEDIA_TYPE,
                 Some(record.body_json.as_bytes()),
                 Some(&record.idempotency_key),
                 &credentials,
@@ -928,7 +1640,12 @@ impl PaimosClient {
             return Err(AdapterError::Refused(status));
         }
         let receipt: ReportReceipt = self
-            .decode_response(response, &credentials, Some(&record.idempotency_key))
+            .decode_response(
+                response,
+                CONTRACT_MEDIA_TYPE,
+                &credentials,
+                Some(&record.idempotency_key),
+            )
             .await?;
         receipt.validate(
             &record.handoff_id,
@@ -945,6 +1662,7 @@ impl PaimosClient {
         &self,
         method: Method,
         path: &str,
+        media_type: &'static str,
         body: Option<&[u8]>,
         idempotency_key: Option<&str>,
         credentials: &Credentials,
@@ -973,7 +1691,7 @@ impl PaimosClient {
             .client
             .request(method, url)
             .header(USER_AGENT, USER_AGENT_VALUE)
-            .header(ACCEPT, CONTRACT_MEDIA_TYPE)
+            .header(ACCEPT, media_type)
             .header(ACCEPT_ENCODING, IDENTITY_ENCODING)
             .header(AUTHORIZATION, authorization_value)
             .header(HANDOFF_SECRET_HEADER, secret_value);
@@ -981,9 +1699,7 @@ impl PaimosClient {
             builder = builder.header(IDEMPOTENCY_HEADER, idempotency_key);
         }
         if let Some(body) = body {
-            builder = builder
-                .header(CONTENT_TYPE, CONTRACT_MEDIA_TYPE)
-                .body(body.to_vec());
+            builder = builder.header(CONTENT_TYPE, media_type).body(body.to_vec());
         }
         builder.send().await.map_err(|_| AdapterError::Transport)
     }
@@ -991,10 +1707,11 @@ impl PaimosClient {
     async fn decode_response<T: for<'de> Deserialize<'de>>(
         &self,
         response: reqwest::Response,
+        media_type: &'static str,
         credentials: &Credentials,
         idempotency_key: Option<&str>,
     ) -> Result<T, AdapterError> {
-        if !response_media_valid(response.headers()) {
+        if !response_media_valid(response.headers(), media_type) {
             return Err(AdapterError::Contract);
         }
         reject_reflected_headers(
@@ -1005,6 +1722,91 @@ impl PaimosClient {
         let bytes = bounded_body(response).await?;
         reject_reflected_bytes(&bytes, credentials, idempotency_key.unwrap_or_default())?;
         decode_strict(&bytes)
+    }
+
+    async fn request_launch_candidate(
+        &self,
+        intent: &DeliveryIntent,
+        record: &LaunchJournalRecord,
+    ) -> Result<LaunchAdmission, AdapterError> {
+        if !record.valid() || record.admission.is_some() || record.consume_started {
+            return Err(AdapterError::Journal);
+        }
+        let credentials = self.credentials(intent)?;
+        let response = self
+            .request(
+                Method::POST,
+                &format!(
+                    "/api/external-stage/handoffs/{}/launch-candidates",
+                    intent.handoff_id
+                ),
+                LAUNCH_MEDIA_TYPE,
+                Some(record.candidate_body_json.as_bytes()),
+                Some(&record.candidate_idempotency_key),
+                &credentials,
+            )
+            .await?;
+        if response.status() != StatusCode::OK || !response_no_store(response.headers()) {
+            return if response.status() == StatusCode::OK {
+                Err(AdapterError::Contract)
+            } else {
+                Err(AdapterError::Refused(response.status()))
+            };
+        }
+        self.decode_response(
+            response,
+            LAUNCH_MEDIA_TYPE,
+            &credentials,
+            Some(&record.candidate_idempotency_key),
+        )
+        .await
+    }
+
+    async fn consume_launch(
+        &self,
+        intent: &DeliveryIntent,
+        record: &LaunchJournalRecord,
+    ) -> Result<LaunchReceipt, AdapterError> {
+        if !record.valid() || !record.consume_started || record.receipt.is_some() {
+            return Err(AdapterError::Journal);
+        }
+        let admission = record.admission.as_ref().ok_or(AdapterError::Journal)?;
+        let idempotency_key = record
+            .consume_idempotency_key
+            .as_deref()
+            .ok_or(AdapterError::Journal)?;
+        let body = record
+            .consume_body_json
+            .as_deref()
+            .ok_or(AdapterError::Journal)?;
+        let credentials = self.credentials(intent)?;
+        let response = self
+            .request(
+                Method::POST,
+                &format!(
+                    "/api/external-stage/handoffs/{}/launch-admissions/{}/consume",
+                    intent.handoff_id, admission.admission_id
+                ),
+                LAUNCH_MEDIA_TYPE,
+                Some(body.as_bytes()),
+                Some(idempotency_key),
+                &credentials,
+            )
+            .await?;
+        if response.status() != StatusCode::OK || !response_no_store(response.headers()) {
+            return if response.status() == StatusCode::OK {
+                Err(AdapterError::Contract)
+            } else {
+                Err(AdapterError::Refused(response.status()))
+            };
+        }
+        self.decode_response(
+            response,
+            LAUNCH_MEDIA_TYPE,
+            &credentials,
+            Some(idempotency_key),
+        )
+        .await
     }
 
     fn credentials(&self, intent: &DeliveryIntent) -> Result<Credentials, AdapterError> {
@@ -1067,8 +1869,12 @@ impl PaimosDeliveryAdapter {
         let journal_path = derived_journal_path(host_store_path);
         let journal = JournalStore::new(journal_path)
             .map_err(|error| format!("Paimos delivery adapter startup failed: {error}"))?;
-        let paimos = PaimosClient::new(config.paimos_origin.clone(), config.api_key_file.clone())
-            .map_err(|error| format!("Paimos delivery adapter startup failed: {error}"))?;
+        let paimos = PaimosClient::new(
+            config.paimos_origin.clone(),
+            config.api_key_file.clone(),
+            &config.paimos_ca_certificates,
+        )
+        .map_err(|error| format!("Paimos delivery adapter startup failed: {error}"))?;
         tracing::info!(
             paimos_release = PAIMOS_RELEASE,
             paimos_commit = PAIMOS_CERTIFIED_COMMIT,
@@ -1109,6 +1915,9 @@ impl PaimosDeliveryAdapter {
     async fn process_intent(&self, intent: &DeliveryIntent) -> Result<(), AdapterError> {
         self.journal
             .assert_bound(intent, &self.config.paimos_origin)?;
+        if self.replay_started_launch(intent).await? {
+            return Ok(());
+        }
         if let Some(pending) = self.journal.pending_for(&intent.handoff_id) {
             return self.replay(intent, pending).await;
         }
@@ -1132,6 +1941,10 @@ impl PaimosDeliveryAdapter {
                     return Err(AdapterError::LocalBinding);
                 }
                 self.bind_after_accept(intent, &pull, now_unix())?;
+                if intent.delegated_launch.is_some() {
+                    self.process_delegated_launch(intent, &pull, now_unix())
+                        .await?;
+                }
                 let Some(request) = self.local_terminal_report(intent, &pull, now_unix())? else {
                     return Ok(());
                 };
@@ -1189,6 +2002,193 @@ impl PaimosDeliveryAdapter {
         }
         let receipt = self.paimos.mutate(intent, &record).await?;
         self.journal.acknowledge(&record, receipt)
+    }
+
+    /// Complete only an already-started consume replay before consulting the
+    /// current handoff state. Paimos may return the immutable historical
+    /// receipt after expiry; a never-consumed, revoked admission still refuses.
+    async fn replay_started_launch(&self, intent: &DeliveryIntent) -> Result<bool, AdapterError> {
+        let Some(record) = self.journal.launch(&intent.handoff_id) else {
+            return Ok(false);
+        };
+        if intent.delegated_launch.is_none() || !record.valid() {
+            return Err(AdapterError::LocalBinding);
+        }
+        let operation = self
+            .journal
+            .operation(&intent.handoff_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if !record.bound_to(intent, &self.config.paimos_origin, &operation.job_id) {
+            return Err(AdapterError::LocalBinding);
+        }
+        if record.receipt.is_some() {
+            self.finish_delegated_confirmation(intent, &record)?;
+            return Ok(false);
+        }
+        if !record.consume_started {
+            return Ok(false);
+        }
+        let receipt = self.paimos.consume_launch(intent, &record).await?;
+        let admission = record.admission.as_ref().ok_or(AdapterError::Journal)?;
+        receipt.validate(admission)?;
+        let record = self.journal.acknowledge_launch_receipt(&record, receipt)?;
+        self.finish_delegated_confirmation(intent, &record)?;
+        Ok(true)
+    }
+
+    async fn process_delegated_launch(
+        &self,
+        intent: &DeliveryIntent,
+        pull: &PullResponse,
+        now: i64,
+    ) -> Result<(), AdapterError> {
+        let selection = intent
+            .delegated_launch
+            .as_ref()
+            .ok_or(AdapterError::LocalBinding)?;
+        if intent.stage != IntentStage::Deployment
+            || intent.workflow != GuardedWorkflow::DeployProduction
+            || pull.state != HandoffState::Accepted
+            || parse_timestamp(&pull.expires_at)?.unix_timestamp() <= now
+        {
+            return Err(AdapterError::LocalBinding);
+        }
+        let operation = self
+            .journal
+            .operation(&intent.handoff_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if !operation.matches_pull(pull) {
+            return Err(AdapterError::LocalBinding);
+        }
+        if self
+            .journal
+            .launch(&intent.handoff_id)
+            .is_some_and(|record| record.receipt.is_some())
+        {
+            return Ok(());
+        }
+        let job = self.launch_ready_job(intent, &operation.job_id)?;
+        let reviewed_digest = reviewed_plan_digest(&job)?;
+        let expected_candidate = launch_candidate(intent, selection, pull, &reviewed_digest, now)?;
+        let mut record = if let Some(existing) = self.journal.launch(&intent.handoff_id) {
+            if !existing.bound_to(intent, &self.config.paimos_origin, &operation.job_id) {
+                return Err(AdapterError::LocalBinding);
+            }
+            let saved = existing.candidate()?;
+            if saved.target_ref != expected_candidate.target_ref
+                || saved.workflow != expected_candidate.workflow
+                || saved.environment != expected_candidate.environment
+                || saved.artifact != expected_candidate.artifact
+                || saved.reviewed_plan_digest != expected_candidate.reviewed_plan_digest
+                || saved.operation_binding_digest != expected_candidate.operation_binding_digest
+            {
+                return Err(AdapterError::LocalBinding);
+            }
+            existing
+        } else {
+            self.journal.ensure_launch(LaunchJournalRecord::new(
+                intent,
+                &self.config.paimos_origin,
+                &operation.job_id,
+                &expected_candidate,
+            )?)?
+        };
+        let candidate = record.candidate()?;
+        if record.admission.is_none() {
+            let admission = self
+                .paimos
+                .request_launch_candidate(intent, &record)
+                .await?;
+            admission.validate(&intent.handoff_id, &candidate, pull, now_unix())?;
+            record = self
+                .journal
+                .acknowledge_launch_admission(&record, admission)?;
+        }
+        let fresh_pull = self.paimos.pull(intent).await?;
+        fresh_pull.validate(intent)?;
+        if fresh_pull.state != HandoffState::Accepted
+            || fresh_pull != *pull
+            || parse_timestamp(&fresh_pull.expires_at)?.unix_timestamp() <= now_unix()
+        {
+            return Err(AdapterError::LocalBinding);
+        }
+        let admission = record.admission.clone().ok_or(AdapterError::Journal)?;
+        admission.validate(&intent.handoff_id, &candidate, &fresh_pull, now_unix())?;
+        let fresh_job = self.launch_ready_job(intent, &operation.job_id)?;
+        if reviewed_plan_digest(&fresh_job)? != candidate.reviewed_plan_digest {
+            return Err(AdapterError::LocalBinding);
+        }
+        record = self.journal.mark_launch_consume_started(&record)?;
+        let receipt = self.paimos.consume_launch(intent, &record).await?;
+        receipt.validate(&admission)?;
+        record = self.journal.acknowledge_launch_receipt(&record, receipt)?;
+        self.finish_delegated_confirmation(intent, &record)
+    }
+
+    fn launch_ready_job(
+        &self,
+        intent: &DeliveryIntent,
+        job_id: &str,
+    ) -> Result<HostActionJob, AdapterError> {
+        let job = self
+            .host_actions
+            .get(job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if job.host != intent.host
+            || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+            || job.state != HostActionState::AwaitingConfirmation
+            || !job.plan.as_ref().is_some_and(HostActionPlan::ready)
+        {
+            return Err(AdapterError::LocalBinding);
+        }
+        Ok(job)
+    }
+
+    fn finish_delegated_confirmation(
+        &self,
+        intent: &DeliveryIntent,
+        record: &LaunchJournalRecord,
+    ) -> Result<(), AdapterError> {
+        let receipt = record.receipt.as_ref().ok_or(AdapterError::Journal)?;
+        let admission = record.admission.as_ref().ok_or(AdapterError::Journal)?;
+        receipt.validate(admission)?;
+        let job = self
+            .host_actions
+            .get(&record.job_id)
+            .ok_or(AdapterError::LocalBinding)?;
+        if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
+            return Err(AdapterError::LocalBinding);
+        }
+        let candidate = record.candidate()?;
+        if reviewed_plan_digest(&job)? != candidate.reviewed_plan_digest {
+            return Err(AdapterError::LocalBinding);
+        }
+        if job.state == HostActionState::AwaitingConfirmation {
+            self.host_actions
+                .confirm_update_delegated(
+                    &record.job_id,
+                    &intent.host,
+                    &admission.admission_id,
+                    parse_timestamp(&receipt.consumed_at)?.unix_timestamp(),
+                )
+                .map_err(map_host_action_error)?;
+            return Ok(());
+        }
+        if matches!(
+            job.state,
+            HostActionState::QueuedApply
+                | HostActionState::Applying
+                | HostActionState::Rebooting
+                | HostActionState::Succeeded
+                | HostActionState::Failed
+                | HostActionState::Cancelled
+        ) {
+            // A prior exact delegated transition or a racing human transition
+            // already moved this job. Historical receipt replay never invokes
+            // confirmation again and never claims, dispatches, or executes it.
+            return Ok(());
+        }
+        Err(AdapterError::LocalBinding)
     }
 
     fn local_terminal_report(
@@ -1549,6 +2549,71 @@ fn read_private_file(
     Ok((bytes, before))
 }
 
+fn load_ca_certificates(
+    path: &Path,
+) -> Result<(Vec<reqwest::Certificate>, FileIdentity), AdapterError> {
+    let (mut bytes, identity) =
+        read_private_file(path, MAX_CA_BUNDLE_BYTES, None).map_err(|_| AdapterError::Trust)?;
+    let result = parse_ca_certificates(&bytes).map(|certificates| (certificates, identity));
+    bytes.fill(0);
+    result
+}
+
+fn parse_ca_certificates(bytes: &[u8]) -> Result<Vec<reqwest::Certificate>, AdapterError> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let text = std::str::from_utf8(bytes).map_err(|_| AdapterError::Trust)?;
+    if !text.is_ascii() {
+        return Err(AdapterError::Trust);
+    }
+    let mut in_certificate = false;
+    let mut payload_line_seen = false;
+    let mut block_count = 0usize;
+    for line in text.lines() {
+        if !in_certificate {
+            if line.is_empty() {
+                continue;
+            }
+            if line != BEGIN {
+                return Err(AdapterError::Trust);
+            }
+            in_certificate = true;
+            payload_line_seen = false;
+            continue;
+        }
+        if line == END {
+            if !payload_line_seen {
+                return Err(AdapterError::Trust);
+            }
+            block_count += 1;
+            if block_count > MAX_CA_CERTIFICATES {
+                return Err(AdapterError::Trust);
+            }
+            in_certificate = false;
+            continue;
+        }
+        if line.is_empty()
+            || line.len() > 76
+            || !line
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        {
+            return Err(AdapterError::Trust);
+        }
+        payload_line_seen = true;
+    }
+    if in_certificate || block_count == 0 {
+        return Err(AdapterError::Trust);
+    }
+    let certificates =
+        reqwest::Certificate::from_pem_bundle(bytes).map_err(|_| AdapterError::Trust)?;
+    if certificates.len() != block_count {
+        return Err(AdapterError::Trust);
+    }
+    Ok(certificates)
+}
+
 fn private_file_metadata(
     file: &File,
     max_bytes: u64,
@@ -1625,11 +2690,17 @@ fn loopback_origin_for_tests(value: &str) -> Url {
 /// request side pins `Accept-Encoding: identity`, and the HTTP client disables
 /// every reqwest response decompressor, so an encoded body reaches this check
 /// with its header intact instead of being transparently decoded away.
-fn response_media_valid(headers: &HeaderMap) -> bool {
+fn response_media_valid(headers: &HeaderMap, expected: &str) -> bool {
     let mut content_types = headers.get_all(CONTENT_TYPE).iter();
-    content_types.next().and_then(|value| value.to_str().ok()) == Some(CONTRACT_MEDIA_TYPE)
+    content_types.next().and_then(|value| value.to_str().ok()) == Some(expected)
         && content_types.next().is_none()
         && !headers.contains_key(CONTENT_ENCODING)
+}
+
+fn response_no_store(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(reqwest::header::CACHE_CONTROL).iter();
+    values.next().and_then(|value| value.to_str().ok()) == Some("private, no-store")
+        && values.next().is_none()
 }
 
 fn receipt_status_valid(status: StatusCode, duplicate: bool) -> bool {
@@ -1678,8 +2749,33 @@ fn idempotency_key(handoff_id: &str, sequence: i64, request_digest: &str) -> Str
     )
 }
 
+fn launch_idempotency_key(domain: &[u8], handoff_id: &str, request_digest: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(handoff_id.as_bytes());
+    digest.update([0]);
+    digest.update(request_digest.as_bytes());
+    let mut bytes: [u8; 16] = digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix has fixed width");
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex_bytes(&bytes[0..4]),
+        hex_bytes(&bytes[4..6]),
+        hex_bytes(&bytes[6..8]),
+        hex_bytes(&bytes[8..10]),
+        hex_bytes(&bytes[10..16])
+    )
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     hex_bytes(&Sha256::digest(bytes))
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex_digest(bytes))
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -1743,6 +2839,21 @@ fn valid_lower_hex(value: &str, lengths: &[usize]) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn valid_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || byte.is_ascii_digit()
+                || matches!(byte, b'a'..=b'f')
+        })
+        && matches!(bytes[14], b'1'..=b'8')
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+}
+
 fn valid_release_manifest_coordinate(value: &str) -> bool {
     let Some((kind, coordinate)) = value.split_once(':') else {
         return false;
@@ -1795,6 +2906,108 @@ fn operation_identity(
     Ok(hex_digest(&bytes))
 }
 
+fn reviewed_plan_digest(job: &HostActionJob) -> Result<String, AdapterError> {
+    #[derive(Serialize)]
+    struct ReviewedPlanBinding<'a> {
+        job_id: &'a str,
+        host: &'a str,
+        update_intent: &'static str,
+        plan: &'a HostActionPlan,
+    }
+
+    let plan = job.plan.as_ref().ok_or(AdapterError::LocalBinding)?;
+    if job.kind != crate::host_actions::HostActionKind::UpdateRestart || !plan.ready() {
+        return Err(AdapterError::LocalBinding);
+    }
+    let canonical = serde_json::to_vec(&ReviewedPlanBinding {
+        job_id: &job.id,
+        host: &job.host,
+        update_intent: job.update_restart_intent().key(),
+        plan,
+    })
+    .map_err(|_| AdapterError::Contract)?;
+    let mut bytes = Vec::with_capacity(REVIEWED_PLAN_DOMAIN.len() + canonical.len());
+    bytes.extend_from_slice(REVIEWED_PLAN_DOMAIN);
+    bytes.extend_from_slice(&canonical);
+    Ok(sha256_digest(&bytes))
+}
+
+fn launch_candidate(
+    intent: &DeliveryIntent,
+    selection: &DelegatedLaunchSelection,
+    pull: &PullResponse,
+    reviewed_plan_digest: &str,
+    observed_at: i64,
+) -> Result<LaunchCandidate, AdapterError> {
+    #[derive(Serialize)]
+    struct LaunchOperationBinding<'a> {
+        handoff_id: &'a str,
+        credential_epoch: i64,
+        target_ref: &'a str,
+        workflow: &'static str,
+        environment: &'a str,
+        artifact: &'a ArtifactEvidence,
+        stage: &'static str,
+        execution: i64,
+        authority: i64,
+        plan_digest: &'a str,
+        predecessor_digest: &'a str,
+        context_digest: &'a str,
+        reviewed_plan_digest: &'a str,
+    }
+
+    if !selection.valid()
+        || intent.stage != IntentStage::Deployment
+        || intent.workflow != GuardedWorkflow::DeployProduction
+        || !valid_sha256_digest(reviewed_plan_digest)
+    {
+        return Err(AdapterError::LocalBinding);
+    }
+    let canonical = serde_json::to_vec(&LaunchOperationBinding {
+        handoff_id: &intent.handoff_id,
+        credential_epoch: pull.credential_epoch,
+        target_ref: &selection.target_ref,
+        workflow: LAUNCH_WORKFLOW,
+        environment: &intent.environment,
+        artifact: &intent.artifact,
+        stage: LAUNCH_STAGE,
+        execution: pull.execution_number,
+        authority: pull.authority_epoch,
+        plan_digest: &pull.plan_digest,
+        predecessor_digest: &pull.predecessor_digest,
+        context_digest: &pull.context_digest,
+        reviewed_plan_digest,
+    })
+    .map_err(|_| AdapterError::Contract)?;
+    let mut binding = Vec::with_capacity(LAUNCH_OPERATION_DOMAIN.len() + canonical.len());
+    binding.extend_from_slice(LAUNCH_OPERATION_DOMAIN);
+    binding.extend_from_slice(&canonical);
+    let candidate = LaunchCandidate {
+        schema: LAUNCH_SCHEMA.to_string(),
+        version: LAUNCH_VERSION,
+        target_ref: selection.target_ref.clone(),
+        workflow: LAUNCH_WORKFLOW.to_string(),
+        environment: intent.environment.clone(),
+        artifact: intent.artifact.clone(),
+        reviewed_plan_digest: reviewed_plan_digest.to_string(),
+        operation_binding_digest: sha256_digest(&binding),
+        observed_at: format_timestamp(observed_at)?,
+    };
+    if !candidate.valid() {
+        return Err(AdapterError::Contract);
+    }
+    Ok(candidate)
+}
+
+fn map_host_action_error(error: HostActionStoreError) -> AdapterError {
+    match error {
+        HostActionStoreError::Persistence | HostActionStoreError::PersistenceCommitted => {
+            AdapterError::Journal
+        }
+        _ => AdapterError::LocalBinding,
+    }
+}
+
 fn deterministic_job_id(host: &str, operation_id: &str) -> String {
     format!("action-update-restart-{host}-{}", &operation_id[..16])
 }
@@ -1838,11 +3051,11 @@ mod tests {
         HOST_REPORT_VERSION, NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
     use serde_json::{json, Value};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::host_actions::{
         AgentActionOutcome, AgentActionPhase, AgentActionResultRequest, HostActionEventKind,
-        HostActionKind, HostActionPlan, HostActionResult, HostActionState,
+        HostActionEventSource, HostActionKind, HostActionPlan, HostActionResult, HostActionState,
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -1861,6 +3074,37 @@ mod tests {
         path
     }
 
+    struct TestDirectoryGuard {
+        path: PathBuf,
+    }
+
+    impl TestDirectoryGuard {
+        fn new(label: &str) -> Self {
+            Self {
+                path: temporary_directory(label),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectoryGuard {
+        fn drop(&mut self) {
+            let is_owned_test_directory = self.path.parent()
+                == Some(std::env::temp_dir().as_path())
+                && self
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("pharos-paimos-delivery-custom-ca-"));
+            if is_owned_test_directory {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
     fn write_private(path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).expect("write private test file");
         #[cfg(unix)]
@@ -1869,6 +3113,219 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .expect("secure private test file");
         }
+    }
+
+    struct TestTlsMaterial {
+        ca_path: PathBuf,
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+    }
+
+    fn run_test_openssl(directory: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("openssl")
+            .current_dir(directory)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("OpenSSL is required to generate ephemeral TLS test certificates");
+        assert!(
+            status.success(),
+            "ephemeral TLS certificate generation failed"
+        );
+    }
+
+    fn generate_test_ca(directory: &Path) -> PathBuf {
+        std::fs::create_dir(directory).expect("create test CA directory");
+        run_test_openssl(
+            directory,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+                "-subj",
+                "/CN=Pharos ephemeral test CA",
+                "-days",
+                "2",
+                "-sha256",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ],
+        );
+        let ca_path = directory.join("ca.pem");
+        let ca_bytes = std::fs::read(&ca_path).expect("read generated test CA");
+        write_private(&ca_path, &ca_bytes);
+        ca_path
+    }
+
+    fn generate_test_tls_material(directory: &Path) -> TestTlsMaterial {
+        let ca_directory = directory.join("trusted-ca");
+        let ca_path = generate_test_ca(&ca_directory);
+        let server_directory = directory.join("server");
+        std::fs::create_dir(&server_directory).expect("create test server directory");
+        run_test_openssl(
+            &server_directory,
+            &[
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                "server.key",
+                "-out",
+                "server.csr",
+                "-subj",
+                "/CN=localhost",
+            ],
+        );
+        std::fs::write(
+            server_directory.join("server.ext"),
+            b"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n",
+        )
+        .expect("write ephemeral server extensions");
+        let ca_path_text = ca_path.to_str().expect("test CA path is UTF-8");
+        let ca_key = ca_directory.join("ca.key");
+        let ca_key_text = ca_key.to_str().expect("test CA key path is UTF-8");
+        run_test_openssl(
+            &server_directory,
+            &[
+                "x509",
+                "-req",
+                "-in",
+                "server.csr",
+                "-CA",
+                ca_path_text,
+                "-CAkey",
+                ca_key_text,
+                "-CAcreateserial",
+                "-out",
+                "server.pem",
+                "-days",
+                "2",
+                "-sha256",
+                "-extfile",
+                "server.ext",
+            ],
+        );
+        run_test_openssl(
+            &server_directory,
+            &[
+                "x509",
+                "-in",
+                "server.pem",
+                "-outform",
+                "DER",
+                "-out",
+                "server.der",
+            ],
+        );
+        run_test_openssl(
+            &server_directory,
+            &[
+                "pkcs8",
+                "-topk8",
+                "-nocrypt",
+                "-in",
+                "server.key",
+                "-outform",
+                "DER",
+                "-out",
+                "server-key.der",
+            ],
+        );
+        TestTlsMaterial {
+            ca_path,
+            certificate_der: std::fs::read(server_directory.join("server.der"))
+                .expect("read ephemeral server certificate"),
+            private_key_der: std::fs::read(server_directory.join("server-key.der"))
+                .expect("read ephemeral server key"),
+        }
+    }
+
+    async fn serve_test_https(
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+        request_hostname: &str,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate_der)],
+                PrivatePkcs8KeyDer::from(private_key_der).into(),
+            )
+            .expect("ephemeral TLS server configuration");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral TLS server");
+        let port = listener.local_addr().expect("TLS listener address").port();
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while request.len() <= 16 * 1024 {
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+        (
+            Url::parse(&format!("https://{request_hostname}:{port}"))
+                .expect("ephemeral HTTPS origin"),
+            task,
+        )
+    }
+
+    async fn test_https_request(
+        origin: Url,
+        root_certificates: &[reqwest::Certificate],
+    ) -> Result<StatusCode, AdapterError> {
+        let client = PaimosClient::new(
+            origin,
+            PathBuf::from("unused-test-api-key"),
+            root_certificates,
+        )?;
+        let credentials = Credentials {
+            api_key: API_KEY_SENTINEL.to_vec(),
+            handoff_secret: HANDOFF_SENTINEL.to_vec(),
+        };
+        client
+            .request(
+                Method::GET,
+                "/",
+                CONTRACT_MEDIA_TYPE,
+                None,
+                None,
+                &credentials,
+            )
+            .await
+            .map(|response| response.status())
     }
 
     fn artifact() -> ArtifactEvidence {
@@ -1997,6 +3454,7 @@ mod tests {
             update_restart_job_id: None,
             deployment_handoff_id: (stage == IntentStage::Verification)
                 .then(|| DEPLOYMENT_HANDOFF.to_string()),
+            delegated_launch: None,
         }
     }
 
@@ -2004,6 +3462,7 @@ mod tests {
         AdapterConfig {
             paimos_origin: origin,
             api_key_file,
+            paimos_ca_certificates: Vec::new(),
             poll_interval: Duration::from_secs(5),
             verification_freshness_secs: 300,
             intents,
@@ -2075,6 +3534,13 @@ mod tests {
     }
 
     fn operator_confirm_existing_update(store: &HostActionStore, job_id: &str, now: i64) {
+        review_existing_update(store, job_id, now);
+        store
+            .confirm_update(job_id, "hsb8", "operator", now + 2)
+            .expect("operator confirm");
+    }
+
+    fn review_existing_update(store: &HostActionStore, job_id: &str, now: i64) {
         let review = store
             .claim("hsb8", now)
             .expect("claim review")
@@ -2102,9 +3568,6 @@ mod tests {
                 now + 1,
             )
             .expect("record review");
-        store
-            .confirm_update(job_id, "hsb8", "operator", now + 2)
-            .expect("operator confirm");
     }
 
     fn record_nix_only_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
@@ -2182,6 +3645,8 @@ mod tests {
         captures: Arc<Mutex<Vec<CapturedRequest>>>,
         refuse_next_mutation: Arc<AtomicBool>,
         deployment_received_at: String,
+        launch_issued_at: String,
+        launch_expires_at: String,
     }
 
     impl FakePaimos {
@@ -2194,6 +3659,8 @@ mod tests {
                 captures: Arc::new(Mutex::new(Vec::new())),
                 refuse_next_mutation: Arc::new(AtomicBool::new(false)),
                 deployment_received_at: format_timestamp(now - 15).unwrap(),
+                launch_issued_at: format_timestamp(now + 10).unwrap(),
+                launch_expires_at: format_timestamp(now + 610).unwrap(),
             }
         }
     }
@@ -2278,6 +3745,65 @@ mod tests {
                 json!({"error":"reporter unavailable"}),
             );
         }
+        if path.ends_with("/launch-candidates") {
+            let candidate: LaunchCandidate =
+                decode_strict(&body).expect("strict launch candidate request");
+            return fake_launch_json_response(
+                StatusCode::OK,
+                json!({
+                    "schema": LAUNCH_SCHEMA,
+                    "version": LAUNCH_VERSION,
+                    "grant_id": "20600000-0000-4000-8000-000000000001",
+                    "grant_revision": 1,
+                    "grant_digest": format!("sha256:{}", "7".repeat(64)),
+                    "admission_id": "20600000-0000-4000-8000-000000000002",
+                    "admission_digest": format!("sha256:{}", "8".repeat(64)),
+                    "handoff_id": handoff_id,
+                    "credential_epoch": 9,
+                    "target_ref": candidate.target_ref,
+                    "workflow": candidate.workflow,
+                    "environment": candidate.environment,
+                    "artifact": candidate.artifact,
+                    "stage": LAUNCH_STAGE,
+                    "attempt": 1,
+                    "plan": 1,
+                    "execution": 1,
+                    "authority": 4,
+                    "plan_digest": format!("sha256:{}", "2".repeat(64)),
+                    "predecessor_digest": format!("sha256:{}", "3".repeat(64)),
+                    "context_digest": format!("sha256:{}", "4".repeat(64)),
+                    "reviewed_plan_digest": candidate.reviewed_plan_digest,
+                    "operation_binding_digest": candidate.operation_binding_digest,
+                    "max_launches": 1,
+                    "used_launches": 0,
+                    "issued_at": fake.launch_issued_at,
+                    "expires_at": fake.launch_expires_at,
+                    "state": "issued"
+                }),
+            );
+        }
+        if path.ends_with("/consume") {
+            let request: LaunchConsumeRequest =
+                decode_strict(&body).expect("strict launch consume request");
+            let admission_id = path
+                .split('/')
+                .nth(6)
+                .expect("admission ID in fixed consume route");
+            return fake_launch_json_response(
+                StatusCode::OK,
+                json!({
+                    "schema": LAUNCH_SCHEMA,
+                    "version": LAUNCH_VERSION,
+                    "admission_id": admission_id,
+                    "admission_digest": request.admission_digest,
+                    "handoff_id": handoff_id,
+                    "credential_epoch": 9,
+                    "launch_number": 1,
+                    "state": "consumed",
+                    "consumed_at": fake.launch_issued_at
+                }),
+            );
+        }
         let value: Value = serde_json::from_slice(&body).expect("strict adapter JSON");
         let sequence = value["sequence"].as_i64().expect("request sequence");
         let state = if sequence == 1 {
@@ -2320,6 +3846,15 @@ mod tests {
             .unwrap()
     }
 
+    fn fake_launch_json_response(status: StatusCode, value: Value) -> Response<Body> {
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, LAUNCH_MEDIA_TYPE)
+            .header(reqwest::header::CACHE_CONTROL, "private, no-store")
+            .body(Body::from(serde_json::to_vec(&value).unwrap()))
+            .unwrap()
+    }
+
     async fn serve_fake(fake: FakePaimos) -> (Url, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2346,8 +3881,12 @@ mod tests {
         actions: Arc<HostActionStore>,
     ) -> PaimosDeliveryAdapter {
         let journal = JournalStore::new(journal_path).expect("test journal");
-        let paimos = PaimosClient::new(config.paimos_origin.clone(), config.api_key_file.clone())
-            .expect("test Paimos client");
+        let paimos = PaimosClient::new(
+            config.paimos_origin.clone(),
+            config.api_key_file.clone(),
+            &config.paimos_ca_certificates,
+        )
+        .expect("test Paimos client");
         PaimosDeliveryAdapter {
             config,
             journal,
@@ -2368,9 +3907,32 @@ mod tests {
         let schema = include_bytes!(
             "../../../contracts/paimos-external-stage-v2/external-stage-v2.schema.json"
         );
+        let launch_schema = include_bytes!(
+            "../../../contracts/paimos-external-stage-launch-admission-v1/external-stage-launch-admission-v1.schema.json"
+        );
+        let launch_candidate = include_bytes!(
+            "../../../contracts/paimos-external-stage-launch-admission-v1/candidate.json"
+        );
+        let launch_admission = include_bytes!(
+            "../../../contracts/paimos-external-stage-launch-admission-v1/admission.json"
+        );
+        let launch_consume = include_bytes!(
+            "../../../contracts/paimos-external-stage-launch-admission-v1/consume.json"
+        );
+        let launch_receipt = include_bytes!(
+            "../../../contracts/paimos-external-stage-launch-admission-v1/receipt.json"
+        );
+        let launch_manifest = include_bytes!(
+            "../../../contracts/paimos-external-stage-launch-admission-v1/manifest-v1.json"
+        );
         assert_eq!(dependency.len(), 1115);
         assert_eq!(owner.len(), 5780);
         assert_eq!(schema.len(), 10380);
+        assert_eq!(launch_schema.len(), 6759);
+        assert_eq!(launch_candidate.len(), 909);
+        assert_eq!(launch_admission.len(), 1707);
+        assert_eq!(launch_consume.len(), 157);
+        assert_eq!(launch_receipt.len(), 348);
         assert_eq!(hex_digest(dependency), PAIMOS_JANUS_DEPENDENCY_SHA256);
         assert_eq!(
             hex_digest(owner),
@@ -2380,6 +3942,30 @@ mod tests {
             hex_digest(schema),
             "9e9140bb7fbf4b46caf53ab9576be8ff99b208dcb4a10b8512f0d69959190ed0"
         );
+        for (bytes, expected) in [
+            (
+                launch_schema.as_slice(),
+                "3b15130cddc9461d038f06332f066220274c265bfd15a3d2aaa636b8b229415c",
+            ),
+            (
+                launch_candidate.as_slice(),
+                "4eed040a5bef85899994c30751bb37ec135f81d42e5ff58a764cf51a87f0775b",
+            ),
+            (
+                launch_admission.as_slice(),
+                "00a564686330328c119f645f5ea9e16e1fab1569b76092b0822b773c8e84b248",
+            ),
+            (
+                launch_consume.as_slice(),
+                "014ced0d247386e30267b0c129c4c7d8abcc3e3987841c966a05ed0cc336159c",
+            ),
+            (
+                launch_receipt.as_slice(),
+                "bd57a2ae684af37a6d43f1888a402189aa48089f733ffb7ef73b40c2a9f3da01",
+            ),
+        ] {
+            assert_eq!(hex_digest(bytes), expected);
+        }
         let mut set = Sha256::new();
         set.update(b"paimos.external-stage.fixtures.v2\0");
         set.update(b"owner-pharos-v2.json");
@@ -2403,6 +3989,38 @@ mod tests {
         assert!(owner
             .windows(b"janus_evidence".len())
             .all(|window| window != b"janus_evidence"));
+        let launch_manifest: Value = decode_strict(launch_manifest).unwrap();
+        assert_eq!(launch_manifest["source_status"], "released");
+        assert_eq!(launch_manifest["artifact_status"], "published-admitted");
+        assert_eq!(launch_manifest["paimos_release"], "v260911172741.0.0");
+        assert_eq!(launch_manifest["paimos_image"], "ghcr.io/inspr-at/paimos");
+        assert_eq!(
+            launch_manifest["paimos_image_index_digest"],
+            "sha256:3143fe79fb72ba1f1ef8fef4380e2ca5285ee011058d6f4f3e9e3da10e9d2155"
+        );
+        assert_eq!(
+            launch_manifest["paimos_source_commit"],
+            "b3e4634af72fa2d1fec51b3d8ca8b7ced2e95270"
+        );
+        assert_eq!(
+            launch_manifest["paimos_integration_commit"],
+            "b3e4634af72fa2d1fec51b3d8ca8b7ced2e95270"
+        );
+        assert_eq!(
+            launch_manifest["schema_sha256"],
+            "3b15130cddc9461d038f06332f066220274c265bfd15a3d2aaa636b8b229415c"
+        );
+        let fixture_candidate: LaunchCandidate = decode_strict(launch_candidate).unwrap();
+        let fixture_admission: LaunchAdmission = decode_strict(launch_admission).unwrap();
+        let fixture_consume: LaunchConsumeRequest = decode_strict(launch_consume).unwrap();
+        let fixture_receipt: LaunchReceipt = decode_strict(launch_receipt).unwrap();
+        assert!(fixture_candidate.valid());
+        assert!(fixture_admission.valid_journaled("01K35P6YRG00000000000000AB", &fixture_candidate));
+        assert_eq!(
+            fixture_consume.admission_digest,
+            fixture_admission.admission_digest
+        );
+        fixture_receipt.validate(&fixture_admission).unwrap();
     }
 
     #[test]
@@ -2437,14 +4055,29 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTRACT_MEDIA_TYPE));
-        assert!(response_media_valid(&headers));
+        assert!(response_media_valid(&headers, CONTRACT_MEDIA_TYPE));
 
         headers.append(CONTENT_TYPE, HeaderValue::from_static(CONTRACT_MEDIA_TYPE));
-        assert!(!response_media_valid(&headers));
+        assert!(!response_media_valid(&headers, CONTRACT_MEDIA_TYPE));
         headers.remove(CONTENT_TYPE);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTRACT_MEDIA_TYPE));
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        assert!(!response_media_valid(&headers));
+        assert!(!response_media_valid(&headers, CONTRACT_MEDIA_TYPE));
+
+        let mut launch_headers = HeaderMap::new();
+        launch_headers.insert(CONTENT_TYPE, HeaderValue::from_static(LAUNCH_MEDIA_TYPE));
+        launch_headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        assert!(response_media_valid(&launch_headers, LAUNCH_MEDIA_TYPE));
+        assert!(response_no_store(&launch_headers));
+        assert!(!response_media_valid(&launch_headers, CONTRACT_MEDIA_TYPE));
+        launch_headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+        assert!(!response_no_store(&launch_headers));
 
         assert!(receipt_status_valid(StatusCode::CREATED, false));
         assert!(receipt_status_valid(StatusCode::OK, true));
@@ -2520,6 +4153,19 @@ mod tests {
             credential_rotation.binding_digest(&origin).unwrap(),
             base_digest
         );
+
+        let mut delegated = base.clone();
+        delegated.delegated_launch = Some(DelegatedLaunchSelection {
+            target_ref: format!("sha256:{}", "a".repeat(64)),
+        });
+        let delegated_digest = delegated.binding_digest(&origin).unwrap();
+        assert_ne!(delegated_digest, base_digest);
+        delegated
+            .delegated_launch
+            .as_mut()
+            .expect("delegated selection")
+            .target_ref = format!("sha256:{}", "b".repeat(64));
+        assert_ne!(delegated.binding_digest(&origin).unwrap(), delegated_digest);
     }
 
     #[test]
@@ -2533,8 +4179,8 @@ mod tests {
         write_private(
             &config_path,
             &serde_json::to_vec(&json!({
-                "schema": CONFIG_SCHEMA,
-                "schema_version": CONFIG_SCHEMA_VERSION,
+                "schema": CONFIG_SCHEMA_V2,
+                "schema_version": CONFIG_SCHEMA_VERSION_V2,
                 "paimos_origin": "https://paimos.example.test",
                 "api_key_file": api_path,
                 "poll_interval_secs": 5,
@@ -2563,6 +4209,228 @@ mod tests {
                 Err(AdapterError::Credential)
             ));
         }
+    }
+
+    #[test]
+    fn optional_paimos_ca_file_is_strict_bounded_and_protected() {
+        let directory = TestDirectoryGuard::new("custom-ca-config");
+        let directory = directory.path();
+        let material = generate_test_tls_material(directory);
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        let config_path = directory.join("adapter.json");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let mut document = json!({
+            "schema": CONFIG_SCHEMA_V2,
+            "schema_version": CONFIG_SCHEMA_VERSION_V2,
+            "paimos_origin": "https://paimos.example.test",
+            "paimos_ca_file": material.ca_path,
+            "api_key_file": api_path,
+            "poll_interval_secs": 5,
+            "verification_freshness_secs": 300,
+            "intents": [{
+                "handoff_id": DEPLOYMENT_HANDOFF,
+                "handoff_secret_file": secret_path,
+                "stage": "deployment",
+                "workflow": "deploy-production",
+                "environment": "production-eu1",
+                "host": "hsb8",
+                "artifact": artifact(),
+                "update_restart_job_id": "action-update-restart-hsb8-placeholder"
+            }]
+        });
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        let configured = AdapterConfig::load(&config_path).expect("protected CA file loads");
+        assert_eq!(configured.paimos_ca_certificates.len(), 1);
+
+        document
+            .as_object_mut()
+            .expect("configuration object")
+            .remove("paimos_ca_file");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        let defaulted = AdapterConfig::load(&config_path).expect("CA file remains optional");
+        assert!(defaulted.paimos_ca_certificates.is_empty());
+
+        let invalid_ca = directory.join("invalid-ca.pem");
+        for bytes in [
+            b"not a PEM certificate".as_slice(),
+            b"-----BEGIN PRIVATE KEY-----\nYWJj\n-----END PRIVATE KEY-----\n".as_slice(),
+            b"unexpected\n-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"
+                .as_slice(),
+        ] {
+            write_private(&invalid_ca, bytes);
+            assert!(matches!(
+                load_ca_certificates(&invalid_ca),
+                Err(AdapterError::Trust)
+            ));
+        }
+
+        let mut certificate_and_key = std::fs::read(directory.join("trusted-ca").join("ca.pem"))
+            .expect("read ephemeral CA certificate");
+        certificate_and_key.extend_from_slice(
+            &std::fs::read(directory.join("trusted-ca").join("ca.key"))
+                .expect("read ephemeral CA key"),
+        );
+        write_private(&invalid_ca, &certificate_and_key);
+        certificate_and_key.fill(0);
+        assert!(matches!(
+            load_ca_certificates(&invalid_ca),
+            Err(AdapterError::Trust)
+        ));
+
+        let certificate = std::fs::read(directory.join("trusted-ca").join("ca.pem"))
+            .expect("read ephemeral CA certificate for count bound");
+        let too_many_certificates = certificate.repeat(MAX_CA_CERTIFICATES + 1);
+        write_private(&invalid_ca, &too_many_certificates);
+        assert!(matches!(
+            load_ca_certificates(&invalid_ca),
+            Err(AdapterError::Trust)
+        ));
+        let oversized = vec![b'A'; MAX_CA_BUNDLE_BYTES as usize + 1];
+        write_private(&invalid_ca, &oversized);
+        assert!(matches!(
+            load_ca_certificates(&invalid_ca),
+            Err(AdapterError::Trust)
+        ));
+
+        document["paimos_ca_file"] = json!(directory.join("missing-ca.pem"));
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Trust)
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ca_path = directory.join("trusted-ca").join("ca.pem");
+            std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                load_ca_certificates(&ca_path),
+                Err(AdapterError::Trust)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_ca_https_preserves_chain_and_hostname_verification() {
+        let directory = TestDirectoryGuard::new("custom-ca-https");
+        let directory = directory.path();
+        let material = generate_test_tls_material(directory);
+        let (trusted_roots, _) =
+            load_ca_certificates(&material.ca_path).expect("load ephemeral trusted CA");
+        let wrong_ca_path = generate_test_ca(&directory.join("wrong-ca"));
+        let (wrong_roots, _) =
+            load_ca_certificates(&wrong_ca_path).expect("load ephemeral wrong CA");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert_eq!(
+            test_https_request(origin, &trusted_roots).await.unwrap(),
+            StatusCode::OK
+        );
+        server.await.expect("matching-CA TLS server exits");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert!(matches!(
+            test_https_request(origin, &[]).await,
+            Err(AdapterError::Transport)
+        ));
+        server.await.expect("default-root TLS server exits");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert!(matches!(
+            test_https_request(origin, &wrong_roots).await,
+            Err(AdapterError::Transport)
+        ));
+        server.await.expect("wrong-CA TLS server exits");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der,
+            material.private_key_der,
+            "127.0.0.1",
+        )
+        .await;
+        assert!(matches!(
+            test_https_request(origin, &trusted_roots).await,
+            Err(AdapterError::Transport)
+        ));
+        server.await.expect("hostname-mismatch TLS server exits");
+    }
+
+    #[test]
+    fn config_v2_stays_closed_and_v3_delegated_launch_is_presence_only() {
+        let directory = temporary_directory("delegated-config");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        let config_path = directory.join("adapter.json");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let mut document = json!({
+            "schema": CONFIG_SCHEMA_V2,
+            "schema_version": CONFIG_SCHEMA_VERSION_V2,
+            "paimos_origin": "https://paimos.example.test",
+            "api_key_file": api_path,
+            "poll_interval_secs": 5,
+            "verification_freshness_secs": 300,
+            "intents": [{
+                "handoff_id": DEPLOYMENT_HANDOFF,
+                "handoff_secret_file": secret_path,
+                "stage": "deployment",
+                "workflow": "deploy-production",
+                "environment": "production-eu1",
+                "host": "hsb8",
+                "artifact": artifact(),
+                "update_restart_job_id": "action-update-restart-hsb8-placeholder"
+            }]
+        });
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        let v2 = AdapterConfig::load(&config_path).expect("unchanged v2 loads");
+        assert!(v2.intents[0].delegated_launch.is_none());
+
+        document["intents"][0]["delegated_launch"] = json!({
+            "target_ref": format!("sha256:{}", "a".repeat(64))
+        });
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
+
+        document["schema"] = json!(CONFIG_SCHEMA_V3);
+        document["schema_version"] = json!(CONFIG_SCHEMA_VERSION_V3);
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        let v3 = AdapterConfig::load(&config_path).expect("closed v3 opt-in loads");
+        assert_eq!(
+            v3.intents[0]
+                .delegated_launch
+                .as_ref()
+                .expect("delegated launch selection")
+                .target_ref,
+            format!("sha256:{}", "a".repeat(64))
+        );
+
+        document["intents"][0]["delegated_launch"]["workflow"] = json!("attacker-controlled");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Configuration)
+        ));
     }
 
     #[test]
@@ -3162,8 +5030,8 @@ mod tests {
         write_private(&deployment_secret, HANDOFF_SENTINEL);
         write_private(&verification_secret, &[8; HANDOFF_SECRET_BYTES]);
         let mut document = json!({
-            "schema": CONFIG_SCHEMA,
-            "schema_version": CONFIG_SCHEMA_VERSION,
+            "schema": CONFIG_SCHEMA_V2,
+            "schema_version": CONFIG_SCHEMA_VERSION_V2,
             "paimos_origin": "https://paimos.example.test",
             "api_key_file": api_path.clone(),
             "poll_interval_secs": 5,
@@ -3266,6 +5134,417 @@ mod tests {
         }
     }
 
+    fn ready_update_with_id(store: &HostActionStore, job_id: &str, now: i64) -> HostActionJob {
+        store
+            .ensure_update_review_with_id(
+                job_id,
+                "hsb8",
+                GUARDED_ACTOR,
+                UpdateRestartIntent::Update,
+                now,
+            )
+            .expect("create exact guarded update");
+        review_existing_update(store, job_id, now + 1);
+        store.get(job_id).expect("reviewed update")
+    }
+
+    fn test_launch_admission(
+        candidate: &LaunchCandidate,
+        pull: &PullResponse,
+        now: i64,
+    ) -> LaunchAdmission {
+        LaunchAdmission {
+            schema: LAUNCH_SCHEMA.to_string(),
+            version: LAUNCH_VERSION,
+            grant_id: "20600000-0000-4000-8000-000000000001".to_string(),
+            grant_revision: 1,
+            grant_digest: format!("sha256:{}", "7".repeat(64)),
+            admission_id: "20600000-0000-4000-8000-000000000002".to_string(),
+            admission_digest: format!("sha256:{}", "8".repeat(64)),
+            handoff_id: pull.handoff_id.clone(),
+            credential_epoch: pull.credential_epoch,
+            target_ref: candidate.target_ref.clone(),
+            workflow: candidate.workflow.clone(),
+            environment: candidate.environment.clone(),
+            artifact: candidate.artifact.clone(),
+            stage: LAUNCH_STAGE.to_string(),
+            attempt: 1,
+            plan: 1,
+            execution: pull.execution_number,
+            authority: pull.authority_epoch,
+            plan_digest: pull.plan_digest.clone(),
+            predecessor_digest: pull.predecessor_digest.clone(),
+            context_digest: pull.context_digest.clone(),
+            reviewed_plan_digest: candidate.reviewed_plan_digest.clone(),
+            operation_binding_digest: candidate.operation_binding_digest.clone(),
+            max_launches: 1,
+            used_launches: 0,
+            issued_at: format_timestamp(now).unwrap(),
+            expires_at: format_timestamp(now + 600).unwrap(),
+            state: "issued".to_string(),
+        }
+    }
+
+    #[test]
+    fn launch_digests_bind_complete_review_and_every_public_pull_commitment() {
+        let now = now_unix();
+        let actions = HostActionStore::new(None);
+        let job = ready_update_with_id(&actions, "action-update-restart-hsb8-launch-digest", now);
+        let reviewed = reviewed_plan_digest(&job).unwrap();
+        let expected_plan = format!(
+            "{{\"job_id\":\"{}\",\"host\":\"hsb8\",\"update_intent\":\"update\",\"plan\":{{\"changed_file_count\":2,\"changed_areas\":[\"flake.lock\"],\"all_host_eval_passed\":true,\"target_build_passed\":true,\"backup_ready\":true,\"running_kernel\":\"6.18.1\",\"expected_kernel\":\"6.18.2\",\"restart_required\":true}}}}",
+            job.id
+        );
+        let mut reviewed_bytes = REVIEWED_PLAN_DOMAIN.to_vec();
+        reviewed_bytes.extend_from_slice(expected_plan.as_bytes());
+        assert_eq!(reviewed, sha256_digest(&reviewed_bytes));
+
+        let mut changed_job = job.clone();
+        changed_job
+            .plan
+            .as_mut()
+            .expect("reviewed plan")
+            .changed_file_count += 1;
+        assert_ne!(reviewed_plan_digest(&changed_job).unwrap(), reviewed);
+
+        let mut deployment = intent(
+            DEPLOYMENT_HANDOFF,
+            PathBuf::from("/private/delegated-secret"),
+            IntentStage::Deployment,
+        );
+        let selection = DelegatedLaunchSelection {
+            target_ref: format!("sha256:{}", "a".repeat(64)),
+        };
+        deployment.delegated_launch = Some(selection.clone());
+        let pull = test_pull(
+            DEPLOYMENT_HANDOFF,
+            "deployment",
+            &format!("sha256:{}", "3".repeat(64)),
+        );
+        let baseline = launch_candidate(&deployment, &selection, &pull, &reviewed, now).unwrap();
+        assert_ne!(
+            baseline.reviewed_plan_digest,
+            baseline.operation_binding_digest
+        );
+
+        let mut digests = BTreeSet::new();
+        digests.insert(baseline.operation_binding_digest.clone());
+        for changed_pull in [
+            {
+                let mut value = pull.clone();
+                value.credential_epoch += 1;
+                value
+            },
+            {
+                let mut value = pull.clone();
+                value.execution_number += 1;
+                value
+            },
+            {
+                let mut value = pull.clone();
+                value.authority_epoch += 1;
+                value
+            },
+            {
+                let mut value = pull.clone();
+                value.plan_digest = format!("sha256:{}", "5".repeat(64));
+                value
+            },
+            {
+                let mut value = pull.clone();
+                value.predecessor_digest = format!("sha256:{}", "6".repeat(64));
+                value
+            },
+            {
+                let mut value = pull.clone();
+                value.context_digest = format!("sha256:{}", "7".repeat(64));
+                value
+            },
+        ] {
+            digests.insert(
+                launch_candidate(&deployment, &selection, &changed_pull, &reviewed, now)
+                    .unwrap()
+                    .operation_binding_digest,
+            );
+        }
+        let mut changed_intent = deployment.clone();
+        changed_intent.environment = "production-eu2".to_string();
+        digests.insert(
+            launch_candidate(&changed_intent, &selection, &pull, &reviewed, now)
+                .unwrap()
+                .operation_binding_digest,
+        );
+        changed_intent = deployment.clone();
+        changed_intent.artifact.release_sequence += 1;
+        digests.insert(
+            launch_candidate(&changed_intent, &selection, &pull, &reviewed, now)
+                .unwrap()
+                .operation_binding_digest,
+        );
+        let changed_selection = DelegatedLaunchSelection {
+            target_ref: format!("sha256:{}", "b".repeat(64)),
+        };
+        digests.insert(
+            launch_candidate(&deployment, &changed_selection, &pull, &reviewed, now)
+                .unwrap()
+                .operation_binding_digest,
+        );
+        digests.insert(
+            launch_candidate(
+                &deployment,
+                &selection,
+                &pull,
+                &format!("sha256:{}", "c".repeat(64)),
+                now,
+            )
+            .unwrap()
+            .operation_binding_digest,
+        );
+        assert_eq!(digests.len(), 11);
+    }
+
+    #[test]
+    fn admission_validation_rejects_echo_pull_and_expiry_drift() {
+        let now = now_unix();
+        let actions = HostActionStore::new(None);
+        let job = ready_update_with_id(&actions, "action-update-restart-hsb8-admission", now - 10);
+        let mut deployment = intent(
+            DEPLOYMENT_HANDOFF,
+            PathBuf::from("/private/delegated-secret"),
+            IntentStage::Deployment,
+        );
+        let selection = DelegatedLaunchSelection {
+            target_ref: format!("sha256:{}", "a".repeat(64)),
+        };
+        deployment.delegated_launch = Some(selection.clone());
+        let mut pull = test_pull(
+            DEPLOYMENT_HANDOFF,
+            "deployment",
+            &format!("sha256:{}", "3".repeat(64)),
+        );
+        pull.expires_at = format_timestamp(now + 1_000).unwrap();
+        let candidate = launch_candidate(
+            &deployment,
+            &selection,
+            &pull,
+            &reviewed_plan_digest(&job).unwrap(),
+            now,
+        )
+        .unwrap();
+        let admission = test_launch_admission(&candidate, &pull, now);
+        admission
+            .validate(DEPLOYMENT_HANDOFF, &candidate, &pull, now)
+            .unwrap();
+
+        let mut variants = Vec::new();
+        let mut changed = admission.clone();
+        changed.target_ref = format!("sha256:{}", "b".repeat(64));
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.environment = "production-eu2".to_string();
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.artifact.release_sequence += 1;
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.credential_epoch += 1;
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.execution += 1;
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.authority += 1;
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.plan_digest = format!("sha256:{}", "5".repeat(64));
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.reviewed_plan_digest = format!("sha256:{}", "6".repeat(64));
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.expires_at = format_timestamp(now).unwrap();
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.max_launches = 2;
+        variants.push(changed);
+        let mut changed = admission.clone();
+        changed.state = "consumed".to_string();
+        variants.push(changed);
+        assert!(variants.iter().all(|changed| changed
+            .validate(DEPLOYMENT_HANDOFF, &candidate, &pull, now)
+            .is_err()));
+
+        let bytes = serde_json::to_vec(&admission).unwrap();
+        let mut unknown = bytes[..bytes.len() - 1].to_vec();
+        unknown.extend_from_slice(b",\"callback\":\"https://invalid.example\"}");
+        assert!(decode_strict::<LaunchAdmission>(&unknown).is_err());
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(b" {}");
+        assert!(decode_strict::<LaunchAdmission>(&trailing).is_err());
+        let mut duplicate = br#"{"schema":"paimos.external-stage-launch-admission","#.to_vec();
+        duplicate.extend_from_slice(&bytes[1..]);
+        assert!(decode_strict::<LaunchAdmission>(&duplicate).is_err());
+        let receipt_bytes = serde_json::to_vec(&LaunchReceipt {
+            schema: LAUNCH_SCHEMA.to_string(),
+            version: LAUNCH_VERSION,
+            admission_id: admission.admission_id.clone(),
+            admission_digest: admission.admission_digest.clone(),
+            handoff_id: admission.handoff_id.clone(),
+            credential_epoch: admission.credential_epoch,
+            launch_number: 1,
+            state: "consumed".to_string(),
+            consumed_at: admission.issued_at.clone(),
+        })
+        .unwrap();
+        assert!(decode_strict::<LaunchAdmission>(&receipt_bytes).is_err());
+        assert!(decode_strict::<LaunchReceipt>(&bytes).is_err());
+
+        let credentials = Credentials {
+            api_key: API_KEY_SENTINEL.to_vec(),
+            handoff_secret: HANDOFF_SENTINEL.to_vec(),
+        };
+        assert!(reject_reflected_bytes(API_KEY_SENTINEL, &credentials, "").is_err());
+        assert!(reject_reflected_bytes(HANDOFF_SENTINEL, &credentials, "").is_err());
+        assert!(reject_reflected_bytes(b"candidate-idem", &credentials, "candidate-idem").is_err());
+    }
+
+    #[test]
+    fn durable_consumed_receipt_finishes_only_the_same_pending_transition_once() {
+        let now = now_unix();
+        let directory = temporary_directory("launch-receipt-restart");
+        let actions_path = directory.join("host-actions.json");
+        let journal_path = directory.join("journal.json");
+        let api_path = directory.join("api-key");
+        write_private(&api_path, API_KEY_SENTINEL);
+        let actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        let job_id = "action-update-restart-hsb8-receipt";
+        let job = ready_update_with_id(&actions, job_id, now);
+        let origin = Url::parse("https://paimos.example.test").unwrap();
+        let mut deployment = intent(
+            DEPLOYMENT_HANDOFF,
+            PathBuf::from("/private/delegated-secret"),
+            IntentStage::Deployment,
+        );
+        let selection = DelegatedLaunchSelection {
+            target_ref: format!("sha256:{}", "a".repeat(64)),
+        };
+        deployment.delegated_launch = Some(selection.clone());
+        let mut pull = test_pull(
+            DEPLOYMENT_HANDOFF,
+            "deployment",
+            &format!("sha256:{}", "3".repeat(64)),
+        );
+        pull.expires_at = format_timestamp(now + 1_000).unwrap();
+        let operation = OperationBinding {
+            handoff_id: DEPLOYMENT_HANDOFF.to_string(),
+            job_id: job_id.to_string(),
+            host: "hsb8".to_string(),
+            workflow: LAUNCH_WORKFLOW.to_string(),
+            environment: deployment.environment.clone(),
+            artifact: deployment.artifact.clone(),
+            plan_digest: pull.plan_digest.clone(),
+            predecessor_digest: pull.predecessor_digest.clone(),
+            authority_epoch: pull.authority_epoch,
+            execution_number: pull.execution_number,
+            context_digest: pull.context_digest.clone(),
+            operation_id: operation_identity(&deployment, &origin, &pull).unwrap(),
+        };
+        let journal = JournalStore::new(journal_path.clone()).unwrap();
+        journal.persist_operation(operation).unwrap();
+        let candidate = launch_candidate(
+            &deployment,
+            &selection,
+            &pull,
+            &reviewed_plan_digest(&job).unwrap(),
+            now + 3,
+        )
+        .unwrap();
+        let record = journal
+            .ensure_launch(
+                LaunchJournalRecord::new(&deployment, &origin, job_id, &candidate).unwrap(),
+            )
+            .unwrap();
+        let candidate_bytes = record.candidate_body_json.clone();
+        let candidate_key = record.candidate_idempotency_key.clone();
+        drop(journal);
+        let journal = JournalStore::new(journal_path.clone()).unwrap();
+        let record = journal.launch(DEPLOYMENT_HANDOFF).unwrap();
+        assert_eq!(record.candidate_body_json, candidate_bytes);
+        assert_eq!(record.candidate_idempotency_key, candidate_key);
+        let mut different_candidate = candidate.clone();
+        different_candidate.observed_at = format_timestamp(now + 4).unwrap();
+        let different_record =
+            LaunchJournalRecord::new(&deployment, &origin, job_id, &different_candidate).unwrap();
+        assert!(matches!(
+            journal.ensure_launch(different_record),
+            Err(AdapterError::LocalBinding)
+        ));
+        let admission = test_launch_admission(&candidate, &pull, now + 3);
+        let record = journal
+            .acknowledge_launch_admission(&record, admission.clone())
+            .unwrap();
+        let consume_bytes = record.consume_body_json.clone().unwrap();
+        let consume_key = record.consume_idempotency_key.clone().unwrap();
+        drop(journal);
+        let journal = JournalStore::new(journal_path.clone()).unwrap();
+        let record = journal.launch(DEPLOYMENT_HANDOFF).unwrap();
+        assert_eq!(
+            record.consume_body_json.as_deref(),
+            Some(consume_bytes.as_str())
+        );
+        assert_eq!(
+            record.consume_idempotency_key.as_deref(),
+            Some(consume_key.as_str())
+        );
+        let record = journal.mark_launch_consume_started(&record).unwrap();
+        let receipt = LaunchReceipt {
+            schema: LAUNCH_SCHEMA.to_string(),
+            version: LAUNCH_VERSION,
+            admission_id: admission.admission_id.clone(),
+            admission_digest: admission.admission_digest.clone(),
+            handoff_id: DEPLOYMENT_HANDOFF.to_string(),
+            credential_epoch: pull.credential_epoch,
+            launch_number: 1,
+            state: "consumed".to_string(),
+            consumed_at: format_timestamp(now + 4).unwrap(),
+        };
+        journal
+            .acknowledge_launch_receipt(&record, receipt)
+            .unwrap();
+        drop(journal);
+        drop(actions);
+
+        let restarted_actions = Arc::new(HostActionStore::new(Some(actions_path)));
+        let adapter = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            journal_path,
+            Arc::new(Store::new(None).unwrap()),
+            restarted_actions.clone(),
+        );
+        let durable = adapter.journal.launch(DEPLOYMENT_HANDOFF).unwrap();
+        adapter
+            .finish_delegated_confirmation(&deployment, &durable)
+            .unwrap();
+        adapter
+            .finish_delegated_confirmation(&deployment, &durable)
+            .unwrap();
+        let queued = restarted_actions.get(job_id).unwrap();
+        assert_eq!(queued.state, HostActionState::QueuedApply);
+        assert_eq!(
+            queued
+                .events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            queued.events.last().unwrap().source,
+            HostActionEventSource::Pharos
+        );
+        assert_eq!(restarted_actions.list().len(), 1);
+    }
+
     #[tokio::test]
     async fn accept_creates_one_guarded_update_and_replays_the_same_job() {
         let now = now_unix();
@@ -3316,6 +5595,117 @@ mod tests {
             .filter(|capture| capture.method == "POST")
             .count();
         assert_eq!(posts, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delegated_launch_is_default_off_then_consumes_once_and_only_queues_existing_job() {
+        let now = now_unix();
+        let directory = temporary_directory("delegated-launch");
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        let journal_path = directory.join("journal.json");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let fake = FakePaimos::new(now);
+        let (origin, server) = serve_fake(fake.clone()).await;
+        let actions = Arc::new(HostActionStore::new(None));
+        let hosts = Arc::new(Store::new(None).unwrap());
+
+        let attended = intent(
+            VERIFICATION_HANDOFF,
+            directory.join("unused-secret"),
+            IntentStage::Verification,
+        );
+        assert!(attended.delegated_launch.is_none());
+
+        let mut deployment = intent(DEPLOYMENT_HANDOFF, secret_path, IntentStage::Deployment);
+        deployment.delegated_launch = Some(DelegatedLaunchSelection {
+            target_ref: format!("sha256:{}", "a".repeat(64)),
+        });
+        let adapter = test_adapter(
+            config(origin, api_path, vec![deployment.clone()]),
+            journal_path.clone(),
+            hosts,
+            actions.clone(),
+        );
+
+        adapter.process_intent(&deployment).await.unwrap();
+        let operation = adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("accepted handoff binds one exact job");
+        assert_eq!(actions.list().len(), 1);
+        assert_eq!(
+            actions.get(&operation.job_id).unwrap().state,
+            HostActionState::QueuedReview
+        );
+        assert!(adapter.journal.launch(DEPLOYMENT_HANDOFF).is_none());
+
+        review_existing_update(&actions, &operation.job_id, now + 1);
+        adapter.process_intent(&deployment).await.unwrap();
+
+        let queued = actions.get(&operation.job_id).unwrap();
+        assert_eq!(queued.state, HostActionState::QueuedApply);
+        assert_eq!(actions.list().len(), 1);
+        let confirmation = queued.events.last().expect("delegated confirmation event");
+        assert_eq!(confirmation.kind, HostActionEventKind::Confirmed);
+        assert_eq!(confirmation.source, HostActionEventSource::Pharos);
+        assert_eq!(
+            confirmation.actor.as_deref(),
+            Some("20600000-0000-4000-8000-000000000002")
+        );
+
+        let launch = adapter
+            .journal
+            .launch(DEPLOYMENT_HANDOFF)
+            .expect("durable launch journal");
+        assert!(launch.valid());
+        assert!(launch.consume_started);
+        assert!(launch.receipt.is_some());
+        let durable = std::fs::read(&journal_path).unwrap();
+        assert!(!contains_slice(&durable, API_KEY_SENTINEL));
+        assert!(!contains_slice(&durable, HANDOFF_SENTINEL));
+
+        {
+            let captures = fake.captures.lock().unwrap();
+            let candidates: Vec<_> = captures
+                .iter()
+                .filter(|capture| capture.path.ends_with("/launch-candidates"))
+                .collect();
+            let consumes: Vec<_> = captures
+                .iter()
+                .filter(|capture| capture.path.ends_with("/consume"))
+                .collect();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(consumes.len(), 1);
+            assert_eq!(candidates[0].content_type, LAUNCH_MEDIA_TYPE);
+            assert_eq!(candidates[0].accept, LAUNCH_MEDIA_TYPE);
+            assert_eq!(candidates[0].body, launch.candidate_body_json.as_bytes());
+            assert_eq!(
+                candidates[0].idempotency_key,
+                launch.candidate_idempotency_key
+            );
+            assert_eq!(consumes[0].content_type, LAUNCH_MEDIA_TYPE);
+            assert_eq!(consumes[0].accept, LAUNCH_MEDIA_TYPE);
+            assert_eq!(
+                consumes[0].body,
+                launch.consume_body_json.as_deref().unwrap().as_bytes()
+            );
+        }
+
+        adapter.process_intent(&deployment).await.unwrap();
+        assert_eq!(actions.list().len(), 1);
+        assert_eq!(
+            actions
+                .get(&operation.job_id)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.kind == HostActionEventKind::Confirmed)
+                .count(),
+            1
+        );
         server.abort();
     }
 
