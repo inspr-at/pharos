@@ -20,7 +20,7 @@
       "additionalProperties": false,
       "required": ["version_scheme", "version", "release_channel", "release_sequence", "digest", "commit_digest", "release_manifest_coordinate", "release_manifest_digest"],
       "properties": {
-        "version_scheme": {"type": "string", "enum": ["legacy", "inspr-calendar-v1"]},
+        "version_scheme": {"type": "string", "enum": ["legacy", "inspr-calendar-v1", "inspr-calendar-v2"]},
         "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
         "release_channel": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
         "release_sequence": {"type": "integer", "format": "int64", "minimum": 0},

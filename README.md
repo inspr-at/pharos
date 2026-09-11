@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-260911012118.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260911173640.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,7 +51,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v260911012118.0.0
+## What ships in v260911173640.0.0
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -856,12 +856,15 @@ reject startup. The bundled contract verifier is
 `scripts/check-paimos-delivery-contract.sh`. Janus remains a separate v1
 dependency fixture and is never the deployment owner. Paimos still owns
 CreateHandoff as a producer follow-up; this adapter does not create handoffs.
-The bundled launch-admission v1 schema and four fixtures are pinned to reviewed
-Paimos source candidate `90e34fa0d5dc9b6e59b62a9021138706cd73af84` (integrated
-documentation `05d21cf4aa6d7d871ea8c03552208a50fcbdb323`) and deliberately record
-no Paimos release. Before release or activation, the coordinator must replace
-that candidate metadata with the exact published Paimos release/merge pin and
-rerun the contract gate.
+The bundled launch-admission v1 schema and four fixtures are pinned byte-exact
+to Paimos's protected release merge
+`b3e4634af72fa2d1fec51b3d8ca8b7ced2e95270`, whose tree matches approved
+release source `f3592475`, for release `v260911172741.0.0`. That immutable tag
+is published and admitted at OCI index digest
+`sha256:3143fe79fb72ba1f1ef8fef4380e2ca5285ee011058d6f4f3e9e3da10e9d2155`,
+with verified signature, SBOM attestations and provenance. This exact supply-chain
+pin does not by itself claim that the artifact has been deployed or observed at
+runtime.
 
 The in-process conformance harness injects its loopback URL directly into a
 test-only configuration value; the production config parser never accepts
@@ -884,7 +887,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v260911012118.0.0**. It is already used as a real
+Pharos is an active early release at **v260911173640.0.0**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 

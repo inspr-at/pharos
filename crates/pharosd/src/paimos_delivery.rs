@@ -3928,7 +3928,7 @@ mod tests {
         assert_eq!(dependency.len(), 1115);
         assert_eq!(owner.len(), 5780);
         assert_eq!(schema.len(), 10380);
-        assert_eq!(launch_schema.len(), 6738);
+        assert_eq!(launch_schema.len(), 6759);
         assert_eq!(launch_candidate.len(), 909);
         assert_eq!(launch_admission.len(), 1707);
         assert_eq!(launch_consume.len(), 157);
@@ -3945,7 +3945,7 @@ mod tests {
         for (bytes, expected) in [
             (
                 launch_schema.as_slice(),
-                "6c7ac4984affdd0ead93091cf02b9c522b83ca5fdc56ab81c80507e547f7a066",
+                "3b15130cddc9461d038f06332f066220274c265bfd15a3d2aaa636b8b229415c",
             ),
             (
                 launch_candidate.as_slice(),
@@ -3990,11 +3990,25 @@ mod tests {
             .windows(b"janus_evidence".len())
             .all(|window| window != b"janus_evidence"));
         let launch_manifest: Value = decode_strict(launch_manifest).unwrap();
-        assert_eq!(launch_manifest["source_status"], "source-candidate");
-        assert_eq!(launch_manifest["paimos_release"], Value::Null);
+        assert_eq!(launch_manifest["source_status"], "released");
+        assert_eq!(launch_manifest["artifact_status"], "published-admitted");
+        assert_eq!(launch_manifest["paimos_release"], "v260911172741.0.0");
+        assert_eq!(launch_manifest["paimos_image"], "ghcr.io/inspr-at/paimos");
+        assert_eq!(
+            launch_manifest["paimos_image_index_digest"],
+            "sha256:3143fe79fb72ba1f1ef8fef4380e2ca5285ee011058d6f4f3e9e3da10e9d2155"
+        );
         assert_eq!(
             launch_manifest["paimos_source_commit"],
-            "90e34fa0d5dc9b6e59b62a9021138706cd73af84"
+            "b3e4634af72fa2d1fec51b3d8ca8b7ced2e95270"
+        );
+        assert_eq!(
+            launch_manifest["paimos_integration_commit"],
+            "b3e4634af72fa2d1fec51b3d8ca8b7ced2e95270"
+        );
+        assert_eq!(
+            launch_manifest["schema_sha256"],
+            "3b15130cddc9461d038f06332f066220274c265bfd15a3d2aaa636b8b229415c"
         );
         let fixture_candidate: LaunchCandidate = decode_strict(launch_candidate).unwrap();
         let fixture_admission: LaunchAdmission = decode_strict(launch_admission).unwrap();
