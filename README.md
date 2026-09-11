@@ -825,12 +825,18 @@ public service endpoints. The CLI has no write command and never calls
 
 See the committed Compose files and NixOS module for the complete wiring.
 
-The Paimos adapter retains the closed
-`inspr.pharos.paimos-delivery-adapter.v2` schema unchanged and adds
-`inspr.pharos.paimos-delivery-adapter.v3` solely for the optional deployment
-field `"delegated_launch":{"target_ref":"sha256:…"}`. Absence preserves the
-attended behavior. It requires a credential-free HTTPS
-origin, `poll_interval_secs` from 5–3600,
+The Paimos adapter accepts an optional top-level `"paimos_ca_file":"…"` in
+both `inspr.pharos.paimos-delivery-adapter.v2` and v3. When absent, the existing
+bundled WebPKI roots remain unchanged. When present, the path must identify a
+mounted, owner-selected regular file with current-user ownership, mode `0600`,
+one link, at most 256 KiB, and 1–32 PEM `CERTIFICATE` blocks with no keys or
+other content. Those roots are added only to this adapter's client; certificate
+chain, hostname and time checks remain enabled, redirects remain disabled, and
+requests remain confined to the exact configured HTTPS origin. The v3 schema
+additionally permits only the optional deployment field
+`"delegated_launch":{"target_ref":"sha256:…"}`; its absence preserves the
+attended behavior. The adapter requires a credential-free HTTPS origin,
+`poll_interval_secs` from 5–3600,
 `verification_freshness_secs` from 30–900, one `api_key_file`, and 1–128 strict
 intents. A deployment intent has `stage: "deployment"`,
 `workflow: "deploy-production"` and either omits `update_restart_job_id` to

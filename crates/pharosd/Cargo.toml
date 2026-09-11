@@ -45,3 +45,4 @@ async-compression = { version = "0.4", default-features = false, features = ["br
 rand = "=0.8.6"
 rsa = { version = "=0.9.10", features = ["sha2"] }
 tokio = { workspace = true, features = ["io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

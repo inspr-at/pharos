@@ -77,6 +77,8 @@ const HANDOFF_SECRET_BYTES: usize = 32;
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_API_KEY_BYTES: u64 = 512;
+const MAX_CA_BUNDLE_BYTES: u64 = 256 * 1024;
+const MAX_CA_CERTIFICATES: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_INTENTS: usize = 128;
 const MAX_JOURNAL_RECORDS: usize = MAX_INTENTS * 2;
@@ -88,6 +90,7 @@ const GUARDED_ACTOR: &str = "paimos-delivery";
 enum AdapterError {
     Configuration,
     Credential,
+    Trust,
     Contract,
     Journal,
     LocalBinding,
@@ -100,6 +103,7 @@ impl AdapterError {
         match self {
             Self::Configuration => "configuration_invalid",
             Self::Credential => "credential_unavailable",
+            Self::Trust => "trust_configuration_invalid",
             Self::Contract => "contract_refused",
             Self::Journal => "journal_unavailable",
             Self::LocalBinding => "local_binding_refused",
@@ -329,6 +333,8 @@ struct ConfigDocumentV2 {
     _schema_version: u16,
     paimos_origin: String,
     api_key_file: PathBuf,
+    #[serde(default)]
+    paimos_ca_file: Option<PathBuf>,
     poll_interval_secs: u64,
     verification_freshness_secs: i64,
     intents: Vec<DeliveryIntentV2>,
@@ -343,6 +349,8 @@ struct ConfigDocumentV3 {
     _schema_version: u16,
     paimos_origin: String,
     api_key_file: PathBuf,
+    #[serde(default)]
+    paimos_ca_file: Option<PathBuf>,
     poll_interval_secs: u64,
     verification_freshness_secs: i64,
     intents: Vec<DeliveryIntent>,
@@ -384,6 +392,7 @@ impl From<DeliveryIntentV2> for DeliveryIntent {
 struct AdapterConfig {
     paimos_origin: Url,
     api_key_file: PathBuf,
+    paimos_ca_certificates: Vec<reqwest::Certificate>,
     poll_interval: Duration,
     verification_freshness_secs: i64,
     intents: Vec<DeliveryIntent>,
@@ -391,35 +400,43 @@ struct AdapterConfig {
 
 impl AdapterConfig {
     fn load(path: &Path) -> Result<Self, AdapterError> {
-        let (bytes, _) = read_private_file(path, MAX_CONFIG_BYTES, None)?;
+        let (bytes, config_identity) = read_private_file(path, MAX_CONFIG_BYTES, None)?;
         let probe: ConfigVersionProbe =
             decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
-        let (paimos_origin, api_key_file, poll_interval_secs, verification_freshness_secs, intents) =
-            match (probe.schema.as_str(), probe.schema_version) {
-                (CONFIG_SCHEMA_V2, CONFIG_SCHEMA_VERSION_V2) => {
-                    let document: ConfigDocumentV2 =
-                        decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
-                    (
-                        document.paimos_origin,
-                        document.api_key_file,
-                        document.poll_interval_secs,
-                        document.verification_freshness_secs,
-                        document.intents.into_iter().map(Into::into).collect(),
-                    )
-                }
-                (CONFIG_SCHEMA_V3, CONFIG_SCHEMA_VERSION_V3) => {
-                    let document: ConfigDocumentV3 =
-                        decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
-                    (
-                        document.paimos_origin,
-                        document.api_key_file,
-                        document.poll_interval_secs,
-                        document.verification_freshness_secs,
-                        document.intents,
-                    )
-                }
-                _ => return Err(AdapterError::Configuration),
-            };
+        let (
+            paimos_origin,
+            api_key_file,
+            paimos_ca_file,
+            poll_interval_secs,
+            verification_freshness_secs,
+            intents,
+        ) = match (probe.schema.as_str(), probe.schema_version) {
+            (CONFIG_SCHEMA_V2, CONFIG_SCHEMA_VERSION_V2) => {
+                let document: ConfigDocumentV2 =
+                    decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
+                (
+                    document.paimos_origin,
+                    document.api_key_file,
+                    document.paimos_ca_file,
+                    document.poll_interval_secs,
+                    document.verification_freshness_secs,
+                    document.intents.into_iter().map(Into::into).collect(),
+                )
+            }
+            (CONFIG_SCHEMA_V3, CONFIG_SCHEMA_VERSION_V3) => {
+                let document: ConfigDocumentV3 =
+                    decode_strict(&bytes).map_err(|_| AdapterError::Configuration)?;
+                (
+                    document.paimos_origin,
+                    document.api_key_file,
+                    document.paimos_ca_file,
+                    document.poll_interval_secs,
+                    document.verification_freshness_secs,
+                    document.intents,
+                )
+            }
+            _ => return Err(AdapterError::Configuration),
+        };
         if !(5..=3600).contains(&poll_interval_secs)
             || !(30..=900).contains(&verification_freshness_secs)
             || intents.is_empty()
@@ -429,6 +446,13 @@ impl AdapterConfig {
             return Err(AdapterError::Configuration);
         }
         let paimos_origin = parse_origin(&paimos_origin)?;
+        let (paimos_ca_certificates, ca_identity) = match paimos_ca_file {
+            Some(path) => {
+                let (certificates, identity) = load_ca_certificates(&path)?;
+                (certificates, Some(identity))
+            }
+            None => (Vec::new(), None),
+        };
         let (mut api_key, api_identity) =
             read_private_file(&api_key_file, MAX_API_KEY_BYTES, None)?;
         let api_key_valid =
@@ -439,7 +463,11 @@ impl AdapterConfig {
         }
         let mut handoff_ids = BTreeSet::new();
         let mut credential_files = BTreeSet::new();
+        credential_files.insert(config_identity);
         credential_files.insert(api_identity);
+        if ca_identity.is_some_and(|identity| !credential_files.insert(identity)) {
+            return Err(AdapterError::Trust);
+        }
         for intent in &intents {
             if !handoff_ids.insert(intent.handoff_id.clone()) {
                 return Err(AdapterError::Configuration);
@@ -474,6 +502,7 @@ impl AdapterConfig {
         Ok(Self {
             paimos_origin,
             api_key_file,
+            paimos_ca_certificates,
             poll_interval: Duration::from_secs(poll_interval_secs),
             verification_freshness_secs,
             intents,
@@ -1533,17 +1562,31 @@ struct PaimosClient {
 }
 
 impl PaimosClient {
-    fn new(origin: Url, api_key_file: PathBuf) -> Result<Self, AdapterError> {
-        let client = reqwest::Client::builder()
+    fn new(
+        origin: Url,
+        api_key_file: PathBuf,
+        root_certificates: &[reqwest::Certificate],
+    ) -> Result<Self, AdapterError> {
+        let has_custom_roots = !root_certificates.is_empty();
+        let mut builder = reqwest::Client::builder()
             .no_gzip()
             .no_brotli()
             .no_zstd()
             .no_deflate()
+            .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|_| AdapterError::Configuration)?;
+            .timeout(REQUEST_TIMEOUT);
+        for certificate in root_certificates {
+            builder = builder.add_root_certificate(certificate.clone());
+        }
+        let client = builder.build().map_err(|_| {
+            if has_custom_roots {
+                AdapterError::Trust
+            } else {
+                AdapterError::Configuration
+            }
+        })?;
         Ok(Self {
             origin,
             api_key_file,
@@ -1827,8 +1870,12 @@ impl PaimosDeliveryAdapter {
         let journal_path = derived_journal_path(host_store_path);
         let journal = JournalStore::new(journal_path)
             .map_err(|error| format!("Paimos delivery adapter startup failed: {error}"))?;
-        let paimos = PaimosClient::new(config.paimos_origin.clone(), config.api_key_file.clone())
-            .map_err(|error| format!("Paimos delivery adapter startup failed: {error}"))?;
+        let paimos = PaimosClient::new(
+            config.paimos_origin.clone(),
+            config.api_key_file.clone(),
+            &config.paimos_ca_certificates,
+        )
+        .map_err(|error| format!("Paimos delivery adapter startup failed: {error}"))?;
         tracing::info!(
             paimos_release = PAIMOS_RELEASE,
             paimos_commit = PAIMOS_CERTIFIED_COMMIT,
@@ -2503,6 +2550,71 @@ fn read_private_file(
     Ok((bytes, before))
 }
 
+fn load_ca_certificates(
+    path: &Path,
+) -> Result<(Vec<reqwest::Certificate>, FileIdentity), AdapterError> {
+    let (mut bytes, identity) =
+        read_private_file(path, MAX_CA_BUNDLE_BYTES, None).map_err(|_| AdapterError::Trust)?;
+    let result = parse_ca_certificates(&bytes).map(|certificates| (certificates, identity));
+    bytes.fill(0);
+    result
+}
+
+fn parse_ca_certificates(bytes: &[u8]) -> Result<Vec<reqwest::Certificate>, AdapterError> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let text = std::str::from_utf8(bytes).map_err(|_| AdapterError::Trust)?;
+    if !text.is_ascii() {
+        return Err(AdapterError::Trust);
+    }
+    let mut in_certificate = false;
+    let mut payload_line_seen = false;
+    let mut block_count = 0usize;
+    for line in text.lines() {
+        if !in_certificate {
+            if line.is_empty() {
+                continue;
+            }
+            if line != BEGIN {
+                return Err(AdapterError::Trust);
+            }
+            in_certificate = true;
+            payload_line_seen = false;
+            continue;
+        }
+        if line == END {
+            if !payload_line_seen {
+                return Err(AdapterError::Trust);
+            }
+            block_count += 1;
+            if block_count > MAX_CA_CERTIFICATES {
+                return Err(AdapterError::Trust);
+            }
+            in_certificate = false;
+            continue;
+        }
+        if line.is_empty()
+            || line.len() > 76
+            || !line
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        {
+            return Err(AdapterError::Trust);
+        }
+        payload_line_seen = true;
+    }
+    if in_certificate || block_count == 0 {
+        return Err(AdapterError::Trust);
+    }
+    let certificates =
+        reqwest::Certificate::from_pem_bundle(bytes).map_err(|_| AdapterError::Trust)?;
+    if certificates.len() != block_count {
+        return Err(AdapterError::Trust);
+    }
+    Ok(certificates)
+}
+
 fn private_file_metadata(
     file: &File,
     max_bytes: u64,
@@ -2940,7 +3052,7 @@ mod tests {
         HOST_REPORT_VERSION, NIX_DEPLOYMENT_EVIDENCE_SCHEMA, NIX_DEPLOYMENT_EVIDENCE_VERSION,
     };
     use serde_json::{json, Value};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::host_actions::{
         AgentActionOutcome, AgentActionPhase, AgentActionResultRequest, HostActionEventKind,
@@ -2971,6 +3083,219 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .expect("secure private test file");
         }
+    }
+
+    struct TestTlsMaterial {
+        ca_path: PathBuf,
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+    }
+
+    fn run_test_openssl(directory: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("openssl")
+            .current_dir(directory)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("OpenSSL is required to generate ephemeral TLS test certificates");
+        assert!(
+            status.success(),
+            "ephemeral TLS certificate generation failed"
+        );
+    }
+
+    fn generate_test_ca(directory: &Path) -> PathBuf {
+        std::fs::create_dir(directory).expect("create test CA directory");
+        run_test_openssl(
+            directory,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+                "-subj",
+                "/CN=Pharos ephemeral test CA",
+                "-days",
+                "2",
+                "-sha256",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+            ],
+        );
+        let ca_path = directory.join("ca.pem");
+        let ca_bytes = std::fs::read(&ca_path).expect("read generated test CA");
+        write_private(&ca_path, &ca_bytes);
+        ca_path
+    }
+
+    fn generate_test_tls_material(directory: &Path) -> TestTlsMaterial {
+        let ca_directory = directory.join("trusted-ca");
+        let ca_path = generate_test_ca(&ca_directory);
+        let server_directory = directory.join("server");
+        std::fs::create_dir(&server_directory).expect("create test server directory");
+        run_test_openssl(
+            &server_directory,
+            &[
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                "server.key",
+                "-out",
+                "server.csr",
+                "-subj",
+                "/CN=localhost",
+            ],
+        );
+        std::fs::write(
+            server_directory.join("server.ext"),
+            b"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n",
+        )
+        .expect("write ephemeral server extensions");
+        let ca_path_text = ca_path.to_str().expect("test CA path is UTF-8");
+        let ca_key = ca_directory.join("ca.key");
+        let ca_key_text = ca_key.to_str().expect("test CA key path is UTF-8");
+        run_test_openssl(
+            &server_directory,
+            &[
+                "x509",
+                "-req",
+                "-in",
+                "server.csr",
+                "-CA",
+                ca_path_text,
+                "-CAkey",
+                ca_key_text,
+                "-CAcreateserial",
+                "-out",
+                "server.pem",
+                "-days",
+                "2",
+                "-sha256",
+                "-extfile",
+                "server.ext",
+            ],
+        );
+        run_test_openssl(
+            &server_directory,
+            &[
+                "x509",
+                "-in",
+                "server.pem",
+                "-outform",
+                "DER",
+                "-out",
+                "server.der",
+            ],
+        );
+        run_test_openssl(
+            &server_directory,
+            &[
+                "pkcs8",
+                "-topk8",
+                "-nocrypt",
+                "-in",
+                "server.key",
+                "-outform",
+                "DER",
+                "-out",
+                "server-key.der",
+            ],
+        );
+        TestTlsMaterial {
+            ca_path,
+            certificate_der: std::fs::read(server_directory.join("server.der"))
+                .expect("read ephemeral server certificate"),
+            private_key_der: std::fs::read(server_directory.join("server-key.der"))
+                .expect("read ephemeral server key"),
+        }
+    }
+
+    async fn serve_test_https(
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+        request_hostname: &str,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate_der)],
+                PrivatePkcs8KeyDer::from(private_key_der).into(),
+            )
+            .expect("ephemeral TLS server configuration");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral TLS server");
+        let port = listener.local_addr().expect("TLS listener address").port();
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while request.len() <= 16 * 1024 {
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+        (
+            Url::parse(&format!("https://{request_hostname}:{port}"))
+                .expect("ephemeral HTTPS origin"),
+            task,
+        )
+    }
+
+    async fn test_https_request(
+        origin: Url,
+        root_certificates: &[reqwest::Certificate],
+    ) -> Result<StatusCode, AdapterError> {
+        let client = PaimosClient::new(
+            origin,
+            PathBuf::from("unused-test-api-key"),
+            root_certificates,
+        )?;
+        let credentials = Credentials {
+            api_key: API_KEY_SENTINEL.to_vec(),
+            handoff_secret: HANDOFF_SENTINEL.to_vec(),
+        };
+        client
+            .request(
+                Method::GET,
+                "/",
+                CONTRACT_MEDIA_TYPE,
+                None,
+                None,
+                &credentials,
+            )
+            .await
+            .map(|response| response.status())
     }
 
     fn artifact() -> ArtifactEvidence {
@@ -3107,6 +3432,7 @@ mod tests {
         AdapterConfig {
             paimos_origin: origin,
             api_key_file,
+            paimos_ca_certificates: Vec::new(),
             poll_interval: Duration::from_secs(5),
             verification_freshness_secs: 300,
             intents,
@@ -3525,8 +3851,12 @@ mod tests {
         actions: Arc<HostActionStore>,
     ) -> PaimosDeliveryAdapter {
         let journal = JournalStore::new(journal_path).expect("test journal");
-        let paimos = PaimosClient::new(config.paimos_origin.clone(), config.api_key_file.clone())
-            .expect("test Paimos client");
+        let paimos = PaimosClient::new(
+            config.paimos_origin.clone(),
+            config.api_key_file.clone(),
+            &config.paimos_ca_certificates,
+        )
+        .expect("test Paimos client");
         PaimosDeliveryAdapter {
             config,
             journal,
@@ -3835,6 +4165,166 @@ mod tests {
                 Err(AdapterError::Credential)
             ));
         }
+    }
+
+    #[test]
+    fn optional_paimos_ca_file_is_strict_bounded_and_protected() {
+        let directory = temporary_directory("custom-ca-config");
+        let material = generate_test_tls_material(&directory);
+        let api_path = directory.join("api-key");
+        let secret_path = directory.join("handoff-secret");
+        let config_path = directory.join("adapter.json");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&secret_path, HANDOFF_SENTINEL);
+        let mut document = json!({
+            "schema": CONFIG_SCHEMA_V2,
+            "schema_version": CONFIG_SCHEMA_VERSION_V2,
+            "paimos_origin": "https://paimos.example.test",
+            "paimos_ca_file": material.ca_path,
+            "api_key_file": api_path,
+            "poll_interval_secs": 5,
+            "verification_freshness_secs": 300,
+            "intents": [{
+                "handoff_id": DEPLOYMENT_HANDOFF,
+                "handoff_secret_file": secret_path,
+                "stage": "deployment",
+                "workflow": "deploy-production",
+                "environment": "production-eu1",
+                "host": "hsb8",
+                "artifact": artifact(),
+                "update_restart_job_id": "action-update-restart-hsb8-placeholder"
+            }]
+        });
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        let configured = AdapterConfig::load(&config_path).expect("protected CA file loads");
+        assert_eq!(configured.paimos_ca_certificates.len(), 1);
+
+        document
+            .as_object_mut()
+            .expect("configuration object")
+            .remove("paimos_ca_file");
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        let defaulted = AdapterConfig::load(&config_path).expect("CA file remains optional");
+        assert!(defaulted.paimos_ca_certificates.is_empty());
+
+        let invalid_ca = directory.join("invalid-ca.pem");
+        for bytes in [
+            b"not a PEM certificate".as_slice(),
+            b"-----BEGIN PRIVATE KEY-----\nYWJj\n-----END PRIVATE KEY-----\n".as_slice(),
+            b"unexpected\n-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"
+                .as_slice(),
+        ] {
+            write_private(&invalid_ca, bytes);
+            assert!(matches!(
+                load_ca_certificates(&invalid_ca),
+                Err(AdapterError::Trust)
+            ));
+        }
+
+        let mut certificate_and_key = std::fs::read(directory.join("trusted-ca").join("ca.pem"))
+            .expect("read ephemeral CA certificate");
+        certificate_and_key.extend_from_slice(
+            &std::fs::read(directory.join("trusted-ca").join("ca.key"))
+                .expect("read ephemeral CA key"),
+        );
+        write_private(&invalid_ca, &certificate_and_key);
+        certificate_and_key.fill(0);
+        assert!(matches!(
+            load_ca_certificates(&invalid_ca),
+            Err(AdapterError::Trust)
+        ));
+
+        let certificate = std::fs::read(directory.join("trusted-ca").join("ca.pem"))
+            .expect("read ephemeral CA certificate for count bound");
+        let too_many_certificates = certificate.repeat(MAX_CA_CERTIFICATES + 1);
+        write_private(&invalid_ca, &too_many_certificates);
+        assert!(matches!(
+            load_ca_certificates(&invalid_ca),
+            Err(AdapterError::Trust)
+        ));
+        let oversized = vec![b'A'; MAX_CA_BUNDLE_BYTES as usize + 1];
+        write_private(&invalid_ca, &oversized);
+        assert!(matches!(
+            load_ca_certificates(&invalid_ca),
+            Err(AdapterError::Trust)
+        ));
+
+        document["paimos_ca_file"] = json!(directory.join("missing-ca.pem"));
+        write_private(&config_path, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            AdapterConfig::load(&config_path),
+            Err(AdapterError::Trust)
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ca_path = directory.join("trusted-ca").join("ca.pem");
+            std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                load_ca_certificates(&ca_path),
+                Err(AdapterError::Trust)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_ca_https_preserves_chain_and_hostname_verification() {
+        let directory = temporary_directory("custom-ca-https");
+        let material = generate_test_tls_material(&directory);
+        let (trusted_roots, _) =
+            load_ca_certificates(&material.ca_path).expect("load ephemeral trusted CA");
+        let wrong_ca_path = generate_test_ca(&directory.join("wrong-ca"));
+        let (wrong_roots, _) =
+            load_ca_certificates(&wrong_ca_path).expect("load ephemeral wrong CA");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert_eq!(
+            test_https_request(origin, &trusted_roots).await.unwrap(),
+            StatusCode::OK
+        );
+        server.await.expect("matching-CA TLS server exits");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert!(matches!(
+            test_https_request(origin, &[]).await,
+            Err(AdapterError::Transport)
+        ));
+        server.await.expect("default-root TLS server exits");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert!(matches!(
+            test_https_request(origin, &wrong_roots).await,
+            Err(AdapterError::Transport)
+        ));
+        server.await.expect("wrong-CA TLS server exits");
+
+        let (origin, server) = serve_test_https(
+            material.certificate_der,
+            material.private_key_der,
+            "127.0.0.1",
+        )
+        .await;
+        assert!(matches!(
+            test_https_request(origin, &trusted_roots).await,
+            Err(AdapterError::Transport)
+        ));
+        server.await.expect("hostname-mismatch TLS server exits");
     }
 
     #[test]
