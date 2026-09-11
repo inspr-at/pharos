@@ -1573,7 +1573,6 @@ impl PaimosClient {
             .no_brotli()
             .no_zstd()
             .no_deflate()
-            .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(REQUEST_TIMEOUT);
@@ -3075,6 +3074,37 @@ mod tests {
         path
     }
 
+    struct TestDirectoryGuard {
+        path: PathBuf,
+    }
+
+    impl TestDirectoryGuard {
+        fn new(label: &str) -> Self {
+            Self {
+                path: temporary_directory(label),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectoryGuard {
+        fn drop(&mut self) {
+            let is_owned_test_directory = self.path.parent()
+                == Some(std::env::temp_dir().as_path())
+                && self
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("pharos-paimos-delivery-custom-ca-"));
+            if is_owned_test_directory {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
     fn write_private(path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).expect("write private test file");
         #[cfg(unix)]
@@ -4169,8 +4199,9 @@ mod tests {
 
     #[test]
     fn optional_paimos_ca_file_is_strict_bounded_and_protected() {
-        let directory = temporary_directory("custom-ca-config");
-        let material = generate_test_tls_material(&directory);
+        let directory = TestDirectoryGuard::new("custom-ca-config");
+        let directory = directory.path();
+        let material = generate_test_tls_material(directory);
         let api_path = directory.join("api-key");
         let secret_path = directory.join("handoff-secret");
         let config_path = directory.join("adapter.json");
@@ -4270,8 +4301,9 @@ mod tests {
 
     #[tokio::test]
     async fn custom_ca_https_preserves_chain_and_hostname_verification() {
-        let directory = temporary_directory("custom-ca-https");
-        let material = generate_test_tls_material(&directory);
+        let directory = TestDirectoryGuard::new("custom-ca-https");
+        let directory = directory.path();
+        let material = generate_test_tls_material(directory);
         let (trusted_roots, _) =
             load_ca_certificates(&material.ca_path).expect("load ephemeral trusted CA");
         let wrong_ca_path = generate_test_ca(&directory.join("wrong-ca"));

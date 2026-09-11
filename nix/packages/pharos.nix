@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   gitMinimal,
+  openssl,
   src ? lib.cleanSource ../..,
   binaryName,
   cargoPackage ? binaryName,
@@ -22,7 +23,9 @@ rustPlatform.buildRustPackage {
     "-p"
     cargoPackage
   ];
-  nativeCheckInputs = lib.optionals (cargoPackage == "pharos-beacon") [ gitMinimal ];
+  nativeCheckInputs =
+    lib.optionals (cargoPackage == "pharos-beacon") [ gitMinimal ]
+    ++ lib.optionals (cargoPackage == "pharosd") [ openssl ];
 
   meta = {
     description = "Pharos fleet management binary: ${binaryName}";

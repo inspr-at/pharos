@@ -828,10 +828,11 @@ See the committed Compose files and NixOS module for the complete wiring.
 The Paimos adapter accepts an optional top-level `"paimos_ca_file":"…"` in
 both `inspr.pharos.paimos-delivery-adapter.v2` and v3. When absent, the existing
 bundled WebPKI roots remain unchanged. When present, the path must identify a
-mounted, owner-selected regular file with current-user ownership, mode `0600`,
-one link, at most 256 KiB, and 1–32 PEM `CERTIFICATE` blocks with no keys or
-other content. Those roots are added only to this adapter's client; certificate
-chain, hostname and time checks remain enabled, redirects remain disabled, and
+mounted, owner-selected regular file with current-user ownership, no group or
+world permissions, one link, at most 256 KiB, and 1–32 PEM `CERTIFICATE`
+blocks with no keys or other content. Those roots are added only to this
+adapter's client; certificate chain, hostname and time checks remain enabled,
+redirects remain disabled, and
 requests remain confined to the exact configured HTTPS origin. The v3 schema
 additionally permits only the optional deployment field
 `"delegated_launch":{"target_ref":"sha256:…"}`; its absence preserves the
