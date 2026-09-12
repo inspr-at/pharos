@@ -5,11 +5,19 @@
 //! choice (PHAROS-2 / ADR-001). See PHAROS-3 (data model) and PHAROS-15
 //! (nix freshness) for the tickets these types back.
 
+pub mod image_identity;
 pub mod managed_operations;
 pub mod managed_services;
 pub mod public_path;
 pub mod secret_input;
 
+pub use image_identity::{
+    classify_image_identity, classify_media_type, parse_image_descriptor_format,
+    resolve_config_digest_from_image_archive, ImageConfigDigestCache, ImageDescriptorMeasurement,
+    ImageIdentityClass, DOCKER_CONFIG_MEDIA_TYPE, DOCKER_INDEX_MEDIA_TYPE,
+    DOCKER_MANIFEST_MEDIA_TYPE, IMAGE_DESCRIPTOR_DOCKER_FORMAT, OCI_CONFIG_MEDIA_TYPE,
+    OCI_INDEX_MEDIA_TYPE, OCI_MANIFEST_MEDIA_TYPE,
+};
 pub use public_path::{PublicBasePath, PublicOrigin};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -686,11 +694,15 @@ impl ApprovedReleaseEnvelope {
 }
 
 /// Filtered facts from a fixed `docker inspect --format` query.
+///
+/// `image_identity` is the engine-reported image id (Docker 29 may put a
+/// *manifest* digest in `{{.Image}}`). It is not a digest class. Config-class
+/// evidence requires a separately resolved config digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningContainerObservation {
     pub running: bool,
     pub container_id: String,
-    pub image_config_digest: String,
+    pub image_identity: String,
     pub environment: Option<String>,
     pub version_scheme: Option<String>,
     pub artifact_version: Option<String>,
@@ -738,12 +750,12 @@ pub fn parse_running_container_format(raw: &str) -> Result<RunningContainerObser
     };
     let container_id = normalize_container_id(fields[1])
         .ok_or_else(|| "running container identity is not an exact container id".to_string())?;
-    let image_config_digest = normalize_prefixed_sha256(fields[2])
-        .ok_or_else(|| "running container image is not an OCI config digest".to_string())?;
+    let image_identity = normalize_prefixed_sha256(fields[2])
+        .ok_or_else(|| "running container image is not a sha256 image identity".to_string())?;
     Ok(RunningContainerObservation {
         running,
         container_id,
-        image_config_digest,
+        image_identity,
         environment: optional_measured_field(fields[3]),
         version_scheme: optional_measured_field(fields[4]),
         artifact_version: optional_measured_field(fields[5]),
@@ -756,18 +768,23 @@ pub fn parse_running_container_format(raw: &str) -> Result<RunningContainerObser
 }
 
 /// Bind a running-container measurement to an optional digest-locked envelope.
-/// Observation time is supplied by the caller from the measurement clock.
+/// `image_config_digest` is the resolved OCI config digest, never an untyped
+/// engine id. Observation time is supplied by the caller from the measurement
+/// clock.
 pub fn evidence_from_running_container(
     observation: &RunningContainerObservation,
+    image_config_digest: &str,
     envelope: Option<&ApprovedReleaseEnvelope>,
     observed_at: UnixSeconds,
 ) -> Result<DeployedArtifactEvidence, String> {
     if !observation.running {
         return Err("allowlisted container is not running".to_string());
     }
+    let image_config_digest = normalize_prefixed_sha256(image_config_digest)
+        .ok_or_else(|| "measured image config is not an OCI config digest".to_string())?;
     if let Some(envelope) = envelope {
         envelope.validate_contract()?;
-        if envelope.oci_config_digest != observation.image_config_digest {
+        if envelope.oci_config_digest != image_config_digest {
             return Err(
                 "approved release envelope is not immutably bound to the measured config digest"
                     .to_string(),
@@ -825,14 +842,14 @@ pub fn evidence_from_running_container(
         artifact_version,
         release_channel,
         release_sequence,
-        digest: observation.image_config_digest.clone(),
+        digest: image_config_digest.clone(),
         digest_class: ArtifactDigestClass::OciConfig,
         commit_digest,
         release_manifest_coordinate,
         release_manifest_digest,
         oci_index_digest: None,
         oci_manifest_digest: None,
-        oci_config_digest: Some(observation.image_config_digest.clone()),
+        oci_config_digest: Some(image_config_digest),
         observed_at,
     };
     evidence.validate_contract()?;
@@ -919,7 +936,7 @@ fn parse_measured_version_scheme(value: &str) -> Result<ArtifactVersionScheme, S
     }
 }
 
-fn normalize_prefixed_sha256(value: &str) -> Option<String> {
+pub(crate) fn normalize_prefixed_sha256(value: &str) -> Option<String> {
     let value = value.trim();
     if valid_prefixed_sha256(value) {
         Some(value.to_string())
@@ -4627,7 +4644,8 @@ mod tests {
         let observation = parse_running_container_format(&filtered_container_line("true", &config))
             .expect("filtered docker format");
         let evidence =
-            evidence_from_running_container(&observation, Some(&envelope), 1_700_000_100).unwrap();
+            evidence_from_running_container(&observation, &config, Some(&envelope), 1_700_000_100)
+                .unwrap();
         assert!(evidence.is_config_class_measurement());
         assert_eq!(evidence.observed_at, 1_700_000_100);
         assert!(evidence.oci_index_digest.is_none());
@@ -4657,6 +4675,32 @@ mod tests {
     }
 
     #[test]
+    fn docker29_manifest_identity_requires_resolved_config_digest() {
+        let config = format!("sha256:{}", "1".repeat(64));
+        let manifest = format!("sha256:{}", "b".repeat(64));
+        let envelope = approved_envelope(&config);
+        let observation =
+            parse_running_container_format(&filtered_container_line("true", &manifest)).unwrap();
+        assert_eq!(observation.image_identity, manifest);
+        assert!(
+            evidence_from_running_container(
+                &observation,
+                &manifest,
+                Some(&envelope),
+                1_700_000_100
+            )
+            .is_err(),
+            "a manifest identity must not be compared as a config digest"
+        );
+        let evidence =
+            evidence_from_running_container(&observation, &config, Some(&envelope), 1_700_000_100)
+                .unwrap();
+        assert!(evidence.is_config_class_measurement());
+        assert_eq!(evidence.digest, config);
+        assert!(evidence.oci_manifest_digest.is_none());
+    }
+
+    #[test]
     fn running_container_mismatch_keeps_expected_metadata_unchanged() {
         let expected = format!("sha256:{}", "3".repeat(64));
         let running = format!("sha256:{}", "9".repeat(64));
@@ -4666,10 +4710,14 @@ mod tests {
         assert_eq!(parsed, envelope);
         let observation =
             parse_running_container_format(&filtered_container_line("true", &running)).unwrap();
-        assert_eq!(observation.image_config_digest, running);
-        assert!(
-            evidence_from_running_container(&observation, Some(&envelope), 1_700_000_100).is_err()
-        );
+        assert_eq!(observation.image_identity, running);
+        assert!(evidence_from_running_container(
+            &observation,
+            &running,
+            Some(&envelope),
+            1_700_000_100
+        )
+        .is_err());
         assert_eq!(envelope.oci_config_digest, expected);
         assert_eq!(envelope.artifact_version, "26.09.05.09.00.00");
     }
@@ -4680,7 +4728,7 @@ mod tests {
         let envelope = approved_envelope(&config);
         let stopped =
             parse_running_container_format(&filtered_container_line("false", &config)).unwrap();
-        assert!(evidence_from_running_container(&stopped, Some(&envelope), 1).is_err());
+        assert!(evidence_from_running_container(&stopped, &config, Some(&envelope), 1).is_err());
         assert!(parse_running_container_format("true\tonly-two-fields\n").is_err());
         assert!(parse_running_container_format(&format!(
             "true\tsha256:{}\tsha256:{}\nextra\n",
@@ -4696,6 +4744,7 @@ mod tests {
         assert!(parse_approved_release_envelope(b"{}").is_err());
         assert!(evidence_from_running_container(
             &parse_running_container_format(&filtered_container_line("true", &config)).unwrap(),
+            &config,
             None,
             1
         )

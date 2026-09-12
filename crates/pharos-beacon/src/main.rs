@@ -27,21 +27,24 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{
-    configured_container_matches_measurement, evidence_from_running_container,
-    parse_approved_release_envelope, parse_running_container_format,
-    valid_allowlisted_container_ref, BackupConfiguredState, BackupEngine, BackupObservation,
-    BackupPostureState, BackupRunState, DeployedArtifactEvidence, GitRevisionRelation,
-    HostLocation, HostLocationSource, HostPreferences, HostPreferencesRegistry, HostReport,
-    HostReportResponse, KernelPosture, NixDeploymentEvidence, NixFreshness, NixcfgGitComparison,
-    NixpkgsGitComparison, NixpkgsInputFreshness, NixpkgsRevisionRelation, ServiceObservation,
-    ServiceObservationState, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
-    MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES, MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS,
-    MAX_SERVICE_OBSERVATIONS, MIN_HEARTBEAT_INTERVAL_SECS, RUNNING_CONTAINER_DOCKER_FORMAT,
+    classify_image_identity, configured_container_matches_measurement,
+    evidence_from_running_container, parse_approved_release_envelope,
+    parse_image_descriptor_format, parse_running_container_format,
+    resolve_config_digest_from_image_archive, valid_allowlisted_container_ref,
+    BackupConfiguredState, BackupEngine, BackupObservation, BackupPostureState, BackupRunState,
+    DeployedArtifactEvidence, GitRevisionRelation, HostLocation, HostLocationSource,
+    HostPreferences, HostPreferencesRegistry, HostReport, HostReportResponse,
+    ImageConfigDigestCache, ImageIdentityClass, KernelPosture, NixDeploymentEvidence, NixFreshness,
+    NixcfgGitComparison, NixpkgsGitComparison, NixpkgsInputFreshness, NixpkgsRevisionRelation,
+    ServiceObservation, ServiceObservationState, HOST_REPORT_SCHEMA, HOST_REPORT_VERSION,
+    IMAGE_DESCRIPTOR_DOCKER_FORMAT, MAX_DEPLOYED_ARTIFACT_EVIDENCE_BYTES,
+    MAX_HEARTBEAT_INTERVAL_SECS, MAX_INBOUND_RTT_MS, MAX_SERVICE_OBSERVATIONS,
+    MIN_HEARTBEAT_INTERVAL_SECS, RUNNING_CONTAINER_DOCKER_FORMAT,
 };
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -62,6 +65,9 @@ const COMPOSE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const COMPOSE_COMMAND_OUTPUT_LIMIT_BYTES: usize = 128 * 1024;
 const DEPLOYED_ARTIFACT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const DEPLOYED_ARTIFACT_COMMAND_OUTPUT_LIMIT_BYTES: usize = 4 * 1024;
+const DEPLOYED_ARTIFACT_IMAGE_SAVE_TIMEOUT: Duration = Duration::from_secs(15);
+const DEPLOYED_ARTIFACT_IMAGE_SAVE_STREAM_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+const IMAGE_CONFIG_CACHE_MAX_ENTRIES: usize = 32;
 const DEFAULT_SERVICE_OBSERVATION_INTERVAL_SECS: u64 = 300;
 const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
 const COMPOSE_DOCKER_FORMAT: &str = "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Label \"com.docker.compose.oneoff\"}}\t{{.State}}\t{{.Status}}";
@@ -1562,29 +1568,19 @@ fn read_approved_release_envelope(
     parse_approved_release_envelope(&raw).map_err(|_| "deployed artifact envelope is invalid")
 }
 
-fn run_running_container_command(
-    command: &str,
-    socket: &Path,
-    container: &str,
-) -> Result<String, &'static str> {
-    if !valid_allowlisted_container_ref(container) {
-        return Err("deployed artifact container is not allowlisted");
-    }
+fn image_config_cache() -> &'static Mutex<ImageConfigDigestCache> {
+    static CACHE: OnceLock<Mutex<ImageConfigDigestCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ImageConfigDigestCache::new(IMAGE_CONFIG_CACHE_MAX_ENTRIES)))
+}
+
+fn docker_cli(command: &str, socket: &Path) -> Result<Command, &'static str> {
     let socket = socket
         .to_str()
         .ok_or("Compose discovery configuration is invalid")?;
     let mut command = Command::new(command);
     command
-        .args([
-            "--host",
-            &format!("unix://{socket}"),
-            "inspect",
-            "--type",
-            "container",
-            "--format",
-            RUNNING_CONTAINER_DOCKER_FORMAT,
-            container,
-        ])
+        .arg("--host")
+        .arg(format!("unix://{socket}"))
         .env_remove("DOCKER_HOST")
         .env_remove("DOCKER_CONTEXT")
         .env_remove("DOCKER_TLS_VERIFY")
@@ -1595,6 +1591,16 @@ fn run_running_container_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     isolate_process_group(&mut command);
+    Ok(command)
+}
+
+fn run_docker_text_command(
+    command: &str,
+    socket: &Path,
+    args: &[&str],
+) -> Result<String, &'static str> {
+    let mut command = docker_cli(command, socket)?;
+    command.args(args);
     let mut child = command
         .spawn()
         .map_err(|_| "deployed artifact command failed")?;
@@ -1620,19 +1626,202 @@ fn run_running_container_command(
     Ok(stdout)
 }
 
+fn run_running_container_command(
+    command: &str,
+    socket: &Path,
+    container: &str,
+) -> Result<String, &'static str> {
+    if !valid_allowlisted_container_ref(container) {
+        return Err("deployed artifact container is not allowlisted");
+    }
+    run_docker_text_command(
+        command,
+        socket,
+        &[
+            "inspect",
+            "--type",
+            "container",
+            "--format",
+            RUNNING_CONTAINER_DOCKER_FORMAT,
+            container,
+        ],
+    )
+}
+
+fn run_image_descriptor_command(
+    command: &str,
+    socket: &Path,
+    identity: &str,
+) -> Result<String, &'static str> {
+    if !valid_allowlisted_container_ref(identity) {
+        return Err("deployed artifact container is not allowlisted");
+    }
+    run_docker_text_command(
+        command,
+        socket,
+        &[
+            "inspect",
+            "--type",
+            "image",
+            "--format",
+            IMAGE_DESCRIPTOR_DOCKER_FORMAT,
+            identity,
+        ],
+    )
+}
+
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "image archive stream exceeded the bound",
+            ));
+        }
+        let cap = usize::try_from(self.remaining)
+            .unwrap_or(buf.len())
+            .min(buf.len());
+        let read = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+fn host_oci_platform() -> Option<(&'static str, &'static str)> {
+    let architecture = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    match std::env::consts::OS {
+        "linux" => Some(("linux", architecture)),
+        _ => None,
+    }
+}
+
+fn resolve_config_from_image_save(
+    command: &str,
+    socket: &Path,
+    identity: &str,
+    class: Option<ImageIdentityClass>,
+) -> Result<String, &'static str> {
+    if !valid_allowlisted_container_ref(identity) {
+        return Err("deployed artifact container is not allowlisted");
+    }
+    let platform = match class {
+        Some(ImageIdentityClass::Index) => Some(
+            host_oci_platform()
+                .ok_or("deployed artifact image index has no unique host platform")?,
+        ),
+        Some(ImageIdentityClass::Manifest) => None,
+        Some(ImageIdentityClass::Config) => return Ok(identity.to_string()),
+        None => host_oci_platform(),
+    };
+    let mut command = docker_cli(command, socket)?;
+    command.args(["save", identity]);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "deployed artifact command failed")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("deployed artifact output unavailable")?;
+    let identity = identity.to_string();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let reader = LimitedReader {
+            inner: stdout,
+            remaining: DEPLOYED_ARTIFACT_IMAGE_SAVE_STREAM_LIMIT_BYTES,
+        };
+        let result = resolve_config_digest_from_image_archive(reader, &identity, class, platform)
+            .map_err(|_| "deployed artifact image descriptor chain is invalid");
+        let _ = sender.send(result);
+    });
+    let deadline = Instant::now() + DEPLOYED_ARTIFACT_IMAGE_SAVE_TIMEOUT;
+    let resolved = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(_) => {
+            terminate_process_tree(&mut child);
+            return Err("deployed artifact command timed out");
+        }
+    };
+    terminate_process_tree(&mut child);
+    resolved
+}
+
+fn measured_image_config_digest(
+    command: &str,
+    socket: &Path,
+    identity: &str,
+    cache: &Mutex<ImageConfigDigestCache>,
+) -> Result<String, &'static str> {
+    let class = match run_image_descriptor_command(command, socket, identity) {
+        Ok(raw) => {
+            let measurement = parse_image_descriptor_format(&raw)
+                .map_err(|_| "deployed artifact image descriptor is invalid")?;
+            if measurement.image_id != identity {
+                return Err("deployed artifact image identity changed during measurement");
+            }
+            Some(
+                classify_image_identity(&measurement)
+                    .map_err(|_| "deployed artifact image descriptor class is invalid")?,
+            )
+        }
+        Err(_) => None,
+    };
+    {
+        let cache = cache
+            .lock()
+            .map_err(|_| "deployed artifact cache is unavailable")?;
+        if let Some((config, cached_class)) = cache.get_with_class(identity) {
+            let class_matches = class.is_none() || cached_class == class;
+            let config_matches_class =
+                class != Some(ImageIdentityClass::Config) || config == identity;
+            if class_matches && config_matches_class {
+                return Ok(config.to_string());
+            }
+        }
+    }
+    let config = match class {
+        Some(ImageIdentityClass::Config) => identity.to_string(),
+        class => resolve_config_from_image_save(command, socket, identity, class)?,
+    };
+    cache
+        .lock()
+        .map_err(|_| "deployed artifact cache is unavailable")?
+        .insert_with_class(identity.to_string(), config.clone(), class);
+    Ok(config)
+}
+
 fn collect_measured_deployed_artifact_at(
     command: &str,
     socket: &Path,
     container: &str,
     envelope: Option<&pharos_core::ApprovedReleaseEnvelope>,
     now: i64,
+    cache: &Mutex<ImageConfigDigestCache>,
 ) -> Option<DeployedArtifactEvidence> {
     let raw = run_running_container_command(command, socket, container).ok()?;
     let observation = parse_running_container_format(&raw).ok()?;
     if !configured_container_matches_measurement(container, &observation.container_id) {
         return None;
     }
-    evidence_from_running_container(&observation, envelope, now).ok()
+    let image_config_digest =
+        measured_image_config_digest(command, socket, &observation.image_identity, cache).ok()?;
+    let final_raw = run_running_container_command(command, socket, container).ok()?;
+    let final_observation = parse_running_container_format(&final_raw).ok()?;
+    if !configured_container_matches_measurement(container, &final_observation.container_id)
+        || final_observation.container_id != observation.container_id
+        || final_observation.image_identity != observation.image_identity
+    {
+        return None;
+    }
+    evidence_from_running_container(&final_observation, &image_config_digest, envelope, now).ok()
 }
 
 fn collect_measured_deployed_artifact(now: i64) -> Option<DeployedArtifactEvidence> {
@@ -1643,7 +1832,14 @@ fn collect_measured_deployed_artifact(now: i64) -> Option<DeployedArtifactEviden
         Ok(None) => None,
         Err(_) => return None,
     };
-    collect_measured_deployed_artifact_at("docker", &socket, &container, envelope.as_ref(), now)
+    collect_measured_deployed_artifact_at(
+        "docker",
+        &socket,
+        &container,
+        envelope.as_ref(),
+        now,
+        image_config_cache(),
+    )
 }
 
 fn sha256_hex(raw: &[u8]) -> String {
@@ -6563,31 +6759,47 @@ mod tests {
             &command,
             concat!(
                 "#!/bin/sh\n",
-                "test \"$#\" -eq 8 || exit 10\n",
                 "test \"$1\" = --host || exit 11\n",
                 "test \"$2\" = unix:///tmp/pharos-docker.sock || exit 12\n",
-                "test \"$3\" = inspect || exit 13\n",
-                "test \"$4\" = --type || exit 14\n",
-                "test \"$5\" = container || exit 15\n",
-                "test \"$6\" = --format || exit 16\n",
-                "test \"$8\" = pharos-prod || exit 18\n",
-                "case \"$7\" in\n",
-                "  *'{{.State.Running}}'*'{{.Id}}'*'{{.Image}}'*) ;;\n",
-                "  *) exit 17 ;;\n",
-                "esac\n",
-                "cat \"$0.out\"\n"
+                "case \"$3\" in\n",
+                "  inspect)\n",
+                "    test \"$#\" -eq 8 || exit 10\n",
+                "    test \"$4\" = --type || exit 14\n",
+                "    test \"$6\" = --format || exit 16\n",
+                "    if [ \"$5\" = container ]; then\n",
+                "      test \"$8\" = pharos-prod || exit 18\n",
+                "      case \"$7\" in\n",
+                "        *'{{.State.Running}}'*'{{.Id}}'*'{{.Image}}'*) ;;\n",
+                "        *) exit 17 ;;\n",
+                "      esac\n",
+                "      cat \"$0.out\"\n",
+                "    elif [ \"$5\" = image ]; then\n",
+                "      case \"$7\" in\n",
+                "        *'{{.Id}}'*'.Descriptor'*) ;;\n",
+                "        *) exit 19 ;;\n",
+                "      esac\n",
+                "      printf '%s\\t\\t\\n' \"$8\"\n",
+                "    else\n",
+                "      exit 15\n",
+                "    fi\n",
+                "    ;;\n",
+                "  save) exit 30 ;;\n",
+                "  *) exit 13 ;;\n",
+                "esac\n"
             ),
         )
         .expect("write command fixture");
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
             .expect("make command fixture executable");
 
+        let cache = Mutex::new(ImageConfigDigestCache::new(8));
         let evidence = collect_measured_deployed_artifact_at(
             &command.to_string_lossy(),
             Path::new("/tmp/pharos-docker.sock"),
             "pharos-prod",
             Some(&loaded),
             1_700_000_100,
+            &cache,
         )
         .expect("running container measurement");
         assert_eq!(
@@ -6615,7 +6827,8 @@ mod tests {
                 Path::new("/tmp/pharos-docker.sock"),
                 "pharos-prod",
                 Some(&loaded),
-                1_700_000_100
+                1_700_000_100,
+                &Mutex::new(ImageConfigDigestCache::new(8)),
             )
             .is_none(),
             "unchanged envelope must not prove a replaced image"
@@ -6647,7 +6860,8 @@ mod tests {
             Path::new("/tmp/pharos-docker.sock"),
             "pharos-prod",
             Some(&loaded),
-            1_700_000_100
+            1_700_000_100,
+            &Mutex::new(ImageConfigDigestCache::new(8)),
         )
         .is_none());
 
@@ -6687,5 +6901,298 @@ mod tests {
         assert!(read_approved_release_envelope(&linked).is_err());
         assert!(collect_deployed_artifact_from_metadata_file(b"{}").is_err());
         std::fs::remove_dir_all(root).expect("remove command fixture");
+    }
+
+    fn sha256_prefixed(raw: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(raw))
+    }
+
+    fn oci_config_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": []}
+        }))
+        .unwrap()
+    }
+
+    fn oci_manifest_bytes(config_digest: &str, config_size: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": pharos_core::OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": pharos_core::OCI_CONFIG_MEDIA_TYPE,
+                "digest": config_digest,
+                "size": config_size
+            },
+            "layers": []
+        }))
+        .unwrap()
+    }
+
+    fn tar_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            for (name, data) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(name).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        buf
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker29_manifest_image_id_resolves_config_and_cache_invalidates() {
+        let root = kernel_fixture("deployed-artifact-docker29");
+        std::fs::create_dir_all(&root).expect("create docker29 fixture");
+        let config_blob = oci_config_bytes();
+        let config_digest = sha256_prefixed(&config_blob);
+        let manifest_blob = oci_manifest_bytes(&config_digest, config_blob.len());
+        let manifest_digest = sha256_prefixed(&manifest_blob);
+        assert_ne!(manifest_digest, config_digest);
+        let archive = tar_files(&[
+            (
+                &format!("blobs/sha256/{}", &manifest_digest[7..]),
+                manifest_blob.as_slice(),
+            ),
+            (
+                &format!("blobs/sha256/{}", &config_digest[7..]),
+                config_blob.as_slice(),
+            ),
+        ]);
+        let envelope = approved_release_envelope(&config_digest);
+        let envelope_path = root.join("envelope.json");
+        std::fs::write(&envelope_path, serde_json::to_vec(&envelope).unwrap()).expect("envelope");
+        std::fs::set_permissions(&envelope_path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure envelope");
+        let loaded = read_approved_release_envelope(&envelope_path).expect("envelope loads");
+
+        let command = root.join("docker-docker29");
+        std::fs::write(
+            command.with_extension("out"),
+            filtered_container_stdout(&manifest_digest),
+        )
+        .expect("container inspect");
+        std::fs::write(
+            command.with_extension("descriptor"),
+            format!(
+                "{manifest_digest}\t{}\t{manifest_digest}\n",
+                pharos_core::OCI_MANIFEST_MEDIA_TYPE
+            ),
+        )
+        .expect("image descriptor");
+        std::fs::write(command.with_extension("tar"), &archive).expect("image archive");
+        std::fs::write(
+            &command,
+            concat!(
+                "#!/bin/sh\n",
+                "test \"$1\" = --host || exit 11\n",
+                "test \"$2\" = unix:///tmp/pharos-docker.sock || exit 12\n",
+                "case \"$3\" in\n",
+                "  inspect)\n",
+                "    test \"$5\" = container && cat \"$0.out\" && exit 0\n",
+                "    test \"$5\" = image || exit 15\n",
+                "    case \"$7\" in\n",
+                "      *'{{.Id}}'*'.Descriptor'*) ;;\n",
+                "      *) exit 19 ;;\n",
+                "    esac\n",
+                "    cat \"$0.descriptor\"\n",
+                "    ;;\n",
+                "  save)\n",
+                "    echo save >> \"$0.saves\"\n",
+                "    if test -f \"$0.replace\"; then cat \"$0.replace\" > \"$0.out\"; fi\n",
+                "    cat \"$0.tar\"\n",
+                "    ;;\n",
+                "  *) exit 13 ;;\n",
+                "esac\n"
+            ),
+        )
+        .expect("write docker29 fixture");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
+            .expect("executable docker29 fixture");
+
+        let cache = Mutex::new(ImageConfigDigestCache::new(8));
+        let evidence = collect_measured_deployed_artifact_at(
+            &command.to_string_lossy(),
+            Path::new("/tmp/pharos-docker.sock"),
+            "pharos-prod",
+            Some(&loaded),
+            1_700_000_100,
+            &cache,
+        )
+        .expect("docker29 config-class measurement");
+        assert!(evidence.is_config_class_measurement());
+        assert_eq!(evidence.digest, config_digest);
+        assert_ne!(evidence.digest, manifest_digest);
+        assert_eq!(evidence.observed_at, 1_700_000_100);
+        assert!(evidence.oci_manifest_digest.is_none());
+
+        let again = collect_measured_deployed_artifact_at(
+            &command.to_string_lossy(),
+            Path::new("/tmp/pharos-docker.sock"),
+            "pharos-prod",
+            Some(&loaded),
+            1_700_000_200,
+            &cache,
+        )
+        .expect("cached docker29 measurement");
+        assert_eq!(again.digest, config_digest);
+        assert_eq!(again.observed_at, 1_700_000_200);
+        let saves = std::fs::read_to_string(command.with_extension("saves")).unwrap();
+        assert_eq!(
+            saves.lines().count(),
+            1,
+            "a cached identity must not export the image again"
+        );
+
+        std::fs::write(
+            command.with_extension("descriptor"),
+            format!(
+                "{manifest_digest}\t{}\t{manifest_digest}\n",
+                pharos_core::OCI_CONFIG_MEDIA_TYPE
+            ),
+        )
+        .expect("contradictory image descriptor");
+        assert!(
+            collect_measured_deployed_artifact_at(
+                &command.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock"),
+                "pharos-prod",
+                Some(&loaded),
+                1_700_000_250,
+                &cache,
+            )
+            .is_none(),
+            "a fresh descriptor class that contradicts the cached mapping must not use the cache"
+        );
+        std::fs::write(
+            command.with_extension("descriptor"),
+            format!(
+                "{manifest_digest}\t{}\t{manifest_digest}\n",
+                pharos_core::OCI_MANIFEST_MEDIA_TYPE
+            ),
+        )
+        .expect("restore image descriptor");
+
+        let other_config = serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {"User": "nobody"},
+            "rootfs": {"type": "layers", "diff_ids": []}
+        }))
+        .unwrap();
+        let other_config_digest = sha256_prefixed(&other_config);
+        let other_manifest = oci_manifest_bytes(&other_config_digest, other_config.len());
+        let other_manifest_digest = sha256_prefixed(&other_manifest);
+        let other_archive = tar_files(&[
+            (
+                &format!("blobs/sha256/{}", &other_manifest_digest[7..]),
+                other_manifest.as_slice(),
+            ),
+            (
+                &format!("blobs/sha256/{}", &other_config_digest[7..]),
+                other_config.as_slice(),
+            ),
+        ]);
+        std::fs::write(
+            command.with_extension("out"),
+            filtered_container_stdout(&other_manifest_digest),
+        )
+        .expect("replaced container image");
+        std::fs::write(
+            command.with_extension("descriptor"),
+            format!(
+                "{other_manifest_digest}\t{}\t{other_manifest_digest}\n",
+                pharos_core::OCI_MANIFEST_MEDIA_TYPE
+            ),
+        )
+        .expect("replaced image descriptor");
+        std::fs::write(command.with_extension("tar"), &other_archive).expect("replaced archive");
+        assert!(
+            collect_measured_deployed_artifact_at(
+                &command.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock"),
+                "pharos-prod",
+                Some(&loaded),
+                1_700_000_300,
+                &cache,
+            )
+            .is_none(),
+            "stale cache must not keep the previous config after the image identity changes"
+        );
+        let saves = std::fs::read_to_string(command.with_extension("saves")).unwrap();
+        assert_eq!(saves.lines().count(), 2);
+
+        let tampered = tar_files(&[(
+            &format!("blobs/sha256/{}", &manifest_digest[7..]),
+            b"not-a-manifest",
+        )]);
+        std::fs::write(
+            command.with_extension("out"),
+            filtered_container_stdout(&manifest_digest),
+        )
+        .expect("restore identity");
+        std::fs::write(
+            command.with_extension("descriptor"),
+            format!(
+                "{manifest_digest}\t{}\t{manifest_digest}\n",
+                pharos_core::OCI_MANIFEST_MEDIA_TYPE
+            ),
+        )
+        .expect("restore image descriptor");
+        std::fs::write(command.with_extension("tar"), &tampered).expect("tampered archive");
+        assert!(
+            collect_measured_deployed_artifact_at(
+                &command.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock"),
+                "pharos-prod",
+                Some(&loaded),
+                1_700_000_400,
+                &Mutex::new(ImageConfigDigestCache::new(8)),
+            )
+            .is_none(),
+            "a tampered descriptor chain must fail closed"
+        );
+
+        std::fs::write(
+            command.with_extension("out"),
+            filtered_container_stdout(&manifest_digest),
+        )
+        .expect("restore container before export race");
+        std::fs::write(command.with_extension("tar"), &archive).expect("restore image archive");
+        std::fs::write(
+            command.with_extension("descriptor"),
+            format!(
+                "{manifest_digest}\t{}\t{manifest_digest}\n",
+                pharos_core::OCI_MANIFEST_MEDIA_TYPE
+            ),
+        )
+        .expect("restore image descriptor before export race");
+        std::fs::write(
+            command.with_extension("replace"),
+            filtered_container_stdout(&other_manifest_digest),
+        )
+        .expect("container replacement during export");
+        assert!(
+            collect_measured_deployed_artifact_at(
+                &command.to_string_lossy(),
+                Path::new("/tmp/pharos-docker.sock"),
+                "pharos-prod",
+                Some(&loaded),
+                1_700_000_500,
+                &Mutex::new(ImageConfigDigestCache::new(8)),
+            )
+            .is_none(),
+            "a container replacement during image export must be rejected"
+        );
+        std::fs::remove_dir_all(root).expect("remove docker29 fixture");
     }
 }

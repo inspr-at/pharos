@@ -6109,8 +6109,13 @@ mod tests {
         fields.resize(11, String::new());
         let line = fields.join("\t");
         let observation = parse_running_container_format(&line).unwrap();
-        let parsed =
-            evidence_from_running_container(&observation, Some(&envelope), 1_700_000_100).unwrap();
+        let parsed = evidence_from_running_container(
+            &observation,
+            &artifact.digest,
+            Some(&envelope),
+            1_700_000_100,
+        )
+        .unwrap();
         assert_eq!(parsed.digest_class, ArtifactDigestClass::OciConfig);
         assert!(parsed.oci_index_digest.is_none());
         assert!(parsed.oci_manifest_digest.is_none());
@@ -6147,6 +6152,7 @@ mod tests {
         let replaced = replaced_fields.join("\t");
         assert!(evidence_from_running_container(
             &parse_running_container_format(&replaced).unwrap(),
+            &format!("sha256:{}", "9".repeat(64)),
             Some(&envelope),
             1_700_000_100
         )
