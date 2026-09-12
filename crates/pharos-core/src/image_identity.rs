@@ -233,7 +233,7 @@ fn validate_descriptor_measurement(
         let descriptor_digest = descriptor_digest.as_ref().ok_or_else(|| {
             "image descriptor digest is required when a media type is present".to_string()
         })?;
-        if descriptor_digest != &image_id {
+        if descriptor_digest != image_id {
             return Err("image descriptor digest must equal the image id".to_string());
         }
         if classify_media_type(media_type).is_none() {
