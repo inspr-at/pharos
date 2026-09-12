@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 260912102405.0.0 - 2026-09-12
+
+- Explicitly install the PCRE2 security update from the existing immutable Debian snapshot; retain the base image and libssh2 fix (PHAROS-269).
+- Read Docker 29 descriptor maps through filtered JSON while preserving legacy image identity support and strict digest classification (PHAROS-268).
+- Retain sequence 12 as a refused release candidate: its image scan found the PCRE2 issues fixed in this successor; its tag and coordinate remain unchanged.
+
 ## 260912093525.0.0 - 2026-09-12
 
 - Resolve Docker 29 engine manifest and index identities to measured OCI configuration digests through the local descriptor chain (PHAROS-268).

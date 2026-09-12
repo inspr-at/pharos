@@ -6984,8 +6984,12 @@ mod tests {
         std::fs::write(
             command.with_extension("descriptor"),
             format!(
-                "{manifest_digest}\t{}\t{manifest_digest}\n",
-                pharos_core::OCI_MANIFEST_MEDIA_TYPE
+                "{manifest_digest}\t{}\n",
+                serde_json::json!({
+                    "mediaType": pharos_core::DOCKER_MANIFEST_MEDIA_TYPE,
+                    "digest": manifest_digest,
+                    "size": manifest_blob.len(),
+                })
             ),
         )
         .expect("image descriptor");
@@ -7001,7 +7005,7 @@ mod tests {
                 "    test \"$5\" = container && cat \"$0.out\" && exit 0\n",
                 "    test \"$5\" = image || exit 15\n",
                 "    case \"$7\" in\n",
-                "      *'{{.Id}}'*'.Descriptor'*) ;;\n",
+                "      *'{{.Id}}'*'{{if .Descriptor}}'*'{{json .Descriptor}}'*'{{else}}'*) ;;\n",
                 "      *) exit 19 ;;\n",
                 "    esac\n",
                 "    cat \"$0.descriptor\"\n",

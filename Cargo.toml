@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pharos-core", "crates/pharosd", "crates/pharos-beacon", "crates/pharos-cli"]
 
 [workspace.package]
-version = "260912093525.0.0"
+version = "260912102405.0.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Markus Barta"]
