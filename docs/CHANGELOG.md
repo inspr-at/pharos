@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 260912093525.0.0 - 2026-09-12
+
+- Resolve Docker 29 engine manifest and index identities to measured OCI configuration digests through the local descriptor chain (PHAROS-268).
+- Cache validated immutable image identities to avoid repeated exports during beacon collection, preserve legacy configuration IDs, and reject ambiguous or tampered image evidence.
+
 ## 260911173640.0.0 - 2026-09-11
 
 - Add an explicit, default-off delegated delivery mode that consumes a one-use Paimos launch admission rooted in human review and confirms only the existing ready Pharos job (PHAROS-206).
