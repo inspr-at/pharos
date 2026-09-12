@@ -16,9 +16,11 @@ use sha2::{Digest, Sha256};
 use crate::{normalize_prefixed_sha256, SHA256_HEX_BYTES};
 
 /// Filtered `docker image inspect --format` query. It never requests Config,
-/// Env, Identity, RepoTags, or RepoDigests.
+/// Env, Identity, RepoTags, or RepoDigests. Serializing only Descriptor keeps
+/// this compatible with Docker 29's map representation and legacy typed
+/// representations alike.
 pub const IMAGE_DESCRIPTOR_DOCKER_FORMAT: &str =
-    "{{.Id}}\t{{with .Descriptor}}{{.MediaType}}\t{{.Digest}}{{else}}\t{{end}}";
+    "{{.Id}}\t{{if .Descriptor}}{{json .Descriptor}}{{else}}null{{end}}";
 
 pub const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 pub const DOCKER_INDEX_MEDIA_TYPE: &str =
@@ -33,6 +35,7 @@ const MAX_OCI_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OCI_METADATA_MEMBERS: usize = 64;
 const MAX_OCI_ARCHIVE_MEMBERS: usize = 4096;
 const MAX_INDEX_DEPTH: u8 = 4;
+const MAX_IMAGE_DESCRIPTOR_JSON_BYTES: usize = 4 * 1024;
 
 const INDEX_MEDIA: &[&str] = &[OCI_INDEX_MEDIA_TYPE, DOCKER_INDEX_MEDIA_TYPE];
 const MANIFEST_MEDIA: &[&str] = &[OCI_MANIFEST_MEDIA_TYPE, DOCKER_MANIFEST_MEDIA_TYPE];
@@ -131,7 +134,9 @@ impl ImageConfigDigestCache {
     }
 }
 
-/// Filtered facts from [`IMAGE_DESCRIPTOR_DOCKER_FORMAT`].
+/// Filtered facts from [`IMAGE_DESCRIPTOR_DOCKER_FORMAT`]. The current wire
+/// form is `<image-id>\t<descriptor-json>`; `null` represents no descriptor.
+/// The previous three-field form remains accepted for legacy callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageDescriptorMeasurement {
     pub image_id: String,
@@ -145,26 +150,90 @@ pub fn parse_image_descriptor_format(raw: &str) -> Result<ImageDescriptorMeasure
         return Err("image descriptor measurement must be exactly one filtered line".to_string());
     }
     let fields: Vec<&str> = line.split('\t').collect();
-    if fields.len() != 3 {
-        return Err(
-            "image descriptor measurement must contain exactly three filtered fields".to_string(),
-        );
-    }
     let image_id = normalize_prefixed_sha256(fields[0])
         .ok_or_else(|| "image identity is not a sha256 digest".to_string())?;
-    let media_type = optional_descriptor_field(fields[1]);
-    let descriptor_digest = match optional_descriptor_field(fields[2]) {
+    let (media_type, descriptor_digest) = match fields.len() {
+        2 => parse_descriptor_json(fields[1])?,
+        3 => parse_descriptor_fields(fields[1], fields[2])?,
+        _ => {
+            return Err(
+                "image descriptor measurement must contain two or three filtered fields"
+                    .to_string(),
+            )
+        }
+    };
+    validate_descriptor_measurement(&image_id, media_type, descriptor_digest)
+}
+
+fn parse_descriptor_fields(
+    media_type: &str,
+    digest: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let media_type = optional_descriptor_field(media_type);
+    let descriptor_digest = match optional_descriptor_field(digest) {
         None => None,
         Some(value) => Some(
             normalize_prefixed_sha256(&value)
                 .ok_or_else(|| "image descriptor digest is not a sha256 digest".to_string())?,
         ),
     };
+    Ok((media_type, descriptor_digest))
+}
+
+fn parse_descriptor_json(raw: &str) -> Result<(Option<String>, Option<String>), String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "<no value>" || raw == "null" {
+        return Ok((None, None));
+    }
+    if raw.len() > MAX_IMAGE_DESCRIPTOR_JSON_BYTES {
+        return Err("image descriptor JSON exceeds the size bound".to_string());
+    }
+    let value: Value =
+        serde_json::from_str(raw).map_err(|_| "image descriptor JSON is invalid".to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "image descriptor JSON is not an object".to_string())?;
+    let media_type = descriptor_json_string(object, "mediaType", "MediaType")?;
+    let descriptor_digest = descriptor_json_string(object, "digest", "Digest")?
+        .map(|value| {
+            normalize_prefixed_sha256(&value)
+                .ok_or_else(|| "image descriptor digest is not a sha256 digest".to_string())
+        })
+        .transpose()?;
+    if media_type.is_none() && descriptor_digest.is_none() {
+        return Err("image descriptor JSON has no public descriptor fields".to_string());
+    }
+    Ok((media_type, descriptor_digest))
+}
+
+fn descriptor_json_string(
+    object: &serde_json::Map<String, Value>,
+    lower: &str,
+    legacy: &str,
+) -> Result<Option<String>, String> {
+    if object.contains_key(lower) && object.contains_key(legacy) {
+        return Err(format!(
+            "image descriptor JSON contains both {lower} and {legacy}"
+        ));
+    }
+    let value = object.get(lower).or_else(|| object.get(legacy));
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(optional_descriptor_field(value)),
+        Some(_) => Err(format!("image descriptor field {lower} is not a string")),
+    }
+}
+
+fn validate_descriptor_measurement(
+    image_id: &str,
+    media_type: Option<String>,
+    descriptor_digest: Option<String>,
+) -> Result<ImageDescriptorMeasurement, String> {
     if let Some(media_type) = &media_type {
         let descriptor_digest = descriptor_digest.as_ref().ok_or_else(|| {
             "image descriptor digest is required when a media type is present".to_string()
         })?;
-        if descriptor_digest != &image_id {
+        if descriptor_digest != image_id {
             return Err("image descriptor digest must equal the image id".to_string());
         }
         if classify_media_type(media_type).is_none() {
@@ -174,7 +243,7 @@ pub fn parse_image_descriptor_format(raw: &str) -> Result<ImageDescriptorMeasure
         return Err("image descriptor digest is present without a media type".to_string());
     }
     Ok(ImageDescriptorMeasurement {
-        image_id,
+        image_id: image_id.to_string(),
         media_type,
         descriptor_digest,
     })
@@ -778,6 +847,50 @@ mod tests {
         .unwrap();
         assert_eq!(resolved, config);
         assert_ne!(resolved, manifest);
+    }
+
+    #[test]
+    fn docker29_lowercase_descriptor_json_is_measured() {
+        let image_id = format!("sha256:{}", "b".repeat(64));
+        let descriptor = serde_json::json!({
+            "mediaType": DOCKER_MANIFEST_MEDIA_TYPE,
+            "digest": image_id,
+            "size": 123,
+        });
+        let raw = format!("{image_id}\t{descriptor}\n");
+        let measurement = parse_image_descriptor_format(&raw).unwrap();
+        assert_eq!(measurement.image_id, image_id);
+        assert_eq!(
+            measurement.media_type,
+            Some(DOCKER_MANIFEST_MEDIA_TYPE.to_string())
+        );
+        assert_eq!(measurement.descriptor_digest, Some(image_id.clone()));
+        assert_eq!(
+            classify_image_identity(&measurement).unwrap(),
+            ImageIdentityClass::Manifest
+        );
+    }
+
+    #[test]
+    fn descriptor_json_supports_legacy_nil_and_typed_layouts() {
+        let image_id = format!("sha256:{}", "c".repeat(64));
+        let nil = parse_image_descriptor_format(&format!("{image_id}\tnull\n")).unwrap();
+        assert_eq!(
+            classify_image_identity(&nil).unwrap(),
+            ImageIdentityClass::Config
+        );
+
+        let descriptor = serde_json::json!({
+            "MediaType": DOCKER_MANIFEST_MEDIA_TYPE,
+            "Digest": image_id,
+            "Size": 123,
+        });
+        let typed = format!("{image_id}\t{descriptor}\n");
+        let measurement = parse_image_descriptor_format(&typed).unwrap();
+        assert_eq!(
+            classify_image_identity(&measurement).unwrap(),
+            ImageIdentityClass::Manifest
+        );
     }
 
     #[test]

@@ -23,9 +23,11 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # The runtime base image is pinned by digest. Package indexes are pinned to a
 # separate immutable snapshot; those pins need not share a date.
 # 20260907T180056Z is the debian-security snapshot that indexes
-# libssh2-1 1.10.0-3+deb12u1; the 20260901T000000Z pin still selected
-# 1.10.0-3+b1. HTTP transport is safe here because apt verifies Debian's
-# signed Release metadata and package hashes.
+# libssh2-1 1.10.0-3+deb12u1 and libpcre2-8-0 10.42-1+deb12u1. The runtime
+# base already contains libpcre2-8-0, so request the fixed version explicitly;
+# apt otherwise leaves the vulnerable 10.42-1 package installed. HTTP transport
+# is safe here because apt verifies Debian's signed Release metadata and package
+# hashes.
 RUN printf '%s\n' \
       'Types: deb' \
       "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
@@ -42,7 +44,8 @@ RUN printf '%s\n' \
       'Check-Valid-Until: no' \
       > /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates iputils-ping openssh-client restic \
+    && apt-get install -y --no-install-recommends git ca-certificates iputils-ping \
+      libpcre2-8-0=10.42-1+deb12u1 openssh-client restic \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 pharos
 # /data owned by pharos so a named volume mounted here inherits writable
