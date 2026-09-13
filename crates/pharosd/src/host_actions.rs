@@ -5458,6 +5458,42 @@ impl HostActionStore {
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
+        self.retry_update_review_locked(&mut jobs, id, host, actor, now, None)
+    }
+
+    pub(crate) fn retry_update_review_with_id(
+        &self,
+        id: &str,
+        retry_id: &str,
+        host: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<HostActionJob, HostActionStoreError> {
+        let mut jobs = self.jobs.write().expect("host action store lock");
+        if let Some(existing) = jobs.get(retry_id) {
+            if existing.host != host {
+                return Err(HostActionStoreError::WrongHost);
+            }
+            if existing.kind != HostActionKind::UpdateRestart
+                || existing.retry_of.as_deref() != Some(id)
+                || existing.requested_by != actor
+            {
+                return Err(HostActionStoreError::InvalidJob);
+            }
+            return Ok(existing.clone());
+        }
+        self.retry_update_review_locked(&mut jobs, id, host, actor, now, Some(retry_id.to_string()))
+    }
+
+    fn retry_update_review_locked(
+        &self,
+        jobs: &mut BTreeMap<String, HostActionJob>,
+        id: &str,
+        host: &str,
+        actor: &str,
+        now: i64,
+        retry_id: Option<String>,
+    ) -> Result<HostActionJob, HostActionStoreError> {
         let existing = jobs.get(id).ok_or(HostActionStoreError::NotFound)?;
         if existing.host != host {
             return Err(HostActionStoreError::WrongHost);
@@ -5465,14 +5501,14 @@ impl HostActionStore {
         let intent = existing.update_restart_intent();
         let settings_change_id = existing.settings_change_id.clone();
         if !existing.review_retryable()
-            || Self::latest_update_for(&jobs, host).is_none_or(|job| job.id != id)
+            || Self::latest_update_for(jobs, host).is_none_or(|job| job.id != id)
         {
             return Err(HostActionStoreError::InvalidTransition);
         }
-        if Self::has_active(&jobs, host, HostActionKind::UpdateRestart) {
+        if Self::has_active(jobs, host, HostActionKind::UpdateRestart) {
             return Err(HostActionStoreError::ActiveJob);
         }
-        if Self::blocked_by_other_update(&jobs, host) {
+        if Self::blocked_by_other_update(jobs, host) {
             return Err(HostActionStoreError::BlockedByFleetGate);
         }
         let job = Self::new_update_review(
@@ -5482,9 +5518,9 @@ impl HostActionStore {
             now,
             Some(id.to_string()),
             settings_change_id,
-            None,
+            retry_id,
         );
-        self.insert_locked(&mut jobs, job)
+        self.insert_locked(jobs, job)
     }
 
     pub(crate) fn cancel_update_review(
@@ -8162,6 +8198,48 @@ mod tests {
                 .expect("failed attempt retained")
                 .state,
             HostActionState::Failed
+        );
+    }
+
+    #[test]
+    fn failed_review_retry_can_bind_an_exact_id_without_weakening_retry_gates() {
+        let store = HostActionStore::new(None);
+        let failed = store
+            .create_update_review("hsb8", "paimos-delivery", 100)
+            .expect("job created");
+        store.claim("hsb8", 101).expect("claim").expect("lease");
+        store
+            .record_agent_result(
+                &failed.id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: AgentActionPhase::Review,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                102,
+            )
+            .expect("failure stored");
+
+        let retry_id = "action-update-restart-hsb8-exact-retry";
+        let retry = store
+            .retry_update_review_with_id(&failed.id, retry_id, "hsb8", "paimos-delivery", 103)
+            .expect("exact retry created");
+        assert_eq!(retry.id, retry_id);
+        assert_eq!(retry.retry_of.as_deref(), Some(failed.id.as_str()));
+        assert_eq!(retry.state, HostActionState::QueuedReview);
+        assert!(retry.confirmed_at.is_none());
+        assert!(retry.plan.is_none());
+
+        let replay = store
+            .retry_update_review_with_id(&failed.id, retry_id, "hsb8", "paimos-delivery", 104)
+            .expect("exact retry replayed");
+        assert_eq!(replay, retry);
+        assert_eq!(
+            store.retry_update_review_with_id(&failed.id, retry_id, "hsb8", "other-actor", 104,),
+            Err(HostActionStoreError::InvalidJob)
         );
     }
 

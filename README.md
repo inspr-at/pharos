@@ -393,6 +393,14 @@ supplies none of those authority-bearing selectors, and no Paimos field can
 become a command, path, callback, host selector or arbitrary workflow. An
 unrelated active job on the same host is not adopted.
 
+When a later Paimos execution follows an adapter-owned review that failed
+before confirmation, the adapter creates a new deterministic review linked by
+`retry_of`. It does so only when the durable prior operation has the same host,
+workflow, environment, artifact, plan and predecessor and is the immediately
+preceding execution. Foreign failures, ambiguous history, changed plans and
+failures after confirmation remain unavailable; the new review still requires
+the normal agent review and human confirmation.
+
 Every external call requires the registered API key and the handoff's separate
 32-byte credential from different owner-only, current-user-owned, single-link
 files. Before a mutation, Pharos durably stores the exact safe JSON request and
