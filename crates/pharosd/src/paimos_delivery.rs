@@ -1336,9 +1336,9 @@ impl JournalStore {
         let prior_execution = pull.execution_number.checked_sub(1);
         let document = self.document.lock().expect("Paimos delivery journal lock");
         let mut matches = document.operations.values().filter(|binding| {
-            // A stage retry keeps the attempt plan but recomputes its
-            // predecessor from the latest required prerequisite. Bind each
-            // predecessor in its own operation; do not require stale equality.
+            // A stage retry keeps the attempt plan but Paimos recomputes its
+            // predecessor from the fresh execution and authority lineage. Bind
+            // each predecessor in its own operation; do not require equality.
             Some(binding.execution_number) == prior_execution
                 && binding.host == intent.host
                 && binding.workflow == intent.workflow.key()
@@ -2260,7 +2260,7 @@ impl PaimosDeliveryAdapter {
                 return Err(AdapterError::LocalBinding);
             }
             if intent.update_restart_job_id.is_none() {
-                self.validate_owned_job(intent, pull, &job)?;
+                self.validate_bound_owned_job(intent, &existing, &job)?;
             }
             return Ok(());
         }
@@ -2294,7 +2294,7 @@ impl PaimosDeliveryAdapter {
             };
             match job {
                 Ok(job) => {
-                    self.validate_owned_job(intent, pull, &job)?;
+                    self.validate_new_owned_job(intent, pull, &job)?;
                     // Exact owned job may already be confirmed if the operator
                     // acted after insert and before journal persist. Bind that
                     // job only; never confirm, claim, dispatch, or adopt another.
@@ -2321,7 +2321,25 @@ impl PaimosDeliveryAdapter {
         Ok(())
     }
 
-    fn validate_owned_job(
+    fn validate_bound_owned_job(
+        &self,
+        intent: &DeliveryIntent,
+        binding: &OperationBinding,
+        job: &HostActionJob,
+    ) -> Result<(), AdapterError> {
+        if job.id != binding.job_id
+            || job.id != deterministic_job_id(&intent.host, &binding.operation_id)
+            || job.host != intent.host
+            || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+            || job.update_restart_intent() != UpdateRestartIntent::Update
+            || job.requested_by != GUARDED_ACTOR
+        {
+            return Err(AdapterError::LocalBinding);
+        }
+        Ok(())
+    }
+
+    fn validate_new_owned_job(
         &self,
         intent: &DeliveryIntent,
         pull: &PullResponse,
@@ -3109,6 +3127,7 @@ mod tests {
     const DEPLOYMENT_HANDOFF: &str = "01K3A000000000000000000001";
     const VERIFICATION_HANDOFF: &str = "01K3A000000000000000000002";
     const RETRY_DEPLOYMENT_HANDOFF: &str = "01K3A000000000000000000003";
+    const AMBIGUOUS_DEPLOYMENT_HANDOFF: &str = "01K3A000000000000000000004";
     const API_KEY_SENTINEL: &[u8] = b"PAIMOS_API_KEY_SENTINEL_1234567890";
     const HANDOFF_SENTINEL: &[u8; 32] = b"HANDOFF_SECRET_SENTINEL_12345678";
 
@@ -6405,25 +6424,46 @@ mod tests {
             Err(AdapterError::LocalBinding)
         ));
 
-        let foreign_actions = Arc::new(HostActionStore::new(None));
-        let foreign = foreign_actions
+        let mut ambiguous = first_binding.clone();
+        ambiguous.handoff_id = AMBIGUOUS_DEPLOYMENT_HANDOFF.to_string();
+        ambiguous.job_id = "action-update-restart-hsb8-ambiguous".to_string();
+        ambiguous.operation_id = "a".repeat(64);
+        adapter
+            .journal
+            .persist_operation(ambiguous)
+            .expect("second prior operation persisted");
+        let mut matching_plan =
+            test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        matching_plan.execution_number = 2;
+        assert!(matches!(
+            adapter.bind_after_accept(&retry, &matching_plan, now + 3),
+            Err(AdapterError::LocalBinding)
+        ));
+
+        let configured_actions = Arc::new(HostActionStore::new(None));
+        let configured = configured_actions
             .create_update_review("hsb8", "operator", now)
-            .expect("foreign review");
-        fail_review(&foreign_actions, &foreign.id, now + 1);
-        let foreign_adapter = test_adapter(
+            .expect("operator review");
+        let mut configured_first = first.clone();
+        configured_first.update_restart_job_id = Some(configured.id.clone());
+        let configured_adapter = test_adapter(
             config(
                 Url::parse("https://paimos.example.test").unwrap(),
                 directory.join("api-key"),
-                vec![retry.clone()],
+                vec![configured_first.clone(), retry.clone()],
             ),
-            directory.join("foreign-journal.json"),
+            directory.join("configured-journal.json"),
             Arc::new(Store::new(None).unwrap()),
-            foreign_actions,
+            configured_actions.clone(),
         );
+        configured_adapter
+            .bind_after_accept(&configured_first, &first_pull, now)
+            .expect("explicit operator job bound only to first execution");
+        fail_review(&configured_actions, &configured.id, now + 1);
         let mut retry_pull = test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
         retry_pull.execution_number = 2;
         assert!(matches!(
-            foreign_adapter.bind_after_accept(&retry, &retry_pull, now + 3),
+            configured_adapter.bind_after_accept(&retry, &retry_pull, now + 3),
             Err(AdapterError::LocalBinding)
         ));
     }

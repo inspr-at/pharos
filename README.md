@@ -398,7 +398,7 @@ before confirmation, the adapter creates a new deterministic review linked by
 `retry_of`. It does so only when the durable prior operation has the same host,
 workflow, environment, artifact and plan and is the immediately
 preceding execution. The fresh execution's own predecessor remains independently
-bound and may change when a prerequisite supplies newer evidence. Foreign
+bound and may change with its new execution and authority lineage. Foreign
 failures, ambiguous history, changed plans and failures after confirmation
 remain unavailable; the new review still requires the normal agent review and
 human confirmation.
