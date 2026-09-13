@@ -180,6 +180,14 @@ fn machine_and_public_routes() -> Router<AppState> {
             get(sidebar_lighthouse_motion_asset),
         )
         .route(
+            "/assets/calendar-version-bootstrap.mjs",
+            get(calendar_version_bootstrap_asset),
+        )
+        .route(
+            "/assets/vendor/calendar-version-display/{name}",
+            get(calendar_version_bundle_asset),
+        )
+        .route(
             "/assets/vendor/leaflet-1.9.4/leaflet.css",
             get(leaflet_css_asset),
         )

@@ -986,6 +986,15 @@ source-lock digest hashes, in order, the exact bytes of `Cargo.lock`,
 `pharosd` exposes both the canonical identity and compatibility mapping at
 `/version`.
 
+The sidebar and release history render calendar v2 coordinates through the
+build-time-only INSPR Calendar display bundle in
+`crates/pharosd/assets/vendor/calendar-version-display`. The bundle is pinned
+to source `83d26aa605b21493d22805ba477e6ac279b6409d`; its manifest, configuration,
+renderer, interaction helper, AutoAnimate library and license are verified
+offline by `scripts/check-calendar-version-display.sh` and again by the Rust
+build. The server-rendered canonical coordinate remains visible if JavaScript
+is unavailable, and `/version` remains the machine interface.
+
 ## License
 
 Copyright © 2026 [Markus Barta](https://github.com/markus-barta).

@@ -1,7 +1,104 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeSet, env, fs, path::Path, path::PathBuf, process::Command};
+
+const DISPLAY_SOURCE: &str = "83d26aa605b21493d22805ba477e6ac279b6409d";
+const DISPLAY_CONFIG_SHA256: &str =
+    "7843f3515ce329277d2d576000bd60ac410d725b241d502a9a3fecb2533d956d";
+const DISPLAY_MANIFEST_SHA256: &str =
+    "e7052c82af0d0cdfe4a466bf3129c1de56014253247106f2670788419f118812";
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn verify_calendar_bundle(manifest_dir: &Path) {
+    let bundle = manifest_dir.join("assets/vendor/calendar-version-display");
+    let expected: BTreeSet<&str> = [
+        "display.json",
+        "version.js",
+        "presentation.js",
+        "version-interaction.js",
+        "auto-animate.js",
+        "auto-animate-license.js",
+        "package.json",
+        "manifest.json",
+    ]
+    .into_iter()
+    .collect();
+    let observed: BTreeSet<String> = fs::read_dir(&bundle)
+        .expect("calendar display bundle is readable")
+        .map(|entry| {
+            let entry = entry.expect("calendar display bundle entry is readable");
+            assert!(
+                entry
+                    .file_type()
+                    .expect("calendar display bundle entry has a type")
+                    .is_file(),
+                "calendar display bundle entries must be regular files"
+            );
+            entry
+                .file_name()
+                .into_string()
+                .expect("calendar display bundle names are UTF-8")
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        expected.into_iter().map(str::to_string).collect(),
+        "calendar display bundle file set drifted"
+    );
+    let manifest_path = bundle.join("manifest.json");
+    let manifest_raw = fs::read(&manifest_path).expect("calendar display manifest is readable");
+    assert_eq!(
+        hex_sha256(&manifest_raw),
+        DISPLAY_MANIFEST_SHA256,
+        "calendar display manifest digest drifted"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_raw).expect("calendar display manifest is valid JSON");
+    assert_eq!(manifest["repository"], "inspr-at/inspr");
+    assert_eq!(manifest["revision"], DISPLAY_SOURCE);
+    assert_eq!(manifest["expectedConfigSha256"], DISPLAY_CONFIG_SHA256);
+    assert_eq!(manifest["schema"], "inspr.calendar-version-display.v2");
+    assert_eq!(manifest["mode"], "build-time-only");
+    assert_eq!(manifest["consumers"], serde_json::json!([]));
+    assert_eq!(manifest["runtimeConsumers"], false);
+    let entries = manifest["files"]
+        .as_array()
+        .expect("calendar display manifest files are an array");
+    assert_eq!(
+        entries.len(),
+        7,
+        "calendar display manifest entry count drifted"
+    );
+    for entry in entries {
+        let name = entry["outputPath"]
+            .as_str()
+            .expect("calendar display outputPath is a string");
+        let path = bundle.join(name);
+        let raw = fs::read(&path).expect("calendar display payload is readable");
+        assert_eq!(
+            raw.len() as u64,
+            entry["size"]
+                .as_u64()
+                .expect("calendar display payload size is unsigned"),
+            "calendar display payload size drifted: {name}"
+        );
+        assert_eq!(
+            hex_sha256(&raw),
+            entry["sha256"]
+                .as_str()
+                .expect("calendar display payload digest is a string"),
+            "calendar display payload digest drifted: {name}"
+        );
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+}
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    verify_calendar_bundle(&manifest_dir);
     let repo_root = manifest_dir
         .parent()
         .and_then(|path| path.parent())

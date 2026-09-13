@@ -49,6 +49,17 @@ test("fleet has no serious accessibility violations and serves hardened headers"
 test("release history exposes the complete immutable release identity", async ({
   page,
 }) => {
+  await page.addInitScript(() => {
+    window.__copiedVersion = null;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (value) => {
+          window.__copiedVersion = value;
+        },
+      },
+    });
+  });
   await page.goto("/");
   const dialog = page.locator("[data-release-modal]");
   await expect(dialog).toHaveCount(1);
@@ -68,19 +79,43 @@ test("release history exposes the complete immutable release identity", async ({
   );
 
   const pill = page.locator(".side-version");
-  await expect(pill).toContainText(`v${releaseCoordinate.version}`);
+  const pillVersion = pill.locator("[data-calendar-display]");
+  await expect(pillVersion).toHaveAttribute(
+    "data-canonical",
+    releaseCoordinate.version,
+  );
+  await expect(pillVersion).toHaveAttribute(
+    "data-version",
+    `v${releaseCoordinate.version}`,
+  );
+  await expect(pillVersion).toHaveAttribute(
+    "data-scheme",
+    releaseCoordinate.version_scheme,
+  );
   if (releaseCoordinate.version_scheme === "inspr-calendar-v2") {
-    const weighted = pill.locator("span.cv2");
-    await expect(weighted).toHaveAttribute(
-      "data-version",
+    await expect(pillVersion).toHaveAttribute("role", "img");
+    await expect(pillVersion).toHaveAttribute(
+      "aria-label",
       `v${releaseCoordinate.version}`,
     );
-    await expect(weighted.locator("b.yy")).toHaveText(
+    await expect(pillVersion.locator("span.yy")).toHaveText(
       releaseCoordinate.version.slice(0, 2),
     );
-    await expect(weighted.locator("b.tail")).toHaveText(".0.0");
+    await expect(pillVersion.locator("span.tail")).toHaveText(".0.0");
+
+    if (await pill.isVisible()) {
+      await pill.click();
+      await expect(dialog).toBeVisible();
+      const dialogVersion = dialog.locator("[data-calendar-display]");
+      await expect(dialogVersion).toHaveAttribute("role", "button");
+      await dialogVersion.focus();
+      await page.keyboard.press("Enter");
+      await expect
+        .poll(() => page.evaluate(() => window.__copiedVersion))
+        .toBe(releaseCoordinate.version);
+    }
   } else {
-    await expect(pill.locator("span.cv2")).toHaveCount(0);
+    await expect(pillVersion).toHaveText(`v${releaseCoordinate.version}`);
   }
 });
 
