@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 260913221718.0.0 - 2026-09-13
+
+- Let a fresh Paimos owner execution create one durable, deterministic review retry after an adapter-owned pre-confirmation failure, preserving the failed attempt and all normal review, confirmation and fleet gates while refusing foreign, ambiguous, changed-lineage or post-confirmation failures (PHAROS-206).
+
 ## 260913150822.0.0 - 2026-09-13
 
 - Add owner-declared, bounded HTTP service health probes with exact manifest bindings, explicit status and optional marker checks, independent cadence and timeout policy, and coarse access-filtered status projection (PHAROS-266).
