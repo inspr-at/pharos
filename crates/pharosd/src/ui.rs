@@ -2942,20 +2942,31 @@ pub(super) fn sanitized_probe_target(url: &Url) -> String {
 pub(super) fn server_probe_summary(observations: &[ServerProbeObservation]) -> serde_json::Value {
     let mut healthy = 0;
     let mut warning = 0;
+    let mut unreachable = 0;
     let mut stale = 0;
     let mut unknown = 0;
     for observation in observations {
         match observation.state {
             ServiceObservationState::Healthy => healthy += 1,
-            ServiceObservationState::Warning => warning += 1,
+            ServiceObservationState::Warning => {
+                warning += 1;
+                if observation.server_reachable == Some(false) {
+                    unreachable += 1;
+                }
+            }
             ServiceObservationState::Stale => stale += 1,
             ServiceObservationState::Unknown => unknown += 1,
         }
     }
+    let unhealthy = warning - unreachable;
     let label = if observations.is_empty() {
         "not probed".to_string()
-    } else if warning > 0 {
-        format!("{warning} unreachable")
+    } else if unreachable > 0 && unhealthy > 0 {
+        format!("{unreachable} unreachable, {unhealthy} unhealthy")
+    } else if unreachable > 0 {
+        format!("{unreachable} unreachable")
+    } else if unhealthy > 0 {
+        format!("{unhealthy} unhealthy")
     } else if stale > 0 {
         format!("{stale} stale")
     } else if unknown > 0 {

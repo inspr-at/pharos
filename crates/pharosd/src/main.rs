@@ -10673,6 +10673,49 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn server_probe_summary_distinguishes_unhealthy_http_from_unreachable_transport() {
+        let http_unhealthy = ServerProbeObservation {
+            id: "http-probe-app-health".to_string(),
+            service: "App".to_string(),
+            source: "server",
+            policy: "pharos-runtime",
+            kind: "http-response",
+            target: Some("https://app.example".to_string()),
+            state: ServiceObservationState::Warning,
+            server_reachable: Some(true),
+            client_reachable: None,
+            summary: "HTTP 503; expected 200".to_string(),
+            checked_at: 1000,
+        };
+        let tcp_unreachable = ServerProbeObservation {
+            id: "database".to_string(),
+            service: "Database".to_string(),
+            source: "server",
+            policy: "pharos-runtime",
+            kind: "tcp-connect",
+            target: Some("tcp://database.example:5432".to_string()),
+            state: ServiceObservationState::Warning,
+            server_reachable: Some(false),
+            client_reachable: None,
+            summary: "server cannot reach database.example:5432".to_string(),
+            checked_at: 1000,
+        };
+
+        assert_eq!(
+            server_probe_summary(std::slice::from_ref(&http_unhealthy))["label"],
+            "1 unhealthy"
+        );
+        assert_eq!(
+            server_probe_summary(std::slice::from_ref(&tcp_unreachable))["label"],
+            "1 unreachable"
+        );
+        assert_eq!(
+            server_probe_summary(&[tcp_unreachable, http_unhealthy])["label"],
+            "1 unreachable, 1 unhealthy"
+        );
+    }
+
+    #[test]
     fn declared_hosts_payload_marks_missing_runtime_as_pending() {
         let manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
