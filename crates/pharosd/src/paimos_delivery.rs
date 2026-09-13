@@ -1328,6 +1328,31 @@ impl JournalStore {
             .cloned()
     }
 
+    fn retry_predecessor(
+        &self,
+        intent: &DeliveryIntent,
+        pull: &PullResponse,
+    ) -> Result<Option<OperationBinding>, AdapterError> {
+        let prior_execution = pull.execution_number.checked_sub(1);
+        let document = self.document.lock().expect("Paimos delivery journal lock");
+        let mut matches = document.operations.values().filter(|binding| {
+            // A stage retry keeps the attempt plan but Paimos recomputes its
+            // predecessor from the fresh execution and authority lineage. Bind
+            // each predecessor in its own operation; do not require equality.
+            Some(binding.execution_number) == prior_execution
+                && binding.host == intent.host
+                && binding.workflow == intent.workflow.key()
+                && binding.environment == intent.environment
+                && binding.artifact == intent.artifact
+                && binding.plan_digest == pull.plan_digest
+        });
+        let predecessor = matches.next().cloned();
+        if matches.next().is_some() {
+            return Err(AdapterError::LocalBinding);
+        }
+        Ok(predecessor)
+    }
+
     fn persist_operation(
         &self,
         binding: OperationBinding,
@@ -2234,6 +2259,9 @@ impl PaimosDeliveryAdapter {
             if job.host != intent.host || job.workflow_kind() != HostWorkflowKind::UpdateRestart {
                 return Err(AdapterError::LocalBinding);
             }
+            if intent.update_restart_job_id.is_none() {
+                self.validate_bound_owned_job(intent, &existing, &job)?;
+            }
             return Ok(());
         }
         let operation_id = operation_identity(intent, &self.config.paimos_origin, pull)?;
@@ -2247,32 +2275,32 @@ impl PaimosDeliveryAdapter {
             configured.to_string()
         } else {
             let job_id = deterministic_job_id(&intent.host, &operation_id);
-            match self.host_actions.ensure_update_review_with_id(
-                &job_id,
-                &intent.host,
-                GUARDED_ACTOR,
-                UpdateRestartIntent::Update,
-                now,
-            ) {
+            let predecessor = self.journal.retry_predecessor(intent, pull)?;
+            let job = match predecessor.as_ref() {
+                Some(predecessor) => self.host_actions.retry_update_review_with_id(
+                    &predecessor.job_id,
+                    &job_id,
+                    &intent.host,
+                    GUARDED_ACTOR,
+                    now,
+                ),
+                None => self.host_actions.ensure_update_review_with_id(
+                    &job_id,
+                    &intent.host,
+                    GUARDED_ACTOR,
+                    UpdateRestartIntent::Update,
+                    now,
+                ),
+            };
+            match job {
                 Ok(job) => {
-                    if job.host != intent.host
-                        || job.workflow_kind() != HostWorkflowKind::UpdateRestart
-                    {
-                        return Err(AdapterError::LocalBinding);
-                    }
+                    self.validate_new_owned_job(intent, pull, &job)?;
                     // Exact owned job may already be confirmed if the operator
                     // acted after insert and before journal persist. Bind that
                     // job only; never confirm, claim, dispatch, or adopt another.
                     job.id
                 }
-                Err(
-                    HostActionStoreError::ActiveJob
-                    | HostActionStoreError::FailedJobRequiresRetry
-                    | HostActionStoreError::BlockedByFleetGate
-                    | HostActionStoreError::WrongHost
-                    | HostActionStoreError::InvalidJob,
-                ) => return Err(AdapterError::LocalBinding),
-                Err(_) => return Err(AdapterError::Journal),
+                Err(error) => return Err(map_host_action_error(error)),
             }
         };
         let binding = OperationBinding {
@@ -2290,6 +2318,43 @@ impl PaimosDeliveryAdapter {
             operation_id,
         };
         self.journal.persist_operation(binding)?;
+        Ok(())
+    }
+
+    fn validate_bound_owned_job(
+        &self,
+        intent: &DeliveryIntent,
+        binding: &OperationBinding,
+        job: &HostActionJob,
+    ) -> Result<(), AdapterError> {
+        if job.id != binding.job_id
+            || job.id != deterministic_job_id(&intent.host, &binding.operation_id)
+            || job.host != intent.host
+            || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+            || job.update_restart_intent() != UpdateRestartIntent::Update
+            || job.requested_by != GUARDED_ACTOR
+        {
+            return Err(AdapterError::LocalBinding);
+        }
+        Ok(())
+    }
+
+    fn validate_new_owned_job(
+        &self,
+        intent: &DeliveryIntent,
+        pull: &PullResponse,
+        job: &HostActionJob,
+    ) -> Result<(), AdapterError> {
+        let predecessor = self.journal.retry_predecessor(intent, pull)?;
+        if job.host != intent.host
+            || job.workflow_kind() != HostWorkflowKind::UpdateRestart
+            || job.update_restart_intent() != UpdateRestartIntent::Update
+            || job.requested_by != GUARDED_ACTOR
+            || job.retry_of.as_deref()
+                != predecessor.as_ref().map(|binding| binding.job_id.as_str())
+        {
+            return Err(AdapterError::LocalBinding);
+        }
         Ok(())
     }
 
@@ -3061,6 +3126,8 @@ mod tests {
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
     const DEPLOYMENT_HANDOFF: &str = "01K3A000000000000000000001";
     const VERIFICATION_HANDOFF: &str = "01K3A000000000000000000002";
+    const RETRY_DEPLOYMENT_HANDOFF: &str = "01K3A000000000000000000003";
+    const AMBIGUOUS_DEPLOYMENT_HANDOFF: &str = "01K3A000000000000000000004";
     const API_KEY_SENTINEL: &[u8] = b"PAIMOS_API_KEY_SENTINEL_1234567890";
     const HANDOFF_SENTINEL: &[u8; 32] = b"HANDOFF_SECRET_SENTINEL_12345678";
 
@@ -3568,6 +3635,28 @@ mod tests {
                 now + 1,
             )
             .expect("record review");
+    }
+
+    fn fail_review(store: &HostActionStore, job_id: &str, now: i64) {
+        let review = store
+            .claim("hsb8", now)
+            .expect("claim review")
+            .expect("review lease");
+        assert_eq!(review.id, job_id);
+        store
+            .record_agent_result(
+                job_id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: review.phase,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                now + 1,
+            )
+            .expect("record failed review");
     }
 
     fn record_nix_only_beacon(store: &Store, observed_at: i64, artifact: &ArtifactEvidence) {
@@ -6204,6 +6293,242 @@ mod tests {
         hosts.record(report, now - 5).unwrap();
         assert!(matches!(
             adapter.deployment_report(&deployment, now),
+            Err(AdapterError::LocalBinding)
+        ));
+    }
+
+    #[test]
+    fn fresh_execution_links_a_new_exact_review_to_the_owned_failed_review() {
+        let now = now_unix();
+        let directory = temporary_directory("delivery-retry");
+        let api_path = directory.join("api-key");
+        let first_secret = directory.join("first-secret");
+        let retry_secret = directory.join("retry-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&first_secret, HANDOFF_SENTINEL);
+        write_private(&retry_secret, &[8; HANDOFF_SECRET_BYTES]);
+        let first = intent(DEPLOYMENT_HANDOFF, first_secret, IntentStage::Deployment);
+        let retry = intent(
+            RETRY_DEPLOYMENT_HANDOFF,
+            retry_secret,
+            IntentStage::Deployment,
+        );
+        let actions_path = directory.join("host-actions.json");
+        let journal_path = directory.join("journal.json");
+        let actions = Arc::new(HostActionStore::new(Some(actions_path.clone())));
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![first.clone(), retry.clone()],
+            ),
+            journal_path.clone(),
+            Arc::new(Store::new(None).unwrap()),
+            actions.clone(),
+        );
+        let predecessor_digest = format!("sha256:{}", "3".repeat(64));
+        let first_pull = test_pull(DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        adapter.bind_after_accept(&first, &first_pull, now).unwrap();
+        let first_binding = adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("first operation bound");
+        fail_review(&actions, &first_binding.job_id, now + 1);
+        drop(adapter);
+        drop(actions);
+
+        let actions = Arc::new(HostActionStore::new(Some(actions_path)));
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                directory.join("api-key"),
+                vec![first, retry.clone()],
+            ),
+            journal_path,
+            Arc::new(Store::new(None).unwrap()),
+            actions.clone(),
+        );
+
+        let mut retry_pull = test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        retry_pull.execution_number = 2;
+        retry_pull.predecessor_digest = format!("sha256:{}", "6".repeat(64));
+        retry_pull.context_digest = format!("sha256:{}", "5".repeat(64));
+        adapter
+            .bind_after_accept(&retry, &retry_pull, now + 3)
+            .expect("fresh execution creates linked retry");
+        let retry_binding = adapter
+            .journal
+            .operation(RETRY_DEPLOYMENT_HANDOFF)
+            .expect("retry operation bound");
+        assert_ne!(retry_binding.job_id, first_binding.job_id);
+        let retry_job = actions.get(&retry_binding.job_id).expect("retry job");
+        assert_eq!(
+            retry_job.retry_of.as_deref(),
+            Some(first_binding.job_id.as_str())
+        );
+        assert_eq!(retry_job.state, HostActionState::QueuedReview);
+        assert!(retry_job.confirmed_at.is_none());
+        assert!(retry_job.plan.is_none());
+
+        adapter
+            .bind_after_accept(&retry, &retry_pull, now + 4)
+            .expect("exact retry binding replays");
+        assert_eq!(
+            actions.get(&retry_binding.job_id).expect("same retry job"),
+            retry_job
+        );
+    }
+
+    #[test]
+    fn fresh_execution_refuses_foreign_or_nonmatching_failed_reviews() {
+        let now = now_unix();
+        let directory = temporary_directory("delivery-retry-refusal");
+        let api_path = directory.join("api-key");
+        let first_secret = directory.join("first-secret");
+        let retry_secret = directory.join("retry-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&first_secret, HANDOFF_SENTINEL);
+        write_private(&retry_secret, &[8; HANDOFF_SECRET_BYTES]);
+        let first = intent(DEPLOYMENT_HANDOFF, first_secret, IntentStage::Deployment);
+        let retry = intent(
+            RETRY_DEPLOYMENT_HANDOFF,
+            retry_secret,
+            IntentStage::Deployment,
+        );
+        let actions = Arc::new(HostActionStore::new(None));
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![first.clone(), retry.clone()],
+            ),
+            directory.join("journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            actions.clone(),
+        );
+        let predecessor_digest = format!("sha256:{}", "3".repeat(64));
+        let first_pull = test_pull(DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        adapter.bind_after_accept(&first, &first_pull, now).unwrap();
+        let first_binding = adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("first operation bound");
+        fail_review(&actions, &first_binding.job_id, now + 1);
+
+        let mut changed_plan =
+            test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        changed_plan.execution_number = 2;
+        changed_plan.plan_digest = format!("sha256:{}", "9".repeat(64));
+        assert!(matches!(
+            adapter.bind_after_accept(&retry, &changed_plan, now + 3),
+            Err(AdapterError::LocalBinding)
+        ));
+
+        let mut ambiguous = first_binding.clone();
+        ambiguous.handoff_id = AMBIGUOUS_DEPLOYMENT_HANDOFF.to_string();
+        ambiguous.job_id = "action-update-restart-hsb8-ambiguous".to_string();
+        ambiguous.operation_id = "a".repeat(64);
+        adapter
+            .journal
+            .persist_operation(ambiguous)
+            .expect("second prior operation persisted");
+        let mut matching_plan =
+            test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        matching_plan.execution_number = 2;
+        assert!(matches!(
+            adapter.bind_after_accept(&retry, &matching_plan, now + 3),
+            Err(AdapterError::LocalBinding)
+        ));
+
+        let configured_actions = Arc::new(HostActionStore::new(None));
+        let configured = configured_actions
+            .create_update_review("hsb8", "operator", now)
+            .expect("operator review");
+        let mut configured_first = first.clone();
+        configured_first.update_restart_job_id = Some(configured.id.clone());
+        let configured_adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                directory.join("api-key"),
+                vec![configured_first.clone(), retry.clone()],
+            ),
+            directory.join("configured-journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            configured_actions.clone(),
+        );
+        configured_adapter
+            .bind_after_accept(&configured_first, &first_pull, now)
+            .expect("explicit operator job bound only to first execution");
+        fail_review(&configured_actions, &configured.id, now + 1);
+        let mut retry_pull = test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        retry_pull.execution_number = 2;
+        assert!(matches!(
+            configured_adapter.bind_after_accept(&retry, &retry_pull, now + 3),
+            Err(AdapterError::LocalBinding)
+        ));
+    }
+
+    #[test]
+    fn fresh_execution_refuses_a_prior_job_that_reached_confirmation() {
+        let now = now_unix();
+        let directory = temporary_directory("delivery-retry-confirmed");
+        let api_path = directory.join("api-key");
+        let first_secret = directory.join("first-secret");
+        let retry_secret = directory.join("retry-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&first_secret, HANDOFF_SENTINEL);
+        write_private(&retry_secret, &[8; HANDOFF_SECRET_BYTES]);
+        let first = intent(DEPLOYMENT_HANDOFF, first_secret, IntentStage::Deployment);
+        let retry = intent(
+            RETRY_DEPLOYMENT_HANDOFF,
+            retry_secret,
+            IntentStage::Deployment,
+        );
+        let actions = Arc::new(HostActionStore::new(None));
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![first.clone(), retry.clone()],
+            ),
+            directory.join("journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            actions.clone(),
+        );
+        let predecessor_digest = format!("sha256:{}", "3".repeat(64));
+        let first_pull = test_pull(DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        adapter.bind_after_accept(&first, &first_pull, now).unwrap();
+        let first_binding = adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("first operation bound");
+        review_existing_update(&actions, &first_binding.job_id, now + 1);
+        actions
+            .confirm_update(&first_binding.job_id, "hsb8", GUARDED_ACTOR, now + 3)
+            .expect("confirm prior job");
+        let apply = actions
+            .claim("hsb8", now + 4)
+            .expect("claim apply")
+            .expect("apply lease");
+        actions
+            .record_agent_result(
+                &first_binding.job_id,
+                "hsb8",
+                AgentActionResultRequest {
+                    host: "hsb8".to_string(),
+                    phase: apply.phase,
+                    outcome: AgentActionOutcome::Failed,
+                    plan: None,
+                    result: None,
+                },
+                now + 5,
+            )
+            .expect("record apply failure");
+
+        let mut retry_pull = test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        retry_pull.execution_number = 2;
+        assert!(matches!(
+            adapter.bind_after_accept(&retry, &retry_pull, now + 6),
             Err(AdapterError::LocalBinding)
         ));
     }
