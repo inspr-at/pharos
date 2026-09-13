@@ -5,6 +5,7 @@
 ## 260913221718.0.0 - 2026-09-13
 
 - Let a fresh Paimos owner execution create one durable, deterministic review retry after an adapter-owned pre-confirmation failure, preserving the failed attempt and all normal review, confirmation and fleet gates while refusing foreign, ambiguous, changed-lineage or post-confirmation failures (PHAROS-206).
+- Adopt the approved INSPR Calendar Version display bundle from source `83d26aa605b21493d22805ba477e6ac279b6409d`: render Pharos release coordinates with the shared Pretty presentation and interaction, current product color, canonical keyboard/click copy and reduced-motion behavior. The complete local module and license closure is pinned and verified offline before every build; canonical version grammar, declared scheme and immutable release identities are unchanged (PHAROS-271, INSPR-424).
 
 ## 260913150822.0.0 - 2026-09-13
 

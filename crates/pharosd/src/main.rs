@@ -5514,6 +5514,12 @@ mod tests {
         assert!(hidden_guard < attach_source);
         assert!(html.contains(r#"class="side-version""#));
         assert!(html.contains(&release_label()));
+        assert_eq!(html.matches("data-calendar-display").count(), 2);
+        assert_eq!(
+            html.matches(r#"data-calendar-interactive="false""#).count(),
+            1
+        );
+        assert!(html.contains(r#"data-scheme="inspr-calendar-v2""#));
         assert!(html.contains("Release history"));
         assert!(html.contains("Pharos Changelog"));
         assert!(html.contains("0.1.0 - 2026-07-09"));
@@ -14819,6 +14825,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             ) || html.contains(r#"href="/pharos""#)
         );
         assert!(html.contains("/pharos/assets/") || html.contains("url('/pharos/assets/"));
+        assert!(html.contains(r#"src="/pharos/assets/calendar-version-bootstrap.mjs""#));
         assert!(html.contains("appUrl('/hosts.json") || html.contains("appUrl('/"));
         let logged_out = client
             .get(format!("{base}/pharos/auth/logged-out"))
@@ -14843,6 +14850,37 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             client
                 .get(format!(
                     "{base}/pharos/assets/vendor/leaflet-1.9.4/leaflet.css"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let calendar_bootstrap = client
+            .get(format!(
+                "{base}/pharos/assets/calendar-version-bootstrap.mjs"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(calendar_bootstrap.status(), StatusCode::OK);
+        assert_eq!(
+            calendar_bootstrap
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache, must-revalidate")
+        );
+        assert!(calendar_bootstrap
+            .text()
+            .await
+            .unwrap()
+            .contains("./vendor/calendar-version-display/version.js"));
+        assert_eq!(
+            client
+                .get(format!(
+                    "{base}/pharos/assets/vendor/calendar-version-display/version.js"
                 ))
                 .send()
                 .await

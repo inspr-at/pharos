@@ -36,6 +36,7 @@ openidconnect = "4"
 
 [build-dependencies]
 serde_json = { workspace = true }
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
