@@ -16,6 +16,7 @@ mod auth;
 mod durable_file;
 mod flow_host;
 mod host_actions;
+mod http_probes;
 mod icons;
 mod janus_auth;
 mod janus_projections;
@@ -111,6 +112,7 @@ use crate::host_actions::{
     HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
     SystemUpdateProposalBegin, UpdateRestartIntent, HOST_WORKFLOW_RECEIPT_RETENTION,
 };
+use crate::http_probes::{spawn_http_probe_loops, HttpProbeRuntime};
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
 use crate::managed_service_operations::{
@@ -160,6 +162,7 @@ struct AppState {
     alert_health: AlertWorkerHealth,
     access_request: AccessRequestConfig,
     flow_host: Option<Arc<flow_host::FlowHostService>>,
+    http_probes: Option<Arc<HttpProbeRuntime>>,
     public_base_path: PublicBasePath,
 }
 
@@ -3783,7 +3786,7 @@ async fn declared_hosts_json(
     } else {
         &[]
     };
-    let server_probes = server_probe_overlays(&manifests, now).await;
+    let server_probes = server_probe_overlays(&manifests, now, state.http_probes.as_deref()).await;
     no_store_json(declared_hosts_payload(
         &manifests,
         load_errors,
@@ -5156,6 +5159,9 @@ async fn main() {
             .unwrap_or_else(|error| panic!("alert store startup failed: {error}")),
     );
     let manifests = Arc::new(ManifestRegistry::from_env());
+    let http_probes = HttpProbeRuntime::from_env(manifests.manifests())
+        .unwrap_or_else(|error| panic!("HTTP probe startup failed: {error}"))
+        .map(Arc::new);
     let managed_setup_intents = match ManagedSetupIntentConfig::from_env()
         .unwrap_or_else(|error| panic!("managed setup intent startup failed: {error}"))
     {
@@ -5229,6 +5235,7 @@ async fn main() {
         alert_health,
         access_request,
         flow_host,
+        http_probes: http_probes.clone(),
         public_base_path: startup.public_base_path.clone(),
     };
     let _ = reconcile_saved_next_actions(&state, now_unix()).await;
@@ -5236,6 +5243,9 @@ async fn main() {
     spawn_alert_loop(state.clone(), alert_notifier);
     if let Some(runtime) = appliance_probes {
         spawn_appliance_probe_loop(runtime, Arc::clone(&state.store));
+    }
+    if let Some(runtime) = http_probes {
+        spawn_http_probe_loops(runtime);
     }
     if let Some(adapter) = paimos_delivery {
         adapter.spawn();
@@ -14667,6 +14677,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
             access_request: AccessRequestConfig::default(),
             flow_host: None,
+            http_probes: None,
             public_base_path: PublicBasePath::root(),
         }
     }

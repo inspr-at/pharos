@@ -577,6 +577,25 @@ explicit host-operator decision. The collector interface is runtime-specific,
 so a future systemd collector can add fixed unit-state discovery without
 changing the report contract or creating a general inspection channel.
 
+### Declared HTTP health observations
+
+Hosts without Compose discovery can still expose service health without a
+Docker socket. When `PHAROS_HTTP_PROBES_PATH` names a reviewed
+`inspr.pharos.http-probes.v1` registry, each entry binds one exact manifest
+host and service to a credential-free HTTP(S) URL, expected status, optional
+body marker, interval and timeout. Startup rejects unknown hosts or services,
+duplicate bindings, unknown fields, credential-bearing URLs and values outside
+the documented bounds. The synthetic shape is in
+`contracts/http-probes-v1.json`.
+
+Pharos checks every declaration on its own 10–3600 second cadence. Redirects
+and retries are disabled, each request has its declared 100–10000 millisecond
+deadline, and marker matching reads at most 64 KiB. The response body and
+marker are never retained, logged or projected. Status surfaces expose only a
+coarse pass, status mismatch, marker mismatch, timeout or transport result;
+results older than three declared intervals become stale. Existing manifest
+TCP probes remain the fallback for services without a declared HTTP probe.
+
 ### Appliance convergence observations
 
 Appliance-tier hosts deliberately run no beacon and hold no Pharos secret.
@@ -784,6 +803,7 @@ HTTPS-only boundary. Store Flow config and API key files under an operator-owned
 | `PHAROS_BEACON_TOKEN_HASH_DIR`                                 | Private Janus v2 token-generation root containing `current` and immutable generation files                                                                                                                                                             |
 | `PHAROS_MANIFEST_PATHS`                                        | Read-only declared-host manifests                                                                                                                                                                                                                      |
 | `PHAROS_HOST_PREFERENCES_PATH`                                 | Read-only declared preference registry                                                                                                                                                                                                                 |
+| `PHAROS_HTTP_PROBES_PATH`                                      | Optional owner-controlled `inspr.pharos.http-probes.v1` registry binding exact manifest services to bounded HTTP(S) health checks                                                                                                                      |
 | `PHAROS_APPLIANCE_PROBES_PATH`                                 | Optional owner-controlled `inspr.pharos.appliance-probes.v1` registry for fixed ICMP/SSH convergence observations; requires `PHAROS_DB`                                                                                                                |
 | `PHAROS_EXISTING_HOST_KNOWN_HOSTS_FILE`                        | Owner-controlled pinned SSH host-key file used by existing-host and optional appliance marker reads                                                                                                                                                    |
 | `PHAROS_EXISTING_HOST_IDENTITY_FILE`                           | Owner-controlled SSH identity path; required with the pinned host-key file before appliance marker reads are attempted                                                                                                                                 |
