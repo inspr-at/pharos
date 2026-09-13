@@ -5470,6 +5470,16 @@ impl HostActionStore {
         now: i64,
     ) -> Result<HostActionJob, HostActionStoreError> {
         let mut jobs = self.jobs.write().expect("host action store lock");
+        let predecessor = jobs.get(id).ok_or(HostActionStoreError::NotFound)?;
+        if predecessor.host != host {
+            return Err(HostActionStoreError::WrongHost);
+        }
+        if predecessor.kind != HostActionKind::UpdateRestart
+            || predecessor.update_restart_intent() != UpdateRestartIntent::Update
+            || predecessor.requested_by != actor
+        {
+            return Err(HostActionStoreError::InvalidJob);
+        }
         if let Some(existing) = jobs.get(retry_id) {
             if existing.host != host {
                 return Err(HostActionStoreError::WrongHost);
