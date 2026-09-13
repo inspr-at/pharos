@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-260913150822.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260913221718.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -396,10 +396,12 @@ unrelated active job on the same host is not adopted.
 When a later Paimos execution follows an adapter-owned review that failed
 before confirmation, the adapter creates a new deterministic review linked by
 `retry_of`. It does so only when the durable prior operation has the same host,
-workflow, environment, artifact, plan and predecessor and is the immediately
-preceding execution. Foreign failures, ambiguous history, changed plans and
-failures after confirmation remain unavailable; the new review still requires
-the normal agent review and human confirmation.
+workflow, environment, artifact and plan and is the immediately
+preceding execution. The fresh execution's own predecessor remains independently
+bound and may change when a prerequisite supplies newer evidence. Foreign
+failures, ambiguous history, changed plans and failures after confirmation
+remain unavailable; the new review still requires the normal agent review and
+human confirmation.
 
 Every external call requires the registered API key and the handoff's separate
 32-byte credential from different owner-only, current-user-owned, single-link

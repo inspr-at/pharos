@@ -1336,13 +1336,15 @@ impl JournalStore {
         let prior_execution = pull.execution_number.checked_sub(1);
         let document = self.document.lock().expect("Paimos delivery journal lock");
         let mut matches = document.operations.values().filter(|binding| {
+            // A stage retry keeps the attempt plan but recomputes its
+            // predecessor from the latest required prerequisite. Bind each
+            // predecessor in its own operation; do not require stale equality.
             Some(binding.execution_number) == prior_execution
                 && binding.host == intent.host
                 && binding.workflow == intent.workflow.key()
                 && binding.environment == intent.environment
                 && binding.artifact == intent.artifact
                 && binding.plan_digest == pull.plan_digest
-                && binding.predecessor_digest == pull.predecessor_digest
         });
         let predecessor = matches.next().cloned();
         if matches.next().is_some() {
@@ -6330,6 +6332,7 @@ mod tests {
 
         let mut retry_pull = test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
         retry_pull.execution_number = 2;
+        retry_pull.predecessor_digest = format!("sha256:{}", "6".repeat(64));
         retry_pull.context_digest = format!("sha256:{}", "5".repeat(64));
         adapter
             .bind_after_accept(&retry, &retry_pull, now + 3)
