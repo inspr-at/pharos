@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 260913150822.0.0 - 2026-09-13
+
+- Add owner-declared, bounded HTTP service health probes with exact manifest bindings, explicit status and optional marker checks, independent cadence and timeout policy, and coarse access-filtered status projection (PHAROS-266).
+
 ## 260912102405.0.0 - 2026-09-12
 
 - Explicitly install the PCRE2 security update from the existing immutable Debian snapshot; retain the base image and libssh2 fix (PHAROS-269).

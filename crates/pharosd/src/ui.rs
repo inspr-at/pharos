@@ -1177,7 +1177,7 @@ pub(super) async fn alerts_page(
     let hosts = filter_hosts_by_access(all_hosts, &access);
     let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let probes = server_probe_overlays(&manifests, now).await;
+    let probes = server_probe_overlays(&manifests, now, state.http_probes.as_deref()).await;
     let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
         state.manifests.load_errors()
     } else {
@@ -1235,7 +1235,7 @@ pub(super) async fn activity_page(
     let hosts = filter_hosts_by_access(all_hosts, &access);
     let jobs = filter_jobs_by_access(state.provisioning_jobs.list(), &access);
     let manifests = filter_manifests_by_access(state.manifests.manifests(), &access);
-    let probes = server_probe_overlays(&manifests, now).await;
+    let probes = server_probe_overlays(&manifests, now, state.http_probes.as_deref()).await;
     let load_errors: &[ManifestLoadIssue] = if access.can_agora() {
         state.manifests.load_errors()
     } else {
@@ -2759,19 +2759,28 @@ pub(super) struct ServerProbeObservation {
 pub(super) async fn server_probe_overlays(
     manifests: &[HostManifest],
     now: i64,
+    http_probes: Option<&HttpProbeRuntime>,
 ) -> BTreeMap<String, Vec<ServerProbeObservation>> {
-    let mut overlays = BTreeMap::new();
+    let mut overlays = http_probes
+        .map(|runtime| runtime.snapshot(now))
+        .unwrap_or_default();
+    let allowed_hosts: BTreeSet<&str> = manifests
+        .iter()
+        .map(|manifest| manifest.host.name.as_str())
+        .collect();
+    overlays.retain(|host, _| allowed_hosts.contains(host.as_str()));
     for manifest in manifests {
-        let mut observations = Vec::new();
+        let observations = overlays.entry(manifest.host.name.clone()).or_default();
         for service in &manifest.services {
-            if should_server_probe(service) {
+            let is_declared_http_probe = http_probes
+                .is_some_and(|runtime| runtime.declares(&manifest.host.name, &service.name));
+            if !is_declared_http_probe && should_server_probe(service) {
                 observations.push(server_probe_service(service, now).await);
             }
         }
-        if !observations.is_empty() {
-            overlays.insert(manifest.host.name.clone(), observations);
-        }
+        observations.sort_by(|left, right| left.id.cmp(&right.id));
     }
+    overlays.retain(|_, observations| !observations.is_empty());
     overlays
 }
 
@@ -2933,20 +2942,31 @@ pub(super) fn sanitized_probe_target(url: &Url) -> String {
 pub(super) fn server_probe_summary(observations: &[ServerProbeObservation]) -> serde_json::Value {
     let mut healthy = 0;
     let mut warning = 0;
+    let mut unreachable = 0;
     let mut stale = 0;
     let mut unknown = 0;
     for observation in observations {
         match observation.state {
             ServiceObservationState::Healthy => healthy += 1,
-            ServiceObservationState::Warning => warning += 1,
+            ServiceObservationState::Warning => {
+                warning += 1;
+                if observation.server_reachable == Some(false) {
+                    unreachable += 1;
+                }
+            }
             ServiceObservationState::Stale => stale += 1,
             ServiceObservationState::Unknown => unknown += 1,
         }
     }
+    let unhealthy = warning - unreachable;
     let label = if observations.is_empty() {
         "not probed".to_string()
-    } else if warning > 0 {
-        format!("{warning} unreachable")
+    } else if unreachable > 0 && unhealthy > 0 {
+        format!("{unreachable} unreachable, {unhealthy} unhealthy")
+    } else if unreachable > 0 {
+        format!("{unreachable} unreachable")
+    } else if unhealthy > 0 {
+        format!("{unhealthy} unhealthy")
     } else if stale > 0 {
         format!("{stale} stale")
     } else if unknown > 0 {

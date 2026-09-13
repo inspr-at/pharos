@@ -1,0 +1,16 @@
+{
+  "schema": "inspr.pharos.http-probes.v1",
+  "version": 1,
+  "probes": [
+    {
+      "id": "example-service",
+      "host": "host-one",
+      "service": "Service One",
+      "url": "https://service.example.test/healthz",
+      "expected_status": 200,
+      "body_marker": "ready",
+      "interval_seconds": 30,
+      "timeout_milliseconds": 2000
+    }
+  ]
+}

@@ -16,6 +16,7 @@ mod auth;
 mod durable_file;
 mod flow_host;
 mod host_actions;
+mod http_probes;
 mod icons;
 mod janus_auth;
 mod janus_projections;
@@ -111,6 +112,7 @@ use crate::host_actions::{
     HostWorkflowSummary, RetiredHost, RetiredHostStore, RetirementAgentResultRequest,
     SystemUpdateProposalBegin, UpdateRestartIntent, HOST_WORKFLOW_RECEIPT_RETENTION,
 };
+use crate::http_probes::{spawn_http_probe_loops, HttpProbeRuntime};
 use crate::janus_auth::{JanusTokenHashError, JanusTokenReadiness, JanusTokenStore};
 use crate::janus_projections::{capability_root_from_env, JanusCapability};
 use crate::managed_service_operations::{
@@ -160,6 +162,7 @@ struct AppState {
     alert_health: AlertWorkerHealth,
     access_request: AccessRequestConfig,
     flow_host: Option<Arc<flow_host::FlowHostService>>,
+    http_probes: Option<Arc<HttpProbeRuntime>>,
     public_base_path: PublicBasePath,
 }
 
@@ -3783,7 +3786,7 @@ async fn declared_hosts_json(
     } else {
         &[]
     };
-    let server_probes = server_probe_overlays(&manifests, now).await;
+    let server_probes = server_probe_overlays(&manifests, now, state.http_probes.as_deref()).await;
     no_store_json(declared_hosts_payload(
         &manifests,
         load_errors,
@@ -5156,6 +5159,9 @@ async fn main() {
             .unwrap_or_else(|error| panic!("alert store startup failed: {error}")),
     );
     let manifests = Arc::new(ManifestRegistry::from_env());
+    let http_probes = HttpProbeRuntime::from_env(manifests.manifests())
+        .unwrap_or_else(|error| panic!("HTTP probe startup failed: {error}"))
+        .map(Arc::new);
     let managed_setup_intents = match ManagedSetupIntentConfig::from_env()
         .unwrap_or_else(|error| panic!("managed setup intent startup failed: {error}"))
     {
@@ -5229,6 +5235,7 @@ async fn main() {
         alert_health,
         access_request,
         flow_host,
+        http_probes: http_probes.clone(),
         public_base_path: startup.public_base_path.clone(),
     };
     let _ = reconcile_saved_next_actions(&state, now_unix()).await;
@@ -5236,6 +5243,9 @@ async fn main() {
     spawn_alert_loop(state.clone(), alert_notifier);
     if let Some(runtime) = appliance_probes {
         spawn_appliance_probe_loop(runtime, Arc::clone(&state.store));
+    }
+    if let Some(runtime) = http_probes {
+        spawn_http_probe_loops(runtime);
     }
     if let Some(adapter) = paimos_delivery {
         adapter.spawn();
@@ -10663,6 +10673,49 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
     }
 
     #[test]
+    fn server_probe_summary_distinguishes_unhealthy_http_from_unreachable_transport() {
+        let http_unhealthy = ServerProbeObservation {
+            id: "http-probe-app-health".to_string(),
+            service: "App".to_string(),
+            source: "server",
+            policy: "pharos-runtime",
+            kind: "http-response",
+            target: Some("https://app.example".to_string()),
+            state: ServiceObservationState::Warning,
+            server_reachable: Some(true),
+            client_reachable: None,
+            summary: "HTTP 503; expected 200".to_string(),
+            checked_at: 1000,
+        };
+        let tcp_unreachable = ServerProbeObservation {
+            id: "database".to_string(),
+            service: "Database".to_string(),
+            source: "server",
+            policy: "pharos-runtime",
+            kind: "tcp-connect",
+            target: Some("tcp://database.example:5432".to_string()),
+            state: ServiceObservationState::Warning,
+            server_reachable: Some(false),
+            client_reachable: None,
+            summary: "server cannot reach database.example:5432".to_string(),
+            checked_at: 1000,
+        };
+
+        assert_eq!(
+            server_probe_summary(std::slice::from_ref(&http_unhealthy))["label"],
+            "1 unhealthy"
+        );
+        assert_eq!(
+            server_probe_summary(std::slice::from_ref(&tcp_unreachable))["label"],
+            "1 unreachable"
+        );
+        assert_eq!(
+            server_probe_summary(&[tcp_unreachable, http_unhealthy])["label"],
+            "1 unreachable, 1 unhealthy"
+        );
+    }
+
+    #[test]
     fn declared_hosts_payload_marks_missing_runtime_as_pending() {
         let manifest: HostManifest = serde_json::from_value(json!({
             "schema": "inspr.hostdash.config.v1",
@@ -14667,6 +14720,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
             alert_health: AlertWorkerHealth::new(false, now_unix(), 60),
             access_request: AccessRequestConfig::default(),
             flow_host: None,
+            http_probes: None,
             public_base_path: PublicBasePath::root(),
         }
     }
