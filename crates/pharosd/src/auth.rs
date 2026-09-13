@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error as StdError;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,6 +59,9 @@ const MAX_SESSION_CREATES_PER_WINDOW: u32 = 120;
 const MAX_RETURN_TO_BYTES: usize = 2_048;
 const ALLOWED_OPERATORS_ENV: &str = "PHAROS_ALLOWED_OPERATORS";
 const ACCESS_POLICY_FILE_ENV: &str = "PHAROS_ACCESS_POLICY_FILE";
+const OIDC_CA_FILE_ENV: &str = "PHAROS_OIDC_CA_FILE";
+const MAX_OIDC_CA_FILE_BYTES: u64 = 256 * 1024;
+const MAX_OIDC_CA_CERTIFICATES: usize = 32;
 const ALLOW_OPEN_ENV: &str = "PHAROS_ALLOW_OPEN";
 const OPERATOR_REF_DOMAIN: &str = "pharos:oidc-principal:operator-ref:v2:";
 const VERIFIED_EMAIL_REF_DOMAIN: &str = "pharos:oidc-principal:verified-email-ref:v1:";
@@ -316,6 +320,7 @@ struct OidcAuthConfig {
     redirect: RedirectUrl,
     operator_policy: OperatorPolicy,
     access_policy_file: Option<PathBuf>,
+    oidc_ca_file: Option<PathBuf>,
 }
 
 impl AuthConfig {
@@ -327,6 +332,7 @@ impl AuthConfig {
         let issuer = env_nonempty("PHAROS_OIDC_ISSUER");
         let client_id = env_nonempty("PHAROS_OIDC_CLIENT_ID");
         let redirect = env_nonempty("PHAROS_OIDC_REDIRECT_URI");
+        let oidc_ca_file = env_nonempty(OIDC_CA_FILE_ENV).map(PathBuf::from);
         let allow_open = env_bool(ALLOW_OPEN_ENV)?.unwrap_or(false);
         let operator_policy = OperatorPolicy::from_env()?;
         let mut config = Self::from_values(
@@ -338,12 +344,21 @@ impl AuthConfig {
             operator_policy,
             access_policy_file_from_env(),
         )?;
-        if let AuthConfigMode::Oidc(oidc) = &config.mode {
-            crate::public_mount::validate_oidc_redirect_uri(
-                oidc.redirect.as_str(),
-                public_base_path,
-                public_origin,
-            )?;
+        match (&config.mode, oidc_ca_file.as_ref()) {
+            (AuthConfigMode::Oidc(oidc), _) => {
+                crate::public_mount::validate_oidc_redirect_uri(
+                    oidc.redirect.as_str(),
+                    public_base_path,
+                    public_origin,
+                )?;
+            }
+            (AuthConfigMode::Open, Some(_)) => {
+                return Err(format!("{OIDC_CA_FILE_ENV} requires OIDC configuration"));
+            }
+            (AuthConfigMode::Open, None) => {}
+        }
+        if let AuthConfigMode::Oidc(oidc) = &mut config.mode {
+            oidc.oidc_ca_file = oidc_ca_file;
         }
         config.machine_root = optional_capability_root_from_env(
             JanusCapability::PharosMachineOperator,
@@ -413,10 +428,113 @@ impl AuthConfig {
                 redirect,
                 operator_policy,
                 access_policy_file,
+                oidc_ca_file: None,
             })),
             machine_root: None,
         })
     }
+}
+
+fn load_oidc_ca_certificates(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| "CA file is unavailable".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "CA file metadata is unavailable".to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err("CA file is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_OIDC_CA_FILE_BYTES {
+        return Err("CA file is too large".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 {
+            return Err("CA file must have one link".to_string());
+        }
+        // A CA bundle is public material, so root-owned read-only mounts are
+        // valid for an unprivileged pharosd process. Never accept a writable
+        // group/other file or a file owned by an unrelated unprivileged user.
+        let uid = metadata.uid();
+        let effective_uid = unsafe { libc::geteuid() };
+        if (uid != 0 && uid != effective_uid) || metadata.permissions().mode() & 0o022 != 0 {
+            return Err("CA file custody is unsafe".to_string());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_OIDC_CA_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "CA file is unreadable".to_string())?;
+    if bytes.len() as u64 != metadata.len() {
+        bytes.fill(0);
+        return Err("CA file changed while reading".to_string());
+    }
+    let result = parse_oidc_ca_certificates(&bytes);
+    bytes.fill(0);
+    result
+}
+
+fn parse_oidc_ca_certificates(bytes: &[u8]) -> Result<Vec<reqwest::Certificate>, String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let text = std::str::from_utf8(bytes).map_err(|_| "CA file is not PEM".to_string())?;
+    if !text.is_ascii() {
+        return Err("CA file is not ASCII PEM".to_string());
+    }
+    let mut in_certificate = false;
+    let mut payload_line_seen = false;
+    let mut block_count = 0usize;
+    for line in text.lines() {
+        if !in_certificate {
+            if line.is_empty() {
+                continue;
+            }
+            if line != BEGIN {
+                return Err("CA file contains non-certificate material".to_string());
+            }
+            in_certificate = true;
+            payload_line_seen = false;
+            continue;
+        }
+        if line == END {
+            if !payload_line_seen {
+                return Err("CA certificate is empty".to_string());
+            }
+            block_count += 1;
+            if block_count > MAX_OIDC_CA_CERTIFICATES {
+                return Err("CA file contains too many certificates".to_string());
+            }
+            in_certificate = false;
+            continue;
+        }
+        if line.is_empty()
+            || line.len() > 76
+            || !line
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        {
+            return Err("CA certificate PEM is malformed".to_string());
+        }
+        payload_line_seen = true;
+    }
+    if in_certificate || block_count == 0 {
+        return Err("CA file contains no complete certificate".to_string());
+    }
+    let certificates = reqwest::Certificate::from_pem_bundle(bytes)
+        .map_err(|_| "CA certificate PEM is invalid".to_string())?;
+    if certificates.len() != block_count {
+        return Err("CA certificate count is inconsistent".to_string());
+    }
+    Ok(certificates)
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -472,11 +590,22 @@ impl Auth {
             redirect,
             operator_policy,
             access_policy_file,
+            oidc_ca_file,
         } = *config;
-        let http_client = reqwest::ClientBuilder::new()
+        let oidc_ca_certificates = oidc_ca_file
+            .as_deref()
+            .map(load_oidc_ca_certificates)
+            .transpose()
+            .map_err(|error| format!("OIDC CA configuration failed: {error}"))?
+            .unwrap_or_default();
+        let mut http_client_builder = reqwest::ClientBuilder::new()
             // OIDC 4 requires a stateful client; redirects must stay disabled
             // to avoid SSRF through provider-controlled endpoints.
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        for certificate in oidc_ca_certificates {
+            http_client_builder = http_client_builder.add_root_certificate(certificate);
+        }
+        let http_client = http_client_builder
             .build()
             .map_err(|err| format!("OIDC HTTP client could not be built: {err}"))?;
         let client = discover_client(
@@ -2982,6 +3111,103 @@ mod tests {
             Some("pharos".to_string()),
             Some("https://pharos.example.test/auth/callback".to_string()),
         )
+    }
+
+    fn generate_test_ca(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "pharos-auth-oidc-ca-{label}-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir(&root).expect("test CA directory created");
+        let ca_path = root.join("ca.pem");
+        let key_path = root.join("ca.key");
+        let status = std::process::Command::new("openssl")
+            .current_dir(&root)
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                key_path.to_str().expect("key path is UTF-8"),
+                "-out",
+                ca_path.to_str().expect("CA path is UTF-8"),
+                "-subj",
+                "/CN=Pharos ephemeral OIDC test CA",
+                "-days",
+                "2",
+                "-sha256",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("openssl is available for TLS fixtures");
+        assert!(status.success());
+        (root, ca_path)
+    }
+
+    #[test]
+    fn oidc_ca_parser_rejects_non_certificate_material_and_private_keys() {
+        assert!(parse_oidc_ca_certificates(
+            b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
+        )
+        .is_err());
+        assert!(parse_oidc_ca_certificates(
+            b"-----BEGIN CERTIFICATE-----\nnot base64!\n-----END CERTIFICATE-----\n"
+        )
+        .is_err());
+        assert!(parse_oidc_ca_certificates(
+            b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
+        )
+        .is_err());
+        assert!(parse_oidc_ca_certificates(b"issuer.example.test\n").is_err());
+    }
+
+    #[test]
+    fn oidc_ca_file_accepts_a_valid_owner_readable_certificate() {
+        let (root, ca_path) = generate_test_ca("valid");
+        let certificates = load_oidc_ca_certificates(&ca_path).expect("CA is accepted");
+        assert_eq!(certificates.len(), 1);
+        std::fs::remove_dir_all(root).expect("test CA directory removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oidc_ca_file_rejects_writable_custody_with_valid_pem() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, ca_path) = generate_test_ca("writable");
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o664))
+            .expect("test CA permissions set");
+        assert!(load_oidc_ca_certificates(&ca_path).is_err());
+        std::fs::remove_dir_all(root).expect("test CA directory removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oidc_ca_file_rejects_symlink_with_valid_pem() {
+        let (root, ca_path) = generate_test_ca("symlink");
+        let link = root.join("ca-link.pem");
+        std::os::unix::fs::symlink(&ca_path, &link).expect("test CA symlink created");
+        assert!(load_oidc_ca_certificates(&link).is_err());
+        std::fs::remove_dir_all(root).expect("test CA directory removed");
+    }
+
+    #[test]
+    fn oidc_ca_file_rejects_oversized_input_before_pem_parse() {
+        let (root, ca_path) = generate_test_ca("oversized");
+        std::fs::write(&ca_path, vec![b'x'; (MAX_OIDC_CA_FILE_BYTES + 1) as usize])
+            .expect("oversized CA fixture written");
+        assert!(load_oidc_ca_certificates(&ca_path).is_err());
+        std::fs::remove_dir_all(root).expect("test CA directory removed");
+    }
+
+    #[test]
+    fn oidc_ca_parser_rejects_more_than_the_certificate_bound() {
+        let block = "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n";
+        let bundle = block.repeat(MAX_OIDC_CA_CERTIFICATES + 1);
+        assert!(parse_oidc_ca_certificates(bundle.as_bytes()).is_err());
     }
 
     #[test]
