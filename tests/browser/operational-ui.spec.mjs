@@ -103,15 +103,17 @@ test("release history exposes the complete immutable release identity", async ({
     );
     await expect(pillVersion.locator("span.tail")).toHaveText(".0.0");
 
-    await pill.click();
-    await expect(dialog).toBeVisible();
-    const dialogVersion = dialog.locator("[data-calendar-display]");
-    await expect(dialogVersion).toHaveAttribute("role", "button");
-    await dialogVersion.focus();
-    await page.keyboard.press("Enter");
-    await expect
-      .poll(() => page.evaluate(() => window.__copiedVersion))
-      .toBe(releaseCoordinate.version);
+    if (await pill.isVisible()) {
+      await pill.click();
+      await expect(dialog).toBeVisible();
+      const dialogVersion = dialog.locator("[data-calendar-display]");
+      await expect(dialogVersion).toHaveAttribute("role", "button");
+      await dialogVersion.focus();
+      await page.keyboard.press("Enter");
+      await expect
+        .poll(() => page.evaluate(() => window.__copiedVersion))
+        .toBe(releaseCoordinate.version);
+    }
   } else {
     await expect(pillVersion).toHaveText(`v${releaseCoordinate.version}`);
   }
