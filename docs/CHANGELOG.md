@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 260914004518.0.0 - 2026-09-14
+
+- Coalesce superseded Paimos owner handoffs only when they bind the same failed predecessor job and identical durable lineage, while retaining ambiguity, ownership, confirmation and retry-linkage refusals (PHAROS-206).
+
 ## 260913221718.0.0 - 2026-09-13
 
 - Let a fresh Paimos owner execution create one durable, deterministic review retry after an adapter-owned pre-confirmation failure, preserving the failed attempt and all normal review, confirmation and fleet gates while refusing foreign, ambiguous, changed-lineage or post-confirmation failures (PHAROS-206).
