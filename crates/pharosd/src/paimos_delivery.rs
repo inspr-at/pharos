@@ -1144,6 +1144,19 @@ impl OperationBinding {
             && self.execution_number == pull.execution_number
             && self.context_digest == pull.context_digest
     }
+
+    fn same_retry_predecessor(&self, other: &Self) -> bool {
+        self.job_id == other.job_id
+            && self.host == other.host
+            && self.workflow == other.workflow
+            && self.environment == other.environment
+            && self.artifact == other.artifact
+            && self.plan_digest == other.plan_digest
+            && self.predecessor_digest == other.predecessor_digest
+            && self.authority_epoch == other.authority_epoch
+            && self.execution_number == other.execution_number
+            && self.context_digest == other.context_digest
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1347,8 +1360,10 @@ impl JournalStore {
                 && binding.plan_digest == pull.plan_digest
         });
         let predecessor = matches.next().cloned();
-        if matches.next().is_some() {
-            return Err(AdapterError::LocalBinding);
+        if let Some(predecessor) = &predecessor {
+            if matches.any(|binding| !binding.same_retry_predecessor(predecessor)) {
+                return Err(AdapterError::LocalBinding);
+            }
         }
         Ok(predecessor)
     }
@@ -6334,6 +6349,13 @@ mod tests {
             .operation(DEPLOYMENT_HANDOFF)
             .expect("first operation bound");
         fail_review(&actions, &first_binding.job_id, now + 1);
+        let mut replacement_binding = first_binding.clone();
+        replacement_binding.handoff_id = AMBIGUOUS_DEPLOYMENT_HANDOFF.to_string();
+        replacement_binding.operation_id = "a".repeat(64);
+        adapter
+            .journal
+            .persist_operation(replacement_binding)
+            .expect("same-job replacement handoff persisted");
         drop(adapter);
         drop(actions);
 
@@ -6464,6 +6486,107 @@ mod tests {
         retry_pull.execution_number = 2;
         assert!(matches!(
             configured_adapter.bind_after_accept(&retry, &retry_pull, now + 3),
+            Err(AdapterError::LocalBinding)
+        ));
+    }
+
+    #[test]
+    fn fresh_execution_refuses_same_job_replacements_with_changed_lineage() {
+        let now = now_unix();
+        let directory = temporary_directory("delivery-retry-replacement-lineage");
+        let api_path = directory.join("api-key");
+        let first_secret = directory.join("first-secret");
+        let retry_secret = directory.join("retry-secret");
+        write_private(&api_path, API_KEY_SENTINEL);
+        write_private(&first_secret, HANDOFF_SENTINEL);
+        write_private(&retry_secret, &[8; HANDOFF_SECRET_BYTES]);
+        let first = intent(DEPLOYMENT_HANDOFF, first_secret, IntentStage::Deployment);
+        let retry = intent(
+            RETRY_DEPLOYMENT_HANDOFF,
+            retry_secret,
+            IntentStage::Deployment,
+        );
+        let actions = Arc::new(HostActionStore::new(None));
+        let adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                api_path,
+                vec![first.clone(), retry.clone()],
+            ),
+            directory.join("journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            actions.clone(),
+        );
+        let predecessor_digest = format!("sha256:{}", "3".repeat(64));
+        let first_pull = test_pull(DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        adapter.bind_after_accept(&first, &first_pull, now).unwrap();
+        let first_binding = adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("first operation bound");
+        fail_review(&actions, &first_binding.job_id, now + 1);
+
+        let mut changed_context = first_binding.clone();
+        changed_context.handoff_id = AMBIGUOUS_DEPLOYMENT_HANDOFF.to_string();
+        changed_context.context_digest = format!("sha256:{}", "7".repeat(64));
+        changed_context.operation_id = "a".repeat(64);
+        adapter
+            .journal
+            .persist_operation(changed_context)
+            .expect("changed-context replacement persisted");
+        let mut retry_pull = test_pull(RETRY_DEPLOYMENT_HANDOFF, "deployment", &predecessor_digest);
+        retry_pull.execution_number = 2;
+        assert!(matches!(
+            adapter.bind_after_accept(&retry, &retry_pull, now + 3),
+            Err(AdapterError::LocalBinding)
+        ));
+
+        let authority_directory = temporary_directory("delivery-retry-replacement-authority");
+        let authority_api_path = authority_directory.join("api-key");
+        let authority_first_secret = authority_directory.join("first-secret");
+        let authority_retry_secret = authority_directory.join("retry-secret");
+        write_private(&authority_api_path, API_KEY_SENTINEL);
+        write_private(&authority_first_secret, HANDOFF_SENTINEL);
+        write_private(&authority_retry_secret, &[8; HANDOFF_SECRET_BYTES]);
+        let authority_first = intent(
+            DEPLOYMENT_HANDOFF,
+            authority_first_secret,
+            IntentStage::Deployment,
+        );
+        let authority_retry = intent(
+            RETRY_DEPLOYMENT_HANDOFF,
+            authority_retry_secret,
+            IntentStage::Deployment,
+        );
+        let authority_actions = Arc::new(HostActionStore::new(None));
+        let authority_adapter = test_adapter(
+            config(
+                Url::parse("https://paimos.example.test").unwrap(),
+                authority_api_path,
+                vec![authority_first.clone(), authority_retry.clone()],
+            ),
+            authority_directory.join("journal.json"),
+            Arc::new(Store::new(None).unwrap()),
+            authority_actions.clone(),
+        );
+        authority_adapter
+            .bind_after_accept(&authority_first, &first_pull, now)
+            .unwrap();
+        let authority_binding = authority_adapter
+            .journal
+            .operation(DEPLOYMENT_HANDOFF)
+            .expect("first authority operation bound");
+        fail_review(&authority_actions, &authority_binding.job_id, now + 1);
+        let mut changed_authority = authority_binding.clone();
+        changed_authority.handoff_id = AMBIGUOUS_DEPLOYMENT_HANDOFF.to_string();
+        changed_authority.authority_epoch += 1;
+        changed_authority.operation_id = "b".repeat(64);
+        authority_adapter
+            .journal
+            .persist_operation(changed_authority)
+            .expect("changed-authority replacement persisted");
+        assert!(matches!(
+            authority_adapter.bind_after_accept(&authority_retry, &retry_pull, now + 3),
             Err(AdapterError::LocalBinding)
         ));
     }
