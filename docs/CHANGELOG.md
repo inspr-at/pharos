@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 260915083121.0.0 - 2026-09-15
+
+- Update rustls to 0.23.45 to reject TLS handshake messages crossing encryption levels (RUSTSEC-2026-0285).
+
+- Preserve existing root machine endpoints when the browser uses a native public prefix, with identical report and agent authentication. Keep browser/account routes prefix-only and redirect the exact trailing browser root without rewriting callbacks (PHAROS-258).
+
 ## 260914004518.0.0 - 2026-09-14
 
 - Coalesce superseded Paimos owner handoffs only when they bind the same failed predecessor job and identical durable lineage, while retaining ambiguity, ownership, confirmation and retry-linkage refusals (PHAROS-206).
