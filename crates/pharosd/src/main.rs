@@ -51,7 +51,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use axum::extract::{DefaultBodyLimit, FromRef, Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRef, Path as AxumPath, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -14799,7 +14799,7 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::NOT_FOUND
+            StatusCode::OK
         );
         assert_eq!(
             client
@@ -14903,6 +14903,167 @@ export WATCHTOWER_NOTIFICATION_URL="https://watchtower.example/hook"
                 .and_then(|value| value.to_str().ok()),
             Some("/pharos/services?flow_project=17")
         );
+    }
+
+    #[tokio::test]
+    async fn configured_prefix_keeps_root_and_prefixed_machine_handlers_with_their_auth() {
+        let mut state = report_test_state(true);
+        state.public_base_path = PublicBasePath::parse("/pharos").unwrap();
+        register_test_token(&state, "ares", "valid-token");
+        let (base, client) = serve_test_app(state).await;
+
+        for mount in ["", "/pharos"] {
+            assert_eq!(
+                client
+                    .get(format!("{base}{mount}/healthz"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+
+            let unauthenticated_report = client
+                .post(format!("{base}{mount}/report"))
+                .json(&test_report("ares"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unauthenticated_report.status(), StatusCode::UNAUTHORIZED);
+            let authenticated_report = client
+                .post(format!("{base}{mount}/report"))
+                .bearer_auth("valid-token")
+                .json(&test_report("ares"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(authenticated_report.status(), StatusCode::NO_CONTENT);
+
+            let unauthenticated_claim = client
+                .post(format!("{base}{mount}/agent/actions/claim"))
+                .json(&json!({ "host": "ares" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unauthenticated_claim.status(), StatusCode::UNAUTHORIZED);
+            let authenticated_claim = client
+                .post(format!("{base}{mount}/agent/actions/claim"))
+                .bearer_auth("valid-token")
+                .json(&json!({ "host": "ares" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(authenticated_claim.status(), StatusCode::NO_CONTENT);
+
+            assert_eq!(
+                client
+                    .get(format!(
+                        "{base}{mount}/internal/managed-service-setup-intents/fixture"
+                    ))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_prefix_keeps_browser_and_account_routes_off_origin_root() {
+        let mut state = report_test_state(false);
+        state.public_base_path = PublicBasePath::parse("/pharos").unwrap();
+        let (base, client) = serve_test_app(state).await;
+
+        for root_only_path in [
+            "/",
+            "/map",
+            "/auth/logged-out",
+            "/auth/callback?code=fixture&state=fixture",
+            "/favicon.svg",
+            "/assets/fleet-horizon.png",
+        ] {
+            let response = client
+                .get(format!("{base}{root_only_path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "unexpected root exposure at {root_only_path}"
+            );
+        }
+
+        let prefixed_callback = client
+            .get(format!(
+                "{base}/pharos/auth/callback?code=fixture&state=fixture"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(prefixed_callback.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            prefixed_callback
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_prefix_canonicalizes_only_the_exact_trailing_browser_root() {
+        let mut state = report_test_state(false);
+        state.public_base_path = PublicBasePath::parse("/pharos").unwrap();
+        let (base, client) = serve_test_app(state).await;
+
+        let get_response = client
+            .get(format!(
+                "{base}/pharos/?code=fixture&return_to=https%3A%2F%2Fother.example"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            get_response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos?code=fixture&return_to=https%3A%2F%2Fother.example")
+        );
+
+        let head_response = client
+            .head(format!("{base}/pharos/?flow_project=17"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head_response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            head_response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/pharos?flow_project=17")
+        );
+
+        for noncanonical_path in [
+            "/pharos/map/",
+            "/pharos/auth/callback/?code=fixture&state=fixture",
+        ] {
+            let response = client
+                .get(format!("{base}{noncanonical_path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "unexpected slash normalization at {noncanonical_path}"
+            );
+            assert!(response.headers().get(header::LOCATION).is_none());
+        }
     }
 
     #[test]
