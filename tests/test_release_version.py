@@ -441,6 +441,48 @@ class CalendarVersionTests(unittest.TestCase):
                     release_version._tagged_calendar_releases(repo),
                 )
 
+    def test_current_release_tag_development_and_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+                ).stdout.strip()
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Calendar Test")
+            git("config", "user.email", "calendar@example.invalid")
+            release = self.release_document()
+            (repo / "RELEASE.json").write_text(json.dumps(release))
+            git("add", "RELEASE.json")
+            git("commit", "-m", "reserve release")
+            validate = release_version.validate_current_release_tag
+            validate(repo, release)
+            with self.assertRaisesRegex(release_version.ReleaseVersionError, "missing"):
+                validate(repo, release, require_tag_at_head=True)
+            tag = f"v{release['version']}"
+            git("tag", "-a", tag, "-m", "release")
+            validate(repo, release, require_tag_at_head=True)
+            git("commit", "--allow-empty", "-m", "normal development")
+            validate(repo, release)
+            with self.assertRaisesRegex(release_version.ReleaseVersionError, "target HEAD"):
+                validate(repo, release, require_tag_at_head=True)
+            changed = copy.deepcopy(release)
+            changed["compatibility_window"] = "changed"
+            with self.assertRaisesRegex(release_version.ReleaseVersionError, "metadata changed"):
+                validate(repo, changed)
+            git("checkout", "--orphan", "unrelated")
+            git("commit", "-m", "unrelated release history")
+            with self.assertRaisesRegex(release_version.ReleaseVersionError, "not an ancestor"):
+                validate(repo, release)
+            git("checkout", "main")
+            lightweight = copy.deepcopy(release)
+            lightweight["version"] = "991231235959.0.0"
+            git("tag", f"v{lightweight['version']}")
+            with self.assertRaisesRegex(release_version.ReleaseVersionError, "annotated"):
+                validate(repo, lightweight)
+
     def test_unknown_absent_and_ambiguous_schemes_fail_closed(self):
         for scheme in ("", "semver", "inspr-calendar-v3"):
             with self.subTest(scheme=scheme), self.assertRaises(

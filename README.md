@@ -977,6 +977,9 @@ stable-channel sequence, the two-step migration anchor (legacy â†’ calendar v1 â
 calendar v2), the exact legacy rollback authority and the Cargo SemVer mapping,
 which is the identity for v2 coordinates. The
 consistency gate keeps Cargo, Nix, the changelog and release workflow aligned.
+Development commits may descend from the current annotated release tag while
+preserving its release metadata. Publication still requires that exact tag at
+HEAD; changing a published coordinate requires a new release reservation.
 Each release first validates an untagged digest-only OCI candidate, then signs
 an exact release-set containing both immutable image coordinates and the real
 OCI signature, provenance and SBOM digests before admitting final tags. Its
