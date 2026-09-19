@@ -5,7 +5,11 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 python3 -m unittest tests/test_release_version.py
-python3 scripts/release_version.py check
+check_args=(check)
+if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+  check_args+=(--require-tag-at-head)
+fi
+python3 scripts/release_version.py "${check_args[@]}"
 
 version=$(jq -er '.version' RELEASE.json)
 

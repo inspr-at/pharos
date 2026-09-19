@@ -977,6 +977,9 @@ stable-channel sequence, the two-step migration anchor (legacy â†’ calendar v1 â
 calendar v2), the exact legacy rollback authority and the Cargo SemVer mapping,
 which is the identity for v2 coordinates. The
 consistency gate keeps Cargo, Nix, the changelog and release workflow aligned.
+Development commits may descend from the current annotated release tag while
+preserving its release metadata. Publication still requires that exact tag at
+HEAD; changing a published coordinate requires a new release reservation.
 Each release first validates an untagged digest-only OCI candidate, then signs
 an exact release-set containing both immutable image coordinates and the real
 OCI signature, provenance and SBOM digests before admitting final tags. Its
@@ -994,6 +997,48 @@ renderer, interaction helper, AutoAnimate library and license are verified
 offline by `scripts/check-calendar-version-display.sh` and again by the Rust
 build. The server-rendered canonical coordinate remains visible if JavaScript
 is unavailable, and `/version` remains the machine interface.
+
+## Contributing
+
+### Developer Certificate of Origin
+
+New contributions use the unmodified [Developer Certificate of Origin 1.1](DCO).
+A `Signed-off-by: Name <email>` trailer records that you have the right to submit
+the contribution under the project licence. It is not a cryptographic signature
+or a guarantee of correctness. Use the same identity as the commit author;
+a GitHub-associated noreply address is fine. Sign-offs remain in public history.
+This applies to maintainers and outside contributors alike, from adoption onward;
+existing history is not rewritten. After reading the DCO, create each new commit
+with `git commit -s` using your own name and GitHub-associated email.
+
+Fork the repository, create a branch from the current upstream `main`, implement
+and test your change, then push to your fork and open a pull request to `main`.
+Describe the change, its purpose, tests, and any limitations. Contributors need
+no write access to this repository. The maintainer reviews agent findings and
+decides whether to merge; passing checks never grants an agent merge authority.
+
+The required `dco` check validates every commit introduced by a PR, including
+merge commits on the contributor branch. An empty or incomplete range fails.
+Local checks require Python 3 and full Git history; deepen a shallow checkout
+with `git fetch --unshallow` first. When merging upstream updates into your
+branch, use `git merge --signoff upstream/main` after fetching upstream.
+It reads real Git trailers, so a sign-off quoted in prose does not count.
+Missing sign-offs must be supplied by the contributor, not invented by a reviewer
+or agent. Do not rewrite shared history to repair them without explicit agreement.
+
+Bots are not exempt. Dependabot's native `Signed-off-by` service address is
+accepted for its exact GitHub author identity; other bots use their own matching
+author/sign-off identity. This checks declarations, not account authenticity.
+For agent-assisted work, the human contributor must understand and authorize
+their DCO declaration; the agent must not invent identities or sign for others.
+
+GitHub web commits require sign-off. For squash merges, retain the original
+commit messages and move their existing sign-off declarations into the final
+trailer block; an indented or quoted sign-off is not a trailer. Check that the
+final author still has a matching declaration. Never invent a contributor's
+sign-off. Use a regular merge when combining authors would obscure provenance.
+Release and deployment remain maintainer-controlled. Existing review and CI
+requirements still apply; DCO introduces no second-maintainer requirement.
 
 ## License
 

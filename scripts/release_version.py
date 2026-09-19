@@ -697,7 +697,7 @@ def _tagged_calendar_releases(repo: Path) -> tuple[dict[str, object], ...]:
     return tuple(releases)
 
 
-def check_repository(repo: Path) -> None:
+def check_repository(repo: Path, *, require_tag_at_head: bool = False) -> None:
     release = load_release(repo / "RELEASE.json")
     validate_release(release)
     version = str(release["version"])
@@ -725,7 +725,14 @@ def check_repository(repo: Path) -> None:
     compose = (repo / "docker-compose.selfhost.yml").read_text(encoding="utf-8")
     if "PHAROS_IMAGE_REFERENCE:?" not in compose:
         raise ReleaseVersionError("self-host Compose does not require an immutable image reference")
-    tag = f"v{version}"
+    validate_current_release_tag(repo, release, require_tag_at_head=require_tag_at_head)
+
+
+def validate_current_release_tag(
+    repo: Path, release: dict[str, object], *, require_tag_at_head: bool = False
+) -> None:
+    """Development may descend from a release; publication must use its exact tag."""
+    tag = f"v{release['version']}"
     ref_type = subprocess.run(
         ["git", "cat-file", "-t", f"refs/tags/{tag}"],
         cwd=repo,
@@ -746,8 +753,23 @@ def check_repository(repo: Path) -> None:
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True
         ).stdout.strip()
-        if tag_target != head:
+        if require_tag_at_head and tag_target != head:
             raise ReleaseVersionError("calendar release tag does not target HEAD")
+
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", tag_target, head],
+            cwd=repo, capture_output=True, check=False,
+        )
+        if ancestor.returncode != 0:
+            raise ReleaseVersionError("calendar release tag is not an ancestor of HEAD")
+        tagged_release = json.loads(subprocess.run(
+            ["git", "show", f"{tag_target}:RELEASE.json"],
+            cwd=repo, text=True, capture_output=True, check=True,
+        ).stdout)
+        if tagged_release != release:
+            raise ReleaseVersionError("published release metadata changed without a new coordinate")
+    elif require_tag_at_head:
+        raise ReleaseVersionError("calendar release tag is missing")
 
 
 def main() -> int:
@@ -757,10 +779,11 @@ def main() -> int:
     )
     parser.add_argument("value", nargs="?")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--require-tag-at-head", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "check":
-            check_repository(args.repo.resolve())
+            check_repository(args.repo.resolve(), require_tag_at_head=args.require_tag_at_head)
             release = load_release(args.repo.resolve() / "RELEASE.json")
             print(
                 "release_consistency=ok"
