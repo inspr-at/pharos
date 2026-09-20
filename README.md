@@ -3,7 +3,7 @@
 **Fleet clarity before fleet control.**
 
 [![CI](https://github.com/inspr-at/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/inspr-at/pharos/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-260915083121.0.0-d79b2b)](docs/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-260920201529.0.0-d79b2b)](docs/CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-0b8178)](LICENSE)
 
 Pharos is a compact, self-hosted fleet control plane for people and automation.
@@ -51,7 +51,7 @@ That model prevents a merged declaration from masquerading as a deployed
 system, and prevents a successful API request from masquerading as a completed
 operation.
 
-## What ships in v260911173640.0.0
+## What ships in v260920201529.0.0
 
 | Area                    | Current capability                                                                                                                                                                                                       |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -280,7 +280,8 @@ Put an HTTPS reverse proxy or a private tailnet endpoint in front of
 `PHAROS_BIND`. For durable operation, supply runtime values through your host
 secret manager or orchestrator rather than a committed environment file.
 
-The OIDC client is public and uses PKCE, so it has no client secret. Login state
+The OIDC client is public and uses PKCE, so it has no client secret. Provider
+requests require HTTPS, verify certificates and refuse redirects. Login state
 is browser-bound and expires after ten minutes; in-flight logins and sessions
 have hard count and creation-rate bounds. Session cookies use the `__Host-`
 prefix, and logout is a CSRF-protected POST. Expired, replayed, restarted or
@@ -484,19 +485,90 @@ injection are disabled. The current server-rendered UI still uses bounded
 inline style attributes, so `style-src-attr 'unsafe-inline'` is the documented
 temporary exception; inline script is not allowed.
 
-Leaflet 1.9.4 and D3 7.9.0 are pinned, vendored with their upstream licenses,
-embedded in `pharosd`, and served from versioned same-origin asset paths. Map
-tiles deliberately remain external CARTO `light_all` requests: the tile host
-can observe the browser IP address and requested viewport/tile coordinates,
-but receives no Pharos credentials, host payload, or HTTP referrer. Deployments
-whose policy forbids that metadata disclosure should block the CARTO tile host;
-the inventory/site view and map labels continue to work without the basemap.
+Leaflet 1.9.4, D3 7.9.0, MapLibre GL JS 5.24.0 and its Leaflet binding 0.1.3
+are pinned, vendored with their upstream licenses, embedded in `pharosd`, and
+served from versioned same-origin asset paths. The MapLibre CSP build uses a
+same-origin worker; external JavaScript, blob workers and `unsafe-eval` remain
+disallowed. Leaflet retains the map controls, viewport persistence and D3 host
+labels; MapLibre renders only the light vector basemap beneath them.
+
+The basemap uses [OpenFreeMap Positron](https://openfreemap.org/quick_start/),
+with OpenMapTiles and OpenStreetMap attribution. No account, API key or manual
+credential issuance/rotation is needed. Styles, tiles, sprites and glyphs are
+fetched from `https://tiles.openfreemap.org` only after the operator activates
+the contextual **Load external basemap** control. The one-time choice is not
+stored. Before that action, the same-origin Leaflet map, D3 host labels and
+location list work without a third-party request. The provider can observe the
+browser IP and requested viewport/tile coordinates, but receives no Pharos
+credentials, host payload or HTTP referrer. Both the page and the worker restrict
+basemap requests to that origin. Tile/provider failures, unavailable WebGL, or
+a failed renderer download leave the site list, D3 labels and Leaflet controls
+available, with a retry control. OpenFreeMap is an external service without an
+SLA; this is not an offline map.
+
+PHAROS-280 chose this source to preserve worldwide street detail without adding
+tile storage and refresh operations to every deployment. A self-hosted Protomaps
+extract would remove that dependency, but also needs an explicitly bounded
+region/detail level, archive distribution and refresh, HTTP range serving,
+and local styles/fonts/sprites. A Europe-only archive would leave other fleet
+locations without coverage. OSM standard public tiles require a Referer, which
+conflicts with Pharos's `no-referrer` policy; Esri's anonymously reachable raster
+endpoint was not selected because anonymous access alone does not establish
+permission to use it. See the [Protomaps download guidance](https://docs.protomaps.com/basemaps/downloads)
+and [OSMF tile policy](https://operations.osmfoundation.org/policies/tiles/).
 
 | Vendored file               | SHA-256                                                            |
 | --------------------------- | ------------------------------------------------------------------ |
 | `leaflet-1.9.4/leaflet.css` | `337bfca5cabd03b39815b2700febe2b3b7edf55921c59cd49f88ecb328212303` |
 | `leaflet-1.9.4/leaflet.js`  | `db49d009c841f5ca34a888c96511ae936fd9f5533e90d8b2c4d57596f4e5641a` |
 | `d3-7.9.0/d3.min.js`        | `f2094bbf6141b359722c4fe454eb6c4b0f0e42cc10cc7af921fc158fceb86539` |
+| `maplibre-gl-5.24.0/maplibre-gl.css` | `ab1e70d59ec40465bae7e7030da2f3ccf28133fd502e62bd598eefbadfd7a732` |
+| `maplibre-gl-5.24.0/maplibre-gl-csp.js` | `a1f1847bac64aa00acbf80fbb79b2c5af24d8eecaaa5e2ad14080fab81f1de95` |
+| `maplibre-gl-5.24.0/maplibre-gl-csp-worker.js` | `f950e7b15c49c8b9c7bb52136df2a2df2f6f03b83b8927774573fc98b067f7f0` |
+| `maplibre-gl-leaflet-0.1.3/leaflet-maplibre-gl.js` | `1c33367962e7755c1a16d1f85658fdc96b5baa36f81adfca9493174cd1b526ce` |
+
+### Browser privacy and device storage
+
+Pharos does not include analytics, advertising, social plugins, remote fonts,
+or cross-site tracking. Application scripts, styles, fonts, images, video and
+data requests are same-origin on first paint. There is no page-wide cookie
+banner: the only optional external runtime service, OpenFreeMap, is disabled
+until the map's contextual load-once action. Adding product analytics later
+requires a separate review; self-hosted builds must ship it disabled, without a
+persistent identifier, and with any consent component disabled until an optional
+integration actually needs it.
+
+Pharos sets these host-only cookies for the requested sign-in service:
+
+| Cookie | Trigger and purpose | Lifetime and scope | Classification |
+| --- | --- | --- | --- |
+| `__Host-pharos_flow` | Starting OIDC login; binds the callback to the initiating browser and safe local return path | 10 minutes; `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain` | Strictly necessary authentication/security state |
+| `__Host-pharos_session` | Successful OIDC callback; authenticates the browser session | 8 hours; `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain` | Strictly necessary authentication state |
+| `__Host-pharos_logout_csrf` | Successful OIDC callback; binds the logout POST to the browser session | 8 hours; `Secure`, script-readable, `SameSite=Strict`, `Path=/`, no `Domain` | Strictly necessary CSRF protection |
+
+Older releases wrote `pharos_sort`, `pharos_view`, `pharos_search`,
+`pharos_live_filter`, and `pharos_signal_window` cookies for one year. The
+current UI expires those legacy cookies and keeps view, sort, status-filter and
+signal-window state in the current URL; search text is no longer persisted.
+
+The UI uses no `sessionStorage`. It writes the following first-party
+`localStorage` preferences only after the operator changes the corresponding
+control. Each record carries its own 180-day expiry and is removed when expired
+or malformed: `pharos_freeform_order_v1`, `pharos.sidebar.still.v1`,
+`pharos-provider-guide-language`, `pharos.map.viewport.v1`,
+`pharos.map.mode.v1`, and `pharos.map.labelDensity.v1`. These records contain
+only the requested card order, motion/language choice, or map view; no generated
+visitor identifier is stored.
+
+The configured identity provider may set its own session, security or language
+cookies on its own origin during the top-level sign-in journey. Their names,
+recipients and lifetimes depend on the operator-selected provider and are not
+controlled by Pharos; deployments must list those provider-specific operations
+in their privacy information. Reverse proxies or other operator-added browser
+services require the same deployment inventory. For GDPR purposes the deployer
+remains responsible for documenting its lawful basis, recipients, retention and
+transfers; the classifications above address Pharos's technical device access,
+not a deployment-specific legal certification.
 
 ## Beacons
 
@@ -529,6 +601,15 @@ The module loads `tokenFile` through a systemd credential, runs the beacon as
 an unprivileged service and hardens its filesystem view. The service uses
 systemd readiness/watchdog notifications; only a successful report refreshes
 the watchdog. Set `allowLegacyReports = true` only for a controlled migration.
+
+The module builds its default package with the consumer's `pkgs`. You can also
+set `package = inputs.pharos.packages.${pkgs.stdenv.hostPlatform.system}.pharos-beacon` explicitly.
+Both forms support `nix flake check --no-build` without first archiving the
+Pharos input or creating the runtime token file. Package evaluation reads release
+metadata and `Cargo.lock` from the original source tree; filtering the build
+source does not require materialising it to read those files. `src` overrides
+remain authoritative: `cleanSource`/`cleanSourceWith` expose their original tree
+for metadata reads, while a plain source path supplies both metadata and contents.
 
 ### Portable Linux service
 
@@ -799,7 +880,7 @@ HTTPS-only boundary. Store Flow config and API key files under an operator-owned
 | `PHAROS_FLOW_CONFIG_FILE`                                      | Optional owner-only Flow host config (`inspr.pharos.flow-host-config.v1`) enabling bounded `@inspr/flow-shell` projection and guarded Review/Start navigation                                                                                          |
 | `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN`                            | When `true` or `1`, allow cleartext loopback Paimos origins only while **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback; for local harnesses only                                                                                           |
 | `PHAROS_PROVISIONING_JOBS_DB`                                  | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset                                                                                                                                          |
-| `PHAROS_OIDC_ISSUER`                                           | OIDC discovery issuer                                                                                                                                                                                                                                  |
+| `PHAROS_OIDC_ISSUER`                                           | HTTPS OIDC discovery issuer                                                                                                                                                                                                                             |
 | `PHAROS_OIDC_CLIENT_ID`                                        | Public OIDC client identifier                                                                                                                                                                                                                          |
 | `PHAROS_OIDC_REDIRECT_URI`                                     | Exact callback URI                                                                                                                                                                                                                                     |
 | `PHAROS_OIDC_CA_FILE`                                          | Optional owner-selected read-only PEM CA bundle for OIDC discovery/token requests; regular file, one link, up to 256 KiB, certificate blocks only, no group/other write. Absent keeps bundled WebPKI roots. The path must be a protected container mount, and trust remains scoped to this OIDC client. |
@@ -918,7 +999,7 @@ incidents, and emit recovery only after the posture returns to Healthy.
 
 ## Project status
 
-Pharos is an active early release at **v260911173640.0.0**. It is already used as a real
+Pharos is an active early release at **v260920201529.0.0**. It is already used as a real
 fleet dashboard and guarded operations layer, but its limits are part of its
 interface.
 
@@ -958,6 +1039,13 @@ cargo deny check
 
 Additional checks cover the NixOS module, native systemd installer,
 `nixos-anywhere` handoff and self-host Compose contract.
+
+`python3 scripts/check-nix-consumer.py` evaluates external consumers for both
+Linux architectures, with the default and exported beacon packages. Each case
+uses an empty Nix store and fetcher cache, a source file deliberately removed by
+filtering, and a nonexistent runtime token path. It asserts that the filtered
+source paths stay absent, then evaluates NixOS configurations without building
+them. CI also builds and tests the beacon on aarch64-darwin.
 
 Browser QA runs with `npm run test:browser`. Playwright keeps transient traces,
 failure screenshots and videos under `test-results/`, while reviewed visual

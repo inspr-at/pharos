@@ -24,6 +24,8 @@ export default defineConfig({
     reducedMotion: "reduce",
     locale: "en-GB",
     timezoneId: "Europe/Vienna",
+    // Trust is relaxed only for the per-run mock OIDC issuer in this flow-host suite.
+    ignoreHTTPSErrors: true,
   },
   projects: [
     {

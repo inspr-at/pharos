@@ -260,6 +260,14 @@ fn browser_public_routes() -> Router<AppState> {
             get(leaflet_image_asset),
         )
         .route("/assets/vendor/d3-7.9.0/d3.min.js", get(d3_js_asset))
+        .route(
+            "/assets/vendor/maplibre-gl-5.24.0/{name}",
+            get(maplibre_asset),
+        )
+        .route(
+            "/assets/vendor/maplibre-gl-leaflet-0.1.3/leaflet-maplibre-gl.js",
+            get(maplibre_leaflet_asset),
+        )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/recover", get(auth::recover))

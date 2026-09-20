@@ -1,5 +1,8 @@
-import http from "node:http";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import https from "node:https";
 import { createSign, generateKeyPairSync } from "node:crypto";
+import path from "node:path";
 import { URL } from "node:url";
 
 const ISSUER_SUBJECT = "flow-harness-subject";
@@ -50,79 +53,180 @@ function writeJson(response, status, body) {
   response.end(payload);
 }
 
-export function createMockOidcIssuer() {
+function runOpenSsl(args) {
+  try {
+    execFileSync("openssl", args, { stdio: "ignore" });
+  } catch {
+    throw new Error("failed to generate the flow harness OIDC TLS fixture");
+  }
+}
+
+function createTlsFixture(runDir) {
+  const tlsDir = path.join(runDir, "oidc-tls");
+  fs.mkdirSync(tlsDir, { recursive: true, mode: 0o700 });
+  const caKeyPath = path.join(tlsDir, "ca-key.pem");
+  const caCertPath = path.join(tlsDir, "ca-cert.pem");
+  const leafKeyPath = path.join(tlsDir, "leaf-key.pem");
+  const leafCsrPath = path.join(tlsDir, "leaf.csr");
+  const leafCertPath = path.join(tlsDir, "leaf-cert.pem");
+  const leafExtPath = path.join(tlsDir, "leaf-ext.cnf");
+  const serialPath = path.join(tlsDir, "ca-cert.srl");
+
+  runOpenSsl([
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-sha256",
+    "-nodes",
+    "-keyout",
+    caKeyPath,
+    "-out",
+    caCertPath,
+    "-days",
+    "1",
+    "-subj",
+    "/CN=Pharos Flow Harness Test CA",
+    "-addext",
+    "basicConstraints=critical,CA:TRUE,pathlen:1",
+    "-addext",
+    "keyUsage=critical,keyCertSign,cRLSign",
+    "-addext",
+    "subjectKeyIdentifier=hash",
+  ]);
+  fs.writeFileSync(
+    leafExtPath,
+    "[v3_server]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
+    { mode: 0o600 },
+  );
+  runOpenSsl([
+    "req",
+    "-new",
+    "-newkey",
+    "rsa:2048",
+    "-nodes",
+    "-keyout",
+    leafKeyPath,
+    "-out",
+    leafCsrPath,
+    "-subj",
+    "/CN=localhost",
+  ]);
+  runOpenSsl([
+    "x509",
+    "-req",
+    "-in",
+    leafCsrPath,
+    "-CA",
+    caCertPath,
+    "-CAkey",
+    caKeyPath,
+    "-CAserial",
+    serialPath,
+    "-CAcreateserial",
+    "-out",
+    leafCertPath,
+    "-days",
+    "1",
+    "-sha256",
+    "-extfile",
+    leafExtPath,
+    "-extensions",
+    "v3_server",
+  ]);
+  for (const privateKeyPath of [caKeyPath, leafKeyPath]) {
+    fs.chmodSync(privateKeyPath, 0o600);
+  }
+  for (const tlsPath of [caCertPath, leafCsrPath, leafCertPath, leafExtPath, serialPath]) {
+    fs.chmodSync(tlsPath, 0o600);
+  }
+  return { caCertPath, leafKeyPath, leafCertPath };
+}
+
+export function createMockOidcIssuer(runDir) {
+  if (!runDir) {
+    throw new Error("createMockOidcIssuer requires the harness run directory");
+  }
+  const { caCertPath, leafKeyPath, leafCertPath } = createTlsFixture(runDir);
   return new Promise((resolve, reject) => {
-    const server = http.createServer((request, response) => {
-      const url = new URL(request.url ?? "/", "http://127.0.0.1");
-      const issuer = `http://127.0.0.1:${server.address().port}`;
-      if (url.pathname === "/.well-known/openid-configuration") {
-        writeJson(response, 200, {
-          issuer,
-          authorization_endpoint: `${issuer}/authorize`,
-          token_endpoint: `${issuer}/token`,
-          userinfo_endpoint: `${issuer}/userinfo`,
-          jwks_uri: `${issuer}/jwks`,
-          response_types_supported: ["code"],
-          subject_types_supported: ["public"],
-          id_token_signing_alg_values_supported: ["RS256"],
-          token_endpoint_auth_methods_supported: ["none"],
-          scopes_supported: ["openid", "profile", "email"],
-        });
-        return;
-      }
-      if (url.pathname === "/jwks") {
-        writeJson(response, 200, {
-          keys: [
-            {
-              kty: "RSA",
-              kid: KID,
-              use: "sig",
-              alg: "RS256",
-              n: jwk.n,
-              e: jwk.e,
-            },
-          ],
-        });
-        return;
-      }
-      if (url.pathname === "/authorize") {
-        pendingNonce = url.searchParams.get("nonce");
-        const redirectUri = url.searchParams.get("redirect_uri");
-        const state = url.searchParams.get("state");
-        const location = `${redirectUri}?code=flow-harness-code&state=${encodeURIComponent(state ?? "")}`;
-        response.writeHead(302, { Location: location });
+    const server = https.createServer(
+      {
+        key: fs.readFileSync(leafKeyPath),
+        cert: fs.readFileSync(leafCertPath),
+      },
+      (request, response) => {
+        const url = new URL(request.url ?? "/", "https://127.0.0.1");
+        const issuer = `https://127.0.0.1:${server.address().port}`;
+        if (url.pathname === "/.well-known/openid-configuration") {
+          writeJson(response, 200, {
+            issuer,
+            authorization_endpoint: `${issuer}/authorize`,
+            token_endpoint: `${issuer}/token`,
+            userinfo_endpoint: `${issuer}/userinfo`,
+            jwks_uri: `${issuer}/jwks`,
+            response_types_supported: ["code"],
+            subject_types_supported: ["public"],
+            id_token_signing_alg_values_supported: ["RS256"],
+            token_endpoint_auth_methods_supported: ["none"],
+            scopes_supported: ["openid", "profile", "email"],
+          });
+          return;
+        }
+        if (url.pathname === "/jwks") {
+          writeJson(response, 200, {
+            keys: [
+              {
+                kty: "RSA",
+                kid: KID,
+                use: "sig",
+                alg: "RS256",
+                n: jwk.n,
+                e: jwk.e,
+              },
+            ],
+          });
+          return;
+        }
+        if (url.pathname === "/authorize") {
+          pendingNonce = url.searchParams.get("nonce");
+          const redirectUri = url.searchParams.get("redirect_uri");
+          const state = url.searchParams.get("state");
+          const location = `${redirectUri}?code=flow-harness-code&state=${encodeURIComponent(state ?? "")}`;
+          response.writeHead(302, { Location: location });
+          response.end();
+          return;
+        }
+        if (url.pathname === "/token" && request.method === "POST") {
+          const nonce = pendingNonce ?? "missing-nonce";
+          writeJson(response, 200, {
+            access_token: "flow-harness-access-token",
+            token_type: "Bearer",
+            expires_in: 300,
+            id_token: signIdToken(issuer, nonce),
+          });
+          return;
+        }
+        if (url.pathname === "/userinfo") {
+          writeJson(response, 200, {
+            sub: ISSUER_SUBJECT,
+            preferred_username: "flow-harness-user",
+            email: "flow-harness@example.invalid",
+            email_verified: true,
+          });
+          return;
+        }
+        response.writeHead(404);
         response.end();
-        return;
-      }
-      if (url.pathname === "/token" && request.method === "POST") {
-        const nonce = pendingNonce ?? "missing-nonce";
-        writeJson(response, 200, {
-          access_token: "flow-harness-access-token",
-          token_type: "Bearer",
-          expires_in: 300,
-          id_token: signIdToken(issuer, nonce),
-        });
-        return;
-      }
-      if (url.pathname === "/userinfo") {
-        writeJson(response, 200, {
-          sub: ISSUER_SUBJECT,
-          preferred_username: "flow-harness-user",
-          email: "flow-harness@example.invalid",
-          email_verified: true,
-        });
-        return;
-      }
-      response.writeHead(404);
-      response.end();
-    });
+      },
+    );
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       const port = server.address().port;
-      const issuer = `http://127.0.0.1:${port}`;
+      const issuer = `https://127.0.0.1:${port}`;
       resolve({
         server,
         issuer,
+        caFilePath: caCertPath,
         clientId: CLIENT_ID,
         subject: ISSUER_SUBJECT,
         close: () =>

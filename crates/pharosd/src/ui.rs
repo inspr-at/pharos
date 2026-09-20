@@ -19,6 +19,19 @@ pub(super) const LEAFLET_MARKER_ICON_2X_PNG: &[u8] =
 pub(super) const LEAFLET_MARKER_SHADOW_PNG: &[u8] =
     include_bytes!("../assets/vendor/leaflet-1.9.4/images/marker-shadow.png");
 pub(super) const D3_JS: &str = include_str!("../assets/vendor/d3-7.9.0/d3.min.js");
+pub(super) const MAPLIBRE_CSS: &str =
+    include_str!("../assets/vendor/maplibre-gl-5.24.0/maplibre-gl.css");
+pub(super) const MAPLIBRE_JS: &str =
+    include_str!("../assets/vendor/maplibre-gl-5.24.0/maplibre-gl-csp.js");
+pub(super) const MAPLIBRE_WORKER_JS: &str =
+    include_str!("../assets/vendor/maplibre-gl-5.24.0/maplibre-gl-csp-worker.js");
+pub(super) const MAPLIBRE_LEAFLET_JS: &str =
+    include_str!("../assets/vendor/maplibre-gl-leaflet-0.1.3/leaflet-maplibre-gl.js");
+// Only the vendored worker response receives this narrow fetch policy.
+#[derive(Clone, Copy)]
+pub(super) struct MapWorkerAsset;
+pub(super) const MAP_WORKER_CSP: &str =
+    "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src https://tiles.openfreemap.org";
 pub(super) const FAVICON_SVG: &str = include_str!("../assets/ui/favicon.svg");
 pub(super) const APP_VERSION: &str = env!("PHAROS_APP_VERSION");
 pub(super) const VERSION_SCHEME: &str = env!("PHAROS_VERSION_SCHEME");
@@ -194,6 +207,8 @@ pub(super) const LOGOUT_CSRF_RUNTIME: &str = include_str!("../assets/ui/logout-c
 
 pub(super) const SIDEBAR_MOTION_RUNTIME: &str = include_str!("../assets/ui/sidebar-motion.html");
 pub(super) const SETUP_ASSISTANT_TEMPLATE: &str = include_str!("../assets/ui/setup-assistant.html");
+pub(super) const OPS_RUNTIME: &str = include_str!("../assets/ui/ops.html");
+pub(super) const MAP_RUNTIME: &str = include_str!("../assets/ui/map.html");
 
 #[cfg(test)]
 mod module_tests {
@@ -342,6 +357,120 @@ mod module_tests {
         assert!(RELEASE_HISTORY_PORTAL.contains("data-release"));
         assert!(SETUP_ASSISTANT_TEMPLATE.contains("data-setup-assistant"));
         assert_eq!(html_escape("<&\"'>"), "&lt;&amp;&quot;&#39;&gt;");
+    }
+
+    fn forbidden_runtime_host(source: &str) -> Option<&'static str> {
+        const HOSTS: [&str; 10] = [
+            "googletagmanager.com",
+            "google-analytics.com",
+            "gstatic.com",
+            "fonts.googleapis.com",
+            "youtube.com",
+            "youtube-nocookie.com",
+            "doubleclick.net",
+            "facebook.com",
+            "hotjar.com",
+            "cdn.",
+        ];
+        let lower = source.to_ascii_lowercase();
+        HOSTS.into_iter().find(|host| {
+            lower.match_indices(host).any(|(index, _)| {
+                let tag_start = lower[..index].rfind('<').unwrap_or(index);
+                let tag_end = lower[index..]
+                    .find('>')
+                    .map(|offset| index + offset + 1)
+                    .unwrap_or(index + host.len());
+                let context = &lower[tag_start..tag_end];
+                !(context.starts_with("<a ") && context.contains("href="))
+            })
+        })
+    }
+
+    #[test]
+    fn ui_runtime_host_guard_blocks_trackers_but_allows_plain_links() {
+        let sources = [
+            ("head", HEAD),
+            ("foot", FOOT),
+            ("map", MAP_RUNTIME),
+            ("ops", OPS_RUNTIME),
+            ("logout-csrf", LOGOUT_CSRF_RUNTIME),
+            ("sidebar-motion", SIDEBAR_MOTION_RUNTIME),
+            ("setup-assistant", SETUP_ASSISTANT_TEMPLATE),
+            ("release-history", RELEASE_HISTORY_PORTAL),
+        ];
+        for (name, source) in sources {
+            assert_eq!(
+                forbidden_runtime_host(source),
+                None,
+                "{name} contains a blocked runtime host"
+            );
+        }
+
+        let shell = ShellContext {
+            user_label: "Runtime host fixture",
+            logout_enabled: false,
+            public_base_path: &PublicBasePath::ROOT,
+        };
+        let rendered_shells = [
+            (
+                "rendered-fleet",
+                render_home(
+                    RuntimeSnapshot {
+                        hosts: &[],
+                        jobs: &[],
+                        action_jobs: &[],
+                        declared_preferences: None,
+                        janus_managed_hosts: None,
+                    },
+                    "pharos",
+                    1_700_000_000,
+                    &[],
+                    shell,
+                    true,
+                ),
+            ),
+            (
+                "rendered-map",
+                render_map(
+                    &[],
+                    "pharos",
+                    1_700_000_000,
+                    "Runtime host fixture",
+                    false,
+                    &PublicBasePath::ROOT,
+                ),
+            ),
+        ];
+        for (name, source) in rendered_shells {
+            assert_eq!(
+                forbidden_runtime_host(&source),
+                None,
+                "{name} contains a blocked runtime host"
+            );
+        }
+
+        assert!(FOOT.contains("max-age=0; SameSite=Lax"));
+        assert!(!FOOT.contains("max-age=31536000"));
+        assert!(FOOT.contains("const UI_PREFERENCE_TTL_MS=180*24*60*60*1000"));
+        assert!(MAP_RUNTIME.contains("const MAP_PREFERENCE_TTL_MS=180*24*60*60*1000"));
+
+        let tracker_fixture = r#"<script src="https://www.googletagmanager.com/gtm.js"></script>"#;
+        assert_eq!(
+            forbidden_runtime_host(tracker_fixture),
+            Some("googletagmanager.com")
+        );
+        let dynamic_tracker_fixture = format!(
+            r#"{head}<main><img src="https://{host}/tracker.gif"></main>{foot}"#,
+            head = HEAD,
+            host = "google-analytics.com",
+            foot = FOOT,
+        );
+        assert_eq!(
+            forbidden_runtime_host(&dynamic_tracker_fixture),
+            Some("google-analytics.com")
+        );
+        let link_fixture = r#"<a href="https://youtube.com/watch?v=fixture">Open video</a>"#;
+        assert_eq!(forbidden_runtime_host(link_fixture), None);
     }
 
     #[test]
@@ -1284,6 +1413,42 @@ pub(super) async fn d3_js_asset() -> impl axum::response::IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         D3_JS,
+    )
+}
+
+pub(super) async fn maplibre_asset(AxumPath(name): AxumPath<String>) -> Response {
+    let (source, content_type) = match name.as_str() {
+        "maplibre-gl.css" => (MAPLIBRE_CSS, "text/css; charset=utf-8"),
+        "maplibre-gl-csp.js" => (MAPLIBRE_JS, "application/javascript; charset=utf-8"),
+        "maplibre-gl-csp-worker.js" => {
+            (MAPLIBRE_WORKER_JS, "application/javascript; charset=utf-8")
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mut response = (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        source,
+    )
+        .into_response();
+    if name == "maplibre-gl-csp-worker.js" {
+        response.extensions_mut().insert(MapWorkerAsset);
+    }
+    response
+}
+
+pub(super) async fn maplibre_leaflet_asset() -> impl axum::response::IntoResponse {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        MAPLIBRE_LEAFLET_JS,
     )
 }
 
@@ -6196,7 +6361,7 @@ pub(super) fn render_backups(hosts: &[Host], now: i64, shell: ShellContext<'_>) 
 }
 
 pub(super) fn ops_script() -> &'static str {
-    include_str!("../assets/ui/ops.html")
+    OPS_RUNTIME
 }
 
 pub(super) fn backup_engine_label(engine: pharos_core::BackupEngine) -> &'static str {
@@ -6962,10 +7127,10 @@ pub(super) fn render_map(
 ) -> String {
     let summary = summary_cards(hosts, self_name, now);
     let toolbar = map_toolbar();
-    let map_script = include_str!("../assets/ui/map.html");
+    let map_script = MAP_RUNTIME;
     let head = document_head(base);
     format!(
-        r#"{head}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof" data-as-of>as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal" data-loading="true" data-map-state="loading"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><div class="map-loading" data-map-loading><div class="map-load-card"><strong>Preparing map</strong><p data-map-status-message>Loading server locations and reachability checks.</p><span class="map-load-rail" aria-hidden="true"></span></div></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available when data can be loaded.</p></div></div></div><aside class="site-panel" aria-label="server locations" data-site-panel data-loading="true"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list" data-site-list><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div></div><div class="map-note" data-map-note>Loading server locations and reachability checks.</div></aside></section></main>{map_script}{FOOT}"#,
+        r#"{head}{sidebar}<main class="map-main" data-map-view="standard"><div class="top"><span class="top-art" aria-hidden="true"></span><div><div class="brand"><h1>Map</h1><svg class="wave" viewBox="0 0 48 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 7c5-7 11 7 16 0s11 7 16 0 10 3 14 0"/></svg></div><p class="fleet">Server locations</p></div><div class="asof" data-as-of>as of {as_of}</div></div>{summary}{toolbar}<section class="map-layout" data-map-layout data-mode="standard"><div id="map-panel" class="map-panel" data-mode="standard" data-label-density="normal" data-loading="true" data-map-state="loading"><div class="map-mode-controls" role="group" aria-label="Map layout"><button class="map-mode-control" type="button" data-map-mode-button="standard" aria-label="Standard layout" aria-pressed="true" title="Standard layout">{standard_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="maximized" aria-label="Maximize to window" aria-pressed="false" title="Maximize to window">{maximize_icon}</button><button class="map-mode-control" type="button" data-map-mode-button="fullscreen" aria-label="Fullscreen" aria-pressed="false" title="Fullscreen">{fullscreen_icon}</button><button class="map-mode-control map-density-control" type="button" data-map-density-button aria-label="Compact server labels" aria-pressed="false" title="Compact server labels">{compact_icon}</button></div><div id="fleet-map" class="fleet-map" aria-label="world map with server locations"></div><aside class="map-basemap-consent" data-basemap-consent aria-label="Optional external basemap"><strong>Street basemap is off</strong><p>Loading OpenFreeMap shares your IP address and requested map area with <code>tiles.openfreemap.org</code>. Permission applies once to this page and is not stored.</p><div><button type="button" data-basemap-load>Load external basemap</button><a href="https://openfreemap.org/" target="_blank" rel="noopener noreferrer">About OpenFreeMap</a></div></aside><div class="map-loading" data-map-loading><div class="map-load-card"><strong>Preparing map</strong><p data-map-status-message>Loading server locations and reachability checks.</p><span class="map-load-rail" aria-hidden="true"></span></div></div><div class="map-fallback" data-map-fallback><div><strong>Map unavailable</strong><p>The location list remains available when data can be loaded.</p></div></div></div><aside class="site-panel" aria-label="server locations" data-site-panel data-loading="true"><div><h2>Locations</h2><p>Approximate site-level coordinates.</p></div><div class="site-list" data-site-list><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line long"></span><span class="site-skel-line medium"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line medium"></span><span class="site-skel-line long"></span><span class="site-skel-line short"></span></div><div class="site-loading" data-site-skeleton><span class="site-skel-line short"></span><span class="site-skel-line medium"></span><span class="site-skel-line long"></span></div></div><div class="map-note" data-map-note>Loading server locations and reachability checks.</div></aside></section></main>{map_script}{FOOT}"#,
         sidebar = sidebar(base, user_label, logout_enabled, "map"),
         as_of = clock_label(now),
         summary = summary,

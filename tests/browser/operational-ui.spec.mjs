@@ -1055,6 +1055,60 @@ test("fleet host actions menu opens adjacent to its trigger", async ({ page }) =
   }
 });
 
+test("freeform order persists only after operator selection and expires", async ({
+  page,
+}, testInfo) => {
+  const key = "pharos_freeform_order_v1";
+  const hosts = [
+    `freeform-z-${testInfo.project.name}`,
+    `freeform-a-${testInfo.project.name}`,
+  ];
+  for (const host of hosts) await reportRuntimeHost(page, host);
+
+  await page.goto("/?sort=freeform");
+  await expect(page.locator("main")).toHaveAttribute("data-arrange", "freeform");
+  expect(await page.evaluate((storageKey) => localStorage.getItem(storageKey), key)).toBeNull();
+
+  await page.evaluate((storageKey) => {
+    localStorage.setItem(storageKey, JSON.stringify({
+      version: 1,
+      value: ["expired-order"],
+      expiresAt: Date.now() - 1,
+    }));
+  }, key);
+  await page.reload();
+  await expect(page.locator("main")).toHaveAttribute("data-arrange", "freeform");
+  expect(await page.evaluate((storageKey) => localStorage.getItem(storageKey), key)).toBeNull();
+
+  const sort = page.locator("[data-sort]");
+  await sort.selectOption("attention");
+  await sort.selectOption("freeform");
+  const saved = await page.evaluate((storageKey) => {
+    const raw = localStorage.getItem(storageKey);
+    const record = raw ? JSON.parse(raw) : null;
+    const order = Array.from(document.querySelectorAll("[data-grid] .card[data-host]"))
+      .map((card) => card.dataset.host);
+    return { raw, record, order, now: Date.now() };
+  }, key);
+  expect(saved.record?.version).toBe(1);
+  expect(saved.record?.value).toEqual(saved.order);
+  expect(Number.isFinite(saved.record?.expiresAt)).toBe(true);
+  expect(saved.record.expiresAt).toBeGreaterThan(saved.now + 179 * 24 * 60 * 60 * 1000);
+  expect(saved.record.expiresAt).toBeLessThan(saved.now + 181 * 24 * 60 * 60 * 1000);
+
+  await page.reload();
+  expect(await page.evaluate((storageKey) => localStorage.getItem(storageKey), key)).toBe(saved.raw);
+  await sort.selectOption("name");
+  expect(await page.evaluate((storageKey) => localStorage.getItem(storageKey), key)).toBeNull();
+  const targetOrder = await page.locator("[data-grid] .card[data-host]").evaluateAll(
+    (cards, targetHosts) => cards
+      .map((card) => card.dataset.host)
+      .filter((host) => targetHosts.includes(host)),
+    hosts,
+  );
+  expect(targetOrder).toEqual([...hosts].sort());
+});
+
 function healthyBackupObservation() {
   return {
     id: "restic-main",
@@ -4898,8 +4952,13 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
     true,
   );
   await failedCard.locator("[data-host-actions-trigger]").click();
+  const failedMenu = failedCard.locator("[data-host-actions-menu]");
+  await expect(failedMenu).toBeVisible();
+  await page.evaluate(() => document.dispatchEvent(new Event("scroll")));
+  await expect(failedMenu).toBeVisible();
   await expect(failedContinue).toBeHidden();
   await page.keyboard.press("Escape");
+  await expect(failedMenu).toBeHidden();
 
   const visiblePayload = await page.request.get("/hosts.json").then((r) => r.json());
   const visibleEntry = visiblePayload.hosts.find((entry) => entry.name === failedHost);

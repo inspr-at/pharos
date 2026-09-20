@@ -537,6 +537,28 @@ fn parse_oidc_ca_certificates(bytes: &[u8]) -> Result<Vec<reqwest::Certificate>,
     Ok(certificates)
 }
 
+fn build_oidc_http_client(
+    oidc_ca_file: Option<&std::path::Path>,
+) -> Result<reqwest::Client, String> {
+    let oidc_ca_certificates = oidc_ca_file
+        .map(load_oidc_ca_certificates)
+        .transpose()
+        .map_err(|error| format!("OIDC CA configuration failed: {error}"))?
+        .unwrap_or_default();
+    let mut builder = reqwest::ClientBuilder::new()
+        // OIDC provider traffic must never use cleartext HTTP.
+        .https_only(true)
+        // OIDC 4 requires a stateful client; redirects must stay disabled
+        // to avoid SSRF through provider-controlled endpoints.
+        .redirect(reqwest::redirect::Policy::none());
+    for certificate in oidc_ca_certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|err| format!("OIDC HTTP client could not be built: {err}"))
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -592,22 +614,7 @@ impl Auth {
             access_policy_file,
             oidc_ca_file,
         } = *config;
-        let oidc_ca_certificates = oidc_ca_file
-            .as_deref()
-            .map(load_oidc_ca_certificates)
-            .transpose()
-            .map_err(|error| format!("OIDC CA configuration failed: {error}"))?
-            .unwrap_or_default();
-        let mut http_client_builder = reqwest::ClientBuilder::new()
-            // OIDC 4 requires a stateful client; redirects must stay disabled
-            // to avoid SSRF through provider-controlled endpoints.
-            .redirect(reqwest::redirect::Policy::none());
-        for certificate in oidc_ca_certificates {
-            http_client_builder = http_client_builder.add_root_certificate(certificate);
-        }
-        let http_client = http_client_builder
-            .build()
-            .map_err(|err| format!("OIDC HTTP client could not be built: {err}"))?;
+        let http_client = build_oidc_http_client(oidc_ca_file.as_deref())?;
         let client = discover_client(
             issuer_url.clone(),
             client_id.clone(),
@@ -1987,9 +1994,23 @@ mod tests {
     #[derive(Clone)]
     struct MockOidcProvider {
         issuer: String,
+        ca_path: std::path::PathBuf,
         signing_key: Arc<RsaPrivateKey>,
         nonce: Arc<Mutex<Option<String>>>,
         token_mode: Arc<Mutex<MockTokenMode>>,
+    }
+
+    struct MockOidcServer {
+        task: tokio::task::JoinHandle<()>,
+        tls_root: std::path::PathBuf,
+    }
+
+    impl MockOidcServer {
+        async fn shutdown(self) {
+            self.task.abort();
+            let _ = self.task.await;
+            std::fs::remove_dir_all(self.tls_root).expect("mock OIDC TLS directory removed");
+        }
     }
 
     #[derive(Clone, Copy, Default)]
@@ -2115,11 +2136,17 @@ mod tests {
         }))
     }
 
-    async fn start_mock_oidc() -> (MockOidcProvider, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
+    async fn start_mock_oidc() -> (MockOidcProvider, MockOidcServer) {
+        let material = generate_test_tls_material("mock-issuer");
+        let listener = TestTlsListener::bind(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+        )
+        .await;
+        let issuer = format!("https://localhost:{}", listener.local_addr().port());
         let provider = MockOidcProvider {
             issuer,
+            ca_path: material.ca_path.clone(),
             signing_key: Arc::new(RsaPrivateKey::new(&mut OsRng, 2048).unwrap()),
             nonce: Arc::new(Mutex::new(None)),
             token_mode: Arc::new(Mutex::new(MockTokenMode::Success)),
@@ -2133,11 +2160,17 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (provider, task)
+        (
+            provider,
+            MockOidcServer {
+                task,
+                tls_root: material.root,
+            },
+        )
     }
 
     async fn auth_for_provider(provider: &MockOidcProvider) -> AuthState {
-        let config = AuthConfig::from_values(
+        let mut config = AuthConfig::from_values(
             true,
             Some(provider.issuer.clone()),
             Some("pharos-oidc-e2e".to_string()),
@@ -2147,6 +2180,10 @@ mod tests {
             None,
         )
         .unwrap();
+        let AuthConfigMode::Oidc(oidc) = &mut config.mode else {
+            unreachable!("mock OIDC configuration is complete");
+        };
+        oidc.oidc_ca_file = Some(provider.ca_path.clone());
         Auth::from_config(config, PublicBasePath::root())
             .await
             .unwrap()
@@ -2315,8 +2352,7 @@ mod tests {
         );
         assert!(auth_state.current_user(&session_headers).is_none());
 
-        server.abort();
-        let _ = server.await;
+        server.shutdown().await;
     }
 
     fn pending_flow(flow_cookie: &str, created: i64) -> Pending {
@@ -2518,8 +2554,7 @@ mod tests {
         assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
         assert!(response_html(replay).await.contains("Start sign-in again"));
 
-        server.abort();
-        let _ = server.await;
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -2550,8 +2585,7 @@ mod tests {
         assert_eq!(newer.status(), StatusCode::SEE_OTHER);
         assert_eq!(newer.headers().get(header::LOCATION).unwrap(), "/backups");
 
-        server.abort();
-        let _ = server.await;
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -2574,8 +2608,7 @@ mod tests {
         assert!(html.contains("Pharos may have restarted"));
         assert!(html.contains(r#"href="/auth/login?return_to=%2Fsettings""#));
 
-        server.abort();
-        let _ = server.await;
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -2622,8 +2655,7 @@ mod tests {
 
         app_server.abort();
         let _ = app_server.await;
-        oidc_server.abort();
-        let _ = oidc_server.await;
+        oidc_server.shutdown().await;
     }
 
     #[tokio::test]
@@ -2684,8 +2716,7 @@ mod tests {
         assert_eq!(authorization_rejection.status(), StatusCode::UNAUTHORIZED);
 
         let (state, flow_cookie) = begin_login(&auth_state, &provider, "/").await;
-        server.abort();
-        let _ = server.await;
+        server.shutdown().await;
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, flow_cookie.parse().unwrap());
         let transport_failure = callback(
@@ -3114,8 +3145,12 @@ mod tests {
     }
 
     fn generate_test_ca(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "pharos-auth-oidc-ca-{label}-{}-{}",
+            "pharos-auth-oidc-ca-{label}-{}-{}-{sequence}",
             std::process::id(),
             now()
         ));
@@ -3139,6 +3174,10 @@ mod tests {
                 "-days",
                 "2",
                 "-sha256",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -3146,6 +3185,219 @@ mod tests {
             .expect("openssl is available for TLS fixtures");
         assert!(status.success());
         (root, ca_path)
+    }
+
+    struct TestTlsMaterial {
+        root: std::path::PathBuf,
+        ca_path: std::path::PathBuf,
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+    }
+
+    struct TestTlsListener {
+        listener: tokio::net::TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+    }
+
+    impl TestTlsListener {
+        async fn bind(certificate_der: Vec<u8>, private_key_der: Vec<u8>) -> Self {
+            Self {
+                listener: tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind ephemeral OIDC TLS server"),
+                acceptor: test_tls_acceptor(certificate_der, private_key_der),
+            }
+        }
+
+        fn local_addr(&self) -> std::net::SocketAddr {
+            self.listener
+                .local_addr()
+                .expect("ephemeral OIDC TLS server address")
+        }
+    }
+
+    fn test_tls_acceptor(
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+    ) -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate_der)],
+                PrivatePkcs8KeyDer::from(private_key_der).into(),
+            )
+            .expect("ephemeral OIDC TLS server configuration");
+        tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+    }
+
+    impl axum::serve::Listener for TestTlsListener {
+        type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+        type Addr = std::net::SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                let (stream, address) = self
+                    .listener
+                    .accept()
+                    .await
+                    .expect("accept ephemeral OIDC TLS connection");
+                if let Ok(stream) = self.acceptor.accept(stream).await {
+                    return (stream, address);
+                }
+            }
+        }
+
+        fn local_addr(&self) -> std::io::Result<Self::Addr> {
+            self.listener.local_addr()
+        }
+    }
+
+    fn run_test_openssl(directory: &std::path::Path, arguments: &[&str]) {
+        let status = std::process::Command::new("openssl")
+            .current_dir(directory)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("OpenSSL is required for ephemeral OIDC TLS fixtures");
+        assert!(
+            status.success(),
+            "ephemeral TLS certificate generation failed"
+        );
+    }
+
+    fn generate_test_tls_material(label: &str) -> TestTlsMaterial {
+        let (root, ca_path) = generate_test_ca(label);
+        let ca_key_path = root.join("ca.key");
+        run_test_openssl(
+            &root,
+            &[
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                "server.key",
+                "-out",
+                "server.csr",
+                "-subj",
+                "/CN=localhost",
+            ],
+        );
+        std::fs::write(
+            root.join("server.ext"),
+            b"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n",
+        )
+        .expect("write ephemeral OIDC server extensions");
+        run_test_openssl(
+            &root,
+            &[
+                "x509",
+                "-req",
+                "-in",
+                "server.csr",
+                "-CA",
+                ca_path.to_str().expect("test CA path is UTF-8"),
+                "-CAkey",
+                ca_key_path.to_str().expect("test CA key path is UTF-8"),
+                "-CAcreateserial",
+                "-out",
+                "server.pem",
+                "-days",
+                "2",
+                "-sha256",
+                "-extfile",
+                "server.ext",
+            ],
+        );
+        run_test_openssl(
+            &root,
+            &[
+                "x509",
+                "-in",
+                "server.pem",
+                "-outform",
+                "DER",
+                "-out",
+                "server.der",
+            ],
+        );
+        run_test_openssl(
+            &root,
+            &[
+                "pkcs8",
+                "-topk8",
+                "-nocrypt",
+                "-in",
+                "server.key",
+                "-outform",
+                "DER",
+                "-out",
+                "server-key.der",
+            ],
+        );
+        TestTlsMaterial {
+            certificate_der: std::fs::read(root.join("server.der"))
+                .expect("read ephemeral OIDC server certificate"),
+            private_key_der: std::fs::read(root.join("server-key.der"))
+                .expect("read ephemeral OIDC server key"),
+            root,
+            ca_path,
+        }
+    }
+
+    async fn serve_test_https(
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+        request_hostname: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let acceptor = test_tls_acceptor(certificate_der, private_key_der);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral OIDC TLS server");
+        let port = listener.local_addr().expect("TLS listener address").port();
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while request.len() <= 16 * 1024 {
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+        (format!("https://{request_hostname}:{port}/"), task)
+    }
+
+    async fn wait_for_test_https_server(server: &mut tokio::task::JoinHandle<()>, case: &str) {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut *server).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("{case} OIDC TLS server exits: {error}"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("{case} OIDC TLS server did not exit");
+            }
+        }
     }
 
     #[test]
@@ -3208,6 +3460,93 @@ mod tests {
         let block = "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n";
         let bundle = block.repeat(MAX_OIDC_CA_CERTIFICATES + 1);
         assert!(parse_oidc_ca_certificates(bundle.as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    async fn oidc_http_client_rejects_http_without_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cleartext HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("cleartext HTTP listener address");
+
+        assert!(build_oidc_http_client(None)
+            .expect("OIDC HTTP client builds")
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "OIDC client connected to a cleartext HTTP listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_ca_https_preserves_chain_and_hostname_verification() {
+        let material = generate_test_tls_material("https");
+        let (_, wrong_ca_path) = generate_test_ca("wrong-https");
+
+        let (url, mut server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        let trusted_client = build_oidc_http_client(Some(&material.ca_path)).unwrap();
+        assert_eq!(
+            trusted_client.get(&url).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        wait_for_test_https_server(&mut server, "matching-CA").await;
+
+        let (url, mut server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert!(build_oidc_http_client(None)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .is_err());
+        wait_for_test_https_server(&mut server, "default-root").await;
+
+        let (url, mut server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "localhost",
+        )
+        .await;
+        assert!(build_oidc_http_client(Some(&wrong_ca_path))
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .is_err());
+        wait_for_test_https_server(&mut server, "wrong-CA").await;
+
+        let (url, mut server) = serve_test_https(
+            material.certificate_der.clone(),
+            material.private_key_der.clone(),
+            "127.0.0.1",
+        )
+        .await;
+        assert!(trusted_client.get(&url).send().await.is_err());
+        wait_for_test_https_server(&mut server, "hostname-mismatch").await;
+
+        std::fs::remove_dir_all(material.root).expect("test TLS directory removed");
+        std::fs::remove_dir_all(
+            wrong_ca_path
+                .parent()
+                .expect("wrong test CA has a parent directory"),
+        )
+        .expect("wrong test CA directory removed");
     }
 
     #[test]

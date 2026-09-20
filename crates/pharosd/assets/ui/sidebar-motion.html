@@ -5,6 +5,7 @@
   const video=sidebar?.querySelector('[data-sidebar-motion]');
   if(!sidebar||!video){script?.remove();return}
   const storageKey='pharos.sidebar.still.v1';
+  const storageTtlMs=180*24*60*60*1000;
   const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
   const desktop=window.matchMedia('(min-width: 901px)');
   const connection=navigator.connection;
@@ -12,11 +13,16 @@
   let note=null;
   let playbackFailed=false;
   let preferStill=false;
-  try{preferStill=localStorage.getItem(storageKey)==='true'}catch(_error){}
+  try{
+    const raw=localStorage.getItem(storageKey);
+    const record=raw?JSON.parse(raw):null;
+    preferStill=record?.version===1&&record.value===true&&Number(record.expiresAt)>Date.now();
+    if(raw&&(!record?.expiresAt||Number(record.expiresAt)<=Date.now()))localStorage.removeItem(storageKey);
+  }catch(_error){try{localStorage.removeItem(storageKey)}catch(_ignored){}}
   video.muted=true;
 
   function savePreference(){
-    try{localStorage.setItem(storageKey,preferStill?'true':'false')}catch(_error){}
+    try{localStorage.setItem(storageKey,JSON.stringify({version:1,value:preferStill,expiresAt:Date.now()+storageTtlMs}))}catch(_error){}
   }
   function dataSaverEnabled(){return connection?.saveData===true}
   function systemRequiresStill(){
@@ -100,7 +106,10 @@
   window.addEventListener('pagehide',()=>video.pause());
   window.addEventListener('storage',event=>{
     if(event.key!==storageKey)return
-    preferStill=event.newValue==='true';
+    try{
+      const record=event.newValue?JSON.parse(event.newValue):null;
+      preferStill=record?.version===1&&record.value===true&&Number(record.expiresAt)>Date.now();
+    }catch(_error){preferStill=false}
     playbackFailed=false;
     applyPreference();
   });
