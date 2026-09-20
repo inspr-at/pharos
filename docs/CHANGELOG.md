@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 260920201529.0.0 - 2026-09-20
+
+- Replace credential-requiring CARTO tiles with an optional key-free OpenFreeMap basemap. Load external map resources only after contextual permission while preserving fleet labels and controls when offline (PHAROS-280).
+- Keep browser assets self-hosted, remove legacy fleet preference cookies, bound explicitly selected preferences to 180 days, and document/test storage and external-resource behavior (PHAROS-273).
+- Verify scoped OIDC private-CA trust with real HTTPS acceptance and rejection tests (PHAROS-272).
+- Fix enabled external NixOS beacon consumers by reading metadata from the original source; cover isolated default/exported consumers, filtered-source absence and native Darwin tests in CI (PHAROS-276, PHAROS-278, PHAROS-279).
+- Prevent delayed scroll events from closing a newly opened mobile host-action menu (PHAROS-278).
+- Update the vendored doctrine to v0.13.0 and retain the verified calendar presentation bundle (PHAROS-274).
+
 ## 260915083121.0.0 - 2026-09-15
 
 - Update rustls to 0.23.45 to reject TLS handshake messages crossing encryption levels (RUSTSEC-2026-0285).
