@@ -4898,6 +4898,7 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
     true,
   );
   await failedCard.locator("[data-host-actions-trigger]").click();
+  await expect(failedCard.locator("[data-host-actions-menu]:not([hidden])")).toBeVisible();
   await expect(failedContinue).toBeHidden();
   await page.keyboard.press("Escape");
 
