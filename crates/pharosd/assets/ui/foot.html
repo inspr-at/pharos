@@ -1831,12 +1831,12 @@ function keepOnboardAffordanceLast(){
   const tile=document.querySelector('[data-onboard-tile]');
   if(grid&&tile&&(tile.parentElement!==grid||tile.nextElementSibling))grid.appendChild(tile);
 }
-function applyFreeformOrder(){
+function applyFreeformOrder(write=true){
   const grid=document.querySelector('[data-grid]');
   const body=document.querySelector('[data-list-body]');
   const order=readFreeformOrder();
   if(!order.length){
-    writeFreeformOrder();
+    if(write)writeFreeformOrder();
     keepOnboardAffordanceLast();
     return;
   }
@@ -1859,7 +1859,7 @@ function applySort(mode,write=true){
     return;
   }
   if(mode==='freeform'){
-    applyFreeformOrder();
+    applyFreeformOrder(write);
   }else{
     if(write)clearFreeformOrder();
     if(grid)reorderChildrenIfNeeded(grid,Array.from(grid.querySelectorAll('.card')).sort((a,b)=>cmp(a,b,mode)));
