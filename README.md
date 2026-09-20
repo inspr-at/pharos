@@ -530,6 +530,15 @@ an unprivileged service and hardens its filesystem view. The service uses
 systemd readiness/watchdog notifications; only a successful report refreshes
 the watchdog. Set `allowLegacyReports = true` only for a controlled migration.
 
+The module builds its default package with the consumer's `pkgs`. You can also
+set `package = inputs.pharos.packages.${pkgs.stdenv.hostPlatform.system}.pharos-beacon` explicitly.
+Both forms support `nix flake check --no-build` without first archiving the
+Pharos input or creating the runtime token file. Package evaluation reads release
+metadata and `Cargo.lock` from the original source tree; filtering the build
+source does not require materialising it to read those files. `src` overrides
+remain authoritative: `cleanSource`/`cleanSourceWith` expose their original tree
+for metadata reads, while a plain source path supplies both metadata and contents.
+
 ### Portable Linux service
 
 For a non-Nix Linux host:
@@ -958,6 +967,13 @@ cargo deny check
 
 Additional checks cover the NixOS module, native systemd installer,
 `nixos-anywhere` handoff and self-host Compose contract.
+
+`python3 scripts/check-nix-consumer.py` evaluates external consumers for both
+Linux architectures, with the default and exported beacon packages. Each case
+uses an empty Nix store and fetcher cache, a source file deliberately removed by
+filtering, and a nonexistent runtime token path. It asserts that the filtered
+source paths stay absent, then evaluates NixOS configurations without building
+them. CI also builds and tests the beacon on aarch64-darwin.
 
 Browser QA runs with `npm run test:browser`. Playwright keeps transient traces,
 failure screenshots and videos under `test-results/`, while reviewed visual

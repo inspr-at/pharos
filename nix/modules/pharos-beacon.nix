@@ -52,7 +52,7 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       default = defaultPackage;
-      defaultText = lib.literalExpression "inputs.pharos.packages.${pkgs.system}.pharos-beacon";
+      defaultText = lib.literalExpression ''pkgs.callPackage ../packages/pharos.nix { binaryName = "pharos-beacon"; src = lib.cleanSource ../..; }'';
       description = "Package that provides the pharos-beacon binary.";
     };
 

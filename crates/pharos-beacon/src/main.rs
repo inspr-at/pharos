@@ -5409,7 +5409,17 @@ mod tests {
     fn set_deny_delete_acl(path: &Path, enable: bool) {
         // The platform chmod at /bin/chmod understands ACL entries; a GNU
         // chmod earlier on PATH would not, so never resolve it by name.
-        let user = std::env::var("USER").expect("USER");
+        // Nix builds do not provide USER. Ask the OS for this process's
+        // effective account instead of trusting the calling shell's identity.
+        let identity = Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .expect("resolve effective user");
+        assert!(identity.status.success(), "id -un must succeed");
+        let user = std::str::from_utf8(&identity.stdout)
+            .expect("effective user is UTF-8")
+            .trim();
+        assert!(!user.is_empty(), "effective user must not be empty");
         let status = Command::new("/bin/chmod")
             .arg(if enable { "+a" } else { "-a" })
             .arg(format!("{user} deny delete"))
@@ -5853,31 +5863,48 @@ mod tests {
 
     #[test]
     fn concurrent_writer_and_probe_never_race_or_report_falsely() {
-        // A beacon refreshing as fast as it can while the container probe
-        // runs back to back: every write and every probe succeeds, every
-        // verdict is healthy, and nothing but the lock is left behind.
+        // Race one write with one probe in each round. OS file locks need
+        // not be fair: an unbounded stream of probes can repeatedly beat a
+        // sleeping writer until its intentional two-second deadline expires.
+        // Rendezvous between rounds tests concurrent operations without
+        // assuming fairness or weakening the production lock deadline.
         let dir = kernel_fixture("concurrent");
         std::fs::create_dir(&dir).expect("create location");
         let path = dir.join("pharos-beacon-health-v1");
         write_marker(&path, 1_000).expect("write initial marker");
         let writer_path = path.clone();
+        let (start_write, starts) = mpsc::sync_channel(0);
+        let (finish_write, writes) = mpsc::sync_channel(0);
         let writer = thread::spawn(move || {
             let generation = generation();
-            (0..300).all(|i| write_beacon_health(&writer_path, 1_000 + i, &generation).is_ok())
+            for i in 0..300 {
+                // Channel closure also lets the worker exit if the test
+                // panics; a barrier would strand it on the next round.
+                if starts.recv().is_err() {
+                    return;
+                }
+                let result = write_beacon_health(&writer_path, 1_000 + i, &generation);
+                if finish_write.send(result).is_err() {
+                    return;
+                }
+            }
         });
         let mut probes = 0;
         let mut healthy = 0;
-        for _ in 0..300 {
-            match beacon_health_verdict(&path, 120, 1_300) {
+        for i in 0..300 {
+            start_write.send(()).expect("start concurrent write");
+            let verdict = beacon_health_verdict(&path, 120, 1_300);
+            writes
+                .recv_timeout(Duration::from_secs(10))
+                .expect("writer must finish this round")
+                .unwrap_or_else(|error| panic!("concurrent write {i} failed: {error}"));
+            match verdict {
                 Ok(_) => healthy += 1,
                 Err(problem) => panic!("probe under concurrent writes failed: {problem}"),
             }
             probes += 1;
         }
-        assert!(
-            writer.join().expect("writer thread"),
-            "every write must succeed"
-        );
+        writer.join().expect("writer thread");
         assert_eq!(healthy, probes);
         assert_eq!(
             std::fs::read_to_string(&path)
