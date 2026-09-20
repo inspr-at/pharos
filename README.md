@@ -280,7 +280,8 @@ Put an HTTPS reverse proxy or a private tailnet endpoint in front of
 `PHAROS_BIND`. For durable operation, supply runtime values through your host
 secret manager or orchestrator rather than a committed environment file.
 
-The OIDC client is public and uses PKCE, so it has no client secret. Login state
+The OIDC client is public and uses PKCE, so it has no client secret. Provider
+requests require HTTPS, verify certificates and refuse redirects. Login state
 is browser-bound and expires after ten minutes; in-flight logins and sessions
 have hard count and creation-rate bounds. Session cookies use the `__Host-`
 prefix, and logout is a CSRF-protected POST. Expired, replayed, restarted or
@@ -879,7 +880,7 @@ HTTPS-only boundary. Store Flow config and API key files under an operator-owned
 | `PHAROS_FLOW_CONFIG_FILE`                                      | Optional owner-only Flow host config (`inspr.pharos.flow-host-config.v1`) enabling bounded `@inspr/flow-shell` projection and guarded Review/Start navigation                                                                                          |
 | `PHAROS_FLOW_ALLOW_LOOPBACK_ORIGIN`                            | When `true` or `1`, allow cleartext loopback Paimos origins only while **both** `PHAROS_ADDR` and `PHAROS_PUBLIC_ADDR` are loopback; for local harnesses only                                                                                           |
 | `PHAROS_PROVISIONING_JOBS_DB`                                  | Optional explicit provisioning-job sidecar path; required for paid provider actions when `PHAROS_DB` is unset                                                                                                                                          |
-| `PHAROS_OIDC_ISSUER`                                           | OIDC discovery issuer                                                                                                                                                                                                                                  |
+| `PHAROS_OIDC_ISSUER`                                           | HTTPS OIDC discovery issuer                                                                                                                                                                                                                             |
 | `PHAROS_OIDC_CLIENT_ID`                                        | Public OIDC client identifier                                                                                                                                                                                                                          |
 | `PHAROS_OIDC_REDIRECT_URI`                                     | Exact callback URI                                                                                                                                                                                                                                     |
 | `PHAROS_OIDC_CA_FILE`                                          | Optional owner-selected read-only PEM CA bundle for OIDC discovery/token requests; regular file, one link, up to 256 KiB, certificate blocks only, no group/other write. Absent keeps bundled WebPKI roots. The path must be a protected container mount, and trust remains scoped to this OIDC client. |
