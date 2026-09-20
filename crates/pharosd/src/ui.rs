@@ -406,6 +406,49 @@ mod module_tests {
             );
         }
 
+        let shell = ShellContext {
+            user_label: "Runtime host fixture",
+            logout_enabled: false,
+            public_base_path: &PublicBasePath::ROOT,
+        };
+        let rendered_shells = [
+            (
+                "rendered-fleet",
+                render_home(
+                    RuntimeSnapshot {
+                        hosts: &[],
+                        jobs: &[],
+                        action_jobs: &[],
+                        declared_preferences: None,
+                        janus_managed_hosts: None,
+                    },
+                    "pharos",
+                    1_700_000_000,
+                    &[],
+                    shell,
+                    true,
+                ),
+            ),
+            (
+                "rendered-map",
+                render_map(
+                    &[],
+                    "pharos",
+                    1_700_000_000,
+                    "Runtime host fixture",
+                    false,
+                    &PublicBasePath::ROOT,
+                ),
+            ),
+        ];
+        for (name, source) in rendered_shells {
+            assert_eq!(
+                forbidden_runtime_host(&source),
+                None,
+                "{name} contains a blocked runtime host"
+            );
+        }
+
         assert!(FOOT.contains("max-age=0; SameSite=Lax"));
         assert!(!FOOT.contains("max-age=31536000"));
         assert!(FOOT.contains("const UI_PREFERENCE_TTL_MS=180*24*60*60*1000"));
@@ -415,6 +458,16 @@ mod module_tests {
         assert_eq!(
             forbidden_runtime_host(tracker_fixture),
             Some("googletagmanager.com")
+        );
+        let dynamic_tracker_fixture = format!(
+            r#"{head}<main><img src="https://{host}/tracker.gif"></main>{foot}"#,
+            head = HEAD,
+            host = "google-analytics.com",
+            foot = FOOT,
+        );
+        assert_eq!(
+            forbidden_runtime_host(&dynamic_tracker_fixture),
+            Some("google-analytics.com")
         );
         let link_fixture = r#"<a href="https://youtube.com/watch?v=fixture">Open video</a>"#;
         assert_eq!(forbidden_runtime_host(link_fixture), None);
