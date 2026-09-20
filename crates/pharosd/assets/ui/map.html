@@ -4,7 +4,14 @@ const MAP_DATA_URL=appUrl('/map/data.json');
 const MAP_LEAFLET_CSS=appUrl('/assets/vendor/leaflet-1.9.4/leaflet.css');
 const MAP_LEAFLET_JS=appUrl('/assets/vendor/leaflet-1.9.4/leaflet.js');
 const MAP_D3_JS=appUrl('/assets/vendor/d3-7.9.0/d3.min.js');
+const MAP_GL_CSS=appUrl('/assets/vendor/maplibre-gl-5.24.0/maplibre-gl.css');
+const MAP_GL_JS=appUrl('/assets/vendor/maplibre-gl-5.24.0/maplibre-gl-csp.js');
+const MAP_GL_WORKER=appUrl('/assets/vendor/maplibre-gl-5.24.0/maplibre-gl-csp-worker.js');
+const MAP_GL_LEAFLET_JS=appUrl('/assets/vendor/maplibre-gl-leaflet-0.1.3/leaflet-maplibre-gl.js');
+const MAP_BASEMAP_STYLE='https://tiles.openfreemap.org/styles/positron';
+const MAP_BASEMAP_ATTRIBUTION='<a href="https://openfreemap.org/">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
 let MAP_HOSTS=[];
+let MAP_BASEMAP_LAYER=null;
 let applyMapFilterNow=null;
 let pendingMapFilter={q:'',live:'all'};
 function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
@@ -37,7 +44,7 @@ function loadStylesheet(href){
     tag.rel='stylesheet';
     tag.href=href;
     tag.onload=resolve;
-    tag.onerror=()=>reject(new Error('stylesheet failed'));
+    tag.onerror=()=>{tag.remove();reject(new Error('stylesheet failed'))};
     document.head.appendChild(tag);
   });
 }
@@ -54,7 +61,7 @@ function loadScript(src,ready){
     tag.src=src;
     tag.async=true;
     tag.onload=resolve;
-    tag.onerror=()=>reject(new Error('script failed'));
+    tag.onerror=()=>{tag.remove();reject(new Error('script failed'))};
     document.head.appendChild(tag);
   });
 }
@@ -62,6 +69,77 @@ async function loadMapAssets(){
   await loadStylesheet(MAP_LEAFLET_CSS);
   await loadScript(MAP_LEAFLET_JS,()=>Boolean(window.L));
   await loadScript(MAP_D3_JS,()=>Boolean(window.d3));
+}
+async function loadBasemap(map,el){
+  let layer;
+  // Keep the fleet overlay independent of tile availability and WebGL support.
+  function basemapState(state){
+    el.dataset.basemapState=state;
+    const note=document.querySelector('[data-map-note]');
+    if(note)note.textContent=state==='unavailable'
+      ?'Basemap unavailable. Host labels and map controls remain available.'
+      :'All servers stay visible; labels are separated by D3 force layout with leader lines.';
+  }
+  const control=document.querySelector('[data-basemap-consent]');
+  const button=document.querySelector('[data-basemap-load]');
+  if(MAP_BASEMAP_LAYER&&map.hasLayer(MAP_BASEMAP_LAYER))map.removeLayer(MAP_BASEMAP_LAYER);
+  MAP_BASEMAP_LAYER=null;
+  el.dataset.basemapState='loading';
+  if(button){button.disabled=true;button.textContent='Loading basemap…'}
+  try{
+    await loadStylesheet(MAP_GL_CSS);
+    await loadScript(MAP_GL_JS,()=>Boolean(window.maplibregl));
+    // The CSP build uses a vendored worker; no blob workers or CDN scripts.
+    maplibregl.setWorkerUrl(MAP_GL_WORKER);
+    await loadScript(MAP_GL_LEAFLET_JS,()=>Boolean(L.maplibreGL));
+    layer=L.maplibreGL({
+      style:MAP_BASEMAP_STYLE,
+      interactive:false,
+      attributionControl:{customAttribution:MAP_BASEMAP_ATTRIBUTION},
+      transformRequest(url){
+        const target=new URL(url);
+        if(target.origin!=='https://tiles.openfreemap.org'||target.username||target.password)throw new Error('Unexpected basemap origin');
+        return {url:target.href,credentials:'omit',referrerPolicy:'no-referrer'};
+      }
+    });
+    // Leaflet registers layer events before MapLibre constructs its context.
+    // A failed WebGL constructor must still leave a removable Leaflet layer.
+    const removeBasemap=layer.onRemove;
+    layer.onRemove=function(owner){
+      if(this.getMaplibreMap())removeBasemap.call(this,owner);
+      else this.getContainer()?.remove();
+    };
+    layer.addTo(map);
+    MAP_BASEMAP_LAYER=layer;
+    const basemap=layer.getMaplibreMap();
+    let resourceFailed=false;
+    basemap.on('error',()=>{
+      resourceFailed=true;
+      basemapState('unavailable');
+      if(control)control.hidden=false;
+      if(button){button.disabled=false;button.textContent='Retry external basemap'}
+    });
+    // MapLibre can finish loading after a source failed; that is not success.
+    basemap.on('load',()=>{
+      if(resourceFailed)return;
+      basemapState('ready');
+      if(control)control.hidden=true;
+    });
+    basemap.on('webglcontextlost',()=>basemapState('unavailable'));
+    basemap.on('webglcontextrestored',()=>{if(!resourceFailed)basemapState('ready')});
+  }catch(_){
+    if(layer&&map.hasLayer(layer))map.removeLayer(layer);
+    if(MAP_BASEMAP_LAYER===layer)MAP_BASEMAP_LAYER=null;
+    basemapState('unavailable');
+    if(control)control.hidden=false;
+    if(button){button.disabled=false;button.textContent='Retry external basemap'}
+  }
+}
+function setupBasemapControl(map,el){
+  const button=document.querySelector('[data-basemap-load]');
+  if(!button)return;
+  el.dataset.basemapState='blocked';
+  button.addEventListener('click',()=>{void loadBasemap(map,el)});
 }
 async function loadMapData(){
   const res=await fetch(MAP_DATA_URL+'?refresh='+Date.now(),{headers:{Accept:'application/json'},cache:'no-store',credentials:'same-origin'});
@@ -318,8 +396,20 @@ function exitFullscreen(){
 const MAP_VIEWPORT_STORAGE='pharos.map.viewport.v1';
 const MAP_MODE_STORAGE='pharos.map.mode.v1';
 const MAP_LABEL_DENSITY_STORAGE='pharos.map.labelDensity.v1';
-function storageGet(key){try{return window.localStorage.getItem(key)}catch(_){return null}}
-function storageSet(key,value){try{window.localStorage.setItem(key,value)}catch(_){}}
+const MAP_PREFERENCE_TTL_MS=180*24*60*60*1000;
+function storageGet(key){
+  try{
+    const raw=window.localStorage.getItem(key);
+    if(!raw)return null;
+    const record=JSON.parse(raw);
+    if(record&&record.version===1&&typeof record.value==='string'&&Number(record.expiresAt)>Date.now())return record.value;
+    window.localStorage.removeItem(key);
+  }catch(_){try{window.localStorage.removeItem(key)}catch(_error){}}
+  return null;
+}
+function storageSet(key,value){
+  try{window.localStorage.setItem(key,JSON.stringify({version:1,value:String(value),expiresAt:Date.now()+MAP_PREFERENCE_TTL_MS}))}catch(_){}
+}
 function storedMapMode(){
   const value=storageGet(MAP_MODE_STORAGE);
   return value==='maximized'?'maximized':'standard';
@@ -377,13 +467,13 @@ function setupMapModes(map,el,relayout){
       button.setAttribute('aria-pressed',active?'true':'false');
     });
   }
-  function commit(next){
+  function commit(next,persist=true){
     mode=next;
     panel.dataset.mode=next;
     layout.dataset.mode=next==='fullscreen'?'maximized':next;
     main.dataset.mapView=next==='standard'?'standard':'maximized';
     setPressed(next);
-    storeMapMode(next);
+    if(persist)storeMapMode(next);
     resizeSoon();
   }
   function setMode(next){
@@ -401,11 +491,11 @@ function setupMapModes(map,el,relayout){
   buttons.forEach(button=>{
     button.addEventListener('click',()=>setMode(button.dataset.mapModeButton||'standard'));
   });
-  function setDensity(next){
+  function setDensity(next,persist=true){
     const density=next==='compact'?'compact':'normal';
     panel.dataset.labelDensity=density;
     if(densityButton)densityButton.setAttribute('aria-pressed',density==='compact'?'true':'false');
-    storeMapLabelDensity(density);
+    if(persist)storeMapLabelDensity(density);
     resizeSoon();
   }
   densityButton?.addEventListener('click',()=>{
@@ -422,15 +512,14 @@ function setupMapModes(map,el,relayout){
   }
   document.addEventListener('fullscreenchange',onFullscreenChange);
   document.addEventListener('webkitfullscreenchange',onFullscreenChange);
-  commit(storedMapMode());
-  setDensity(storedMapLabelDensity());
+  commit(storedMapMode(),false);
+  setDensity(storedMapLabelDensity(),false);
 }
 function initMap(){
   const el=document.getElementById('fleet-map');
   if(!el||!window.L){document.querySelector('[data-map-fallback]')?.style.setProperty('display','grid');return}
-  const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:true,zoomControl:false});
+  const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:true,zoomControl:false,minZoom:0,maxZoom:20});
   L.control.zoom({position:'topleft'}).addTo(map);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:20,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'}).addTo(map);
   const bounds=MAP_HOSTS.map(host=>[host.lat,host.lon]);
   const saved=storedViewport();
   if(saved){map.setView([saved.lat,saved.lon],saved.zoom)}
@@ -439,8 +528,17 @@ function initMap(){
   else{map.setView([20,0],2)}
   const relayout=buildLabels(map,el);
   setupMapModes(map,el,relayout);
-  map.on('moveend zoomend',()=>storeViewport(map));
-  storeViewport(map);
+  let persistViewport=false;
+  const markViewportInteraction=()=>{persistViewport=true};
+  el.addEventListener('pointerdown',markViewportInteraction,{passive:true});
+  el.addEventListener('wheel',markViewportInteraction,{passive:true});
+  el.addEventListener('keydown',markViewportInteraction);
+  map.on('moveend zoomend',()=>{
+    if(!persistViewport)return;
+    persistViewport=false;
+    storeViewport(map);
+  });
+  setupBasemapControl(map,el);
 }
 window.pharosMapApplyFilter=(q='',live='all')=>{
   pendingMapFilter={q,live};

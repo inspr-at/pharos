@@ -4655,6 +4655,12 @@ async fn secure_response(response: Response) -> Response {
     };
 
     apply_security_headers(response.headers_mut(), nonce.as_deref());
+    if response.extensions().get::<MapWorkerAsset>().is_some() {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("content-security-policy"),
+            axum::http::HeaderValue::from_static(MAP_WORKER_CSP),
+        );
+    }
     response
 }
 
@@ -4676,7 +4682,7 @@ fn apply_security_headers(headers: &mut HeaderMap, nonce: Option<&str>) {
         || "default-src 'none'; base-uri 'none'; frame-ancestors 'none'".to_string(),
         |nonce| {
             format!(
-                "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'nonce-{nonce}'; script-src-attr 'none'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data: https://*.basemaps.cartocdn.com; connect-src 'self'; font-src 'self'; media-src 'self'; frame-src 'none'; worker-src 'none'; manifest-src 'self'"
+                "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'nonce-{nonce}'; script-src-attr 'none'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob: https://tiles.openfreemap.org; connect-src 'self' https://tiles.openfreemap.org; font-src 'self'; media-src 'self'; frame-src 'none'; worker-src 'self'; manifest-src 'self'"
             )
         },
     );
@@ -5855,6 +5861,58 @@ mod tests {
             .expect("vendored D3 body");
         assert!(d3.starts_with(b"// https://d3js.org"));
 
+        for name in [
+            "maplibre-gl.css",
+            "maplibre-gl-csp.js",
+            "maplibre-gl-csp-worker.js",
+        ] {
+            let asset = secure_response(maplibre_asset(AxumPath(name.to_string())).await).await;
+            assert_eq!(asset.status(), StatusCode::OK);
+            assert_eq!(
+                asset.headers().get(header::CACHE_CONTROL).unwrap(),
+                "public, max-age=31536000, immutable"
+            );
+            let csp = asset.headers().get("content-security-policy").unwrap();
+            if name.ends_with("-worker.js") {
+                assert_eq!(csp, MAP_WORKER_CSP);
+            } else {
+                assert_eq!(
+                    csp,
+                    "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+                );
+            }
+            let content_type = asset.headers().get(header::CONTENT_TYPE).unwrap();
+            assert_eq!(
+                content_type,
+                if name.ends_with(".css") {
+                    "text/css; charset=utf-8"
+                } else {
+                    "application/javascript; charset=utf-8"
+                }
+            );
+            let body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(!body.is_empty());
+        }
+        assert_eq!(
+            maplibre_asset(AxumPath("not-vendored.js".to_string()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let binding = maplibre_leaflet_asset().await.into_response();
+        assert_eq!(binding.status(), StatusCode::OK);
+        assert_eq!(
+            binding.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        let binding = axum::body::to_bytes(binding.into_body(), usize::MAX)
+            .await
+            .expect("vendored MapLibre Leaflet binding body");
+        assert!(binding.starts_with(b"(function (root, factory)"));
+
         assert_eq!(
             leaflet_image_asset(AxumPath("not-vendored.png".to_string()))
                 .await
@@ -5888,7 +5946,11 @@ mod tests {
         assert!(headers.contains_key("strict-transport-security"));
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("script-src-attr 'none'"));
-        assert!(csp.contains("img-src 'self' data: https://*.basemaps.cartocdn.com"));
+        assert!(csp.contains("img-src 'self' data: blob: https://tiles.openfreemap.org;"));
+        assert!(csp.contains("connect-src 'self' https://tiles.openfreemap.org;"));
+        assert!(csp.contains("worker-src 'self';"));
+        assert!(!csp.contains("cartocdn.com"));
+        assert!(!csp.contains("unsafe-eval"));
         assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -8528,7 +8590,15 @@ mod tests {
         assert!(html.contains("class=\"map-source\""));
         assert!(html.contains("data-location-source"));
         assert!(html.contains("buildLabels(map,el)"));
-        assert!(html.contains("basemaps.cartocdn.com/light_all"));
+        assert!(html.contains("https://tiles.openfreemap.org/styles/positron"));
+        assert!(html.contains(r#"data-basemap-consent aria-label="Optional external basemap""#));
+        assert!(html.contains("Load external basemap"));
+        assert!(html.contains("Permission applies once to this page and is not stored."));
+        assert!(html.contains("button.addEventListener('click',()=>{void loadBasemap(map,el)})"));
+        assert!(!html.contains("cartocdn.com"));
+        assert!(html.contains("/assets/vendor/maplibre-gl-5.24.0/maplibre-gl-csp.js"));
+        assert!(html.contains("/assets/vendor/maplibre-gl-5.24.0/maplibre-gl-csp-worker.js"));
+        assert!(html.contains("/assets/vendor/maplibre-gl-leaflet-0.1.3/leaflet-maplibre-gl.js"));
         assert!(html.contains("map.on('move zoom moveend zoomend resize viewreset'"));
         assert!(html.contains("classList.add('map-links')"));
         assert!(html.contains("animateMotion"));
@@ -8536,7 +8606,8 @@ mod tests {
         assert!(html.contains("const MAP_MODE_STORAGE='pharos.map.mode.v1'"));
         assert!(html.contains("storedViewport()"));
         assert!(html.contains("storeViewport(map)"));
-        assert!(html.contains("map.on('moveend zoomend',()=>storeViewport(map))"));
+        assert!(html.contains("const markViewportInteraction=()=>{persistViewport=true}"));
+        assert!(html.contains("if(!persistViewport)return"));
         assert!(html.contains("scrollWheelZoom:true"));
         assert!(html.contains("L.control.zoom({position:'topleft'})"));
         assert!(html.contains(r#"data-map-view="standard""#));
