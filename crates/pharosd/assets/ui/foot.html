@@ -266,7 +266,7 @@ function openHostActions(root){
   trigger.setAttribute('aria-expanded','true');
   openHostActionsRoot=root;
   positionHostActions(root);
-  visibleHostActionItems(menu)[0]?.focus();
+  visibleHostActionItems(menu)[0]?.focus({preventScroll:true});
 }
 function setHostActionFact(name,value,visible=true){
   const overlay=document.querySelector('[data-host-action-overlay]');
