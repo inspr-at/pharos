@@ -3201,20 +3201,11 @@ mod tests {
 
     impl TestTlsListener {
         async fn bind(certificate_der: Vec<u8>, private_key_der: Vec<u8>) -> Self {
-            use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-
-            let server_config = tokio_rustls::rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![CertificateDer::from(certificate_der)],
-                    PrivatePkcs8KeyDer::from(private_key_der).into(),
-                )
-                .expect("ephemeral OIDC TLS server configuration");
             Self {
                 listener: tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind ephemeral OIDC TLS server"),
-                acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+                acceptor: test_tls_acceptor(certificate_der, private_key_der),
             }
         }
 
@@ -3223,6 +3214,22 @@ mod tests {
                 .local_addr()
                 .expect("ephemeral OIDC TLS server address")
         }
+    }
+
+    fn test_tls_acceptor(
+        certificate_der: Vec<u8>,
+        private_key_der: Vec<u8>,
+    ) -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate_der)],
+                PrivatePkcs8KeyDer::from(private_key_der).into(),
+            )
+            .expect("ephemeral OIDC TLS server configuration");
+        tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
     }
 
     impl axum::serve::Listener for TestTlsListener {
@@ -3348,10 +3355,18 @@ mod tests {
         request_hostname: &str,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut listener = TestTlsListener::bind(certificate_der, private_key_der).await;
-        let port = listener.local_addr().port();
+        let acceptor = test_tls_acceptor(certificate_der, private_key_der);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral OIDC TLS server");
+        let port = listener.local_addr().expect("TLS listener address").port();
         let task = tokio::spawn(async move {
-            let (mut stream, _) = axum::serve::Listener::accept(&mut listener).await;
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
             while request.len() <= 16 * 1024 {
@@ -3371,6 +3386,18 @@ mod tests {
                 .await;
         });
         (format!("https://{request_hostname}:{port}/"), task)
+    }
+
+    async fn wait_for_test_https_server(server: &mut tokio::task::JoinHandle<()>, case: &str) {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut *server).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("{case} OIDC TLS server exits: {error}"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("{case} OIDC TLS server did not exit");
+            }
+        }
     }
 
     #[test]
@@ -3463,7 +3490,7 @@ mod tests {
         let material = generate_test_tls_material("https");
         let (_, wrong_ca_path) = generate_test_ca("wrong-https");
 
-        let (url, server) = serve_test_https(
+        let (url, mut server) = serve_test_https(
             material.certificate_der.clone(),
             material.private_key_der.clone(),
             "localhost",
@@ -3474,9 +3501,9 @@ mod tests {
             trusted_client.get(&url).send().await.unwrap().status(),
             StatusCode::OK
         );
-        server.await.expect("matching-CA OIDC TLS server exits");
+        wait_for_test_https_server(&mut server, "matching-CA").await;
 
-        let (url, server) = serve_test_https(
+        let (url, mut server) = serve_test_https(
             material.certificate_der.clone(),
             material.private_key_der.clone(),
             "localhost",
@@ -3488,9 +3515,9 @@ mod tests {
             .send()
             .await
             .is_err());
-        server.await.expect("default-root OIDC TLS server exits");
+        wait_for_test_https_server(&mut server, "default-root").await;
 
-        let (url, server) = serve_test_https(
+        let (url, mut server) = serve_test_https(
             material.certificate_der.clone(),
             material.private_key_der.clone(),
             "localhost",
@@ -3502,18 +3529,16 @@ mod tests {
             .send()
             .await
             .is_err());
-        server.await.expect("wrong-CA OIDC TLS server exits");
+        wait_for_test_https_server(&mut server, "wrong-CA").await;
 
-        let (url, server) = serve_test_https(
+        let (url, mut server) = serve_test_https(
             material.certificate_der.clone(),
             material.private_key_der.clone(),
             "127.0.0.1",
         )
         .await;
         assert!(trusted_client.get(&url).send().await.is_err());
-        server
-            .await
-            .expect("hostname-mismatch OIDC TLS server exits");
+        wait_for_test_https_server(&mut server, "hostname-mismatch").await;
 
         std::fs::remove_dir_all(material.root).expect("test TLS directory removed");
         std::fs::remove_dir_all(
