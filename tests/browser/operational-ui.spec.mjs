@@ -4898,9 +4898,13 @@ test("lifecycle continue menu opens saved run at lifecycle.run_id", async ({
     true,
   );
   await failedCard.locator("[data-host-actions-trigger]").click();
-  await expect(failedCard.locator("[data-host-actions-menu]:not([hidden])")).toBeVisible();
+  const failedMenu = failedCard.locator("[data-host-actions-menu]");
+  await expect(failedMenu).toBeVisible();
+  await page.evaluate(() => document.dispatchEvent(new Event("scroll")));
+  await expect(failedMenu).toBeVisible();
   await expect(failedContinue).toBeHidden();
   await page.keyboard.press("Escape");
+  await expect(failedMenu).toBeHidden();
 
   const visiblePayload = await page.request.get("/hosts.json").then((r) => r.json());
   const visibleEntry = visiblePayload.hosts.find((entry) => entry.name === failedHost);

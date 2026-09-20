@@ -206,6 +206,7 @@ function initHostDrawer(){
   });
 }
 let openHostActionsRoot=null;
+let openHostActionsScrollPosition=null;
 let hostActionContext=null;
 let hostActionReturnFocus=null;
 let fleetHostsByName=new Map();
@@ -235,7 +236,7 @@ function closeHostActions(root=openHostActionsRoot,restore=false){
   const menu=root.querySelector('[data-host-actions-menu]');
   if(menu){menu.hidden=true;menu.style.removeProperty('left');menu.style.removeProperty('top')}
   if(trigger)trigger.setAttribute('aria-expanded','false');
-  if(openHostActionsRoot===root)openHostActionsRoot=null;
+  if(openHostActionsRoot===root){openHostActionsRoot=null;openHostActionsScrollPosition=null}
   if(restore)trigger?.focus();
   flushFleetSortAfterInteraction();
 }
@@ -265,8 +266,15 @@ function openHostActions(root){
   menu.hidden=false;
   trigger.setAttribute('aria-expanded','true');
   openHostActionsRoot=root;
+  openHostActionsScrollPosition={x:window.scrollX,y:window.scrollY};
   positionHostActions(root);
   visibleHostActionItems(menu)[0]?.focus({preventScroll:true});
+}
+function closeHostActionsOnScroll(event){
+  if(!openHostActionsRoot)return;
+  const viewportScroll=event.target===document||event.target===window;
+  if(viewportScroll&&openHostActionsScrollPosition&&window.scrollX===openHostActionsScrollPosition.x&&window.scrollY===openHostActionsScrollPosition.y)return;
+  closeHostActions(openHostActionsRoot);
 }
 function setHostActionFact(name,value,visible=true){
   const overlay=document.querySelector('[data-host-action-overlay]');
@@ -971,7 +979,7 @@ function initHostActions(){
   });
   window.addEventListener('pagehide',stopHostActionPoll);
   window.addEventListener('resize',()=>closeHostActions(openHostActionsRoot));
-  window.addEventListener('scroll',()=>closeHostActions(openHostActionsRoot),true);
+  window.addEventListener('scroll',closeHostActionsOnScroll,true);
 }
 function openRequestedWorkflow(){
   const params=new URLSearchParams(location.search);
