@@ -7,14 +7,20 @@
   binaryName,
   cargoPackage ? binaryName,
 }:
-
+let
+  # cleanSource and cleanSourceWith retain the original tree. Plain src
+  # overrides remain authoritative for both metadata and build contents.
+  metadataSource = src.origSrc or src;
+in
 rustPlatform.buildRustPackage {
   pname = binaryName;
-  version = (builtins.fromJSON (builtins.readFile (src + "/RELEASE.json"))).version;
+  # Evaluation must read the original tree, not a filtered store path that
+  # `nix flake check --no-build` may only compute without materialising.
+  version = (builtins.fromJSON (builtins.readFile (metadataSource + "/RELEASE.json"))).version;
 
   inherit src;
 
-  cargoLock.lockFile = src + "/Cargo.lock";
+  cargoLock.lockFile = metadataSource + "/Cargo.lock";
   cargoBuildFlags = [
     "-p"
     cargoPackage

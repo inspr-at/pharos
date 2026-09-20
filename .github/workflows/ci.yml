@@ -214,6 +214,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
       - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0 (composite)
         with:
+          # PHAROS-276: keep the cold-source regression on the reproduced evaluator.
+          install_url: https://releases.nixos.org/nix/nix-2.34.7/install
           nix_path: nixpkgs=channel:nixos-unstable
       - name: build Nix package checks
         run: nix build --print-build-logs .#checks.x86_64-linux.pharosd .#checks.x86_64-linux.pharos-beacon
+      - name: evaluate external consumers with empty stores and caches
+        run: python3 scripts/check-nix-consumer.py
+
+  nix-beacon-darwin:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0 (composite)
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.34.7/install
+      - name: build and test the native Apple Silicon beacon
+        run: nix build --print-build-logs .#checks.aarch64-darwin.pharos-beacon
