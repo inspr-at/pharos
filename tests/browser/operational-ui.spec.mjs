@@ -1773,7 +1773,7 @@ test("nixpkgs age threshold persists in Settings and controls server and refresh
     await expect(warning("age-above")).toBeHidden();
     await expect(warning("age-override")).toBeVisible();
 
-    await settingsPage.goto("/hosts/age-override");
+    await settingsPage.goto("/hosts/age-override?section=settings");
     await settingsPage.getByText("Alert preferences", { exact: true }).click();
     const override = settingsPage.getByRole("spinbutton", { name: "Host nixpkgs warning threshold (days)" });
     await expect(override).toHaveValue("7");
@@ -1870,7 +1870,7 @@ async function reportRuntimeHost(page, name, extra = {}) {
   expect(response.status()).toBe(204);
 }
 
-test("host workspace is a durable manager task rail that becomes in-flow on mobile", async ({
+test("host workspace keeps receipts and sections and stacks on mobile", async ({
   page,
 }, testInfo) => {
   const host = `host-workspace-${testInfo.project.name}`;
@@ -1973,12 +1973,14 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
     "data-can-manage-fleet",
     "true",
   );
-  await expect(page.locator("[data-host-task-rail]")).toContainText("Up to date");
+  await expect(page.locator("[data-host-task-rail]")).toHaveCount(0);
+  await expect(page.locator("[data-host-section='overview']")).toBeVisible();
+  await expect(page.locator("[data-host-section='settings']")).toBeHidden();
   await expect(page.locator("[data-host-workspace-primary]")).toHaveAttribute(
     "href",
     "#host-settings-editor",
   );
-  await expect(page.locator("[data-host-workspace-settings]")).toBeVisible();
+  await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
   await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
   await expect(page.locator("[data-host-workspace-receipts]")).toBeVisible();
   const receipt = page.locator(`[data-workflow-receipt="receipt-${host}"]`);
@@ -2018,23 +2020,16 @@ test("host workspace is a durable manager task rail that becomes in-flow on mobi
   await expect(page.locator("[data-host-workspace-services]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-activity]")).toBeVisible();
   await expect(page.locator("[data-host-workspace-technical]")).toBeVisible();
-  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "sticky");
-  const desktopGeometry = await page.locator("[data-host-workspace]").evaluate((workspace) => {
-    const rail = workspace.querySelector("[data-host-task-rail]");
-    const main = workspace.querySelector(".host-workspace-main");
-    return {
-      railWidth: rail?.getBoundingClientRect().width ?? 0,
-      mainWidth: main?.getBoundingClientRect().width ?? 0,
-    };
-  });
-  expect(desktopGeometry.railWidth).toBeGreaterThanOrEqual(300);
-  expect(desktopGeometry.railWidth).toBeLessThanOrEqual(312);
-  expect(desktopGeometry.mainWidth).toBeGreaterThan(desktopGeometry.railWidth * 2);
+  const columnTracks = () => page.locator("[data-host-section='overview'] .host-columns").evaluate((columns) => (
+    getComputedStyle(columns).gridTemplateColumns.split(" ").filter(Boolean).length
+  ));
+  expect(await columnTracks()).toBe(2);
 
   await page.reload();
   await expect(page.locator("[data-host-workspace-primary]")).toBeVisible();
+  await expect(page.locator("[data-host-section='settings']")).toBeHidden();
   await page.setViewportSize({ width: 640, height: 900 });
-  await expect(page.locator("[data-host-task-rail]")).toHaveCSS("position", "static");
+  expect(await columnTracks()).toBe(1);
 });
 
 test("legacy Agora links hand host context to the host workspace and never dead-end", async ({
@@ -2045,9 +2040,11 @@ test("legacy Agora links hand host context to the host workspace and never dead-
 
   const selected = await page.goto(`/agora?host=${encodeURIComponent(host)}`);
   expect(selected?.status()).toBe(200);
-  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}\\?section=settings$`));
   await expect(page.locator("[data-host-workspace]")).toHaveAttribute("data-host", host);
   await expect(page.locator("[data-color-root]")).toHaveAttribute("data-host", host);
+  await expect(page.locator("[data-host-section='settings']")).toBeVisible();
+  await expect(page.locator("[data-host-section='overview']")).toBeHidden();
 
   await page.goto("/agora");
   await expect(page).toHaveURL(/\/$/);
@@ -2199,10 +2196,24 @@ test("fleet host drawer keeps context and hands a local draft to guarded setting
   await expect(review).toBeEnabled();
   expect(settingsDispatches).toBe(0);
   await drawer.locator(".host-drawer-close").focus();
+  const focusOrder = await drawer.evaluate((panel) => Array.from(panel.querySelectorAll("a[href],button:not([disabled]),input:not([disabled]),select:not([disabled])"))
+    .filter((node) => !node.hidden && node.getClientRects().length > 0)
+    .map((node) => {
+      if (node.classList.contains("host-drawer-close")) return "close";
+      if (node.hasAttribute("data-host-drawer-review")) return "review";
+      if (node.hasAttribute("data-grace-reset")) return "grace-reset";
+      return node.tagName.toLowerCase();
+    }));
+  expect(focusOrder[0]).toBe("close");
+  expect(focusOrder.at(-1)).toBe("grace-reset");
+  expect(focusOrder.indexOf("review")).toBeGreaterThan(0);
+  expect(focusOrder.indexOf("review")).toBeLessThan(focusOrder.length - 1);
   await page.keyboard.press("Shift+Tab");
-  await expect(review).toBeFocused();
+  await expect(drawer.locator("[data-grace-reset]")).toBeFocused();
   await page.keyboard.press("Tab");
   await expect(drawer.locator(".host-drawer-close")).toBeFocused();
+  await review.focus();
+  await expect(review).toBeFocused();
   await page.screenshot({
     path: testInfo.outputPath("host-drawer-desktop.png"),
   });
@@ -2237,7 +2248,7 @@ test("fleet host drawer keeps context and hands a local draft to guarded setting
 
   await color.fill("#48b8a8");
   await review.click();
-  await expect(page).toHaveURL(new RegExp(`/hosts/${host}$`));
+  await expect(page).toHaveURL(new RegExp(`/hosts/${host}(?:\\?|$)`));
   const settings = page.locator("[data-color-root]");
   await expect(settings).toHaveAttribute("data-host", host);
   await expect(settings.locator("[data-color]")).toHaveValue("#48b8a8");
@@ -2659,7 +2670,7 @@ test("fleet refresh kernel chip follows server lifecycle transitions", async ({ 
     },
   });
   expect(await applyServerFleetSnapshot(page)).toBe(true);
-  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText("Up to date");
+  await expect(card.locator("[data-host-lifecycle-chip-copy]")).toContainText("No pending changes");
 
   const removal = await page.request.post(`/host-actions/${host}/remove`, {
     headers: { "x-pharos-action": "1" },
@@ -2766,14 +2777,14 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await page.locator("[data-view-button='list']").click();
   await expect(page.locator("main")).toHaveAttribute("data-view", "list");
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await page.locator("[data-view-button='grid']").click();
 
@@ -2888,7 +2899,7 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(card, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await expect(card.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
     "data-lifecycle-level",
@@ -2898,7 +2909,7 @@ test("fleet refresh keeps sequential settings surfaces aligned on card and row",
   await expectSettingsSurfaces(row, {
     state: "applied",
     title: settingsTitle,
-    chipCopy: "Up to date",
+    chipCopy: "No pending changes",
   });
   await expect(row.locator("[data-host-lifecycle-chip]")).toHaveAttribute(
     "data-lifecycle-level",
@@ -3717,7 +3728,7 @@ test("settings no-run-on-single-field keeps color and host type as drafts", asyn
     }
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3762,7 +3773,7 @@ test("settings discard-is-clean closes review without a request", async ({
     }
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3796,7 +3807,7 @@ test("settings confirm-creates-one-run and opens the workflow sheet", async ({
     }
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3970,7 +3981,7 @@ test("settings sheet live wait advances only from host evidence and stops termin
   const requestedUrls = [];
   page.on("request", (request) => requestedUrls.push(request.url()));
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#48b8a8";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -4208,7 +4219,7 @@ test("settings dispatch uncertainty stays recoverable after page reload", async 
   );
   const uncertainJobId = uncertainPayload.job.id;
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator("[data-color]").evaluate((input) => {
     input.value = "#d45d5d";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -4812,7 +4823,7 @@ test("Agora keeps guarded settings apply read-only without fleet operator access
     await route.fulfill({ status: 403, contentType: "application/json", body: '{"error":"forbidden"}' });
   });
 
-  await page.goto(`/agora?host=${encodeURIComponent(host)}`);
+  await page.goto(`/hosts/${encodeURIComponent(host)}?section=settings`);
   await page.locator(".settings-main").evaluate((main) => {
     main.dataset.canManageFleet = "false";
   });

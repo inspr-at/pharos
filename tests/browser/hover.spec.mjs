@@ -90,7 +90,6 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
   const asOf = card.locator("[data-card-asof]");
   const mark = card.locator('.beat-mark[data-history-level="down"]').first();
   const hint = page.locator("#history-hint");
-  const readout = card.locator("[data-history-readout]");
   const beforeSeen = await seen.textContent();
   const beforeAsOf = await asOf.textContent();
   const boxes = () => page.evaluate(() => {
@@ -112,31 +111,18 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
   await expect(hint).toHaveAttribute("data-history-hint-mode", "line");
   await expect(hint).toHaveText(hintText);
   await expect(hint).toHaveAttribute("title", hintText);
-  await expect(readout).toHaveText(hintText);
-  await expect(readout).toHaveAttribute("title", hintText);
+  await expect(card.locator("[data-history-readout]")).toHaveCount(0);
+  await expect(card.locator("[data-arrival-detail]")).toHaveCount(0);
+  await expect(page.locator("#history-hint-chrome")).toHaveCount(0);
+  await expect(mark).toHaveAttribute("aria-label", hintText);
+  await expect(mark).toHaveAttribute("title", hintText);
   expect(await hint.evaluate((node) => getComputedStyle(node).whiteSpace)).toBe("nowrap");
-  expect(await readout.evaluate((node) => {
-    const style = getComputedStyle(node);
-    return {
-      position: style.position,
-      whiteSpace: style.whiteSpace,
-      height: style.height,
-      overflow: style.overflow,
-      textOverflow: style.textOverflow,
-    };
-  })).toEqual({
-    position: "absolute",
-    whiteSpace: "nowrap",
-    height: "14px",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-  });
   expect(await boxes()).toEqual(before);
   expect(await row.locator(".list-seen-detail").evaluate((node) => getComputedStyle(node).display)).toBe("none");
 
   await card.locator(".name").hover();
   await expect(hint).toBeHidden();
-  await expect(readout).toHaveText("");
+  await expect(card.locator("[data-history-readout]")).toHaveCount(0);
   await expect(seen).toHaveText(beforeSeen ?? "");
   await expect(asOf).toHaveText(beforeAsOf ?? "");
   expect(await boxes()).toEqual(before);
@@ -153,7 +139,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
 
   await mark.blur();
   await expect(hint).toBeHidden();
-  await expect(readout).toHaveText("");
+  await expect(card.locator("[data-history-readout]")).toHaveCount(0);
   await expect(seen).toHaveText(beforeSeen ?? "");
   await expect(asOf).toHaveText(beforeAsOf ?? "");
   await expect(mark).not.toHaveAttribute("aria-describedby", /.+/);
@@ -169,7 +155,7 @@ test("history dot hover keeps geometry and shows a stable hint", async ({ page }
   const identity = await page.evaluate((sample) => {
     const beat = document.querySelector('[data-host="demo-host"] .beat');
     const mark = beat.querySelector('[data-identity-probe="kept"]');
-    window.setBeatHistory(beat, [sample], 60, Date.now() / 1000, 15);
+    window.setBeatHistory(beat, [sample - 90, sample], 60, Date.now() / 1000, 15);
     const kept = document.querySelector('[data-identity-probe="kept"]');
     return {
       same: kept === mark,

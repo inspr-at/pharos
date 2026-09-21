@@ -17,6 +17,7 @@ function esc(v){return String(v ?? '').replace(/[&<>"']/g,ch=>ESC[ch])}
 const DEFAULT_HEARTBEAT_GRACE_SECS=15;
 const CLOCK_SKEW_SECS=2;
 const SELECTIVE_RESTORE_OVERDUE_SECS=30*24*60*60;
+const DAILY_SUCCESS_STALE_SECS=129600;
 const HISTORY_LEVEL_RANK={down:0,stale:1,late:2,unknown:3,first:4,ok:5};
 const DAILY_POSTURE_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
 function wholeGrace(grace){
@@ -112,45 +113,29 @@ function aggregateHistory(samples,windowDef,now,interval,grace){
   const end=Number(now);
   const windowSecs=Math.max(1,Number(windowDef?.secs)||1);
   const start=end-windowSecs;
-  const span=windowSecs;
-  if(!Number.isFinite(end)||!kept.length)return {marks:[],partial:false,retainedStart:kept[0]??null,start,end,empty:'unobserved'};
-  const partial=kept[0]>start+1;
-  const buckets=Array.from({length:HISTORY_DOTS},(_,index)=>({index,events:[]}));
-  const bucketIndex=stamp=>Math.min(HISTORY_DOTS-1,Math.max(0,Math.floor(((stamp-start)/span)*HISTORY_DOTS)));
-  kept.filter(stamp=>stamp>=start&&stamp<=end+CLOCK_SKEW_SECS).forEach(stamp=>{
-    const info=historyInfo(kept,kept.indexOf(stamp),interval,grace,end);
-    buckets[bucketIndex(Math.min(Math.max(stamp,start),end))].events.push({stamp,info,kind:'sample'});
-  });
-  const paintGap=(from,to)=>{
-    const info=gapInfo(to-from,interval,grace);
-    if(!info)return;
-    const left=Math.max(from,start);
-    const right=Math.min(to,end);
-    if(!(right>left))return;
-    const first=bucketIndex(left);
-    const last=bucketIndex(Math.max(left,right-0.001));
-    for(let index=first;index<=last;index++)buckets[index].events.push({stamp:start+(span*index)/HISTORY_DOTS,info,kind:'gap'});
-  };
+  if(!Number.isFinite(end)||kept.length<2)return {marks:[],partial:false,retainedStart:kept[0]??null,start,end,empty:'unobserved'};
+  const limit=end+CLOCK_SKEW_SECS;
+  const candidates=[];
   for(let index=1;index<kept.length;index++){
-    if(kept[index]<=start||kept[index-1]>=end)continue;
-    paintGap(kept[index-1],kept[index]);
+    const stamp=kept[index];
+    if(stamp>=start&&stamp<=limit)candidates.push(index);
   }
-  if(partial){
-    const limit=bucketIndex(Math.min(kept[0],end));
-    for(let index=0;index<limit;index++){
-      buckets[index].events.push({stamp:start+(span*index)/HISTORY_DOTS,info:{level:'unknown',label:'not retained',detail:'no stored heartbeat in this slice'},kind:'unobserved'});
-    }
+  let indexes=candidates;
+  if(candidates.length>HISTORY_DOTS){
+    const buckets=Array.from({length:HISTORY_DOTS},()=>null);
+    candidates.forEach(index=>{
+      const raw=Math.floor(((Math.max(0,kept[index]-start))/windowSecs)*HISTORY_DOTS);
+      buckets[Math.min(HISTORY_DOTS-1,Math.max(0,raw))]=index;
+    });
+    indexes=buckets.filter(index=>index!=null);
   }
-  const marks=[];
-  buckets.forEach(bucket=>{
-    if(!bucket.events.length)return;
-    bucket.events.sort((a,b)=>(HISTORY_LEVEL_RANK[a.info.level]??9)-(HISTORY_LEVEL_RANK[b.info.level]??9)||a.stamp-b.stamp);
-    const worst=bucket.events[0];
-    const stamp=Math.min(Math.max(worst.stamp,start),end);
-    const key=worst.kind==='sample'?'sample:'+worst.stamp:worst.kind+':'+bucket.index;
-    marks.push({key,x:((stamp-start)/span)*100,stamp:worst.kind==='sample'?worst.stamp:null,level:worst.info.level,label:worst.info.label,detail:worst.info.detail,kind:worst.kind});
+  const marks=indexes.map(index=>{
+    const stamp=kept[index];
+    const info=historyInfo(kept,index,interval,grace,end);
+    const x=Math.max(0,Math.min(100,((stamp-start)/windowSecs)*100));
+    return {key:'sample:'+stamp,x,stamp,level:info.level,label:info.label,detail:info.detail,kind:'sample'};
   });
-  return {marks,partial,retainedStart:kept[0],start,end,empty:marks.length?'observed':'quiet'};
+  return {marks,partial:kept[0]>start+1,retainedStart:kept[0],start,end,empty:marks.length?'observed':'quiet'};
 }
 function signalInfo(beats,last,interval,now,windowDef=signalWindow,grace){
   const bounds=cadenceBounds(interval,grace);
@@ -190,12 +175,11 @@ function arrivalPresentation(last,interval,grace,now){
   if(!Number.isFinite(current)||at>current+CLOCK_SKEW_SECS)return {state:'unknown',label:'Clock skew',detail:'Last report is ahead of Pharos',x:0};
   const age=Math.max(0,current-at);
   const x=heartbeatTimelineX(age,interval,grace);
-  const scale='Arrival scale: 0–'+EXPECT_X+'% on time through '+bounds.onTimeThrough+'s, '+STALE_X+'% at '+bounds.staleAfter+'s, 100% at '+bounds.downAfter+'s. History uses a separate time axis.';
   const timing=heartbeatTiming(age,interval,grace);
-  if(timing==='on-time')return {state:'on-time',label:'On time',detail:'Late after '+dur(bounds.lateAfter-age)+'. '+scale,x,age};
-  if(timing==='late')return {state:'late',label:'Late',detail:dur(age-bounds.lateAfter)+' past grace. '+scale,x,age};
-  if(timing==='stale')return {state:'stale',label:'Stale',detail:dur(age)+' since last report. '+scale,x,age};
-  return {state:'down',label:'Down',detail:dur(age)+' since last report. '+scale,x,age};
+  if(timing==='on-time')return {state:'on-time',label:'On time',detail:'Late after '+dur(bounds.lateAfter-age)+'.',x,age};
+  if(timing==='late')return {state:'late',label:'Late',detail:dur(age-bounds.lateAfter)+' past grace.',x,age};
+  if(timing==='stale')return {state:'stale',label:'Stale',detail:dur(age)+' since last report.',x,age};
+  return {state:'down',label:'Down',detail:dur(age)+' since last report.',x,age};
 }
 function backupLevelKey(value){return String(value||'').trim().toLowerCase().replace(/_/g,'-')}
 function selectiveRestoreFileCount(restore){
@@ -217,32 +201,64 @@ function dailyLabel(schedule){
   if(/^(daily|day|nightly)$/i.test(text)||/24h|every day/i.test(text))return 'Daily OK';
   return 'Successful';
 }
+function backupAgeText(at,now){
+  const stamp=Number(at);
+  const current=Number(now);
+  if(!Number.isFinite(stamp)||!Number.isFinite(current))return 'time unknown';
+  if(stamp>current+CLOCK_SKEW_SECS)return 'time is in the future';
+  const seconds=Math.max(0,Math.floor(current-stamp));
+  if(seconds>=86400)return Math.floor(seconds/86400)+'d ago';
+  if(seconds<60)return seconds+'s ago';
+  if(seconds<3600)return Math.floor(seconds/60)+'m '+String(seconds%60).padStart(2,'0')+'s ago';
+  return Math.floor(seconds/3600)+'h '+String(Math.floor((seconds%3600)/60)).padStart(2,'0')+'m ago';
+}
+function agoNote(at,now,prefix){
+  const stamp=Number(at);
+  if(!Number.isFinite(stamp)||stamp<=0)return prefix+' not recorded';
+  return prefix+' '+backupAgeText(stamp,now);
+}
 function projectDailyBackup(observations,now){
   const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
-  if(!jobs.length)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No backup evidence',at:null};
-  if(jobs.every(job=>backupLevelKey(job.configured)==='disabled'))return {tone:'neutral',state:'not-required',label:'Not required',detail:'Backup is not configured',at:null};
-  const active=jobs.filter(job=>backupLevelKey(job.configured)!=='disabled');
-  const primary=active.slice().sort((a,b)=>(DAILY_POSTURE_RANK[backupLevelKey(a.state)]??4)-(DAILY_POSTURE_RANK[backupLevelKey(b.state)]??4))[0];
-  const state=backupLevelKey(primary.state);
+  if(!jobs.length)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No backup signal yet',at:null};
+  const primary=jobs.slice().sort((a,b)=>(DAILY_POSTURE_RANK[backupLevelKey(a.state)]??4)-(DAILY_POSTURE_RANK[backupLevelKey(b.state)]??4))[0];
+  let state=backupLevelKey(primary.state);
   const at=Number(primary.last_success_at);
   const hasSuccess=Number.isFinite(at)&&at>0;
-  if(state==='healthy'&&hasSuccess){
-    const label=dailyLabel(primary.schedule);
-    const prefix=label==='Daily OK'?'Last success ':(String(primary.schedule||'').trim()?String(primary.schedule).trim()+' · ':'Last success ');
-    return {tone:'good',state:'healthy',label,detail:prefix+dur(Math.max(0,Number(now)-at))+' ago',at};
+  const current=Number(now);
+  if((state==='healthy'||state==='warning')&&hasSuccess&&(at>current+CLOCK_SKEW_SECS||current-at>DAILY_SUCCESS_STALE_SECS))state='stale';
+  if(backupLevelKey(primary.configured)==='disabled'&&state!=='failed'&&state!=='missing'&&state!=='stale'&&state!=='warning'){
+    return {tone:'amber',state:'disabled',label:'Disabled',detail:'Backup is disabled and is not an exemption from backup policy',at:hasSuccess?at:null};
   }
-  if(state==='healthy')return {tone:'neutral',state:'unknown',label:'Success time unknown',detail:'No success time was reported',at:null};
-  if(state==='failed'||state==='missing')return {tone:'bad',state,label:state==='failed'?'Backup failed':'Backup missing',detail:String(primary.summary||'Backup needs attention'),at:hasSuccess?at:null};
-  if(state==='stale'||state==='warning')return {tone:'amber',state,label:state==='stale'?'Backup stale':'Review backup',detail:String(primary.summary||'Backup needs attention'),at:hasSuccess?at:null};
-  if(state==='not-configured')return {tone:'neutral',state:'not-configured',label:'Not configured',detail:String(primary.summary||'No backup configured'),at:null};
-  return {tone:'neutral',state:state||'unknown',label:'Not observed',detail:String(primary.summary||'No backup evidence'),at:null};
+  if(state==='healthy'&&!hasSuccess)return {tone:'neutral',state:'unknown',label:'Success time unknown',detail:'No successful-run time was recorded',at:null};
+  if(state==='healthy'){
+    const schedule=String(primary.schedule||'').trim()||'schedule not declared';
+    return {tone:'good',state:'ok',label:dailyLabel(primary.schedule),detail:'last success '+backupAgeText(at,current)+' · '+schedule,at};
+  }
+  if(state==='failed')return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='missing')return {tone:'bad',state:'missing',label:'Missing',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='stale')return {tone:'amber',state:'stale',label:'Stale',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='warning')return {tone:'amber',state:'warning',label:'Review',detail:agoNote(hasSuccess?at:null,current,'last success'),at:hasSuccess?at:null};
+  if(state==='not-configured')return {tone:'neutral',state:'not-configured',label:'Not configured',detail:'No backup is configured',at:hasSuccess?at:null};
+  if(state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:String(primary.summary||'No backup is required'),at:hasSuccess?at:null};
+  return {tone:'neutral',state:state||'unknown',label:state==='unknown'?'Unknown':'Not observed',detail:state==='unknown'?'Backup evidence is unknown':String(primary.summary||'No backup evidence'),at:hasSuccess?at:null};
+}
+function primaryRepositoryId(jobs){
+  const objects=jobs.filter(job=>job&&typeof job==='object');
+  if(!objects.length)return '';
+  const primary=objects.slice().sort((a,b)=>(DAILY_POSTURE_RANK[backupLevelKey(a.state)]??4)-(DAILY_POSTURE_RANK[backupLevelKey(b.state)]??4))[0];
+  return String(primary.repository_id||'');
 }
 function projectRestoreStatus(observations,now){
-  const jobs=Array.isArray(observations)?observations:[];
-  if(jobs.length&&jobs.every(job=>backupLevelKey(job?.configured)==='disabled'))return {tone:'neutral',state:'not-required',label:'Not required',detail:'Restore is not configured',at:null,overdue:false,producer:''};
+  const jobs=(Array.isArray(observations)?observations:[]).filter(job=>job&&typeof job==='object');
+  if(projectDailyBackup(jobs,now).state==='not-required')return {tone:'neutral',state:'not-required',label:'Not required',detail:'No selective restore is required',at:null,overdue:false,producer:''};
+  const repo=primaryRepositoryId(jobs);
+  const scoped=repo?jobs.filter(job=>{
+    const other=String(job.repository_id||'');
+    return !other||other===repo;
+  }):jobs;
   let passed=null;
   let failed=null;
-  for(const job of jobs){
+  for(const job of scoped){
     const restore=job?.restore_validation;
     if(backupLevelKey(restore?.level)!=='restore-sample')continue;
     const at=Number(restore.checked_at);
@@ -254,14 +270,17 @@ function projectRestoreStatus(observations,now){
     }
     if(state==='failed'&&(!failed||at>failed.at))failed={at};
   }
-  const passedAge=passed?Math.max(0,Number(now)-passed.at):null;
-  const files=passed&&passed.files!=null?' · '+passed.files+' file'+(passed.files===1?'':'s'):'';
+  const current=Number(now);
   if(failed&&(!passed||failed.at>passed.at)){
-    return {tone:'bad',state:'failed',label:'Failed',detail:'Selective restore did not succeed.'+(passed?' Last successful selective restore '+dur(passedAge)+' ago'+files+'.':''),at:failed.at,overdue:false,producer:'failed'};
+    return {tone:'bad',state:'failed',label:'Failed',detail:agoNote(passed?passed.at:null,current,'last successful selective restore'),at:passed?passed.at:null,overdue:false,producer:'failed'};
   }
-  if(!passed)return {tone:'neutral',state:'unknown',label:'Not observed',detail:'No successful selective restore',at:null,overdue:false,producer:''};
-  if(passedAge>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:'Last successful selective restore '+dur(passedAge)+' ago'+files,at:passed.at,overdue:true,producer:'passed'};
-  return {tone:'good',state:'current',label:'Passed',detail:'Last successful selective restore '+dur(passedAge)+' ago'+files,at:passed.at,overdue:false,producer:'passed'};
+  if(!passed){
+    const sawRestore=scoped.some(job=>backupLevelKey(job?.restore_validation?.level)==='restore-sample');
+    return {tone:'neutral',state:'unknown',label:'Not observed',detail:sawRestore?'No successful selective restore is recorded':'No selective restore evidence from the backup source',at:null,overdue:false,producer:''};
+  }
+  const age=Math.max(0,current-passed.at);
+  if(age>SELECTIVE_RESTORE_OVERDUE_SECS)return {tone:'amber',state:'overdue',label:'Overdue',detail:agoNote(passed.at,current,'last successful selective restore'),at:passed.at,overdue:true,producer:'passed'};
+  return {tone:'good',state:'passed',label:'Passed',detail:agoNote(passed.at,current,'selective restore'),at:passed.at,overdue:false,producer:'passed'};
 }
 function projectBackupCheck(observations,now){
   const jobs=Array.isArray(observations)?observations:[];
@@ -289,36 +308,38 @@ function projectHealth(facts){
   const backup=facts?.backup;
   const restore=facts?.restore;
   const check=facts?.check;
-  if(facts?.liveness==='down'&&facts?.expectedOffline)add('good','Offline as expected',facts.lastSeen);
+  if(facts?.liveness==='down'&&facts?.expectedOffline)add('good','Offline as expected',null);
   else if(facts?.liveness==='down')add('bad','Not reporting',facts.lastSeen);
-  if(backup?.tone==='bad')add('bad',backup.label,backup.at);
-  if(restore?.state==='failed')add('bad','Selective restore failed',restore.at);
-  if(check?.state==='failed')add('bad','Repository check failed',check.at);
-  if(facts?.liveness==='stale')add('amber','Heartbeat stale',facts.lastSeen);
-  if(backup?.tone==='amber')add('amber',backup.label,backup.at);
-  if(restore?.overdue)add('amber','Selective restore overdue',restore.at);
-  if(check?.state==='stale')add('amber','Repository check stale',check.at);
+  else if(facts?.liveness==='stale')add('amber','Stale heartbeat',facts.lastSeen);
+  else if(facts?.liveness==='awaiting_first_heartbeat')add('neutral','Awaiting first heartbeat','');
+  if(backup&&backup.tone!=='good'&&backup.state!=='not-required')add(backup.tone||'neutral','Backup '+backup.label,backup.at);
+  if(check&&check.tone!=='good')add(check.tone||'neutral',check.label,check.at);
+  if(restore&&restore.tone!=='good'&&restore.state!=='not-required')add(restore.tone||'neutral','Restore '+restore.label,restore.at);
+  let warnings=0;
+  let staleServices=0;
+  let unknownServices=0;
   (Array.isArray(facts?.services)?facts.services:[]).forEach(service=>{
     const id=String(service?.id||'');
     if(id==='nix-freshness'||id==='appliance-convergence')return;
     const state=backupLevelKey(service?.state);
-    const name=String(service?.label||'Service');
-    if(state==='warning'||state==='stale')add('amber',name+' '+state,'');
-    if(state==='unknown')add('neutral',name+' unknown','');
+    if(state==='warning')warnings+=1;
+    else if(state==='stale')staleServices+=1;
+    else if(state==='unknown')unknownServices+=1;
   });
-  if(facts?.kernelRestart)add('amber','Kernel restart required','');
+  if(warnings)add('amber',warnings+' service warning'+(warnings===1?'':'s'),'');
+  if(staleServices)add('amber',staleServices+' service stale'+(staleServices===1?'':'s'),'');
+  if(unknownServices)add('neutral','Service state unknown','');
+  if(facts?.kernelRestart)add('amber','Restart needed','');
   if(facts?.freshness?.level==='warn')add('amber',facts.freshness.label,'');
-  if(facts?.liveness==='awaiting_first_heartbeat')add('neutral','Awaiting first heartbeat','');
-  if(!backup||(backup.tone==='neutral'&&backup.state!=='not-required'))add('neutral',backup?.label||'Backup not observed',backup?.at);
-  if(!restore||(restore.tone==='neutral'&&restore.state!=='not-required'))add('neutral',restore?.label||'Restore not observed',restore?.at);
   if(facts?.freshness?.level==='wait')add('neutral',facts.freshness.label,'');
-  if(backup?.tone==='good')add('good',backup.label,backup.at);
-  if(restore?.tone==='good')add('good',restore.label,restore.at);
   const rank={bad:0,amber:1,neutral:2,good:3};
   let tone='good';
   reasons.forEach(reason=>{if((rank[reason.tone]??2)<rank[tone])tone=reason.tone});
-  const labels={good:'Healthy',amber:'Needs attention',bad:'Not healthy',neutral:'Unknown'};
-  return {tone,count:reasons.length,label:labels[tone]||'Unknown',reasons};
+  const problems=reasons.filter(reason=>reason.tone!=='good');
+  const summary=problems.find(reason=>reason.tone==='bad')?.label||problems.find(reason=>reason.tone==='amber')?.label||problems.find(reason=>reason.tone==='neutral')?.label||'No action needed';
+  const down=reasons.some(reason=>reason.label==='Not reporting');
+  const labels={bad:down?'Not reporting':'Problem',amber:'Needs attention',neutral:'Unknown',good:'Healthy'};
+  return {tone,count:problems.length,label:labels[tone]||'Unknown',summary,reasons:problems};
 }
 function projectProtection(observations,now){
   return {daily:projectDailyBackup(observations,now),restore:projectRestoreStatus(observations,now),check:projectBackupCheck(observations,now)};
@@ -421,7 +442,7 @@ function updateOpenHostDrawer(host,now){
   const state=hostDrawerField('[data-host-drawer-state]');
   if(state)state.dataset.level=String(lifecycle.level||host.liveness||'');
   setHostDrawerText('[data-host-drawer-attention]',String(host.attention?.label||'all clear'));
-  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle.detail||'No host lifecycle work is waiting.'));
+  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle.detail||'No pending work is waiting.'));
   setHostDrawerText('[data-host-drawer-owner]',hostDrawerOwner(lifecycle,''));
   setHostDrawerText('[data-host-drawer-next]',hostDrawerNext(lifecycle,''));
   setHostDrawerText('[data-host-drawer-settings-state]',String(host.preferences_state||'applied').replaceAll('_',' '));
@@ -454,7 +475,7 @@ function populateHostDrawer(surface){
   const state=hostDrawerField('[data-host-drawer-state]');
   if(state)state.dataset.level=String(lifecycle?.level||surface.dataset.live||'');
   setHostDrawerText('[data-host-drawer-attention]',attention);
-  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle?.detail||surface.dataset.drawerLifecycleDetail||'No host lifecycle work is waiting.'));
+  setHostDrawerText('[data-host-drawer-guidance]',String(lifecycle?.detail||surface.dataset.drawerLifecycleDetail||'No pending work is waiting.'));
   setHostDrawerText('[data-host-drawer-owner]',hostDrawerOwner(lifecycle,surface.dataset.drawerLifecycleOwner));
   setHostDrawerText('[data-host-drawer-next]',hostDrawerNext(lifecycle,surface.dataset.drawerNextAction));
   setHostDrawerText('[data-host-drawer-settings-state]',String(surface.dataset.drawerSettingsState||'applied').replaceAll('_',' '));
@@ -1519,7 +1540,7 @@ function downAlertsSuppressed(preferences){
   return preferences?.kind==='workstation'||Boolean(preferences?.alerts?.suppress_down);
 }
 function expectedOfflineHost(host){
-  if(downAlertsSuppressed(host?.preferences))return true;
+  if(host?.preferences?.kind==='workstation')return true;
   const services=Array.isArray(host?.service_observations)?host.service_observations:[];
   return services.some(service=>service?.id==='appliance-convergence'&&service.summary==='powered off as expected');
 }
@@ -1540,12 +1561,12 @@ function projectHostAssurance(host,now){
   return {protection,health};
 }
 function attentionFor(live,f,preferences,now,threshold=30){
-  if(live==='down'&&!downAlertsSuppressed(preferences))return {label:'silent heartbeat',level:'down',rank:0};
+  if(live==='down'&&preferences?.kind!=='workstation')return {label:'silent heartbeat',level:'down',rank:0};
   if(live==='stale')return {label:'stale heartbeat',level:'warn',rank:1};
   if(live==='awaiting_first_heartbeat')return {label:'awaiting first beat',level:'wait',rank:2};
   const freshness=preferences?.alerts?.suppress_nix_freshness?null:freshnessAttention(f,now,threshold);
   if(freshness)return freshness;
-  if(live==='down')return {label:preferences?.kind==='workstation'?'offline as expected':'down alerts muted',level:'ok',rank:4};
+  if(live==='down')return {label:'offline as expected',level:'ok',rank:4};
   return {label:'all clear',level:'ok',rank:4};
 }
 const BACKUP_RANK={failed:0,missing:1,stale:2,warning:3,unknown:4,'not-configured':5,healthy:6};
@@ -1577,6 +1598,112 @@ function setFactText(root,selector,value){
   const node=root?.querySelector(selector);
   if(node)node.textContent=value==null?'':String(value);
 }
+function utcObservedStamp(at){
+  const stamp=Number(at);
+  if(!Number.isFinite(stamp)||stamp<0)return null;
+  const iso=new Date(stamp*1000).toISOString().replace(/\.\d{3}Z$/,'Z');
+  return {iso,visible:iso.slice(0,10)+' '+iso.slice(11,19)+' UTC'};
+}
+function upsertObservedTime(parent,at,hook){
+  if(!parent||typeof parent.querySelector!=='function'||typeof document.createElement!=='function')return;
+  const selector='[data-'+hook+'-date]';
+  let time=parent.querySelector(selector);
+  const stamp=utcObservedStamp(at);
+  if(!stamp){
+    if(time&&typeof time.remove==='function')time.remove();
+    return;
+  }
+  if(!time){
+    time=document.createElement('time');
+    time.setAttribute('data-'+hook+'-date','');
+    parent.appendChild(time);
+  }
+  time.setAttribute('datetime',stamp.iso);
+  if(time.textContent!==stamp.visible)time.textContent=stamp.visible;
+}
+function placeHealthScan(line,icon,summary,count){
+  if(!line)return;
+  if(icon&&icon.parentElement!==line&&typeof line.prepend==='function')line.prepend(icon);
+  if(summary&&summary.parentElement!==line)line.appendChild(summary);
+  if(count&&count.parentElement!==line)line.appendChild(count);
+}
+function ensureHealthScan(surface,health){
+  const block=surface.querySelector('[data-health-block]');
+  if(!block||typeof document.createElement!=='function')return;
+  const problems=(health.reasons||[]).filter(reason=>reason&&reason.tone&&reason.tone!=='good');
+  const summaryText=health.summary||problems[0]?.label||'No action needed';
+  const countLabel=problems.length===1?'1 reason':problems.length+' reasons';
+  surface.dataset.healthCount=String(health.count!=null?health.count:problems.length);
+  block.dataset.healthTone=health.tone||'';
+  const icon=block.querySelector('.attention-icon');
+  let summary=block.querySelector('[data-health-summary]');
+  if(!summary){
+    summary=document.createElement('span');
+    summary.setAttribute('data-health-summary','');
+  }
+  summary.textContent=summaryText;
+  let count=block.querySelector('[data-health-count]');
+  if(!count){
+    count=document.createElement('span');
+    count.setAttribute('data-health-count','');
+  }
+  count.textContent=problems.length?countLabel:'0';
+  count.hidden=problems.length===0;
+  let list=block.querySelector('[data-health-reasons]');
+  if(!list){
+    list=document.createElement('ul');
+    list.className='health-reasons';
+    list.setAttribute('data-health-reasons','');
+  }
+  if(typeof list.replaceChildren==='function')list.replaceChildren();
+  else list.textContent='';
+  problems.forEach(reason=>{
+    const item=document.createElement('li');
+    item.setAttribute('data-health-reason','');
+    item.dataset.healthTone=reason.tone;
+    if(reason.at!==''&&reason.at!=null)item.dataset.healthAt=String(reason.at);
+    item.textContent=reason.label;
+    upsertObservedTime(item,reason.at,'health');
+    list.appendChild(item);
+  });
+  list.hidden=problems.length===0;
+  block.querySelectorAll('details.health-more').forEach(node=>{
+    if(!node.hasAttribute('data-health-disclosure')&&typeof node.remove==='function')node.remove();
+  });
+  if(!problems.length){
+    const details=block.querySelector('[data-health-disclosure]');
+    let line=Array.from(block.querySelectorAll('.attention-line')).find(node=>node.tagName!=='SUMMARY')||null;
+    if(!line){
+      line=document.createElement('div');
+      line.className='attention-line';
+      if(details&&typeof details.replaceWith==='function')details.replaceWith(line);
+      else block.appendChild(line);
+    }
+    if(details&&details.isConnected&&typeof details.remove==='function')details.remove();
+    placeHealthScan(line,icon,summary,count);
+    if(list.parentElement!==block)block.appendChild(list);
+    return;
+  }
+  let details=block.querySelector('[data-health-disclosure]');
+  if(!details){
+    details=document.createElement('details');
+    details.className='health-disclosure';
+    details.setAttribute('data-health-disclosure','');
+    const existing=block.querySelector('.attention-line');
+    if(existing&&typeof existing.replaceWith==='function')existing.replaceWith(details);
+    else block.appendChild(details);
+  }
+  let sum=details.querySelector('summary');
+  if(!sum){
+    sum=document.createElement('summary');
+    sum.className='attention-line';
+    if(typeof details.prepend==='function')details.prepend(sum);
+    else details.appendChild(sum);
+  }
+  if(!sum.classList.contains('attention-line'))sum.classList.add('attention-line');
+  placeHealthScan(sum,icon,summary,count);
+  if(list.parentElement!==details)details.appendChild(list);
+}
 function updateBackupStatus(surface,protection){
   if(!surface||!protection)return;
   const daily=protection.daily;
@@ -1598,7 +1725,11 @@ function updateBackupStatus(surface,protection){
     if(typeof dailyNode.setAttribute==='function')dailyNode.setAttribute('href',appUrl('/backups?host='+encodeURIComponent(host)));
     setFactText(dailyNode,'[data-daily-backup-label]',daily.label);
     setFactText(dailyNode,'[data-daily-backup-note]',daily.detail);
+    dailyNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
+    upsertObservedTime(dailyNode,daily.at,'daily-backup');
   }
+  const more=surface.querySelector('[data-protection-more]');
+  if(more)more.hidden=!check;
   const checkNode=surface.querySelector('[data-backup-check]');
   if(checkNode){
     checkNode.hidden=!check;
@@ -1609,6 +1740,8 @@ function updateBackupStatus(surface,protection){
       else delete checkNode.dataset.backupCheckAt;
       setFactText(checkNode,'[data-backup-check-label]',check.label);
       setFactText(checkNode,'[data-backup-check-note]',check.detail);
+      checkNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
+      upsertObservedTime(checkNode,check.at,'backup-check');
     }
   }
   const restoreNode=surface.querySelector('[data-restore]');
@@ -1622,28 +1755,17 @@ function updateBackupStatus(surface,protection){
     else delete restoreNode.dataset.restoreAt;
     setFactText(restoreNode,'[data-restore-label]',restore.label);
     setFactText(restoreNode,'[data-restore-note]',restore.detail);
+    restoreNode.querySelectorAll('.fact-exact').forEach(node=>node.remove());
+    upsertObservedTime(restoreNode,restore.at,'restore');
   }
 }
 function updateHealthProjection(surface,health){
   if(!surface||!health)return;
   surface.dataset.health=health.tone;
-  surface.dataset.healthCount=String(health.reasons.length);
   const badge=surface.querySelector('[data-health-badge]');
   if(badge)badge.dataset.healthTone=health.tone;
   setFactText(surface,'[data-health-label]',health.label);
-  const summary=health.reasons.map(reason=>reason.label).filter(Boolean).join(' · ')||health.label;
-  setFactText(surface,'[data-health-summary]',summary);
-  const list=surface.querySelector('[data-health-reasons]');
-  if(!list||typeof document.createElement!=='function')return;
-  list.replaceChildren();
-  health.reasons.forEach(reason=>{
-    const item=document.createElement('li');
-    item.dataset.healthReason='true';
-    item.dataset.healthTone=reason.tone;
-    if(reason.at!==''&&reason.at!=null)item.dataset.healthAt=String(reason.at);
-    item.textContent=reason.label;
-    list.appendChild(item);
-  });
+  ensureHealthScan(surface,health);
 }
 function updateBackup(surface,info){
   const el=surface.querySelector('.backup-chip[data-backup-state]');
@@ -1874,8 +1996,8 @@ function openHostLifecycleSheet(chip,root,lifecycle,host){
       setHostActionFact('scope',resolver.title,true);
     }
   }else{
-    if(title)title.textContent=String(lifecycle.label||'Up to date');
-    if(copy)copy.textContent=String(lifecycle.detail||'No host lifecycle work is waiting.');
+    if(title)title.textContent=String(lifecycle.label||'No pending changes');
+    if(copy)copy.textContent=String(lifecycle.detail||'No pending work is waiting.');
     if(infoTitle)infoTitle.textContent='No drift';
     if(infoCopy)infoCopy.textContent='Pharos has no saved workflow or drift waiting on this host.';
     setHostActionFact('scope','No lifecycle work',true);
@@ -2008,13 +2130,7 @@ function historyHintText(mark){
   const detail=mark?.dataset?.historyDetail||'';
   return detail?label+' · '+detail:label;
 }
-function installHistoryChrome(){
-  if(document.getElementById('history-hint-chrome')||typeof document.createElement!=='function')return;
-  const style=document.createElement('style');
-  style.id='history-hint-chrome';
-  style.textContent='.beat[data-history-axis="time"] .beat-threshold,.beat[data-history-axis="time"] .beat-fill,.beat[data-history-axis="time"] .beat-current{display:none}.beat-stage{position:relative}.history-readout{position:absolute;left:0;right:0;top:0;height:14px;line-height:14px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;pointer-events:none;font-size:10px}.history-hint{position:fixed;z-index:80;max-width:min(320px,calc(100vw - 16px));pointer-events:none;padding:6px 8px;border-radius:6px;background:#17304a;color:#fff;font-size:11px;line-height:1.35}.history-hint[data-history-hint-mode="line"]{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.history-hint[data-history-hint-mode="full"]{white-space:normal}.arrival{display:flex;align-items:baseline;gap:8px;min-height:18px;min-width:0;overflow:hidden;font-size:11px}.arrival-track{position:relative;flex:0 0 72px;height:4px;border-radius:999px;background:rgba(137,151,163,.25)}.arrival [data-arrival-fill]{position:absolute;left:0;top:0;bottom:0;width:var(--arrival-x,0%);background:var(--fill-color,var(--sea))}';
-  (document.head||document.documentElement).appendChild(style);
-}
+function installHistoryChrome(){}
 function ensureHistoryOverlay(){
   let overlay=document.getElementById('history-hint');
   if(overlay)return overlay;
@@ -2028,13 +2144,7 @@ function ensureHistoryOverlay(){
   return overlay;
 }
 function ensureHistoryReadout(beat){
-  let readout=beat.querySelector('[data-history-readout]');
-  if(readout)return readout;
-  readout=document.createElement('div');
-  readout.className='history-readout';
-  readout.dataset.historyReadout='true';
-  (beat.querySelector('.beat-stage')||beat).appendChild(readout);
-  return readout;
+  return beat?.querySelector?.('[data-history-readout]')||null;
 }
 function positionHistoryOverlay(mark,overlay){
   const rect=mark.getBoundingClientRect();
@@ -2051,13 +2161,6 @@ function showHistoryHint(mark,mode){
   activeHistoryMark=mark;
   const full=mode==='full';
   const text=historyHintText(mark);
-  const beat=mark.closest('.beat');
-  const readout=beat?ensureHistoryReadout(beat):null;
-  if(readout){
-    if(!readout.dataset.default)readout.dataset.default=readout.textContent||'';
-    readout.textContent=text;
-    readout.title=text;
-  }
   const overlay=ensureHistoryOverlay();
   overlay.hidden=false;
   overlay.dataset.historyHintMode=full?'full':'line';
@@ -2069,8 +2172,6 @@ function showHistoryHint(mark,mode){
 function hideHistoryHint(force){
   if(!force&&historyPin)return;
   const mark=activeHistoryMark;
-  const readout=mark?.closest('.beat')?.querySelector('[data-history-readout]');
-  if(readout)readout.textContent=readout.dataset.default||'';
   const overlay=document.getElementById('history-hint');
   if(overlay)overlay.hidden=true;
   if(mark)mark.removeAttribute('aria-describedby');
@@ -2216,17 +2317,17 @@ function updateArrival(beat,last,interval,grace,now){
     const fill=document.createElement('span');
     fill.dataset.arrivalFill='true';
     track.appendChild(fill);
-    const detail=document.createElement('span');
-    detail.dataset.arrivalDetail='true';
-    arrival.append(label,track,detail);
-    beat.appendChild(arrival);
+    arrival.append(label,track);
+    const stage=beat.querySelector('.beat-stage');
+    if(stage&&typeof beat.insertBefore==='function')beat.insertBefore(arrival,stage);
+    else beat.appendChild(arrival);
   }
-  arrival.dataset.arrivalState=presentation.state;
+  arrival.dataset.arrivalState=presentation.state==='on-time'?'on_time':presentation.state;
   const label=arrival.querySelector('[data-arrival-label]');
   const detail=arrival.querySelector('[data-arrival-detail]');
   const fill=arrival.querySelector('[data-arrival-fill]');
   if(label)label.textContent=presentation.label;
-  if(detail){detail.textContent=presentation.detail;detail.title=presentation.detail}
+  if(detail){detail.textContent='';detail.hidden=true;detail.removeAttribute('title')}
   if(fill)fill.style.setProperty('--arrival-x',presentation.x.toFixed(2)+'%');
   return presentation;
 }
@@ -2260,15 +2361,12 @@ function setBeatHistory(beat,beats,interval,now,grace){
   });
   beat.querySelectorAll('.beat-threshold,.beat-fill,.beat-current').forEach(node=>{node.hidden=true});
   const stage=beat.querySelector('.beat-stage');
-  if(stage)stage.setAttribute('aria-label',signalWindow.label+' heartbeat history by time. Current lateness is separate. Empty is not healthy.');
+  if(stage)stage.setAttribute('aria-label',signalWindow.label+' heartbeat history by time');
   const marks=beat.querySelector('.beat-marks');
   if(marks)reconcileHistoryMarks(marks,view.marks);
-  const readout=ensureHistoryReadout(beat);
-  const legend=signalWindow.label+' time axis'+(view.partial&&view.retainedStart?' · retained from '+clock(view.retainedStart):'')+' · empty is not healthy';
-  readout.dataset.default=legend;
-  readout.title=legend;
+  const readout=beat.querySelector('[data-history-readout]');
+  if(readout){readout.textContent='';readout.hidden=true;readout.removeAttribute('title')}
   if(activeHistoryMark&&beat.contains(activeHistoryMark))showHistoryHint(activeHistoryMark,historyPin?'full':'line');
-  else readout.textContent=legend;
   updateHistoryEvents(beat.closest('[data-host]'),view.marks);
   bindHistoryHints();
 }
@@ -2338,10 +2436,11 @@ function resumeBeatClock(){
   frame();
 }
 function armFleetWatchdog(){
-  if(fleetWatchdogTimer!=null)return;
+  if(fleetWatchdogTimer!=null||pageFrozen())return;
   const tick=()=>{
-    fleetWatchdogTimer=setTimeout(tick,5000);
+    fleetWatchdogTimer=null;
     if(pageFrozen()||!fleetMain())return;
+    fleetWatchdogTimer=setTimeout(tick,5000);
     if(document.body.dataset.hostActionDialogOpen==='true'){
       if(refreshTimer==null&&refreshPromise==null)scheduleRefresh();
       return;
@@ -4511,6 +4610,9 @@ function updateUrlState(){
   params.set('sort',sort);
   params.set('filter',activeLiveFilter);
   params.set('signal',signalWindow.key);
+  const search=document.querySelector('[data-search]')?.value||'';
+  if(search)params.set('q',search);
+  else params.delete('q');
   const url=location.pathname+'?'+params.toString();
   history.replaceState(null,'',url);
 }
@@ -4519,7 +4621,7 @@ function initControls(){
   const params=new URLSearchParams(location.search);
   const view=params.get('view')||'grid';
   const sort=params.get('sort')||'attention';
-  const search='';
+  const search=params.get('q')||'';
   const liveFilter=params.get('filter')||'all';
   const selectedSignalWindow=params.get('signal')||SIGNAL_WINDOWS[0].key;
   applyView(view,false);
@@ -4529,7 +4631,7 @@ function initControls(){
   applySignalWindow(selectedSignalWindow,false);
   document.querySelectorAll('[data-view-button]').forEach(btn=>btn.addEventListener('click',()=>{applyView(btn.dataset.viewButton);updateUrlState()}));
   document.querySelector('[data-sort]')?.addEventListener('change',e=>{applySort(e.target.value);updateUrlState()});
-  document.querySelector('[data-search]')?.addEventListener('input',e=>applyFilter(e.target.value));
+  document.querySelector('[data-search]')?.addEventListener('input',e=>{applyFilter(e.target.value);updateUrlState()});
   document.querySelectorAll('[data-live-filter]').forEach(btn=>btn.addEventListener('click',()=>{applyLiveFilter(btn.dataset.liveFilter);updateUrlState()}));
   document.querySelectorAll('[data-signal-window]').forEach(btn=>btn.addEventListener('click',cycleSignalWindow));
   bindFreeformDrag();
@@ -4789,6 +4891,7 @@ function suspendFleet(){
   stopBeatClock();
   abandonRefresh();
   recoveryPromise=null;
+  if(typeof fleetWatchdogTimer!=='undefined'&&fleetWatchdogTimer!=null){clearTimeout(fleetWatchdogTimer);fleetWatchdogTimer=null}
 }
 function recoverFleet(reason='foreground'){
   if(!fleetMain()||pageFrozen())return Promise.resolve(false);
@@ -4965,6 +5068,7 @@ document.addEventListener('visibilitychange',()=>{
   if(document.hidden)suspendFleet();
   else{
     if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+    armFleetWatchdog();
     recoverFleet('visible');
   }
 });
@@ -4974,6 +5078,7 @@ window.addEventListener('blur',()=>{
 window.addEventListener('focus',onFleetFocus);
 window.addEventListener('pageshow',event=>{
   if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  armFleetWatchdog();
   if(event.persisted||!fleetSnapshotFresh()||beatClockTimer==null||refreshTimer==null)recoverFleet('pageshow');
 });
 window.addEventListener('pagehide',()=>{
@@ -4986,6 +5091,7 @@ window.addEventListener('freeze',()=>{
 });
 window.addEventListener('resume',()=>{
   if(document.body?.dataset)delete document.body.dataset.fleetLifecycleFrozen;
+  armFleetWatchdog();
   recoverFleet('resume');
 });
 window.addEventListener('online',()=>{if(!pageFrozen())recoverFleet('online')});
