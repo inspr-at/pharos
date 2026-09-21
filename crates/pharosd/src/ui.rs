@@ -780,6 +780,10 @@ mod module_tests {
         assert!(drawer.contains("Closing or discarding removes the draft completely"));
         assert!(drawer.contains("Review settings"));
         assert!(drawer.contains("it does not send or apply changes"));
+        assert!(drawer.contains("data-host-grace"));
+        assert!(drawer.contains("Use fleet default"));
+        assert!(!drawer.contains("awaiting-policy"));
+        assert!(!drawer.contains("data-grace-reset disabled"));
 
         let runtime = FOOT
             .split("function initHostDrawer()")
@@ -928,6 +932,220 @@ mod module_tests {
         assert!(faults.contains("12 commits behind"), "{faults}");
         assert!(faults.contains("Backup failed"), "{faults}");
         assert!(!faults.contains("+N"), "{faults}");
+    }
+
+    fn backup_observation(
+        state: BackupPostureState,
+        schedule: Option<&str>,
+        last_success_at: Option<i64>,
+        validation: Option<pharos_core::BackupValidationObservation>,
+    ) -> BackupObservation {
+        BackupObservation {
+            id: "restic-main".to_string(),
+            label: "Restic main".to_string(),
+            engine: pharos_core::BackupEngine::Restic,
+            state,
+            configured: pharos_core::BackupConfiguredState::Enabled,
+            summary: "backup evidence".to_string(),
+            target_label: None,
+            repository_id: None,
+            schedule: schedule.map(str::to_string),
+            next_run_at: None,
+            last_attempt_at: last_success_at,
+            last_attempt_state: None,
+            last_success_at,
+            snapshot_count: None,
+            total_bytes: None,
+            latest_snapshot_bytes: None,
+            last_check_at: None,
+            last_check_state: None,
+            restore_validation: validation,
+        }
+    }
+
+    fn restore_sample(
+        state: pharos_core::BackupValidationState,
+        checked_at: Option<i64>,
+    ) -> pharos_core::BackupValidationObservation {
+        pharos_core::BackupValidationObservation {
+            level: pharos_core::BackupValidationLevel::RestoreSample,
+            state,
+            checked_at,
+            evidence_label: Some("one file".to_string()),
+            summary: None,
+        }
+    }
+
+    fn health_for(
+        protection: &FleetProtectionView,
+        freshness: &NixFreshness,
+        now: i64,
+    ) -> HostHealthView {
+        host_health_view(
+            Liveness::Live,
+            &HostPreferences::default(),
+            freshness,
+            None,
+            &[],
+            protection,
+            now,
+            30,
+        )
+    }
+
+    #[test]
+    fn selective_restore_is_overdue_only_after_thirty_days() {
+        let now = 2_000_000_000;
+        let on_time = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(restore_sample(
+                pharos_core::BackupValidationState::Passed,
+                Some(now - SELECTIVE_RESTORE_OVERDUE_AFTER_SECS),
+            )),
+        );
+        let current = fleet_protection_view(std::slice::from_ref(&on_time), now);
+        assert_eq!(current.run.tone, "good");
+        assert_eq!(current.run.label, "Daily OK");
+        assert_eq!(current.restore.state, "passed");
+        assert!(!current.restore_overdue);
+
+        let late = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(restore_sample(
+                pharos_core::BackupValidationState::Passed,
+                Some(now - SELECTIVE_RESTORE_OVERDUE_AFTER_SECS - 1),
+            )),
+        );
+        let overdue = fleet_protection_view(std::slice::from_ref(&late), now);
+        assert_eq!(overdue.run.tone, "good");
+        assert_eq!(overdue.restore.state, "overdue");
+        assert_eq!(overdue.restore.tone, "amber");
+        assert!(overdue.restore_overdue);
+        let health = health_for(&overdue, &proven_current("nixos-unstable"), now);
+        assert_eq!(health.tone, "amber");
+        assert_eq!(health.label, "Needs attention");
+        let markup = protection_markup(&overdue, "poseidon", &PublicBasePath::ROOT);
+        assert!(markup.contains(r#"data-daily-backup-tone="good""#));
+        assert!(markup.contains(r#"data-restore-overdue="true""#));
+        assert!(markup.contains(r#"data-restore-state="overdue""#));
+    }
+
+    #[test]
+    fn repository_check_and_non_sample_levels_do_not_paint_restore_green() {
+        let now = 2_000_000_000;
+        let check_only = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(pharos_core::BackupValidationObservation {
+                level: pharos_core::BackupValidationLevel::RepositoryCheck,
+                state: pharos_core::BackupValidationState::Passed,
+                checked_at: Some(now),
+                evidence_label: Some("repo check".to_string()),
+                summary: None,
+            }),
+        );
+        let checked = fleet_protection_view(std::slice::from_ref(&check_only), now);
+        assert_eq!(checked.restore.tone, "neutral");
+        assert!(!checked.restore_overdue);
+        assert!(checked.missing_restore_producer);
+        assert_ne!(checked.check.as_ref().map(|fact| fact.tone), Some("bad"));
+
+        for level in [
+            pharos_core::BackupValidationLevel::DiffHash,
+            pharos_core::BackupValidationLevel::OperatorTest,
+        ] {
+            let observation = backup_observation(
+                BackupPostureState::Healthy,
+                Some("daily"),
+                Some(now),
+                Some(pharos_core::BackupValidationObservation {
+                    level,
+                    state: pharos_core::BackupValidationState::Passed,
+                    checked_at: Some(now),
+                    evidence_label: None,
+                    summary: None,
+                }),
+            );
+            let view = fleet_protection_view(std::slice::from_ref(&observation), now);
+            assert_ne!(view.restore.tone, "good");
+            assert!(view.missing_restore_producer);
+        }
+
+        let stale_without_pass = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(restore_sample(
+                pharos_core::BackupValidationState::Stale,
+                Some(now),
+            )),
+        );
+        let stale = fleet_protection_view(std::slice::from_ref(&stale_without_pass), now);
+        assert_eq!(stale.restore.tone, "neutral");
+        assert!(!stale.restore_overdue);
+
+        let empty = fleet_protection_view(&[], now);
+        assert_ne!(empty.run.tone, "good");
+        assert_ne!(empty.restore.tone, "good");
+    }
+
+    #[test]
+    fn fresh_nixpkgs_mismatch_does_not_make_health_amber() {
+        let now = 1_700_000_000;
+        let mut freshness = proven_current("nixos-unstable");
+        freshness.nixpkgs_comparison = Some(NixpkgsGitComparison {
+            upstream_revision: "9".repeat(40),
+            relation: NixpkgsRevisionRelation::Different,
+        });
+        if let Some(evidence) = freshness.deployment_evidence.as_mut() {
+            evidence.nixpkgs_last_modified = now;
+        }
+        let observation = backup_observation(
+            BackupPostureState::Healthy,
+            Some("daily"),
+            Some(now),
+            Some(restore_sample(
+                pharos_core::BackupValidationState::Passed,
+                Some(now),
+            )),
+        );
+        let protection = fleet_protection_view(std::slice::from_ref(&observation), now);
+        let health = health_for(&protection, &freshness, now);
+        assert!(freshness_attention_reason(&freshness, now, 30).is_none());
+        assert_eq!(health.tone, "good");
+        assert_eq!(health.label, "Healthy");
+    }
+
+    #[test]
+    fn extra_head_inserts_before_close_without_the_old_style_anchor() {
+        assert!(HEAD.contains("<!--pharos-extra-head-->"));
+        assert!(!HEAD.contains("</style></head>"));
+        let html = head_with_extra(&PublicBasePath::ROOT, "<style id=\"agora-css\"></style>");
+        let extra_at = html
+            .find("<style id=\"agora-css\"></style>")
+            .expect("inserted extra");
+        let head_at = html.rfind("</head>").expect("head close");
+        assert!(extra_at < head_at);
+        assert_eq!(html.matches("<style id=\"agora-css\"></style>").count(), 1);
+        assert!(!html.contains("<!--pharos-extra-head-->"));
+    }
+
+    #[test]
+    fn fleet_grace_control_uses_the_saved_value() {
+        let markup = heartbeat_grace_settings_markup(40, true);
+        assert!(markup.contains(r#"name="heartbeat_grace_secs""#));
+        assert!(markup.contains(r#"value="40""#));
+        assert!(markup.contains(r#"data-grace-saved="40""#));
+        assert!(!markup.contains("awaiting-policy"));
+        assert!(!markup.contains("disabled"));
+        let viewer = heartbeat_grace_settings_markup(15, false);
+        assert!(viewer.contains("disabled"));
+        assert!(viewer.contains(r#"value="15""#));
     }
 }
 
@@ -1153,7 +1371,7 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
     no_store_html(
         &state,
         crate::flow_host::inject_flow_shell(
-            render_home_with_capabilities(
+            render_home_with_grace(
                 RuntimeSnapshot {
                     nixpkgs_warn_after_days: state.fleet_settings.get().nixpkgs_warn_after_days,
                     hosts: &hosts,
@@ -1177,6 +1395,7 @@ pub(super) async fn home(State(state): State<AppState>, headers: HeaderMap) -> i
                         && (state.beacon_auth.report_token_mode == BeaconTokenMode::Local
                             || state.retirement_owner.configured()),
                 },
+                Some(state.fleet_settings.get().heartbeat_grace_secs),
             ),
             crate::flow_mount_enabled(&state, &state.auth, &headers, &access, None),
             None,
@@ -2405,6 +2624,760 @@ pub(super) fn backup_ui_summary(observations: &[BackupObservation], now: i64) ->
     }
 }
 
+/// Seconds after a qualifying selective-restore success before it is overdue.
+/// Exactly this age is still current; only a strictly greater age is overdue.
+pub(super) const SELECTIVE_RESTORE_OVERDUE_AFTER_SECS: i64 = 30 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProtectionFact {
+    pub(super) state: &'static str,
+    pub(super) tone: &'static str,
+    pub(super) label: String,
+    pub(super) note: String,
+    pub(super) at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FleetProtectionView {
+    pub(super) run: ProtectionFact,
+    pub(super) check: Option<ProtectionFact>,
+    pub(super) restore: ProtectionFact,
+    pub(super) daily_ok: bool,
+    pub(super) missing_restore_producer: bool,
+    pub(super) restore_overdue: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HealthReason {
+    pub(super) label: String,
+    pub(super) tone: &'static str,
+    pub(super) at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HostHealthView {
+    pub(super) tone: &'static str,
+    pub(super) label: &'static str,
+    pub(super) summary: String,
+    pub(super) problem_count: usize,
+    pub(super) reasons: Vec<HealthReason>,
+}
+
+fn schedule_is_daily(schedule: &str) -> bool {
+    let lowered = schedule.to_ascii_lowercase();
+    let mut words = Vec::new();
+    let mut token = String::new();
+    for ch in lowered.chars() {
+        if ch.is_ascii_alphanumeric() {
+            token.push(ch);
+        } else if !token.is_empty() {
+            words.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        words.push(token);
+    }
+    words
+        .iter()
+        .any(|word| matches!(word.as_str(), "daily" | "day" | "nightly"))
+        || lowered.contains("24h")
+        || lowered.contains("every day")
+}
+
+fn is_selective_restore(level: pharos_core::BackupValidationLevel) -> bool {
+    level == pharos_core::BackupValidationLevel::RestoreSample
+}
+
+fn ago_note(at: Option<i64>, now: i64, prefix: &str) -> String {
+    match at {
+        Some(at) => format!("{prefix} {}", backup_age_text(at, now)),
+        None => format!("{prefix} not recorded"),
+    }
+}
+
+fn backup_age_text(at: i64, now: i64) -> String {
+    format!("{} ago", duration_label(now.saturating_sub(at)))
+}
+
+fn run_fact(observation: &BackupObservation, now: i64) -> ProtectionFact {
+    if observation.configured == pharos_core::BackupConfiguredState::Disabled {
+        return ProtectionFact {
+            state: "not-required",
+            tone: "neutral",
+            label: "Not required".to_string(),
+            note: "Backup is explicitly not required".to_string(),
+            at: observation.last_success_at,
+        };
+    }
+    let success_at = observation.last_success_at;
+    let success = backup_last_success_label(observation, now);
+    match observation.state {
+        BackupPostureState::Healthy if success_at.is_none() => ProtectionFact {
+            state: "unknown",
+            tone: "neutral",
+            label: "Success time unknown".to_string(),
+            note: "No successful-run time was recorded".to_string(),
+            at: None,
+        },
+        BackupPostureState::Healthy => {
+            let schedule = observation
+                .schedule
+                .as_deref()
+                .unwrap_or("schedule not declared");
+            let daily = observation
+                .schedule
+                .as_deref()
+                .is_some_and(schedule_is_daily);
+            ProtectionFact {
+                state: "ok",
+                tone: "good",
+                label: if daily {
+                    "Daily OK".to_string()
+                } else {
+                    "Successful".to_string()
+                },
+                note: format!("last success {success} · {schedule}"),
+                at: success_at,
+            }
+        }
+        BackupPostureState::Failed => ProtectionFact {
+            state: "failed",
+            tone: "bad",
+            label: "Failed".to_string(),
+            note: ago_note(success_at, now, "last success"),
+            at: success_at,
+        },
+        BackupPostureState::Missing => ProtectionFact {
+            state: "missing",
+            tone: "bad",
+            label: "Missing".to_string(),
+            note: ago_note(success_at, now, "last success"),
+            at: success_at,
+        },
+        BackupPostureState::Stale => ProtectionFact {
+            state: "stale",
+            tone: "amber",
+            label: "Stale".to_string(),
+            note: ago_note(success_at, now, "last success"),
+            at: success_at,
+        },
+        BackupPostureState::Warning => ProtectionFact {
+            state: "warning",
+            tone: "amber",
+            label: "Review".to_string(),
+            note: ago_note(success_at, now, "last success"),
+            at: success_at,
+        },
+        BackupPostureState::Unknown => ProtectionFact {
+            state: "unknown",
+            tone: "neutral",
+            label: "Unknown".to_string(),
+            note: "Backup evidence is unknown".to_string(),
+            at: success_at,
+        },
+        BackupPostureState::NotConfigured => ProtectionFact {
+            state: "not-configured",
+            tone: "neutral",
+            label: "Not configured".to_string(),
+            note: "No backup is configured".to_string(),
+            at: success_at,
+        },
+    }
+}
+
+fn check_fact(observations: &[BackupObservation], now: i64) -> Option<ProtectionFact> {
+    let validation = observations
+        .iter()
+        .filter_map(|observation| observation.restore_validation.as_ref())
+        .filter(|validation| !is_selective_restore(validation.level))
+        .max_by_key(|validation| validation.checked_at.unwrap_or(i64::MIN));
+    if let Some(validation) = validation {
+        return Some(validation_check_fact(validation, now));
+    }
+    let check = observations
+        .iter()
+        .filter(|observation| observation.last_check_state.is_some())
+        .max_by_key(|observation| observation.last_check_at.unwrap_or(i64::MIN))?;
+    let state = check.last_check_state?;
+    Some(check_state_fact(
+        state,
+        check.last_check_at,
+        "Repository check",
+        now,
+    ))
+}
+
+fn validation_check_fact(
+    validation: &pharos_core::BackupValidationObservation,
+    now: i64,
+) -> ProtectionFact {
+    let name = validation
+        .evidence_label
+        .as_deref()
+        .unwrap_or_else(|| backup_validation_level_label(validation.level));
+    check_state_fact(validation.state, validation.checked_at, name, now)
+}
+
+fn check_state_fact(
+    state: pharos_core::BackupValidationState,
+    at: Option<i64>,
+    name: &str,
+    now: i64,
+) -> ProtectionFact {
+    let (key, tone, label) = match state {
+        pharos_core::BackupValidationState::Passed => ("passed", "good", "Check passed"),
+        pharos_core::BackupValidationState::Failed => ("failed", "bad", "Check failed"),
+        pharos_core::BackupValidationState::Stale => ("stale", "amber", "Check stale"),
+        pharos_core::BackupValidationState::Unknown => ("unknown", "neutral", "Check unknown"),
+    };
+    ProtectionFact {
+        state: key,
+        tone,
+        label: label.to_string(),
+        note: match at {
+            Some(at) => format!("{name} · {}", backup_age_text(at, now)),
+            None => format!("{name} · time not recorded"),
+        },
+        at,
+    }
+}
+
+fn restore_fact(
+    observations: &[BackupObservation],
+    run_not_required: bool,
+    now: i64,
+) -> (ProtectionFact, bool, bool) {
+    if run_not_required {
+        return (
+            ProtectionFact {
+                state: "not-required",
+                tone: "neutral",
+                label: "Not required".to_string(),
+                note: "No selective restore is required".to_string(),
+                at: None,
+            },
+            false,
+            false,
+        );
+    }
+    let validations: Vec<&pharos_core::BackupValidationObservation> = observations
+        .iter()
+        .filter_map(|observation| observation.restore_validation.as_ref())
+        .filter(|validation| is_selective_restore(validation.level))
+        .collect();
+    if validations.is_empty() {
+        return (
+            ProtectionFact {
+                state: "unknown",
+                tone: "neutral",
+                label: "Not observed".to_string(),
+                note: "No selective restore evidence from the backup source".to_string(),
+                at: None,
+            },
+            true,
+            false,
+        );
+    }
+    let last_success = validations
+        .iter()
+        .copied()
+        .filter(|validation| {
+            validation.state == pharos_core::BackupValidationState::Passed
+                && validation.checked_at.is_some()
+        })
+        .max_by_key(|validation| validation.checked_at.unwrap_or(i64::MIN));
+    let latest = validations
+        .iter()
+        .copied()
+        .max_by_key(|validation| validation.checked_at.unwrap_or(i64::MIN));
+    let newer_failed = match (latest, last_success) {
+        (Some(latest), Some(success)) => {
+            latest.state == pharos_core::BackupValidationState::Failed
+                && latest.checked_at.unwrap_or(i64::MIN) > success.checked_at.unwrap_or(i64::MIN)
+        }
+        (Some(latest), None) => latest.state == pharos_core::BackupValidationState::Failed,
+        _ => false,
+    };
+    if newer_failed {
+        let at = last_success.and_then(|validation| validation.checked_at);
+        return (
+            ProtectionFact {
+                state: "failed",
+                tone: "bad",
+                label: "Failed".to_string(),
+                note: ago_note(at, now, "last successful selective restore"),
+                at,
+            },
+            false,
+            false,
+        );
+    }
+    let Some(success) = last_success else {
+        return (
+            ProtectionFact {
+                state: "unknown",
+                tone: "neutral",
+                label: "Not observed".to_string(),
+                note: "No successful selective restore is recorded".to_string(),
+                at: None,
+            },
+            false,
+            false,
+        );
+    };
+    let at = success.checked_at;
+    let age = now.saturating_sub(at.unwrap_or(now));
+    if age > SELECTIVE_RESTORE_OVERDUE_AFTER_SECS {
+        return (
+            ProtectionFact {
+                state: "overdue",
+                tone: "amber",
+                label: "Overdue".to_string(),
+                note: ago_note(at, now, "last successful selective restore"),
+                at,
+            },
+            false,
+            true,
+        );
+    }
+    let latest_is_success = latest.is_some_and(|validation| {
+        validation.state == pharos_core::BackupValidationState::Passed
+            && validation.checked_at == at
+    });
+    if latest_is_success {
+        return (
+            ProtectionFact {
+                state: "passed",
+                tone: "good",
+                label: "Passed".to_string(),
+                note: ago_note(at, now, "selective restore"),
+                at,
+            },
+            false,
+            false,
+        );
+    }
+    (
+        ProtectionFact {
+            state: "unknown",
+            tone: "neutral",
+            label: "Unknown".to_string(),
+            note: ago_note(at, now, "last successful selective restore"),
+            at,
+        },
+        false,
+        false,
+    )
+}
+
+pub(super) fn fleet_protection_view(
+    observations: &[BackupObservation],
+    now: i64,
+) -> FleetProtectionView {
+    let run = observations
+        .iter()
+        .min_by_key(|observation| backup_posture_rank(observation.state))
+        .map(|observation| run_fact(observation, now))
+        .unwrap_or(ProtectionFact {
+            state: "unknown",
+            tone: "neutral",
+            label: "Not observed".to_string(),
+            note: "No backup signal yet".to_string(),
+            at: None,
+        });
+    let not_required = run.state == "not-required";
+    let (restore, missing_restore_producer, restore_overdue) =
+        restore_fact(observations, not_required, now);
+    let daily_ok = run.tone == "good" && run.label == "Daily OK";
+    FleetProtectionView {
+        run,
+        check: check_fact(observations, now),
+        restore,
+        daily_ok,
+        missing_restore_producer,
+        restore_overdue,
+    }
+}
+
+fn push_reason(
+    reasons: &mut Vec<HealthReason>,
+    label: impl Into<String>,
+    tone: &'static str,
+    at: Option<i64>,
+) {
+    reasons.push(HealthReason {
+        label: label.into(),
+        tone,
+        at,
+    });
+}
+
+fn expected_offline(
+    preferences: &HostPreferences,
+    services: &[ServiceObservation],
+    live: Liveness,
+) -> bool {
+    live == Liveness::Down
+        && (preferences.suppresses_down_alerts()
+            || services.iter().any(|observation| {
+                appliance_probes::is_appliance_observation(observation)
+                    && observation.summary == "powered off as expected"
+            }))
+}
+
+fn worst_health_tone(reasons: &[HealthReason]) -> &'static str {
+    if reasons.iter().any(|reason| reason.tone == "bad") {
+        "bad"
+    } else if reasons.iter().any(|reason| reason.tone == "amber") {
+        "amber"
+    } else if reasons.iter().any(|reason| reason.tone == "neutral") {
+        "neutral"
+    } else {
+        "good"
+    }
+}
+
+pub(super) fn host_health_view(
+    live: Liveness,
+    preferences: &HostPreferences,
+    freshness: &NixFreshness,
+    kernel: Option<&KernelPosture>,
+    services: &[ServiceObservation],
+    protection: &FleetProtectionView,
+    now: i64,
+    nixpkgs_threshold: u32,
+) -> HostHealthView {
+    let mut reasons = Vec::new();
+    if expected_offline(preferences, services, live) {
+        push_reason(&mut reasons, "Offline as expected", "good", None);
+    } else {
+        match live {
+            Liveness::Down => push_reason(&mut reasons, "Not reporting", "bad", None),
+            Liveness::Stale => push_reason(&mut reasons, "Stale heartbeat", "amber", None),
+            Liveness::AwaitingFirstHeartbeat => {
+                push_reason(&mut reasons, "Awaiting first heartbeat", "neutral", None);
+            }
+            Liveness::Live => {}
+        }
+    }
+
+    let run_label = format!("Backup {} · {}", protection.run.label, protection.run.note);
+    match protection.run.state {
+        "not-required" => push_reason(&mut reasons, run_label, "good", protection.run.at),
+        _ => push_reason(
+            &mut reasons,
+            run_label,
+            protection.run.tone,
+            protection.run.at,
+        ),
+    }
+    if let Some(check) = &protection.check {
+        push_reason(
+            &mut reasons,
+            format!("{} · {}", check.label, check.note),
+            check.tone,
+            check.at,
+        );
+    }
+    let restore_tone = if protection.restore.state == "not-required" {
+        "good"
+    } else {
+        protection.restore.tone
+    };
+    push_reason(
+        &mut reasons,
+        format!(
+            "Restore {} · {}",
+            protection.restore.label, protection.restore.note
+        ),
+        restore_tone,
+        protection.restore.at,
+    );
+
+    let mut warnings = 0usize;
+    let mut stale = 0usize;
+    let mut unknown = 0usize;
+    for observation in services {
+        if is_nix_freshness_observation(observation)
+            || appliance_probes::is_appliance_observation(observation)
+        {
+            continue;
+        }
+        match observation.state {
+            ServiceObservationState::Warning => warnings += 1,
+            ServiceObservationState::Stale => stale += 1,
+            ServiceObservationState::Unknown => unknown += 1,
+            ServiceObservationState::Healthy => {}
+        }
+    }
+    if warnings > 0 {
+        push_reason(
+            &mut reasons,
+            format!(
+                "{warnings} service warning{}",
+                if warnings == 1 { "" } else { "s" }
+            ),
+            "amber",
+            None,
+        );
+    }
+    if stale > 0 {
+        push_reason(
+            &mut reasons,
+            format!("{stale} service stale{}", if stale == 1 { "" } else { "s" }),
+            "amber",
+            None,
+        );
+    }
+    if unknown > 0 {
+        push_reason(&mut reasons, "Service state unknown", "neutral", None);
+    }
+    if kernel_reboot_required(kernel).is_some() {
+        push_reason(&mut reasons, "Restart needed", "amber", None);
+    }
+    if let Some(freshness_reason) = freshness_attention_reason(freshness, now, nixpkgs_threshold) {
+        let tone = if freshness_reason.level == "warn" {
+            "amber"
+        } else {
+            "neutral"
+        };
+        push_reason(&mut reasons, freshness_reason.label, tone, None);
+    }
+
+    let tone = worst_health_tone(&reasons);
+    let down = reasons.iter().any(|reason| reason.label == "Not reporting");
+    let label = match tone {
+        "bad" if down => "Not reporting",
+        "bad" => "Problem",
+        "amber" => "Needs attention",
+        "neutral" => "Unknown",
+        _ => "Healthy",
+    };
+    let problems: Vec<&str> = reasons
+        .iter()
+        .filter(|reason| reason.tone != "good")
+        .map(|reason| reason.label.as_str())
+        .collect();
+    let summary = if problems.is_empty() {
+        "No action needed".to_string()
+    } else {
+        problems.join(" · ")
+    };
+    let problem_count = problems.len();
+    HostHealthView {
+        tone,
+        label,
+        summary,
+        problem_count,
+        reasons,
+    }
+}
+
+fn fact_markup(fact: &ProtectionFact, kind: &str, href: Option<&str>) -> String {
+    let at = fact
+        .at
+        .map(|at| at.to_string())
+        .unwrap_or_default();
+    let body = format!(
+        r#"<span class="fact-label">{label_kind}</span><strong class="fact-value {tone}" data-{kind}-label>{label}</strong><span class="fact-note" data-{kind}-note>{note}</span>"#,
+        label_kind = html_escape(match kind {
+            "daily-backup" => "Backup run",
+            "restore" => "Selective restore",
+            _ => "Repository check",
+        }),
+        tone = html_escape(fact.tone),
+        kind = kind,
+        label = html_escape(&fact.label),
+        note = html_escape(&fact.note),
+    );
+    let attrs = format!(
+        r#"data-{kind} data-{kind}-state="{state}" data-{kind}-tone="{tone}" data-{kind}-at="{at}""#,
+        kind = kind,
+        state = html_escape(fact.state),
+        tone = html_escape(fact.tone),
+        at = html_escape(&at),
+    );
+    match href {
+        Some(href) => format!(r#"<a class="protection-fact" {attrs} href="{href}">{body}</a>"#),
+        None => format!(r#"<div class="protection-fact" {attrs}>{body}</div>"#),
+    }
+}
+
+pub(super) fn protection_markup(
+    view: &FleetProtectionView,
+    host: &str,
+    base: &PublicBasePath,
+) -> String {
+    let href = app_href(base, &format!("/backups?host={}", url_query_escape(host)));
+    let check = match &view.check {
+        Some(check) => fact_markup(check, "backup-check", Some(&href)),
+        None => {
+            r#"<div class="protection-fact protection-check" data-backup-check data-backup-check-state="" data-backup-check-tone="" data-backup-check-at="" hidden><span class="fact-label">Repository check</span><strong class="fact-value neutral" data-backup-check-label></strong><span class="fact-note" data-backup-check-note></span></div>"#.to_string()
+        }
+    };
+    let producer = if view.restore.state == "not-required" {
+        "not-required"
+    } else if view.missing_restore_producer {
+        "missing"
+    } else {
+        "present"
+    };
+    let restore_at = view
+        .restore
+        .at
+        .map(|at| at.to_string())
+        .unwrap_or_default();
+    format!(
+        r#"<div class="protection-pair" data-protection data-selective-restore-overdue-after-secs="{overdue_after}">{run}{check}<div class="protection-fact" data-restore data-restore-state="{restore_state}" data-restore-tone="{restore_tone}" data-restore-at="{restore_at}" data-restore-producer="{producer}" data-restore-overdue="{overdue}"><span class="fact-label">Selective restore</span><strong class="fact-value {restore_tone}" data-restore-label>{restore_label}</strong><span class="fact-note" data-restore-note>{restore_note}</span></div></div>"#,
+        overdue_after = SELECTIVE_RESTORE_OVERDUE_AFTER_SECS,
+        run = fact_markup(&view.run, "daily-backup", Some(&href)),
+        check = check,
+        restore_state = html_escape(view.restore.state),
+        restore_tone = html_escape(view.restore.tone),
+        restore_at = html_escape(&restore_at),
+        producer = producer,
+        overdue = if view.restore_overdue { "true" } else { "false" },
+        restore_label = html_escape(&view.restore.label),
+        restore_note = html_escape(&view.restore.note),
+    )
+}
+
+pub(super) fn health_markup(health: &HostHealthView) -> String {
+    let reasons = health
+        .reasons
+        .iter()
+        .map(|reason| {
+            let at = reason.at.map(|at| at.to_string()).unwrap_or_default();
+            format!(
+                r#"<li data-health-reason data-health-tone="{tone}" data-health-at="{at}">{label}</li>"#,
+                tone = html_escape(reason.tone),
+                at = html_escape(&at),
+                label = html_escape(&reason.label),
+            )
+        })
+        .collect::<String>();
+    let icon = if health.problem_count == 0 {
+        icons::SHIELD_CHECK
+    } else {
+        icons::BELL
+    };
+    format!(
+        r#"<div class="harbor-health" data-health-block data-health-tone="{tone}"><div class="attention-line"><span class="attention-icon" aria-hidden="true">{icon}</span><span data-health-summary>{summary}</span></div><ul class="health-reasons" data-health-reasons>{reasons}</ul></div>"#,
+        tone = html_escape(health.tone),
+        summary = html_escape(&health.summary),
+    )
+}
+
+pub(super) fn os_badge_markup(icon: &str, health: &HostHealthView) -> String {
+    format!(
+        r#"<span class="os-badge" data-health-badge data-health-tone="{tone}" role="img" aria-label="{label}"><span class="os-badge-icon" aria-hidden="true">{icon}</span></span>"#,
+        tone = html_escape(health.tone),
+        label = html_escape(health.label),
+    )
+}
+
+pub(super) fn quick_preview_markup(name: &str, nix_icon: &str) -> String {
+    format!(
+        r#"<button class="preview-button" type="button" data-host-drawer-trigger aria-haspopup="dialog" aria-controls="host-quick-drawer" aria-expanded="false" title="Quick preview of {name}" aria-label="Quick preview of {name}"><span class="nix" hidden>{nix_icon}</span>{icon}<span>Quick preview</span></button>"#,
+        icon = icons::PANEL_RIGHT,
+    )
+}
+
+pub(super) fn revision_evidence_markup(freshness: &NixFreshness) -> String {
+    let summary = freshness.tldr();
+    let (deployed, nixcfg, nixpkgs) = match freshness.deployment_evidence.as_ref() {
+        Some(evidence) => {
+            let deployed: String = evidence.source_revision.chars().take(12).collect();
+            let nixpkgs: String = evidence.nixpkgs_revision.chars().take(12).collect();
+            let nixcfg = freshness
+                .nixcfg_comparison
+                .as_ref()
+                .map(|comparison| comparison.upstream_revision.chars().take(12).collect())
+                .unwrap_or_else(|| "unknown".to_string());
+            (deployed, nixcfg, nixpkgs)
+        }
+        None => ("n/a".to_string(), "n/a".to_string(), "n/a".to_string()),
+    };
+    format!(
+        r#"<details class="revision-evidence" data-revision-evidence><summary>Configuration evidence</summary><dl class="revision-panel"><div><dt>Summary</dt><dd data-config-summary>{summary}</dd></div><div><dt>Deployed SHA</dt><dd data-deployed-sha>{deployed}</dd></div><div><dt>nixcfg SHA</dt><dd data-nixcfg-sha>{nixcfg}</dd></div><div><dt>nixpkgs SHA</dt><dd data-nixpkgs-sha>{nixpkgs}</dd></div></dl></details>"#,
+        summary = html_escape(&summary),
+        deployed = html_escape(&deployed),
+        nixcfg = html_escape(&nixcfg),
+        nixpkgs = html_escape(&nixpkgs),
+    )
+}
+
+pub(super) fn heartbeat_grace_settings_markup(fleet_grace_secs: u64, can_manage: bool) -> String {
+    let disabled = if can_manage { "" } else { " disabled" };
+    format!(
+        r#"<div data-heartbeat-grace-settings data-grace-seconds="{seconds}" data-grace-source="fleet"><h3 class="settings-section-title" id="heartbeat-grace-title">Heartbeat grace</h3><label class="appearance-row"><span class="appearance-copy"><strong>Extra grace after expected heartbeat</strong><span id="heartbeat-grace-note">The default applies to every host without an override. Late begins after the expected interval plus this grace. Stale and down stay at two times and five times the interval.</span></span><input name="heartbeat_grace_secs" data-grace-seconds-input data-grace-saved="{seconds}" aria-label="Extra grace after expected heartbeat" aria-describedby="heartbeat-grace-note" type="number" min="0" max="3600" step="1" required value="{seconds}"{disabled}></label></div>"#,
+        seconds = fleet_grace_secs,
+        disabled = disabled,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HostGracePresentation {
+    pub(super) attrs: String,
+    pub(super) effective_secs: u64,
+    pub(super) source: String,
+    pub(super) late_after_secs: u64,
+}
+
+pub(super) fn host_grace_presentation(
+    preferences: &HostPreferences,
+    requested: Option<&HostPreferences>,
+    fleet_grace_secs: Option<u64>,
+    interval_secs: Option<u64>,
+) -> HostGracePresentation {
+    let policy = preferences.heartbeat_grace_policy(fleet_grace_secs, interval_secs);
+    let requested_override = requested.map(|prefs| prefs.alerts.heartbeat_grace_secs);
+    let pending = match requested_override {
+        Some(value) if value != policy.override_secs => match value {
+            Some(secs) => secs.to_string(),
+            None => "inherit".to_string(),
+        },
+        _ => String::new(),
+    };
+    let override_secs = policy
+        .override_secs
+        .map(|secs| secs.to_string())
+        .unwrap_or_default();
+    let source_line = match policy.source {
+        pharos_core::HeartbeatGraceSource::Host => "Override for this host".to_string(),
+        pharos_core::HeartbeatGraceSource::Fleet => {
+            format!("Fleet default · {} seconds", policy.fleet_secs)
+        }
+    };
+    let rule = pharos_core::heartbeat_late_rule_copy(policy.interval_secs, policy.effective_secs);
+    let pending_line = match pending.as_str() {
+        "" => String::new(),
+        "inherit" => "Requested change: inherit the fleet default. The live clock stays on the applied grace until the host reports it."
+            .to_string(),
+        secs => format!(
+            "Requested override: {secs} seconds. The live clock stays on the applied grace until the host reports it."
+        ),
+    };
+    let attrs = format!(
+        r#" data-grace="{effective}" data-grace-source="{source}" data-grace-override="{override_secs}" data-grace-fleet="{fleet}" data-late-after="{late_after}" data-grace-pending="{pending}" data-grace-source-line="{source_line}" data-grace-rule="{rule}" data-grace-pending-line="{pending_line}""#,
+        effective = policy.effective_secs,
+        source = policy.source.as_str(),
+        override_secs = html_escape(&override_secs),
+        fleet = policy.fleet_secs,
+        late_after = policy.late_after_secs,
+        pending = html_escape(&pending),
+        source_line = html_escape(&source_line),
+        rule = html_escape(&rule),
+        pending_line = html_escape(&pending_line),
+    );
+    HostGracePresentation {
+        attrs,
+        effective_secs: policy.effective_secs,
+        source: policy.source.as_str().to_string(),
+        late_after_secs: policy.late_after_secs,
+    }
+}
+
 pub(super) fn backup_glyph(level: &str) -> &'static str {
     match level {
         "clear" => "check",
@@ -2632,8 +3605,9 @@ pub(super) fn host_actions_markup(
 
 fn host_quick_drawer(base: &PublicBasePath, can_manage_fleet: bool) -> String {
     format!(
-        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="{home}">Open host workspace {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form></div></aside></div>"#,
+        r#"<div class="host-drawer-layer" data-host-drawer-layer hidden><button class="host-drawer-scrim" type="button" data-host-drawer-close tabindex="-1" aria-label="Close host overview"></button><aside class="host-drawer" id="host-quick-drawer" data-host-drawer role="dialog" aria-modal="true" aria-labelledby="host-drawer-title" aria-describedby="host-drawer-guidance" data-can-manage="{can_manage}"><header class="host-drawer-head"><span class="host-drawer-mark" data-host-drawer-mark>{server}</span><div><span class="host-drawer-kicker">Host overview</span><h2 id="host-drawer-title" data-host-drawer-title>Host</h2><p data-host-drawer-role></p></div><button class="host-drawer-close" type="button" data-host-drawer-close aria-label="Close host overview">{close}</button></header><div class="host-drawer-scroll"><section class="host-drawer-posture" aria-labelledby="host-drawer-posture-title"><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Right now</span><h3 id="host-drawer-posture-title">Posture and next step</h3></div><span class="host-drawer-state" data-host-drawer-state></span></div><p class="host-drawer-guidance" id="host-drawer-guidance" data-host-drawer-guidance></p><dl class="host-drawer-facts"><div><dt>Attention</dt><dd data-host-drawer-attention></dd></div><div><dt>Current owner</dt><dd data-host-drawer-owner></dd></div><div><dt>Next action</dt><dd data-host-drawer-next></dd></div><div><dt>Settings</dt><dd data-host-drawer-settings-state></dd></div><div><dt>Health</dt><dd data-host-drawer-health></dd></div><div><dt>Daily backup</dt><dd data-host-drawer-backup></dd></div><div><dt>Restore test</dt><dd data-host-drawer-restore></dd></div></dl><a class="host-drawer-workspace" data-host-drawer-workspace href="{home}">Open host workspace {arrow}</a><a class="full-page-link" data-host-drawer-full-page href="{home}">Open full host page {arrow}</a></section><form class="host-drawer-draft" data-host-drawer-draft><div class="host-drawer-section-head"><div><span class="host-drawer-kicker">Quick settings</span><h3>Prepare a local draft</h3></div><span class="host-drawer-local">Not sent</span></div><p>These values stay in this drawer until you choose review. Closing or discarding removes the draft completely.</p><div class="host-drawer-fields"><label class="host-drawer-color"><span>Host color</span><input type="color" data-host-drawer-color aria-label="Draft host color"></label><label><span>Host type</span><select data-host-drawer-kind><option value="server">Server</option><option value="workstation">Workstation</option></select></label></div><fieldset class="host-drawer-alerts"><legend>Alert preferences</legend><label><span><strong>Down alerts</strong><small>Warn when the host stops reporting.</small></span><input type="checkbox" data-host-drawer-alert="down"></label><label><span><strong>Backup warnings</strong><small>Warn when backup evidence needs attention.</small></span><input type="checkbox" data-host-drawer-alert="backup"></label><label><span><strong>Nix freshness</strong><small>Warn when the host falls behind nixcfg.</small></span><input type="checkbox" data-host-drawer-alert="nix"></label></fieldset><p class="host-drawer-draft-status" data-host-drawer-draft-status role="status" aria-live="polite">Change a setting to prepare a review.</p><div class="host-drawer-buttons"><button class="secondary-action" type="button" data-host-drawer-discard disabled>Discard draft</button><button class="primary-action" type="submit" data-host-drawer-review disabled>Review settings</button></div><p class="host-drawer-effect">Opens the draft in this host workspace; it does not send or apply changes.</p><p class="host-drawer-viewer" data-host-drawer-viewer{viewer_hidden}>Fleet operator access is required to prepare a settings draft.</p></form><section class="host-drawer-grace" data-host-grace aria-label="Heartbeat grace"><h3>Heartbeat grace</h3><p data-grace-source-line></p><p data-grace-rule></p><p data-grace-pending hidden></p><div class="host-drawer-grace-controls"><label>Source <select data-grace-mode{grace_disabled}><option value="inherit">Fleet default</option><option value="override">Override for this host</option></select></label><label>Extra grace after expected heartbeat <input data-grace-seconds-input type="number" min="0" max="3600" step="1" inputmode="numeric"{grace_disabled}></label><button type="button" data-grace-reset{grace_disabled}>Use fleet default</button></div><p>Use fleet default clears this host override through the existing settings review. Leave heartbeat grace out of that request, or send null. A number, including 0, is an override.</p></section></div></aside></div>"#,
         can_manage = can_manage_fleet,
+        grace_disabled = if can_manage_fleet { "" } else { " disabled" },
         server = icons::SERVER,
         close = icons::X,
         arrow = icons::ARROW_RIGHT,
@@ -3531,10 +4505,13 @@ pub(super) fn render_provider_connections_page(
             render_provider_connection_row(provider, can_manage, shell.public_base_path)
         })
         .collect::<String>();
+    let disabled = if can_manage { "" } else { " disabled" };
+    let grace = heartbeat_grace_settings_markup(fleet_settings.heartbeat_grace_secs, can_manage);
     let fleet_policy = format!(
-        r#"<section class="appearance-settings" aria-labelledby="fleet-freshness-title"><h2 class="settings-section-title" id="fleet-freshness-title">Fleet freshness</h2><form data-fleet-settings><label class="appearance-row"><span class="appearance-copy"><strong>nixpkgs warning threshold (days)</strong><span id="fleet-threshold-note">Warn when deployed nixpkgs differs from its channel and is older than this limit. Host overrides take precedence.</span></span><input name="nixpkgs_warn_after_days" aria-label="nixpkgs warning threshold (days)" aria-describedby="fleet-threshold-note" type="number" min="1" max="3650" step="1" required value="{days}"{disabled}></label><button class="provider-secondary" type="submit"{disabled}>Save freshness settings</button><span data-fleet-settings-status role="status" aria-live="polite"></span></form></section>"#,
+        r#"<section class="appearance-settings" aria-labelledby="fleet-freshness-title"><h2 class="settings-section-title" id="fleet-freshness-title">Fleet freshness</h2><form data-fleet-settings><label class="appearance-row"><span class="appearance-copy"><strong>nixpkgs warning threshold (days)</strong><span id="fleet-threshold-note">Warn when deployed nixpkgs differs from its channel and is older than this limit. Host overrides take precedence.</span></span><input name="nixpkgs_warn_after_days" aria-label="nixpkgs warning threshold (days)" aria-describedby="fleet-threshold-note" type="number" min="1" max="3650" step="1" required value="{days}"{disabled}></label>{grace}<button class="provider-secondary" type="submit"{disabled}>Save freshness settings</button><span data-fleet-settings-status role="status" aria-live="polite"></span></form></section>"#,
         days = fleet_settings.nixpkgs_warn_after_days,
-        disabled = if can_manage { "" } else { " disabled" },
+        disabled = disabled,
+        grace = grace,
     );
     let head = document_head(shell.public_base_path);
     format!(
@@ -3547,7 +4524,7 @@ pub(super) fn render_provider_connections_page(
         ),
         header = page_header(
             "Settings",
-            "Fleet freshness, appearance and provider connections.",
+            "Fleet freshness, appearance and provider connections. Heartbeat grace is shown beside freshness.",
             now_unix(),
         ),
         rows = rows,
@@ -4761,8 +5738,21 @@ pub(super) fn availability_markup(signal: &HeartbeatSignal) -> String {
     )
 }
 
+pub(super) const EXTRA_HEAD_MARKER: &str = "<!--pharos-extra-head-->";
+
 pub(super) fn head_with_extra(base: &PublicBasePath, extra: &str) -> String {
-    document_head(base).replacen("</style></head>", &format!("</style>{extra}</head>"), 1)
+    let head = document_head(base);
+    if let Some((before, after)) = head.split_once(EXTRA_HEAD_MARKER) {
+        return format!("{before}{extra}{after}");
+    }
+    if let Some(index) = head.rfind("</head>") {
+        let mut out = String::with_capacity(head.len() + extra.len());
+        out.push_str(&head[..index]);
+        out.push_str(extra);
+        out.push_str(&head[index..]);
+        return out;
+    }
+    format!("{head}{extra}")
 }
 
 pub(super) const LOCATION_STALE_AFTER_SECS: i64 = 24 * 3600;
@@ -5082,6 +6072,9 @@ pub(super) fn preferences_summary(prefs: &HostPreferences) -> String {
     let mut parts = Vec::new();
     if let Some(days) = prefs.alerts.nixpkgs_warn_after_days {
         parts.push(format!("nixpkgs warning after {days}d"));
+    }
+    if let Some(secs) = prefs.alerts.heartbeat_grace_secs {
+        parts.push(format!("heartbeat grace {secs}s"));
     }
     if let Some(accent) = prefs.accent.as_deref() {
         parts.push(format!("accent {}", accent));
@@ -7355,38 +8348,37 @@ pub(super) fn heartbeat_history(
     log: &[i64],
     idx: usize,
     interval: i64,
+    grace_secs: u64,
 ) -> (&'static str, String, String) {
     let stamp = log[idx];
-    let Some(previous) = idx.checked_sub(1).and_then(|previous| log.get(previous)) else {
-        return (
-            "first",
-            "first heartbeat".to_string(),
-            format!("at {}", clock_label(stamp)),
-        );
-    };
-    let gap = (stamp - previous).max(0);
-    let interval = interval.max(1);
-    let (level, label) = if gap <= interval {
-        ("ok", "on cadence")
-    } else if gap <= interval * 2 {
-        ("late", "late heartbeat")
-    } else if gap <= interval * 5 {
-        ("stale", "stale gap recovered")
-    } else {
-        ("down", "offline gap recovered")
-    };
-    (
-        level,
-        label.to_string(),
-        format!(
+    let previous = idx.checked_sub(1).and_then(|previous| log.get(previous));
+    let gap = previous.map(|previous| (stamp - previous).max(0) as u64);
+    let level = pharos_core::heartbeat_history_level(gap, interval.max(1) as u64, grace_secs);
+    let detail = match gap {
+        Some(gap) => format!(
             "{} after previous · {}",
-            duration_label(gap),
+            duration_label(gap as i64),
             clock_label(stamp)
         ),
+        None => format!("at {}", clock_label(stamp)),
+    };
+    (
+        pharos_core::heartbeat_history_level_key(level),
+        pharos_core::heartbeat_history_label(level).to_string(),
+        detail,
     )
 }
 
 pub(super) fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (String, f64) {
+    heartbeat_marks_with_grace(log, interval, window_secs, 0)
+}
+
+pub(super) fn heartbeat_marks_with_grace(
+    log: &[i64],
+    interval: i64,
+    window_secs: i64,
+    grace_secs: u64,
+) -> (String, f64) {
     if log.len() < 2 {
         return (String::new(), 0.0);
     }
@@ -7404,7 +8396,7 @@ pub(super) fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (
     let mut marks = String::new();
     for idx in view.visible {
         let x = mark_x(idx);
-        let (level, label, detail) = heartbeat_history(log, idx, interval);
+        let (level, label, detail) = heartbeat_history(log, idx, interval, grace_secs);
         let title = format!("{label} · {detail}");
         marks.push_str(&format!(
             r#"<span class="beat-mark" role="img" tabindex="0" data-history-level="{level}" data-history-label="{label}" data-history-detail="{detail}" title="{title}" aria-label="{title}" style="--mark-x:{x:.1}%"></span>"#,
@@ -7418,18 +8410,17 @@ pub(super) fn heartbeat_marks(log: &[i64], interval: i64, window_secs: i64) -> (
 }
 
 pub(super) fn heartbeat_x(age: i64, interval: i64) -> f64 {
-    let age = age.max(0) as f64;
-    let interval = interval.max(1) as f64;
-    if age <= interval {
-        return (age / interval) * HEARTBEAT_EXPECT_X;
-    }
-    if age <= interval * 2.0 {
-        return HEARTBEAT_EXPECT_X + ((age - interval) / interval) * 18.0;
-    }
-    if age <= interval * 5.0 {
-        return HEARTBEAT_STALE_X + ((age - interval * 2.0) / (interval * 3.0)) * 18.0;
-    }
-    100.0
+    heartbeat_x_with_grace(age, interval, 0)
+}
+
+pub(super) fn heartbeat_x_with_grace(age: i64, interval: i64, grace_secs: u64) -> f64 {
+    pharos_core::heartbeat_timeline_x(
+        age.max(0) as u64,
+        interval.max(1) as u64,
+        grace_secs,
+        HEARTBEAT_EXPECT_X,
+        HEARTBEAT_STALE_X,
+    )
 }
 
 pub(super) fn heartbeat_card(
@@ -7439,6 +8430,9 @@ pub(super) fn heartbeat_card(
     now: i64,
     is_self: bool,
     window_control: bool,
+    grace_secs: u64,
+    grace_source: &str,
+    late_after_secs: u64,
 ) -> String {
     let interval = i64::try_from(interval_secs.unwrap_or(60))
         .unwrap_or(60)
@@ -7456,58 +8450,42 @@ pub(super) fn heartbeat_card(
         .collect::<Vec<_>>()
         .join(",");
     let (marks, history_start_x) =
-        heartbeat_marks(&all_beats, interval, SIGNAL_DEFAULT_WINDOW_SECS);
-    let (last_attr, next_at_attr, beat_state, now_x, fill_color, expect_fill, target_ring) =
+        heartbeat_marks_with_grace(&all_beats, interval, SIGNAL_DEFAULT_WINDOW_SECS, grace_secs);
+    let (last_attr, next_at_attr, beat_state, timing, now_x, fill_color, expect_fill, target_ring) =
         match last_seen {
             Some(last) => {
                 let age = (now - last).max(0);
-                let progress = (age as f64 / interval as f64).clamp(0.0, 1.0);
-                if age <= interval {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
+                let timing = pharos_core::heartbeat_timing(age as u64, interval as u64, grace_secs);
+                let now_x = heartbeat_x_with_grace(age, interval, grace_secs);
+                let on_time_through = (late_after_secs as f64).min(interval as f64 * 2.0).max(1.0);
+                let progress = (age as f64 / on_time_through).clamp(0.0, 1.0);
+                let (state, color, fill, ring) = match timing {
+                    pharos_core::HeartbeatTiming::OnTime => (
                         if is_self { "lit" } else { "tracking" },
-                        heartbeat_x(age, interval),
                         if is_self { "var(--sun)" } else { "var(--sea)" },
                         progress * 360.0,
                         3.0 + progress * 5.0,
-                    )
-                } else if age <= interval * 2 {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "late",
-                        heartbeat_x(age, interval),
-                        "var(--sun)",
-                        360.0,
-                        8.0,
-                    )
-                } else if age <= interval * 5 {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "stale",
-                        heartbeat_x(age, interval),
-                        "var(--stale)",
-                        360.0,
-                        8.0,
-                    )
-                } else {
-                    (
-                        last.to_string(),
-                        (last + interval).to_string(),
-                        "down",
-                        100.0,
-                        "var(--down)",
-                        360.0,
-                        8.0,
-                    )
-                }
+                    ),
+                    pharos_core::HeartbeatTiming::Late => ("late", "var(--sun)", 360.0, 8.0),
+                    pharos_core::HeartbeatTiming::Stale => ("stale", "var(--stale)", 360.0, 8.0),
+                    pharos_core::HeartbeatTiming::Down => ("down", "var(--down)", 360.0, 8.0),
+                };
+                (
+                    last.to_string(),
+                    (last + interval).to_string(),
+                    state,
+                    timing.as_str(),
+                    now_x,
+                    color,
+                    fill,
+                    ring,
+                )
             }
             None => (
                 "".to_string(),
                 "".to_string(),
                 "waiting",
+                "",
                 0.0,
                 "var(--wait)",
                 0.0,
@@ -7524,7 +8502,7 @@ pub(super) fn heartbeat_card(
         format!(r#"<span data-history-window-label>{history_window_label}</span>"#)
     };
     format!(
-        r#"<div class="beat" data-beat="{beat_state}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--now-x:{now_x:.2}%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones">{history_window_control}<span>expected</span><span>late</span></span></div></div>"#,
+        r#"<div class="beat" data-beat="{beat_state}" data-heartbeat-timing="{timing}" data-count="{count}" data-last="{last_attr}" data-interval="{interval}" data-grace="{grace_secs}" data-grace-source="{grace_source}" data-late-after="{late_after_secs}" data-next-at="{next_at_attr}" data-beats="{beats_attr}" data-signal-beats="{signal_beats_attr}" data-history-window="{history_window_label}" style="--now-x:{now_x:.2}%;--history-start-x:{history_start_x:.1}%;--fill-color:{fill_color};--expect-fill:{expect_fill:.1}deg;--target-ring:{target_ring:.1}px"{self_attr}><div class="beat-stage" aria-label="heartbeat timeline"><span class="beat-floor"></span><span class="beat-fill"></span><span class="beat-current"></span><span class="beat-marks">{marks}</span><span class="beat-threshold expected"></span><span class="beat-threshold stale"></span><span class="beat-now"></span><span class="beat-hit"></span><span class="beat-zones">{history_window_control}<span>expected</span><span>late</span></span></div></div>"#,
         count = visible_beats.len(),
     )
 }
@@ -7559,6 +8537,26 @@ pub(super) fn render_home_with_capabilities(
     manifests: &[HostManifest],
     shell: ShellContext<'_>,
     capabilities: FleetCapabilities,
+) -> String {
+    render_home_with_grace(
+        runtime,
+        self_name,
+        now,
+        manifests,
+        shell,
+        capabilities,
+        None,
+    )
+}
+
+pub(super) fn render_home_with_grace(
+    runtime: RuntimeSnapshot<'_>,
+    self_name: &str,
+    now: i64,
+    manifests: &[HostManifest],
+    shell: ShellContext<'_>,
+    capabilities: FleetCapabilities,
+    fleet_heartbeat_grace_secs: Option<u64>,
 ) -> String {
     let can_onboard = capabilities.can_manage_fleet;
     let access_path = if capabilities.can_manage_fleet {
@@ -7760,6 +8758,26 @@ pub(super) fn render_home_with_capabilities(
         if lifecycle.slot != HostLifecycleSlot::Quiet {
             search_parts.push(lifecycle.label.to_lowercase());
         }
+        let assurance = fleet_protection_view(&h.backup_observations, now);
+        let health = host_health_view(
+            live,
+            &h.preferences,
+            &h.freshness,
+            h.kernel.as_ref(),
+            &h.service_observations,
+            &assurance,
+            now,
+            h.preferences
+                .nixpkgs_warn_after_days(Some(runtime.nixpkgs_warn_after_days)),
+        );
+        search_parts.push(health.summary.to_lowercase());
+        search_parts.push(format!(
+            "{} {} {} {}",
+            assurance.run.label,
+            assurance.run.note,
+            assurance.restore.label,
+            assurance.restore.note
+        ));
         let search = html_escape(&search_parts.join(" "));
         let settings_href_raw = shell
             .public_base_path
@@ -7923,11 +8941,25 @@ pub(super) fn render_home_with_capabilities(
             r#"<button class="drag-handle" type="button" data-drag-handle title="Move {name}" aria-label="Move {name}">{icon}</button>"#,
             icon = icons::GRIP
         );
-        let drawer_title = html_escape(&format!("Open overview for {}", h.name));
+        let health_tone = health.tone;
+        let health_count = health.problem_count;
+        let health_html = health_markup(&health);
+        let assurance_html = protection_markup(&assurance, &h.name, shell.public_base_path);
+        let badge = os_badge_markup(nix_icon, &health);
+        let preview = quick_preview_markup(&name, nix_icon);
+        let card_revision = revision_evidence_markup(&h.freshness);
+        let config_summary = html_escape(&h.freshness.tldr());
         let card_identity = format!(
-            r#"<button class="host host-drawer-trigger" type="button" data-host-drawer-trigger title="{drawer_title}" aria-label="{drawer_title}" aria-haspopup="dialog" aria-controls="host-quick-drawer" aria-expanded="false"><span class="nix">{nix_icon}</span><span><span class="name">{name}</span><span class="role">{role}</span></span></button>"#,
+            r#"<div class="harbor-identity">{badge}<div class="host-title"><h2><a class="host-name name" href="{settings_href}" title="{name}">{name}</a></h2><span class="role">{role}</span></div><span class="health-label" data-health-label data-health-tone="{health_tone}">{health_label}</span></div>"#,
+            health_label = html_escape(health.label),
         );
         let row_identity = card_identity.clone();
+        let grace_view = host_grace_presentation(
+            &h.preferences,
+            h.requested_preferences.as_ref(),
+            fleet_heartbeat_grace_secs,
+            h.heartbeat_interval_secs,
+        );
         let card_heartbeat = heartbeat_card(
             h.last_seen,
             &h.heartbeat_log,
@@ -7935,6 +8967,9 @@ pub(super) fn render_home_with_capabilities(
             now,
             is_self,
             true,
+            grace_view.effective_secs,
+            grace_view.source.as_str(),
+            grace_view.late_after_secs,
         );
         let list_heartbeat = heartbeat_card(
             h.last_seen,
@@ -7943,7 +8978,11 @@ pub(super) fn render_home_with_capabilities(
             now,
             is_self,
             false,
+            grace_view.effective_secs,
+            grace_view.source.as_str(),
+            grace_view.late_after_secs,
         );
+        let grace_attrs = grace_view.attrs;
         let interval = i64::try_from(h.heartbeat_interval_secs.unwrap_or(60))
             .unwrap_or(60)
             .max(1);
@@ -7957,13 +8996,15 @@ pub(super) fn render_home_with_capabilities(
         );
         let availability = availability_markup(&heartbeat_signal);
         let signal = signal_markup(&heartbeat_signal);
-        let row_cls = format!("{light_cls}{settings_cls}").trim().to_string();
+        let row_cls = format!("{light_cls}{settings_cls} harbor-host")
+            .trim()
+            .to_string();
         cards.push_str(&format!(
-            r#"<article class="card{light_cls}{settings_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}>{beam}<header class="card-head">{card_identity}<div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}</article>"#,
+            r#"<article class="card{light_cls}{settings_cls} harbor-host" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}>{beam}<header class="card-head">{card_identity}<div class="card-actions">{drag_action}{card_host_actions}{backup_chip}</div></header><div class="card-maintenance">{card_lifecycle_chip}</div>{card_reason}{muted}{health_html}{assurance_html}<div class="fresh freshness-rail" data-fresh role="group" aria-label="Host faults"{card_fresh_hidden}>{card_fresh}</div>{protection_card}<div class="meta card-meta" title="Snapshot as of {as_of}" aria-label="{seen_card}; snapshot as of {as_of}"><span data-seen data-seen-card>{seen_card}</span><span class="meta-separator" aria-hidden="true">·</span><span data-card-asof data-card-asof-compact>{as_of_short}</span></div><div class="availability-head">{availability}</div>{card_heartbeat}<div class="harbor-card-foot">{card_revision}{preview}</div></article>"#,
             live_key = live_key(live),
         ));
         rows.push_str(&format!(
-            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}><td>{row_identity}</td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{protection_list}</div></td><td><div class="fresh" data-fresh>{list_fresh}</div></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}</div></td></tr>"#,
+            r#"<tr class="{row_cls}" data-host="{name}" data-live="{live_key}" data-sev="{sev}" data-health="{health_tone}" data-health-count="{health_count}" data-sort-name="{sort_name}" data-last="{last_sort}" data-search="{search}" data-host-surface="runtime"{self_attr}{host_color_style}{drawer_attrs}{grace_attrs}><td>{row_identity}</td><td><div class="list-attention">{row_lifecycle_chip}{list_reason}{muted}{health_html}{assurance_html}{protection_list}</div></td><td><details class="revision-evidence" data-revision-evidence><summary title="{config_summary}"><span data-config-summary>{config_summary}</span></summary><div class="revision-panel"><div class="fresh" data-fresh>{list_fresh}</div></div></details></td><td><div class="list-seen"><span data-seen data-seen-compact>{seen_compact}</span><span class="list-seen-detail" data-card-asof>as of {as_of}</span></div></td><td><div class="list-heartbeat">{list_heartbeat}{signal}</div></td><td><div class="list-actions">{backup_chip}{settings_action}{row_host_actions}{preview}</div></td></tr>"#,
             live_key = live_key(live),
         ));
     }
