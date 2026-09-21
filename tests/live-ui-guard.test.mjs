@@ -17,13 +17,20 @@ import {
   browserContextOptions,
   browserLaunchOptions,
   classifyObservation,
+  bindTargetCloser,
   classifyProbeSurface,
   collectProbeSurface,
   continuationAllowed,
+  credentialFillPermitted,
+  decideFetchPause,
   decideIncidental,
   decideRedirect,
   decideRequest,
+  disposeFetchGuard,
+  enableFetchGuard,
+  foreignTargetAction,
   hostNamesFromPayload,
+  ISSUER_LOGIN_POST_PATHS,
   loadPasswordFile,
   loadUsernameFile,
   parseClientDraft,
@@ -34,6 +41,10 @@ import {
   sanitizeNavigationError,
   screenshotName,
   screenshotPermitted,
+  settleFetchAuth,
+  settleFetchPause,
+  submitLabelRejected,
+  takeAuthenticatedShot,
   LiveUiError,
 } from "../scripts/live-ui-guard.mjs";
 
@@ -155,10 +166,55 @@ test("login-provider requests stay on the personal issuer and its login paths", 
   assert.equal(authorize.allow, true);
   assert.equal(authorize.reason, "issuer-read");
   assert.equal(authorize.path, "/oauth/v2/authorize");
-  const loginPost = request("POST", "https://auth.inspr.at/ui/v2/login/password");
+  assert.deepEqual(ISSUER_LOGIN_POST_PATHS, ["/ui/login/loginname", "/ui/login/password"]);
+  const loginName = request("POST", "https://auth.inspr.at/ui/login/loginname");
+  assert.equal(loginName.allow, true);
+  assert.equal(loginName.reason, "issuer-login");
+  const loginPost = request("POST", "https://auth.inspr.at/ui/login/password", []);
   assert.equal(loginPost.allow, true);
   assert.equal(loginPost.reason, "issuer-login");
   assert.equal(continuationAllowed(loginPost), true);
+  const loginBody = decideRequest(
+    {
+      method: "POST",
+      url: "https://auth.inspr.at/ui/login/password",
+      postData: "loginName=person%40example.test&password=placeholder",
+    },
+    {},
+  );
+  assert.equal(loginBody.allow, true);
+  assert.equal(JSON.stringify(loginBody).includes("placeholder"), false);
+  for (const url of [
+    "https://auth.inspr.at/ui/login/password/reset",
+    "https://auth.inspr.at/ui/login/password/init",
+    "https://auth.inspr.at/oauth/v2/revoke",
+    "https://auth.inspr.at/oauth/v2/token",
+    "https://auth.inspr.at/ui/v2/login/password",
+    "https://auth.inspr.at/ui/login/password/change",
+  ]) {
+    const denied = request("POST", url);
+    assert.equal(denied.allow, false, url);
+    assert.equal(continuationAllowed(denied), false);
+  }
+  const resetBody = decideRequest(
+    {
+      method: "POST",
+      url: "https://auth.inspr.at/ui/login/password",
+      postData: "reset=1",
+    },
+    {},
+  );
+  assert.equal(resetBody.allow, false);
+  assert.equal(resetBody.reason, "issuer-mutation");
+  const resetJson = decideRequest(
+    {
+      method: "POST",
+      url: "https://auth.inspr.at/ui/login/loginname",
+      postData: "{\"init\":true}",
+    },
+    {},
+  );
+  assert.equal(resetJson.allow, false);
   for (const url of [
     "https://auth.inspr.at/ui/console",
     "https://auth.inspr.at/management/v1/users",
@@ -223,6 +279,10 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", () 
     `https://pharos.barta.cm/pharos/${short}`,
     `https://pharos.barta.cm/pharos/${tiny}`,
     `https://pharos.barta.cm/pharos/pre-${short}-post`,
+    `https://pharos.barta.cm/pharos/hosts/pres3crpost`,
+    `https://pharos.barta.cm/pharos/hosts/pre-ab1-post`,
+    `https://pharos.barta.cm/pharos/map?x=pre-a%62%31-post`,
+    `https://pharos.barta.cm/pharos/hosts/pre-%2561%2562%2531-post`,
     `https://user:${short}@pharos.barta.cm/pharos/map`,
   ];
   const secrets = [secret, FIXTURE_USER, short, tiny];
@@ -232,9 +292,13 @@ test("pathname, encoding, fragment, and short secrets stay out of verdicts", () 
     assert.equal(result.reason, "secret-in-url");
     assert.equal(leaks(result, [secret, FIXTURE_USER, encodedUser, mixed, short, tiny]), false);
     const sanitized = sanitizeNavigationError(new Error(`navigation failed ${url}`), secrets);
-    assert.equal(leaks(sanitized, [secret, FIXTURE_USER, encodedUser, mixed, short, tiny]), false);
+    assert.equal(leaks(sanitized, [secret, FIXTURE_USER, encodedUser, mixed, short, tiny, "a%62%31", "%2561"]), false);
     assert.equal(sanitized.includes("?"), false);
   }
+  const embedded = sanitizeNavigationError(new Error("navigation failed pre-a%62%31-post pres3crpost"), ["ab1", "s3cr"]);
+  assert.equal(embedded.includes("ab1"), false);
+  assert.equal(embedded.includes("s3cr"), false);
+  assert.equal(embedded.includes("a%62%31"), false);
   const evidence = redactEvidence(
     { blocked: [{ method: "GET", path: `/pharos/${secret}`, reason: "secret-in-url" }] },
     secrets,
@@ -359,8 +423,10 @@ test("optional passkey login is not MFA and a real challenge is", () => {
   const passwordProbe = classifyProbeSurface(collectProbeSurface(passwordLogin));
   assert.equal(passwordProbe.passkeyAlternative, true);
   assert.equal(passwordProbe.mfa, false);
+  assert.equal(passwordProbe.accountMutation, false);
   assert.equal(passwordProbe.loginForm, true);
   assert.equal(passwordProbe.authUiVisible, true);
+  assert.equal(credentialFillPermitted(passwordProbe), true);
 
   const usernameStep = fakeDocument([
     domNode("form", {}, [
@@ -387,6 +453,34 @@ test("optional passkey login is not MFA and a real challenge is", () => {
     ], "Use your security key"),
   ]);
   assert.equal(classifyProbeSurface(collectProbeSurface(webauthn)).mfa, true);
+
+  const reset = fakeDocument([
+    domNode("form", {}, [
+      domNode("input", { type: "password", name: "password", autocomplete: "new-password" }),
+      domNode("button", { type: "submit" }, [], "Reset password"),
+    ]),
+  ], "Reset password");
+  const resetProbe = classifyProbeSurface(collectProbeSurface(reset));
+  assert.equal(resetProbe.passwordCount, 1);
+  assert.equal(resetProbe.accountMutation, true);
+  assert.equal(resetProbe.authRecovery, true);
+  assert.equal(resetProbe.mfa, false);
+  assert.equal(credentialFillPermitted(resetProbe), false);
+  assert.equal(submitLabelRejected("Reset password"), true);
+  assert.equal(submitLabelRejected("Next"), false);
+  assert.equal(submitLabelRejected("Sign in with a passkey"), true);
+
+  const forgotLink = fakeDocument([
+    domNode("form", {}, [
+      domNode("input", { type: "password", name: "password", autocomplete: "current-password" }),
+      domNode("a", { href: "/ui/login/password/init" }, [], "Forgot password?"),
+      domNode("button", { type: "submit" }, [], "Next"),
+    ]),
+  ]);
+  const forgotProbe = classifyProbeSurface(collectProbeSurface(forgotLink));
+  assert.equal(forgotProbe.accountMutation, false);
+  assert.equal(forgotProbe.mfa, false);
+  assert.equal(credentialFillPermitted(forgotProbe), true);
   assert.equal(
     classifyProbeSurface({
       passwordCount: 1,
@@ -745,9 +839,285 @@ test("the browser session is headless, memory-only, and guarded before login", (
   assert.ok(runner.includes("classifyProbeSurface"));
   assert.ok(runner.includes("routeWebSocket"));
   assert.ok(runner.includes("decideIncidental(\"download\")"));
+  assert.equal(runner.includes("context.route("), false);
+  assert.equal(runner.includes("context.on(\"response\""), false);
+  assert.equal(runner.includes("split(/[^A-Za-z0-9"), false);
+  assert.ok(runner.includes("enableFetchGuard"));
+  assert.ok(runner.includes("bindTargetCloser"));
+  assert.ok(runner.includes("newBrowserCDPSession"));
+  assert.ok(runner.includes("takeAuthenticatedShot"));
+  assert.ok(runner.includes("credentialFillPermitted"));
+  assert.ok(guard.includes("Fetch.failRequest"));
+  assert.ok(guard.includes('requestStage: "Request"'));
+  assert.equal(guard.includes("ProvideCredentials"), false);
+  assert.ok(guard.includes("Target.setDiscoverTargets"));
+  assert.ok(guard.includes("Target.closeTarget"));
+  const discoverAt = runner.indexOf("closer.enable()", runAt);
+  const armAt = runner.indexOf("await guard.armPage", runAt);
+  const shotAt = runner.indexOf("takeAuthenticatedShot", runner.indexOf("async function shoot"));
+  assert.ok(discoverAt > runAt);
+  assert.ok(armAt > discoverAt);
+  assert.ok(loginAt > armAt);
+  assert.ok(shotAt > runner.indexOf("async function shoot"));
   assert.equal(runner.includes("tracing.start"), false);
   assert.equal(runner.includes("screencast"), false);
   assert.equal(runner.includes(".storageState("), false);
   assert.equal(guard.includes("acceptDownloads: false"), true);
   assert.equal(guard.includes('serviceWorkers: "block"'), true);
+});
+
+function fakeFetchSession(options = {}) {
+  const calls = [];
+  const listeners = {};
+  return {
+    calls,
+    listeners,
+    on(event, handler) {
+      calls.push({ method: "on", event });
+      listeners[event] = handler;
+    },
+    async send(method, params) {
+      calls.push({ method, params });
+      if (options.failMethods?.has(method)) throw new Error("send-failed");
+    },
+    async detach() {
+      calls.push({ method: "detach" });
+      if (options.failMethods?.has("detach")) throw new Error("detach-failed");
+    },
+  };
+}
+
+test("each redirect hop is failed by Fetch before continue, including preserved POST", async () => {
+  const companyHop = {
+    requestId: "hop-company",
+    redirectedRequestId: "login-post",
+    resourceType: "Document",
+    request: {
+      method: "POST",
+      url: "https://pharos.agm.ng/pharos/host-actions/example/remove",
+    },
+  };
+  const company = fakeFetchSession();
+  const remembered = [];
+  const companyStatus = await settleFetchPause(company, companyHop, { secrets: ["Ab!cdEF12"] }, (verdict) => {
+    remembered.push(verdict);
+  });
+  assert.equal(companyStatus, "failed");
+  assert.deepEqual(company.calls.map((call) => call.method), ["Fetch.failRequest"]);
+  assert.equal(company.calls[0].params.errorReason, "BlockedByClient");
+  assert.equal(company.calls[0].params.requestId, "hop-company");
+  assert.equal(JSON.stringify(remembered).includes("pharos.agm.ng"), false);
+  assert.equal(JSON.stringify(remembered).includes("Ab!cdEF12"), false);
+  assert.equal(decideFetchPause(companyHop).action, "fail");
+
+  const mutationHop = {
+    requestId: "hop-mutation",
+    redirectedRequestId: "login-post",
+    request: {
+      method: "POST",
+      url: "https://pharos.barta.cm/pharos/agora/requests/host-preferences.json",
+    },
+  };
+  const mutation = fakeFetchSession();
+  assert.equal(await settleFetchPause(mutation, mutationHop, {}, () => {}), "failed");
+  assert.equal(mutation.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+  assert.equal(decideFetchPause(mutationHop).verdict.reason, "app-mutation");
+
+  const allowedHop = {
+    requestId: "hop-app",
+    redirectedRequestId: "issuer-redirect",
+    request: { method: "GET", url: "https://pharos.barta.cm/pharos/auth/callback" },
+  };
+  const allowed = fakeFetchSession();
+  assert.equal(await settleFetchPause(allowed, allowedHop, {}, () => {}), "continued");
+  assert.deepEqual(allowed.calls.map((call) => call.method), ["Fetch.continueRequest"]);
+
+  const loginHop = {
+    requestId: "hop-login",
+    redirectedRequestId: "authorize",
+    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+  };
+  const login = fakeFetchSession();
+  assert.equal(await settleFetchPause(login, loginHop, {}, () => {}), "continued");
+  const resetHop = {
+    requestId: "hop-reset",
+    redirectedRequestId: "authorize",
+    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password/reset" },
+  };
+  const reset = fakeFetchSession();
+  assert.equal(await settleFetchPause(reset, resetHop, {}, () => {}), "failed");
+  assert.equal(reset.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+
+  const responseStage = {
+    requestId: "too-late",
+    responseStatusCode: 307,
+    request: { method: "POST", url: "https://auth.inspr.at/ui/login/password" },
+  };
+  const late = fakeFetchSession();
+  assert.equal(await settleFetchPause(late, responseStage, {}, () => {}), "failed");
+  assert.equal(late.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+
+  const brokenRemember = fakeFetchSession();
+  assert.equal(
+    await settleFetchPause(brokenRemember, companyHop, {}, () => {
+      throw new Error("evidence");
+    }),
+    "failed",
+  );
+  assert.equal(brokenRemember.calls[0].method, "Fetch.failRequest");
+
+  const brokenFail = fakeFetchSession({ failMethods: new Set(["Fetch.failRequest"]) });
+  assert.equal(await settleFetchPause(brokenFail, companyHop, {}, () => {}), "paused");
+  assert.equal(brokenFail.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+});
+
+test("fetch guard enables request-stage pauses, cancels auth, and disposes after callback failure", async () => {
+  const session = fakeFetchSession();
+  await enableFetchGuard(session, { secrets: [] }, () => {});
+  assert.deepEqual(
+    session.calls.map((call) => call.method === "on" ? `on:${call.event}` : call.method),
+    ["on:Fetch.requestPaused", "on:Fetch.authRequired", "Fetch.enable"],
+  );
+  assert.deepEqual(session.calls[2].params.patterns, [{ urlPattern: "*", requestStage: "Request" }]);
+  assert.equal(session.calls[2].params.handleAuthRequests, true);
+  await session.listeners["Fetch.requestPaused"]({
+    requestId: "direct-post",
+    request: { method: "POST", url: "https://pharos.barta.cm/pharos/auth/logout" },
+  });
+  assert.equal(session.calls.some((call) => call.method === "Fetch.failRequest"), true);
+  assert.equal(session.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+
+  const auth = fakeFetchSession();
+  assert.equal(await settleFetchAuth(auth, { requestId: "challenge" }), "cancelled");
+  assert.equal(auth.calls[0].params.authChallengeResponse.response, "CancelAuth");
+  assert.equal(JSON.stringify(auth.calls[0].params).includes("password"), false);
+  assert.equal(Object.hasOwn(auth.calls[0].params.authChallengeResponse, "username"), false);
+
+  const enableFailed = fakeFetchSession({ failMethods: new Set(["Fetch.enable"]) });
+  await assert.rejects(enableFetchGuard(enableFailed, {}, () => {}), /send-failed/);
+  assert.equal(enableFailed.calls.some((call) => call.method === "Fetch.continueRequest"), false);
+
+  const disposeFailed = fakeFetchSession({ failMethods: new Set(["Fetch.disable"]) });
+  await disposeFetchGuard(disposeFailed);
+  assert.deepEqual(disposeFailed.calls.map((call) => call.method), ["Fetch.disable", "detach"]);
+});
+
+test("new pages and service workers are closed and the first page is kept", async () => {
+  assert.equal(foreignTargetAction({ type: "page", targetId: "primary" }, false), "primary");
+  assert.equal(foreignTargetAction({ type: "page", targetId: "popup" }, true), "close");
+  assert.equal(foreignTargetAction({ type: "service_worker", targetId: "worker" }, true), "close");
+  assert.equal(foreignTargetAction({ type: "iframe", targetId: "frame" }, true), "ignore");
+  const session = fakeFetchSession();
+  const notes = [];
+  const closer = bindTargetCloser(session, (verdict) => {
+    if (verdict.reason === "serviceworker") throw new Error("evidence");
+    notes.push(verdict.reason);
+  });
+  await closer.enable();
+  closer.onCreated({ targetInfo: { type: "page", targetId: "primary", url: "https://user:secret@pharos.barta.cm/pharos/" } });
+  closer.onCreated({ targetInfo: { type: "page", targetId: "primary", url: "https://pharos.barta.cm/pharos/" } });
+  closer.onCreated({ targetInfo: { type: "page", targetId: "popup" } });
+  closer.onCreated({ targetInfo: { type: "service_worker", targetId: "worker" } });
+  closer.onCreated({ targetInfo: { type: "iframe", targetId: "frame" } });
+  const closed = session.calls.filter((call) => call.method === "Target.closeTarget").map((call) => call.params.targetId);
+  assert.deepEqual(closed, ["popup", "worker"]);
+  assert.equal(JSON.stringify(session.calls).includes("secret"), false);
+  assert.deepEqual(notes, ["popup"]);
+});
+
+test("visible password text blocks the screenshot and username text does not", async () => {
+  const password = "Ab!cdEF12";
+  const previous = globalThis.document;
+  const shots = [];
+  const page = {
+    async evaluate(fn, arg) {
+      return fn(arg);
+    },
+    async screenshot() {
+      shots.push("screenshot");
+    },
+  };
+  const withDocument = async (document, permitted) => {
+    shots.length = 0;
+    globalThis.document = document;
+    return takeAuthenticatedShot(page, {
+      permitted,
+      password,
+      options: { path: "shot.png", type: "png" },
+    });
+  };
+  try {
+    const leaked = await withDocument({
+      title: "",
+      body: { innerText: `Account ${password} shown`, textContent: "hidden label" },
+      querySelectorAll() {
+        return [];
+      },
+    }, true);
+    assert.equal(leaked, false);
+    assert.deepEqual(shots, []);
+
+    for (const [secret, text] of [["s3cr", "pres3crpost"], ["ab1", "pre-ab1-post"]]) {
+      shots.length = 0;
+      globalThis.document = {
+        title: "",
+        body: { innerText: text, textContent: text },
+        querySelectorAll() {
+          return [];
+        },
+      };
+      const blocked = await takeAuthenticatedShot(page, {
+        permitted: true,
+        password: secret,
+        options: { path: "shot.png", type: "png" },
+      });
+      assert.equal(blocked, false, secret);
+      assert.deepEqual(shots, []);
+    }
+
+    const hiddenOnly = await withDocument({
+      title: "Fleet",
+      body: { innerText: "Password", textContent: "Password" },
+      querySelectorAll() {
+        return [{ value: password, getAttribute() { return "hidden"; } }];
+      },
+    }, true);
+    assert.equal(hiddenOnly, false);
+    assert.deepEqual(shots, []);
+
+    const usernameOnly = await withDocument({
+      title: "Fleet",
+      body: { innerText: FIXTURE_USER, textContent: FIXTURE_USER },
+      querySelectorAll() {
+        return [];
+      },
+    }, true);
+    assert.equal(usernameOnly, true);
+    assert.deepEqual(shots, ["screenshot"]);
+
+    shots.length = 0;
+    const refused = await withDocument({
+      title: "",
+      body: { innerText: "Fleet map", textContent: "Fleet map" },
+      querySelectorAll() {
+        return [];
+      },
+    }, false);
+    assert.equal(refused, false);
+    assert.deepEqual(shots, []);
+
+    const broken = {
+      async evaluate() {
+        throw new Error("probe");
+      },
+      async screenshot() {
+        shots.push("screenshot");
+      },
+    };
+    shots.length = 0;
+    assert.equal(await takeAuthenticatedShot(broken, { permitted: true, password, options: {} }), false);
+    assert.deepEqual(shots, []);
+  } finally {
+    globalThis.document = previous;
+  }
 });

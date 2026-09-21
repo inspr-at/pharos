@@ -17,13 +17,15 @@ import {
   assertSessionPrefix,
   browserContextOptions,
   browserLaunchOptions,
+  bindTargetCloser,
   classifyObservation,
   classifyProbeSurface,
   collectProbeSurface,
-  continuationAllowed,
+  credentialFillPermitted,
   decideIncidental,
-  decideRedirect,
   decideRequest,
+  disposeFetchGuard,
+  enableFetchGuard,
   hostNamesFromPayload,
   isHostPath,
   isUnderBasePath,
@@ -37,6 +39,8 @@ import {
   repoRootFromScripts,
   screenshotName,
   screenshotPermitted,
+  submitLabelRejected,
+  takeAuthenticatedShot,
   LiveUiError,
 } from "./live-ui-guard.mjs";
 
@@ -75,6 +79,7 @@ function remember(blocked, result, secrets) {
 
 async function installGuard(context, policy, blocked) {
   const secrets = Array.isArray(policy.secrets) ? policy.secrets : [];
+  const sessions = [];
   if (typeof context.routeWebSocket !== "function") throw new LiveUiError("browser-context");
   await context.routeWebSocket(
     () => true,
@@ -88,56 +93,21 @@ async function installGuard(context, policy, blocked) {
   context.on("serviceworker", () => {
     remember(blocked, decideIncidental("serviceworker"), secrets);
   });
-  context.on("response", (response) => {
-    const status = response.status();
-    if (status < 300 || status >= 400) return;
-    let location = "";
+  return async function armPage(page) {
+    if (!page || typeof page.context !== "function" || typeof page.context().newCDPSession !== "function") {
+      throw new LiveUiError("network-guard");
+    }
+    const session = await page.context().newCDPSession(page);
+    sessions.push(session);
     try {
-      location = response.headers().location || "";
+      await enableFetchGuard(session, policy, (verdict) => remember(blocked, verdict, secrets));
     } catch {
-      location = "";
+      await disposeFetchGuard(session);
+      throw new LiveUiError("network-guard");
     }
-    if (!location) return;
-    let absolute = "";
-    let method = "GET";
-    try {
-      absolute = new URL(location, response.url()).href;
-      method = response.request().method() || "GET";
-    } catch {
-      remember(blocked, { allow: false, reason: "redirect", method: "GET", path: "path-category" }, secrets);
-      return;
-    }
-    let verdict;
-    try {
-      verdict = decideRedirect({ method, url: absolute }, policy);
-    } catch {
-      verdict = { allow: false, reason: "redirect", method, path: "path-category" };
-    }
-    if (!verdict.allow) remember(blocked, verdict, secrets);
-  });
-  await context.route("**/*", async (route) => {
-    let result;
-    try {
-      const headers = route.request().headers();
-      result = decideRequest(
-        {
-          url: route.request().url(),
-          method: route.request().method(),
-          resourceType: route.request().resourceType(),
-          headers: { upgrade: headers.upgrade || headers.Upgrade || "" },
-        },
-        policy,
-      );
-    } catch {
-      result = { allow: false, reason: "guard-error", method: "?", path: "/" };
-    }
-    if (!continuationAllowed(result)) {
-      remember(blocked, result.allow ? { ...result, reason: "guard-bypass" } : result, secrets);
-      await route.abort("blockedbyclient").catch(() => {});
-      return;
-    }
-    await route.continue();
-  });
+    return session;
+  };
+  return { sessions, armPage };
 }
 
 async function openDocument(page, href, policy) {
@@ -184,7 +154,7 @@ async function submitControl(page) {
         return `${aria} ${text}`.slice(0, 180);
       })
       .catch(() => "");
-    if (/\b(passkey|security key|webauthn)\b/i.test(label)) continue;
+    if (submitLabelRejected(label)) continue;
     await control.click();
     return true;
   }
@@ -205,11 +175,12 @@ async function fillIssuerCredentialsOnce(page, username, password) {
   assertCredentialEntryOrigin(origin);
   const before = await readProbe(page);
   if (before.mfa) return "mfa-required";
+  if (!credentialFillPermitted(before)) return "auth-required";
   const passwords = page.locator("input[type='password']");
   const users = page.locator(
     "input[name='loginName'], input[name='username'], input[autocomplete='username'], input[type='email']",
   );
-  if ((await passwords.count()) > 1) return "mfa-required";
+  if ((await passwords.count()) > 1) return "auth-required";
   if ((await passwords.count()) === 0) {
     if ((await users.count()) !== 1) return "auth-required";
     const userOrigin = await users.first().evaluate((element) => element.ownerDocument.location.origin);
@@ -225,11 +196,18 @@ async function fillIssuerCredentialsOnce(page, username, password) {
     }
   }
   const again = await readProbe(page);
-  if (again.mfa || (await passwords.count()) !== 1) {
-    return again.mfa ? "mfa-required" : "auth-required";
-  }
-  const fieldOrigin = await passwords.first().evaluate((element) => element.ownerDocument.location.origin);
-  assertCredentialEntryOrigin(fieldOrigin);
+  if (again.mfa) return "mfa-required";
+  if (!credentialFillPermitted(again) || (await passwords.count()) !== 1) return "auth-required";
+  const fieldOrigin = await passwords.first().evaluate((element) => {
+    const autocomplete = (element.getAttribute("autocomplete") || "").toLowerCase();
+    const name = (element.getAttribute("name") || "").toLowerCase();
+    return {
+      origin: element.ownerDocument.location.origin,
+      mutation: autocomplete === "new-password" || name.includes("reset") || name.includes("new"),
+    };
+  });
+  assertCredentialEntryOrigin(fieldOrigin.origin);
+  if (fieldOrigin.mutation) return "auth-required";
   await passwords.first().fill(password);
   if (!(await submitControl(page))) return "auth-required";
   return "submitted";
@@ -348,21 +326,6 @@ async function waitForAuthUiHidden(page) {
   }
 }
 
-async function secretRendered(page, password) {
-  if (typeof password !== "string" || password.length < 1) return false;
-  try {
-    return await page.evaluate((secret) => {
-      const inputs = [...document.querySelectorAll("input, textarea")];
-      if (inputs.some((node) => node.value === secret)) return true;
-      if (secret.length < 4) return false;
-      const text = document.body ? document.body.innerText || "" : "";
-      return text.split(/[^A-Za-z0-9._@%+-]+/).includes(secret);
-    }, password);
-  } catch {
-    return true;
-  }
-}
-
 async function shoot(page, outputDir, route, secrets) {
   await waitForAuthUiHidden(page);
   const probe = await readProbe(page);
@@ -373,24 +336,27 @@ async function shoot(page, outputDir, route, secrets) {
   } catch {
     return "";
   }
-  if (!screenshotPermitted({ classification: route.classification, location, probe })) return "";
-  if (await secretRendered(page, password)) return "";
   const fileName = screenshotName(route.path, route.hostIndex);
   if (!fileName) return "";
   const file = path.join(outputDir, fileName);
+  let written = false;
   try {
-    await page.screenshot({
-      path: file,
-      type: "png",
-      fullPage: false,
-      animations: "disabled",
-      caret: "hide",
+    written = await takeAuthenticatedShot(page, {
+      permitted: screenshotPermitted({ classification: route.classification, location, probe }),
+      password,
+      options: {
+        path: file,
+        type: "png",
+        fullPage: false,
+        animations: "disabled",
+        caret: "hide",
+      },
     });
-    fs.chmodSync(file, 0o600);
+    if (written) fs.chmodSync(file, 0o600);
   } catch {
     return "";
   }
-  return fileName;
+  return written ? fileName : "";
 }
 
 async function applyClientDraft(page, draft) {
@@ -470,6 +436,8 @@ async function run(command) {
   const blocked = [];
   const routes = [];
   let browser;
+  let browserSession;
+  let fetchSessions = [];
   let overall = "broken-ui";
   let appOrigin = "";
   let clientDraft = draft ? "dom-only" : "none";
@@ -480,6 +448,10 @@ async function run(command) {
     }
     browser = await chromium.launch(launch);
     if (browser.browserType().name() !== "chromium") throw new LiveUiError("browser-launch");
+    if (typeof browser.newBrowserCDPSession !== "function") throw new LiveUiError("network-guard");
+    browserSession = await browser.newBrowserCDPSession();
+    const closer = bindTargetCloser(browserSession, (verdict) => remember(blocked, verdict, secrets));
+    await closer.enable();
     const options = browserContextOptions();
     if (["storageState", "recordVideo", "recordHar", "userDataDir"].some((key) => key in options)) {
       throw new LiveUiError("browser-context");
@@ -487,8 +459,10 @@ async function run(command) {
     const context = await browser.newContext(options);
     if (browser.contexts().length !== 1) throw new LiveUiError("browser-context");
     mark("install-request-guard");
-    await installGuard(context, policy, blocked);
+    const guard = await installGuard(context, policy, blocked);
+    fetchSessions = guard.sessions;
     const page = await context.newPage();
+    await guard.armPage(page);
     const watchSurface = (target) => {
       target.on("download", (download) => {
         download.cancel().catch(() => {});
@@ -505,6 +479,7 @@ async function run(command) {
       watchSurface(popup);
       remember(blocked, decideIncidental("popup"), secrets);
       popup.close().catch(() => {});
+      guard.armPage(popup).catch(() => {});
     });
     mark("open-login");
     const signedIn = await signIn(page, secrets[0], secrets[1], policy);
@@ -616,6 +591,12 @@ async function run(command) {
     secrets.fill("");
     if (draft) {
       for (const field of draft.fields) field.value = "";
+    }
+    for (const session of fetchSessions) {
+      await disposeFetchGuard(session);
+    }
+    if (browserSession && typeof browserSession.detach === "function") {
+      await browserSession.detach().catch(() => {});
     }
     if (browser) {
       for (const context of browser.contexts()) {

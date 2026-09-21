@@ -67,11 +67,11 @@ const ISSUER_DENY_PREFIXES = Object.freeze([
   "/v2/organizations",
   "/v2/settings",
 ]);
-const ISSUER_POST_PREFIXES = Object.freeze([
-  "/oauth",
-  "/oidc",
-  "/ui/login",
-  "/ui/v2/login",
+// Exact Zitadel login v1 credential posts. Reset, init, revoke, and any
+// broader auth prefix are not login. Unknown login-v2 session posts stay denied.
+export const ISSUER_LOGIN_POST_PATHS = Object.freeze([
+  "/ui/login/loginname",
+  "/ui/login/password",
 ]);
 const ISSUER_GET_PREFIXES = Object.freeze([
   "/.well-known",
@@ -197,8 +197,43 @@ function isIssuerAdminPath(pathname) {
   return ISSUER_DENY_PREFIXES.some((prefix) => hasPathPrefix(pathname, prefix));
 }
 
-function isIssuerPostPath(pathname) {
-  return ISSUER_POST_PREFIXES.some((prefix) => hasPathPrefix(pathname, prefix));
+function isIssuerLoginPost(pathname) {
+  return ISSUER_LOGIN_POST_PATHS.includes(pathname);
+}
+
+const ACCOUNT_MUTATION_FIELD = /reset|revoke|enroll|enrol|register|new[-_]?password|recover|change[-_]?password|init/i;
+
+function fieldRequestsAccountMutation(key) {
+  return ACCOUNT_MUTATION_FIELD.test(String(key || ""));
+}
+
+function jsonRequestsAccountMutation(value) {
+  if (!value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((item) => jsonRequestsAccountMutation(item));
+  for (const [key, item] of Object.entries(value)) {
+    if (fieldRequestsAccountMutation(key) || jsonRequestsAccountMutation(item)) return true;
+  }
+  return false;
+}
+
+function postDataRequestsAccountMutation(postData) {
+  if (postData == null || postData === "") return false;
+  const raw = String(postData).trim();
+  if (raw.startsWith("{") || raw.startsWith("[")) {
+    try {
+      return jsonRequestsAccountMutation(JSON.parse(raw));
+    } catch {
+      return true;
+    }
+  }
+  try {
+    for (const key of new URLSearchParams(raw).keys()) {
+      if (fieldRequestsAccountMutation(key)) return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
 }
 
 function deniedHost(hostname) {
@@ -214,19 +249,31 @@ function listedSecrets(secrets) {
   return (Array.isArray(secrets) ? secrets : []).filter((secret) => typeof secret === "string" && secret.length > 0);
 }
 
-function decodeRepeated(value) {
-  let current = String(value ?? "");
-  for (let index = 0; index < 3; index += 1) {
-    if (!current.includes("%")) break;
-    try {
-      const next = decodeURIComponent(current);
-      if (next === current) break;
-      current = next;
-    } catch {
-      break;
+function decodeOnceSafe(value) {
+  const text = String(value ?? "");
+  if (!text.includes("%")) return text;
+  let out = "";
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "%" && /^[0-9A-Fa-f]{2}$/.test(text.slice(index + 1, index + 3))) {
+      out += String.fromCharCode(Number.parseInt(text.slice(index + 1, index + 3), 16));
+      index += 2;
+    } else {
+      out += text[index];
     }
   }
-  return current;
+  return out;
+}
+
+function decodeRepeated(value) {
+  let current = String(value ?? "");
+  const forms = [current];
+  for (let index = 0; index < 8; index += 1) {
+    const next = decodeOnceSafe(current);
+    if (next === current) break;
+    forms.push(next);
+    current = next;
+  }
+  return forms;
 }
 
 function percentEncode(secret, alphabet) {
@@ -263,15 +310,10 @@ function secretVariants(secret) {
 function pieceMatchesSecret(piece, secrets) {
   const raw = String(piece ?? "");
   if (!raw) return false;
-  const decoded = decodeRepeated(raw);
-  const values = decoded === raw ? [raw] : [raw, decoded];
+  const forms = decodeRepeated(raw);
   for (const secret of listedSecrets(secrets)) {
-    for (const value of values) {
-      if (value === secret) return true;
-      const segments = value.split("/").filter(Boolean);
-      if (segments.some((segment) => segment === secret || decodeRepeated(segment) === secret)) return true;
-      if (secret.length >= 4 && value.split("-").some((part) => part === secret)) return true;
-      if (secret.length >= 8 && value.includes(secret)) return true;
+    for (const value of forms) {
+      if (value.includes(secret)) return true;
       for (const variant of secretVariants(secret)) {
         if (value.includes(variant)) return true;
       }
@@ -411,7 +453,10 @@ export function decideRequest(request, policy = {}) {
       if (isIssuerReadPath(pathname)) return decision(true, "issuer-read", method, pathname, secrets);
       return decision(false, "issuer-path", method, pathname, secrets);
     }
-    if (method === "POST" && isIssuerPostPath(pathname)) {
+    if (method === "POST" && isIssuerLoginPost(pathname)) {
+      if (postDataRequestsAccountMutation(request?.postData)) {
+        return decision(false, "issuer-mutation", method, pathname, secrets);
+      }
       return decision(true, "issuer-login", method, pathname, secrets);
     }
     return decision(false, "issuer-mutation", method, pathname, secrets);
@@ -443,20 +488,26 @@ function safePath(url) {
 }
 
 function scrubText(text, secrets) {
-  let out = String(text ?? "");
+  const secretsList = listedSecrets(secrets).sort((left, right) => right.length - left.length);
   const needles = [];
-  for (const secret of listedSecrets(secrets)) {
+  for (const secret of secretsList) {
     needles.push(secret);
     for (const variant of secretVariants(secret)) needles.push(variant);
   }
   needles.sort((left, right) => right.length - left.length);
-  for (const needle of needles) {
-    if (!needle || !out.includes(needle)) continue;
-    if (needle.length >= 4) out = out.split(needle).join("[redacted]");
-    else {
-      const pattern = new RegExp(`(^|[^A-Za-z0-9])${needle.replace(/[\\^$*+?.()|[\]{}]/g, "\\$&")}(?=$|[^A-Za-z0-9])`, "g");
-      out = out.replace(pattern, "$1[redacted]");
+  const apply = (value) => {
+    let next = value;
+    for (const needle of needles) {
+      if (needle && next.includes(needle)) next = next.split(needle).join("[redacted]");
     }
+    return next;
+  };
+  let out = apply(String(text ?? ""));
+  if (secretsList.some((secret) => decodeRepeated(out).some((form) => form.includes(secret)))) {
+    out = apply(out.replace(/%[0-9A-Fa-f]{2}/g, "[redacted]"));
+  }
+  if (secretsList.some((secret) => decodeRepeated(out).some((form) => form.includes(secret)) || out.includes(secret))) {
+    return "[redacted]";
   }
   return out;
 }
@@ -555,7 +606,9 @@ export function screenshotPermitted({ classification, location, probe }) {
     probe.noAccess ||
     probe.accessDenied ||
     probe.accessRequest ||
-    probe.viewerOnly
+    probe.viewerOnly ||
+    probe.authRecovery ||
+    probe.accountMutation
   ) {
     return false;
   }
@@ -770,6 +823,7 @@ export function collectProbeSurface(root) {
     authRecovery: false,
     rateLimited: false,
     loginForm: false,
+    accountMutation: false,
   });
   const document = root && typeof root.querySelectorAll === "function" ? root : globalThis.document;
   if (!document || typeof document.querySelectorAll !== "function") return emptySurface();
@@ -792,8 +846,23 @@ export function collectProbeSurface(root) {
   });
   const webauthnInputs = visible("input[autocomplete='webauthn']");
   const labelOf = (element) =>
-    `${element.getAttribute("aria-label") || ""} ${element.innerText || element.textContent || ""}`.slice(0, 180);
+    `${element.getAttribute("aria-label") || ""} ${element.getAttribute("value") || ""} ${element.innerText || element.textContent || ""}`.slice(0, 180);
   const passkeyControl = (element) => /\b(passkey|security key|webauthn)\b/i.test(labelOf(element));
+  const mutationControl = (element) =>
+    /\b(reset password|new password|change password|create account|sign up|sign-up|enroll|enrol|register|recover|recovery)\b/i.test(
+      labelOf(element),
+    );
+  const newPasswordField = passwords.some((element) => {
+    const autocomplete = String(element.getAttribute("autocomplete") || "").toLowerCase();
+    const name = String(element.getAttribute("name") || "").toLowerCase();
+    return (
+      autocomplete === "new-password" ||
+      name === "newpassword" ||
+      name === "new_password" ||
+      name === "passwordconfirm" ||
+      name === "password_confirm"
+    );
+  });
   const primaryLogin = passwords.length > 0 || usernames.length > 0;
   const challenge = visible("form, [role='dialog']").some((element) => {
     if (typeof element.querySelector === "function") {
@@ -826,6 +895,7 @@ export function collectProbeSurface(root) {
     otpField: otp.length > 0,
     webauthnChallenge: webauthnInputs.length > 0 || (!primaryLogin && challenge),
     passkeyAlternative: primaryLogin && visible("a, button").some(passkeyControl),
+    accountMutation: newPasswordField || visible("button, input[type='submit']").some(mutationControl),
     noAccess:
       text.includes("No access yet") || text.includes("has not been granted any hosts or settings yet"),
     accessDenied: title === "Access denied · Pharos" || text.includes("has not granted you operator access"),
@@ -853,7 +923,8 @@ export function classifyProbeSurface(surface = {}) {
     managerShell: Boolean(surface.managerShell),
     viewerOnly: Boolean(surface.viewerOnly) && !surface.managerShell,
     appShell: Boolean(surface.appShell),
-    authRecovery: Boolean(surface.authRecovery),
+    authRecovery: Boolean(surface.authRecovery || surface.accountMutation),
+    accountMutation: Boolean(surface.accountMutation),
     rateLimited: Boolean(surface.rateLimited),
     loginForm: Boolean(surface.loginForm || surface.usernameField || Number(surface.passwordCount) > 0),
     authUiVisible: Boolean(
@@ -928,6 +999,201 @@ export function planInventory({
     add(`/pharos/hosts/${name}?section=settings`);
   }
   return paths;
+}
+
+export function credentialFillPermitted(probe) {
+  if (!probe || probe.mfa || probe.authRecovery || probe.accountMutation) return false;
+  return true;
+}
+
+export function submitLabelRejected(label) {
+  return /\b(passkey|security key|webauthn|reset password|new password|change password|sign up|sign-up|create account|enroll|enrol|register|recover|recovery)\b/i.test(
+    String(label || ""),
+  );
+}
+
+export function passwordAppearsInText(text, password) {
+  if (typeof password !== "string" || password.length < 1) return false;
+  return String(text ?? "").includes(password);
+}
+
+export async function takeAuthenticatedShot(page, { permitted, password, options }) {
+  if (!permitted) return false;
+  let rendered = true;
+  try {
+    rendered = await page.evaluate(scanVisiblePassword, password);
+  } catch {
+    rendered = true;
+  }
+  if (rendered) return false;
+  await page.screenshot(options);
+  return true;
+}
+
+export function scanVisiblePassword(secret) {
+  const appears = (text, password) =>
+    typeof password === "string" && password.length > 0 && String(text ?? "").includes(password);
+  if (typeof secret !== "string" || secret.length < 1) return true;
+  const document = globalThis.document;
+  if (!document || typeof document.querySelectorAll !== "function") return true;
+  const nodes = [...document.querySelectorAll("input, textarea")];
+  for (const node of nodes) {
+    if (appears(node.value, secret)) return true;
+  }
+  const body = document.body;
+  const visible = `${document.title || ""}\n${body ? body.innerText || "" : ""}\n${body ? body.textContent || "" : ""}`;
+  return appears(visible, secret);
+}
+
+export function fetchPausePatterns() {
+  return [{ urlPattern: "*", requestStage: "Request" }];
+}
+
+function headerUpgrade(headers) {
+  if (!headers) return "";
+  if (Array.isArray(headers)) {
+    const entry = headers.find((item) => String(item?.name || "").toLowerCase() === "upgrade");
+    return String(entry?.value || "");
+  }
+  return String(headers.upgrade || headers.Upgrade || "");
+}
+
+export function decideFetchPause(event, policy = {}) {
+  if (event?.responseStatusCode || event?.responseErrorReason) {
+    return {
+      action: "fail",
+      verdict: decision(false, "response-stage", "?", "/", listedSecrets(policy.secrets)),
+    };
+  }
+  const request = event?.request || {};
+  let verdict;
+  try {
+    verdict = decideRequest(
+      {
+        url: request.url,
+        method: request.method,
+        resourceType: String(event?.resourceType || "").toLowerCase(),
+        headers: { upgrade: headerUpgrade(request.headers) },
+        postData: request.postData,
+      },
+      policy,
+    );
+  } catch {
+    verdict = decision(false, "guard-error", "?", "/", listedSecrets(policy.secrets));
+  }
+  return {
+    action: continuationAllowed(verdict) ? "continue" : "fail",
+    verdict,
+  };
+}
+
+export async function settleFetchPause(session, event, policy = {}, rememberFn) {
+  const decision = decideFetchPause(event, policy);
+  if (decision.action !== "continue") {
+    if (typeof rememberFn === "function") {
+      try {
+        rememberFn(decision.verdict);
+      } catch {
+        // Evidence failure must not turn a deny into a continue.
+      }
+    }
+    try {
+      await session.send("Fetch.failRequest", {
+        requestId: event?.requestId,
+        errorReason: "BlockedByClient",
+      });
+      return "failed";
+    } catch {
+      return "paused";
+    }
+  }
+  try {
+    await session.send("Fetch.continueRequest", { requestId: event?.requestId });
+    return "continued";
+  } catch {
+    return "paused";
+  }
+}
+
+export async function settleFetchAuth(session, event) {
+  try {
+    await session.send("Fetch.continueWithAuth", {
+      requestId: event?.requestId,
+      authChallengeResponse: { response: "CancelAuth" },
+    });
+    return "cancelled";
+  } catch {
+    return "paused";
+  }
+}
+
+export async function enableFetchGuard(session, policy, rememberFn) {
+  if (!session || typeof session.on !== "function" || typeof session.send !== "function") {
+    throw new LiveUiError("network-guard");
+  }
+  session.on("Fetch.requestPaused", (paused) => settleFetchPause(session, paused, policy, rememberFn).catch(() => {}));
+  session.on("Fetch.authRequired", (challenge) => settleFetchAuth(session, challenge).catch(() => {}));
+  await session.send("Fetch.enable", {
+    patterns: fetchPausePatterns(),
+    handleAuthRequests: true,
+  });
+}
+
+export async function disposeFetchGuard(session) {
+  if (!session || typeof session.send !== "function") return;
+  try {
+    await session.send("Fetch.disable");
+  } catch {
+    // The session may already be closed. Detach still runs.
+  }
+  if (typeof session.detach === "function") {
+    try {
+      await session.detach();
+    } catch {
+      // Closed sessions have nothing left to release.
+    }
+  }
+}
+
+export function foreignTargetAction(info, primaryClaimed) {
+  const type = String(info?.type || "");
+  if (type === "page" && !primaryClaimed) return "primary";
+  if (type === "page" || type === "service_worker" || type === "background_page") return "close";
+  return "ignore";
+}
+
+export function bindTargetCloser(session, rememberFn) {
+  if (!session || typeof session.on !== "function" || typeof session.send !== "function") {
+    throw new LiveUiError("network-guard");
+  }
+  const seen = new Set();
+  let primaryClaimed = false;
+  const onCreated = (event) => {
+    const info = event?.targetInfo || {};
+    const action = foreignTargetAction(info, primaryClaimed);
+    if (action === "primary") {
+      primaryClaimed = true;
+      if (info.targetId) seen.add(info.targetId);
+      return;
+    }
+    if (action !== "close" || !info.targetId || seen.has(info.targetId)) return;
+    seen.add(info.targetId);
+    if (typeof rememberFn === "function") {
+      try {
+        rememberFn(decideIncidental(info.type === "service_worker" ? "serviceworker" : "popup"));
+      } catch {
+        // Closing the target does not wait on evidence.
+      }
+    }
+    session.send("Target.closeTarget", { targetId: info.targetId }).catch(() => {});
+  };
+  session.on("Target.targetCreated", onCreated);
+  return {
+    onCreated,
+    async enable() {
+      await session.send("Target.setDiscoverTargets", { discover: true });
+    },
+  };
 }
 
 export function screenshotName(routePath, hostIndex = 1) {
